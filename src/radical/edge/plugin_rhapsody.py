@@ -142,6 +142,10 @@ class RhapsodySession(PluginSession):
 
             self._rh_session = rh.Session(backends=backends, uid=self._sid)
 
+            telemetry = await self._rh_session.start_telemetry(
+                resource_poll_interval=0.1, checkpoint_path=f"telemetry-output"
+                )
+
             # Register state-change callbacks for intermediate notifications
             self._notified_states: dict[str, str] = {}
             self._notified_lock = threading.Lock()
@@ -703,6 +707,7 @@ class RhapsodySession(PluginSession):
         Shutdown RHAPSODY session and clean up.
         """
         if self._rh_session:
+            print(json.dumps(telemetry.summary(), indent=4), flush=True)
             await self._rh_session.close()
             self._rh_session = None
         self._tasks = {}
