@@ -305,14 +305,14 @@ AMSC_DIR = Path(os.environ.get('AMSC_DIR') or Path.home() / '.amsc').expanduser(
 # ─────────────────────────────────────────────────────────────────────────────
 
 try:
-    from rich.console import Console
-    from rich.live    import Live as _RichLive
-    from rich.text    import Text as _RichText
+    from rich.console  import Console
+    from rich.progress import (BarColumn, Progress, TaskProgressColumn,
+                               TextColumn)
     _console = Console()
 except ImportError:                              # pragma: no cover
-    _console   = None
-    _RichLive  = None
-    _RichText  = None
+    _console  = None
+    Progress  = None
+    BarColumn = TaskProgressColumn = TextColumn = None
 
 _TOTAL_STEPS = 7   # connect / pick / configure / submit / await / run / teardown
 
@@ -339,32 +339,36 @@ def say(*args, **kwargs):
         print(*args, **kwargs)
 
 
-def _render_progress(counts, n_matey, n_gkeyll):
-    """Two-line counter for the rhapsody workload's live display.
+def _make_progress(n_matey, n_gkeyll):
+    """Build the rhapsody workload's progress display.
 
-    matey and gkeyll are reported on separate lines; either is omitted
-    when its task count is 0.  Used by submit_rhapsody_workload's
-    rich.Live block as the renderable refreshed every second.
+    Returns ``(progress, tids)`` where *progress* is a ``rich.Progress``
+    (or ``None`` when rich is unavailable) and *tids* maps each active
+    kind to its task id.  Drive it with::
 
-    Numeric columns are right-aligned at width 6 — comfortably covers
-    the 10k-task workloads we expect (six digits = up to 999,999).
+        progress.update(tids[kind], advance=1,
+                        done=counts[kind]['done'],
+                        failed=counts[kind]['failed'])
     """
-    def _line(label, done, total, failed):
-        return (f'  [cyan]{label:<6s}[/cyan]   '
-                f'[bright_white]{done:>6d}[/bright_white] / '
-                f'[bright_white]{total:>6d}[/bright_white] done, '
-                f'[red]{failed:>6d}[/red] failed')
+    if Progress is None or _console is None:
+        return None, {}
 
-    lines = []
-    if n_matey > 0:
-        c = counts['matey']
-        lines.append(_line('matey',  c['done'], n_matey,  c['failed']))
-    if n_gkeyll > 0:
-        c = counts['gkeyll']
-        lines.append(_line('gkeyll', c['done'], n_gkeyll, c['failed']))
-    if _RichText:
-        return _RichText.from_markup('\n'.join(lines))
-    return '\n'.join(lines)
+    progress = Progress(
+        TextColumn("  [cyan]{task.fields[label]:<6s}[/cyan]"),
+        BarColumn(bar_width=20),
+        TaskProgressColumn(),
+        TextColumn(
+            "[bright_white]{task.fields[done]:>6d}[/bright_white] / "
+            "[bright_white]{task.total:>6d}[/bright_white] done, "
+            "[red]{task.fields[failed]:>6d}[/red] failed"),
+        console=_console,
+    )
+    tids = {}
+    for kind, n in (('matey', n_matey), ('gkeyll', n_gkeyll)):
+        if n > 0:
+            tids[kind] = progress.add_task('', total=n, label=kind,
+                                           done=0, failed=0)
+    return progress, tids
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1176,8 +1180,7 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg):
     # ``os.makedirs(backend._work_dir)`` locally) — we can't pass the
     # remote matey/gkeyll paths there.  Per-task ``cwd`` rides through
     # the ``process_template`` instead.
-    n_matey  = len(matey_tasks)
-    n_gkeyll = len(gkeyll_tasks)
+    progress, tids = _make_progress(len(matey_tasks), len(gkeyll_tasks))
 
     async with Session(backends=[backend]) as session:
         # Use 1 as a no-op cap when a kind isn't running (its task list is
@@ -1193,48 +1196,19 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg):
                     counts[kind]['done'] += 1
                 except BaseException:
                     counts[kind]['failed'] += 1
+                if progress:
+                    c = counts[kind]
+                    progress.update(tids[kind], advance=1,
+                                    done=c['done'], failed=c['failed'])
 
         coros  = [run_one(t, 'matey',  sem_gpu)  for t in matey_tasks]
         coros += [run_one(t, 'gkeyll', sem_core) for t in gkeyll_tasks]
 
-        # Live counter — replaces the per-task done/fail stream.  Rich's
-        # auto-refresh redraws the same renderable every period; a 1-Hz
-        # ticker swaps in a fresh snapshot of the counters.
-        if _RichLive and _console:
-            with _RichLive(_render_progress(counts, n_matey, n_gkeyll),
-                           console=_console, refresh_per_second=2,
-                           transient=False) as live:
-
-                async def _ticker():
-                    try:
-                        while True:
-                            await asyncio.sleep(1.0)
-                            live.update(_render_progress(
-                                counts, n_matey, n_gkeyll))
-                    except asyncio.CancelledError:
-                        pass
-
-                tick = asyncio.create_task(_ticker())
-                try:
-                    await asyncio.gather(*coros, return_exceptions=True)
-                finally:
-                    tick.cancel()
-                    live.update(_render_progress(counts, n_matey, n_gkeyll))
+        if progress:
+            with progress:
+                await asyncio.gather(*coros, return_exceptions=True)
         else:
             await asyncio.gather(*coros, return_exceptions=True)
-
-    parts = []
-    if has_matey:
-        parts.append(f"matey: {counts['matey']['done']} done / "
-                     f"{counts['matey']['failed']} failed")
-    if has_gkeyll:
-        parts.append(f"gkeyll: {counts['gkeyll']['done']} done / "
-                     f"{counts['gkeyll']['failed']} failed")
-    if _console:
-        _console.print('\n[bold]summary[/bold]              '
-                       f'[bright_white]{"; ".join(parts)}[/bright_white]')
-    else:
-        print('\n— summary: ' + '; '.join(parts) + ' —')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
