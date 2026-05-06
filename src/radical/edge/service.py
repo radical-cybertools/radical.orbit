@@ -677,19 +677,50 @@ class EdgeService(PluginHostBase):
 
     async def _open_tunnel_reverse(self,
                                     wait_timeout: float = 300.0) -> None:
-        """Reverse mode: wait for the parent (login-side) PsiJ watcher to
-        open ``ssh -R`` and write the rendezvous file.
+        """Reverse mode: wait for a login-side spawner to open ``ssh -R``
+        and write the rendezvous file.
 
-        We don't spawn anything here — the plugin_psij watcher is
-        responsible for the SSH side and for writing
-        ``~/.radical/edge/tunnels/<edge_name>.port``.  We just poll
-        the file until it appears (or *wait_timeout* elapses) and
-        rewrite ``self._bridge_url`` to ``localhost:<port>``.
+        Two flows produce that file today:
+
+        * **PsiJ-launched** — the parent edge's ``plugin_psij`` watcher
+          discovers our compute hostname via ``BatchSystem.job_nodes``,
+          spawns ``ssh -R``, writes ``<edge_name>.port``.
+
+        * **IRI-launched** — there is no parent edge on the login node,
+          so we drop a ``<edge_name>.req`` JSON sibling here with our
+          compute hostname + bridge target.  A standalone shell helper
+          (``bin/radical-edge-iri-tunnel-helper.sh``) running on the
+          login node watches the directory for ``.req`` files and does
+          the spawn+write.  PsiJ flows ignore the ``.req``.
+
+        Either way we just poll for ``<edge_name>.port`` and rewrite
+        ``self._bridge_url`` to ``localhost:<port>`` once it appears.
         """
+        import json
+        import socket
         from urllib.parse import urlparse, urlunparse
         from . import tunnel as _tunnel
 
-        relay_file = _tunnel.relay_dir() / f'{self._name}.port'
+        rdir       = _tunnel.relay_dir()
+        relay_file = rdir / f'{self._name}.port'
+        req_file   = rdir / f'{self._name}.req'
+
+        parsed      = urlparse(self._bridge_url)
+        bridge_host = parsed.hostname or 'localhost'
+        bridge_port = parsed.port or (443 if parsed.scheme == 'https' else 8000)
+
+        # Drop the request file *before* polling — atomic via tmp + rename
+        # so the helper script never reads a half-written payload.
+        req_payload = json.dumps({
+            'edge_name'  : self._name,
+            'hostname'   : socket.gethostname(),
+            'bridge_host': bridge_host,
+            'bridge_port': bridge_port,
+        })
+        tmp = req_file.with_suffix('.req.tmp')
+        tmp.write_text(req_payload)
+        tmp.rename(req_file)
+        log.info("[Edge] --tunnel reverse: wrote request file %s", req_file)
 
         log.info("[Edge] --tunnel reverse: waiting for parent-side "
                  "rendezvous file %s (timeout %.0fs)",
@@ -703,7 +734,6 @@ class EdgeService(PluginHostBase):
                 except (ValueError, OSError):
                     port = None
                 if port:
-                    parsed = urlparse(self._bridge_url)
                     self._bridge_url = urlunparse(
                         parsed._replace(netloc=f'localhost:{port}'))
                     log.info("[Edge] Reverse tunnel active on localhost:%d; "

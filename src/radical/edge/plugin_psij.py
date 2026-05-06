@@ -50,6 +50,13 @@ _OUTPUT_BASE = pathlib.Path.home() / '.radical' / 'edge' / 'psij' / 'output'
 # Maximum age (days) for stale output directories cleaned up on session creation
 _OUTPUT_MAX_AGE_DAYS = 7
 
+# Diagnostic: when set (truthy env var), pass ``keep_files=True`` into the
+# batch-scheduler executor config so PsiJ leaves its generated submit
+# scripts under ``~/.psij/work/<scheduler>/`` for inspection.  Off by
+# default to keep the workdir tidy.
+_KEEP_PSIJ_FILES = os.environ.get('RADICAL_EDGE_PSIJ_KEEP_FILES', '').lower() \
+                   in ('1', 'true', 'yes', 'on')
+
 
 # Terminal states that don't need further polling
 TERMINAL_STATES = {'COMPLETED', 'FAILED', 'CANCELED'}
@@ -205,7 +212,22 @@ class PSIJSession(PluginSession):
             spec.stdout_path = out_path
             spec.stderr_path = err_path
 
-            ex = psij.JobExecutor.get_instance(executor_name)
+            # ``keep_files=True`` only meaningful for batch-scheduler
+            # executors (slurm/pbs/lsf/cobalt/...).  ``local`` ignores it.
+            ex_config = None
+            if _KEEP_PSIJ_FILES and executor_name in ('slurm', 'pbs', 'lsf',
+                                                       'cobalt', 'flux'):
+                from psij.executors.batch.batch_scheduler_executor \
+                    import BatchSchedulerExecutorConfig
+                ex_config = BatchSchedulerExecutorConfig(keep_files=True)
+                log.info("[psij] RADICAL_EDGE_PSIJ_KEEP_FILES set: "
+                         "executor=%s keep_files=True", executor_name)
+
+            if ex_config is not None:
+                ex = psij.JobExecutor.get_instance(executor_name,
+                                                    config=ex_config)
+            else:
+                ex = psij.JobExecutor.get_instance(executor_name)
 
             # Set poll interval for status updates
             if hasattr(ex, 'poll_interval'):

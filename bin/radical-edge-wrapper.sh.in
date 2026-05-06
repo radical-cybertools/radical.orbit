@@ -23,20 +23,23 @@ if [ -n "${RADICAL_EDGE_SETUP:-}" ]; then
     eval "$RADICAL_EDGE_SETUP"
 fi
 
-DRAGON_PATH=$(command -v dragon  2>/dev/null)
-PYTHON_PATH=$(command -v python3 2>/dev/null)
+# Anchor the dragon/python lookup to ``@BINDIR@`` (= the venv this
+# wrapper was installed into), NOT a PATH search.  RADICAL_EDGE_SETUP
+# may legitimately ``module load`` a different python (e.g. cray-python
+# for headers / linking) and prepend it to PATH; that's for runtime
+# libraries (LD_LIBRARY_PATH), not for picking the interpreter.  We
+# always want the venv's own dragon + python.
+DRAGON_PATH="@BINDIR@/dragon"
+PYTHON_PATH="@BINDIR@/python3"
 
 # Decide whether to launch via dragon.  Use it only when:
-#   * dragon is installed,
-#   * dragon and python3 live in the same bin/ (= same venv),
+#   * dragon is installed in this venv,
 #   * we are NOT on a SLURM/PBS login node without an allocation —
 #     dragon's launch_selector raises in that case.
 USE_DRAGON=no
 REASON=""
-if   [ -z "$DRAGON_PATH" ]; then
-    REASON="dragon not installed"
-elif [ "$(dirname "$DRAGON_PATH")" != "$(dirname "$PYTHON_PATH")" ]; then
-    REASON="external dragon ($DRAGON_PATH)"
+if   [ ! -x "$DRAGON_PATH" ]; then
+    REASON="dragon not installed at $DRAGON_PATH"
 elif command -v sbatch >/dev/null 2>&1 && [ -z "$SLURM_JOB_ID" ]; then
     REASON="SLURM login node without allocation"
 elif command -v qsub   >/dev/null 2>&1 && [ -z "$PBS_JOBID"    ]; then
@@ -47,7 +50,7 @@ fi
 
 if [ "$USE_DRAGON" = "yes" ]; then
     echo "[radical-edge] starting with dragon ($DRAGON_PATH)" >&2
-    exec dragon "@BINDIR@/radical-edge-service.py" "$@"
+    exec "$DRAGON_PATH" "@BINDIR@/radical-edge-service.py" "$@"
 else
     echo "[radical-edge] starting with python ($PYTHON_PATH) — $REASON" >&2
     exec "$PYTHON_PATH" "@BINDIR@/radical-edge-service.py" "$@"
