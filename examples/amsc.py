@@ -86,12 +86,22 @@ rhapsody.enable_logging(level=logging.WARNING)
 #  Workflow knobs — edit to taste.
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Which workload to run once the first edge is up.  Toggle freely:
+#   'rose'     — active-learning loop (run_rose_workflow).
+#   'rhapsody' — N matey-inference tasks via rhapsody (submit_rhapsody_workload).
+WORKLOAD           = 'rhapsody'
+
 # ROSE active-learning shape (mirrors examples/example_rose.py).
 N_MPI_RANKS        = 4      # MPI ranks per simulation launch
 N_SAMPLES_PER_RANK = 5      # sparse start; AL drives exploration
 N_QUERY            = 8      # query points selected per AL step
 MSE_THRESHOLD      = 0.01   # convergence target
 MAX_ITER           = 15     # hard cap on AL iterations
+
+# Rhapsody-direct workload shape (mirrors examples/run_matey.py).
+N_RHAPSODY_TASKS     = 10
+MATEY_WRAPPER_NAME   = 'matey_wrapper.sh'
+RHAPSODY_WORK_SUBDIR = 'rhapsody-runs'
 
 # How long we are willing to wait for the first edge to come up.
 EDGE_WAIT_SECONDS  = 30 * 60
@@ -128,7 +138,8 @@ IRI_DEFAULTS = {
         'queue_name'  : 'debug',
         'walltime_min': 30,
         'n_nodes'     : 1,
-        'constraint'  : 'cpu',
+        'gpus_per_node': 4,
+        'constraint'  : 'gpu',
         'reservation' : None,
         'environment' : {},
         # ``setup`` is a list of shell commands the edge wrapper
@@ -138,6 +149,17 @@ IRI_DEFAULTS = {
         'setup'       : [
             'module load openmpi',
         ],
+        # ``app`` carries workload-specific paths consumed by
+        # submit_rhapsody_workload (matey).  ``None`` means "this target
+        # does not support the rhapsody/matey workload".
+        'app'         : {
+            'matey_dir'      : '/global/u2/m/merzky/MATEY/examples',
+            'matey_model_dir': '/global/cfs/projectdirs/amsc007/zhan1668/MATEY'
+                               '/models/Dev_Fusion_DemoMay_toytestonly'
+                               '/demo_nbatchsloc100/',
+            'matey_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
+                               '/d3d_174310.03500/',
+        },
     },
     'olcf': {
         'enabled'     : True,
@@ -152,10 +174,12 @@ IRI_DEFAULTS = {
         'queue_name'  : 'batch',
         'walltime_min': 30,
         'n_nodes'     : 1,
+        'gpus_per_node': None,
         'constraint'  : None,
         'reservation' : None,
         'environment' : {},
         'setup'       : None,
+        'app'         : None,
     },
 }
 
@@ -176,10 +200,12 @@ MACHINE_DEFAULTS = {
         'queue_name'  : 'debug',
         'walltime_min': 30,
         'n_nodes'     : 1,
+        'gpus_per_node': None,
         'constraint'  : None,
         'tunnel'      : 'forward',
         'amsc_dir'    : None,
         'setup'       : None,
+        'app'         : None,
     },
     'perlmutter': {
         'enabled'     : True,
@@ -187,12 +213,21 @@ MACHINE_DEFAULTS = {
         'queue_name'  : 'debug',
         'walltime_min': 30,
         'n_nodes'     : 1,
-        'constraint'  : 'cpu',
+        'gpus_per_node': 4,
+        'constraint'  : 'gpu',
         'tunnel'      : 'forward',
         'amsc_dir'    : None,
         'setup'       : [
             'module load openmpi',
         ],
+        'app'         : {
+            'matey_dir'      : '/global/u2/m/merzky/MATEY/examples',
+            'matey_model_dir': '/global/cfs/projectdirs/amsc007/zhan1668/MATEY'
+                               '/models/Dev_Fusion_DemoMay_toytestonly'
+                               '/demo_nbatchsloc100/',
+            'matey_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
+                               '/d3d_174310.03500/',
+        },
     },
     'odo': {
         'enabled'     : True,
@@ -200,15 +235,18 @@ MACHINE_DEFAULTS = {
         'queue_name'  : 'batch',
         'walltime_min': 30,
         'n_nodes'     : 1,
+        'gpus_per_node': None,
         'constraint'  : None,
         'tunnel'      : 'reverse',
         'amsc_dir'    : None,
         'setup'       : None,
+        'app'         : None,
     },
     'thinkie': {
         'enabled'     : False,
         'amsc_dir'    : None,
         'setup'       : None,
+        'app'         : None,
     },
 }
 
@@ -479,6 +517,10 @@ def launch_iri(bc, endpoint, cfg, bridge_url):
     }
     if cfg['constraint']:  attrs['constraint']  = cfg['constraint']
     if cfg['reservation']: attrs['reservation'] = cfg['reservation']
+    # GPU allocation hint — best-effort: IRI may translate to the underlying
+    # scheduler's flag (--gpus-per-node on SLURM) or silently drop it.
+    if cfg.get('gpus_per_node'):
+        attrs['gpus_per_node'] = cfg['gpus_per_node']
 
     # Compose absolute paths against the target's $HOME (configured in
     # IRI_DEFAULTS).  We can't rely on bash to expand ``~`` — PsiJ's
@@ -524,6 +566,7 @@ def launch_iri(bc, endpoint, cfg, bridge_url):
         'resource_id': cfg['resource_id'],
         'job_id'     : job['job_id'],
         'edge_name'  : edge_name,
+        'cfg'        : cfg,
     }
 
 
@@ -599,6 +642,8 @@ def launch_psij(bc, edge_name, cfg, bridge_url):
     custom_attrs = {}
     if cfg.get('constraint'):
         custom_attrs[f'{cfg["executor"]}.constraint'] = cfg['constraint']
+    if cfg.get('gpus_per_node'):
+        custom_attrs[f'{cfg["executor"]}.gpus-per-node'] = str(cfg['gpus_per_node'])
 
     # Cert is left to the child edge to resolve from
     # ``~/.radical/edge/bridge_cert.pem`` on the target (or via
@@ -633,6 +678,7 @@ def launch_psij(bc, edge_name, cfg, bridge_url):
         'parent_edge': edge_name,
         'job_id'     : res['job_id'],
         'edge_name'  : res.get('edge_name', child_name),
+        'cfg'        : cfg,
     }
 
 
@@ -678,8 +724,11 @@ def wait_for_first_edge(bc, expected_names, timeout=EDGE_WAIT_SECONDS,
 #  it targets a specific edge_name passed in by the launcher.
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def run_rose_workflow(bridge_url, edge_name):
+async def run_rose_workflow(bridge_url, edge_name, cfg=None):
     """Run the active-learning loop using the named edge as a Dragon backend.
+
+    *cfg* (the matched per-target config dict) is accepted for signature
+    parity with :func:`submit_rhapsody_workload` and currently unused.
 
     Closure discipline (from example_rose.py): every task captures only
     ``ddict_descriptor`` (a plain str) and re-derives the current iteration
@@ -854,6 +903,111 @@ async def run_rose_workflow(bridge_url, edge_name):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Rhapsody-direct workload (alternative to ROSE).
+#
+#  Mirrors examples/run_matey.py: submits N matey-inference tasks against
+#  the named edge as a rhapsody backend, with a semaphore-limited
+#  concurrency cap and per-task GPU-affinity round-robin.  Goes through
+#  the edge backend (bridge -> edge -> rhapsody plugin -> V3) — same
+#  transport as run_rose_workflow.
+#
+#  Per-target requirements (see ``app`` field in IRI_DEFAULTS /
+#  MACHINE_DEFAULTS):
+#    * ``app.matey_dir``       — host directory containing
+#                                ``matey_wrapper.sh`` and
+#                                ``basic_inference.py``.
+#    * ``app.matey_model_dir`` — passed as ``--model_dir``.
+#    * ``app.matey_xgc_dir``   — passed as ``--newxgc_dir``.
+#    * ``gpus_per_node``       — used to derive concurrency
+#                                (``n_nodes * gpus_per_node``) and the
+#                                per-task ``gpu_affinity`` index.
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def submit_rhapsody_workload(bridge_url, edge_name, cfg):
+    """Submit N matey-inference tasks via the named edge as rhapsody backend."""
+    app_cfg = (cfg or {}).get('app')
+    if not app_cfg:
+        raise RuntimeError(
+            f"target {edge_name!r} has no 'app' config block — "
+            "the rhapsody/matey workload is not supported here.  Either "
+            "set WORKLOAD='rose' or populate IRI_DEFAULTS / "
+            "MACHINE_DEFAULTS['app'] for this target.")
+
+    gpus_per_node = cfg.get('gpus_per_node') or 0
+    n_nodes       = cfg.get('n_nodes') or 1
+    n_gpus        = n_nodes * gpus_per_node
+    if n_gpus <= 0:
+        raise RuntimeError(
+            f"target {edge_name!r}: gpus_per_node * n_nodes must be > 0 "
+            f"(got {gpus_per_node} * {n_nodes}={n_gpus})")
+
+    matey_dir    = app_cfg['matey_dir'].rstrip('/')
+    wrapper_path = f'{matey_dir}/{MATEY_WRAPPER_NAME}'
+    work_dir     = f'{matey_dir}/{RHAPSODY_WORK_SUBDIR}'
+
+    args = [
+        'python', 'basic_inference.py',
+        '--model_dir',  app_cfg['matey_model_dir'],
+        '--use_ddp',
+        '--on_perlmutter',
+        '--AR',
+        '--leadtime',   '5',
+        '--newxgc_dir', app_cfg['matey_xgc_dir'],
+    ]
+
+    # ``Policy`` lives in dragon — lazy-import so amsc.py still parses on
+    # client machines without dragon installed (it'll only fail here when
+    # the user actually selects the rhapsody workload).
+    from dragon.infrastructure.policy import Policy
+    from rhapsody.api import ComputeTask, Session
+
+    print(f'\n— Running rhapsody workload on edge "{edge_name}" '
+          f'(bridge: {bridge_url}) —')
+    print(f'  wrapper : {wrapper_path}')
+    print(f'  workdir : {work_dir}')
+    print(f'  N tasks : {N_RHAPSODY_TASKS}, concurrency: {n_gpus} '
+          f'({n_nodes} node x {gpus_per_node} gpu)')
+
+    backend = await rhapsody.get_backend(
+        'edge', bridge_url=bridge_url, edge_name=edge_name)
+
+    async with Session(backends=[backend], work_dir=work_dir) as session:
+        tasks = [
+            ComputeTask(
+                executable=wrapper_path,
+                arguments=args,
+                capture_stdio=True,
+                task_backend_specific_kwargs={
+                    'process_template': {
+                        'cwd'   : work_dir,
+                        'policy': Policy(gpu_affinity=[i % gpus_per_node]),
+                    },
+                },
+            )
+            for i in range(N_RHAPSODY_TASKS)
+        ]
+
+        sem = asyncio.Semaphore(n_gpus)
+
+        async def run_one(task, idx):
+            async with sem:
+                await session.submit_tasks([task])
+                try:
+                    await task
+                    print(f'  done [{idx:>3d}]: {task.uid} '
+                          f'state={task.state} exit={task.exit_code} '
+                          f'log={task.stdout}', flush=True)
+                except BaseException as exc:
+                    print(f'  fail [{idx:>3d}]: {task.uid} '
+                          f'state={task.state} exit={task.exit_code} '
+                          f'err={exc}', flush=True)
+                    raise
+
+        await asyncio.gather(*(run_one(t, i) for i, t in enumerate(tasks)),
+                             return_exceptions=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Teardown — only touch resources THIS SCRIPT created.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -965,7 +1119,18 @@ def main():
                 sys.exit('No targets launched successfully — nothing to run.')
             first = wait_for_first_edge(bc, expected_edges)
             print(f'\n— First edge up: {first} —')
-            asyncio.run(run_rose_workflow(bridge_url, first))
+            matched = next((r for r in created if r.get('edge_name') == first),
+                           None)
+            matched_cfg = (matched or {}).get('cfg') or {}
+
+            if WORKLOAD == 'rose':
+                asyncio.run(run_rose_workflow(bridge_url, first, matched_cfg))
+            elif WORKLOAD == 'rhapsody':
+                asyncio.run(submit_rhapsody_workload(bridge_url, first,
+                                                    matched_cfg))
+            else:
+                sys.exit(f'unknown WORKLOAD={WORKLOAD!r} '
+                         f"(expected 'rose' or 'rhapsody')")
 
         finally:
             # 5. Tear down what we created — runs whether the workflow
