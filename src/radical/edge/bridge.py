@@ -41,7 +41,11 @@ log = logging.getLogger("radical.edge.bridge")
 
 BRIDGE_EDGE_NAME   = 'bridge'
 HEARTBEAT_INTERVAL = 20
-REQUEST_TIMEOUT    = 45
+# Per proxied request: the bridge forwards a HTTP request to the edge over
+# WS and waits this many seconds for the edge's response before returning
+# 504.  Bumped to 600 s so submit batches of 1000s of tasks (whose dragon-
+# side ProcessGroup creation takes seconds per task) don't time out.
+REQUEST_TIMEOUT    = 600
 
 
 class Bridge:

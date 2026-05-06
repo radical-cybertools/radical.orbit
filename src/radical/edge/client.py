@@ -208,7 +208,10 @@ class BridgeClient:
         self._http: httpx.Client = httpx.Client(
             base_url=self._url,
             verify=self._cert if self._cert else False,
-            timeout=60.0,
+            # Match the bridge's REQUEST_TIMEOUT (600s).  Submit batches
+            # of 1000s of tasks can take many seconds at the edge; a 60s
+            # client cap would 504 long before the bridge would.
+            timeout=600.0,
             event_hooks={'request' : [_inject_req_id],
                          'response': [_on_response]},
         )
