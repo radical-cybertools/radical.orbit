@@ -973,7 +973,12 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg):
     backend = await rhapsody.get_backend(
         'edge', bridge_url=bridge_url, edge_name=edge_name)
 
-    async with Session(backends=[backend], work_dir=work_dir) as session:
+    # Session(work_dir=…) is a *client-side* setting: rhapsody calls
+    # ``os.makedirs(backend._work_dir, ...)`` locally for each backend.
+    # Passing the matey path (``/global/…/MATEY/.../rhapsody-runs``) here
+    # would try to mkdir under ``/global`` on the client.  The compute-side
+    # cwd is set per-task via ``process_template['cwd']`` instead.
+    async with Session(backends=[backend]) as session:
         tasks = [
             ComputeTask(
                 executable=wrapper_path,
