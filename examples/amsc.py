@@ -97,6 +97,7 @@ WORKLOAD           = 'rhapsody'
 # perlmutter PsiJ path with MACHINE_DEFAULTS values, emit a coarse
 # 7-step trace.  Set False to restore the original interactive flow.
 DEMO_MODE          = True
+N_NODES            = 16
 
 # ROSE active-learning shape (mirrors examples/example_rose.py).
 N_MPI_RANKS        = 4      # MPI ranks per simulation launch
@@ -106,8 +107,8 @@ MSE_THRESHOLD      = 0.01   # convergence target
 MAX_ITER           = 15     # hard cap on AL iterations
 
 # Rhapsody-direct workload shape (mirrors examples/run_matey.py).
-N_MATEY_TASKS        = 10        # GPU-bound matey-inference tasks
-N_GKEYLL_TASKS       = 1024      # core-bound gkeyll tasks
+N_MATEY_TASKS        = N_NODES * 10        # GPU-bound matey inference tasks
+N_GKEYLL_TASKS       = N_NODES * 128 * 3   # CPU-bound gkeyll training tasks
 MATEY_WRAPPER_NAME   = 'matey_wrapper.sh'
 RHAPSODY_WORK_SUBDIR = 'rhapsody-runs'
 
@@ -137,7 +138,7 @@ IRI_DEFAULTS = {
         'queue_name'  : 'debug',
         'qos'         : None,
         'walltime_min': 30,
-        'n_nodes'     : 1,
+        'n_nodes'     : N_NODES,
         'gpus_per_node': 4,
         'cores_per_node': 128,
         'constraint'  : 'gpu',
@@ -173,7 +174,7 @@ IRI_DEFAULTS = {
         'queue_name'  : 'batch',
         'qos'         : None,
         'walltime_min': 30,
-        'n_nodes'     : 1,
+        'n_nodes'     : N_NODES,
         'gpus_per_node': None,
         'cores_per_node': None,
         'constraint'  : None,
@@ -203,7 +204,7 @@ MACHINE_DEFAULTS = {
         'queue_name'  : 'debug',
         'qos'         : None,
         'walltime_min': 30,
-        'n_nodes'     : 1,
+        'n_nodes'     : N_NODES,
         'gpus_per_node': None,
         'cores_per_node': None,
         'constraint'  : None,
@@ -215,10 +216,10 @@ MACHINE_DEFAULTS = {
     'perlmutter': {
         'enabled'     : True,
         'account'     : 'amsc007_g',
-        'queue_name'  : 'gpu_ss11',
+        'queue_name'  : None,                    # 'gpu_ss11',
         'qos'         : 'express_amsc',
         'walltime_min': 30,
-        'n_nodes'     : 1,
+        'n_nodes'     : N_NODES,
         'gpus_per_node': 4,
         'cores_per_node': 128,
         'constraint'  : 'gpu',
@@ -244,7 +245,7 @@ MACHINE_DEFAULTS = {
         'queue_name'  : 'batch',
         'qos'         : None,
         'walltime_min': 30,
-        'n_nodes'     : 1,
+        'n_nodes'     : N_NODES,
         'gpus_per_node': None,
         'cores_per_node': None,
         'constraint'  : None,
