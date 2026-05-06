@@ -199,6 +199,14 @@ class Bridge:
                     log_level="info",
                     ws_max_size=10 * 1024 * 1024,
                     ws_per_message_deflate=True,
+                    # Generous pong deadline so the edge's blocking dragon
+                    # init (Batch(num_nodes=…) on a multi-node alloc takes
+                    # 30+ s and pauses the asyncio loop) doesn't trip the
+                    # websockets-library keepalive.  Probe cadence stays at
+                    # the default 20 s; the 600 s ceiling is the per-ping
+                    # tolerance window.
+                    ws_ping_interval=20.0,
+                    ws_ping_timeout=600.0,
                     timeout_graceful_shutdown=3)
 
     # ── lifecycle ────────────────────────────────────────────────────

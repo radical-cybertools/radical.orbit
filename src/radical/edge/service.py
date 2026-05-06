@@ -427,7 +427,9 @@ class EdgeService(PluginHostBase):
         Connects to Bridge and starts processing loop.
         """
         PING_INTERVAL  = 20
-        PING_TIMEOUT   = 30
+        PING_TIMEOUT   = 600    # 10 min: tolerate long blocking ops
+                                # (e.g. dragon V3 Batch init across many
+                                # nodes) without dropping the WS to bridge.
         MAX_BACKOFF    = 10
         JITTER_FACTOR  = 0.3  # Add up to 30% jitter to prevent thundering herd
         BACKOFF_FACTOR = 1.2
