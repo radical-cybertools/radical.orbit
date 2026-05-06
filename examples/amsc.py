@@ -138,7 +138,7 @@ IRI_DEFAULTS = {
         # submit_rhapsody_workload (matey).  ``None`` means "this target
         # does not support the rhapsody/matey workload".
         'app'         : {
-            'matey_dir'      : '/global/u2/m/merzky/MATEY/examples',
+            'matey_dir'      : '/global/u2/m/merzky/MATEY',
             'matey_model_dir': '/global/cfs/projectdirs/amsc007/zhan1668/MATEY'
                                '/models/Dev_Fusion_DemoMay_toytestonly'
                                '/demo_nbatchsloc100/',
@@ -208,7 +208,7 @@ MACHINE_DEFAULTS = {
             'module load openmpi',
         ],
         'app'         : {
-            'matey_dir'      : '/global/u2/m/merzky/MATEY/examples',
+            'matey_dir'      : '/global/u2/m/merzky/MATEY',
             'matey_model_dir': '/global/cfs/projectdirs/amsc007/zhan1668/MATEY'
                                '/models/Dev_Fusion_DemoMay_toytestonly'
                                '/demo_nbatchsloc100/',
@@ -951,7 +951,7 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg):
     work_dir     = f'{matey_dir}/{RHAPSODY_WORK_SUBDIR}'
 
     args = [
-        'python', 'basic_inference.py',
+        'python', '/global/u2/m/merzky/MATEY/examples/basic_inference.py',
         '--model_dir',  app_cfg['matey_model_dir'],
         '--use_ddp',
         '--on_perlmutter',
