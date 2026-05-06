@@ -98,6 +98,7 @@ class RhapsodySession(PluginSession):
         self.backend_names       = backend_names or ['dragon_v3']
         self.allow_pickled_tasks = allow_pickled_tasks
         self._rh_session         = None
+        self._telemetry          = None
         self._tasks: dict[str, dict] = {}
 
         # Async init tracking
@@ -142,7 +143,7 @@ class RhapsodySession(PluginSession):
 
             self._rh_session = rh.Session(backends=backends, uid=self._sid)
 
-            telemetry = await self._rh_session.start_telemetry(
+            self._telemetry = await self._rh_session.start_telemetry(
                 resource_poll_interval=0.1, checkpoint_path=f"telemetry-output"
                 )
 
@@ -707,7 +708,9 @@ class RhapsodySession(PluginSession):
         Shutdown RHAPSODY session and clean up.
         """
         if self._rh_session:
-            print(json.dumps(telemetry.summary(), indent=4), flush=True)
+            if self._telemetry is not None:
+                print(json.dumps(self._telemetry.summary(), indent=4), flush=True)
+                self._telemetry = None
             await self._rh_session.close()
             self._rh_session = None
         self._tasks = {}
