@@ -93,6 +93,11 @@ rhapsody.enable_logging(level=logging.WARNING)
 #   'rhapsody' — N matey-inference tasks via rhapsody (submit_rhapsody_workload).
 WORKLOAD           = 'rhapsody'
 
+# Demo mode: skip target discovery / configure prompts, auto-pick the
+# perlmutter PsiJ path with MACHINE_DEFAULTS values, emit a coarse
+# 7-step trace.  Set False to restore the original interactive flow.
+DEMO_MODE          = True
+
 # ROSE active-learning shape (mirrors examples/example_rose.py).
 N_MPI_RANKS        = 4      # MPI ranks per simulation launch
 N_SAMPLES_PER_RANK = 5      # sparse start; AL drives exploration
@@ -280,6 +285,48 @@ MACHINE_DEFAULTS = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 AMSC_DIR = Path(os.environ.get('AMSC_DIR') or Path.home() / '.amsc').expanduser()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Demo-mode output helpers.
+#
+#  ``step()`` prints one aligned, coloured line per coarse phase via rich.
+#  ``abort()`` prints a red ABORT line and exits non-zero — used at every
+#  fail-fast boundary in the demo flow (no Python traceback noise).
+#  ``say()`` is a print() proxy that no-ops in demo mode so chatty diagnostic
+#  lines from the underlying functions don't dilute the step trace.  In
+#  interactive mode it is plain print().
+# ─────────────────────────────────────────────────────────────────────────────
+
+try:
+    from rich.console import Console
+    _console = Console()
+except ImportError:                              # pragma: no cover
+    _console = None
+
+_TOTAL_STEPS = 7   # connect / pick / configure / submit / await / run / teardown
+
+def step(idx, label, detail=''):
+    if _console:
+        _console.print(
+            f'[cyan]step {idx}/{_TOTAL_STEPS}[/cyan]  '
+            f'[bold]{label:<20}[/bold]  '
+            f'[dim]{detail}[/dim]')
+    else:
+        print(f'step {idx}/{_TOTAL_STEPS}  {label:<20}  {detail}')
+
+def abort(msg):
+    """Print a red ABORT line and exit with status 1.  No traceback."""
+    if _console:
+        _console.print(f'[bold red]ABORT[/bold red]               [red]{msg}[/red]')
+    else:
+        print(f'ABORT  {msg}')
+    sys.exit(1)
+
+def say(*args, **kwargs):
+    """Chatty print, suppressed in demo mode."""
+    if not DEMO_MODE:
+        print(*args, **kwargs)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -677,11 +724,11 @@ def launch_psij(bc, edge_name, cfg, bridge_url):
         'environment'       : env,
     }
 
-    print(f'  submitting PsiJ job via {edge_name} (executor: {cfg["executor"]}, '
-          f'edge name: {child_name})…')
+    say(f'  submitting PsiJ job via {edge_name} (executor: {cfg["executor"]}, '
+        f'edge name: {child_name})…')
     res = psij.submit_tunneled(job_spec, executor=cfg['executor'],
                                tunnel=cfg['tunnel'])
-    print(f'  PsiJ job_id: {res["job_id"]}')
+    say(f'  PsiJ job_id: {res["job_id"]}')
 
     return {
         'kind'       : 'psij',
@@ -712,8 +759,8 @@ def wait_for_first_edge(bc, expected_names, timeout=EDGE_WAIT_SECONDS,
     if not expected_names:
         raise RuntimeError('no expected edges — nothing to wait for')
 
-    print(f'\n— Waiting for first edge to come up '
-          f'(any of: {", ".join(expected_names)}) —')
+    say(f'\n— Waiting for first edge to come up '
+        f'(any of: {", ".join(expected_names)}) —')
     start_time = time.time()
     last_beat  = start_time
     while time.time() - start_time < timeout:
@@ -724,10 +771,31 @@ def wait_for_first_edge(bc, expected_names, timeout=EDGE_WAIT_SECONDS,
         time.sleep(poll)
         if time.time() - last_beat >= heartbeat:
             elapsed = int(time.time() - start_time)
-            print(f'  …{elapsed}s elapsed, {timeout - elapsed}s left')
+            say(f'  …{elapsed}s elapsed, {timeout - elapsed}s left')
             last_beat = time.time()
     raise TimeoutError(f'no edge appeared within {timeout}s; '
                        f'expected one of {expected_names}')
+
+
+def _find_perlmutter_psij(bc):
+    """Locate a connected perlmutter login-edge with the PsiJ plugin.
+
+    Returns ``(edge_name, executor)`` or ``None``.  Used by demo mode to
+    auto-pick the only target it cares about, without going through the
+    interactive ``discover_targets`` / ``select_many`` flow.
+    """
+    if 'perlmutter' not in set(bc.list_edges()):
+        return None
+    edge    = bc.get_edge_client('perlmutter')
+    plugins = edge.list_plugins()
+    if 'psij' not in plugins:
+        return None
+    try:
+        info     = edge.get_plugin('sysinfo').host_role()
+        executor = info.get('psij_executor', 'slurm')
+    except Exception:
+        executor = 'slurm'
+    return ('perlmutter', executor)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1043,16 +1111,16 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg):
             for i in range(N_GKEYLL_TASKS)
         ]
 
-    print(f'\n— Running rhapsody workload on edge "{edge_name}" '
-          f'(bridge: {bridge_url}) —')
+    say(f'\n— Running rhapsody workload on edge "{edge_name}" '
+        f'(bridge: {bridge_url}) —')
     if has_matey:
-        print(f'  matey  : {len(matey_tasks)} tasks, concurrency {n_gpus} '
-              f'({n_nodes} node x {gpus_per_node} gpu)')
-        print(f'           wrapper={matey_wrap}, cwd={matey_wd}')
+        say(f'  matey  : {len(matey_tasks)} tasks, concurrency {n_gpus} '
+            f'({n_nodes} node x {gpus_per_node} gpu)')
+        say(f'           wrapper={matey_wrap}, cwd={matey_wd}')
     if has_gkeyll:
-        print(f'  gkeyll : {len(gkeyll_tasks)} tasks, concurrency {n_cores} '
-              f'({n_nodes} node x {cores_per_node} core)')
-        print(f'           exe={gkeyll_exe}, cwd={gkeyll_wd}')
+        say(f'  gkeyll : {len(gkeyll_tasks)} tasks, concurrency {n_cores} '
+            f'({n_nodes} node x {cores_per_node} core)')
+        say(f'           exe={gkeyll_exe}, cwd={gkeyll_wd}')
 
     backend = await rhapsody.get_backend(
         'edge', bridge_url=bridge_url, edge_name=edge_name)
@@ -1077,14 +1145,28 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg):
                 try:
                     await task
                     counts[kind]['done'] += 1
-                    print(f'  done [{kind:6s} {idx:>4d}]: {task.uid} '
-                          f'state={task.state} exit={task.exit_code} '
-                          f'log={task.stdout}', flush=True)
+                    if _console:
+                        _console.print(
+                            f'  [green]done[/green]  '
+                            f'[{kind:6s} {idx:>4d}]  {task.uid}  '
+                            f'state={task.state} exit={task.exit_code}  '
+                            f'[dim]log={task.stdout}[/dim]')
+                    else:
+                        print(f'  done [{kind:6s} {idx:>4d}]: {task.uid} '
+                              f'state={task.state} exit={task.exit_code} '
+                              f'log={task.stdout}', flush=True)
                 except BaseException as exc:
                     counts[kind]['failed'] += 1
-                    print(f'  fail [{kind:6s} {idx:>4d}]: {task.uid} '
-                          f'state={task.state} exit={task.exit_code} '
-                          f'err={exc}', flush=True)
+                    if _console:
+                        _console.print(
+                            f'  [red]fail[/red]  '
+                            f'[{kind:6s} {idx:>4d}]  {task.uid}  '
+                            f'state={task.state} exit={task.exit_code}  '
+                            f'[red]err={exc}[/red]')
+                    else:
+                        print(f'  fail [{kind:6s} {idx:>4d}]: {task.uid} '
+                              f'state={task.state} exit={task.exit_code} '
+                              f'err={exc}', flush=True)
 
         coros  = [run_one(t, i, 'matey',  sem_gpu)
                   for i, t in enumerate(matey_tasks)]
@@ -1100,7 +1182,11 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg):
     if has_gkeyll:
         parts.append(f"gkeyll: {counts['gkeyll']['done']} done / "
                      f"{counts['gkeyll']['failed']} failed")
-    print('\n— summary: ' + '; '.join(parts) + ' —')
+    if _console:
+        _console.print('\n[bold]summary[/bold]              '
+                       f'[dim]{"; ".join(parts)}[/dim]')
+    else:
+        print('\n— summary: ' + '; '.join(parts) + ' —')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1109,7 +1195,7 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg):
 
 def teardown(bc, created):
     """Cancel jobs we submitted and disconnect IRI endpoints we connected."""
-    print('\n— Tearing down resources we created —')
+    say('\n— Tearing down resources we created —')
 
     # 1. Cancel IRI jobs
     for c in created:
@@ -1117,9 +1203,9 @@ def teardown(bc, created):
             continue
         try:
             c['iri'].cancel_job(c['resource_id'], c['job_id'])
-            print(f'  cancelled IRI job {c["job_id"]}@{c["endpoint"]}')
+            say(f'  cancelled IRI job {c["job_id"]}@{c["endpoint"]}')
         except Exception as exc:
-            print(f'  could not cancel IRI job {c["job_id"]}: {exc}')
+            say(f'  could not cancel IRI job {c["job_id"]}: {exc}')
 
     # 2. Cancel PsiJ jobs
     for c in created:
@@ -1127,9 +1213,9 @@ def teardown(bc, created):
             continue
         try:
             c['psij'].cancel_job(c['job_id'])
-            print(f'  cancelled PsiJ job {c["job_id"]} on {c["parent_edge"]}')
+            say(f'  cancelled PsiJ job {c["job_id"]} on {c["parent_edge"]}')
         except Exception as exc:
-            print(f'  could not cancel PsiJ job {c["job_id"]}: {exc}')
+            say(f'  could not cancel PsiJ job {c["job_id"]}: {exc}')
 
     # 3. Disconnect IRI endpoints
     iri_eps = {c['endpoint'] for c in created if c['kind'] == 'iri'}
@@ -1138,9 +1224,71 @@ def teardown(bc, created):
         for ep in iri_eps:
             try:
                 cx.disconnect(ep)
-                print(f'  disconnected IRI endpoint {ep}')
+                say(f'  disconnected IRI endpoint {ep}')
             except Exception as exc:
-                print(f'  could not disconnect IRI {ep}: {exc}')
+                say(f'  could not disconnect IRI {ep}: {exc}')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Demo-mode driver — auto-pick perlmutter PsiJ, no prompts, 7-step trace.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _main_demo(bc, bridge_url):
+    """Auto-run the perlmutter PsiJ path with MACHINE_DEFAULTS values.
+
+    Fail-fast at every boundary via ``abort()`` — no Python tracebacks.
+    Mirrors the interactive flow's structure but skips ``select_many``
+    and ``configure_psij`` (defaults are taken verbatim) and skips IRI
+    target discovery entirely.
+    """
+    step(1, 'connect bridge', bridge_url)
+
+    target = _find_perlmutter_psij(bc)
+    if not target:
+        abort("no 'perlmutter' login edge with PsiJ found in bridge "
+              "topology.  Start the parent edge on Perlmutter first.")
+    edge_name, executor = target
+    step(2, 'pick target', f'{edge_name} (psij/{executor})')
+
+    cfg = dict(MACHINE_DEFAULTS['perlmutter'])
+    cfg['executor'] = executor
+    step(3, 'configure',
+         f'{cfg["n_nodes"]} node x {cfg["gpus_per_node"]} gpu '
+         f'x {cfg["cores_per_node"]} core, {cfg["walltime_min"]}m walltime')
+
+    created = []
+    try:
+        try:
+            rec = launch_psij(bc, edge_name, cfg, bridge_url)
+        except Exception as exc:
+            abort(f'launch_psij failed: {exc}')
+        created.append(rec)
+        step(4, 'submit child edge',
+             f'job={rec["job_id"][:8]}…  edge={rec["edge_name"]}')
+
+        t0 = time.time()
+        try:
+            first = wait_for_first_edge(bc, [rec['edge_name']])
+        except Exception as exc:
+            abort(f'wait_for_first_edge failed: {exc}')
+        step(5, 'await child edge', f'up after {int(time.time() - t0)}s')
+
+        n_nodes = cfg['n_nodes']
+        n_gpus  = n_nodes * (cfg.get('gpus_per_node')  or 0)
+        n_cores = n_nodes * (cfg.get('cores_per_node') or 0)
+        step(6, 'run rhapsody',
+             f'matey {N_MATEY_TASKS} (cap {n_gpus})  '
+             f'gkeyll {N_GKEYLL_TASKS} (cap {n_cores})')
+
+        try:
+            asyncio.run(submit_rhapsody_workload(
+                bridge_url, first, rec.get('cfg') or cfg))
+        except Exception as exc:
+            abort(f'workload failed: {exc}')
+
+    finally:
+        step(7, 'teardown', f'cancelling {len(created)} psij job(s)')
+        teardown(bc, created)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1165,6 +1313,14 @@ def main():
     #    via radical.edge.utils (CLI > env > file).
     bc         = BridgeClient()
     bridge_url = bc.url
+
+    if DEMO_MODE:
+        try:
+            _main_demo(bc, bridge_url)
+        finally:
+            bc.close()
+        return
+
     print(f'Bridge: {bridge_url}')
     try:
         # 2. Discover targets and prompt for selection.
