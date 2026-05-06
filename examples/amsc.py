@@ -135,6 +135,7 @@ IRI_DEFAULTS = {
         'account'     : 'm5290',
         'workdir'     : None,
         'queue_name'  : 'debug',
+        'qos'         : None,
         'walltime_min': 30,
         'n_nodes'     : 1,
         'gpus_per_node': 4,
@@ -170,6 +171,7 @@ IRI_DEFAULTS = {
         'account'     : 'fus183',
         'workdir'     : '/gpfs/wolf2/olcf/fus183/proj-shared',
         'queue_name'  : 'batch',
+        'qos'         : None,
         'walltime_min': 30,
         'n_nodes'     : 1,
         'gpus_per_node': None,
@@ -199,6 +201,7 @@ MACHINE_DEFAULTS = {
         'enabled'     : True,
         'account'     : 'Fusion-FM',
         'queue_name'  : 'debug',
+        'qos'         : None,
         'walltime_min': 30,
         'n_nodes'     : 1,
         'gpus_per_node': None,
@@ -212,7 +215,8 @@ MACHINE_DEFAULTS = {
     'perlmutter': {
         'enabled'     : True,
         'account'     : 'amsc007_g',
-        'queue_name'  : 'express_amsc_g',
+        'queue_name'  : 'gpu_ss11',
+        'qos'         : 'express_amsc',
         'walltime_min': 30,
         'n_nodes'     : 1,
         'gpus_per_node': 4,
@@ -238,6 +242,7 @@ MACHINE_DEFAULTS = {
         'enabled'     : True,
         'account'     : 'fus183',
         'queue_name'  : 'batch',
+        'qos'         : None,
         'walltime_min': 30,
         'n_nodes'     : 1,
         'gpus_per_node': None,
@@ -575,6 +580,8 @@ def launch_iri(bc, endpoint, cfg, bridge_url):
     # scheduler's flag (--gpus-per-node on SLURM) or silently drop it.
     if cfg.get('gpus_per_node'):
         attrs['gpus_per_node'] = cfg['gpus_per_node']
+    if cfg.get('qos'):
+        attrs['qos'] = cfg['qos']
 
     # Compose absolute paths against the target's $HOME (configured in
     # IRI_DEFAULTS).  We can't rely on bash to expand ``~`` — PsiJ's
@@ -663,6 +670,7 @@ def configure_psij(edge_name, executor):
         'setup'       : list(d.get('setup') or []),
         'gpus_per_node': d.get('gpus_per_node'),
         'cores_per_node': d.get('cores_per_node'),
+        'qos'         : d.get('qos'),
         'app'         : d.get('app'),
     }
     if not cfg['account']:
@@ -702,6 +710,8 @@ def launch_psij(bc, edge_name, cfg, bridge_url):
         custom_attrs[f'{cfg["executor"]}.constraint'] = cfg['constraint']
     if cfg.get('gpus_per_node'):
         custom_attrs[f'{cfg["executor"]}.gpus-per-node'] = str(cfg['gpus_per_node'])
+    if cfg.get('qos'):
+        custom_attrs[f'{cfg["executor"]}.qos'] = cfg['qos']
 
     # Cert is left to the child edge to resolve from
     # ``~/.radical/edge/bridge_cert.pem`` on the target (or via
@@ -1252,9 +1262,11 @@ def _main_demo(bc, bridge_url):
 
     cfg = dict(MACHINE_DEFAULTS['perlmutter'])
     cfg['executor'] = executor
+    qos_str = f', qos={cfg["qos"]}' if cfg.get('qos') else ''
     step(3, 'configure',
          f'{cfg["n_nodes"]} node x {cfg["gpus_per_node"]} gpu '
-         f'x {cfg["cores_per_node"]} core, {cfg["walltime_min"]}m walltime')
+         f'x {cfg["cores_per_node"]} core, {cfg["walltime_min"]}m walltime, '
+         f'queue={cfg["queue_name"]}{qos_str}')
 
     created = []
     try:
