@@ -305,9 +305,13 @@ AMSC_DIR = Path(os.environ.get('AMSC_DIR') or Path.home() / '.amsc').expanduser(
 
 try:
     from rich.console import Console
+    from rich.live    import Live as _RichLive
+    from rich.text    import Text as _RichText
     _console = Console()
 except ImportError:                              # pragma: no cover
-    _console = None
+    _console   = None
+    _RichLive  = None
+    _RichText  = None
 
 _TOTAL_STEPS = 7   # connect / pick / configure / submit / await / run / teardown
 
@@ -332,6 +336,33 @@ def say(*args, **kwargs):
     """Chatty print, suppressed in demo mode."""
     if not DEMO_MODE:
         print(*args, **kwargs)
+
+
+def _render_progress(counts, n_matey, n_gkeyll):
+    """Two-line counter for the rhapsody workload's live display.
+
+    matey and gkeyll are reported on separate lines; either is omitted
+    when its task count is 0.  Used by submit_rhapsody_workload's
+    rich.Live block as the renderable refreshed every second.
+    """
+    lines = []
+    if n_matey > 0:
+        c = counts['matey']
+        lines.append(
+            f'  [cyan]matey [/cyan]   '
+            f'[bright_white]{c["done"]:>4d}[/bright_white] / '
+            f'[bright_white]{n_matey}[/bright_white] done, '
+            f'[red]{c["failed"]}[/red] failed')
+    if n_gkeyll > 0:
+        c = counts['gkeyll']
+        lines.append(
+            f'  [cyan]gkeyll[/cyan]   '
+            f'[bright_white]{c["done"]:>4d}[/bright_white] / '
+            f'[bright_white]{n_gkeyll}[/bright_white] done, '
+            f'[red]{c["failed"]}[/red] failed')
+    if _RichText:
+        return _RichText.from_markup('\n'.join(lines))
+    return '\n'.join(lines)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1143,47 +1174,52 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg):
     # ``os.makedirs(backend._work_dir)`` locally) — we can't pass the
     # remote matey/gkeyll paths there.  Per-task ``cwd`` rides through
     # the ``process_template`` instead.
+    n_matey  = len(matey_tasks)
+    n_gkeyll = len(gkeyll_tasks)
+
     async with Session(backends=[backend]) as session:
         # Use 1 as a no-op cap when a kind isn't running (its task list is
         # empty, so no coro will ever acquire that semaphore).
         sem_gpu  = asyncio.Semaphore(n_gpus  or 1)
         sem_core = asyncio.Semaphore(n_cores or 1)
 
-        async def run_one(task, idx, kind, sem):
+        async def run_one(task, kind, sem):
             async with sem:
                 await session.submit_tasks([task])
                 try:
                     await task
                     counts[kind]['done'] += 1
-                    if _console:
-                        _console.print(
-                            f'  [green]done[/green]  '
-                            f'[{kind:6s} {idx:>4d}]  {task.uid}  '
-                            f'state={task.state} exit={task.exit_code}  '
-                            f'[bright_white]log={task.stdout}[/bright_white]')
-                    else:
-                        print(f'  done [{kind:6s} {idx:>4d}]: {task.uid} '
-                              f'state={task.state} exit={task.exit_code} '
-                              f'log={task.stdout}', flush=True)
-                except BaseException as exc:
+                except BaseException:
                     counts[kind]['failed'] += 1
-                    if _console:
-                        _console.print(
-                            f'  [red]fail[/red]  '
-                            f'[{kind:6s} {idx:>4d}]  {task.uid}  '
-                            f'state={task.state} exit={task.exit_code}  '
-                            f'[red]err={exc}[/red]')
-                    else:
-                        print(f'  fail [{kind:6s} {idx:>4d}]: {task.uid} '
-                              f'state={task.state} exit={task.exit_code} '
-                              f'err={exc}', flush=True)
 
-        coros  = [run_one(t, i, 'matey',  sem_gpu)
-                  for i, t in enumerate(matey_tasks)]
-        coros += [run_one(t, i, 'gkeyll', sem_core)
-                  for i, t in enumerate(gkeyll_tasks)]
+        coros  = [run_one(t, 'matey',  sem_gpu)  for t in matey_tasks]
+        coros += [run_one(t, 'gkeyll', sem_core) for t in gkeyll_tasks]
 
-        await asyncio.gather(*coros, return_exceptions=True)
+        # Live counter — replaces the per-task done/fail stream.  Rich's
+        # auto-refresh redraws the same renderable every period; a 1-Hz
+        # ticker swaps in a fresh snapshot of the counters.
+        if _RichLive and _console:
+            with _RichLive(_render_progress(counts, n_matey, n_gkeyll),
+                           console=_console, refresh_per_second=2,
+                           transient=False) as live:
+
+                async def _ticker():
+                    try:
+                        while True:
+                            await asyncio.sleep(1.0)
+                            live.update(_render_progress(
+                                counts, n_matey, n_gkeyll))
+                    except asyncio.CancelledError:
+                        pass
+
+                tick = asyncio.create_task(_ticker())
+                try:
+                    await asyncio.gather(*coros, return_exceptions=True)
+                finally:
+                    tick.cancel()
+                    live.update(_render_progress(counts, n_matey, n_gkeyll))
+        else:
+            await asyncio.gather(*coros, return_exceptions=True)
 
     parts = []
     if has_matey:
