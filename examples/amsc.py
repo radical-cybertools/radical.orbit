@@ -101,7 +101,8 @@ MSE_THRESHOLD      = 0.01   # convergence target
 MAX_ITER           = 15     # hard cap on AL iterations
 
 # Rhapsody-direct workload shape (mirrors examples/run_matey.py).
-N_RHAPSODY_TASKS     = 10
+N_MATEY_TASKS        = 10        # GPU-bound matey-inference tasks
+N_GKEYLL_TASKS       = 1024      # core-bound gkeyll tasks
 MATEY_WRAPPER_NAME   = 'matey_wrapper.sh'
 RHAPSODY_WORK_SUBDIR = 'rhapsody-runs'
 
@@ -132,6 +133,7 @@ IRI_DEFAULTS = {
         'walltime_min': 30,
         'n_nodes'     : 1,
         'gpus_per_node': 4,
+        'cores_per_node': 128,
         'constraint'  : 'gpu',
         'reservation' : None,
         'environment' : {},
@@ -139,8 +141,8 @@ IRI_DEFAULTS = {
             'module load openmpi',
         ],
         # ``app`` carries workload-specific paths consumed by
-        # submit_rhapsody_workload (matey).  ``None`` means "this target
-        # does not support the rhapsody/matey workload".
+        # submit_rhapsody_workload (matey + gkeyll).  ``None`` means
+        # "this target does not support the rhapsody workload".
         'app'         : {
             'matey_dir'      : '/global/u2/m/merzky/MATEY',
             'matey_model_dir': '/global/cfs/projectdirs/amsc007/zhan1668/MATEY'
@@ -148,6 +150,8 @@ IRI_DEFAULTS = {
                                '/demo_nbatchsloc100/',
             'matey_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
                                '/d3d_174310.03500/',
+            'gkeyll_dir'     : '/global/u2/m/merzky/gkeyll/amsc',
+            'gkeyll_exe'     : 'rt_gk_d3d_iwl_2x2v_p1.sh',
         },
     },
     'olcf': {
@@ -164,6 +168,7 @@ IRI_DEFAULTS = {
         'walltime_min': 30,
         'n_nodes'     : 1,
         'gpus_per_node': None,
+        'cores_per_node': None,
         'constraint'  : None,
         'reservation' : None,
         'environment' : {},
@@ -192,6 +197,7 @@ MACHINE_DEFAULTS = {
         'walltime_min': 30,
         'n_nodes'     : 1,
         'gpus_per_node': None,
+        'cores_per_node': None,
         'constraint'  : None,
         'tunnel'      : 'forward',
         'amsc_dir'    : None,
@@ -205,6 +211,7 @@ MACHINE_DEFAULTS = {
         'walltime_min': 30,
         'n_nodes'     : 1,
         'gpus_per_node': 4,
+        'cores_per_node': 128,
         'constraint'  : 'gpu',
         'tunnel'      : 'forward',
         'amsc_dir'    : None,
@@ -229,6 +236,7 @@ MACHINE_DEFAULTS = {
         'walltime_min': 30,
         'n_nodes'     : 1,
         'gpus_per_node': None,
+        'cores_per_node': None,
         'constraint'  : None,
         'tunnel'      : 'reverse',
         'amsc_dir'    : None,
@@ -607,6 +615,7 @@ def configure_psij(edge_name, executor):
         'amsc_dir'    : d.get('amsc_dir'),
         'setup'       : list(d.get('setup') or []),
         'gpus_per_node': d.get('gpus_per_node'),
+        'cores_per_node': d.get('cores_per_node'),
         'app'         : d.get('app'),
     }
     if not cfg['account']:
@@ -937,107 +946,161 @@ async def run_rose_workflow(bridge_url, edge_name, cfg=None):
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def submit_rhapsody_workload(bridge_url, edge_name, cfg):
-    """Submit N matey-inference tasks via the named edge as rhapsody backend."""
+    """Submit matey-inference + gkeyll tasks via the named edge.
+
+    Two task families share one Session and run concurrently, mixed by
+    independent Semaphores: matey scales by GPU count (``n_nodes *
+    gpus_per_node``), gkeyll by core count (``n_nodes * cores_per_node``).
+    Either family is skipped when its config block / resource count is
+    absent or zero; bails if neither has anything to do.
+    """
     app_cfg = (cfg or {}).get('app')
     if not app_cfg:
         raise RuntimeError(
             f"target {edge_name!r} has no 'app' config block — "
-            "the rhapsody/matey workload is not supported here.  Either "
+            "the rhapsody workload is not supported here.  Either "
             "set WORKLOAD='rose' or populate IRI_DEFAULTS / "
             "MACHINE_DEFAULTS['app'] for this target.")
 
-    gpus_per_node = cfg.get('gpus_per_node') or 0
-    n_nodes       = cfg.get('n_nodes') or 1
-    n_gpus        = n_nodes * gpus_per_node
-    if n_gpus <= 0:
+    n_nodes        = cfg.get('n_nodes')        or 1
+    gpus_per_node  = cfg.get('gpus_per_node')  or 0
+    cores_per_node = cfg.get('cores_per_node') or 0
+    n_gpus         = n_nodes * gpus_per_node
+    n_cores        = n_nodes * cores_per_node
+
+    has_matey = (n_gpus > 0 and N_MATEY_TASKS > 0
+                 and all(app_cfg.get(k) for k in
+                         ('matey_dir', 'matey_model_dir', 'matey_xgc_dir')))
+    has_gkeyll = (n_cores > 0 and N_GKEYLL_TASKS > 0
+                  and all(app_cfg.get(k) for k in ('gkeyll_dir', 'gkeyll_exe')))
+
+    if not (has_matey or has_gkeyll):
         raise RuntimeError(
-            f"target {edge_name!r}: gpus_per_node * n_nodes must be > 0 "
-            f"(got {gpus_per_node} * {n_nodes}={n_gpus})")
+            f"target {edge_name!r}: nothing to run.  Need either "
+            "(gpus_per_node > 0 + N_MATEY_TASKS > 0 + matey_* paths) "
+            "or (cores_per_node > 0 + N_GKEYLL_TASKS > 0 + gkeyll_dir/exe).")
 
-    matey_dir    = app_cfg['matey_dir'].rstrip('/')
-    wrapper_path = f'{matey_dir}/{MATEY_WRAPPER_NAME}'
-    work_dir     = f'{matey_dir}/{RHAPSODY_WORK_SUBDIR}'
-
-    args = [
-        'python', '/global/u2/m/merzky/MATEY/examples/basic_inference.py',
-        '--model_dir',  app_cfg['matey_model_dir'],
-        '--use_ddp',
-        '--on_perlmutter',
-        '--AR',
-        '--leadtime',   '5',
-        '--newxgc_dir', app_cfg['matey_xgc_dir'],
-    ]
-
-    # ``Policy`` lives in dragon — lazy-import so amsc.py still parses on
-    # client machines without dragon installed (it'll only fail here when
-    # the user actually selects the rhapsody workload).
+    # Lazy imports: dragon's Policy + cloudpickle are only needed when the
+    # rhapsody workload actually runs; this lets amsc.py parse on client
+    # machines without dragon installed.
     import base64
     import cloudpickle
     from dragon.infrastructure.policy import Policy
     from rhapsody.api import ComputeTask, Session
 
-    def _pack_psk(rank_idx):
-        """Cloudpickle-encode ``task_backend_specific_kwargs`` for the wire.
+    def _pack_psk(cwd, policy):
+        """Cloudpickle-encode task_backend_specific_kwargs for the wire.
 
-        ``Policy`` is a dragon C-extension object that msgpack can't serialise
-        on its own, so we ride through rhapsody's existing ``_pickled_fields``
-        escape hatch: encode the whole kwargs dict as a ``cloudpickle::<b64>``
-        string here, and the rhapsody plugin's ``_deserialize_task`` unpickles
-        it back to a real dict with a live ``Policy`` on the edge side.
+        dragon ``Policy`` is a C-extension object that msgpack can't serialise.
+        We ride through rhapsody's existing ``_pickled_fields`` escape hatch:
+        encode the whole kwargs dict as ``cloudpickle::<b64>`` here and let
+        the rhapsody plugin's ``_deserialize_task`` unpickle it on the edge.
         """
-        raw = {
-            'process_template': {
-                'cwd'   : work_dir,
-                'policy': Policy(gpu_affinity=[rank_idx % gpus_per_node]),
-            },
-        }
+        raw = {'process_template': {'cwd': cwd, 'policy': policy}}
         return 'cloudpickle::' + base64.b64encode(cloudpickle.dumps(raw)).decode()
+
+    matey_tasks  = []
+    gkeyll_tasks = []
+
+    if has_matey:
+        matey_dir  = app_cfg['matey_dir'].rstrip('/')
+        matey_wrap = f'{matey_dir}/{MATEY_WRAPPER_NAME}'
+        matey_wd   = f'{matey_dir}/{RHAPSODY_WORK_SUBDIR}'
+        matey_args = [
+            'python', f'{matey_dir}/examples/basic_inference.py',
+            '--model_dir',  app_cfg['matey_model_dir'],
+            '--use_ddp',
+            '--on_perlmutter',
+            '--AR',
+            '--leadtime',   '5',
+            '--newxgc_dir', app_cfg['matey_xgc_dir'],
+        ]
+        matey_tasks = [
+            ComputeTask(
+                executable=matey_wrap,
+                arguments=matey_args,
+                capture_stdio=True,
+                task_backend_specific_kwargs=_pack_psk(
+                    matey_wd, Policy(gpu_affinity=[i % gpus_per_node])),
+                _pickled_fields=['task_backend_specific_kwargs'],
+            )
+            for i in range(N_MATEY_TASKS)
+        ]
+
+    if has_gkeyll:
+        gkeyll_dir = app_cfg['gkeyll_dir'].rstrip('/')
+        gkeyll_exe = f'{gkeyll_dir}/{app_cfg["gkeyll_exe"]}'
+        gkeyll_wd  = f'{gkeyll_dir}/{RHAPSODY_WORK_SUBDIR}'
+        gkeyll_tasks = [
+            ComputeTask(
+                executable=gkeyll_exe,
+                arguments=[],
+                capture_stdio=True,
+                task_backend_specific_kwargs=_pack_psk(
+                    gkeyll_wd, Policy(cpu_affinity=[i % cores_per_node])),
+                _pickled_fields=['task_backend_specific_kwargs'],
+            )
+            for i in range(N_GKEYLL_TASKS)
+        ]
 
     print(f'\n— Running rhapsody workload on edge "{edge_name}" '
           f'(bridge: {bridge_url}) —')
-    print(f'  wrapper : {wrapper_path}')
-    print(f'  workdir : {work_dir}')
-    print(f'  N tasks : {N_RHAPSODY_TASKS}, concurrency: {n_gpus} '
-          f'({n_nodes} node x {gpus_per_node} gpu)')
+    if has_matey:
+        print(f'  matey  : {len(matey_tasks)} tasks, concurrency {n_gpus} '
+              f'({n_nodes} node x {gpus_per_node} gpu)')
+        print(f'           wrapper={matey_wrap}, cwd={matey_wd}')
+    if has_gkeyll:
+        print(f'  gkeyll : {len(gkeyll_tasks)} tasks, concurrency {n_cores} '
+              f'({n_nodes} node x {cores_per_node} core)')
+        print(f'           exe={gkeyll_exe}, cwd={gkeyll_wd}')
 
     backend = await rhapsody.get_backend(
         'edge', bridge_url=bridge_url, edge_name=edge_name)
 
-    # Session(work_dir=…) is a *client-side* setting: rhapsody calls
-    # ``os.makedirs(backend._work_dir, ...)`` locally for each backend.
-    # Passing the matey path (``/global/…/MATEY/.../rhapsody-runs``) here
-    # would try to mkdir under ``/global`` on the client.  The compute-side
-    # cwd is set per-task via ``process_template['cwd']`` instead.
+    # Per-kind counters, inspected after gather for the summary line.
+    counts = {'matey':  {'done': 0, 'failed': 0},
+              'gkeyll': {'done': 0, 'failed': 0}}
+
+    # ``Session(work_dir=…)`` is a client-side setting (rhapsody calls
+    # ``os.makedirs(backend._work_dir)`` locally) — we can't pass the
+    # remote matey/gkeyll paths there.  Per-task ``cwd`` rides through
+    # the ``process_template`` instead.
     async with Session(backends=[backend]) as session:
-        tasks = [
-            ComputeTask(
-                executable=wrapper_path,
-                arguments=args,
-                capture_stdio=True,
-                task_backend_specific_kwargs=_pack_psk(i),
-                _pickled_fields=['task_backend_specific_kwargs'],
-            )
-            for i in range(N_RHAPSODY_TASKS)
-        ]
+        # Use 1 as a no-op cap when a kind isn't running (its task list is
+        # empty, so no coro will ever acquire that semaphore).
+        sem_gpu  = asyncio.Semaphore(n_gpus  or 1)
+        sem_core = asyncio.Semaphore(n_cores or 1)
 
-        sem = asyncio.Semaphore(n_gpus)
-
-        async def run_one(task, idx):
+        async def run_one(task, idx, kind, sem):
             async with sem:
                 await session.submit_tasks([task])
                 try:
                     await task
-                    print(f'  done [{idx:>3d}]: {task.uid} '
+                    counts[kind]['done'] += 1
+                    print(f'  done [{kind:6s} {idx:>4d}]: {task.uid} '
                           f'state={task.state} exit={task.exit_code} '
                           f'log={task.stdout}', flush=True)
                 except BaseException as exc:
-                    print(f'  fail [{idx:>3d}]: {task.uid} '
+                    counts[kind]['failed'] += 1
+                    print(f'  fail [{kind:6s} {idx:>4d}]: {task.uid} '
                           f'state={task.state} exit={task.exit_code} '
                           f'err={exc}', flush=True)
-                    raise
 
-        await asyncio.gather(*(run_one(t, i) for i, t in enumerate(tasks)),
-                             return_exceptions=True)
+        coros  = [run_one(t, i, 'matey',  sem_gpu)
+                  for i, t in enumerate(matey_tasks)]
+        coros += [run_one(t, i, 'gkeyll', sem_core)
+                  for i, t in enumerate(gkeyll_tasks)]
+
+        await asyncio.gather(*coros, return_exceptions=True)
+
+    parts = []
+    if has_matey:
+        parts.append(f"matey: {counts['matey']['done']} done / "
+                     f"{counts['matey']['failed']} failed")
+    if has_gkeyll:
+        parts.append(f"gkeyll: {counts['gkeyll']['done']} done / "
+                     f"{counts['gkeyll']['failed']} failed")
+    print('\n— summary: ' + '; '.join(parts) + ' —')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
