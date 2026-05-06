@@ -61,6 +61,8 @@ import sys
 import time
 import uuid
 
+from collections import defaultdict
+
 from pathlib import Path
 
 import numpy as np
@@ -105,6 +107,8 @@ RHAPSODY_WORK_SUBDIR = 'rhapsody-runs'
 
 # How long we are willing to wait for the first edge to come up.
 EDGE_WAIT_SECONDS  = 30 * 60
+
+COUNTERS = defaultdict(int)  # for unique edge names per submission endpoint
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -214,6 +218,8 @@ MACHINE_DEFAULTS = {
                                '/demo_nbatchsloc100/',
             'matey_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
                                '/d3d_174310.03500/',
+            'gkeyll_dir'     : '/global/u2/m/merzky/gkeyll/amsc',
+            'gkeyll_exe'     : 'rt_gk_d3d_iwl_2x2v_p1.sh',
         },
     },
     'odo': {
@@ -492,7 +498,8 @@ def launch_iri(bc, endpoint, cfg, bridge_url):
     iri   = cx.connect(endpoint=endpoint, token=token)
 
     # Pick a unique edge name so we can spot it in topology updates.
-    edge_name = f'amsc-{endpoint}-{uuid.uuid4().hex[:6]}'
+    edge_name = f'{endpoint}.{COUNTERS[endpoint]}'
+    COUNTERS[endpoint] += 1
 
     # Build the radical-edge-service.py CLI.  See bin/radical-edge-service.py.
     args = ['--name', edge_name, '--url', bridge_url]
@@ -620,7 +627,8 @@ def launch_psij(bc, edge_name, cfg, bridge_url):
     wrapper = f'{home}/{amsc}/ve/bin/radical-edge-wrapper.sh'
 
     # Unique name for the child edge.
-    child_name = f'amsc-{edge_name}-{uuid.uuid4().hex[:6]}'
+    COUNTERS[edge_name] += 1
+    child_name = f'{edge_name}.{COUNTERS[edge_name]}'
 
     attrs = {
         'queue_name': cfg['queue_name'],
