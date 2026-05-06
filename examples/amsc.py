@@ -311,7 +311,7 @@ def step(idx, label, detail=''):
         _console.print(
             f'[cyan]step {idx}/{_TOTAL_STEPS}[/cyan]  '
             f'[bold]{label:<20}[/bold]  '
-            f'[dim]{detail}[/dim]')
+            f'[bright_white]{detail}[/bright_white]')
     else:
         print(f'step {idx}/{_TOTAL_STEPS}  {label:<20}  {detail}')
 
@@ -1150,7 +1150,7 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg):
                             f'  [green]done[/green]  '
                             f'[{kind:6s} {idx:>4d}]  {task.uid}  '
                             f'state={task.state} exit={task.exit_code}  '
-                            f'[dim]log={task.stdout}[/dim]')
+                            f'[bright_white]log={task.stdout}[/bright_white]')
                     else:
                         print(f'  done [{kind:6s} {idx:>4d}]: {task.uid} '
                               f'state={task.state} exit={task.exit_code} '
@@ -1184,7 +1184,7 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg):
                      f"{counts['gkeyll']['failed']} failed")
     if _console:
         _console.print('\n[bold]summary[/bold]              '
-                       f'[dim]{"; ".join(parts)}[/dim]')
+                       f'[bright_white]{"; ".join(parts)}[/bright_white]')
     else:
         print('\n— summary: ' + '; '.join(parts) + ' —')
 
