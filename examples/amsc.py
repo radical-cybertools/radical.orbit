@@ -99,7 +99,7 @@ MSE_THRESHOLD      = 0.01   # convergence target
 MAX_ITER           = 15     # hard cap on AL iterations
 
 # Rhapsody-direct workload shape (mirrors examples/run_matey.py).
-N_RHAPSODY_TASKS     = 10        # GPU-bound matey-inference tasks
+N_MATEY_TASKS        = 10        # GPU-bound matey-inference tasks
 N_GKEYLL_TASKS       = 1024      # core-bound gkeyll tasks
 MATEY_WRAPPER_NAME   = 'matey_wrapper.sh'
 RHAPSODY_WORK_SUBDIR = 'rhapsody-runs'
@@ -962,7 +962,7 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg):
     n_gpus         = n_nodes * gpus_per_node
     n_cores        = n_nodes * cores_per_node
 
-    has_matey = (n_gpus > 0 and N_RHAPSODY_TASKS > 0
+    has_matey = (n_gpus > 0 and N_MATEY_TASKS > 0
                  and all(app_cfg.get(k) for k in
                          ('matey_dir', 'matey_model_dir', 'matey_xgc_dir')))
     has_gkeyll = (n_cores > 0 and N_GKEYLL_TASKS > 0
@@ -971,7 +971,7 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg):
     if not (has_matey or has_gkeyll):
         raise RuntimeError(
             f"target {edge_name!r}: nothing to run.  Need either "
-            "(gpus_per_node > 0 + N_RHAPSODY_TASKS > 0 + matey_* paths) "
+            "(gpus_per_node > 0 + N_MATEY_TASKS > 0 + matey_* paths) "
             "or (cores_per_node > 0 + N_GKEYLL_TASKS > 0 + gkeyll_dir/exe).")
 
     # Lazy imports: dragon's Policy + cloudpickle are only needed when the
@@ -1018,7 +1018,7 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg):
                     matey_wd, Policy(gpu_affinity=[i % gpus_per_node])),
                 _pickled_fields=['task_backend_specific_kwargs'],
             )
-            for i in range(N_RHAPSODY_TASKS)
+            for i in range(N_MATEY_TASKS)
         ]
 
     if has_gkeyll:
