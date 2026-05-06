@@ -963,8 +963,27 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg):
     # ``Policy`` lives in dragon — lazy-import so amsc.py still parses on
     # client machines without dragon installed (it'll only fail here when
     # the user actually selects the rhapsody workload).
+    import base64
+    import cloudpickle
     from dragon.infrastructure.policy import Policy
     from rhapsody.api import ComputeTask, Session
+
+    def _pack_psk(rank_idx):
+        """Cloudpickle-encode ``task_backend_specific_kwargs`` for the wire.
+
+        ``Policy`` is a dragon C-extension object that msgpack can't serialise
+        on its own, so we ride through rhapsody's existing ``_pickled_fields``
+        escape hatch: encode the whole kwargs dict as a ``cloudpickle::<b64>``
+        string here, and the rhapsody plugin's ``_deserialize_task`` unpickles
+        it back to a real dict with a live ``Policy`` on the edge side.
+        """
+        raw = {
+            'process_template': {
+                'cwd'   : work_dir,
+                'policy': Policy(gpu_affinity=[rank_idx % gpus_per_node]),
+            },
+        }
+        return 'cloudpickle::' + base64.b64encode(cloudpickle.dumps(raw)).decode()
 
     print(f'\n— Running rhapsody workload on edge "{edge_name}" '
           f'(bridge: {bridge_url}) —')
@@ -987,12 +1006,8 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg):
                 executable=wrapper_path,
                 arguments=args,
                 capture_stdio=True,
-                task_backend_specific_kwargs={
-                    'process_template': {
-                        'cwd'   : work_dir,
-                        'policy': Policy(gpu_affinity=[i % gpus_per_node]),
-                    },
-                },
+                task_backend_specific_kwargs=_pack_psk(i),
+                _pickled_fields=['task_backend_specific_kwargs'],
             )
             for i in range(N_RHAPSODY_TASKS)
         ]
