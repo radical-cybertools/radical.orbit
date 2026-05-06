@@ -344,22 +344,23 @@ def _render_progress(counts, n_matey, n_gkeyll):
     matey and gkeyll are reported on separate lines; either is omitted
     when its task count is 0.  Used by submit_rhapsody_workload's
     rich.Live block as the renderable refreshed every second.
+
+    Numeric columns are right-aligned at width 6 — comfortably covers
+    the 10k-task workloads we expect (six digits = up to 999,999).
     """
+    def _line(label, done, total, failed):
+        return (f'  [cyan]{label:<6s}[/cyan]   '
+                f'[bright_white]{done:>6d}[/bright_white] / '
+                f'[bright_white]{total:>6d}[/bright_white] done, '
+                f'[red]{failed:>6d}[/red] failed')
+
     lines = []
     if n_matey > 0:
         c = counts['matey']
-        lines.append(
-            f'  [cyan]matey [/cyan]   '
-            f'[bright_white]{c["done"]:>4d}[/bright_white] / '
-            f'[bright_white]{n_matey}[/bright_white] done, '
-            f'[red]{c["failed"]}[/red] failed')
+        lines.append(_line('matey',  c['done'], n_matey,  c['failed']))
     if n_gkeyll > 0:
         c = counts['gkeyll']
-        lines.append(
-            f'  [cyan]gkeyll[/cyan]   '
-            f'[bright_white]{c["done"]:>4d}[/bright_white] / '
-            f'[bright_white]{n_gkeyll}[/bright_white] done, '
-            f'[red]{c["failed"]}[/red] failed')
+        lines.append(_line('gkeyll', c['done'], n_gkeyll, c['failed']))
     if _RichText:
         return _RichText.from_markup('\n'.join(lines))
     return '\n'.join(lines)
