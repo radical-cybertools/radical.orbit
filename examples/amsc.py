@@ -1136,7 +1136,7 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg):
                 arguments=matey_args,
                 capture_stdio=True,
                 task_backend_specific_kwargs=_pack_psk(
-                    matey_wd, Policy(gpu_affinity=[i % gpus_per_node])),
+                    matey_wd, Policy(gpu_affinity=[(i // n_nodes) % gpus_per_node])),
                 _pickled_fields=['task_backend_specific_kwargs'],
             )
             for i in range(N_MATEY_TASKS)
@@ -1152,7 +1152,7 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg):
                 arguments=[],
                 capture_stdio=True,
                 task_backend_specific_kwargs=_pack_psk(
-                    gkeyll_wd, Policy(cpu_affinity=[i % cores_per_node])),
+                    gkeyll_wd, Policy(cpu_affinity=[(i // n_nodes) % cores_per_node])),
                 _pickled_fields=['task_backend_specific_kwargs'],
             )
             for i in range(N_GKEYLL_TASKS)
