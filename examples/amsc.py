@@ -599,6 +599,8 @@ def configure_psij(edge_name, executor):
         # Carried verbatim from MACHINE_DEFAULTS — not prompted.
         'amsc_dir'    : d.get('amsc_dir'),
         'setup'       : list(d.get('setup') or []),
+        'gpus_per_node': d.get('gpus_per_node'),
+        'app'         : d.get('app'),
     }
     if not cfg['account']:
         raise RuntimeError(f'edge {edge_name}: account/project is required')
