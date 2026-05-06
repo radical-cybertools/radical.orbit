@@ -109,19 +109,8 @@ IRI_DEFAULTS = {
         'iri_url'     : 'https://api.iri.nersc.gov',
         'resource_id' : 'perlmutter',
         'login_host'  : 'perlmutter.nersc.gov',
-        'home_dir'    : '/global/u2/m/merzky',         # target's $HOME
-        # ``amsc_dir`` is the path component (relative to the target's
-        # $HOME) under which the install script laid down
-        # ``ve/bin/radical-edge-wrapper.sh``.  ``None`` falls back to
-        # the literal default ``.amsc`` — applied at submit time.
-        'amsc_dir'    : None,
-        # ``tunnel``: SSH tunnel direction for the child's bridge
-        # connection.  One of:
-        #   'none'    — direct connect.
-        #   'forward' — child opens ssh -L compute -> login (Aurora,
-        #               Perlmutter; outbound compute->login allowed).
-        #   'reverse' — parent opens ssh -R login -> compute (Odo;
-        #               compute->login blocked, login->compute allowed).
+        'home_dir'    : '/global/u2/m/merzky',
+        'amsc_dir'    : None,  # relative to $HOME on the target
         'tunnel'      : 'forward',
         'account'     : 'm5290',
         'workdir'     : None,
@@ -131,10 +120,6 @@ IRI_DEFAULTS = {
         'constraint'  : 'cpu',
         'reservation' : None,
         'environment' : {},
-        # ``setup`` is a list of shell commands the edge wrapper
-        # ``eval``s before exec'ing dragon / python (module loads,
-        # LD_LIBRARY_PATH tweaks, ...).  Joined with ``;`` and shipped
-        # via $RADICAL_EDGE_SETUP.  ``None`` is treated as empty.
         'setup'       : [
             'module load openmpi',
         ],
@@ -156,6 +141,8 @@ IRI_DEFAULTS = {
         'reservation' : None,
         'environment' : {},
         'setup'       : None,
+        'setup'       : ['module load cray-python/3.11.7',
+                        ],
     },
 }
 
@@ -183,11 +170,11 @@ MACHINE_DEFAULTS = {
     },
     'perlmutter': {
         'enabled'     : True,
-        'account'     : 'm5290',
-        'queue_name'  : 'debug',
+        'account'     : 'amsc007_g',
+        'queue_name'  : 'express_amsc_g',
         'walltime_min': 30,
         'n_nodes'     : 1,
-        'constraint'  : 'cpu',
+        'constraint'  : 'gpu',
         'tunnel'      : 'forward',
         'amsc_dir'    : None,
         'setup'       : [
@@ -203,7 +190,12 @@ MACHINE_DEFAULTS = {
         'constraint'  : None,
         'tunnel'      : 'reverse',
         'amsc_dir'    : None,
-        'setup'       : None,
+        'setup'       : [
+            'module reset',
+            'module load cray-python/3.11.7 craype-network-ofi cray-mpich/8.1.32',
+            'module list',
+            'python3 -c "import mpi4py.MPI as M; print(M.Get_library_version())"',
+                        ],
     },
     'thinkie': {
         'enabled'     : False,
@@ -711,6 +703,17 @@ async def run_rose_workflow(bridge_url, edge_name):
     @acl.simulation_task(as_executable=False)
     async def simulation(*args,
                          task_description={"process_templates": [(N_MPI_RANKS, {})]}):
+
+        import sys, traceback
+        try:
+            from mpi4py import MPI
+            from dragon.data.ddict.ddict import DDict
+        except Exception:
+            sys.stderr.write("=== SIM IMPORT FAILED ===\n")
+            traceback.print_exc(file=sys.stderr)
+            sys.stderr.flush()
+            raise
+
         from mpi4py import MPI
         from dragon.data.ddict.ddict import DDict
 
