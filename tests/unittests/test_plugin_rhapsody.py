@@ -83,6 +83,19 @@ from radical.edge.plugin_rhapsody import (  # noqa: E402
 )
 
 
+# Stub RhapsodySession.initialize for every test in this module.
+# The background `_init_session` task runs concurrently inside the same
+# TestClient.post that registers the session, so the test's own
+# `_init_ready.set()` always loses the race with `await initialize()`
+# — and initialize() now awaits start_telemetry / awaitable backends
+# that the sync MagicMock cannot satisfy.  These tests assign their own
+# mock `_rh_session` afterwards, so the real initialize is unwanted.
+@pytest.fixture(autouse=True)
+def _stub_session_initialize():
+    with patch.object(RhapsodySession, 'initialize', new_callable=AsyncMock):
+        yield
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
