@@ -749,6 +749,15 @@ def launch_psij(bc, edge_name, cfg, bridge_url):
         custom_attrs[f'{cfg["executor"]}.gpus-per-node'] = str(cfg['gpus_per_node'])
     if cfg.get('qos'):
         custom_attrs[f'{cfg["executor"]}.qos'] = cfg['qos']
+    # Allocate ``n_nodes`` nodes but launch only ONE wrapper on the head
+    # compute node -- Dragon spawns its own daemons on the rest.  PsiJ's
+    # ResourceSpecV1 can't express this (its ``process_count = node_count
+    # × ppn`` constraint forbids 1 task across N nodes), so we ride
+    # through the slurm.mustache custom_attributes hook: it renders the
+    # ``--nodes`` line *after* the default ResourceSpec block, so SLURM's
+    # last-flag-wins gives us ``--nodes=N --ntasks=1 --ntasks-per-node=1``.
+    if cfg.get('n_nodes'):
+        custom_attrs[f'{cfg["executor"]}.nodes'] = str(cfg['n_nodes'])
 
     # Cert is left to the child edge to resolve from
     # ``~/.radical/edge/bridge_cert.pem`` on the target (or via
@@ -767,7 +776,10 @@ def launch_psij(bc, edge_name, cfg, bridge_url):
         'arguments'         : ['--name', child_name, '--url', bridge_url],
         'attributes'        : attrs,
         'custom_attributes' : custom_attrs,
-        'resources'         : {'node_count': cfg['n_nodes']},
+        # No ``resources`` -- ``--nodes`` rides through ``slurm.nodes``
+        # in custom_attributes so PsiJ's default ResourceSpec
+        # (``--ntasks=1``) stays in place.  See the comment on
+        # ``slurm.nodes`` above.
         'environment'       : env,
     }
 
