@@ -205,6 +205,11 @@ class PBSProBatchSystem(BatchSystem):
         info = _parse_qstat_f(r.stdout)
         return _parse_exec_host(info.get('exec_host', ''))
 
+    def nodelist(self) -> list:
+        # PBS_NODEFILE lists each host once per slot; ``_read_pbs_nodefile``
+        # already dedupes and short-circuits on a missing / empty file.
+        return _read_pbs_nodefile()
+
     def cancel(self, native_id) -> None:
         r = subprocess.run(['qdel', str(native_id)],
                            capture_output=True, text=True, timeout=10)

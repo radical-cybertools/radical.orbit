@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
-ROSE active learning across heterogeneous edge endpoints — interactive demo.
+MATEY active learning across heterogeneous edge endpoints — interactive demo.
+
+This is the MATEY-driven counterpart of ``amsc.py``.  Same launch /
+discovery / teardown machinery; the difference is in step 4: the ROSE
+workflow runs the MATEY transformer-based fusion-seed inference as an
+*executable task* via Rhapsody / Dragon, rather than the toy GP-fitting
+workload that ``amsc.py`` ships with.
 
 Architecture
 ============
@@ -26,7 +32,11 @@ What this script does
 3. Submits the launch jobs (or reuses ready edges).  Then waits for the
    *first* edge to come up.
 
-4. Runs a small ROSE active-learning workflow on the first-up edge.
+4. On that first edge: stages one ``env_runner_<name>.sh`` per entry of
+   the target's ``env_setup`` dict (each runner just activates an env
+   then ``exec "$@"`` — the actual command comes from the caller), then
+   runs a ROSE active-learning workflow whose simulation step is the
+   MATEY ``basic_inference.py`` driver invoked through the runner.
 
 5. Tears down anything this script created.  Pre-existing edges and any
    stragglers from our submission set are left alone — the demo keeps
@@ -51,21 +61,18 @@ only — they are never written to disk on the bridge side.
 
 Run::
 
-    python examples/amsc.py
+    python examples/matey.py
 """
 
 import asyncio
 import logging
 import os
+import re
 import sys
 import time
 import uuid
 
-from collections import defaultdict
-
 from pathlib import Path
-
-import numpy as np
 
 # RADICAL Edge client + ROSE / Rhapsody bits
 from radical.edge.client import BridgeClient
@@ -88,34 +95,14 @@ rhapsody.enable_logging(level=logging.WARNING)
 #  Workflow knobs — edit to taste.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Which workload to run once the first edge is up.  Toggle freely:
-#   'rose'     — active-learning loop (run_rose_workflow).
-#   'rhapsody' — N matey-inference tasks via rhapsody (submit_rhapsody_workload).
-WORKLOAD           = 'rhapsody'
-
-# Demo mode: skip target discovery / configure prompts, auto-pick the
-# perlmutter PsiJ path with MACHINE_DEFAULTS values, emit a coarse
-# 7-step trace.  Set False to restore the original interactive flow.
-DEMO_MODE          = True
-N_NODES            = 16
-
-# ROSE active-learning shape (mirrors examples/example_rose.py).
-N_MPI_RANKS        = 4      # MPI ranks per simulation launch
-N_SAMPLES_PER_RANK = 5      # sparse start; AL drives exploration
-N_QUERY            = 8      # query points selected per AL step
-MSE_THRESHOLD      = 0.01   # convergence target
-MAX_ITER           = 15     # hard cap on AL iterations
-
-# Rhapsody-direct workload shape (mirrors examples/run_matey.py).
-N_MATEY_TASKS        = N_NODES * 10        # GPU-bound matey inference tasks
-N_GKEYLL_TASKS       = N_NODES * 128 * 3   # CPU-bound gkeyll training tasks
-MATEY_WRAPPER_NAME   = 'matey_wrapper.sh'
-RHAPSODY_WORK_SUBDIR = 'rhapsody-runs'
+# ROSE active-learning shape.  GPU placement / ensemble width are
+# deliberately not knobs yet — the first cut of this script just runs
+# one MATEY inference per AL iteration.
+MSE_THRESHOLD = 0.01   # convergence target — compared against MATEY's nrmse
+MAX_ITER      = 15     # hard cap on AL iterations
 
 # How long we are willing to wait for the first edge to come up.
 EDGE_WAIT_SECONDS  = 30 * 60
-
-COUNTERS = defaultdict(int)  # for unique edge names per submission endpoint
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -130,36 +117,47 @@ IRI_DEFAULTS = {
         'iri_url'     : 'https://api.iri.nersc.gov',
         'resource_id' : 'perlmutter',
         'login_host'  : 'perlmutter.nersc.gov',
-        'home_dir'    : '/global/u2/m/merzky',
-        'amsc_dir'    : None,  # relative to $HOME on the target
+        'home_dir'    : '/global/u2/m/merzky',  # target's $HOME
+        'amsc_dir'    : None,                   # default to <home>/.amsc
+        # ``tunnel``: 'none' / 'forward' / 'reverse'.  Forward = child
+        # ssh -L compute->login (Aurora, Perlmutter).  Reverse = parent
+        # ssh -R login->compute (Odo).
         'tunnel'      : 'forward',
         'account'     : 'm5290',
         'workdir'     : None,
         'queue_name'  : 'debug',
-        'qos'         : None,
         'walltime_min': 30,
-        'n_nodes'     : N_NODES,
-        'gpus_per_node': 4,
-        'cores_per_node': 128,
-        'constraint'  : 'gpu',
+        'n_nodes'     : 1,
+        'constraint'  : 'cpu',
         'reservation' : None,
         'environment' : {},
-        'setup'       : [
+        'setup'       : [                       # setup for the edge service
             'module load openmpi',
         ],
-        # ``app`` carries workload-specific paths consumed by
-        # submit_rhapsody_workload (matey + gkeyll).  ``None`` means
-        # "this target does not support the rhapsody workload".
-        'app'         : {
-            'matey_dir'      : '/global/u2/m/merzky/MATEY',
-            'matey_model_dir': '/global/cfs/projectdirs/amsc007/zhan1668/MATEY'
-                               '/models/Dev_Fusion_DemoMay_toytestonly'
-                               '/demo_nbatchsloc100/',
-            'matey_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
-                               '/d3d_174310.03500/',
-            'gkeyll_dir'     : '/global/u2/m/merzky/gkeyll/amsc',
-            'gkeyll_exe'     : 'rt_gk_d3d_iwl_2x2v_p1.sh',
+        # ─── Application configuration ───────────────────────────────
+        # ``env_setup``: named env-activation profiles for *task*
+        # launchers (NOT the edge service).  Each non-empty entry
+        # yields a ``~/.amsc/env_runner_<name>.sh`` whose body runs
+        # the commands and then ``exec "$@"``.  ``None`` is treated
+        # as no profiles.
+        #
+        # ``app``: per-target paths the workflow body needs (MATEY).
+        # ``None`` is treated as no application paths configured.
+        'env_setup'   : {
+            'matey': [
+                'module load conda',
+                'conda activate /global/common/software/amsc007/matey_env',
+            ],
         },
+        'app'         : {
+            'matey_dir'      : '/global/u2/m/merzky/MATEY/examples',
+            'matey_model_dir': '/global/cfs/projectdirs/amsc007/zhan1668/MATEY'
+                               '/models/Dev_Fusion_Demo_March2026_Final'
+                               '/demo_nbatchsloc100',
+            'matey_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
+                               '/d3d_174310.03500',
+        },
+        # ─────────────────────────────────────────────────────────────
     },
     'olcf': {
         'enabled'     : True,
@@ -172,17 +170,13 @@ IRI_DEFAULTS = {
         'account'     : 'fus183',
         'workdir'     : '/gpfs/wolf2/olcf/fus183/proj-shared',
         'queue_name'  : 'batch',
-        'qos'         : None,
         'walltime_min': 30,
-        'n_nodes'     : N_NODES,
-        'gpus_per_node': None,
-        'cores_per_node': None,
+        'n_nodes'     : 1,
         'constraint'  : None,
         'reservation' : None,
         'environment' : {},
         'setup'       : None,
-        'setup'       : ['module load cray-python/3.11.7',
-                        ],
+        'env_setup'   : None,
         'app'         : None,
     },
 }
@@ -202,67 +196,60 @@ MACHINE_DEFAULTS = {
         'enabled'     : True,
         'account'     : 'Fusion-FM',
         'queue_name'  : 'debug',
-        'qos'         : None,
         'walltime_min': 30,
-        'n_nodes'     : N_NODES,
-        'gpus_per_node': None,
-        'cores_per_node': None,
+        'n_nodes'     : 1,
         'constraint'  : None,
         'tunnel'      : 'forward',
         'amsc_dir'    : None,
         'setup'       : None,
+        'env_setup'   : None,
         'app'         : None,
     },
     'perlmutter': {
         'enabled'     : True,
-        'account'     : 'amsc007_g',
-        'queue_name'  : None,                    # 'gpu_ss11',
-        'qos'         : 'express_amsc',
+        'account'     : 'm5290',
+        'queue_name'  : 'debug',
         'walltime_min': 30,
-        'n_nodes'     : N_NODES,
-        'gpus_per_node': 4,
-        'cores_per_node': 128,
-        'constraint'  : 'gpu',
+        'n_nodes'     : 1,
+        'constraint'  : 'cpu',
         'tunnel'      : 'forward',
         'amsc_dir'    : None,
         'setup'       : [
             'module load openmpi',
         ],
+        'env_setup'   : {
+            'matey': [
+                'module load conda',
+                'conda activate /global/common/software/amsc007/matey_env',
+            ],
+        },
         'app'         : {
-            'matey_dir'      : '/global/u2/m/merzky/MATEY',
+            'matey_dir'      : '/global/u2/m/merzky/MATEY/examples',
             'matey_model_dir': '/global/cfs/projectdirs/amsc007/zhan1668/MATEY'
-                               '/models/Dev_Fusion_DemoMay_toytestonly'
-                               '/demo_nbatchsloc100/',
+                               '/models/Dev_Fusion_Demo_March2026_Final'
+                               '/demo_nbatchsloc100',
             'matey_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
-                               '/d3d_174310.03500/',
-            'gkeyll_dir'     : '/global/u2/m/merzky/gkeyll/amsc',
-            'gkeyll_exe'     : 'rt_gk_d3d_iwl_2x2v_p1.sh',
+                               '/d3d_174310.03500',
         },
     },
     'odo': {
         'enabled'     : True,
         'account'     : 'fus183',
         'queue_name'  : 'batch',
-        'qos'         : None,
         'walltime_min': 30,
-        'n_nodes'     : N_NODES,
-        'gpus_per_node': None,
-        'cores_per_node': None,
+        'n_nodes'     : 1,
         'constraint'  : None,
         'tunnel'      : 'reverse',
         'amsc_dir'    : None,
-        'setup'       : [
-            'module reset',
-            'module load cray-python/3.11.7 craype-network-ofi cray-mpich/8.1.32',
-            'module list',
-            'python3 -c "import mpi4py.MPI as M; print(M.Get_library_version())"',
-                        ],
+        'setup'       : None,
+        'env_setup'   : None,
         'app'         : None,
     },
     'thinkie': {
         'enabled'     : False,
         'amsc_dir'    : None,
         'setup'       : None,
+        'env_setup'   : None,
         'app'         : None,
     },
 }
@@ -291,84 +278,6 @@ MACHINE_DEFAULTS = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 AMSC_DIR = Path(os.environ.get('AMSC_DIR') or Path.home() / '.amsc').expanduser()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Demo-mode output helpers.
-#
-#  ``step()`` prints one aligned, coloured line per coarse phase via rich.
-#  ``abort()`` prints a red ABORT line and exits non-zero — used at every
-#  fail-fast boundary in the demo flow (no Python traceback noise).
-#  ``say()`` is a print() proxy that no-ops in demo mode so chatty diagnostic
-#  lines from the underlying functions don't dilute the step trace.  In
-#  interactive mode it is plain print().
-# ─────────────────────────────────────────────────────────────────────────────
-
-try:
-    from rich.console  import Console
-    from rich.progress import (BarColumn, Progress, TaskProgressColumn,
-                               TextColumn)
-    _console = Console()
-except ImportError:                              # pragma: no cover
-    _console  = None
-    Progress  = None
-    BarColumn = TaskProgressColumn = TextColumn = None
-
-_TOTAL_STEPS = 7   # connect / pick / configure / submit / await / run / teardown
-
-def step(idx, label, detail=''):
-    if _console:
-        _console.print(
-            f'[cyan]step {idx}/{_TOTAL_STEPS}[/cyan]  '
-            f'[bold]{label:<20}[/bold]  '
-            f'[bright_white]{detail}[/bright_white]')
-    else:
-        print(f'step {idx}/{_TOTAL_STEPS}  {label:<20}  {detail}')
-
-def abort(msg):
-    """Print a red ABORT line and exit with status 1.  No traceback."""
-    if _console:
-        _console.print(f'[bold red]ABORT[/bold red]               [red]{msg}[/red]')
-    else:
-        print(f'ABORT  {msg}')
-    sys.exit(1)
-
-def say(*args, **kwargs):
-    """Chatty print, suppressed in demo mode."""
-    if not DEMO_MODE:
-        print(*args, **kwargs)
-
-
-def _make_progress(n_matey, n_gkeyll):
-    """Build the rhapsody workload's progress display.
-
-    Returns ``(progress, tids)`` where *progress* is a ``rich.Progress``
-    (or ``None`` when rich is unavailable) and *tids* maps each active
-    kind to its task id.  Drive it with::
-
-        progress.update(tids[kind], advance=1,
-                        done=counts[kind]['done'],
-                        failed=counts[kind]['failed'])
-    """
-    if Progress is None or _console is None:
-        return None, {}
-
-    progress = Progress(
-        TextColumn("  [cyan]{task.fields[label]:<6s}[/cyan]"),
-        BarColumn(bar_width=20),
-        TaskProgressColumn(),
-        TextColumn(
-            "[bright_white]{task.fields[done]:>6d}[/bright_white] / "
-            "[bright_white]{task.total:>6d}[/bright_white] done, "
-            "[red]{task.fields[failed]:>6d}[/red] failed"),
-        console=_console,
-    )
-    tids = {}
-    for kind, n in (('matey', n_matey), ('gkeyll', n_gkeyll)):
-        if n > 0:
-            tids[kind] = progress.add_task('', total=n, label=kind,
-                                           done=0, failed=0)
-    return progress, tids
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -559,8 +468,7 @@ def configure_iri(endpoint):
     d['n_nodes']      = ask_int ('  number of nodes',      d['n_nodes'])
     d['constraint']   = ask     ('  constraint (or empty)', d['constraint'] or '') or None
     d['reservation']  = ask     ('  reservation (or empty)', d['reservation'] or '') or None
-    d['login_host']   = ask     ('  login host (for --tunnel forward)',
-                                  d['login_host'])
+    d['login_host']   = ask     ('  login host (for --tunnel)', d['login_host'])
     d['tunnel']       = _ask_tunnel(d.get('tunnel'))
     if not d['account']:
         raise RuntimeError(f'IRI {endpoint}: account/project is required')
@@ -595,8 +503,7 @@ def launch_iri(bc, endpoint, cfg, bridge_url):
     iri   = cx.connect(endpoint=endpoint, token=token)
 
     # Pick a unique edge name so we can spot it in topology updates.
-    edge_name = f'{endpoint}.{COUNTERS[endpoint]}'
-    COUNTERS[endpoint] += 1
+    edge_name = f'amsc-{endpoint}-{uuid.uuid4().hex[:6]}'
 
     # Build the radical-edge-service.py CLI.  See bin/radical-edge-service.py.
     args = ['--name', edge_name, '--url', bridge_url]
@@ -613,12 +520,6 @@ def launch_iri(bc, endpoint, cfg, bridge_url):
     }
     if cfg['constraint']:  attrs['constraint']  = cfg['constraint']
     if cfg['reservation']: attrs['reservation'] = cfg['reservation']
-    # GPU allocation hint — best-effort: IRI may translate to the underlying
-    # scheduler's flag (--gpus-per-node on SLURM) or silently drop it.
-    if cfg.get('gpus_per_node'):
-        attrs['gpus_per_node'] = cfg['gpus_per_node']
-    if cfg.get('qos'):
-        attrs['qos'] = cfg['qos']
 
     # Compose absolute paths against the target's $HOME (configured in
     # IRI_DEFAULTS).  We can't rely on bash to expand ``~`` — PsiJ's
@@ -643,7 +544,7 @@ def launch_iri(bc, endpoint, cfg, bridge_url):
         'executable' : wrapper,
         'arguments'  : args,
         'name'       : edge_name,
-        'resources'  : {'node_count': cfg['n_nodes']},
+        'resources'  : {'node_count': cfg['n_nodes'], 'process_count': 1},
         'attributes' : attrs,
         'environment': env,
     }
@@ -704,11 +605,9 @@ def configure_psij(edge_name, executor):
         'tunnel'      : _ask_tunnel(d.get('tunnel')),
         # Carried verbatim from MACHINE_DEFAULTS — not prompted.
         'amsc_dir'    : d.get('amsc_dir'),
-        'setup'       : list(d.get('setup') or []),
-        'gpus_per_node': d.get('gpus_per_node'),
-        'cores_per_node': d.get('cores_per_node'),
-        'qos'         : d.get('qos'),
-        'app'         : d.get('app'),
+        'setup'       : list(d.get('setup')     or []),
+        'env_setup'   : dict(d.get('env_setup') or {}),
+        'app'         : dict(d.get('app')       or {}),
     }
     if not cfg['account']:
         raise RuntimeError(f'edge {edge_name}: account/project is required')
@@ -728,8 +627,7 @@ def launch_psij(bc, edge_name, cfg, bridge_url):
     wrapper = f'{home}/{amsc}/ve/bin/radical-edge-wrapper.sh'
 
     # Unique name for the child edge.
-    COUNTERS[edge_name] += 1
-    child_name = f'{edge_name}.{COUNTERS[edge_name]}'
+    child_name = f'amsc-{edge_name}-{uuid.uuid4().hex[:6]}'
 
     attrs = {
         'queue_name': cfg['queue_name'],
@@ -745,18 +643,6 @@ def launch_psij(bc, edge_name, cfg, bridge_url):
     custom_attrs = {}
     if cfg.get('constraint'):
         custom_attrs[f'{cfg["executor"]}.constraint'] = cfg['constraint']
-    if cfg.get('gpus_per_node'):
-        custom_attrs[f'{cfg["executor"]}.gpus-per-node'] = str(cfg['gpus_per_node'])
-    if cfg.get('qos'):
-        custom_attrs[f'{cfg["executor"]}.qos'] = cfg['qos']
-    # ``--nodes=N`` is rendered by PsiJ from spec.resources (set in the
-    # job_spec below) -- a single occurrence avoids the duplicated
-    # ``--nodes`` lines SLURM appears to resolve first-wins on.  We
-    # override ``--ntasks`` here to flip PsiJ's derived
-    # ``process_count = node_count`` (16 tasks across 16 nodes) back
-    # to one wrapper on the head node; Dragon spawns the rest.  SLURM
-    # honours last-wins for ``--ntasks``, so this works.
-    custom_attrs[f'{cfg["executor"]}.ntasks'] = '1'
 
     # Cert is left to the child edge to resolve from
     # ``~/.radical/edge/bridge_cert.pem`` on the target (or via
@@ -775,20 +661,15 @@ def launch_psij(bc, edge_name, cfg, bridge_url):
         'arguments'         : ['--name', child_name, '--url', bridge_url],
         'attributes'        : attrs,
         'custom_attributes' : custom_attrs,
-        # plugin_psij translates ``resources.node_count`` into
-        # ``ResourceSpecV1(node_count=N)``; PsiJ then renders
-        # ``--nodes=N`` (single occurrence) and derives
-        # ``--ntasks=N --ntasks-per-node=1``.  We flip --ntasks back to
-        # 1 via custom_attributes -- see the slurm.ntasks comment above.
-        'resources'         : {'node_count': cfg['n_nodes']},
+        'resources'         : {'node_count': cfg['n_nodes'], 'process_count': 1},
         'environment'       : env,
     }
 
-    say(f'  submitting PsiJ job via {edge_name} (executor: {cfg["executor"]}, '
-        f'edge name: {child_name})…')
+    print(f'  submitting PsiJ job via {edge_name} (executor: {cfg["executor"]}, '
+          f'edge name: {child_name})…')
     res = psij.submit_tunneled(job_spec, executor=cfg['executor'],
                                tunnel=cfg['tunnel'])
-    say(f'  PsiJ job_id: {res["job_id"]}')
+    print(f'  PsiJ job_id: {res["job_id"]}')
 
     return {
         'kind'       : 'psij',
@@ -798,6 +679,65 @@ def launch_psij(bc, edge_name, cfg, bridge_url):
         'edge_name'  : res.get('edge_name', child_name),
         'cfg'        : cfg,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Per-target env-runner staging.
+#
+#  ``env_setup`` is a dict mapping a profile name to a list of shell
+#  commands.  For each non-empty entry we materialise an
+#  ``env_runner_<name>.sh`` whose body runs the listed commands and then
+#  ``exec "$@"`` — the actual command (executable + args) is supplied by
+#  the caller, so a single runner can launch any application that needs
+#  this environment.  We stage the runner via the ``staging`` plugin so
+#  it lands in ``<home>/.amsc/`` on the edge's filesystem.
+#
+#  Returns ``{name: remote_path}`` for the runners we put in place.  An
+#  empty dict means the target opted out (no env_setup configured).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def stage_env_runners(edge_client, env_setup):
+    """Generate + stage one ``env_runner_<name>.sh`` per ``env_setup`` entry."""
+    if not env_setup:
+        return {}
+
+    # Resolve target $HOME via the edge's sysinfo plugin.
+    home    = edge_client.get_plugin('sysinfo').homedir().rstrip('/')
+    staging = edge_client.get_plugin('staging')
+    AMSC_DIR.mkdir(parents=True, exist_ok=True)
+
+    runners = {}
+    for name, cmds in env_setup.items():
+        if not cmds:
+            continue   # empty profile -> caller can run commands directly
+
+        body = ('#!/bin/bash\n'
+                '# Auto-generated by examples/matey.py — do not edit.\n'
+                + '\n'.join(cmds)
+                + '\nexec "$@"\n')
+
+        local  = AMSC_DIR / f'env_runner_{name}.sh'
+        remote = f'{home}/.amsc/env_runner_{name}.sh'
+
+        local.write_text(body)
+        staging.put(str(local), remote, overwrite=True)
+        runners[name] = remote
+        print(f'  staged {remote}')
+    return runners
+
+
+def find_target_cfg(edge_name, created):
+    """Look up the per-target cfg for a given edge name.
+
+    Two cases:
+      * we launched the edge (PsiJ or IRI) — pull the cfg from the
+        ``created`` record we stashed at submission time;
+      * the edge was already running — fall back to MACHINE_DEFAULTS.
+    """
+    for c in created:
+        if c.get('edge_name') == edge_name:
+            return c['cfg']
+    return MACHINE_DEFAULTS.get(edge_name, {})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -819,8 +759,8 @@ def wait_for_first_edge(bc, expected_names, timeout=EDGE_WAIT_SECONDS,
     if not expected_names:
         raise RuntimeError('no expected edges — nothing to wait for')
 
-    say(f'\n— Waiting for first edge to come up '
-        f'(any of: {", ".join(expected_names)}) —')
+    print(f'\n— Waiting for first edge to come up '
+          f'(any of: {", ".join(expected_names)}) —')
     start_time = time.time()
     last_beat  = start_time
     while time.time() - start_time < timeout:
@@ -831,49 +771,114 @@ def wait_for_first_edge(bc, expected_names, timeout=EDGE_WAIT_SECONDS,
         time.sleep(poll)
         if time.time() - last_beat >= heartbeat:
             elapsed = int(time.time() - start_time)
-            say(f'  …{elapsed}s elapsed, {timeout - elapsed}s left')
+            print(f'  …{elapsed}s elapsed, {timeout - elapsed}s left')
             last_beat = time.time()
     raise TimeoutError(f'no edge appeared within {timeout}s; '
                        f'expected one of {expected_names}')
 
 
-def _find_perlmutter_psij(bc):
-    """Locate a connected perlmutter login-edge with the PsiJ plugin.
+# ─────────────────────────────────────────────────────────────────────────────
+#  ROSE workflow body.
+#
+#  Each AL iteration runs the MATEY ``basic_inference.py`` driver as an
+#  *executable task*.  The command is composed by the simulation task
+#  body and reads:
+#
+#      bash <env_runner_matey.sh> python <matey_dir>/basic_inference.py
+#           --model_dir <model_dir> --newxgc_dir <xgc_dir>
+#           --leadtime <K> --AR
+#
+#  The runner just activates the matey conda env and ``exec``s the
+#  remainder, so the runner itself stays application-agnostic.
+#
+#  Wiring (verified by reading rose/asyncflow source)
+#  --------------------------------------------------
+#  asyncflow's executable-task future resolves to the captured stdout
+#  string (workflow_manager.handle_task_success: as_executable → stdout).
+#  ROSE's ``_register_task`` appends ``deps`` futures to the next task's
+#  positional args, and asyncflow's ``_extract_dependency_values`` calls
+#  ``.result()`` on each Future arg before invoking the function.  Net
+#  effect: when ``training`` is registered with ``deps=sim_task``, the
+#  simulation's full stdout reaches ``training`` as a positional ``*arg``.
+#
+#  MATEY's basic_inference prints a single metric line per run (see
+#  matey/inference.py:343 and :487):
+#      Prediction of XGC-D3D, rmse_loss:<value>; nrmse_loss <value>
+#  where ``<value>`` is either a plain float or a ``tensor(...)`` repr.
+#  The training task parses that line out of the sim's stdout, stores
+#  ``rmse_iter_<K>`` / ``nrmse_iter_<K>`` plus the alias ``mse_iter_<K>``
+#  (using nrmse — the normalised loss is the threshold-comparable one)
+#  in DDict, and check_mse reads ``mse_iter_<K>`` back.
+#
+#  AL-driven leadtime
+#  ------------------
+#  ``active_learn_task`` looks at the (leadtime, nrmse) history in DDict
+#  and writes ``next_leadtime_iter_<K+1>`` for the upcoming iteration.
+#  The simulation reads ``next_leadtime_iter_<K>`` (falling back to 1
+#  when missing — i.e. the pre-loop iteration) to pick its leadtime.
+#  Strategy: round-robin sweep over 1..LEADTIME_MAX, biased toward
+#  un-evaluated leadtimes, then toward the worst (highest-nrmse) one
+#  among those already seen.  No GP needed for this first cut — the
+#  closure stays cloudpickle-safe (no sklearn at module level) and the
+#  behaviour is deterministic enough to debug.
+# ─────────────────────────────────────────────────────────────────────────────
 
-    Returns ``(edge_name, executor)`` or ``None``.  Used by demo mode to
-    auto-pick the only target it cares about, without going through the
-    interactive ``discover_targets`` / ``select_many`` flow.
+LEADTIME_MAX = 5    # AL sweeps leadtime in [1..LEADTIME_MAX]
+
+
+def _extract_nrmse(stdout: str) -> tuple[float | None, float | None]:
+    """Parse ``rmse_loss``/``nrmse_loss`` out of MATEY's stdout.
+
+    Handles both plain-float and ``tensor(<num>, ...)`` formattings
+    (basic_inference.py prints torch tensor repr).  Returns the *last*
+    occurrence in stdout (the run actually executed in this task)
+    rather than the first, in case the driver logs multiple cases.
     """
-    if 'perlmutter' not in set(bc.list_edges()):
-        return None
-    edge    = bc.get_edge_client('perlmutter')
-    plugins = edge.list_plugins()
-    if 'psij' not in plugins:
-        return None
-    try:
-        info     = edge.get_plugin('sysinfo').host_role()
-        executor = info.get('psij_executor', 'slurm')
-    except Exception:
-        executor = 'slurm'
-    return ('perlmutter', executor)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  ROSE workflow body.  Mirrors examples/example_rose.py — only difference:
-#  it targets a specific edge_name passed in by the launcher.
+    # Allow optional ``tensor(`` wrapper, then capture the number.  The
+    # number itself can be int / float / scientific notation.
+    pat = re.compile(
+        r'rmse_loss[:=]?\s*(?:tensor\()?\s*([\-+]?\d*\.?\d+(?:[eE][\-+]?\d+)?)'
+        r'.*?nrmse_loss[:=]?\s*(?:tensor\()?\s*([\-+]?\d*\.?\d+(?:[eE][\-+]?\d+)?)'
+    )
+    matches = list(pat.finditer(stdout or ''))
+    if not matches:
+        return None, None
+    rmse_s, nrmse_s = matches[-1].group(1), matches[-1].group(2)
+    try:    return float(rmse_s), float(nrmse_s)
+    except ValueError:
+        return None, None
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def run_rose_workflow(bridge_url, edge_name, cfg=None):
+async def run_rose_workflow(bridge_url, edge_name, app_cfg, runners):
     """Run the active-learning loop using the named edge as a Dragon backend.
 
-    *cfg* (the matched per-target config dict) is accepted for signature
-    parity with :func:`submit_rhapsody_workload` and currently unused.
-
-    Closure discipline (from example_rose.py): every task captures only
-    ``ddict_descriptor`` (a plain str) and re-derives the current iteration
-    from sentinel keys in the DDict — no live object references.
+    Args:
+      bridge_url: URL the Rhapsody edge backend connects to.
+      edge_name:  name of the (compute-side) edge that runs tasks.
+      app_cfg:    ``app`` sub-dict from the target's per-target config —
+                  must carry ``matey_dir`` / ``matey_model_dir`` /
+                  ``matey_xgc_dir``.
+      runners:    ``{name: remote_path}`` from ``stage_env_runners`` —
+                  this script needs the entry under key ``'matey'``.
     """
     print(f'\n— Running ROSE on edge "{edge_name}" (bridge: {bridge_url}) —')
+
+    # Refuse to start without the bits we need on the target.  Better to
+    # die here with a clear message than to launch a futile job.
+    matey_runner = runners.get('matey')
+    if not matey_runner:
+        raise RuntimeError(
+            f'no env_runner_matey.sh staged on {edge_name}; '
+            f'check the target\'s env_setup["matey"] is non-empty')
+    for key in ('matey_dir', 'matey_model_dir', 'matey_xgc_dir'):
+        if not app_cfg.get(key):
+            raise RuntimeError(
+                f'app config for {edge_name} is missing {key!r} — '
+                f'fill it in MACHINE_DEFAULTS / IRI_DEFAULTS')
+
+    matey_dir = app_cfg['matey_dir'].rstrip('/')
+    model_dir = app_cfg['matey_model_dir']
+    xgc_dir   = app_cfg['matey_xgc_dir']
 
     # 1. Engine + active learner
     backend   = rhapsody.get_backend('edge', bridge_url=bridge_url,
@@ -882,7 +887,8 @@ async def run_rose_workflow(bridge_url, edge_name, cfg=None):
     asyncflow = await WorkflowEngine.create(engine)
     acl       = SequentialActiveLearner(asyncflow)
 
-    # 2. Shared DDict for cross-task state
+    # 2. Shared DDict for cross-task state (rmse/nrmse history + the
+    #    next leadtime the AL strategy wants the simulation to evaluate).
     @asyncflow.function_task
     async def create_ddict() -> str:
         from dragon.data.ddict.ddict import DDict
@@ -895,145 +901,161 @@ async def run_rose_workflow(bridge_url, edge_name, cfg=None):
     ddict_descriptor = await create_ddict()
     print(f'  DDict ready (descriptor prefix: {ddict_descriptor[:32]}…)')
 
-    # 3. Tasks — captured closure: ddict_descriptor (str) only.
-    @acl.simulation_task(as_executable=False)
-    async def simulation(*args,
-                         task_description={"process_templates": [(N_MPI_RANKS, {})]}):
+    # Bind the leadtime knob to the closure so it survives cloudpickle.
+    leadtime_max = LEADTIME_MAX
 
-        import sys, traceback
-        try:
-            from mpi4py import MPI
-            from dragon.data.ddict.ddict import DDict
-        except Exception:
-            sys.stderr.write("=== SIM IMPORT FAILED ===\n")
-            traceback.print_exc(file=sys.stderr)
-            sys.stderr.flush()
-            raise
-
-        from mpi4py import MPI
+    # 3. Tasks
+    #
+    # simulation: executable task — composes and returns the matey
+    # command string.  Rhapsody / Dragon spawn a fresh process per
+    # invocation; our env_runner activates the matey conda env first
+    # and then exec's the python driver.
+    #
+    # The leadtime is read from DDict (key ``next_leadtime_iter_<K>``)
+    # so the AL loop drives this knob.  Iteration index is derived the
+    # same way every other task does it: count the existing
+    # ``mse_iter_*`` sentinels and that's the next iteration index.
+    # On the very first call (pre-loop, no entries yet) we default to
+    # leadtime=1.
+    @acl.simulation_task(as_executable=True)
+    async def matey_inference(*args, **kwargs):
         from dragon.data.ddict.ddict import DDict
-
-        comm  = MPI.COMM_WORLD
-        rank  = comm.Get_rank()
-        size  = comm.Get_size()
         ddict = DDict.attach(ddict_descriptor)
+        try:
+            iteration = 0
+            while f"mse_iter_{iteration}" in ddict:
+                iteration += 1
+            key = f"next_leadtime_iter_{iteration}"
+            leadtime = int(ddict[key]) if key in ddict else 1
+            # Persist what we actually ran so the training task can pair
+            # the resulting nrmse with the leadtime that produced it.
+            ddict[f"leadtime_iter_{iteration}"] = leadtime
+        finally:
+            ddict.detach()
 
-        iteration = 0
-        while f"sim_meta_iter_{iteration}" in ddict:
-            iteration += 1
+        return (f'bash {matey_runner}'
+                f' python {matey_dir}/basic_inference.py'
+                f' --model_dir {model_dir}'
+                f' --newxgc_dir {xgc_dir}'
+                f' --leadtime {leadtime}'
+                f' --AR')
 
-        prev_iter = iteration - 1
-        query_key = f"query_points_iter_{prev_iter}"
-
-        if prev_iter >= 0 and query_key in ddict:
-            all_query = ddict[query_key]
-            X_local   = all_query[rank::size]
-            rng       = np.random.default_rng(seed=rank + iteration * size)
-            y_local   = (np.sin(X_local) * np.sin(5 * X_local)
-                         + rng.normal(0.0, 0.1, X_local.shape))
-        else:
-            rng     = np.random.default_rng(seed=rank + iteration * size)
-            X_local = rng.uniform(0.0, 2.0 * np.pi, (N_SAMPLES_PER_RANK, 1))
-            y_local = (np.sin(X_local) * np.sin(5 * X_local)
-                       + rng.normal(0.0, 0.1, X_local.shape))
-
-        ddict[f"sim_rank_{rank}_iter_{iteration}"] = {"X": X_local, "y": y_local}
-        comm.Barrier()
-        if rank == 0:
-            ddict[f"sim_meta_iter_{iteration}"] = {
-                "n_ranks"           : size,
-                "n_samples_per_rank": len(X_local),
-            }
-            print(f'[sim]   iter={iteration} ranks={size} '
-                  f'pts={size * len(X_local)}', flush=True)
-        ddict.detach()
-        return {}
-
+    # training: parses MATEY's stdout (passed in as the last positional
+    # arg via ROSE's deps→args wiring; see module docstring above) and
+    # records rmse / nrmse in DDict.  ``mse_iter_<K>`` is aliased to
+    # nrmse — that's the normalised metric the threshold compares.
     @acl.training_task(as_executable=False)
     async def training(*args):
-        # sklearn lives only on the HPC side; import inside the task.
-        from sklearn.gaussian_process         import GaussianProcessRegressor
-        from sklearn.gaussian_process.kernels import RBF, WhiteKernel
-        from sklearn.metrics                  import mean_squared_error
-        from dragon.data.ddict.ddict          import DDict
+        from dragon.data.ddict.ddict import DDict
         ddict = DDict.attach(ddict_descriptor)
+        try:
+            iteration = 0
+            while f"mse_iter_{iteration}" in ddict:
+                iteration += 1
 
-        iteration = 0
-        while f"sim_meta_iter_{iteration}" in ddict:
-            iteration += 1
-        iteration -= 1
+            sim_stdout = args[-1] if args else ''
+            if not isinstance(sim_stdout, str):
+                sim_stdout = str(sim_stdout) if sim_stdout is not None else ''
 
-        # Accumulate samples from ALL completed iterations — active learning
-        # trains on the cumulative labeled set, not just the latest batch.
-        X_parts, y_parts = [], []
-        for it in range(iteration + 1):
-            meta = ddict[f"sim_meta_iter_{it}"]
-            for rank in range(meta["n_ranks"]):
-                data = ddict[f"sim_rank_{rank}_iter_{it}"]
-                X_parts.append(data["X"])
-                y_parts.append(data["y"])
-        X_train = np.vstack(X_parts)
-        y_train = np.vstack(y_parts).ravel()
+            rmse, nrmse = _extract_nrmse(sim_stdout)
+            if nrmse is None:
+                # Fail loudly — the AL loop has no signal to drive on
+                # otherwise.  Stash the raw stdout for post-mortem.
+                tail = sim_stdout[-2000:] if sim_stdout else '<empty>'
+                ddict[f"sim_stdout_iter_{iteration}"] = tail
+                raise RuntimeError(
+                    f'iter={iteration}: could not parse rmse/nrmse from '
+                    f'MATEY stdout — last 2KB stored at '
+                    f'sim_stdout_iter_{iteration}.  Tail: {tail!r}')
 
-        kernel = (RBF(length_scale=0.3, length_scale_bounds=(0.01, 5.0))
-                  + WhiteKernel(noise_level=1e-2))
-        gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=10,
-                                      normalize_y=True)
-        gp.fit(X_train, y_train)
+            ddict[f"rmse_iter_{iteration}"]  = float(rmse) if rmse is not None else float('nan')
+            ddict[f"nrmse_iter_{iteration}"] = float(nrmse)
+            ddict[f"mse_iter_{iteration}"]   = float(nrmse)  # alias for criterion
+            print(f'[train] iter={iteration} '
+                  f'rmse={rmse} nrmse={nrmse:.6f}', flush=True)
+        finally:
+            ddict.detach()
+        return {"rmse": rmse, "nrmse": nrmse}
 
-        X_test = np.linspace(0.0, 2.0 * np.pi, 300).reshape(-1, 1)
-        y_pred = gp.predict(X_test)
-        y_true = (np.sin(X_test) * np.sin(5 * X_test)).ravel()
-        mse    = float(mean_squared_error(y_true, y_pred))
-
-        ddict[f"model_iter_{iteration}"] = gp
-        ddict[f"mse_iter_{iteration}"]   = mse
-        print(f'[train] iter={iteration} n={len(X_train)} MSE={mse:.6f}',
-              flush=True)
-        ddict.detach()
-        return {}
-
+    # active_learn: choose the leadtime to evaluate next.  Strategy:
+    #   1. round-robin sweep — pick the lowest leadtime in 1..MAX that
+    #      has not been evaluated yet;
+    #   2. once every leadtime has at least one sample, re-pick the one
+    #      with the highest current nrmse (most uncertain / worst fit).
+    # Stores the choice under ``next_leadtime_iter_<K+1>`` so the next
+    # iteration's simulation reads it.
     @acl.active_learn_task(as_executable=False)
     async def active_learn(*args):
         from dragon.data.ddict.ddict import DDict
         ddict = DDict.attach(ddict_descriptor)
+        try:
+            # iter index of the just-finished training round
+            iteration = 0
+            while f"mse_iter_{iteration}" in ddict:
+                iteration += 1
+            iteration -= 1   # latest completed
 
-        iteration = 0
-        while f"model_iter_{iteration}" in ddict:
-            iteration += 1
-        iteration -= 1
+            # Build (leadtime → list[nrmse]) history.
+            history: dict[int, list[float]] = {}
+            for i in range(iteration + 1):
+                lk = f"leadtime_iter_{i}"
+                nk = f"nrmse_iter_{i}"
+                if lk in ddict and nk in ddict:
+                    history.setdefault(int(ddict[lk]), []).append(float(ddict[nk]))
 
-        gp = ddict[f"model_iter_{iteration}"]
-        X_candidates  = np.linspace(0.0, 2.0 * np.pi, 500).reshape(-1, 1)
-        _, std        = gp.predict(X_candidates, return_std=True)
-        top_idx       = np.argsort(std)[-N_QUERY:]
-        ddict[f"query_points_iter_{iteration}"] = X_candidates[top_idx]
-        print(f'[active] iter={iteration} mean_unc={std.mean():.4f} '
-              f'max_unc={std.max():.4f} n_query={N_QUERY}', flush=True)
-        ddict.detach()
-        return {"mean_uncertainty": float(std.mean()),
-                "max_uncertainty" : float(std.max())}
+            # Step 1: any leadtime in 1..MAX never tried?
+            unseen = [lt for lt in range(1, leadtime_max + 1)
+                      if lt not in history]
+            if unseen:
+                next_leadtime = unseen[0]
+                strategy = 'round-robin (unseen)'
+            else:
+                # Step 2: pick the worst-performing (highest mean nrmse).
+                next_leadtime = max(history,
+                                    key=lambda lt: sum(history[lt]) / len(history[lt]))
+                strategy = 'max-uncertainty (worst nrmse)'
+
+            ddict[f"next_leadtime_iter_{iteration + 1}"] = next_leadtime
+
+            # Cheap proxy for "uncertainty" so the IterationState has
+            # something useful to surface.  Spread of seen nrmse values
+            # is a reasonable stand-in until we wire a real surrogate.
+            all_nrmse = [v for vs in history.values() for v in vs]
+            mean_unc  = (sum(all_nrmse) / len(all_nrmse)) if all_nrmse else 0.0
+            max_unc   = max(all_nrmse) if all_nrmse else 0.0
+
+            print(f'[active] iter={iteration} chose leadtime='
+                  f'{next_leadtime} ({strategy}) '
+                  f'history={ {k: round(sum(v)/len(v), 4) for k, v in history.items()} }',
+                  flush=True)
+        finally:
+            ddict.detach()
+        return {"mean_uncertainty": mean_unc,
+                "max_uncertainty" : max_unc,
+                "next_leadtime"   : next_leadtime}
 
     @acl.as_stop_criterion(metric_name=MEAN_SQUARED_ERROR_MSE,
                            threshold=MSE_THRESHOLD, as_executable=False)
     async def check_mse(*args) -> float:
         from dragon.data.ddict.ddict import DDict
         ddict = DDict.attach(ddict_descriptor)
-        iteration = 0
-        while f"mse_iter_{iteration}" in ddict:
-            iteration += 1
-        iteration -= 1
-        mse: float = ddict[f"mse_iter_{iteration}"]
-        ddict.detach()
+        try:
+            iteration = 0
+            while f"mse_iter_{iteration}" in ddict:
+                iteration += 1
+            iteration -= 1
+            mse: float = float(ddict[f"mse_iter_{iteration}"])
+        finally:
+            ddict.detach()
         return mse
 
     # 4. Run
-    print('\nStarting ROSE active-learning loop\n' + '─' * 60)
+    print('\nStarting ROSE active-learning loop (MATEY)\n' + '─' * 60)
     final_state = None
     async for state in acl.start(max_iter=MAX_ITER):
         final_state = state
         print(f'  ROSE iter={state.iteration:2d}  MSE={state.metric_value:.6f}  '
-              f'mean_unc={state.mean_uncertainty}  stop={state.should_stop}')
+              f'stop={state.should_stop}')
         if state.should_stop:
             break
 
@@ -1053,196 +1075,12 @@ async def run_rose_workflow(bridge_url, edge_name, cfg=None):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Rhapsody-direct workload (alternative to ROSE).
-#
-#  Mirrors examples/run_matey.py: submits N matey-inference tasks against
-#  the named edge as a rhapsody backend, with a semaphore-limited
-#  concurrency cap and per-task GPU-affinity round-robin.  Goes through
-#  the edge backend (bridge -> edge -> rhapsody plugin -> V3) — same
-#  transport as run_rose_workflow.
-#
-#  Per-target requirements (see ``app`` field in IRI_DEFAULTS /
-#  MACHINE_DEFAULTS):
-#    * ``app.matey_dir``       — host directory containing
-#                                ``matey_wrapper.sh`` and
-#                                ``basic_inference.py``.
-#    * ``app.matey_model_dir`` — passed as ``--model_dir``.
-#    * ``app.matey_xgc_dir``   — passed as ``--newxgc_dir``.
-#    * ``gpus_per_node``       — used to derive concurrency
-#                                (``len(nodelist) * gpus_per_node``) and
-#                                the per-task ``gpu_affinity`` index.
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
-    """Submit matey-inference + gkeyll tasks via the named edge.
-
-    Two task families share one Session and run concurrently, mixed by
-    independent Semaphores: matey scales by GPU count (``n_hosts *
-    gpus_per_node``), gkeyll by core count (``n_hosts * cores_per_node``),
-    where ``n_hosts = len(nodelist)``.
-
-    *nodelist* is the list of compute hostnames in the edge's allocation
-    (from ``queue_info.nodelist()``).  Each task's policy pins it to a
-    specific (host, gpu/core) slot via ``Policy.Placement.HOST_NAME``,
-    so dragon's scheduler is forced onto the slot we picked rather than
-    relying on its internal round-robin.
-
-    Either family is skipped when its config block / resource count is
-    absent or zero; bails if neither has anything to do.
-    """
-    app_cfg = (cfg or {}).get('app')
-    if not app_cfg:
-        raise RuntimeError(
-            f"target {edge_name!r} has no 'app' config block — "
-            "the rhapsody workload is not supported here.  Either "
-            "set WORKLOAD='rose' or populate IRI_DEFAULTS / "
-            "MACHINE_DEFAULTS['app'] for this target.")
-
-    n_hosts        = len(nodelist) or 1
-    gpus_per_node  = cfg.get('gpus_per_node')  or 0
-    cores_per_node = cfg.get('cores_per_node') or 0
-    n_gpus         = n_hosts * gpus_per_node
-    n_cores        = n_hosts * cores_per_node
-
-    has_matey = (n_gpus > 0 and N_MATEY_TASKS > 0
-                 and all(app_cfg.get(k) for k in
-                         ('matey_dir', 'matey_model_dir', 'matey_xgc_dir')))
-    has_gkeyll = (n_cores > 0 and N_GKEYLL_TASKS > 0
-                  and all(app_cfg.get(k) for k in ('gkeyll_dir', 'gkeyll_exe')))
-
-    if not (has_matey or has_gkeyll):
-        raise RuntimeError(
-            f"target {edge_name!r}: nothing to run.  Need either "
-            "(gpus_per_node > 0 + N_MATEY_TASKS > 0 + matey_* paths) "
-            "or (cores_per_node > 0 + N_GKEYLL_TASKS > 0 + gkeyll_dir/exe).")
-
-    # Lazy imports: dragon's Policy + cloudpickle are only needed when the
-    # rhapsody workload actually runs; this lets amsc.py parse on client
-    # machines without dragon installed.
-    import base64
-    import cloudpickle
-    from dragon.infrastructure.policy import Policy
-    from rhapsody.api import ComputeTask, Session
-
-    def _pack_psk(cwd, policy):
-        """Cloudpickle-encode task_backend_specific_kwargs for the wire.
-
-        dragon ``Policy`` is a C-extension object that msgpack can't serialise.
-        We ride through rhapsody's existing ``_pickled_fields`` escape hatch:
-        encode the whole kwargs dict as ``cloudpickle::<b64>`` here and let
-        the rhapsody plugin's ``_deserialize_task`` unpickle it on the edge.
-        """
-        raw = {'process_template': {'cwd': cwd, 'policy': policy}}
-        return 'cloudpickle::' + base64.b64encode(cloudpickle.dumps(raw)).decode()
-
-    matey_tasks  = []
-    gkeyll_tasks = []
-
-    if has_matey:
-        matey_dir  = app_cfg['matey_dir'].rstrip('/')
-        matey_wrap = f'{matey_dir}/{MATEY_WRAPPER_NAME}'
-        matey_wd   = f'{matey_dir}/{RHAPSODY_WORK_SUBDIR}'
-        matey_args = [
-            'python', f'{matey_dir}/examples/basic_inference.py',
-            '--model_dir',  app_cfg['matey_model_dir'],
-            '--use_ddp',
-            '--on_perlmutter',
-            '--AR',
-            '--leadtime',   '5',
-            '--newxgc_dir', app_cfg['matey_xgc_dir'],
-        ]
-        matey_tasks = [
-            ComputeTask(
-                executable=matey_wrap,
-                arguments=matey_args,
-                capture_stdio=True,
-                task_backend_specific_kwargs=_pack_psk(matey_wd, Policy(
-                    placement=Policy.Placement.HOST_NAME,
-                    host_name=nodelist[i % n_hosts],
-                    gpu_affinity=[(i // n_hosts) % gpus_per_node])),
-                _pickled_fields=['task_backend_specific_kwargs'],
-            )
-            for i in range(N_MATEY_TASKS)
-        ]
-
-    if has_gkeyll:
-        gkeyll_dir = app_cfg['gkeyll_dir'].rstrip('/')
-        gkeyll_exe = f'{gkeyll_dir}/{app_cfg["gkeyll_exe"]}'
-        gkeyll_wd  = f'{gkeyll_dir}/{RHAPSODY_WORK_SUBDIR}'
-        gkeyll_tasks = [
-            ComputeTask(
-                executable=gkeyll_exe,
-                arguments=[],
-                capture_stdio=True,
-                task_backend_specific_kwargs=_pack_psk(gkeyll_wd, Policy(
-                    placement=Policy.Placement.HOST_NAME,
-                    host_name=nodelist[i % n_hosts],
-                    cpu_affinity=[(i // n_hosts) % cores_per_node])),
-                _pickled_fields=['task_backend_specific_kwargs'],
-            )
-            for i in range(N_GKEYLL_TASKS)
-        ]
-
-    say(f'\n— Running rhapsody workload on edge "{edge_name}" '
-        f'(bridge: {bridge_url}) —')
-    if has_matey:
-        say(f'  matey  : {len(matey_tasks)} tasks, concurrency {n_gpus} '
-            f'({n_hosts} host x {gpus_per_node} gpu)')
-        say(f'           wrapper={matey_wrap}, cwd={matey_wd}')
-    if has_gkeyll:
-        say(f'  gkeyll : {len(gkeyll_tasks)} tasks, concurrency {n_cores} '
-            f'({n_hosts} host x {cores_per_node} core)')
-        say(f'           exe={gkeyll_exe}, cwd={gkeyll_wd}')
-
-    backend = await rhapsody.get_backend(
-        'edge', bridge_url=bridge_url, edge_name=edge_name)
-
-    # Per-kind counters, inspected after gather for the summary line.
-    counts = {'matey':  {'done': 0, 'failed': 0},
-              'gkeyll': {'done': 0, 'failed': 0}}
-
-    # ``Session(work_dir=…)`` is a client-side setting (rhapsody calls
-    # ``os.makedirs(backend._work_dir)`` locally) — we can't pass the
-    # remote matey/gkeyll paths there.  Per-task ``cwd`` rides through
-    # the ``process_template`` instead.
-    progress, tids = _make_progress(len(matey_tasks), len(gkeyll_tasks))
-
-    async with Session(backends=[backend]) as session:
-        # Use 1 as a no-op cap when a kind isn't running (its task list is
-        # empty, so no coro will ever acquire that semaphore).
-        sem_gpu  = asyncio.Semaphore(n_gpus  or 1)
-        sem_core = asyncio.Semaphore(n_cores or 1)
-
-        async def run_one(task, kind, sem):
-            async with sem:
-                await session.submit_tasks([task])
-                try:
-                    await task
-                    counts[kind]['done'] += 1
-                except BaseException:
-                    counts[kind]['failed'] += 1
-                if progress:
-                    c = counts[kind]
-                    progress.update(tids[kind], advance=1,
-                                    done=c['done'], failed=c['failed'])
-
-        coros  = [run_one(t, 'matey',  sem_gpu)  for t in matey_tasks]
-        coros += [run_one(t, 'gkeyll', sem_core) for t in gkeyll_tasks]
-
-        if progress:
-            with progress:
-                await asyncio.gather(*coros, return_exceptions=True)
-        else:
-            await asyncio.gather(*coros, return_exceptions=True)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 #  Teardown — only touch resources THIS SCRIPT created.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def teardown(bc, created):
     """Cancel jobs we submitted and disconnect IRI endpoints we connected."""
-    say('\n— Tearing down resources we created —')
+    print('\n— Tearing down resources we created —')
 
     # 1. Cancel IRI jobs
     for c in created:
@@ -1250,9 +1088,9 @@ def teardown(bc, created):
             continue
         try:
             c['iri'].cancel_job(c['resource_id'], c['job_id'])
-            say(f'  cancelled IRI job {c["job_id"]}@{c["endpoint"]}')
+            print(f'  cancelled IRI job {c["job_id"]}@{c["endpoint"]}')
         except Exception as exc:
-            say(f'  could not cancel IRI job {c["job_id"]}: {exc}')
+            print(f'  could not cancel IRI job {c["job_id"]}: {exc}')
 
     # 2. Cancel PsiJ jobs
     for c in created:
@@ -1260,9 +1098,9 @@ def teardown(bc, created):
             continue
         try:
             c['psij'].cancel_job(c['job_id'])
-            say(f'  cancelled PsiJ job {c["job_id"]} on {c["parent_edge"]}')
+            print(f'  cancelled PsiJ job {c["job_id"]} on {c["parent_edge"]}')
         except Exception as exc:
-            say(f'  could not cancel PsiJ job {c["job_id"]}: {exc}')
+            print(f'  could not cancel PsiJ job {c["job_id"]}: {exc}')
 
     # 3. Disconnect IRI endpoints
     iri_eps = {c['endpoint'] for c in created if c['kind'] == 'iri'}
@@ -1271,85 +1109,9 @@ def teardown(bc, created):
         for ep in iri_eps:
             try:
                 cx.disconnect(ep)
-                say(f'  disconnected IRI endpoint {ep}')
+                print(f'  disconnected IRI endpoint {ep}')
             except Exception as exc:
-                say(f'  could not disconnect IRI {ep}: {exc}')
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Demo-mode driver — auto-pick perlmutter PsiJ, no prompts, 7-step trace.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _main_demo(bc, bridge_url):
-    """Auto-run the perlmutter PsiJ path with MACHINE_DEFAULTS values.
-
-    Fail-fast at every boundary via ``abort()`` — no Python tracebacks.
-    Mirrors the interactive flow's structure but skips ``select_many``
-    and ``configure_psij`` (defaults are taken verbatim) and skips IRI
-    target discovery entirely.
-    """
-    step(1, 'connect bridge', bridge_url)
-
-    target = _find_perlmutter_psij(bc)
-    if not target:
-        abort("no 'perlmutter' login edge with PsiJ found in bridge "
-              "topology.  Start the parent edge on Perlmutter first.")
-    edge_name, executor = target
-    step(2, 'pick target', f'{edge_name} (psij/{executor})')
-
-    cfg = dict(MACHINE_DEFAULTS['perlmutter'])
-    cfg['executor'] = executor
-    qos_str = f', qos={cfg["qos"]}' if cfg.get('qos') else ''
-    step(3, 'configure',
-         f'{cfg["n_nodes"]} node x {cfg["gpus_per_node"]} gpu '
-         f'x {cfg["cores_per_node"]} core, {cfg["walltime_min"]}m walltime, '
-         f'queue={cfg["queue_name"]}{qos_str}')
-
-    created = []
-    try:
-        try:
-            rec = launch_psij(bc, edge_name, cfg, bridge_url)
-        except Exception as exc:
-            abort(f'launch_psij failed: {exc}')
-        created.append(rec)
-        step(4, 'submit child edge',
-             f'job={rec["job_id"][:8]}…  edge={rec["edge_name"]}')
-
-        t0 = time.time()
-        try:
-            first = wait_for_first_edge(bc, [rec['edge_name']])
-        except Exception as exc:
-            abort(f'wait_for_first_edge failed: {exc}')
-        step(5, 'await child edge', f'up after {int(time.time() - t0)}s')
-
-        # Fetch the child edge's allocated hostnames via queue_info.  These
-        # become the ``host_name`` field of each task's Policy in step 6,
-        # so dragon's scheduler is forced onto a (host, gpu/cpu) slot we
-        # picked rather than relying on its internal round-robin.
-        try:
-            nodelist = bc.get_edge_client(first).get_plugin('queue_info').nodelist()
-        except Exception as exc:
-            abort(f'queue_info.nodelist failed: {exc}')
-        if not nodelist:
-            abort(f'edge {first!r} reported empty nodelist (queue_info not '
-                  f'loaded, or edge not inside a batch allocation)')
-        n_hosts = len(nodelist)
-        n_gpus  = n_hosts * (cfg.get('gpus_per_node')  or 0)
-        n_cores = n_hosts * (cfg.get('cores_per_node') or 0)
-        step(6, 'run rhapsody',
-             f'{n_hosts} hosts  '
-             f'matey {N_MATEY_TASKS} (cap {n_gpus})  '
-             f'gkeyll {N_GKEYLL_TASKS} (cap {n_cores})')
-
-        try:
-            asyncio.run(submit_rhapsody_workload(
-                bridge_url, first, rec.get('cfg') or cfg, nodelist))
-        except Exception as exc:
-            abort(f'workload failed: {exc}')
-
-    finally:
-        step(7, 'teardown', f'cancelling {len(created)} psij job(s)')
-        teardown(bc, created)
+                print(f'  could not disconnect IRI {ep}: {exc}')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1365,23 +1127,15 @@ def main():
     # second one.  flock is held until this process exits (kernel auto-
     # releases on close).
     import fcntl
-    _lock = open('/tmp/amsc.lock', 'w')
+    _lock = open('/tmp/matey.lock', 'w')
     try:    fcntl.flock(_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        sys.exit('another amsc.py is already running; kill it first.')
+        sys.exit('another matey.py is already running; kill it first.')
 
     # 1. Connect to the bridge.  BridgeClient self-resolves URL + cert
     #    via radical.edge.utils (CLI > env > file).
     bc         = BridgeClient()
     bridge_url = bc.url
-
-    if DEMO_MODE:
-        try:
-            _main_demo(bc, bridge_url)
-        finally:
-            bc.close()
-        return
-
     print(f'Bridge: {bridge_url}')
     try:
         # 2. Discover targets and prompt for selection.
@@ -1427,32 +1181,22 @@ def main():
                     print(f'\n— launch failed for {label}: {exc} —')
                     print('  (continuing with remaining targets)')
 
-            # 4. Wait for the first edge to register, then run the workflow.
+            # 4. Wait for the first edge to register, then prepare the
+            #    application environment on it (env_runner_<name>.sh
+            #    per non-empty env_setup entry) and run the workflow.
             if not expected_edges:
                 sys.exit('No targets launched successfully — nothing to run.')
             first = wait_for_first_edge(bc, expected_edges)
             print(f'\n— First edge up: {first} —')
-            matched = next((r for r in created if r.get('edge_name') == first),
-                           None)
-            matched_cfg = (matched or {}).get('cfg') or {}
 
-            if WORKLOAD == 'rose':
-                asyncio.run(run_rose_workflow(bridge_url, first, matched_cfg))
-            elif WORKLOAD == 'rhapsody':
-                # See _main_demo for why we fetch the nodelist here.
-                try:
-                    nodelist = bc.get_edge_client(first) \
-                                 .get_plugin('queue_info').nodelist()
-                except Exception as exc:
-                    sys.exit(f'queue_info.nodelist failed for {first}: {exc}')
-                if not nodelist:
-                    sys.exit(f'edge {first!r} reported empty nodelist '
-                             '(queue_info not loaded, or edge not in alloc)')
-                asyncio.run(submit_rhapsody_workload(bridge_url, first,
-                                                    matched_cfg, nodelist))
-            else:
-                sys.exit(f'unknown WORKLOAD={WORKLOAD!r} '
-                         f"(expected 'rose' or 'rhapsody')")
+            cfg     = find_target_cfg(first, created)
+            app_cfg = dict(cfg.get('app') or {})
+            print(f'\n— Staging env runners on {first} —')
+            runners = stage_env_runners(bc.get_edge_client(first),
+                                        cfg.get('env_setup'))
+
+            asyncio.run(run_rose_workflow(bridge_url, first,
+                                          app_cfg, runners))
 
         finally:
             # 5. Tear down what we created — runs whether the workflow

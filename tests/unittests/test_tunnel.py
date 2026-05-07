@@ -119,12 +119,16 @@ def test_cleanup_tunnel_falls_back_to_kill():
 # EdgeService._open_tunnel
 # ---------------------------------------------------------------------------
 
-def _make_edge_service(bridge_url='https://bridge:8000', tunnel_via=None):
-    """Build an EdgeService without going through the plugin loader."""
+def _make_edge_service(bridge_url='http://bridge:8000', tunnel_via=None):
+    """Build an EdgeService without going through the plugin loader.
+
+    Default URL uses ``http://`` (not ``https://``) so the cert
+    resolution path is skipped — these tests don't exercise TLS.
+    """
     from radical.edge.service import EdgeService
     with patch('radical.edge.service.EdgeService._load_plugins_from_filter'):
-        svc = EdgeService(bridge_url=bridge_url, name='edge1', tunnel=True,
-                          tunnel_via=tunnel_via)
+        svc = EdgeService(bridge_url=bridge_url, name='edge1',
+                          tunnel='forward', tunnel_via=tunnel_via)
     return svc
 
 
@@ -138,7 +142,7 @@ def test_open_tunnel_uses_explicit_via(tmp_path, monkeypatch,
 
     proc = _FakeProc()
     with patch('subprocess.Popen', return_value=proc):
-        asyncio.run(svc._open_tunnel())
+        asyncio.run(svc._open_tunnel_forward())
 
     assert f'localhost:{port}' in svc._bridge_url
     assert svc._tunnel_proc is proc
@@ -154,7 +158,7 @@ def test_open_tunnel_falls_back_to_pbs_o_host(tmp_path, monkeypatch,
 
     proc = _FakeProc()
     with patch('subprocess.Popen', return_value=proc) as popen:
-        asyncio.run(svc._open_tunnel())
+        asyncio.run(svc._open_tunnel_forward())
     argv = popen.call_args[0][0]
     assert argv[-1] == 'aurora-uan-0010'
     assert f'localhost:{port}' in svc._bridge_url
@@ -169,7 +173,7 @@ def test_open_tunnel_falls_back_to_slurm_submit_host(tmp_path, monkeypatch,
 
     proc = _FakeProc()
     with patch('subprocess.Popen', return_value=proc) as popen:
-        asyncio.run(svc._open_tunnel())
+        asyncio.run(svc._open_tunnel_forward())
     argv = popen.call_args[0][0]
     assert argv[-1] == 'login3'
 
@@ -181,7 +185,7 @@ def test_open_tunnel_raises_without_login_host(tmp_path, monkeypatch):
     svc = _make_edge_service()
 
     with pytest.raises(RuntimeError, match='no login host'):
-        asyncio.run(svc._open_tunnel())
+        asyncio.run(svc._open_tunnel_forward())
 
 
 def test_stop_terminates_tunnel_process(tmp_path, monkeypatch):

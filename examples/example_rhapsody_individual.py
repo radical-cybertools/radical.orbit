@@ -23,7 +23,6 @@ Usage:
 
 import argparse
 import asyncio
-import os
 import time
 
 import rhapsody
@@ -53,33 +52,14 @@ async def main():
 
     args = parse_args()
 
-    # ---- discover bridge / edge ---
-    bridge_url = os.environ.get('RADICAL_BRIDGE_URL',
-                                'https://localhost:8000')
-
-    from radical.edge import BridgeClient
-    bc   = BridgeClient()
-    eids = bc.list_edges()
-    bc.close()
-
-    if not eids:
-        print("No edges found.")
-        return
-
-    edge_name = eids[0]
-    print(f"Bridge:         {bridge_url}")
-    print(f"Edge:           {edge_name}")
-    print(f"Tasks:          {args.tasks}")
-    print(f"Batch window:   {args.batch_window}s")
-    print(f"Batch limit:    {args.batch_limit}")
-    print(f"Notify window:  {args.notify_window}s")
-    print(f"Notify limit:   {args.notify_limit}")
-
     # ---- set up Rhapsody session with Edge backend ---
+    # Edge auto-discovery: ``get_backend('edge')`` with no
+    # ``bridge_url`` / ``edge_name`` resolves the bridge URL via
+    # radical.edge.utils and selects the first connected edge
+    # advertising the rhapsody plugin.  ``await backend`` raises
+    # RuntimeError if no candidate is found.
     backend = rhapsody.get_backend(
         'edge',
-        bridge_url=bridge_url,
-        edge_name=edge_name,
         backends=['noop'],
         batch_window=args.batch_window,
         batch_limit=args.batch_limit,
@@ -87,6 +67,15 @@ async def main():
         notify_batch_size=args.notify_limit,
     )
     backend = await backend
+
+    print(f"Bridge:         {backend._bridge_url}")
+    print(f"Edge:           {backend._edge_name}")
+    print(f"Tasks:          {args.tasks}")
+    print(f"Batch window:   {args.batch_window}s")
+    print(f"Batch limit:    {args.batch_limit}")
+    print(f"Notify window:  {args.notify_window}s")
+    print(f"Notify limit:   {args.notify_limit}")
+
     session = rhapsody.Session(backends=[backend])
 
     # ---- submit tasks individually ---

@@ -34,7 +34,9 @@ def test_sysinfo_provider_basic():
     # Check content via keys
     sys = metrics['system']
     assert 'hostname' in sys
-    assert 'uptime' in sys
+    assert 'user'     in sys
+    assert 'uptime'   in sys
+    assert isinstance(sys['user'], str)
 
     cpu = metrics['cpu']
     assert 'model' in cpu

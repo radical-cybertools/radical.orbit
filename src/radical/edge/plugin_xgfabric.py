@@ -1291,10 +1291,17 @@ class PluginXGFabric(Plugin):
         """Create session with workdir, edge name, and bridge connection info."""
         edge_name = getattr(self._app.state, 'edge_name', 'local')
 
-        # Get bridge URL from edge service
+        # Get bridge URL from edge service.  Cert path comes from the
+        # shared resolver (CLI > env > file) — we ignore CLI here since
+        # this is the bridge-internal session-creation path.
+        from . import utils
         edge_service = getattr(self._app.state, 'edge_service', None)
-        bridge_url = getattr(edge_service, '_bridge_url', None) if edge_service else None
-        bridge_cert = os.environ.get('RADICAL_BRIDGE_CERT')
+        bridge_url   = getattr(edge_service, '_bridge_url', None) if edge_service else None
+        try:
+            cert_path, _ = utils.resolve_bridge_cert()
+            bridge_cert  = str(cert_path)
+        except (ValueError, FileNotFoundError):
+            bridge_cert  = None
 
         log.info("[XGFabric] _create_session: sid=%s  edge=%s  bridge_url=%s  cached_edges=%s",
                  sid, edge_name, bridge_url, list(self._connected_edges.keys()))

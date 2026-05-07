@@ -60,6 +60,30 @@ def _assert_json_serializable(obj, path=""):
             f"{type(obj).__name__} = {repr(obj)!s:.200}")
 
 
+def _json_safe(v):
+    """Coerce *v* to a JSON-serializable form.
+
+    Backend-specific kwargs (e.g. dragon ``Policy`` objects passed via
+    ``task_backend_specific_kwargs``) are not JSON-encodable; without
+    this, any read of the cached task dict (list_tasks / wait_tasks /
+    notification serialization) raises ``TypeError`` and the response
+    or WS frame is dropped.  Falls back through ``to_dict`` / recursion
+    / ``str``.
+    """
+    try:
+        json.dumps(v)
+        return v
+    except (TypeError, ValueError):
+        if hasattr(v, 'to_dict'):
+            try:                  return _json_safe(v.to_dict())
+            except Exception:     pass
+        if isinstance(v, dict):
+            return {str(k): _json_safe(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple, set)):
+            return [_json_safe(x) for x in v]
+        return str(v)
+
+
 # ---------------------------------------------------------------------------
 # Edge-side session
 # ---------------------------------------------------------------------------
@@ -98,6 +122,7 @@ class RhapsodySession(PluginSession):
         self.backend_names       = backend_names or ['dragon_v3']
         self.allow_pickled_tasks = allow_pickled_tasks
         self._rh_session         = None
+        self._telemetry          = None
         self._tasks: dict[str, dict] = {}
 
         # Async init tracking
@@ -141,6 +166,10 @@ class RhapsodySession(PluginSession):
                 backends.append(b)
 
             self._rh_session = rh.Session(backends=backends, uid=self._sid)
+
+            self._telemetry = await self._rh_session.start_telemetry(
+                resource_poll_interval=0.1, checkpoint_path=f"telemetry-output"
+                )
 
             # Register state-change callbacks for intermediate notifications
             self._notified_states: dict[str, str] = {}
@@ -614,7 +643,7 @@ class RhapsodySession(PluginSession):
                 except (TypeError, ValueError):
                     d['return_value'] = str(rv)
 
-        return d
+        return {k: _json_safe(v) for k, v in d.items()}
 
     _NOTIFICATION_KEYS = {'uid', 'state', 'exit_code',
                           'return_value', '_return_value_encoding',
@@ -703,6 +732,9 @@ class RhapsodySession(PluginSession):
         Shutdown RHAPSODY session and clean up.
         """
         if self._rh_session:
+            if self._telemetry is not None:
+                print(json.dumps(self._telemetry.summary(), indent=4), flush=True)
+                self._telemetry = None
             await self._rh_session.close()
             self._rh_session = None
         self._tasks = {}

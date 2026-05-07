@@ -183,20 +183,20 @@ async def test_submit_tunneled_no_tunnel(mock_psij):
             "arguments": ["--url", "http://bridge:8000", "-n", "test-edge"]
         },
         "executor": "local",
-        "tunnel": False
+        "tunnel": "none",
     }
     resp = client.post(f"{plugin.namespace}/submit_tunneled/{sid}", json=payload)
     assert resp.status_code == 200
     data = resp.json()
     assert data['job_id'] == 'edge-job.1'
     assert data['edge_name'] == 'test-edge'
-    # No watcher created when tunnel=False
+    # No watcher created when tunnel='none'
     assert 'test-edge' not in plugin._watchers
 
 
 @pytest.mark.asyncio
 async def test_submit_tunneled_with_tunnel(mock_psij):
-    """submit_tunneled with tunnel=True injects --tunnel into args and spawns watcher."""
+    """submit_tunneled with tunnel='forward' injects --tunnel into args and spawns watcher."""
     app = FastAPI()
     plugin = PluginPSIJ(app)
 
@@ -220,7 +220,7 @@ async def test_submit_tunneled_with_tunnel(mock_psij):
                 "arguments": ["--url", "http://bridge:8000", "-n", "tunnel-edge"],
             },
             "executor": "slurm",
-            "tunnel": True
+            "tunnel": "forward",
         }
         resp = client.post(f"{plugin.namespace}/submit_tunneled/{sid}", json=payload)
         assert resp.status_code == 200
@@ -230,9 +230,12 @@ async def test_submit_tunneled_with_tunnel(mock_psij):
         # Watcher task was created
         assert mock_create_task.called
 
-        # --tunnel must have been injected into the job arguments
+        # --tunnel forward must have been injected into the job arguments
         spec_instance = mock_psij.JobSpec.return_value
         assert '--tunnel' in spec_instance.arguments
+        idx = spec_instance.arguments.index('--tunnel')
+        assert spec_instance.arguments[idx + 1] == 'forward'
+        assert '--tunnel-via' in spec_instance.arguments
 
 
 @pytest.mark.asyncio
@@ -312,14 +315,25 @@ async def _drive_watcher(plugin, state_seq, tmp_path, caplog):
     fake_batch.name = 'slurm'
     fake_batch.job_state = _next_state
     relay_file = tmp_path / 'edge.port'
-    with patch('radical.edge.batch_system.detect_batch_system',
-               return_value=fake_batch), \
-         patch('radical.edge.plugin_psij.asyncio.sleep',
-               new=AsyncMock(return_value=None)):
-        caplog.set_level(_logging.WARNING, logger='radical.edge')
-        await asyncio.wait_for(
-            plugin._tunnel_watcher('edge1', '12345', relay_file),
-            timeout=5.0)
+    # The radical.edge logger has propagate=False so external
+    # ``basicConfig(force=True)`` calls during runtime can't wipe its
+    # file handler.  pytest's ``caplog`` attaches its capture handler
+    # only to the root logger, so we have to add it to radical.edge
+    # manually for these tests to see the warning.
+    re_log = _logging.getLogger('radical.edge')
+    re_log.addHandler(caplog.handler)
+    try:
+        with patch('radical.edge.batch_system.detect_batch_system',
+                   return_value=fake_batch), \
+             patch('radical.edge.plugin_psij.asyncio.sleep',
+                   new=AsyncMock(return_value=None)):
+            caplog.set_level(_logging.WARNING, logger='radical.edge')
+            await asyncio.wait_for(
+                plugin._tunnel_watcher('edge1', '12345', 'edge-job.x',
+                                        relay_file, 'forward'),
+                timeout=5.0)
+    finally:
+        re_log.removeHandler(caplog.handler)
     return idx['i']
 
 
@@ -365,3 +379,151 @@ async def test_tunnel_watcher_tolerates_initial_unknown(tmp_path, caplog):
     # bailed on the second UNKNOWN streak (3 more polls) → ~7 polls total.
     assert polls <= 8, f"watcher polled too many times: {polls}"
     assert any(_VANISHED_MSG in r.message for r in caplog.records)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Reverse-tunnel watcher
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_reverse_tunnel_watcher_happy_path(tmp_path, monkeypatch):
+    """Reverse mode: job RUNNING → spawn ssh -R succeeds → port file written
+    → watcher sees the rendezvous file and reports active."""
+    import logging as _logging
+    from radical.edge import tunnel as _tunnel
+    monkeypatch.setattr(_tunnel, 'RELAY_BASE', tmp_path)
+
+    app = FastAPI()
+    plugin = PluginPSIJ(app)
+    app.state.bridge_url = 'https://bridge:8000'
+
+    fake_batch = MagicMock()
+    fake_batch.name = 'slurm'
+    # Normalised state vocabulary: PENDING / RUNNING / DONE / FAILED / etc.
+    states = iter(['PENDING', 'RUNNING', 'RUNNING', 'DONE'])
+    fake_batch.job_state = lambda _nid: next(states, 'DONE')
+    fake_batch.job_nodes = lambda _nid: ['nid001']
+
+    relay_file = tmp_path / 'edge-r.port'
+
+    def fake_spawn(compute_host, bhost, bport, edge_name,
+                   allocate_timeout=30.0):
+        # Simulate sshd allocating remote port 54321 + writing rendezvous file
+        relay_file.write_text('54321')
+        proc = MagicMock()
+        proc.poll.return_value = None
+        return proc, 54321
+
+    async def _to_thread_inline(fn, *args, **kw):
+        return fn(*args, **kw)
+
+    with patch('radical.edge.batch_system.detect_batch_system',
+               return_value=fake_batch), \
+         patch('radical.edge.tunnel.spawn_reverse_tunnel',
+               side_effect=fake_spawn), \
+         patch('radical.edge.plugin_psij.asyncio.sleep',
+               new=AsyncMock(return_value=None)), \
+         patch('radical.edge.plugin_psij.asyncio.to_thread',
+               new=_to_thread_inline):
+        await asyncio.wait_for(
+            plugin._tunnel_watcher('edge-r', '12345', 'edge-job.r',
+                                    relay_file, 'reverse'),
+            timeout=5.0)
+
+    # No tunnel-failure recorded; the job_id is NOT in _failure_reasons
+    assert 'edge-job.r' not in plugin._failure_reasons
+
+
+@pytest.mark.asyncio
+async def test_reverse_tunnel_watcher_spawn_failure(tmp_path, monkeypatch):
+    """Reverse mode: ssh -R spawn raises → watcher records reason and
+    fires a cancel; ``get_job_status`` would surface FAILED + the reason."""
+    import logging as _logging
+    from radical.edge import tunnel as _tunnel
+    monkeypatch.setattr(_tunnel, 'RELAY_BASE', tmp_path)
+
+    app = FastAPI()
+    plugin = PluginPSIJ(app)
+    app.state.bridge_url = 'https://bridge:8000'
+
+    fake_batch = MagicMock()
+    fake_batch.name = 'slurm'
+    states = iter(['PENDING', 'RUNNING'])
+    fake_batch.job_state = lambda _nid: next(states, 'RUNNING')
+    fake_batch.job_nodes = lambda _nid: ['nid001']
+
+    relay_file = tmp_path / 'edge-rfail.port'
+
+    def fake_spawn_raises(*a, **kw):
+        raise RuntimeError("ssh: connection refused (gatewayports denied)")
+
+    cancelled: list = []
+
+    async def fake_dispatch_cancel(job_id):
+        cancelled.append(job_id)
+
+    with patch('radical.edge.batch_system.detect_batch_system',
+               return_value=fake_batch), \
+         patch('radical.edge.tunnel.spawn_reverse_tunnel',
+               side_effect=fake_spawn_raises), \
+         patch.object(plugin, '_dispatch_cancel',
+                       side_effect=fake_dispatch_cancel), \
+         patch('radical.edge.plugin_psij.asyncio.sleep',
+               new=AsyncMock(return_value=None)):
+        await asyncio.wait_for(
+            plugin._tunnel_watcher('edge-rfail', '54321',
+                                    'edge-job.rfail', relay_file,
+                                    'reverse'),
+            timeout=5.0)
+
+    assert 'edge-job.rfail' in plugin._failure_reasons
+    assert 'connection refused' in plugin._failure_reasons['edge-job.rfail']
+    assert 'edge-job.rfail' in cancelled
+
+
+def test_get_job_status_overrides_cancelled_to_failed(mock_psij):
+    """When a job_id is in _failure_reasons, get_job_status synthesises
+    state='FAILED' + error.  Operator-cancelled jobs (no entry) keep
+    their natural CANCELLED state."""
+    from unittest.mock import patch as _patch
+    app = FastAPI()
+    plugin = PluginPSIJ(app)
+    plugin._failure_reasons['edge-job.99'] = 'reverse SSH tunnel: oops'
+
+    client = TestClient(app)
+    resp = client.post(f"{plugin.namespace}/register_session")
+    sid = resp.json()['sid']
+
+    async def _fwd(self, *args, **kwargs):
+        # Pretend PsiJ reports CANCELLED for the requested job_id.
+        return {'job_id': kwargs.get('job_id'), 'state': 'CANCELLED'}
+
+    with _patch.object(PluginPSIJ, '_forward', _fwd):
+        # Failure-tagged job: state must be overridden to FAILED + error.
+        resp = client.get(f"{plugin.namespace}/status/{sid}/edge-job.99")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data['state'] == 'FAILED'
+        assert 'oops' in data['error']
+
+        # Untagged job: natural CANCELLED state preserved.
+        resp = client.get(f"{plugin.namespace}/status/{sid}/edge-job.42")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data['state'] == 'CANCELLED'
+        assert 'error' not in data
+
+
+def test_submit_tunneled_rejects_boolean_tunnel(mock_psij):
+    """Boolean tunnel field is no longer accepted — must be a string."""
+    app = FastAPI()
+    plugin = PluginPSIJ(app)
+    client = TestClient(app)
+    resp = client.post(f"{plugin.namespace}/register_session")
+    sid = resp.json()['sid']
+
+    payload = {"job_spec": {"executable": "x", "arguments": ["-n", "e"]},
+               "executor": "local", "tunnel": True}
+    resp = client.post(f"{plugin.namespace}/submit_tunneled/{sid}", json=payload)
+    assert resp.status_code == 400
+    assert 'tunnel must be one of' in resp.json()['detail']

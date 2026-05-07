@@ -1,34 +1,4 @@
-#!/usr/bin/env python3
-"""radical-edge-run — per-rule wrapper for the task dispatcher.
 
-Invoked by Makeflow after ``radical-edge-makeflow-prep`` rewrites each
-rule's command.  Not normally invoked by humans directly.
-
-Usage:
-    radical-edge-run --edge=NAME --pool=NAME --run-id=ID \
-                     [--priority=N] [--in FILE [FILE ...]] \
-                     [--out FILE [FILE ...]] \
-                     -- <command> [<args>...]
-
-Flow:
-    1. Register (or reconnect to) a task-dispatcher session on the edge.
-    2. Upload each declared input into the pool's scratch dir.
-    3. Submit the task with a stable task_id.
-    4. Block on SSE task_status until terminal.
-    5. Download each declared output into the local Makeflow workdir.
-    6. Exit with the task's exit_code.
-
-The task_id is derived from
-``sha1(cmd + inputs + outputs + run_id)[:16]``.  Stability across retries
-of the same Makeflow run makes the dispatcher's cached-state logic
-handle re-executions correctly (see design doc §3.3).
-
-See plans/task_dispatcher_design.md for the full architecture.
-"""
-
-from __future__ import annotations
-
-import argparse
 import base64
 import hashlib
 import logging

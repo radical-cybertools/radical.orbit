@@ -23,7 +23,6 @@ Usage:
 """
 
 import asyncio
-import os
 import sys
 import time
 
@@ -132,32 +131,19 @@ async def main():
                        16384, 32768, 65536
                        ]
 
-    # ---- discover bridge / edge ---
-    bridge_url = os.environ.get('RADICAL_BRIDGE_URL', 'https://localhost:8000')
+    # ---- set up Rhapsody session with Edge backend ---
+    # Edge auto-discovery: ``get_backend('edge')`` with no
+    # ``bridge_url`` / ``edge_name`` resolves the bridge URL via
+    # radical.edge.utils and selects the first connected edge
+    # advertising the rhapsody plugin.  ``await backend`` raises
+    # RuntimeError if no candidate is found.
+    backend = rhapsody.get_backend('edge', backends=['noop'])
+    backend = await backend       # async init (registers remote session)
 
-    # Use a temporary BridgeClient just to find the first edge name
-    from radical.edge import BridgeClient
-    bc   = BridgeClient()
-    eids = bc.list_edges()
-    bc.close()
-
-    if not eids:
-        print("No edges found.")
-        return
-
-    edge_name = eids[0]
-    out(f"Bridge:  {bridge_url}")
-    out(f"Edge:    {edge_name}")
+    out(f"Bridge:  {backend._bridge_url}")
+    out(f"Edge:    {backend._edge_name}")
     out(f"Batches: {batch_sizes}")
 
-    # ---- set up Rhapsody session with Edge backend ---
-    backend = rhapsody.get_backend(
-        'edge',
-        bridge_url=bridge_url,
-        edge_name=edge_name,
-        backends=['noop'],
-    )
-    backend = await backend   # async init (registers remote session)
     session = rhapsody.Session(backends=[backend])
 
     await run_pass(session, batch_sizes, hetero=False)

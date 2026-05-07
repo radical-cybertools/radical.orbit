@@ -141,6 +141,7 @@ function renderSysinfo(m) {
       <div class="card-title">🖥️ System</div>
       <div class="grid4">
         <div class="metric-box"><label>Hostname</label><div class="val" style="font-size:.85rem">${sys.hostname || '?'}</div></div>
+        <div class="metric-box"><label>User</label><div class="val" style="font-size:.85rem">${sys.user || '?'}</div></div>
         <div class="metric-box"><label>Kernel</label><div class="val" style="font-size:.85rem">${sys.kernel || '?'}</div></div>
         <div class="metric-box"><label>Arch</label><div class="val" style="font-size:.85rem">${sys.arch || '?'}</div></div>
         <div class="metric-box"><label>Uptime</label><div class="val" style="font-size:.85rem">${formatUptime(sys.uptime)}</div></div>

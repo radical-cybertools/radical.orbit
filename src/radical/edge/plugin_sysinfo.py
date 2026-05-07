@@ -5,6 +5,7 @@ __copyright__ = 'Copyright 2024, RADICAL@Rutgers'
 __license__   = 'MIT'
 
 
+import getpass
 import glob
 import os
 import re
@@ -365,12 +366,21 @@ class SysInfoProvider:
         uptime = time.time() - boot_time
         unet = platform.uname()
 
+        # ``getpass.getuser()`` checks the standard env vars (LOGNAME /
+        # USER / LNAME / USERNAME) before falling back to pwd lookup —
+        # right answer in the common case, no exception on rootless
+        # container weirdness where pwd lookup might fail.
+        try:    user = getpass.getuser()
+        except Exception:
+            user = ''
+
         metrics = {
             "system": {
                 "hostname": socket.gethostname(),
-                "uptime": uptime,
-                "kernel": f"{unet.system} {unet.release}",
-                "arch": unet.machine
+                "user":     user,
+                "uptime":   uptime,
+                "kernel":   f"{unet.system} {unet.release}",
+                "arch":     unet.machine,
             }
         }
 
