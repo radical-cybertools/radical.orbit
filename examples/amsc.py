@@ -749,15 +749,14 @@ def launch_psij(bc, edge_name, cfg, bridge_url):
         custom_attrs[f'{cfg["executor"]}.gpus-per-node'] = str(cfg['gpus_per_node'])
     if cfg.get('qos'):
         custom_attrs[f'{cfg["executor"]}.qos'] = cfg['qos']
-    # Allocate ``n_nodes`` nodes but launch only ONE wrapper on the head
-    # compute node -- Dragon spawns its own daemons on the rest.  PsiJ's
-    # ResourceSpecV1 can't express this (its ``process_count = node_count
-    # × ppn`` constraint forbids 1 task across N nodes), so we ride
-    # through the slurm.mustache custom_attributes hook: it renders the
-    # ``--nodes`` line *after* the default ResourceSpec block, so SLURM's
-    # last-flag-wins gives us ``--nodes=N --ntasks=1 --ntasks-per-node=1``.
-    if cfg.get('n_nodes'):
-        custom_attrs[f'{cfg["executor"]}.nodes'] = str(cfg['n_nodes'])
+    # ``--nodes=N`` is rendered by PsiJ from spec.resources (set in the
+    # job_spec below) -- a single occurrence avoids the duplicated
+    # ``--nodes`` lines SLURM appears to resolve first-wins on.  We
+    # override ``--ntasks`` here to flip PsiJ's derived
+    # ``process_count = node_count`` (16 tasks across 16 nodes) back
+    # to one wrapper on the head node; Dragon spawns the rest.  SLURM
+    # honours last-wins for ``--ntasks``, so this works.
+    custom_attrs[f'{cfg["executor"]}.ntasks'] = '1'
 
     # Cert is left to the child edge to resolve from
     # ``~/.radical/edge/bridge_cert.pem`` on the target (or via
@@ -776,10 +775,12 @@ def launch_psij(bc, edge_name, cfg, bridge_url):
         'arguments'         : ['--name', child_name, '--url', bridge_url],
         'attributes'        : attrs,
         'custom_attributes' : custom_attrs,
-        # No ``resources`` -- ``--nodes`` rides through ``slurm.nodes``
-        # in custom_attributes so PsiJ's default ResourceSpec
-        # (``--ntasks=1``) stays in place.  See the comment on
-        # ``slurm.nodes`` above.
+        # plugin_psij translates ``resources.node_count`` into
+        # ``ResourceSpecV1(node_count=N)``; PsiJ then renders
+        # ``--nodes=N`` (single occurrence) and derives
+        # ``--ntasks=N --ntasks-per-node=1``.  We flip --ntasks back to
+        # 1 via custom_attributes -- see the slurm.ntasks comment above.
+        'resources'         : {'node_count': cfg['n_nodes']},
         'environment'       : env,
     }
 
