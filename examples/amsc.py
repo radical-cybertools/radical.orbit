@@ -1056,16 +1056,24 @@ async def run_rose_workflow(bridge_url, edge_name, cfg=None):
 #    * ``app.matey_model_dir`` — passed as ``--model_dir``.
 #    * ``app.matey_xgc_dir``   — passed as ``--newxgc_dir``.
 #    * ``gpus_per_node``       — used to derive concurrency
-#                                (``n_nodes * gpus_per_node``) and the
-#                                per-task ``gpu_affinity`` index.
+#                                (``len(nodelist) * gpus_per_node``) and
+#                                the per-task ``gpu_affinity`` index.
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def submit_rhapsody_workload(bridge_url, edge_name, cfg):
+async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
     """Submit matey-inference + gkeyll tasks via the named edge.
 
     Two task families share one Session and run concurrently, mixed by
-    independent Semaphores: matey scales by GPU count (``n_nodes *
-    gpus_per_node``), gkeyll by core count (``n_nodes * cores_per_node``).
+    independent Semaphores: matey scales by GPU count (``n_hosts *
+    gpus_per_node``), gkeyll by core count (``n_hosts * cores_per_node``),
+    where ``n_hosts = len(nodelist)``.
+
+    *nodelist* is the list of compute hostnames in the edge's allocation
+    (from ``queue_info.nodelist()``).  Each task's policy pins it to a
+    specific (host, gpu/core) slot via ``Policy.Placement.HOST_NAME``,
+    so dragon's scheduler is forced onto the slot we picked rather than
+    relying on its internal round-robin.
+
     Either family is skipped when its config block / resource count is
     absent or zero; bails if neither has anything to do.
     """
@@ -1077,11 +1085,11 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg):
             "set WORKLOAD='rose' or populate IRI_DEFAULTS / "
             "MACHINE_DEFAULTS['app'] for this target.")
 
-    n_nodes        = cfg.get('n_nodes')        or 1
+    n_hosts        = len(nodelist) or 1
     gpus_per_node  = cfg.get('gpus_per_node')  or 0
     cores_per_node = cfg.get('cores_per_node') or 0
-    n_gpus         = n_nodes * gpus_per_node
-    n_cores        = n_nodes * cores_per_node
+    n_gpus         = n_hosts * gpus_per_node
+    n_cores        = n_hosts * cores_per_node
 
     has_matey = (n_gpus > 0 and N_MATEY_TASKS > 0
                  and all(app_cfg.get(k) for k in
@@ -1135,8 +1143,10 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg):
                 executable=matey_wrap,
                 arguments=matey_args,
                 capture_stdio=True,
-                task_backend_specific_kwargs=_pack_psk(
-                    matey_wd, Policy(gpu_affinity=[(i // n_nodes) % gpus_per_node])),
+                task_backend_specific_kwargs=_pack_psk(matey_wd, Policy(
+                    placement=Policy.Placement.HOST_NAME,
+                    host_name=nodelist[i % n_hosts],
+                    gpu_affinity=[(i // n_hosts) % gpus_per_node])),
                 _pickled_fields=['task_backend_specific_kwargs'],
             )
             for i in range(N_MATEY_TASKS)
@@ -1151,8 +1161,10 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg):
                 executable=gkeyll_exe,
                 arguments=[],
                 capture_stdio=True,
-                task_backend_specific_kwargs=_pack_psk(
-                    gkeyll_wd, Policy(cpu_affinity=[(i // n_nodes) % cores_per_node])),
+                task_backend_specific_kwargs=_pack_psk(gkeyll_wd, Policy(
+                    placement=Policy.Placement.HOST_NAME,
+                    host_name=nodelist[i % n_hosts],
+                    cpu_affinity=[(i // n_hosts) % cores_per_node])),
                 _pickled_fields=['task_backend_specific_kwargs'],
             )
             for i in range(N_GKEYLL_TASKS)
@@ -1162,11 +1174,11 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg):
         f'(bridge: {bridge_url}) —')
     if has_matey:
         say(f'  matey  : {len(matey_tasks)} tasks, concurrency {n_gpus} '
-            f'({n_nodes} node x {gpus_per_node} gpu)')
+            f'({n_hosts} host x {gpus_per_node} gpu)')
         say(f'           wrapper={matey_wrap}, cwd={matey_wd}')
     if has_gkeyll:
         say(f'  gkeyll : {len(gkeyll_tasks)} tasks, concurrency {n_cores} '
-            f'({n_nodes} node x {cores_per_node} core)')
+            f'({n_hosts} host x {cores_per_node} core)')
         say(f'           exe={gkeyll_exe}, cwd={gkeyll_wd}')
 
     backend = await rhapsody.get_backend(
@@ -1297,16 +1309,28 @@ def _main_demo(bc, bridge_url):
             abort(f'wait_for_first_edge failed: {exc}')
         step(5, 'await child edge', f'up after {int(time.time() - t0)}s')
 
-        n_nodes = cfg['n_nodes']
-        n_gpus  = n_nodes * (cfg.get('gpus_per_node')  or 0)
-        n_cores = n_nodes * (cfg.get('cores_per_node') or 0)
+        # Fetch the child edge's allocated hostnames via queue_info.  These
+        # become the ``host_name`` field of each task's Policy in step 6,
+        # so dragon's scheduler is forced onto a (host, gpu/cpu) slot we
+        # picked rather than relying on its internal round-robin.
+        try:
+            nodelist = bc.get_edge_client(first).get_plugin('queue_info').nodelist()
+        except Exception as exc:
+            abort(f'queue_info.nodelist failed: {exc}')
+        if not nodelist:
+            abort(f'edge {first!r} reported empty nodelist (queue_info not '
+                  f'loaded, or edge not inside a batch allocation)')
+        n_hosts = len(nodelist)
+        n_gpus  = n_hosts * (cfg.get('gpus_per_node')  or 0)
+        n_cores = n_hosts * (cfg.get('cores_per_node') or 0)
         step(6, 'run rhapsody',
+             f'{n_hosts} hosts  '
              f'matey {N_MATEY_TASKS} (cap {n_gpus})  '
              f'gkeyll {N_GKEYLL_TASKS} (cap {n_cores})')
 
         try:
             asyncio.run(submit_rhapsody_workload(
-                bridge_url, first, rec.get('cfg') or cfg))
+                bridge_url, first, rec.get('cfg') or cfg, nodelist))
         except Exception as exc:
             abort(f'workload failed: {exc}')
 
@@ -1402,8 +1426,17 @@ def main():
             if WORKLOAD == 'rose':
                 asyncio.run(run_rose_workflow(bridge_url, first, matched_cfg))
             elif WORKLOAD == 'rhapsody':
+                # See _main_demo for why we fetch the nodelist here.
+                try:
+                    nodelist = bc.get_edge_client(first) \
+                                 .get_plugin('queue_info').nodelist()
+                except Exception as exc:
+                    sys.exit(f'queue_info.nodelist failed for {first}: {exc}')
+                if not nodelist:
+                    sys.exit(f'edge {first!r} reported empty nodelist '
+                             '(queue_info not loaded, or edge not in alloc)')
                 asyncio.run(submit_rhapsody_workload(bridge_url, first,
-                                                    matched_cfg))
+                                                    matched_cfg, nodelist))
             else:
                 sys.exit(f'unknown WORKLOAD={WORKLOAD!r} '
                          f"(expected 'rose' or 'rhapsody')")
