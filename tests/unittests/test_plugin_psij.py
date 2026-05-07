@@ -315,15 +315,25 @@ async def _drive_watcher(plugin, state_seq, tmp_path, caplog):
     fake_batch.name = 'slurm'
     fake_batch.job_state = _next_state
     relay_file = tmp_path / 'edge.port'
-    with patch('radical.edge.batch_system.detect_batch_system',
-               return_value=fake_batch), \
-         patch('radical.edge.plugin_psij.asyncio.sleep',
-               new=AsyncMock(return_value=None)):
-        caplog.set_level(_logging.WARNING, logger='radical.edge')
-        await asyncio.wait_for(
-            plugin._tunnel_watcher('edge1', '12345', 'edge-job.x',
-                                    relay_file, 'forward'),
-            timeout=5.0)
+    # The radical.edge logger has propagate=False so external
+    # ``basicConfig(force=True)`` calls during runtime can't wipe its
+    # file handler.  pytest's ``caplog`` attaches its capture handler
+    # only to the root logger, so we have to add it to radical.edge
+    # manually for these tests to see the warning.
+    re_log = _logging.getLogger('radical.edge')
+    re_log.addHandler(caplog.handler)
+    try:
+        with patch('radical.edge.batch_system.detect_batch_system',
+                   return_value=fake_batch), \
+             patch('radical.edge.plugin_psij.asyncio.sleep',
+                   new=AsyncMock(return_value=None)):
+            caplog.set_level(_logging.WARNING, logger='radical.edge')
+            await asyncio.wait_for(
+                plugin._tunnel_watcher('edge1', '12345', 'edge-job.x',
+                                        relay_file, 'forward'),
+                timeout=5.0)
+    finally:
+        re_log.removeHandler(caplog.handler)
     return idx['i']
 
 
