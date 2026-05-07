@@ -131,6 +131,10 @@ def configure_logging(level: int = logging.INFO,
     logging.getLogger("radical.edge").setLevel(level)
 
 
-# Auto-configure on import with INFO level
-configure_logging()
+# Auto-configure on import.  Honor ``RADICAL_EDGE_LOG_LEVEL`` so that
+# client scripts (amsc.py, etc.) inherit the level via env without
+# needing a code edit; entry-point scripts call ``configure_logging``
+# again after argparse, so this has no effect on them.
+_env_level = os.environ.get('RADICAL_EDGE_LOG_LEVEL', 'INFO').upper()
+configure_logging(getattr(logging, _env_level, logging.INFO))
 
