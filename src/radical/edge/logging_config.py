@@ -126,23 +126,24 @@ def configure_logging(level: int = logging.INFO,
             datefmt='%Y-%m-%d %H:%M:%S'))
         handlers.append(file_handler)
 
-    # Attach handlers to the ``radical.edge`` logger directly with
-    # propagate=False so external libraries that call
+    # Attach handlers to the ``radical.edge`` and ``rhapsody`` loggers
+    # directly with propagate=False so external libraries that call
     # ``logging.basicConfig(force=True, ...)`` during their own init
     # — Dragon's launcher and rhapsody V3 backend bringup are the
     # observed offenders — cannot wipe our file handler.  Without
-    # this, all radical.edge log output past V3 init silently vanishes
-    # from the file, which is exactly what we hit at 16-node scale.
+    # this, log output past V3 init silently vanishes from the file,
+    # which is exactly what we hit at 16-node scale.
     #
     # Idempotent across re-calls: drop any handlers we previously
     # attached before re-installing.
-    re_log = logging.getLogger("radical.edge")
-    for h in list(re_log.handlers):
-        re_log.removeHandler(h)
-    for h in handlers:
-        re_log.addHandler(h)
-    re_log.setLevel(level)
-    re_log.propagate = False
+    for name in ('radical.edge', 'rhapsody'):
+        protected = logging.getLogger(name)
+        for h in list(protected.handlers):
+            protected.removeHandler(h)
+        for h in handlers:
+            protected.addHandler(h)
+        protected.setLevel(level)
+        protected.propagate = False
 
     # Root is still configured so third-party libraries (psij, dragon,
     # websockets, uvicorn) keep showing up in stdout / file.  This
