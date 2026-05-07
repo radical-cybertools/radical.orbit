@@ -74,6 +74,15 @@ class BatchSystem(ABC):
         """
 
     @abstractmethod
+    def nodelist(self) -> list:
+        """Return the expanded list of hostnames in *this* edge's allocation.
+
+        Returns an empty list when the edge is not running inside a job (i.e.
+        on a login node) or when the scheduler doesn't expose the info.
+        Hostnames are returned one per node, in scheduler-reported order.
+        """
+
+    @abstractmethod
     def cancel(self, native_id) -> None:
         """Cancel *native_id*. Raises RuntimeError on failure."""
 
@@ -128,6 +137,9 @@ class NullBatchSystem(BatchSystem):
         return STATE_UNKNOWN
 
     def job_nodes(self, native_id) -> list:
+        return []
+
+    def nodelist(self) -> list:
         return []
 
     def cancel(self, native_id) -> None:
