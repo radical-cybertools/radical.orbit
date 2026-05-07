@@ -643,7 +643,7 @@ def launch_iri(bc, endpoint, cfg, bridge_url):
         'executable' : wrapper,
         'arguments'  : args,
         'name'       : edge_name,
-        'resources'  : {'node_count': cfg['n_nodes'], 'process_count': 1},
+        'resources'  : {'node_count': cfg['n_nodes']},
         'attributes' : attrs,
         'environment': env,
     }
@@ -767,7 +767,7 @@ def launch_psij(bc, edge_name, cfg, bridge_url):
         'arguments'         : ['--name', child_name, '--url', bridge_url],
         'attributes'        : attrs,
         'custom_attributes' : custom_attrs,
-        'resources'         : {'node_count': cfg['n_nodes'], 'process_count': 1},
+        'resources'         : {'node_count': cfg['n_nodes']},
         'environment'       : env,
     }
 

@@ -178,9 +178,19 @@ class PSIJSession(PluginSession):
                 spec.attributes.account = attribs.get("account")
                 spec.attributes.reservation_id = attribs.get("reservation_id")
 
-                node_count = attribs.get("node_count")
-                if node_count:
-                    spec.attributes.resource_count = int(node_count)
+            # ``node_count`` belongs on PsiJ's ResourceSpec, not on
+            # JobAttributes -- the slurm template renders --nodes from
+            # ``{{computed_node_count}}`` which is derived from
+            # ``ResourceSpecV1.node_count``.  We pass node_count alone
+            # and let PsiJ default ``processes_per_node = 1`` → one
+            # wrapper process per node (matches what the edge wrapper
+            # does).  Sending an explicit process_count=1 alongside
+            # would trip _check_constraints (1 process across N nodes
+            # is not an integer division).
+            res = job_spec_dict.get('resources') or {}
+            node_count = res.get('node_count')
+            if node_count:
+                spec.resources = psij.ResourceSpecV1(node_count=int(node_count))
 
             # Merge site defaults for PSIJ custom_attributes with the
             # caller's (caller wins on conflict).  Defaults come from the
