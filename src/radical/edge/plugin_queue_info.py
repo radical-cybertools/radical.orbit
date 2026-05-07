@@ -411,8 +411,13 @@ class PluginQueueInfo(Plugin):
 
             {"nodelist": []}                                # login node / no scheduler
             {"nodelist": ["nid001234", "nid001235", ...]}   # inside a job
+
+        Implementation note: nodelist lives on the ``BatchSystem``
+        hierarchy (``detect_batch_system()``), not on ``QueueInfo``
+        (``self._backend``).  Mirrors the ``get_job_allocation`` pattern
+        a few methods up.
         """
-        nodes = await asyncio.to_thread(self._backend.nodelist)
+        nodes = await asyncio.to_thread(detect_batch_system().nodelist)
         return {'nodelist': nodes}
 
     async def get_info(self, request: Request) -> dict:
