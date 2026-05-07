@@ -120,7 +120,7 @@ def configure_logging(level: int = logging.INFO,
         log_dir = os.path.dirname(log_file)
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)
-        file_handler = logging.FileHandler(log_file, mode='w')
+        file_handler = logging.FileHandler(log_file, mode='a')
         file_handler.setFormatter(logging.Formatter(
             fmt='%(asctime)s %(levelname)-8s %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'))
