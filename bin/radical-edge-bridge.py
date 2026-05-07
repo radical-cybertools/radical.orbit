@@ -6,7 +6,10 @@ script just parses CLI options and constructs the class.
 """
 
 import argparse
+import logging
+import os
 
+import radical.edge.logging_config as _lc
 from radical.edge.bridge import Bridge
 
 
@@ -34,6 +37,14 @@ def main():
                              'allowed: "iri*". Prefix matching '
                              'supported. Combine, e.g.: "-p default,rose".')
     args = parser.parse_args()
+
+    log_level_name = os.environ.get('RADICAL_EDGE_LOG_LEVEL', 'INFO').upper()
+    level = getattr(logging, log_level_name, logging.INFO)
+    log_file = (os.environ.get('RADICAL_EDGE_LOG_FILE')
+                or os.path.expanduser('~/.radical/edge/logs/bridge.log'))
+    _lc.configure_logging(level, log_file=log_file)
+    logging.getLogger('radical.edge').info(
+        "Log level: %s; log file: %s", log_level_name, log_file)
 
     Bridge(cert=args.cert,
            key=args.key,

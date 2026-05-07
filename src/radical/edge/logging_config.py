@@ -10,6 +10,7 @@ Import this module early in your application to configure logging.
 """
 
 import logging
+import os
 import sys
 import copy
 import contextvars
@@ -89,21 +90,43 @@ class ColoredFormatter(logging.Formatter):
 
 
 def configure_logging(level: int = logging.INFO,
-                      format_string: Optional[str] = None) -> None:
+                      format_string: Optional[str] = None,
+                      log_file: Optional[str] = None) -> None:
     """
     Configure logging for radical.edge.
 
     Args:
         level:         Logging level (default: logging.INFO).
-        format_string: Custom format string (optional).
+        format_string: Custom format string for the stdout handler
+                       (optional; ignored by the file handler which
+                       always uses a plain timestamped format).
+        log_file:      If given, also write logs to this file
+                       (truncated on open).  Parent directory is
+                       created if missing.  Stdout output stays
+                       colored; the file is plain text with
+                       timestamps so it survives ``less`` / ``grep``
+                       and Dragon's stdio capture.
     """
     if format_string is None:
         format_string = '%(levelname)s %(message)s'
 
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(ColoredFormatter(fmt=format_string))
+    handlers: list = []
 
-    logging.basicConfig(force=True, level=level, handlers=[handler])
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setFormatter(ColoredFormatter(fmt=format_string))
+    handlers.append(stdout_handler)
+
+    if log_file:
+        log_dir = os.path.dirname(log_file)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        file_handler = logging.FileHandler(log_file, mode='w')
+        file_handler.setFormatter(logging.Formatter(
+            fmt='%(asctime)s %(levelname)-8s %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'))
+        handlers.append(file_handler)
+
+    logging.basicConfig(force=True, level=level, handlers=handlers)
 
     logging.getLogger("radical.edge").setLevel(level)
 

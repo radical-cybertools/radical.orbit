@@ -58,8 +58,13 @@ async def main():
     args = parser.parse_args()
 
     level = getattr(logging, args.log_level.upper(), logging.INFO)
-    _lc.configure_logging(level)
-    log.info("Log level: %s", args.log_level.upper())
+    edge_name = args.name or 'edge'
+    log_file = (os.environ.get('RADICAL_EDGE_LOG_FILE')
+                or os.path.expanduser(
+                    f'~/.radical/edge/logs/{edge_name}.log'))
+    _lc.configure_logging(level, log_file=log_file)
+    log.info("Log level: %s; log file: %s",
+             args.log_level.upper(), log_file)
 
     plugins = [t.strip() for t in args.plugins.split(',') if t.strip()]
 
