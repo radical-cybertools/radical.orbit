@@ -196,10 +196,14 @@ class RhapsodySession(PluginSession):
             # Policy(host_name=…).  A mismatch silently turns HOST_NAME
             # placement into a no-op and tasks pile up on whichever node
             # Dragon's default policy lands them.
+            #
+            # ``System().nodes`` returns huids (int).  ``Node(huid)``
+            # wraps each one and exposes ``.hostname``.
             try:
-                from dragon.native.machine import System as _DragonSystem
-                _dragon_hosts = [str(n.hostname)
-                                 for n in _DragonSystem().nodes]
+                from dragon.native.machine import (
+                    System as _DragonSystem, Node as _DragonNode)
+                _dragon_hosts = [str(_DragonNode(h).hostname)
+                                 for h in _DragonSystem().nodes]
                 log.info("[%s] dragon System().nodes hostnames: %s",
                          self._sid, _dragon_hosts)
             except Exception as _e:
