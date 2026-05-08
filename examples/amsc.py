@@ -1153,6 +1153,7 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
         ]
         matey_tasks = [
             ComputeTask(
+                uid=f'matey.{i:04d}',
                 executable=matey_wrap,
                 arguments=matey_args,
                 capture_stdio=True,
@@ -1171,6 +1172,7 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
         gkeyll_wd  = f'{gkeyll_dir}/{RHAPSODY_WORK_SUBDIR}'
         gkeyll_tasks = [
             ComputeTask(
+                uid=f'gkeyll.{i:04d}',
                 executable=gkeyll_exe,
                 arguments=[],
                 capture_stdio=True,
