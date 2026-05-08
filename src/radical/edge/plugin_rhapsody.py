@@ -191,6 +191,21 @@ class RhapsodySession(PluginSession):
             self._init_ready.set()
             log.info("[%s] Session initialization complete", self._sid)
 
+            # Probe: log Dragon's view of node hostnames so we can compare
+            # against what queue_info.nodelist() / amsc.py is using for
+            # Policy(host_name=…).  A mismatch silently turns HOST_NAME
+            # placement into a no-op and tasks pile up on whichever node
+            # Dragon's default policy lands them.
+            try:
+                from dragon.native.machine import System as _DragonSystem
+                _dragon_hosts = [str(n.hostname)
+                                 for n in _DragonSystem().nodes]
+                log.info("[%s] dragon System().nodes hostnames: %s",
+                         self._sid, _dragon_hosts)
+            except Exception as _e:
+                log.info("[%s] dragon hostname probe skipped: %s",
+                         self._sid, _e)
+
         except Exception as e:
             self._init_error = str(e)
             self._init_ready.set()  # unblock waiters
