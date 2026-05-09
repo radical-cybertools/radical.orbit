@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""Minimal reproducer for HOST_NAME / gpu_affinity placement oversubscription.
+
+Submits ``GPUS_PER_NODE * n_hosts`` tasks, each pinned to a specific
+``(host, gpu)`` via ``Policy(HOST_NAME, gpu_affinity)``.  Each task does
+``sleep 10; hostname >> ./repro_placement.out`` — so after all tasks
+finish, ``sort | uniq -c`` on the output file shows exactly how many
+ran on each host.
+
+The append (``>>``) opens the file with ``O_APPEND``; each ``hostname``
+write is well under 4 KiB (PIPE_BUF) so the kernel guarantees the
+write is atomic on a local filesystem.  That keeps lines clean for
+counting.
+
+Expected: each host appears exactly ``GPUS_PER_NODE`` times.
+Observed bug (in amsc.py): per-host count varies 1..7 on a 16-node
+allocation with GPUS_PER_NODE=4.
+
+Usage
+-----
+    salloc -A <acct> -C gpu -N 16 -t 30 --ntasks-per-node=1 ...
+    cd <some-dir-on-shared-fs>
+    dragon python repro_placement.py
+    sort repro_placement.out | uniq -c
+"""
+import asyncio
+import os
+import subprocess
+import time
+
+from dragon.infrastructure.policy import Policy
+from rhapsody.api import ComputeTask, Session
+from rhapsody.backends import DragonExecutionBackendV3
+
+
+# === adjust ==================================================================
+GPUS_PER_NODE = 4
+OUT_FILE      = os.path.abspath('repro_placement.out')
+# =============================================================================
+
+
+# Truncate prior runs so the count after this run is unambiguous.
+open(OUT_FILE, 'w').close()
+
+nodelist = subprocess.check_output(
+    ['scontrol', 'show', 'hostnames', os.environ['SLURM_JOB_NODELIST']],
+    text=True).split()
+n_hosts = len(nodelist)
+n_tasks = n_hosts * GPUS_PER_NODE
+
+print(f'\nnodelist ({n_hosts} hosts):')
+for h in nodelist:
+    print(f'  {h}')
+print(f'\nbuilding {n_tasks} tasks ({GPUS_PER_NODE}/node)')
+print(f'  output file: {OUT_FILE}\n')
+
+shell_cmd = f'sleep 10; hostname >> {OUT_FILE}'
+
+tasks = []
+for i in range(n_tasks):
+    host = nodelist[i % n_hosts]
+    gpu  = (i // n_hosts) % GPUS_PER_NODE
+    print(f'  task t.{i:02d}  host={host:>10s}  gpu={gpu}')
+    tasks.append(ComputeTask(
+        uid           = f't.{i:02d}',
+        executable    = '/bin/bash',
+        arguments     = ['-c', shell_cmd],
+        capture_stdio = True,
+        task_backend_specific_kwargs = {
+            'process_template': {
+                'cwd'   : os.path.dirname(OUT_FILE) or '.',
+                'policy': Policy(
+                    placement    = Policy.Placement.HOST_NAME,
+                    host_name    = host,
+                    gpu_affinity = [gpu],
+                ),
+            },
+        },
+    ))
+
+
+async def main():
+    backend = await DragonExecutionBackendV3()
+    session = Session(backends=[backend])
+    async with session:
+        t0 = time.time()
+        await session.submit_tasks(tasks)
+        print(f'\nsubmitted {n_tasks} tasks in {time.time()-t0:.2f}s')
+
+        await asyncio.gather(*tasks)
+        elapsed = time.time() - t0
+        done   = sum(1 for t in tasks if str(t.state) == 'DONE')
+        failed = n_tasks - done
+        print(f'\nall {n_tasks} tasks finished in {elapsed:.1f}s'
+              f'   (done={done}  failed={failed})')
+        print(f'\nsort {OUT_FILE} | uniq -c\n')
+
+
+asyncio.run(main())
