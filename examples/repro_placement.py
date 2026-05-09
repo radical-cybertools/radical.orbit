@@ -35,7 +35,9 @@ from rhapsody.backends import DragonExecutionBackendV3
 
 # === adjust ==================================================================
 GPUS_PER_NODE = 4
-OUT_FILE      = os.path.abspath('repro_placement.out')
+CPUS_PER_NODE = 128
+OUT_FILE      = './repro_placement.out'
+GENERATIONS   = 1
 # =============================================================================
 
 
@@ -46,18 +48,24 @@ nodelist = subprocess.check_output(
     ['scontrol', 'show', 'hostnames', os.environ['SLURM_JOB_NODELIST']],
     text=True).split()
 n_hosts = len(nodelist)
-n_tasks = n_hosts * GPUS_PER_NODE
+n_tasks_gpu = n_hosts * GPUS_PER_NODE * GENERATIONS
+
+# reserve CPU cores for GPU tasks
+if n_tasks_gpu:
+    CPUS_PER_NODE -= GPUS_PER_NODE
+
+n_tasks_cpu = n_hosts * CPUS_PER_NODE * GENERATIONS 
 
 print(f'\nnodelist ({n_hosts} hosts):')
 for h in nodelist:
     print(f'  {h}')
-print(f'\nbuilding {n_tasks} tasks ({GPUS_PER_NODE}/node)')
+print(f'\nbuilding {n_tasks_gpu} tasks ({GPUS_PER_NODE}/node)')
 print(f'  output file: {OUT_FILE}\n')
 
 shell_cmd = f'sleep 10; hostname >> {OUT_FILE}'
 
 tasks = []
-for i in range(n_tasks):
+for i in range(n_tasks_gpu):
     host = nodelist[i % n_hosts]
     gpu  = (i // n_hosts) % GPUS_PER_NODE
     print(f'  task t.{i:02d}  host={host:>10s}  gpu={gpu}')
@@ -85,15 +93,16 @@ async def main():
     async with session:
         t0 = time.time()
         await session.submit_tasks(tasks)
-        print(f'\nsubmitted {n_tasks} tasks in {time.time()-t0:.2f}s')
+        print(f'\nsubmitted {n_tasks_gpu} tasks in {time.time()-t0:.2f}s')
 
         await asyncio.gather(*tasks)
         elapsed = time.time() - t0
         done   = sum(1 for t in tasks if str(t.state) == 'DONE')
-        failed = n_tasks - done
-        print(f'\nall {n_tasks} tasks finished in {elapsed:.1f}s'
+        failed = n_tasks_gpu - done
+        print(f'\nall {n_tasks_gpu} tasks finished in {elapsed:.1f}s'
               f'   (done={done}  failed={failed})')
         print(f'\nsort {OUT_FILE} | uniq -c\n')
 
 
 asyncio.run(main())
+
