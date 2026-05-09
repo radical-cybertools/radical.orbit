@@ -3,14 +3,16 @@
 
 Submits ``GPUS_PER_NODE * n_hosts`` tasks, each pinned to a specific
 ``(host, gpu)`` via ``Policy(HOST_NAME, gpu_affinity)``.  Each task does
-``sleep 10; hostname >> ./repro_placement.out`` — so after all tasks
-finish, ``sort | uniq -c`` on the output file shows exactly how many
+``sleep 10; hostname > ./repro_placement.out.$$`` — one file per task,
+named with the task shell's PID, so the post-run
+``cat repro_placement.out.* | sort | uniq -c`` shows exactly how many
 ran on each host.
 
-The append (``>>``) opens the file with ``O_APPEND``; each ``hostname``
-write is well under 4 KiB (PIPE_BUF) so the kernel guarantees the
-write is atomic on a local filesystem.  That keeps lines clean for
-counting.
+A single shared output file with ``>>`` looks tempting but is unreliable
+on parallel filesystems: POSIX ``O_APPEND`` atomicity is guaranteed only
+within one host's kernel, so concurrent appends from many compute nodes
+on Lustre / GPFS / DVS / NFS can clobber each other.  Per-task files
+sidestep that entirely.
 
 Expected: each host appears exactly ``GPUS_PER_NODE`` times.
 Observed bug (in amsc.py): per-host count varies 1..7 on a 16-node
@@ -21,9 +23,10 @@ Usage
     salloc -A <acct> -C gpu -N 16 -t 30 --ntasks-per-node=1 ...
     cd <some-dir-on-shared-fs>
     dragon python repro_placement.py
-    sort repro_placement.out | uniq -c
+    cat repro_placement.out.* | sort | uniq -c
 """
 import asyncio
+import glob
 import os
 import subprocess
 import time
@@ -41,8 +44,9 @@ GENERATIONS   = 1
 # =============================================================================
 
 
-# Truncate prior runs so the count after this run is unambiguous.
-open(OUT_FILE, 'w').close()
+# Remove prior per-task outputs so this run's counts are unambiguous.
+for stale in glob.glob(f'{OUT_FILE}.*'):
+    os.unlink(stale)
 
 nodelist = subprocess.check_output(
     ['scontrol', 'show', 'hostnames', os.environ['SLURM_JOB_NODELIST']],
@@ -62,7 +66,7 @@ for h in nodelist:
 print(f'\nbuilding {n_tasks_gpu} tasks ({GPUS_PER_NODE}/node)')
 print(f'  output file: {OUT_FILE}\n')
 
-shell_cmd = f'sleep 10; hostname >> {OUT_FILE}'
+shell_cmd = f'sleep 10; hostname > {OUT_FILE}.$$'
 
 tasks = []
 for i in range(n_tasks_gpu):
@@ -101,7 +105,7 @@ async def main():
         failed = n_tasks_gpu - done
         print(f'\nall {n_tasks_gpu} tasks finished in {elapsed:.1f}s'
               f'   (done={done}  failed={failed})')
-        print(f'\nsort {OUT_FILE} | uniq -c\n')
+        print(f'\ncat {OUT_FILE}.* | sort | uniq -c\n')
 
 
 asyncio.run(main())
