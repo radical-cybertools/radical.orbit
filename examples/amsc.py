@@ -99,7 +99,7 @@ WORKLOAD           = 'rhapsody'
 # perlmutter PsiJ path with MACHINE_DEFAULTS values, emit a coarse
 # 7-step trace.  Set False to restore the original interactive flow.
 DEMO_MODE          = True
-N_NODES            = 2
+N_NODES            = 1
 N_GENERATIONS      = 1
 
 # ROSE active-learning shape (mirrors examples/example_rose.py).
@@ -261,7 +261,16 @@ MACHINE_DEFAULTS = {
             'module list',
             'python3 -c "import mpi4py.MPI as M; print(M.Get_library_version())"',
                         ],
-        'app'         : None,
+        'app'         : {
+            'matey_dir'      : '/global/u2/m/merzky/MATEY',
+            'matey_model_dir': '/global/cfs/projectdirs/amsc007/zhan1668/MATEY'
+                               '/models/Dev_Fusion_DemoMay_toytestonly'
+                               '/demo_nbatchsloc100/',
+            'matey_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
+                               '/d3d_174310.03500/',
+            'gkeyll_dir'     : '/global/u2/m/merzky/gkeyll/amsc',
+            'gkeyll_exe'     : 'rt_gk_d3d_iwl_2x2v_p1.sh',
+        },
     },
     'thinkie': {
         'enabled'     : False,
