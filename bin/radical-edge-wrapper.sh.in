@@ -48,9 +48,12 @@ else
     USE_DRAGON=yes
 fi
 
+# Uncomment to write a dragon.log next to the wrapper's CWD (WARNING level).
+# ARGS="-l dragon_file=WARNING"
+
 if [ "$USE_DRAGON" = "yes" ]; then
     echo "[radical-edge] starting with dragon ($DRAGON_PATH)" >&2
-    exec "$DRAGON_PATH" "@BINDIR@/radical-edge-service.py" "$@"
+    exec "$DRAGON_PATH" $ARGS "@BINDIR@/radical-edge-service.py" "$@"
 else
     echo "[radical-edge] starting with python ($PYTHON_PATH) — $REASON" >&2
     exec "$PYTHON_PATH" "@BINDIR@/radical-edge-service.py" "$@"
