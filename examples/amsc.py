@@ -823,16 +823,16 @@ def wait_for_first_edge(bc, expected_names, timeout=EDGE_WAIT_SECONDS,
                        f'expected one of {expected_names}')
 
 
-def _find_perlmutter_psij(bc):
-    """Locate a connected perlmutter login-edge with the PsiJ plugin.
+def _find_psij(edge, bc):
+    """Locate a connected 'edge' login-edge with the PsiJ plugin.
 
     Returns ``(edge_name, executor)`` or ``None``.  Used by demo mode to
     auto-pick the only target it cares about, without going through the
     interactive ``discover_targets`` / ``select_many`` flow.
     """
-    if 'perlmutter' not in set(bc.list_edges()):
+    if edge not in set(bc.list_edges()):
         return None
-    edge    = bc.get_edge_client('perlmutter')
+    edge    = bc.get_edge_client(edge)
     plugins = edge.list_plugins()
     if 'psij' not in plugins:
         return None
@@ -841,7 +841,7 @@ def _find_perlmutter_psij(bc):
         executor = info.get('psij_executor', 'slurm')
     except Exception:
         executor = 'slurm'
-    return ('perlmutter', executor)
+    return (edge, executor)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1309,7 +1309,8 @@ def _main_demo(bc, bridge_url):
     """
     step(1, 'connect bridge', bridge_url)
 
-    target = _find_perlmutter_psij(bc)
+    edge = 'odo'
+    target = _find_psij(edge, bc)
     if not target:
         abort("no 'perlmutter' login edge with PsiJ found in bridge "
               "topology.  Start the parent edge on Perlmutter first.")
