@@ -117,7 +117,7 @@ MATEY_WRAPPER_NAME   = 'matey_wrapper.sh'
 RHAPSODY_WORK_SUBDIR = 'rhapsody-runs'
 
 # How long we are willing to wait for the first edge to come up.
-EDGE_WAIT_SECONDS  = 30 * 60
+EDGE_WAIT_SECONDS  = 60 * 3
 
 COUNTERS = defaultdict(int)  # for unique edge names per submission endpoint
 
@@ -250,8 +250,8 @@ MACHINE_DEFAULTS = {
         'qos'         : None,
         'walltime_min': 60,
         'n_nodes'     : N_NODES,
-        'gpus_per_node': None,
-        'cores_per_node': None,
+        'gpus_per_node': 4,
+        'cores_per_node': 128,
         'constraint'  : None,
         'tunnel'      : 'reverse',
         'amsc_dir'    : None,
