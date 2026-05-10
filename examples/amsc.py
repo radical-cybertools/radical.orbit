@@ -99,8 +99,8 @@ WORKLOAD           = 'rhapsody'
 # perlmutter PsiJ path with MACHINE_DEFAULTS values, emit a coarse
 # 7-step trace.  Set False to restore the original interactive flow.
 DEMO_MODE          = True
-N_NODES            = 32
-N_GENERATIONS      =  1
+N_NODES            = 2
+N_GENERATIONS      = 1
 
 # ROSE active-learning shape (mirrors examples/example_rose.py).
 N_MPI_RANKS        = 4      # MPI ranks per simulation launch
@@ -1300,7 +1300,7 @@ def teardown(bc, created):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _main_demo(bc, bridge_url):
-    """Auto-run the perlmutter PsiJ path with MACHINE_DEFAULTS values.
+    """Auto-run the PsiJ path with MACHINE_DEFAULTS values.
 
     Fail-fast at every boundary via ``abort()`` — no Python tracebacks.
     Mirrors the interactive flow's structure but skips ``select_many``
@@ -1312,12 +1312,12 @@ def _main_demo(bc, bridge_url):
     edge = 'odo'
     target = _find_psij(edge, bc)
     if not target:
-        abort("no 'perlmutter' login edge with PsiJ found in bridge "
-              "topology.  Start the parent edge on Perlmutter first.")
+        abort(f"no '{edge}' login edge with PsiJ found in bridge "
+              "topology.  Start the parent edge on '{edge}'first.")
     edge_name, executor = target
     step(2, 'pick target', f'{edge_name} (psij/{executor})')
 
-    cfg = dict(MACHINE_DEFAULTS['perlmutter'])
+    cfg = dict(MACHINE_DEFAULTS[edge])
     cfg['executor'] = executor
     qos_str = f', qos={cfg["qos"]}' if cfg.get('qos') else ''
     step(3, 'configure',
