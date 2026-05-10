@@ -832,12 +832,12 @@ def _find_psij(edge, bc):
     """
     if edge not in set(bc.list_edges()):
         return None
-    edge    = bc.get_edge_client(edge)
-    plugins = edge.list_plugins()
+    ec      = bc.get_edge_client(edge)
+    plugins = ec.list_plugins()
     if 'psij' not in plugins:
         return None
     try:
-        info     = edge.get_plugin('sysinfo').host_role()
+        info     = ec.get_plugin('sysinfo').host_role()
         executor = info.get('psij_executor', 'slurm')
     except Exception:
         executor = 'slurm'
