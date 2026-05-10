@@ -848,6 +848,8 @@ class PluginPSIJ(Plugin):
             relay_file.unlink(missing_ok=True)  # remove stale file from previous run
             pid_file = _relay_dir() / f'{edge_name}.pid'
             pid_file.unlink(missing_ok=True)
+            req_file = _relay_dir() / f'{edge_name}.req'
+            req_file.unlink(missing_ok=True)
 
             if '--tunnel' not in args:
                 args.extend(['--tunnel', tunnel])
@@ -1017,12 +1019,30 @@ class PluginPSIJ(Plugin):
 
                 if mode == 'reverse' and ssh_proc is None and \
                         state == STATE_RUNNING:
-                    nodes = await asyncio.to_thread(batch.job_nodes, native_id)
-                    if not nodes:
-                        # RUNNING but exec_host not yet visible — try again
-                        # next poll.
-                        continue
-                    compute_host = nodes[0]
+                    # Prefer the hostname the child wrote into its .req
+                    # file (its own socket.gethostname()).  Falls back to
+                    # nodes[0] from the scheduler when the child hasn't
+                    # produced .req yet (e.g. early in startup) — that
+                    # is correct for single-node jobs but can pick the
+                    # wrong host on multi-node allocations where the
+                    # script's node != scheduler's first hostname.
+                    req_file = relay_file.with_suffix('.req')
+                    compute_host = None
+                    if req_file.exists():
+                        try:
+                            import json as _json
+                            compute_host = _json.loads(
+                                req_file.read_text()).get('hostname')
+                        except (ValueError, OSError):
+                            compute_host = None
+                    if not compute_host:
+                        nodes = await asyncio.to_thread(
+                            batch.job_nodes, native_id)
+                        if not nodes:
+                            # RUNNING but neither .req nor exec_host
+                            # visible — try again next poll.
+                            continue
+                        compute_host = nodes[0]
                     log.info("[psij] reverse: job %s RUNNING on %s, spawning "
                              "ssh -R to %s:%s",
                              native_id, compute_host, bridge_host, bridge_port)
@@ -1114,6 +1134,7 @@ class PluginPSIJ(Plugin):
         finally:
             _tunnel.cleanup_tunnel(ssh_proc, edge_name)
             self._tunnel_procs.pop(edge_name, None)
+            (_relay_dir() / f'{edge_name}.req').unlink(missing_ok=True)
 
     async def _fail_tunnel(self, edge_name: str, job_id: 'str | None',
                             native_id, reason: str, spawn_proc=None) -> None:
@@ -1131,6 +1152,7 @@ class PluginPSIJ(Plugin):
         if spawn_proc is not None:
             _tunnel.cleanup_tunnel(spawn_proc, edge_name)
             self._tunnel_procs.pop(edge_name, None)
+            (_relay_dir() / f'{edge_name}.req').unlink(missing_ok=True)
         if job_id is not None:
             try:
                 # Use the underlying PSIJSession.cancel_job to release the
@@ -1166,6 +1188,7 @@ class PluginPSIJ(Plugin):
         self._watchers.clear()
         for edge_name, proc in list(self._tunnel_procs.items()):
             _tunnel.cleanup_tunnel(proc, edge_name)
+            (_relay_dir() / f'{edge_name}.req').unlink(missing_ok=True)
         self._tunnel_procs.clear()
 
 
