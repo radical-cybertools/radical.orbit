@@ -1078,11 +1078,11 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
     """
     app_cfg = (cfg or {}).get('app')
     if not app_cfg:
-        raise RuntimeError(
-            f"target {edge_name!r} has no 'app' config block — "
-            "the rhapsody workload is not supported here.  Either "
-            "set WORKLOAD='rose' or populate IRI_DEFAULTS / "
-            "MACHINE_DEFAULTS['app'] for this target.")
+        step(6, 'run rhapsody',
+             f'skipped — target {edge_name!r} has no app config')
+        say(f'  rhapsody workload skipped: target {edge_name!r} '
+            f'has no app config block')
+        return
 
     n_hosts        = len(nodelist) or 1
     gpus_per_node  = cfg.get('gpus_per_node')  or 0
@@ -1097,10 +1097,11 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
                   and all(app_cfg.get(k) for k in ('gkeyll_dir', 'gkeyll_exe')))
 
     if not (has_matey or has_gkeyll):
-        raise RuntimeError(
-            f"target {edge_name!r}: nothing to run.  Need either "
-            "(gpus_per_node > 0 + N_MATEY_TASKS > 0 + matey_* paths) "
-            "or (cores_per_node > 0 + N_GKEYLL_TASKS > 0 + gkeyll_dir/exe).")
+        step(6, 'run rhapsody',
+             f'skipped — no matey/gkeyll resources on {edge_name!r}')
+        say(f'  rhapsody workload skipped: target {edge_name!r} '
+            f'has no matey/gkeyll resources to run')
+        return
 
     # Lazy imports: dragon's Policy + cloudpickle are only needed when the
     # rhapsody workload actually runs; this lets amsc.py parse on client
