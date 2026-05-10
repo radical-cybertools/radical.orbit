@@ -54,6 +54,8 @@ Run::
     python examples/amsc.py
 """
 
+print()
+
 import asyncio
 import logging
 import os
@@ -97,7 +99,8 @@ WORKLOAD           = 'rhapsody'
 # perlmutter PsiJ path with MACHINE_DEFAULTS values, emit a coarse
 # 7-step trace.  Set False to restore the original interactive flow.
 DEMO_MODE          = True
-N_NODES            = 16
+N_NODES            = 32
+N_GENERATIONS      =  1
 
 # ROSE active-learning shape (mirrors examples/example_rose.py).
 N_MPI_RANKS        = 4      # MPI ranks per simulation launch
@@ -107,8 +110,9 @@ MSE_THRESHOLD      = 0.01   # convergence target
 MAX_ITER           = 15     # hard cap on AL iterations
 
 # Rhapsody-direct workload shape (mirrors examples/run_matey.py).
-N_MATEY_TASKS        = N_NODES * 10        # GPU-bound matey inference tasks
-N_GKEYLL_TASKS       = N_NODES * 128 * 3   # CPU-bound gkeyll training tasks
+N_MATEY_TASKS        = N_NODES *   4 * N_GENERATIONS   # GPU: matey  inference
+N_GKEYLL_TASKS       = N_NODES * 128 * N_GENERATIONS   # CPU: gkeyll training
+
 MATEY_WRAPPER_NAME   = 'matey_wrapper.sh'
 RHAPSODY_WORK_SUBDIR = 'rhapsody-runs'
 
@@ -137,7 +141,7 @@ IRI_DEFAULTS = {
         'workdir'     : None,
         'queue_name'  : 'debug',
         'qos'         : None,
-        'walltime_min': 30,
+        'walltime_min': 60,
         'n_nodes'     : N_NODES,
         'gpus_per_node': 4,
         'cores_per_node': 128,
@@ -173,7 +177,7 @@ IRI_DEFAULTS = {
         'workdir'     : '/gpfs/wolf2/olcf/fus183/proj-shared',
         'queue_name'  : 'batch',
         'qos'         : None,
-        'walltime_min': 30,
+        'walltime_min': 60,
         'n_nodes'     : N_NODES,
         'gpus_per_node': None,
         'cores_per_node': None,
@@ -203,7 +207,7 @@ MACHINE_DEFAULTS = {
         'account'     : 'Fusion-FM',
         'queue_name'  : 'debug',
         'qos'         : None,
-        'walltime_min': 30,
+        'walltime_min': 60,
         'n_nodes'     : N_NODES,
         'gpus_per_node': None,
         'cores_per_node': None,
@@ -218,12 +222,12 @@ MACHINE_DEFAULTS = {
         'account'     : 'amsc007_g',
         'queue_name'  : None,                    # 'gpu_ss11',
         'qos'         : 'express_amsc',
-        'walltime_min': 30,
+        'walltime_min': 60,
         'n_nodes'     : N_NODES,
         'gpus_per_node': 4,
         'cores_per_node': 128,
         'constraint'  : 'gpu',
-        'tunnel'      : 'forward',
+        'tunnel'      : 'none',
         'amsc_dir'    : None,
         'setup'       : [
             'module load openmpi',
@@ -244,7 +248,7 @@ MACHINE_DEFAULTS = {
         'account'     : 'fus183',
         'queue_name'  : 'batch',
         'qos'         : None,
-        'walltime_min': 30,
+        'walltime_min': 60,
         'n_nodes'     : N_NODES,
         'gpus_per_node': None,
         'cores_per_node': None,
@@ -696,7 +700,7 @@ def configure_psij(edge_name, executor):
         'account'     : ask     ('  account / project',
                                   d.get('account', '') or '') or None,
         'walltime_min': ask_int ('  walltime (minutes)',
-                                  d.get('walltime_min', 30)),
+                                  d.get('walltime_min', 60)),
         'n_nodes'     : ask_int ('  number of nodes',
                                   d.get('n_nodes', 1)),
         'constraint'  : ask     ('  constraint (or empty)',
@@ -749,20 +753,9 @@ def launch_psij(bc, edge_name, cfg, bridge_url):
         custom_attrs[f'{cfg["executor"]}.gpus-per-node'] = str(cfg['gpus_per_node'])
     if cfg.get('qos'):
         custom_attrs[f'{cfg["executor"]}.qos'] = cfg['qos']
-    # ``--nodes=N`` is rendered by PsiJ from spec.resources (set in the
-    # job_spec below) -- a single occurrence avoids the duplicated
-    # ``--nodes`` lines SLURM appears to resolve first-wins on.  We
-    # override ``--ntasks`` here to flip PsiJ's derived
-    # ``process_count = node_count`` (16 tasks across 16 nodes) back
-    # to one wrapper on the head node; Dragon spawns the rest.  SLURM
-    # honours last-wins for ``--ntasks``, so this works.
-    custom_attrs[f'{cfg["executor"]}.ntasks'] = '1'
 
-    # Cert is left to the child edge to resolve from
-    # ``~/.radical/edge/bridge_cert.pem`` on the target (or via
-    # $RADICAL_BRIDGE_CERT if explicitly set there).  Only the bridge
-    # URL — which changes per bridge run — is injected here.
     env = {'RADICAL_BRIDGE_URL': bridge_url}
+
     # Site-specific shell snippet — module loads, env exports, etc.
     # The wrapper ``eval``s this *before* exec-ing dragon / python.
     if cfg.get('setup'):
@@ -770,16 +763,9 @@ def launch_psij(bc, edge_name, cfg, bridge_url):
 
     job_spec = {
         'executable'        : wrapper,
-        # ``--name`` is required by submit_tunneled; ``--tunnel`` and
-        # ``--tunnel-via`` are appended for us when tunnel=True.
         'arguments'         : ['--name', child_name, '--url', bridge_url],
         'attributes'        : attrs,
         'custom_attributes' : custom_attrs,
-        # plugin_psij translates ``resources.node_count`` into
-        # ``ResourceSpecV1(node_count=N)``; PsiJ then renders
-        # ``--nodes=N`` (single occurrence) and derives
-        # ``--ntasks=N --ntasks-per-node=1``.  We flip --ntasks back to
-        # 1 via custom_attributes -- see the slurm.ntasks comment above.
         'resources'         : {'node_count': cfg['n_nodes']},
         'environment'       : env,
     }
@@ -1102,12 +1088,12 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
     gpus_per_node  = cfg.get('gpus_per_node')  or 0
     cores_per_node = cfg.get('cores_per_node') or 0
     n_gpus         = n_hosts * gpus_per_node
-    n_cores        = n_hosts * cores_per_node
+    n_cpus         = n_hosts * cores_per_node
 
     has_matey = (n_gpus > 0 and N_MATEY_TASKS > 0
                  and all(app_cfg.get(k) for k in
                          ('matey_dir', 'matey_model_dir', 'matey_xgc_dir')))
-    has_gkeyll = (n_cores > 0 and N_GKEYLL_TASKS > 0
+    has_gkeyll = (n_cpus > 0 and N_GKEYLL_TASKS > 0
                   and all(app_cfg.get(k) for k in ('gkeyll_dir', 'gkeyll_exe')))
 
     if not (has_matey or has_gkeyll):
@@ -1145,12 +1131,14 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
         matey_args = [
             'python', f'{matey_dir}/examples/basic_inference.py',
             '--model_dir',  app_cfg['matey_model_dir'],
-            '--use_ddp',
+          # '--use_ddp',
             '--on_perlmutter',
             '--AR',
             '--leadtime',   '5',
             '--newxgc_dir', app_cfg['matey_xgc_dir'],
         ]
+        # for i in range(N_MATEY_TASKS):
+        #     print(f'  pin: {i:3d}  host={nodelist[i%n_hosts]}  gpu={(i//n_hosts)%gpus_per_node}')
         matey_tasks = [
             ComputeTask(
                 uid=f'matey.{i:04d}',
@@ -1165,6 +1153,8 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
             )
             for i in range(N_MATEY_TASKS)
         ]
+
+
 
     if has_gkeyll:
         gkeyll_dir = app_cfg['gkeyll_dir'].rstrip('/')
@@ -1192,7 +1182,7 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
             f'({n_hosts} host x {gpus_per_node} gpu)')
         say(f'           wrapper={matey_wrap}, cwd={matey_wd}')
     if has_gkeyll:
-        say(f'  gkeyll : {len(gkeyll_tasks)} tasks, concurrency {n_cores} '
+        say(f'  gkeyll : {len(gkeyll_tasks)} tasks, concurrency {n_cpus} '
             f'({n_hosts} host x {cores_per_node} core)')
         say(f'           exe={gkeyll_exe}, cwd={gkeyll_wd}')
 
@@ -1207,18 +1197,45 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
     # ``os.makedirs(backend._work_dir)`` locally) — we can't pass the
     # remote matey/gkeyll paths there.  Per-task ``cwd`` rides through
     # the ``process_template`` instead.
+
+    cap_gpu = n_gpus or 1
+    cap_cpu = n_cpus or 1
+
+    if cap_cpu > cap_gpu:
+        # each gpu task needs one core for its main thread
+        cap_cpu -= cap_gpu
+
+    step(6, 'run rhapsody',
+         f'{n_hosts} hosts  '
+         f'matey {N_MATEY_TASKS} (cap {n_gpus})  '
+         f'gkeyll {N_GKEYLL_TASKS} (cap {n_cpus})')
+
     progress, tids = _make_progress(len(matey_tasks), len(gkeyll_tasks))
 
     async with Session(backends=[backend]) as session:
         # Use 1 as a no-op cap when a kind isn't running (its task list is
         # empty, so no coro will ever acquire that semaphore).
-        sem_gpu  = asyncio.Semaphore(n_gpus  or 1)
-        sem_core = asyncio.Semaphore(n_cores or 1)
+        sem_gpu = asyncio.Semaphore(cap_gpu)
+        sem_cpu = asyncio.Semaphore(cap_cpu)
 
         async def run_one(task, kind, sem):
+            # print(f'  waiting for {kind} task {task.uid} to acquire semaphore…')
             async with sem:
-                await session.submit_tasks([task])
                 try:
+
+                    # print hostname and gpu ID we place the next task on before
+                    # submission, so the log is informative even if the task
+                    # fails to start and never prints its own stdout.  The
+                    # task's Policy is serialized and sent with the task, so we
+                    # re-derive the placement info here rather than trying to
+                    # capture it in the closure.
+                    args = cloudpickle.loads(base64.b64decode(
+                        task.task_backend_specific_kwargs['cloudpickle::'.__len__():]))
+                    policy = args['process_template']['policy']
+                    host = policy.host_name
+                    gpu  = policy.gpu_affinity[0] if policy.gpu_affinity else None
+                    # print(f"submitting {task.uid} (host={host} gpu={gpu}))")
+                    await session.submit_tasks([task])
                     await task
                     counts[kind]['done'] += 1
                 except BaseException:
@@ -1229,7 +1246,7 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
                                     done=c['done'], failed=c['failed'])
 
         coros  = [run_one(t, 'matey',  sem_gpu)  for t in matey_tasks]
-        coros += [run_one(t, 'gkeyll', sem_core) for t in gkeyll_tasks]
+        coros += [run_one(t, 'gkeyll', sem_cpu) for t in gkeyll_tasks]
 
         if progress:
             with progress:
@@ -1335,19 +1352,21 @@ def _main_demo(bc, bridge_url):
         if not nodelist:
             abort(f'edge {first!r} reported empty nodelist (queue_info not '
                   f'loaded, or edge not inside a batch allocation)')
+        import pprint
+        # pprint.pprint(nodelist, indent=2)
         n_hosts = len(nodelist)
         n_gpus  = n_hosts * (cfg.get('gpus_per_node')  or 0)
-        n_cores = n_hosts * (cfg.get('cores_per_node') or 0)
-        step(6, 'run rhapsody',
-             f'{n_hosts} hosts  '
-             f'matey {N_MATEY_TASKS} (cap {n_gpus})  '
-             f'gkeyll {N_GKEYLL_TASKS} (cap {n_cores})')
+        n_cpus  = n_hosts * (cfg.get('cores_per_node') or 0)
+        # print(f'  detected {n_hosts} hosts, {n_gpus} gpu slots, {n_cpus} cpu slots')
 
         try:
             asyncio.run(submit_rhapsody_workload(
                 bridge_url, first, rec.get('cfg') or cfg, nodelist))
         except Exception as exc:
             abort(f'workload failed: {exc}')
+
+    except Exception:
+        log.exception(f'run failed')
 
     finally:
         step(7, 'teardown', f'cancelling {len(created)} psij job(s)')
@@ -1473,3 +1492,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+    print()
+
