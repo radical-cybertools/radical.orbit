@@ -1087,10 +1087,8 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
     """
     app_cfg = (cfg or {}).get('app')
     if not app_cfg:
-        step(6, 'run rhapsody',
-             f'skipped — target {edge_name!r} has no app config')
-        say(f'  rhapsody workload skipped: target {edge_name!r} '
-            f'has no app config block')
+        step(6, 'run rhapsody', 'skipped — cfg has no app block')
+        say('  rhapsody workload skipped: cfg has no app block')
         return
 
     n_hosts        = len(nodelist) or 1
@@ -1107,9 +1105,9 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
 
     if not (has_matey or has_gkeyll):
         step(6, 'run rhapsody',
-             f'skipped — no matey/gkeyll resources on {edge_name!r}')
-        say(f'  rhapsody workload skipped: target {edge_name!r} '
-            f'has no matey/gkeyll resources to run')
+             'skipped — cfg has no gpus_per_node / cores_per_node')
+        say('  rhapsody workload skipped: cfg has no gpus_per_node '
+            'or cores_per_node (n_gpus=0, n_cpus=0)')
         return
 
     # Lazy imports: dragon's Policy + cloudpickle are only needed when the
