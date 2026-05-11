@@ -372,6 +372,49 @@ After this change, SLURM state polling is used ONLY for the
 abort paths (terminal-state, UNKNOWN-streak, watcher timeout).
 Spawn doesn't depend on it.
 
+### 10c. SSH from login → compute denied by `pam_slurm_adopt` race
+
+With 10b in place, watcher correctly waited for `.req`, parsed
+`hostname=odo11`, and spawned `ssh -R 0:<bridge>:<port> odo11`.
+SSH authenticated successfully via the user's `id_ed25519`, then
+sshd on odo11 closed the session:
+
+    Access denied by pam_slurm_adopt: you have no active jobs on this node
+    Connection closed by 10.129.16.52 port 22
+
+`pam_slurm_adopt` is ODO's compute-node PAM module that denies any
+SSH whose user has no active SLURM job on the destination node.
+The user DOES (the child wrote `.req` from there), but there's a
+short window after the job is registered with SLURM during which
+the PAM module isn't yet aware — `pam_slurm_adopt` rejects, then
+within seconds starts accepting.
+
+Manual repro: `ssh odo05 hostname` from login1 succeeds *while* an
+`interact` allocation is running on odo05.  So the rejection is a
+race, not a policy.
+
+**Fix applied** (`src/radical/edge/plugin_psij.py`,
+`_tunnel_watcher` reverse-spawn branch): wrap the
+`spawn_reverse_tunnel` call in a retry loop — up to 30 attempts,
+1s apart.  Any spawn failure triggers a retry without trying to
+classify the error (a transient network blip / pam denial / SSH
+hiccup all get the same handling).  Between attempts, poll
+`batch.job_state(native_id)` and bail via `_fail_tunnel` if the
+job has hit a TERMINAL state — no point retrying once the
+allocation is gone.
+
+Transport-agnostic on purpose: this works for any batch system
+whose login→compute SSH is gated by a similar
+job-must-be-fully-registered check (PBS, LSF, future backends).
+Avoided alternatives like `srun --jobid=<id> --overlap` (SLURM-only)
+or `socat` tunneling (different topology, more invasive).
+
+Logging discipline: INFO once on first failure ("likely
+pam_slurm_adopt race, retrying"), DEBUG per subsequent attempt,
+INFO once on the spawn that finally succeeds (the existing
+`[tunnel] Reverse SSH allocated remote port ...` line in
+tunnel.py).
+
 ## Files touched outside the radical.edge repo
 
 - `/ccsopen/home/merzky/matey/env/lib/python3.10/site-packages/flash_attn/__init__.py` — flash-attn stub replaced with SDPA delegator (issue 5). Lost if the venv is reinstalled.

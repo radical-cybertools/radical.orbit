@@ -1049,14 +1049,50 @@ class PluginPSIJ(Plugin):
                         log.info("[psij] reverse: child .req says hostname=%s "
                                  "for job %s, spawning ssh -R to %s:%s",
                                  compute_host, native_id, bridge_host, bridge_port)
-                        try:
-                            ssh_proc, port = await asyncio.to_thread(
-                                _tunnel.spawn_reverse_tunnel,
-                                compute_host, bridge_host, bridge_port, edge_name)
-                        except Exception as exc:
+                        # Retry the spawn for up to ~30s.  Some
+                        # sites' compute-node sshd refuses logins
+                        # from the login node for a short window
+                        # after the job is registered (e.g.
+                        # pam_slurm_adopt rejects until the job's
+                        # cgroup is fully established).  The retry
+                        # is transport-agnostic: any spawn failure
+                        # gets a fresh attempt 1s later.  Bail out
+                        # immediately if the job goes terminal in
+                        # the meantime — no point retrying once the
+                        # allocation is gone.
+                        last_exc = None
+                        for spawn_attempt in range(30):
+                            try:
+                                ssh_proc, port = await asyncio.to_thread(
+                                    _tunnel.spawn_reverse_tunnel,
+                                    compute_host, bridge_host, bridge_port,
+                                    edge_name)
+                                break
+                            except Exception as exc:
+                                last_exc = exc
+                                if (await asyncio.to_thread(
+                                        batch.job_state, native_id)
+                                        in TERMINAL_STATES):
+                                    await self._fail_tunnel(
+                                        edge_name, job_id, native_id,
+                                        f"reverse SSH spawn failed and job "
+                                        f"went terminal: {exc}")
+                                    return
+                                if spawn_attempt == 0:
+                                    log.info("[psij] reverse: first ssh -R "
+                                             "spawn rejected (likely "
+                                             "pam_slurm_adopt race), "
+                                             "retrying: %s", exc)
+                                else:
+                                    log.debug("[psij] reverse: ssh -R spawn "
+                                              "retry %d/30: %s",
+                                              spawn_attempt + 1, exc)
+                                await asyncio.sleep(1)
+                        else:
                             await self._fail_tunnel(
                                 edge_name, job_id, native_id,
-                                f"reverse SSH spawn failed: {exc}")
+                                f"reverse SSH spawn failed after 30 "
+                                f"attempts: {last_exc}")
                             return
                         self._tunnel_procs[edge_name] = ssh_proc
 
