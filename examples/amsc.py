@@ -234,14 +234,17 @@ MACHINE_DEFAULTS = {
             'module load openmpi',
         ],
         'app'         : {
-            'matey_dir'      : '/global/u2/m/merzky/MATEY',
-            'matey_model_dir': '/global/cfs/projectdirs/amsc007/zhan1668/MATEY'
-                               '/models/Dev_Fusion_DemoMay_toytestonly'
-                               '/demo_nbatchsloc100/',
-            'matey_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
-                               '/d3d_174310.03500/',
-            'gkeyll_dir'     : '/global/u2/m/merzky/gkeyll/amsc',
-            'gkeyll_exe'     : 'rt_gk_d3d_iwl_2x2v_p1.sh',
+            'matey_dir'            : '/global/u2/m/merzky/MATEY',
+            'matey_model_dir'      : '/global/cfs/projectdirs/amsc007/zhan1668/MATEY'
+                                     '/models/Dev_Fusion_DemoMay_toytestonly'
+                                     '/demo_nbatchsloc100/',
+            'matey_xgc_dir'        : '/global/cfs/cdirs/amsc007/data/xgc'
+                                     '/d3d_174310.03500/',
+            'matey_pretraining_dir': '/global/cfs/projectdirs/amsc007/zhan1668'
+                                     '/MATEY/Datasets_pretraining/',
+            'matey_on_perlmutter'  : True,
+            'gkeyll_dir'           : '/global/u2/m/merzky/gkeyll/amsc',
+            'gkeyll_exe'           : 'rt_gk_d3d_iwl_2x2v_p1.sh',
         },
     },
     'odo': {
@@ -263,17 +266,18 @@ MACHINE_DEFAULTS = {
             'python3 -c "import mpi4py.MPI as M; print(M.Get_library_version())"',
                         ],
         'app'         : {
-            'matey_dir'      : '/autofs/nccsopen-svm1_home/merzky/matey/MATEY',
-            'matey_model_dir': '/autofs/nccsopen-svm1_home/merzky/'
-                               '/matey/models/demo_nbatchsloc100',
-            'matey_xgc_dir'  : '/autofs/nccsopen-svm1_home/merzky/'
-                               '/matey/data/d3d_174310.03500',
-            'gkeyll_dir'     : '/autofs/nccsopen-svm1_home/merzky/gkeyll_cpu_runs',
-            'gkeyll_exe'     : 'rt_gk_d3d_iwl_2x2v_p1',
+            'matey_dir'            : '/autofs/nccsopen-svm1_home/merzky/matey/MATEY',
+            'matey_model_dir'      : '/gpfs/wolf2/olcf/fus183/proj-shared/MATEY'
+                                     '/models/Dev_Fusion_Demo_March2026_AR_Final'
+                                     '/demo_nbatchsloc100',
+            'matey_xgc_dir'        : '/gpfs/wolf2/olcf/fus183/proj-shared'
+                                     '/fusiond-seed-xgc1-data'
+                                     '/n565pe_PT_xgc1_d3d_adjust_flow2_for_C/',
+            'matey_pretraining_dir': '/gpfs/wolf2/olcf/fus183/proj-shared'
+                                     '/MATEY/Datasets_pretraining/',
+            'gkeyll_dir'           : '/autofs/nccsopen-svm1_home/merzky/gkeyll_cpu_runs',
+            'gkeyll_exe'           : 'rt_gk_d3d_iwl_2x2v_p1',
         },
-        # 'python /autofs/nccsopen-svm1_home/merzky/matey/MATEY/examples/basic_inference.py --model_dir /autofs/nccsopen-svm1_home/merzky//matey/models/demo_nbatchsloc100 --AR --leadtime 5 --newxgc_dir /autofs/nccsopen-svm1_home/merzky//matey/data/d3d_174310.03500'
-          # '--use_ddp',
-          # '--on_perlmutter',
     },
     'thinkie': {
         'enabled'     : False,
@@ -1142,12 +1146,21 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
         matey_args = [
             'python', f'{matey_dir}/examples/basic_inference.py',
             '--model_dir',  app_cfg['matey_model_dir'],
-          # '--use_ddp',
-            '--on_perlmutter',
+            '--use_ddp',
             '--AR',
             '--leadtime',   '5',
             '--newxgc_dir', app_cfg['matey_xgc_dir'],
         ]
+        # Site-specific extras: --pretraining_data_dir steers the
+        # solps/xgc1 dataloader away from basic_inference.py's NERSC
+        # default; --on_perlmutter toggles a perlmutter-only code branch.
+        # Both opt-in via app_cfg so ODO (and any other site) can
+        # override without breaking perlmutter.
+        if app_cfg.get('matey_pretraining_dir'):
+            matey_args += ['--pretraining_data_dir',
+                           app_cfg['matey_pretraining_dir']]
+        if app_cfg.get('matey_on_perlmutter'):
+            matey_args += ['--on_perlmutter']
         # for i in range(N_MATEY_TASKS):
         #     print(f'  pin: {i:3d}  host={nodelist[i%n_hosts]}  gpu={(i//n_hosts)%gpus_per_node}')
         matey_tasks = [
