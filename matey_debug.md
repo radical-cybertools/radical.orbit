@@ -460,6 +460,37 @@ negative-lookup entries for that dir.
   watcher timeout) now clean up `.req` so a quick re-submit
   doesn't inherit stale state past submit-time cleanup.
 
+### 10e. Same NFS cache hides the parent's .port from the child
+
+ODO 2026-05-11 17:17-17:18, after 10d landed on the parent side:
+
+    17:17:43  parent watcher attempt 0: state=RUNNING
+    17:17:59  parent: child .req says hostname=odo11 (readdir worked!)
+    17:18:00  parent: ssh -R allocated port 36687, .port written
+    17:18:02  parent: tunnel active, _await_reverse_teardown begins
+    17:18:15  child: 15s timeout, .port "not found"
+    17:18:17  parent: ssh -R exited (rc=255) — child died, sshd reaped tunnel
+
+Parent's view: everything worked end-to-end in ~3s after .req appeared.
+Child's view: never saw .port for the full 15s window despite the
+file being on the same shared FS the whole time.
+
+Same NFSv3 negative-lookup cache, **opposite direction**: child's
+`relay_file.exists()` cached ENOENT at +0s and reused it even after
+the parent wrote `.port` at +1s.
+
+**Fix applied** (`src/radical/edge/service.py:_open_tunnel_reverse`):
+
+Same readdir trick on the child side — `relay_file.name in
+set(os.listdir(relay_file.parent))` instead of
+`relay_file.exists()`.  Forces a fresh readdir on every poll
+iteration; the cached ENOENT gets invalidated within 2s of the
+parent's write.
+
+Both rendezvous-file checks (parent's `.req`, child's `.port`)
+now bypass the NFS negative-lookup cache.  The reverse-tunnel
+flow should be reliable end-to-end on NFSv3.
+
 ## Files touched outside the radical.edge repo
 
 - `/ccsopen/home/merzky/matey/env/lib/python3.10/site-packages/flash_attn/__init__.py` — flash-attn stub replaced with SDPA delegator (issue 5). Lost if the venv is reinstalled.

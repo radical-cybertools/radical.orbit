@@ -707,6 +707,7 @@ class EdgeService(PluginHostBase):
         predictable than the work that got the child to this line.
         """
         import json
+        import os
         import socket
         from urllib.parse import urlparse, urlunparse
         from . import tunnel as _tunnel
@@ -738,7 +739,20 @@ class EdgeService(PluginHostBase):
 
         deadline = asyncio.get_running_loop().time() + wait_timeout
         while asyncio.get_running_loop().time() < deadline:
-            if relay_file.exists():
+            # NFSv3 negative-lookup cache hides the parent's freshly-
+            # written .port file from our `relay_file.exists()` checks
+            # for tens of seconds.  An os.listdir on the parent dir
+            # triggers a readdir RPC which forces fresh directory
+            # attributes; on Linux NFS clients this invalidates the
+            # cached ENOENT, so we see the parent's write within one
+            # polling iteration (2s) instead of waiting for the
+            # client's acregmin (30-60s) to expire.  Same trick is
+            # applied parent-side for .req — see plugin_psij.py.
+            try:
+                dir_contents = set(os.listdir(str(relay_file.parent)))
+            except OSError:
+                dir_contents = set()
+            if relay_file.name in dir_contents:
                 try:
                     port = int(relay_file.read_text().strip())
                 except (ValueError, OSError):
