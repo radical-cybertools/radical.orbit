@@ -1019,33 +1019,37 @@ class PluginPSIJ(Plugin):
 
                 if mode == 'reverse' and ssh_proc is None and \
                         state == STATE_RUNNING:
-                    # Prefer the hostname the child wrote into its .req
-                    # file (its own socket.gethostname()).  Falls back to
-                    # nodes[0] from the scheduler when the child hasn't
-                    # produced .req yet (e.g. early in startup) — that
-                    # is correct for single-node jobs but can pick the
-                    # wrong host on multi-node allocations where the
-                    # script's node != scheduler's first hostname.
+                    # Gate ssh -R spawn on the child's .req file, NOT on
+                    # SLURM's RUNNING transition.  SLURM reports RUNNING
+                    # as soon as the allocation is granted, but the child
+                    # may take many seconds more to import Python +
+                    # Dragon and call socket.gethostname().  Using the
+                    # scheduler's nodes[0] in that gap reliably picks
+                    # the wrong host on multi-node allocations and
+                    # produces an ssh -R listener the child can never
+                    # reach.  Wait for .req — the watcher's outer 300-
+                    # iteration loop bounds the wait at ~10 min, and
+                    # _fail_tunnel covers the never-appeared case.
                     req_file = relay_file.with_suffix('.req')
-                    compute_host = None
-                    if req_file.exists():
-                        try:
-                            import json as _json
-                            compute_host = _json.loads(
-                                req_file.read_text()).get('hostname')
-                        except (ValueError, OSError):
-                            compute_host = None
+                    if not req_file.exists():
+                        continue
+                    try:
+                        import json as _json
+                        compute_host = _json.loads(
+                            req_file.read_text()).get('hostname')
+                    except (ValueError, OSError) as exc:
+                        await self._fail_tunnel(
+                            edge_name, job_id, native_id,
+                            f"reverse SSH: .req file unreadable: {exc}")
+                        return
                     if not compute_host:
-                        nodes = await asyncio.to_thread(
-                            batch.job_nodes, native_id)
-                        if not nodes:
-                            # RUNNING but neither .req nor exec_host
-                            # visible — try again next poll.
-                            continue
-                        compute_host = nodes[0]
-                    log.info("[psij] reverse: job %s RUNNING on %s, spawning "
-                             "ssh -R to %s:%s",
-                             native_id, compute_host, bridge_host, bridge_port)
+                        await self._fail_tunnel(
+                            edge_name, job_id, native_id,
+                            "reverse SSH: .req file has no 'hostname' field")
+                        return
+                    log.info("[psij] reverse: child .req says hostname=%s "
+                             "for job %s, spawning ssh -R to %s:%s",
+                             compute_host, native_id, bridge_host, bridge_port)
                     try:
                         ssh_proc, port = await asyncio.to_thread(
                             _tunnel.spawn_reverse_tunnel,

@@ -286,6 +286,45 @@ truncated/multi-word reason on a FAILED job would trip that
 secondary assert — same root cause, different code path.  Not seen
 yet; flag for a follow-up if it appears.
 
+### 10. Reverse-tunnel watcher races child Dragon startup
+
+Symptom seen on a multi-node ODO run: child log shows
+`Reverse tunnel active on localhost:32893` immediately followed by
+`[Errno 111] Connect call failed ('127.0.0.1', 32893)` — the ssh -R
+listener exists, just not on this node.  Rendezvous file timestamps:
+
+    odo.1.port  2026-05-11 08:43:43   (parent wrote)
+    odo.1.req   2026-05-11 08:43:58   (child wrote, 15s LATER)
+
+Watcher's spawn gate was `state == RUNNING` — SLURM reports RUNNING
+when the allocation is granted, but the child needs another 15s
+to import Python + Dragon + radical.edge before it can write
+`.req`.  The earlier `.req`-first fix (issue 0) still kept a
+`nodes[0]` fallback, which is what fired in that 15-second gap.
+
+The architectural fix from this turn:
+
+- **Watcher gates ssh -R spawn on `.req` existence, not on SLURM
+  state.**  `state == RUNNING` is only used to know *whether* to
+  start looking; spawn waits for `.req`.
+- **`nodes[0]` fallback removed entirely.**  If `.req` never
+  appears, the watcher's existing 300-iteration / ~10 min loop
+  bounds the wait, and `_fail_tunnel` cancels with a clear reason.
+- **Client `.port` wait shortened from 300s to 15s** in
+  `service.py:_open_tunnel_reverse`.  Once `.req` is on disk
+  Dragon startup is already past — what remains is the ssh
+  handshake + "Allocated port N" parse + .port write, which is
+  predictable and small.
+
+Flow on a healthy reverse tunnel is now:
+
+    child  → writes .req (own hostname)
+    parent → reads .req, spawns ssh -R, writes .port
+    child  → reads .port, rewrites bridge URL to localhost:<port>
+
+with both sides bounded by their own timeouts and the watcher's
+outer 10-min loop as the ultimate stop.
+
 ## Files touched outside the radical.edge repo
 
 - `/ccsopen/home/merzky/matey/env/lib/python3.10/site-packages/flash_attn/__init__.py` — flash-attn stub replaced with SDPA delegator (issue 5). Lost if the venv is reinstalled.
