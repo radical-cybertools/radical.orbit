@@ -99,6 +99,7 @@ WORKLOAD           = 'rhapsody'
 # perlmutter PsiJ path with MACHINE_DEFAULTS values, emit a coarse
 # 7-step trace.  Set False to restore the original interactive flow.
 DEMO_MODE          = True
+TARGET_EDGE        = 'odo'
 N_NODES            = 1
 N_GENERATIONS      = 1
 
@@ -262,15 +263,17 @@ MACHINE_DEFAULTS = {
             'python3 -c "import mpi4py.MPI as M; print(M.Get_library_version())"',
                         ],
         'app'         : {
-            'matey_dir'      : '/global/u2/m/merzky/MATEY',
-            'matey_model_dir': '/global/cfs/projectdirs/amsc007/zhan1668/MATEY'
-                               '/models/Dev_Fusion_DemoMay_toytestonly'
-                               '/demo_nbatchsloc100/',
-            'matey_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
-                               '/d3d_174310.03500/',
-            'gkeyll_dir'     : '/global/u2/m/merzky/gkeyll/amsc',
-            'gkeyll_exe'     : 'rt_gk_d3d_iwl_2x2v_p1.sh',
+            'matey_dir'      : '/autofs/nccsopen-svm1_home/merzky/matey/MATEY',
+            'matey_model_dir': '/autofs/nccsopen-svm1_home/merzky/'
+                               '/matey/models/demo_nbatchsloc100',
+            'matey_xgc_dir'  : '/autofs/nccsopen-svm1_home/merzky/'
+                               '/matey/data/d3d_174310.03500',
+            'gkeyll_dir'     : '/autofs/nccsopen-svm1_home/merzky/gkeyll_cpu_runs',
+            'gkeyll_exe'     : 'rt_gk_d3d_iwl_2x2v_p1',
         },
+        # 'python /autofs/nccsopen-svm1_home/merzky/matey/MATEY/examples/basic_inference.py --model_dir /autofs/nccsopen-svm1_home/merzky//matey/models/demo_nbatchsloc100 --AR --leadtime 5 --newxgc_dir /autofs/nccsopen-svm1_home/merzky//matey/data/d3d_174310.03500'
+          # '--use_ddp',
+          # '--on_perlmutter',
     },
     'thinkie': {
         'enabled'     : False,
@@ -1317,7 +1320,7 @@ def _main_demo(bc, bridge_url):
     """
     step(1, 'connect bridge', bridge_url)
 
-    edge = 'odo'
+    edge = TARGET_EDGE
     target = _find_psij(edge, bc)
     if not target:
         abort(f"no '{edge}' login edge with PsiJ found in bridge "
