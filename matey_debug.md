@@ -415,6 +415,51 @@ INFO once on the spawn that finally succeeds (the existing
 `[tunnel] Reverse SSH allocated remote port ...` line in
 tunnel.py).
 
+### 10d. NFSv3 negative-lookup cache hides the child's .req from the parent
+
+ODO 2026-05-11 17:10 run, third attempt with 10b + 10c patches:
+
+    17:10:11  watcher attempt 0: state=RUNNING (.req not on disk yet)
+    17:10:30  child writes .req with hostname=odo11
+    17:10:31..45  watcher iterates 8 times — req_file.exists() returns False on EVERY check
+    17:10:46  child crashes (15s .port timeout)
+    17:10:47  SLURM marks job COMPLETED
+    17:10:59  watcher: state=UNKNOWN (job purged from squeue)
+    17:11:03  watcher aborts on UNKNOWN×3
+
+The `.req` file was on disk for 16 seconds; the parent was checking
+for it every 2s; it was visible on **both** mount views to a manual
+`ls` after the run (same inode `32680474`).  But the watcher's
+`Path.exists()` returned False the entire time.
+
+The mount table tells the story:
+
+    172.30.252.205:/nccsopen/home on /autofs/nccsopen-svm1_home type nfs (..., vers=3, ...)
+
+NFSv3 + Linux client caches negative lookups (`stat → ENOENT`) for
+`acregmin` seconds (default 30-60s).  Once the parent's first
+`req_file.exists()` returned False at 17:10:11, the cached ENOENT
+was reused for every subsequent stat() of that path until the
+cache expired — irrespective of the file's actual state on the
+server.
+
+A readdir on the parent directory forces the client to fetch
+fresh directory attributes; on Linux NFS clients this invalidates
+negative-lookup entries for that dir.
+
+**Fix applied** (`src/radical/edge/plugin_psij.py`):
+
+- Replaced the `req_file.exists()` check with
+  `req_file.name in set(os.listdir(req_file.parent))`.  The
+  `os.listdir` call triggers a readdir RPC which forces fresh
+  directory attributes and invalidates the cached negative
+  lookup.
+- Moved the `.req` unlink in `_fail_tunnel` out of the
+  `spawn_proc is not None` guard.  All failure paths
+  (UNKNOWN-streak abort, terminal-state abort without spawn,
+  watcher timeout) now clean up `.req` so a quick re-submit
+  doesn't inherit stale state past submit-time cleanup.
+
 ## Files touched outside the radical.edge repo
 
 - `/ccsopen/home/merzky/matey/env/lib/python3.10/site-packages/flash_attn/__init__.py` — flash-attn stub replaced with SDPA delegator (issue 5). Lost if the venv is reinstalled.

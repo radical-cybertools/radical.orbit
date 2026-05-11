@@ -1031,7 +1031,22 @@ class PluginPSIJ(Plugin):
                 # reaches a TERMINAL state without producing .req.
                 if mode == 'reverse' and ssh_proc is None:
                     req_file = relay_file.with_suffix('.req')
-                    if req_file.exists():
+                    # NFSv3 caches negative lookups (file-doesn't-exist)
+                    # for tens of seconds.  After the parent's first
+                    # `req_file.exists()` returns False, the cached
+                    # ENOENT keeps returning False even after the
+                    # child writes .req on the shared FS — observed
+                    # on ODO 2026-05-11 17:10: .req appeared at +21s,
+                    # parent kept seeing False for the whole 16s
+                    # window the file was on disk.  A readdir on the
+                    # parent dir invalidates the negative-lookup
+                    # cache by forcing fresh directory attributes.
+                    try:
+                        dir_contents = set(
+                            os.listdir(str(req_file.parent)))
+                    except OSError:
+                        dir_contents = set()
+                    if req_file.name in dir_contents:
                         try:
                             import json as _json
                             compute_host = _json.loads(
@@ -1202,7 +1217,13 @@ class PluginPSIJ(Plugin):
         if spawn_proc is not None:
             _tunnel.cleanup_tunnel(spawn_proc, edge_name)
             self._tunnel_procs.pop(edge_name, None)
-            (_relay_dir() / f'{edge_name}.req').unlink(missing_ok=True)
+        # Clean up the child's .req rendezvous file on every failure
+        # path, not just when an ssh proc was spawned.  Otherwise an
+        # UNKNOWN-streak / terminal-state abort that fires before we
+        # ever entered the spawn branch leaves stale .req on disk,
+        # which the next watcher run might pick up after submit-time
+        # cleanup if the user re-submits very quickly.
+        (_relay_dir() / f'{edge_name}.req').unlink(missing_ok=True)
         if job_id is not None:
             try:
                 # Use the underlying PSIJSession.cancel_job to release the
