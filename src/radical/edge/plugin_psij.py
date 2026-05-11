@@ -967,7 +967,7 @@ class PluginPSIJ(Plugin):
             mode:       ``'forward'`` or ``'reverse'``.  ``'none'``
                         callers don't reach here.
         """
-        from .batch_system import (detect_batch_system, STATE_RUNNING,
+        from .batch_system import (detect_batch_system, STATE_CANCELLED,
                                    STATE_UNKNOWN, TERMINAL_STATES)
         from . import tunnel as _tunnel
         batch = detect_batch_system()
@@ -1017,49 +1017,48 @@ class PluginPSIJ(Plugin):
                 # the job has been allocated a compute host.
                 state = await asyncio.to_thread(batch.job_state, native_id)
 
-                if mode == 'reverse' and ssh_proc is None and \
-                        state == STATE_RUNNING:
-                    # Gate ssh -R spawn on the child's .req file, NOT on
-                    # SLURM's RUNNING transition.  SLURM reports RUNNING
-                    # as soon as the allocation is granted, but the child
-                    # may take many seconds more to import Python +
-                    # Dragon and call socket.gethostname().  Using the
-                    # scheduler's nodes[0] in that gap reliably picks
-                    # the wrong host on multi-node allocations and
-                    # produces an ssh -R listener the child can never
-                    # reach.  Wait for .req — the watcher's outer 300-
-                    # iteration loop bounds the wait at ~10 min, and
-                    # _fail_tunnel covers the never-appeared case.
+                # Reverse-mode spawn: gate on the child's .req file
+                # ONLY.  We deliberately do NOT require state ==
+                # RUNNING: SLURM state polling is unreliable on some
+                # clusters (squeue can return UNKNOWN/empty for the
+                # entire lifetime of a short job; observed on ODO
+                # 2026-05-11) and is a stale-at-best proxy for
+                # "child is ready".  The .req file is authoritative
+                # — it can only have been produced by the running
+                # child, on its own compute node, after
+                # socket.gethostname() returned.  State polling
+                # below still aborts the watcher when the job
+                # reaches a TERMINAL state without producing .req.
+                if mode == 'reverse' and ssh_proc is None:
                     req_file = relay_file.with_suffix('.req')
-                    if not req_file.exists():
-                        continue
-                    try:
-                        import json as _json
-                        compute_host = _json.loads(
-                            req_file.read_text()).get('hostname')
-                    except (ValueError, OSError) as exc:
-                        await self._fail_tunnel(
-                            edge_name, job_id, native_id,
-                            f"reverse SSH: .req file unreadable: {exc}")
-                        return
-                    if not compute_host:
-                        await self._fail_tunnel(
-                            edge_name, job_id, native_id,
-                            "reverse SSH: .req file has no 'hostname' field")
-                        return
-                    log.info("[psij] reverse: child .req says hostname=%s "
-                             "for job %s, spawning ssh -R to %s:%s",
-                             compute_host, native_id, bridge_host, bridge_port)
-                    try:
-                        ssh_proc, port = await asyncio.to_thread(
-                            _tunnel.spawn_reverse_tunnel,
-                            compute_host, bridge_host, bridge_port, edge_name)
-                    except Exception as exc:
-                        await self._fail_tunnel(
-                            edge_name, job_id, native_id,
-                            f"reverse SSH spawn failed: {exc}")
-                        return
-                    self._tunnel_procs[edge_name] = ssh_proc
+                    if req_file.exists():
+                        try:
+                            import json as _json
+                            compute_host = _json.loads(
+                                req_file.read_text()).get('hostname')
+                        except (ValueError, OSError) as exc:
+                            await self._fail_tunnel(
+                                edge_name, job_id, native_id,
+                                f"reverse SSH: .req file unreadable: {exc}")
+                            return
+                        if not compute_host:
+                            await self._fail_tunnel(
+                                edge_name, job_id, native_id,
+                                "reverse SSH: .req file has no 'hostname' field")
+                            return
+                        log.info("[psij] reverse: child .req says hostname=%s "
+                                 "for job %s, spawning ssh -R to %s:%s",
+                                 compute_host, native_id, bridge_host, bridge_port)
+                        try:
+                            ssh_proc, port = await asyncio.to_thread(
+                                _tunnel.spawn_reverse_tunnel,
+                                compute_host, bridge_host, bridge_port, edge_name)
+                        except Exception as exc:
+                            await self._fail_tunnel(
+                                edge_name, job_id, native_id,
+                                f"reverse SSH spawn failed: {exc}")
+                            return
+                        self._tunnel_procs[edge_name] = ssh_proc
 
                 if state == STATE_UNKNOWN:
                     unknown_streak += 1
@@ -1085,6 +1084,17 @@ class PluginPSIJ(Plugin):
                             edge_name, job_id, native_id,
                             f"reverse SSH spawned but rendezvous file never "
                             f"appeared (job {state})", spawn_proc=ssh_proc)
+                    elif mode == 'reverse' and state != STATE_CANCELLED:
+                        # Job hit a terminal state before the child
+                        # could write .req — surface that as a tunnel
+                        # failure so the client gets a clear error.
+                        # CANCELLED is left alone: that's a deliberate
+                        # operator-initiated outcome and shouldn't be
+                        # converted to FAILED via _fail_tunnel.
+                        await self._fail_tunnel(
+                            edge_name, job_id, native_id,
+                            f"child never wrote .req (job ended {state} "
+                            f"before reverse tunnel could be set up)")
                     return
 
                 if seen_known and unknown_streak >= UNKNOWN_TOLERANCE:

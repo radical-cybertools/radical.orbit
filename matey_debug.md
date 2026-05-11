@@ -325,6 +325,53 @@ Flow on a healthy reverse tunnel is now:
 with both sides bounded by their own timeouts and the watcher's
 outer 10-min loop as the ultimate stop.
 
+### 10b. Watcher's RUNNING precondition was still a single point of failure
+
+ODO 2026-05-11 11:27-11:38: another reverse-tunnel run, this time
+with the issue-10 patches in place.  Symptom from
+`~/.radical/edge/logs/odo.log`:
+
+    11:27:59  [psij] Watcher started ...
+    11:28:59  [psij] watcher edge=odo.1 job=40063 mode=reverse state='UNKNOWN' (attempt 29/300)
+    [every 30 attempts, all UNKNOWN, until]
+    11:38:02  [psij] Watcher for edge 'odo.1' timed out
+
+Meanwhile in `odo.1.log`:
+
+    11:28:30  [Edge] wrote request file odo.1.req
+    11:28:46  RuntimeError: rendezvous file did not appear within 15s
+
+sacct: job 40063 actually ran 11:27:59 → 11:28:47 and COMPLETED.
+But this cluster's `squeue --job <id> --format=%T` returned
+empty/error for the entire job lifetime — the watcher's
+`batch.job_state()` saw UNKNOWN the whole time, never matched
+`state == STATE_RUNNING`, never even tried to read `.req`.
+
+Even though `.req` was on disk by 11:28:30, the watcher couldn't
+look at it because it was still waiting for the (broken) RUNNING
+signal.
+
+**Fix applied** (`src/radical/edge/plugin_psij.py`,
+`_tunnel_watcher` reverse-spawn branch):
+
+- Drop the `state == STATE_RUNNING` conjunct entirely.  The
+  spawn branch now fires whenever `.req` exists and `ssh_proc is
+  None`, regardless of what SLURM state polling reports.
+- `.req` is itself authoritative: the child can only have written
+  it after Python + Dragon were up and `socket.gethostname()`
+  returned a real hostname.  It's a much better readiness signal
+  than a `squeue` call.
+- Terminal-state branch extended: when the job hits
+  `TERMINAL_STATES` *without* `ssh_proc` (i.e. the child died
+  before producing `.req`), call `_fail_tunnel` with a clear
+  reason — UNLESS state is `CANCELLED`, since that's
+  operator-initiated and shouldn't be converted to FAILED.
+- Imports updated: drop unused `STATE_RUNNING`, add `STATE_CANCELLED`.
+
+After this change, SLURM state polling is used ONLY for the
+abort paths (terminal-state, UNKNOWN-streak, watcher timeout).
+Spawn doesn't depend on it.
+
 ## Files touched outside the radical.edge repo
 
 - `/ccsopen/home/merzky/matey/env/lib/python3.10/site-packages/flash_attn/__init__.py` — flash-attn stub replaced with SDPA delegator (issue 5). Lost if the venv is reinstalled.
