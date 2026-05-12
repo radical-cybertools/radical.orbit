@@ -643,15 +643,6 @@ def launch_psij(bc, edge_name, cfg, bridge_url):
         custom_attrs[f'{cfg["executor"]}.gpus-per-node'] = str(cfg['gpus_per_node'])
     if cfg.get('qos'):
         custom_attrs[f'{cfg["executor"]}.qos'] = cfg['qos']
-    # ``--nodes=N`` is rendered by PsiJ from spec.resources (set in the
-    # job_spec below) -- a single occurrence avoids the duplicated
-    # ``--nodes`` lines SLURM appears to resolve first-wins on.  We
-    # override ``--ntasks`` here to flip PsiJ's derived
-    # ``process_count = node_count`` (16 tasks across 16 nodes) back
-    # to one wrapper on the head node; Dragon spawns the rest.  SLURM
-    # honours last-wins for ``--ntasks``, so this works.
-    custom_attrs[f'{cfg["executor"]}.ntasks'] = '1'
-
     # Cert is left to the child edge to resolve from
     # ``~/.radical/edge/bridge_cert.pem`` on the target (or via
     # $RADICAL_BRIDGE_CERT if explicitly set there).  Only the bridge
@@ -669,12 +660,15 @@ def launch_psij(bc, edge_name, cfg, bridge_url):
         'arguments'         : ['--name', child_name, '--url', bridge_url],
         'attributes'        : attrs,
         'custom_attributes' : custom_attrs,
-        # plugin_psij translates ``resources.node_count`` into
-        # ``ResourceSpecV1(node_count=N)``; PsiJ then renders
-        # ``--nodes=N`` (single occurrence) and derives
-        # ``--ntasks=N --ntasks-per-node=1``.  We flip --ntasks back to
-        # 1 via custom_attributes -- see the slurm.ntasks comment above.
-        'resources'         : {'node_count': cfg['n_nodes']},
+        # ``exclusive_node_use=True`` forces SLURM to allocate whole
+        # nodes regardless of the ``ntasks / ntasks-per-node`` arithmetic
+        # PsiJ derives from ``node_count``.  Without it, the trio
+        # (nodes=N, ntasks=N, ppn=1) is internally consistent but slurm
+        # site policy / job_submit hooks can collapse the allocation
+        # to the smallest node count that satisfies ntasks -- which is
+        # 1.  ``--exclusive`` short-circuits that.
+        'resources'         : {'node_count'        : cfg['n_nodes'],
+                               'exclusive_node_use': True},
         'environment'       : env,
     }
 
