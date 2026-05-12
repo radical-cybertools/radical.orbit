@@ -84,12 +84,12 @@ N_NODES            = 16
 N_GENERATIONS      = 1   # uniform scaling factor across all task kinds
 
 # Rhapsody workload shape (mirrors examples/run_matey.py).
-N_MATEY_TASKS        = N_NODES * 10      * N_GENERATIONS   # matey inference tasks
-N_INFERENCE_TASKS        = N_NODES * 10      * N_GENERATIONS   # inference tasks (copy from matey)
-N_GKEYLL_TASKS       = N_NODES * 128 * 3 * N_GENERATIONS   # gkeyll tasks
-MATEY_WRAPPER_NAME   = 'matey_wrapper.sh'
-INFERENCE_WRAPPER_NAME   = 'matey_wrapper.sh'  # copy from matey
-RHAPSODY_WORK_SUBDIR = 'rhapsody-runs'
+N_MATEY_TASKS          = N_NODES * 10      * N_GENERATIONS
+N_INFER_TASKS      = N_NODES * 10      * N_GENERATIONS
+N_GKEYLL_TASKS         = N_NODES * 128 * 3 * N_GENERATIONS
+MATEY_WRAPPER_NAME     = 'matey_wrapper.sh'
+INFER_WRAPPER_NAME = 'matey_wrapper.sh'
+RHAPSODY_WORK_SUBDIR   = 'rhapsody-runs'
 
 # Per-task-kind spec consumed by ``submit_rhapsody_workload``.  Each entry
 # is a tuple ``(name, n_tasks, required_app_paths, default_template)``:
@@ -100,15 +100,12 @@ RHAPSODY_WORK_SUBDIR = 'rhapsody-runs'
 #   - n_tasks              : how many tasks of this kind to submit.
 #   - required_app_paths   : ``app_cfg`` keys that must exist when no
 #                            ``<name>_executable`` override is set.
-#   - default_template     : ``'inference'`` (matey/inference: basic_inference.py
+#   - default_template     : ``'infer'`` (matey/infer: basic_infer.py
 #                            wrapper) or ``'gkeyll'`` (single exe, no args).
 KINDS = [
-    ('matey',  N_MATEY_TASKS,  ('matey_model_dir', 'matey_xgc_dir'),
-     'inference'),
-    ('inference',  N_INFERENCE_TASKS,  ('inference_model_dir', 'inference_xgc_dir'),
-     'inference'),
-    ('gkeyll', N_GKEYLL_TASKS, ('gkeyll_exe',),
-     'gkeyll'),
+    ('matey',  N_MATEY_TASKS,  ('matey_model_dir', 'matey_xgc_dir'), 'infer'),
+    ('infer',  N_INFER_TASKS,  ('infer_model_dir', 'infer_xgc_dir'), 'infer'),
+    ('gkeyll', N_GKEYLL_TASKS, ('gkeyll_exe',                     ), 'gkeyll'),
 ]
 
 # How long we are willing to wait for the first edge to come up.
@@ -144,7 +141,7 @@ SLICING = {
     'mode': 'horizontal',
     'kinds': {
         'matey':  {'device': 'gpu', 'per_node': 2},
-        'inference':  {'device': 'gpu', 'per_node': 2},
+        'infer':  {'device': 'gpu', 'per_node': 2},
         'gkeyll': {'device': 'cpu', 'per_node': 'rest'},
     },
 }
@@ -154,7 +151,7 @@ SLICING = {
 #     'mode': 'vertical',
 #     'kinds': {
 #         'matey':  {'device': 'gpu', 'weight': 1},
-#         'inference':  {'device': 'gpu', 'weight': 1},
+#         'infer':  {'device': 'gpu', 'weight': 1},
 #         'gkeyll': {'device': 'cpu', 'weight': 2},
 #     },
 # }
@@ -190,7 +187,7 @@ IRI_DEFAULTS = {
             'module load openmpi',
         ],
         # ``app`` carries workload-specific paths consumed by
-        # submit_rhapsody_workload (matey + inference + gkeyll).  ``None``
+        # submit_rhapsody_workload (matey + infer + gkeyll).  ``None``
         # means "this target does not support the rhapsody workload".
         'app'         : {
             'matey_dir'      : '/global/u2/m/merzky/MATEY',
@@ -199,11 +196,11 @@ IRI_DEFAULTS = {
                                '/demo_nbatchsloc100/',
             'matey_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
                                '/d3d_174310.03500/',
-            'inference_dir'      : '/global/u2/m/merzky/MATEY',
-            'inference_model_dir': '/global/cfs/projectdirs/amsc007/zhan1668/MATEY'
+            'infer_dir'      : '/global/u2/m/merzky/MATEY',
+            'infer_model_dir': '/global/cfs/projectdirs/amsc007/zhan1668/MATEY'
                                '/models/Dev_Fusion_DemoMay_toytestonly'
                                '/demo_nbatchsloc100/',
-            'inference_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
+            'infer_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
                                '/d3d_174310.03500/',
             'gkeyll_dir'     : '/global/u2/m/merzky/gkeyll/amsc',
             'gkeyll_exe'     : 'rt_gk_d3d_iwl_2x2v_p1.sh',
@@ -278,11 +275,11 @@ MACHINE_DEFAULTS = {
                                '/demo_nbatchsloc100/',
             'matey_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
                                '/d3d_174310.03500/',
-            'inference_dir'      : '/global/u2/m/merzky/MATEY',
-            'inference_model_dir': '/global/cfs/projectdirs/amsc007/zhan1668/MATEY'
+            'infer_dir'      : '/global/u2/m/merzky/MATEY',
+            'infer_model_dir': '/global/cfs/projectdirs/amsc007/zhan1668/MATEY'
                                '/models/Dev_Fusion_DemoMay_toytestonly'
                                '/demo_nbatchsloc100/',
-            'inference_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
+            'infer_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
                                '/d3d_174310.03500/',
             'gkeyll_dir'     : '/global/u2/m/merzky/gkeyll/amsc',
             'gkeyll_exe'     : 'rt_gk_d3d_iwl_2x2v_p1.sh',
@@ -322,13 +319,13 @@ MACHINE_DEFAULTS = {
         # Per-machine slicing override (consumed by submit_rhapsody_workload
         # in place of the module-level ``SLICING``).  thinkie has a single
         # GPU and can't host the default 4-GPU-per-node horizontal split,
-        # so everything runs on CPU here: matey/inference each take 1 core,
+        # so everything runs on CPU here: matey/infer each take 1 core,
         # gkeyll takes the remaining 18.
         'slicing'      : {
             'mode': 'horizontal',
             'kinds': {
                 'matey':  {'device': 'cpu', 'per_node': 1},
-                'inference':  {'device': 'cpu', 'per_node': 1},
+                'infer':  {'device': 'cpu', 'per_node': 1},
                 'gkeyll': {'device': 'cpu', 'per_node': 'rest'},
             },
         },
@@ -340,9 +337,9 @@ MACHINE_DEFAULTS = {
             'matey_dir'        : '/tmp',
             'matey_executable' : '/bin/sleep',
             'matey_arguments'  : ['0.1'],
-            'inference_dir'        : '/tmp',
-            'inference_executable' : '/bin/sleep',
-            'inference_arguments'  : ['0.2'],
+            'infer_dir'        : '/tmp',
+            'infer_executable' : '/bin/sleep',
+            'infer_arguments'  : ['0.2'],
             'gkeyll_dir'       : '/tmp',
             'gkeyll_executable': '/bin/sleep',
             'gkeyll_arguments' : ['0.3'],
@@ -447,7 +444,7 @@ def abort(msg):
     sys.exit(1)
 
 
-def _make_progress(n_matey, n_inference, n_gkeyll):
+def _make_progress(n_matey, n_infer, n_gkeyll):
     """Build the rhapsody workload's progress display.
 
     Returns ``(progress, tids)`` where *progress* is a ``rich.Progress``
@@ -474,9 +471,9 @@ def _make_progress(n_matey, n_inference, n_gkeyll):
         console=_console,
     )
     tids = {}
-    for kind, n in (('gkeyll',    n_gkeyll),
-                    ('matey',     n_matey),
-                    ('inference', n_inference)):
+    for kind, n in (('gkeyll', n_gkeyll),
+                    ('matey',  n_matey),
+                    ('infer',  n_infer)):
         if n > 0:
             tids[kind] = progress.add_task('', total=n, label=kind,
                                            submitted=0, done=0, failed=0)
@@ -729,7 +726,7 @@ def wait_for_first_edge(bc, expected_names, timeout=EDGE_WAIT_SECONDS,
 # ─────────────────────────────────────────────────────────────────────────────
 #  Rhapsody workload.
 #
-#  Submits matey + inference + gkeyll task families against the named edge
+#  Submits matey + infer + gkeyll task families against the named edge
 #  as a rhapsody backend.  Resources are carved up per ``SLICING`` (see
 #  top of file) into per-kind pools: each kind gets its own per-host
 #  affinity range (horizontal) or its own disjoint node subset
@@ -738,7 +735,7 @@ def wait_for_first_edge(bc, expected_names, timeout=EDGE_WAIT_SECONDS,
 #  Per-target requirements (see ``app`` field in IRI_DEFAULTS /
 #  MACHINE_DEFAULTS):
 #    * ``app.matey_dir / matey_model_dir / matey_xgc_dir``  — matey paths
-#    * ``app.inference_dir / inference_model_dir / inference_xgc_dir``  — inference paths
+#    * ``app.infer_dir / infer_model_dir / infer_xgc_dir``  — infer paths
 #    * ``app.gkeyll_dir / gkeyll_exe``                      — gkeyll paths
 #    * ``gpus_per_node`` / ``cores_per_node``               — device totals
 #                                                             carved by SLICING
@@ -923,12 +920,12 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
         if has_override:
             exe  = app_cfg[f'{name}_executable']
             args = list(app_cfg.get(f'{name}_arguments') or [])
-        elif template == 'inference':
+        elif template == 'infer':
             wrapper = (MATEY_WRAPPER_NAME if name == 'matey'
-                       else INFERENCE_WRAPPER_NAME)
+                       else INFER_WRAPPER_NAME)
             exe  = f'{app_dir}/{wrapper}'
             args = [
-                'python', f'{app_dir}/examples/basic_inference.py',
+                'python', f'{app_dir}/examples/basic_infer.py',
                 '--model_dir',  app_cfg[f'{name}_model_dir'],
                 '--use_ddp',
                 '--on_perlmutter',
@@ -958,7 +955,7 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
     # ``process_template`` instead.
     progress, tids = _make_progress(
         len(tasks_by_kind.get('matey',  ())),
-        len(tasks_by_kind.get('inference',  ())),
+        len(tasks_by_kind.get('infer',  ())),
         len(tasks_by_kind.get('gkeyll', ())))
 
     async with Session(backends=[backend]) as session:
@@ -1130,7 +1127,7 @@ def _step_run(bc, bridge_url, edge_name, cfg):
     step(6, 'run rhapsody',
          f'{n_hosts} hosts  '
          f'matey {N_MATEY_TASKS} (cap {slices["matey"]["cap"]})  '
-         f'inference {N_INFERENCE_TASKS} (cap {slices["inference"]["cap"]})  '
+         f'infer {N_INFER_TASKS} (cap {slices["infer"]["cap"]})  '
          f'gkeyll {N_GKEYLL_TASKS} (cap {slices["gkeyll"]["cap"]})')
     try:
         asyncio.run(submit_rhapsody_workload(
