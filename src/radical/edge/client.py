@@ -92,6 +92,8 @@ import logging
 import urllib3
 import json
 import itertools
+
+from .http_utils import make_http_client
 import threading
 
 from typing import Any, Dict, List, Optional, Callable, Tuple
@@ -205,7 +207,7 @@ class BridgeClient:
             self._prof.prof('client_recv', uid=req_id,
                             state=str(response.status_code))
 
-        self._http: httpx.Client = httpx.Client(
+        self._http: httpx.Client = make_http_client(
             base_url=self._url,
             verify=self._cert if self._cert else False,
             # Match the bridge's REQUEST_TIMEOUT (600s).  Submit batches

@@ -34,6 +34,8 @@ import httpx
 
 from fastapi import FastAPI, HTTPException, Request
 
+from .http_utils import make_async_http_client
+
 from .plugin_session_base import PluginSession
 from .plugin_base          import Plugin
 from .client               import PluginClient
@@ -104,7 +106,7 @@ class IRIInstanceSession(PluginSession):
         self._endpoint     = IRI_ENDPOINTS[endpoint]
         self._token        = token
 
-        self._http = httpx.AsyncClient(
+        self._http = make_async_http_client(
             base_url = self._endpoint['url'],
             headers  = {'Authorization': f'Bearer {self._token}'},
             timeout  = 30.0,
