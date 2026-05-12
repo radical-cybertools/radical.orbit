@@ -1142,9 +1142,20 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
                     progress.update(tids[kind], advance=1,
                                     done=c['done'], failed=c['failed'])
 
-        coros = [run_one(t, name)
-                 for name, tasks in tasks_by_kind.items()
-                 for t in tasks]
+        # Round-robin interleave across kinds so the rhapsody-edge
+        # backend's single FIFO flush channel sees one task from each
+        # active kind per round, not all of one kind first.  Without
+        # this, the matey/infer bars fill before any gkeyll task is
+        # even submitted -- the cap semaphores are per-kind, but the
+        # submit channel is shared.  Each kind's per-task order is
+        # preserved; once a kind runs out, the round skips it and the
+        # longest kind tails out alone.
+        from itertools import zip_longest
+        _sentinel = object()
+        per_kind  = [[run_one(t, name) for t in tasks]
+                     for name, tasks in tasks_by_kind.items()]
+        coros = [c for tup in zip_longest(*per_kind, fillvalue=_sentinel)
+                   for c in tup if c is not _sentinel]
 
         if progress:
             _console.print()
