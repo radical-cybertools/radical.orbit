@@ -1127,11 +1127,19 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
 
         async def run_one(task, kind):
             async with sems[kind]:
-                await session.submit_tasks([task])
+                # Count slot-occupancy, not flush-completion: bump
+                # ``submitted`` the moment we acquire the kind's semaphore
+                # (= a resource slot is in use), before the rhapsody-edge
+                # batch-flush queue starts processing.  Without this, all
+                # three bars stall at the same flush boundary
+                # (batch_limit=1024 in rhapsody-edge) because that's
+                # where the ``await session.submit_tasks`` first actually
+                # blocks; users read this as a stuck progress bar.
                 counts[kind]['submitted'] += 1
                 if progress and kind in tids:
                     progress.update(tids[kind],
                                     submitted=counts[kind]['submitted'])
+                await session.submit_tasks([task])
                 try:
                     await task
                     counts[kind]['done'] += 1
