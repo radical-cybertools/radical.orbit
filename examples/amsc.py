@@ -825,6 +825,108 @@ def _compute_slices(slicing, n_hosts, gpus_per_node, cores_per_node, nodelist):
         f"SLICING.mode={mode!r} (expected 'horizontal' or 'vertical')")
 
 
+def _render_slicing(slicing_mode, slices, gpus_per_node, cores_per_node,
+                    nodelist, active_kinds):
+    """ASCII visualization of the resource carve-up, wrapped in a titled
+    panel.
+
+    Horizontal (uniform per-node): one template + ``×N`` for the node
+    count.  Vertical (disjoint node subsets, CPU-only by current design):
+    one line per kind with its node range.
+
+    Yellow is reserved for structural / non-task text; each kind gets
+    its own colour (matey=magenta, infer=cyan, gkeyll=green).
+    """
+    if not _console:
+        return
+
+    from rich.panel import Panel
+
+    glyph = {'matey': 'M', 'infer': 'I', 'gkeyll': 'G'}
+    color = {'matey': 'magenta', 'infer': 'cyan', 'gkeyll': 'green'}
+    Y     = 'yellow'
+
+    lines = []
+
+    if slicing_mode == 'horizontal':
+        n_hosts = len(nodelist)
+        lines.append(f'[{Y}]each of {n_hosts} nodes:[/{Y}]')
+
+        gpu_slots = [None] * (gpus_per_node  or 0)
+        cpu_slots = [None] * (cores_per_node or 0)
+        for name in active_kinds:
+            sl       = slices[name]
+            slot_arr = gpu_slots if sl['device'] == 'gpu' else cpu_slots
+            for i in range(sl['affinity_start'],
+                           sl['affinity_start'] + sl['affinity_count']):
+                if i < len(slot_arr):
+                    slot_arr[i] = name
+
+        def _row(label, slots):
+            if not slots or not any(slots):
+                return
+            # Short rows (≤ 8 slots) list each slot; longer ones run-length
+            # compress contiguous same-kind runs (typical for cpu(128)).
+            if len(slots) <= 8:
+                cells = ' '.join(
+                    f'[{color[s]}]{glyph[s]}[/{color[s]}]' if s
+                    else f'[{Y}]·[/{Y}]'
+                    for s in slots)
+            else:
+                parts = []
+                i = 0
+                while i < len(slots):
+                    k, j = slots[i], i
+                    while j < len(slots) and slots[j] == k:
+                        j += 1
+                    run = j - i
+                    if k:
+                        parts.append(
+                            f'[{color[k]}]{glyph[k]}[/{color[k]}] '
+                            f'[{Y}]×{run}[/{Y}]')
+                    else:
+                        parts.append(f'[{Y}]·×{run}[/{Y}]')
+                    i = j
+                cells = '  '.join(parts)
+            pad = f'{label}:'.ljust(9)
+            lines.append(f'  [{Y}]{pad}[/{Y}]  {cells}')
+
+        if gpus_per_node:
+            _row(f'gpu({gpus_per_node})',  gpu_slots)
+        if cores_per_node:
+            _row(f'cpu({cores_per_node})', cpu_slots)
+
+        title = 'horizontal slicing'
+
+    elif slicing_mode == 'vertical':
+        # Cursor accumulates across ALL declared kinds so displayed
+        # (start..end) indices match the underlying nodelist offsets
+        # even when some kinds are inactive but still consume nodes.
+        cursor = 0
+        for name, sl in slices.items():
+            n = len(sl['hosts'])
+            if name in active_kinds and n > 0:
+                start, end = cursor, cursor + n - 1
+                lines.append(
+                    f'  [{color[name]}]{name:<7s}[/{color[name]}] '
+                    f'[{Y}]×{n} nodes ({start}..{end})[/{Y}]')
+            cursor += n
+
+        title = 'vertical slicing'
+
+    else:
+        return
+
+    if not lines:
+        return
+
+    _console.print(Panel('\n'.join(lines),
+                         title=f'[{Y}]{title}[/{Y}]',
+                         title_align='left',
+                         border_style=Y,
+                         expand=False))
+
+
 async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
     """Submit the active task kinds (per ``KINDS``) via the named edge.
 
@@ -953,6 +1055,10 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
         raise RuntimeError(
             f"target {edge_name!r}: nothing to run.  Need a non-zero "
             "SLICING cap and matching app paths for at least one kind.")
+
+    _render_slicing(slicing.get('mode'), slices,
+                    gpus_per_node, cores_per_node, nodelist,
+                    list(tasks_by_kind.keys()))
 
     backend = await rhapsody.get_backend(
         'edge', bridge_url=bridge_url, edge_name=edge_name)
