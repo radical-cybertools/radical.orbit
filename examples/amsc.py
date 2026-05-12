@@ -155,14 +155,18 @@ SLICING = {
 }
 
 # --- shape B: vertical (whole-node weights) ---------------------------------
-# SLICING = {
-#     'mode': 'vertical',
-#     'kinds': {
-#         'matey':  {'device': 'gpu', 'weight': 1},
-#         'infer':  {'device': 'gpu', 'weight': 1},
-#         'gkeyll': {'device': 'cpu', 'weight': 2},
-#     },
-# }
+# Each kind owns its node subset fully on CPU (gpu unused in this mode).
+# Selected via the CLI ``vertical`` override (see ``main`` /
+# ``_apply_cli_overrides``); ``n_nodes`` must be a multiple of
+# sum(weights) so every kind ends up with whole, non-zero node count.
+VERTICAL_SLICING = {
+    'mode': 'vertical',
+    'kinds': {
+        'matey':  {'device': 'cpu', 'weight': 1},
+        'infer':  {'device': 'cpu', 'weight': 1},
+        'gkeyll': {'device': 'cpu', 'weight': 2},
+    },
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -799,16 +803,29 @@ def _compute_slices(slicing, n_hosts, gpus_per_node, cores_per_node, nodelist):
 
     if mode == 'vertical':
         # Disjoint node subsets by weight; each kind owns its nodes fully.
+        # We reject any allocation that would leave a remainder after the
+        # weight-based split (so we never silently drop nodes) and any
+        # allocation where a kind would end up with zero nodes.  In
+        # practice this means ``n_nodes`` must be a multiple of the
+        # ``sum(weights)`` declared in ``VERTICAL_SLICING``.
         weights = {k: int(kinds[k].get('weight', 0)) for k in kinds}
-        total_w = sum(weights.values()) or 1
-        n_each  = {k: (n_hosts * w) // total_w for k, w in weights.items()}
-        remainder = n_hosts - sum(n_each.values())
-        # Hand out leftover nodes in declaration order — deterministic.
-        for k in list(weights):
-            if remainder <= 0:
-                break
-            n_each[k] += 1
-            remainder -= 1
+        zeros   = [k for k, w in weights.items() if w <= 0]
+        if zeros:
+            abort(f"vertical slicing: kinds with zero or missing weight: "
+                  f"{zeros} (got {weights})")
+        total_w = sum(weights.values())
+        if n_hosts % total_w != 0:
+            abort(f"vertical slicing: n_nodes={n_hosts} is not a multiple "
+                  f"of sum(weights)={total_w} (weights={weights}); pick a "
+                  f"compatible n_nodes")
+        n_each = {k: (n_hosts * w) // total_w for k, w in weights.items()}
+        # Defense in depth: covers n_hosts == 0 (which slips past the
+        # modulo check) and any future-weights edge case.
+        zero_alloc = [k for k, n in n_each.items() if n == 0]
+        if zero_alloc:
+            abort(f"vertical slicing: kinds with zero-node allocation: "
+                  f"{zero_alloc} (n_nodes={n_hosts}, weights={weights}); "
+                  f"need n_nodes >= sum(weights)={total_w}")
 
         cursor = 0
         slices = {}
@@ -1282,17 +1299,20 @@ def _step_run(bc, bridge_url, edge_name, cfg):
 def _apply_cli_overrides(cfg, mode, n_nodes):
     """Apply optional CLI overrides onto a freshly-loaded target ``cfg``.
 
-    ``mode`` (``'horizontal'`` / ``'vertical'`` / None) replaces the
-    slicing mode in whichever slicing dict the target uses (per-cfg
-    override if present, else module-level ``SLICING``).  ``n_nodes``
-    (int / None) replaces ``cfg['n_nodes']``.  Either may be None to
-    leave the corresponding cfg field untouched.
+    ``mode`` (``'horizontal'`` / ``'vertical'`` / None) swaps in the
+    matching module-level template (``SLICING`` / ``VERTICAL_SLICING``)
+    in place of any per-target slicing.  This is a whole-template swap,
+    not just a mode-string patch: the per-kind ``per_node`` (horizontal)
+    and ``weight`` (vertical) fields differ between templates.
+    ``n_nodes`` (int / None) replaces ``cfg['n_nodes']``.  Either may be
+    None to leave the corresponding cfg field untouched.
     """
     if n_nodes is not None:
         cfg['n_nodes'] = n_nodes
-    if mode:
-        base = cfg.get('slicing') or SLICING
-        cfg['slicing'] = {**base, 'mode': mode}
+    if mode == 'horizontal':
+        cfg['slicing'] = SLICING
+    elif mode == 'vertical':
+        cfg['slicing'] = VERTICAL_SLICING
 
 
 def _main_target(bc, bridge_url, kind, name,
