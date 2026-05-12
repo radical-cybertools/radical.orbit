@@ -10,7 +10,7 @@ The `docker-compose.yaml` file defines the following services:
 - **edge-b**: A radical.edge instance named `edge_b`.
 - **client**: A container for launching the Makeflow workflow.
 
-The build context is set to the parent directory, so `pools.json` and `workflow.makeflow` are automatically included in the image during build.
+The build context is set to the parent directory (`..`), so `pools.json` and `workflow.makeflow` are automatically included in the image during build.
 
 ## Running the Example
 

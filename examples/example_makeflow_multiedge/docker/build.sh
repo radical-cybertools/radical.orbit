@@ -3,7 +3,6 @@
 DOCKER_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]:-$0}"; )" &> /dev/null && pwd 2> /dev/null; )"
 CONTEXT_DIR="$( dirname "$DOCKER_DIR" )"
 
-
 IMAGE_NAME="${RADICAL_EDGE_IMAGE:-radicalcybertools/radical.edge}"
 IMAGE_TAG="${RADICAL_EDGE_TAG:-latest}"
 BRANCH="${RADICAL_EDGE_BRANCH:-master}"

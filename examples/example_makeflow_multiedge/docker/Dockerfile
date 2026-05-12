@@ -18,13 +18,13 @@ RUN apt-get update -y && \
 
 USER $MAMBA_USER
 
-COPY --chown=$MAMBA_USER:$MAMBA_USER docker/environment.yml /tmp/environment.yml
-RUN micromamba install -y -n base -f /tmp/environment.yml && \
-    micromamba clean --all --yes
-
-ENV ENV_NAME=base
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONNOUSERSITE=True
+ENV ENV_NAME=base
+
+COPY --chown=$MAMBA_USER:$MAMBA_USER docker/environment.yml /tmp/environment.yml
+RUN micromamba install -y -n $ENV_NAME -f /tmp/environment.yml && \
+    micromamba clean --all --yes
 
 ARG MAMBA_DOCKERFILE_ACTIVATE=1
 ENV PATH="/opt/conda/bin:${PATH}"

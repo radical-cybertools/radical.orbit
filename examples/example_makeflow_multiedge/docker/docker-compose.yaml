@@ -1,16 +1,8 @@
-x-common-build: &common-build
+x-common-image: &common-image
   image: ${RADICAL_EDGE_IMAGE:-radicalcybertools/radical.edge}:${RADICAL_EDGE_TAG:-latest}
-  build:
-    context: ..
-    dockerfile: docker/Dockerfile
-    args:
-      RADICAL_EDGE_BRANCH: ${RADICAL_EDGE_BRANCH:-master}
 
 x-edge-service: &edge-service
-  <<: *common-build
-  build:
-    args:
-      GENERATE_BRIDGE_CERT: "false"
+  <<: *common-image
   environment:
     - RADICAL_BRIDGE_URL=https://${RADICAL_BRIDGE_HOSTNAME:-bridge}:8000
   command: [ "bash", "-c", "radical-edge-wrapper.sh -n $$(hostname) --plugins psij,rhapsody,staging,task_dispatcher" ]
@@ -19,17 +11,30 @@ x-edge-service: &edge-service
   networks:
     - radical-edge-network
   depends_on:
+    image-builder:
+      condition: service_completed_successfully
     bridge:
       condition: service_healthy
 
 services:
-  bridge:
-    <<: *common-build
+
+  image-builder:
+    <<: *common-image
+    container_name: radical-edge-image-builder
     build:
+      context: ..
+      dockerfile: docker/Dockerfile
       args:
+        RADICAL_EDGE_BRANCH: ${RADICAL_EDGE_BRANCH:-master}
         GENERATE_BRIDGE_CERT: "true"
         BRIDGE_IP: "127.0.0.1"
         BRIDGE_HOSTNAME: ${RADICAL_BRIDGE_HOSTNAME:-bridge}
+    command: [ "echo", "Build complete" ]
+    networks:
+      - radical-edge-network
+
+  bridge:
+    <<: *common-image
     container_name: radical-bridge
     hostname: ${RADICAL_BRIDGE_HOSTNAME:-bridge}
     command: [ "radical-edge-bridge.py" ]
@@ -47,6 +52,9 @@ services:
       - radical-edge-volume:/app
     networks:
       - radical-edge-network
+    depends_on:
+      image-builder:
+        condition: service_completed_successfully
 
   edge-a:
     <<: *edge-service
@@ -59,10 +67,7 @@ services:
     hostname: edge_b
 
   client:
-    <<: *common-build
-    build:
-      args:
-        GENERATE_BRIDGE_CERT: "false"
+    <<: *common-image
     container_name: radical-edge-client
     hostname: client
     environment:
@@ -73,6 +78,8 @@ services:
     networks:
       - radical-edge-network
     depends_on:
+      image-builder:
+        condition: service_completed_successfully
       bridge:
         condition: service_healthy
       edge-a:
