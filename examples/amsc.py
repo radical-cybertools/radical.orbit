@@ -100,10 +100,12 @@ RHAPSODY_WORK_SUBDIR   = 'rhapsody-runs'
 #   - n_tasks              : how many tasks of this kind to submit.
 #   - required_app_paths   : ``app_cfg`` keys that must exist when no
 #                            ``<name>_executable`` override is set.
-#   - default_template     : ``'infer'`` (matey/infer: basic_infer.py
-#                            wrapper) or ``'gkeyll'`` (single exe, no args).
+#   - default_template     : ``'matey'`` / ``'infer'`` (each builds its own
+#                            basic_infer.py argv -- currently identical but
+#                            kept separate so they can diverge) or ``'gkeyll'``
+#                            (single exe, no args).
 KINDS = [
-    ('matey',  N_MATEY_TASKS,  ('matey_model_dir', 'matey_xgc_dir'), 'infer'),
+    ('matey',  N_MATEY_TASKS,  ('matey_model_dir', 'matey_xgc_dir'), 'matey'),
     ('infer',  N_INFER_TASKS,  ('infer_model_dir', 'infer_xgc_dir'), 'infer'),
     ('gkeyll', N_GKEYLL_TASKS, ('gkeyll_exe',                     ), 'gkeyll'),
 ]
@@ -920,18 +922,27 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
         if has_override:
             exe  = app_cfg[f'{name}_executable']
             args = list(app_cfg.get(f'{name}_arguments') or [])
-        elif template == 'infer':
-            wrapper = (MATEY_WRAPPER_NAME if name == 'matey'
-                       else INFER_WRAPPER_NAME)
-            exe  = f'{app_dir}/{wrapper}'
+        elif template == 'matey':
+            exe  = f'{app_dir}/{MATEY_WRAPPER_NAME}'
             args = [
                 'python', f'{app_dir}/examples/basic_infer.py',
-                '--model_dir',  app_cfg[f'{name}_model_dir'],
+                '--model_dir',  app_cfg['matey_model_dir'],
                 '--use_ddp',
                 '--on_perlmutter',
                 '--AR',
                 '--leadtime',   '5',
-                '--newxgc_dir', app_cfg[f'{name}_xgc_dir'],
+                '--newxgc_dir', app_cfg['matey_xgc_dir'],
+            ]
+        elif template == 'infer':
+            exe  = f'{app_dir}/{INFER_WRAPPER_NAME}'
+            args = [
+                'python', f'{app_dir}/examples/basic_infer.py',
+                '--model_dir',  app_cfg['infer_model_dir'],
+                '--use_ddp',
+                '--on_perlmutter',
+                '--AR',
+                '--leadtime',   '5',
+                '--newxgc_dir', app_cfg['infer_xgc_dir'],
             ]
         else:  # 'gkeyll'
             exe  = f'{app_dir}/{app_cfg["gkeyll_exe"]}'
@@ -984,10 +995,10 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
                  for t in tasks]
 
         if progress:
-            print()
+            _console.print()
             with progress:
                 await asyncio.gather(*coros, return_exceptions=True)
-            print()
+            _console.print()
         else:
             await asyncio.gather(*coros, return_exceptions=True)
 
@@ -1009,7 +1020,6 @@ def teardown(bc, created):
             continue
         try:
             c['iri'].cancel_job(c['resource_id'], c['job_id'])
-            print(f'  cancelled IRI job {c["job_id"]}@{c["endpoint"]}')
         except Exception as exc:
             print(f'  could not cancel IRI job {c["job_id"]}: {exc}')
 
@@ -1019,7 +1029,6 @@ def teardown(bc, created):
             continue
         try:
             c['psij'].cancel_job(c['job_id'])
-            print(f'  cancelled PsiJ job {c["job_id"]} on {c["parent_edge"]}')
         except Exception as exc:
             print(f'  could not cancel PsiJ job {c["job_id"]}: {exc}')
 
@@ -1030,7 +1039,6 @@ def teardown(bc, created):
         for ep in iri_eps:
             try:
                 cx.disconnect(ep)
-                print(f'  disconnected IRI endpoint {ep}')
             except Exception as exc:
                 print(f'  could not disconnect IRI {ep}: {exc}')
 
@@ -1264,6 +1272,7 @@ def main():
         _main_target(bc, bridge_url, kind, name)
     finally:
         bc.close()
+        print()
 
 
 if __name__ == '__main__':
