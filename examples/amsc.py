@@ -81,11 +81,12 @@ rhapsody.enable_logging(level=logging.WARNING)
 # ─────────────────────────────────────────────────────────────────────────────
 
 N_NODES            = 16
+N_GENERATIONS      = 1   # uniform scaling factor across all task kinds
 
 # Rhapsody workload shape (mirrors examples/run_matey.py).
-N_MATEY_TASKS        = N_NODES * 10        # matey inference tasks
-N_SIMUL_TASKS        = N_NODES * 10        # simul tasks (copy from matey)
-N_GKEYLL_TASKS       = N_NODES * 128 * 3   # gkeyll tasks
+N_MATEY_TASKS        = N_NODES * 10      * N_GENERATIONS   # matey inference tasks
+N_SIMUL_TASKS        = N_NODES * 10      * N_GENERATIONS   # simul tasks (copy from matey)
+N_GKEYLL_TASKS       = N_NODES * 128 * 3 * N_GENERATIONS   # gkeyll tasks
 MATEY_WRAPPER_NAME   = 'matey_wrapper.sh'
 SIMUL_WRAPPER_NAME   = 'matey_wrapper.sh'  # copy from matey
 RHAPSODY_WORK_SUBDIR = 'rhapsody-runs'
