@@ -85,10 +85,10 @@ N_GENERATIONS      = 1   # uniform scaling factor across all task kinds
 
 # Rhapsody workload shape (mirrors examples/run_matey.py).
 N_MATEY_TASKS        = N_NODES * 10      * N_GENERATIONS   # matey inference tasks
-N_SIMUL_TASKS        = N_NODES * 10      * N_GENERATIONS   # simul tasks (copy from matey)
+N_INFERENCE_TASKS        = N_NODES * 10      * N_GENERATIONS   # inference tasks (copy from matey)
 N_GKEYLL_TASKS       = N_NODES * 128 * 3 * N_GENERATIONS   # gkeyll tasks
 MATEY_WRAPPER_NAME   = 'matey_wrapper.sh'
-SIMUL_WRAPPER_NAME   = 'matey_wrapper.sh'  # copy from matey
+INFERENCE_WRAPPER_NAME   = 'matey_wrapper.sh'  # copy from matey
 RHAPSODY_WORK_SUBDIR = 'rhapsody-runs'
 
 # Per-task-kind spec consumed by ``submit_rhapsody_workload``.  Each entry
@@ -100,12 +100,12 @@ RHAPSODY_WORK_SUBDIR = 'rhapsody-runs'
 #   - n_tasks              : how many tasks of this kind to submit.
 #   - required_app_paths   : ``app_cfg`` keys that must exist when no
 #                            ``<name>_executable`` override is set.
-#   - default_template     : ``'inference'`` (matey/simul: basic_inference.py
+#   - default_template     : ``'inference'`` (matey/inference: basic_inference.py
 #                            wrapper) or ``'gkeyll'`` (single exe, no args).
 KINDS = [
     ('matey',  N_MATEY_TASKS,  ('matey_model_dir', 'matey_xgc_dir'),
      'inference'),
-    ('simul',  N_SIMUL_TASKS,  ('simul_model_dir', 'simul_xgc_dir'),
+    ('inference',  N_INFERENCE_TASKS,  ('inference_model_dir', 'inference_xgc_dir'),
      'inference'),
     ('gkeyll', N_GKEYLL_TASKS, ('gkeyll_exe',),
      'gkeyll'),
@@ -144,7 +144,7 @@ SLICING = {
     'mode': 'horizontal',
     'kinds': {
         'matey':  {'device': 'gpu', 'per_node': 2},
-        'simul':  {'device': 'gpu', 'per_node': 2},
+        'inference':  {'device': 'gpu', 'per_node': 2},
         'gkeyll': {'device': 'cpu', 'per_node': 'rest'},
     },
 }
@@ -154,7 +154,7 @@ SLICING = {
 #     'mode': 'vertical',
 #     'kinds': {
 #         'matey':  {'device': 'gpu', 'weight': 1},
-#         'simul':  {'device': 'gpu', 'weight': 1},
+#         'inference':  {'device': 'gpu', 'weight': 1},
 #         'gkeyll': {'device': 'cpu', 'weight': 2},
 #     },
 # }
@@ -190,7 +190,7 @@ IRI_DEFAULTS = {
             'module load openmpi',
         ],
         # ``app`` carries workload-specific paths consumed by
-        # submit_rhapsody_workload (matey + simul + gkeyll).  ``None``
+        # submit_rhapsody_workload (matey + inference + gkeyll).  ``None``
         # means "this target does not support the rhapsody workload".
         'app'         : {
             'matey_dir'      : '/global/u2/m/merzky/MATEY',
@@ -199,11 +199,11 @@ IRI_DEFAULTS = {
                                '/demo_nbatchsloc100/',
             'matey_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
                                '/d3d_174310.03500/',
-            'simul_dir'      : '/global/u2/m/merzky/MATEY',
-            'simul_model_dir': '/global/cfs/projectdirs/amsc007/zhan1668/MATEY'
+            'inference_dir'      : '/global/u2/m/merzky/MATEY',
+            'inference_model_dir': '/global/cfs/projectdirs/amsc007/zhan1668/MATEY'
                                '/models/Dev_Fusion_DemoMay_toytestonly'
                                '/demo_nbatchsloc100/',
-            'simul_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
+            'inference_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
                                '/d3d_174310.03500/',
             'gkeyll_dir'     : '/global/u2/m/merzky/gkeyll/amsc',
             'gkeyll_exe'     : 'rt_gk_d3d_iwl_2x2v_p1.sh',
@@ -278,11 +278,11 @@ MACHINE_DEFAULTS = {
                                '/demo_nbatchsloc100/',
             'matey_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
                                '/d3d_174310.03500/',
-            'simul_dir'      : '/global/u2/m/merzky/MATEY',
-            'simul_model_dir': '/global/cfs/projectdirs/amsc007/zhan1668/MATEY'
+            'inference_dir'      : '/global/u2/m/merzky/MATEY',
+            'inference_model_dir': '/global/cfs/projectdirs/amsc007/zhan1668/MATEY'
                                '/models/Dev_Fusion_DemoMay_toytestonly'
                                '/demo_nbatchsloc100/',
-            'simul_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
+            'inference_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
                                '/d3d_174310.03500/',
             'gkeyll_dir'     : '/global/u2/m/merzky/gkeyll/amsc',
             'gkeyll_exe'     : 'rt_gk_d3d_iwl_2x2v_p1.sh',
@@ -322,13 +322,13 @@ MACHINE_DEFAULTS = {
         # Per-machine slicing override (consumed by submit_rhapsody_workload
         # in place of the module-level ``SLICING``).  thinkie has a single
         # GPU and can't host the default 4-GPU-per-node horizontal split,
-        # so everything runs on CPU here: matey/simul each take 1 core,
+        # so everything runs on CPU here: matey/inference each take 1 core,
         # gkeyll takes the remaining 18.
         'slicing'      : {
             'mode': 'horizontal',
             'kinds': {
                 'matey':  {'device': 'cpu', 'per_node': 1},
-                'simul':  {'device': 'cpu', 'per_node': 1},
+                'inference':  {'device': 'cpu', 'per_node': 1},
                 'gkeyll': {'device': 'cpu', 'per_node': 'rest'},
             },
         },
@@ -340,9 +340,9 @@ MACHINE_DEFAULTS = {
             'matey_dir'        : '/tmp',
             'matey_executable' : '/bin/sleep',
             'matey_arguments'  : ['0.1'],
-            'simul_dir'        : '/tmp',
-            'simul_executable' : '/bin/sleep',
-            'simul_arguments'  : ['0.2'],
+            'inference_dir'        : '/tmp',
+            'inference_executable' : '/bin/sleep',
+            'inference_arguments'  : ['0.2'],
             'gkeyll_dir'       : '/tmp',
             'gkeyll_executable': '/bin/sleep',
             'gkeyll_arguments' : ['0.3'],
@@ -427,14 +427,16 @@ except ImportError:                              # pragma: no cover
 
 _TOTAL_STEPS = 7   # connect / pick / configure / submit / await / run / teardown
 
-def step(idx, label, detail=''):
+def step(idx, label, detail='', newline=True):
+    end = '\n' if newline else ''
     if _console:
         _console.print(
             f'[cyan]step {idx}/{_TOTAL_STEPS}[/cyan]  '
             f'[bold]{label:<20}[/bold]  '
-            f'[bright_white]{detail}[/bright_white]')
+            f'[bright_white]{detail}[/bright_white]',
+            end=end)
     else:
-        print(f'step {idx}/{_TOTAL_STEPS}  {label:<20}  {detail}')
+        print(f'step {idx}/{_TOTAL_STEPS}  {label:<20}  {detail}', end=end)
 
 def abort(msg):
     """Print a red ABORT line and exit with status 1.  No traceback."""
@@ -445,7 +447,7 @@ def abort(msg):
     sys.exit(1)
 
 
-def _make_progress(n_matey, n_simul, n_gkeyll):
+def _make_progress(n_matey, n_inference, n_gkeyll):
     """Build the rhapsody workload's progress display.
 
     Returns ``(progress, tids)`` where *progress* is a ``rich.Progress``
@@ -462,7 +464,7 @@ def _make_progress(n_matey, n_simul, n_gkeyll):
         return None, {}
 
     progress = Progress(
-        TextColumn("  [cyan]{task.fields[label]:<6s}[/cyan]"),
+        TextColumn("  [cyan]{task.fields[label]:<9s}[/cyan]"),
         _TwoBars(bar_width=20),
         TextColumn(
             "[blue]{task.fields[submitted]:>6d}[/blue] sub  "
@@ -472,9 +474,9 @@ def _make_progress(n_matey, n_simul, n_gkeyll):
         console=_console,
     )
     tids = {}
-    for kind, n in (('matey',  n_matey),
-                    ('simul',  n_simul),
-                    ('gkeyll', n_gkeyll)):
+    for kind, n in (('gkeyll',    n_gkeyll),
+                    ('matey',     n_matey),
+                    ('inference', n_inference)):
         if n > 0:
             tids[kind] = progress.add_task('', total=n, label=kind,
                                            submitted=0, done=0, failed=0)
@@ -694,7 +696,7 @@ def launch_psij(bc, edge_name, cfg, bridge_url):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def wait_for_first_edge(bc, expected_names, timeout=EDGE_WAIT_SECONDS,
-                        poll=3.0, heartbeat=30.0):
+                        poll=3.0, heartbeat=10.0):
     """Block until any name in *expected_names* appears in ``bc.list_edges()``.
 
     Returns the winning name, or raises TimeoutError after *timeout* seconds.
@@ -706,24 +708,28 @@ def wait_for_first_edge(bc, expected_names, timeout=EDGE_WAIT_SECONDS,
 
     start_time = time.time()
     last_beat  = start_time
-    while time.time() - start_time < timeout:
-        live = set(bc.list_edges())
-        for name in expected_names:
-            if name in live:
-                return name
-        time.sleep(poll)
-        if time.time() - last_beat >= heartbeat:
-            elapsed = int(time.time() - start_time)
-            print(f'  …{elapsed}s elapsed, {timeout - elapsed}s left')
-            last_beat = time.time()
-    raise TimeoutError(f'no edge appeared within {timeout}s; '
-                       f'expected one of {expected_names}')
+    try:
+        while time.time() - start_time < timeout:
+            live = set(bc.list_edges())
+            for name in expected_names:
+                if name in live:
+                    return name
+            time.sleep(poll)
+            if time.time() - last_beat >= heartbeat:
+                sys.stdout.write('.')
+                sys.stdout.flush()
+                last_beat = time.time()
+        raise TimeoutError(f'no edge appeared within {timeout}s; '
+                           f'expected one of {expected_names}')
+    finally:
+        sys.stdout.write('\n')
+        sys.stdout.flush()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Rhapsody workload.
 #
-#  Submits matey + simul + gkeyll task families against the named edge
+#  Submits matey + inference + gkeyll task families against the named edge
 #  as a rhapsody backend.  Resources are carved up per ``SLICING`` (see
 #  top of file) into per-kind pools: each kind gets its own per-host
 #  affinity range (horizontal) or its own disjoint node subset
@@ -732,7 +738,7 @@ def wait_for_first_edge(bc, expected_names, timeout=EDGE_WAIT_SECONDS,
 #  Per-target requirements (see ``app`` field in IRI_DEFAULTS /
 #  MACHINE_DEFAULTS):
 #    * ``app.matey_dir / matey_model_dir / matey_xgc_dir``  — matey paths
-#    * ``app.simul_dir / simul_model_dir / simul_xgc_dir``  — simul paths
+#    * ``app.inference_dir / inference_model_dir / inference_xgc_dir``  — inference paths
 #    * ``app.gkeyll_dir / gkeyll_exe``                      — gkeyll paths
 #    * ``gpus_per_node`` / ``cores_per_node``               — device totals
 #                                                             carved by SLICING
@@ -919,7 +925,7 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
             args = list(app_cfg.get(f'{name}_arguments') or [])
         elif template == 'inference':
             wrapper = (MATEY_WRAPPER_NAME if name == 'matey'
-                       else SIMUL_WRAPPER_NAME)
+                       else INFERENCE_WRAPPER_NAME)
             exe  = f'{app_dir}/{wrapper}'
             args = [
                 'python', f'{app_dir}/examples/basic_inference.py',
@@ -940,13 +946,6 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
             f"target {edge_name!r}: nothing to run.  Need a non-zero "
             "SLICING cap and matching app paths for at least one kind.")
 
-    # Per-kind summary line, under the step 6 header printed by the caller.
-    for name, tasks in tasks_by_kind.items():
-        sl = slices[name]
-        print(f'  {name:6s}: {len(tasks)} tasks, concurrency {sl["cap"]} '
-              f'({len(sl["hosts"])} host x {sl["affinity_count"]} '
-              f'{sl["device"]})')
-
     backend = await rhapsody.get_backend(
         'edge', bridge_url=bridge_url, edge_name=edge_name)
 
@@ -959,7 +958,7 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
     # ``process_template`` instead.
     progress, tids = _make_progress(
         len(tasks_by_kind.get('matey',  ())),
-        len(tasks_by_kind.get('simul',  ())),
+        len(tasks_by_kind.get('inference',  ())),
         len(tasks_by_kind.get('gkeyll', ())))
 
     async with Session(backends=[backend]) as session:
@@ -988,8 +987,10 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
                  for t in tasks]
 
         if progress:
+            print()
             with progress:
                 await asyncio.gather(*coros, return_exceptions=True)
+            print()
         else:
             await asyncio.gather(*coros, return_exceptions=True)
 
@@ -1129,7 +1130,7 @@ def _step_run(bc, bridge_url, edge_name, cfg):
     step(6, 'run rhapsody',
          f'{n_hosts} hosts  '
          f'matey {N_MATEY_TASKS} (cap {slices["matey"]["cap"]})  '
-         f'simul {N_SIMUL_TASKS} (cap {slices["simul"]["cap"]})  '
+         f'inference {N_INFERENCE_TASKS} (cap {slices["inference"]["cap"]})  '
          f'gkeyll {N_GKEYLL_TASKS} (cap {slices["gkeyll"]["cap"]})')
     try:
         asyncio.run(submit_rhapsody_workload(
@@ -1176,7 +1177,8 @@ def _main_target(bc, bridge_url, kind, name):
                 abort(f'launch_psij failed: {exc}')
             created.append(rec)
             step(4, 'submit child edge',
-                 f'job={rec["job_id"][:8]}…  edge={rec["edge_name"]}')
+                 f'job={rec["job_id"][:8]}…  edge={rec["edge_name"]}',
+                 newline=False)
 
             t0 = time.time()
             try:
@@ -1209,7 +1211,8 @@ def _main_target(bc, bridge_url, kind, name):
                 abort(f'launch_iri failed: {exc}')
             created.append(rec)
             step(4, 'submit child edge',
-                 f'job={rec["job_id"][:8]}…  edge={rec["edge_name"]}')
+                 f'job={rec["job_id"][:8]}…  edge={rec["edge_name"]}',
+                 newline=False)
 
             t0 = time.time()
             try:
