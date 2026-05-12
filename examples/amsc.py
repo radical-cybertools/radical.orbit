@@ -18,18 +18,24 @@ Usage
 -----
 ::
 
-    python examples/amsc.py [<kind>:<name>]
+    python examples/amsc.py [<kind>:<name>] [horizontal|vertical] [<n_nodes>]
 
 Where ``<kind>`` is one of ``psij``, ``iri``, or ``compute``, and ``<name>``
 selects an entry in ``MACHINE_DEFAULTS`` (psij / compute) or
-``IRI_DEFAULTS`` (iri).  Examples::
+``IRI_DEFAULTS`` (iri).  The optional second / third arguments override
+the slicing mode and the allocation size declared in the matching
+``*_DEFAULTS`` entry; they can appear in any order (dispatched by
+content).  Examples::
 
     python examples/amsc.py psij:perlmutter
+    python examples/amsc.py psij:perlmutter horizontal 16
+    python examples/amsc.py psij:perlmutter vertical 8
     python examples/amsc.py psij:thinkie
     python examples/amsc.py iri:olcf
     python examples/amsc.py compute:thinkie
 
-With no argument the script defaults to ``psij:perlmutter``.
+With no arguments the script defaults to ``psij:perlmutter`` and the
+slicing / node-count from ``MACHINE_DEFAULTS``.
 
 The run is non-interactive: defaults are taken verbatim from the
 matching ``*_DEFAULTS`` entry, and a 7-step coloured trace is emitted
@@ -920,11 +926,34 @@ def _render_slicing(slicing_mode, slices, gpus_per_node, cores_per_node,
     if not lines:
         return
 
-    _console.print(Panel('\n'.join(lines),
-                         title=f'[{Y}]{title}[/{Y}]',
-                         title_align='left',
-                         border_style=Y,
-                         expand=False))
+    from rich.padding import Padding
+    from rich.table   import Table
+    from rich.text    import Text
+
+    panel = Panel('\n'.join(lines),
+                  title=f'[{Y}]{title}[/{Y}]',
+                  title_align='left',
+                  border_style=Y,
+                  expand=False)
+
+    _console.print()                                   # empty line before
+
+    if slicing_mode == 'horizontal':
+        # M / I / G are opaque without a legend.  Render box + legend
+        # side-by-side via an invisible 2-column grid; vertical mode has
+        # full kind names inline so it doesn't need this.
+        legend_md = '\n'.join(
+            f'[{color[k]}]{glyph[k]}[/{color[k]}] [{Y}]=[/{Y}] '
+            f'[{color[k]}]{k}[/{color[k]}]'
+            for k in ('matey', 'infer', 'gkeyll')
+            if k in active_kinds)
+        grid = Table.grid(padding=(0, 3))
+        grid.add_column()
+        grid.add_column()
+        grid.add_row(panel, Text.from_markup(legend_md))
+        _console.print(Padding(grid, (0, 0, 0, 2)))
+    else:
+        _console.print(Padding(panel, (0, 0, 0, 2)))
 
 
 async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
@@ -1250,7 +1279,24 @@ def _step_run(bc, bridge_url, edge_name, cfg):
         abort(f'workload failed: {exc}')
 
 
-def _main_target(bc, bridge_url, kind, name):
+def _apply_cli_overrides(cfg, mode, n_nodes):
+    """Apply optional CLI overrides onto a freshly-loaded target ``cfg``.
+
+    ``mode`` (``'horizontal'`` / ``'vertical'`` / None) replaces the
+    slicing mode in whichever slicing dict the target uses (per-cfg
+    override if present, else module-level ``SLICING``).  ``n_nodes``
+    (int / None) replaces ``cfg['n_nodes']``.  Either may be None to
+    leave the corresponding cfg field untouched.
+    """
+    if n_nodes is not None:
+        cfg['n_nodes'] = n_nodes
+    if mode:
+        base = cfg.get('slicing') or SLICING
+        cfg['slicing'] = {**base, 'mode': mode}
+
+
+def _main_target(bc, bridge_url, kind, name,
+                 slicing_mode=None, n_nodes=None):
     """Run the workload against ``<kind>:<name>``.
 
     All three branches share the step 3/6/7 helpers; only the launch
@@ -1279,6 +1325,7 @@ def _main_target(bc, bridge_url, kind, name):
 
         cfg = dict(MACHINE_DEFAULTS[name])
         cfg['executor'] = executor
+        _apply_cli_overrides(cfg, slicing_mode, n_nodes)
         _step_configure(cfg)
 
         try:
@@ -1313,6 +1360,7 @@ def _main_target(bc, bridge_url, kind, name):
             _validate_iri_cfg(name, cfg)
         except Exception as exc:
             abort(str(exc))
+        _apply_cli_overrides(cfg, slicing_mode, n_nodes)
         _step_configure(cfg)
 
         try:
@@ -1347,6 +1395,7 @@ def _main_target(bc, bridge_url, kind, name):
         step(2, 'pick target', f'{name} (compute)')
 
         cfg = dict(MACHINE_DEFAULTS[name])
+        _apply_cli_overrides(cfg, slicing_mode, n_nodes)
         _step_configure(cfg)
 
         step(4, 'submit child edge', 'reusing existing edge')
@@ -1365,9 +1414,26 @@ def main():
     with ``asyncio.run()`` inside ``_step_run``."""
     _lock = _flock_or_exit()  # noqa: F841 — held for the process lifetime
 
-    if len(sys.argv) > 2:
-        abort(f'expected at most 1 argument (got {len(sys.argv) - 1})')
-    target_arg = sys.argv[1] if len(sys.argv) > 1 else None
+    if len(sys.argv) > 4:
+        abort(f'expected at most 3 arguments (got {len(sys.argv) - 1})')
+
+    # Positional args dispatched by content (any order):
+    #   target  : ``<kind>:<name>``       (e.g. ``psij:perlmutter``)
+    #   mode    : ``horizontal`` / ``vertical``
+    #   n_nodes : positive integer
+    target_arg = slicing_mode = n_nodes = None
+    for a in sys.argv[1:]:
+        if ':' in a and target_arg is None:
+            target_arg = a
+        elif a in ('horizontal', 'vertical') and slicing_mode is None:
+            slicing_mode = a
+        elif a.isdigit() and n_nodes is None:
+            n_nodes = int(a)
+            if n_nodes <= 0:
+                abort(f'n_nodes must be positive: got {n_nodes!r}')
+        else:
+            abort(f'unrecognized or duplicate argument: {a!r}')
+
     kind, name = _parse_target_arg(target_arg)
 
     # BridgeClient self-resolves URL + cert via radical.edge.utils
@@ -1375,7 +1441,8 @@ def main():
     bc         = BridgeClient()
     bridge_url = bc.url
     try:
-        _main_target(bc, bridge_url, kind, name)
+        _main_target(bc, bridge_url, kind, name,
+                     slicing_mode=slicing_mode, n_nodes=n_nodes)
     finally:
         bc.close()
         print()
