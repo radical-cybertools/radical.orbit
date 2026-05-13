@@ -90,12 +90,12 @@ N_NODES            = 16
 N_GENERATIONS      = 1   # uniform scaling factor across all task kinds
 
 # Rhapsody workload shape (mirrors examples/run_matey.py).
-N_MATEY_TASKS          = N_NODES * 10      * N_GENERATIONS
-N_INFER_TASKS      = N_NODES * 10      * N_GENERATIONS
-N_GKEYLL_TASKS         = N_NODES * 128 * 3 * N_GENERATIONS
-MATEY_WRAPPER_NAME     = 'matey_wrapper.sh'
-INFER_WRAPPER_NAME = 'matey_wrapper.sh'
-RHAPSODY_WORK_SUBDIR   = 'rhapsody-runs'
+N_MATEY_TASKS        = N_NODES *  4 *  3 * N_GENERATIONS
+N_INFER_TASKS        = N_NODES *  1 *  0 * N_GENERATIONS
+N_GKEYLL_TASKS       = N_NODES * 16 *  0 * N_GENERATIONS
+MATEY_WRAPPER_NAME   = 'matey_wrapper.sh'
+INFER_WRAPPER_NAME   = 'matey_wrapper.sh'
+RHAPSODY_WORK_SUBDIR = 'rhapsody-runs'
 
 # Per-task-kind spec consumed by ``submit_rhapsody_workload``.  Each entry
 # is a tuple ``(name, n_tasks, required_app_paths, default_template)``:
@@ -148,9 +148,9 @@ COUNTERS = defaultdict(int)  # for unique edge names per submission endpoint
 SLICING = {
     'mode': 'horizontal',
     'kinds': {
-        'matey':  {'device': 'gpu', 'per_node': 2},
-        'infer':  {'device': 'gpu', 'per_node': 2},
-        'gkeyll': {'device': 'cpu', 'per_node': 'rest'},
+        'matey':  {'device': 'gpu', 'per_node': 4},
+        'infer':  {'device': 'gpu', 'per_node': 0},
+        'gkeyll': {'device': 'cpu', 'per_node': 0},
     },
 }
 
@@ -162,9 +162,9 @@ SLICING = {
 VERTICAL_SLICING = {
     'mode': 'vertical',
     'kinds': {
-        'matey':  {'device': 'cpu', 'weight': 1},
-        'infer':  {'device': 'cpu', 'weight': 1},
-        'gkeyll': {'device': 'cpu', 'weight': 2},
+        'matey':  {'device': 'gpu', 'weight': 3},
+        'infer':  {'device': 'gpu', 'weight': 1},
+        'gkeyll': {'device': 'cpu', 'weight': 4},
     },
 }
 
@@ -214,8 +214,8 @@ IRI_DEFAULTS = {
                                '/demo_nbatchsloc100/',
             'infer_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
                                '/d3d_174310.03500/',
-            'gkeyll_dir'     : '/global/u2/m/merzky/gkeyll/amsc',
-            'gkeyll_exe'     : 'rt_gk_d3d_iwl_2x2v_p1.sh',
+            'gkeyll_dir'     : '/global/u2/m/merzky/tcv',
+            'gkeyll_exe'     : 'tcv',
         },
     },
     'olcf': {
@@ -293,8 +293,8 @@ MACHINE_DEFAULTS = {
                                '/demo_nbatchsloc100/',
             'infer_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
                                '/d3d_174310.03500/',
-            'gkeyll_dir'     : '/global/u2/m/merzky/gkeyll/amsc',
-            'gkeyll_exe'     : 'rt_gk_d3d_iwl_2x2v_p1.sh',
+            'gkeyll_dir'     : '/global/u2/m/merzky/tcv',
+            'gkeyll_exe'     : 'tcv',
         },
     },
     'odo': {
@@ -808,7 +808,13 @@ def _compute_slices(slicing, n_hosts, gpus_per_node, cores_per_node, nodelist):
         # allocation where a kind would end up with zero nodes.  In
         # practice this means ``n_nodes`` must be a multiple of the
         # ``sum(weights)`` declared in ``VERTICAL_SLICING``.
-        weights = {k: int(kinds[k].get('weight', 0)) for k in kinds}
+        weights_raw = {k: kinds[k].get('weight', 0) for k in kinds}
+        bad = {k: v for k, v in weights_raw.items() if not isinstance(v, int)}
+        if bad:
+            hint = (" ('rest' is only supported in horizontal slicing)"
+                    if 'rest' in bad.values() else "")
+            abort(f"vertical slicing: non-integer weight(s): {bad}{hint}")
+        weights = {k: int(v) for k, v in weights_raw.items()}
         zeros   = [k for k, w in weights.items() if w <= 0]
         if zeros:
             abort(f"vertical slicing: kinds with zero or missing weight: "
@@ -1073,7 +1079,7 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
         elif template == 'matey':
             exe  = f'{app_dir}/{MATEY_WRAPPER_NAME}'
             args = [
-                'python', f'{app_dir}/examples/basic_infer.py',
+                'python', f'{app_dir}/examples/basic_inference.py',
                 '--model_dir',  app_cfg['matey_model_dir'],
                 '--use_ddp',
                 '--on_perlmutter',
@@ -1084,7 +1090,7 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
         elif template == 'infer':
             exe  = f'{app_dir}/{INFER_WRAPPER_NAME}'
             args = [
-                'python', f'{app_dir}/examples/basic_infer.py',
+                'python', f'{app_dir}/examples/basic_inference.py',
                 '--model_dir',  app_cfg['infer_model_dir'],
                 '--use_ddp',
                 '--on_perlmutter',
@@ -1243,22 +1249,6 @@ def _parse_target_arg(arg):
     if not name:
         abort(f'empty name in target argument {arg!r}')
     return kind, name
-
-
-def _flock_or_exit():
-    """Single-instance guard via flock(/tmp/amsc.lock).
-
-    Concurrent amsc.py runs interleave their log output and step on each
-    other's plugin sessions; refuse to start a second one.  The lock is
-    held until this process exits (kernel auto-releases on close).
-    """
-    import fcntl
-    _lock = open('/tmp/amsc.lock', 'w')
-    try:
-        fcntl.flock(_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        sys.exit('another amsc.py is already running; kill it first.')
-    return _lock
 
 
 def _resolve_executor(bc, edge_name):
@@ -1451,8 +1441,8 @@ def main():
     """Top-level driver.  Synchronous on purpose: only the rhapsody
     workload body needs an event loop, and that's spun up explicitly
     with ``asyncio.run()`` inside ``_step_run``."""
-    _lock = _flock_or_exit()  # noqa: F841 — held for the process lifetime
 
+    print()
     if len(sys.argv) > 4:
         abort(f'expected at most 3 arguments (got {len(sys.argv) - 1})')
 
