@@ -704,32 +704,20 @@ def launch_psij(bc, edge_name, cfg, bridge_url):
 #  better than wiring up an SSE callback bridge to asyncio.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def wait_for_first_edge(bc, expected_names, timeout=EDGE_WAIT_SECONDS,
-                        poll=3.0, heartbeat=10.0):
-    """Block until any name in *expected_names* appears in ``bc.list_edges()``.
+def _heartbeat_dot():
+    """Print a single dot to stdout; passed to ``bc.wait_for_edge`` so
+    a long queue wait shows visible progress without spamming the
+    screen."""
+    sys.stdout.write('.')
+    sys.stdout.flush()
 
-    Returns the winning name, or raises TimeoutError after *timeout* seconds.
-    Prints a heartbeat at most every ``heartbeat`` seconds so we don't
-    spam the screen during long queue waits.
-    """
-    if not expected_names:
-        raise RuntimeError('no expected edges — nothing to wait for')
 
-    start_time = time.time()
-    last_beat  = start_time
+def _wait_for_edge(bc, name):
+    """``bc.wait_for_edge`` wrapper that adds the demo's heartbeat-dot
+    progress UI and guarantees a trailing newline on either path."""
     try:
-        while time.time() - start_time < timeout:
-            live = set(bc.list_edges())
-            for name in expected_names:
-                if name in live:
-                    return name
-            time.sleep(poll)
-            if time.time() - last_beat >= heartbeat:
-                sys.stdout.write('.')
-                sys.stdout.flush()
-                last_beat = time.time()
-        raise TimeoutError(f'no edge appeared within {timeout}s; '
-                           f'expected one of {expected_names}')
+        return bc.wait_for_edge([name], timeout=EDGE_WAIT_SECONDS,
+                                on_heartbeat=_heartbeat_dot)
     finally:
         sys.stdout.write('\n')
         sys.stdout.flush()
@@ -1369,9 +1357,9 @@ def _main_target(bc, bridge_url, kind, name,
 
             t0 = time.time()
             try:
-                first = wait_for_first_edge(bc, [rec['edge_name']])
+                first = _wait_for_edge(bc, rec['edge_name'])
             except Exception as exc:
-                abort(f'wait_for_first_edge failed: {exc}')
+                abort(f'wait_for_edge failed: {exc}')
             step(5, 'await child edge', f'up after {int(time.time() - t0)}s')
 
             _step_run(bc, bridge_url, first, rec.get('cfg') or cfg)
@@ -1404,9 +1392,9 @@ def _main_target(bc, bridge_url, kind, name,
 
             t0 = time.time()
             try:
-                first = wait_for_first_edge(bc, [rec['edge_name']])
+                first = _wait_for_edge(bc, rec['edge_name'])
             except Exception as exc:
-                abort(f'wait_for_first_edge failed: {exc}')
+                abort(f'wait_for_edge failed: {exc}')
             step(5, 'await child edge', f'up after {int(time.time() - t0)}s')
 
             _step_run(bc, bridge_url, first, rec.get('cfg') or cfg)
