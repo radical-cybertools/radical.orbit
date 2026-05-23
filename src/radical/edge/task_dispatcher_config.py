@@ -1,15 +1,22 @@
 '''
 Task dispatcher — pool configuration schema and loader.
 
-A ``PoolConfig`` is a durable, operator-declared scope that owns a fleet
-of pilots and a single dispatch strategy.  Each pool carries a menu of
+A ``PoolConfig`` is a durable resource scope that owns a fleet of
+pilots and a single dispatch strategy.  Each pool carries a menu of
 named ``PilotSize`` entries; the strategy picks one by key when it
 decides to submit a new pilot.  See ``plans/task_dispatcher_design.md``
-for the surrounding design.
+and ``memory/project_bridge_dispatcher.md`` for the surrounding design.
 
 The ``rhapsody_backend`` field on ``PilotSize`` is **required** — there
 is deliberately no pool-level default and no cascade, to keep the
 pilot-to-backend mapping explicit.
+
+The ``edge_name`` field on ``PoolConfig`` is **optional**: when omitted,
+the dispatcher selects a connected compute edge automatically (policy:
+first by lexical name).  Sessions can declare arbitrary pool names; the
+single reserved name :data:`DEFAULT_POOL_NAME` (``"default"``) is
+materialised automatically by the dispatcher when a session registers
+without declaring any pools.
 '''
 
 from dataclasses import dataclass, field
@@ -17,6 +24,12 @@ from pathlib import Path
 from typing import Any
 
 import json
+
+
+# Reserved pool name auto-materialised by the dispatcher when a
+# session registers without declaring any pools.  See
+# memory/project_bridge_dispatcher.md (Phase 4) for the lifecycle.
+DEFAULT_POOL_NAME: str = 'default'
 
 
 # ---------------------------------------------------------------------------
@@ -40,12 +53,20 @@ class PilotSize:
 
 @dataclass
 class PoolConfig:
-    '''One pool — the unit of resource budget, policy, and task grouping.'''
-    name            : str                # unique per edge
+    '''One pool — the unit of resource budget, policy, and task grouping.
+
+    Pool identity is the tuple ``(name, edge_name)``.  When ``edge_name``
+    is ``None`` at parse time the dispatcher resolves it at pool
+    materialisation by picking a connected compute edge (lexically
+    first); this lets clients declare resource intent without binding
+    to a specific cluster up-front.
+    '''
+    name            : str                # unique within (name, edge_name) tuple
     queue           : str                # batch queue name
     account         : str | None         # charge account / project
     pilot_sizes     : dict[str, PilotSize]
     default_size    : str                # key into pilot_sizes
+    edge_name       : str | None = None  # which edge runs psij; None → auto
     min_pilots      : int  = 0
     max_pilots      : int  = 4
     scratch_base    : str | None = None  # None → default scratch tree
@@ -155,6 +176,12 @@ def _parse_pool(d: Any, source: str) -> PoolConfig:
         raise PoolConfigError(
             f"{source}: 'account' must be a string or null")
 
+    edge_name = d.get('edge_name')
+    if edge_name is not None:
+        if not isinstance(edge_name, str) or not edge_name:
+            raise PoolConfigError(
+                f"{source}: 'edge_name' must be a non-empty string or null")
+
     # pilot_sizes: dict[str, PilotSize]
     sizes_raw = d['pilot_sizes']
     if not isinstance(sizes_raw, dict) or not sizes_raw:
@@ -199,6 +226,7 @@ def _parse_pool(d: Any, source: str) -> PoolConfig:
         account         = account,
         pilot_sizes     = pilot_sizes,
         default_size    = default_size,
+        edge_name       = edge_name,
         min_pilots      = min_pilots,
         max_pilots      = max_pilots,
         scratch_base    = scratch_base,
@@ -241,3 +269,39 @@ def _parse_int(val: Any, name: str, source: str, *, min_value: int) -> int:
         raise PoolConfigError(
             f"{source}: {name!r} must be >= {min_value}, got {val}")
     return val
+
+
+# ---------------------------------------------------------------------------
+# Built-in default pool
+# ---------------------------------------------------------------------------
+
+def default_pool_config(queue: str = 'default') -> PoolConfig:
+    '''Return the built-in fallback pool config (name="default").
+
+    Materialised by the dispatcher when a session registers without
+    declaring any pools.  ``edge_name`` is ``None`` so the dispatcher
+    auto-selects a connected compute edge at materialisation time.
+
+    *queue* defaults to ``"default"`` because the schema's ``queue``
+    field is required non-empty; the dispatcher will override this
+    with an edge-appropriate value during materialisation (caller
+    can also pass a known queue here).
+    '''
+    return PoolConfig(
+        name            = DEFAULT_POOL_NAME,
+        queue           = queue,
+        account         = None,
+        pilot_sizes     = {
+            'node': PilotSize(
+                nodes            = 1,
+                cpus_per_node    = 1,
+                rhapsody_backend = 'concurrent',
+            )
+        },
+        default_size    = 'node',
+        edge_name       = None,
+        min_pilots      = 0,
+        max_pilots      = 1,
+        strategy        = 'conservative',
+        strategy_config = {},
+    )

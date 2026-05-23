@@ -10,8 +10,8 @@ from pathlib import Path
 import pytest
 
 from radical.edge.task_dispatcher_config import (
-    PilotSize, PoolConfigError,
-    load_pools, parse_pools,
+    DEFAULT_POOL_NAME, PilotSize, PoolConfigError,
+    default_pool_config, load_pools, parse_pools,
 )
 
 
@@ -103,6 +103,46 @@ class TestParsePools:
             strategy='my_module.pkg:MyStrategy'))
         assert pools['cpu'].strategy == 'my_module.pkg:MyStrategy'
 
+    def test_edge_name_defaults_to_none(self):
+        """Pools without explicit edge_name parse to edge_name=None."""
+        pools = parse_pools(_minimal_pool_dict())
+        assert pools['cpu'].edge_name is None
+
+    def test_edge_name_explicit_string(self):
+        pools = parse_pools(_minimal_pool_dict(edge_name='edge_perlmutter'))
+        assert pools['cpu'].edge_name == 'edge_perlmutter'
+
+    def test_edge_name_explicit_null(self):
+        pools = parse_pools(_minimal_pool_dict(edge_name=None))
+        assert pools['cpu'].edge_name is None
+
+
+# ---------------------------------------------------------------------------
+# Default pool factory
+# ---------------------------------------------------------------------------
+
+class TestDefaultPool:
+
+    def test_default_pool_name_constant(self):
+        assert DEFAULT_POOL_NAME == 'default'
+
+    def test_default_pool_config_factory(self):
+        p = default_pool_config()
+        assert p.name == 'default'
+        assert p.edge_name is None             # auto-resolved later
+        assert p.account is None
+        assert p.max_pilots == 1
+        assert p.min_pilots == 0
+        assert p.strategy == 'conservative'
+        assert p.default_size in p.pilot_sizes
+        size = p.pilot_sizes[p.default_size]
+        assert isinstance(size, PilotSize)
+        assert size.rhapsody_backend == 'concurrent'
+
+    def test_default_pool_queue_override(self):
+        p = default_pool_config(queue='regular')
+        assert p.queue == 'regular'
+
 
 # ---------------------------------------------------------------------------
 # Schema errors
@@ -176,6 +216,14 @@ class TestSchemaErrors:
     def test_empty_pilot_sizes(self):
         with pytest.raises(PoolConfigError, match="pilot_sizes"):
             parse_pools(_minimal_pool_dict(pilot_sizes={}))
+
+    def test_edge_name_empty_string_rejected(self):
+        with pytest.raises(PoolConfigError, match="edge_name"):
+            parse_pools(_minimal_pool_dict(edge_name=''))
+
+    def test_edge_name_non_string_rejected(self):
+        with pytest.raises(PoolConfigError, match="edge_name"):
+            parse_pools(_minimal_pool_dict(edge_name=42))
 
 
 # ---------------------------------------------------------------------------

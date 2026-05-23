@@ -49,12 +49,23 @@ def _split_argv(argv: list[str]) -> tuple[list[str], list[str]]:
 def _parse_opts(opts: list[str]) -> argparse.Namespace:
     ap = argparse.ArgumentParser(prog='radical-edge-run',
                                   add_help=False)
-    ap.add_argument('--edge',     required=True)
-    ap.add_argument('--pool',     required=True)
+    # --edge XOR --pool: a task targets either a pool (dispatcher
+    # manages pilots) or an edge directly (transparent proxy to that
+    # edge's rhapsody — no pool, no input/output staging).
+    target = ap.add_mutually_exclusive_group(required=True)
+    target.add_argument('--edge', default=None)
+    target.add_argument('--pool', default=None)
     ap.add_argument('--run-id',   required=True, dest='run_id')
     ap.add_argument('--priority', type=int, default=0)
     ap.add_argument('--in',  dest='inputs',  action='append', default=[])
     ap.add_argument('--out', dest='outputs', action='append', default=[])
+    ap.add_argument('--pools', dest='pools_file', default=None,
+                    help='Path to a pools.json declaring the workflow\'s '
+                         'pools.  Sent to the dispatcher on register_session; '
+                         'idempotent across rules (matching pools attach to '
+                         'existing state, new pools materialise).  Without '
+                         'this flag the dispatcher uses its built-in '
+                         '"default" pool.')
     ap.add_argument('-h', '--help', action='store_true')
     args = ap.parse_args(opts)
     if args.help:
@@ -64,6 +75,12 @@ def _parse_opts(opts: list[str]) -> argparse.Namespace:
     # argparse keeps each as a single element, so split post-hoc.
     args.inputs  = _flatten(args.inputs)
     args.outputs = _flatten(args.outputs)
+    # Edge mode does not support file staging yet.
+    if args.edge and (args.inputs or args.outputs):
+        print('radical-edge-run: --in/--out are not supported with --edge; '
+              'use --pool for staging-enabled tasks',
+              file=sys.stderr)
+        sys.exit(2)
     return args
 
 
@@ -122,11 +139,28 @@ class Wrapper:
 
     def _get_td(self):
         '''Lazy import + connect.  Done inside run() so argv errors
-        fail before we bring up a full BridgeClient.'''
+        fail before we bring up a full BridgeClient.
+
+        The dispatcher is bridge-hosted, so we always target the
+        ``'bridge'`` edge for plugin lookup; ``--edge`` (if given) is
+        a per-task routing hint forwarded in the submit body.
+        '''
         from radical.edge import BridgeClient  # type: ignore[import-untyped]
         self._bc = BridgeClient()
-        edge_c   = self._bc.get_edge_client(self.args.edge)
-        self._td_client = edge_c.get_plugin('task_dispatcher')
+        edge_c   = self._bc.get_edge_client('bridge')
+
+        # Forward --pools to register_session if provided.  The body
+        # must match the pools.json schema (top-level "pools" list).
+        kwargs: dict = {}
+        pools_file = getattr(self.args, 'pools_file', None)
+        if pools_file:
+            import json
+            with open(pools_file) as f:
+                body = json.load(f)
+            pools = body.get('pools', body) if isinstance(body, dict) else body
+            kwargs['pools'] = pools
+
+        self._td_client = edge_c.get_plugin('task_dispatcher', **kwargs)
         return self._td_client
 
     def _close(self) -> None:
@@ -256,18 +290,26 @@ class Wrapper:
 
         # Register a persistent SSE callback BEFORE submitting so no
         # notification can slip through between submit and subscribe.
+        # The dispatcher is always on the 'bridge' edge.
         if self._bc is not None:
             self._bc.register_callback(
-                edge_id=self.args.edge,
+                edge_id='bridge',
                 plugin_name='task_dispatcher',
                 topic='task_status',
                 callback=self._on_task_status)
 
-        cwd = self._stage_inputs(td)
+        if self.args.pool:
+            cwd = self._stage_inputs(td)
+        else:
+            # Edge mode: no staging; the task's cwd is the directory
+            # we were invoked from (makeflow rules run their child in
+            # the workflow's workdir).
+            cwd = os.getcwd()
 
         try:
             td.submit_task(
                 pool     = self.args.pool,
+                edge     = self.args.edge,
                 task_id  = self.task_id,
                 cmd      = self.cmd,
                 cwd      = cwd,
@@ -285,7 +327,7 @@ class Wrapper:
         state = str(final.get('state', '')).upper()
         rc    = final.get('exit_code')
 
-        if state == 'DONE':
+        if state == 'DONE' and self.args.pool:
             self._stage_outputs(td)
 
         if rc is None:

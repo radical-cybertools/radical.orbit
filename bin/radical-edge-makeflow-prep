@@ -42,11 +42,38 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import re
 import shlex
 import sys
 
 from dataclasses import dataclass
 from pathlib import Path
+
+
+# Substitute Makeflow's ``$(VAR)`` references with the values
+# captured from ``VAR=value`` assignments earlier in the file.
+# Needed because we wrap the original rule command in
+# ``sh -c '<cmd>'`` — the single quotes block Makeflow's own
+# substitution, and we cannot rely on ${VAR} env expansion at the
+# remote edge (the executor's process tree doesn't inherit
+# Makeflow's exports).  Unknown vars are left alone so the user
+# notices the typo rather than silently getting an empty string.
+_MAKEFLOW_VAR = re.compile(r'\$\((\w+)\)')
+
+
+def _expand_vars(cmd: str, vars: dict[str, str]) -> str:
+    '''Replace Makeflow ``$(VAR)`` with the captured assignment value.
+
+    Two passes so simple nesting like ``A=$(B)`` resolves; we cap at
+    a small number of passes to avoid loops on circular refs.
+    '''
+    for _ in range(4):
+        new = _MAKEFLOW_VAR.sub(
+            lambda m: vars.get(m.group(1), m.group(0)), cmd)
+        if new == cmd:
+            return cmd
+        cmd = new
+    return cmd
 
 
 # ---------------------------------------------------------------------------
@@ -65,13 +92,29 @@ class Rule:
     edge    : str | None
     pool    : str | None
     priority: int | None
+    pools   : str | None = None   # path to pools.json (workflow-level)
 
 
 @dataclass
 class PrepOptions:
+    # A rule targets EITHER a specific edge (transparent proxy to that
+    # edge's rhapsody) OR a pool (dispatcher-managed pilot fleet) —
+    # never both.  At most one of default_edge / default_pool may be
+    # set; the same XOR is enforced per scope inside the file
+    # (EDGE = "..." clears any active POOL scope and vice versa).
     default_edge    : str | None = None
     default_pool    : str | None = None
     default_priority: int        = 0
+    # Absolute path to a pools.json declaring the workflow's pools.
+    # When set, every generated rule gets --pools=<path>.  Without
+    # this, the dispatcher uses the built-in 'default' pool — which
+    # is rarely what a real workflow wants.
+    pools_file      : str | None = None
+
+    def __post_init__(self) -> None:
+        if self.default_edge and self.default_pool:
+            raise PrepError(
+                '--default-edge and --default-pool are mutually exclusive')
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +122,7 @@ class PrepOptions:
 # ---------------------------------------------------------------------------
 
 # We only care about three directives; everything else passes through.
-_SCOPED_DIRECTIVES = ('EDGE', 'POOL', 'PRIORITY')
+_SCOPED_DIRECTIVES = ('EDGE', 'POOL', 'PRIORITY', 'POOLS')
 
 
 def prep_stream(lines: list[str], run_id: str,
@@ -94,6 +137,13 @@ def prep_stream(lines: list[str], run_id: str,
     scope_edge    : str | None = opts.default_edge
     scope_pool    : str | None = opts.default_pool
     scope_priority: int        = opts.default_priority
+    # POOLS is workflow-level (not per-rule); we track it in the same
+    # scope walk for simplicity but only one final value reaches the
+    # rule emitter.
+    scope_pools   : str | None = opts.pools_file
+    # Captured ``VAR=value`` assignments to substitute at prep time
+    # into wrapped rule commands (see _expand_vars).
+    scope_vars    : dict[str, str] = {}
 
     i = 0
     n = len(lines)
@@ -107,18 +157,35 @@ def prep_stream(lines: list[str], run_id: str,
             i += 1
             continue
 
-        # Directive assignment (EDGE/POOL/PRIORITY).  We match case-
-        # insensitively and allow optional whitespace around '='.
+        # Directive assignment (EDGE/POOL/PRIORITY/POOLS).  We match
+        # case-insensitively and allow optional whitespace around '='.
         directive = _parse_scoped_directive(stripped)
         if directive is not None:
             name, value = directive
             if name == 'EDGE':
+                # EDGE and POOL are mutually exclusive per scope —
+                # setting EDGE clears any active POOL.
                 scope_edge = _expect_string(value, name, i + 1)
+                scope_pool = None
             elif name == 'POOL':
                 scope_pool = _expect_string(value, name, i + 1)
+                scope_edge = None
             elif name == 'PRIORITY':
                 scope_priority = _expect_int(value, name, i + 1)
+            elif name == 'POOLS':
+                scope_pools = _expect_string(value, name, i + 1)
             # Our directives are consumed — don't emit to output.
+            i += 1
+            continue
+
+        # Generic ``NAME = "value"`` or ``NAME=value`` assignment —
+        # capture for substitution but ALSO pass the line through so
+        # makeflow itself sees it (other tools, LOCAL rules, etc.).
+        generic = _parse_generic_assignment(stripped)
+        if generic is not None:
+            name, value = generic
+            scope_vars[name] = value
+            out.append(line)
             i += 1
             continue
 
@@ -141,7 +208,8 @@ def prep_stream(lines: list[str], run_id: str,
                 commands = commands, header_line = rule_header,
                 edge = scope_edge, pool = scope_pool,
                 priority = scope_priority if scope_priority != 0 else
-                           scope_priority)
+                           scope_priority,
+                pools = scope_pools)
 
             if not commands:
                 raise PrepError(
@@ -149,7 +217,7 @@ def prep_stream(lines: list[str], run_id: str,
 
             _validate_placement(rule, i)
 
-            for line_out in _emit_rule(rule, run_id):
+            for line_out in _emit_rule(rule, run_id, scope_vars):
                 out.append(line_out)
             continue
 
@@ -170,6 +238,25 @@ def _parse_scoped_directive(stripped: str) -> tuple[str, str] | None:
             if rest.startswith('='):
                 return name, rest[1:].strip()
     return None
+
+
+_GENERIC_ASSIGN = re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$')
+
+
+def _parse_generic_assignment(stripped: str) -> tuple[str, str] | None:
+    '''Return (NAME, value) for a plain ``NAME=value`` assignment.
+
+    Strips one layer of surrounding double or single quotes from the
+    value if present.  Matches Makeflow's lexical handling closely
+    enough for substitution into commands.
+    '''
+    m = _GENERIC_ASSIGN.match(stripped)
+    if not m:
+        return None
+    name, value = m.group(1), m.group(2).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        value = value[1:-1]
+    return name, value
 
 
 def _expect_string(value: str, name: str, line_no: int) -> str:
@@ -210,17 +297,22 @@ def _parse_rule_header(line: str, line_no: int) -> tuple[list[str], list[str]]:
 
 
 def _validate_placement(rule: Rule, line_no: int) -> None:
-    if rule.edge is None:
+    if rule.edge is None and rule.pool is None:
         raise PrepError(
             f'line {line_no}: rule "{" ".join(rule.outputs)}" has no '
-            f'EDGE assignment (set EDGE = "..." or pass --default-edge)')
-    if rule.pool is None:
+            f'EDGE or POOL assignment (set EDGE = "..." or POOL = "..." '
+            f'in the file, or pass --default-edge/--default-pool)')
+    if rule.edge is not None and rule.pool is not None:
+        # Shouldn't happen — directive handler clears the other when
+        # one is set, and the CLI mutex prevents both defaults — but
+        # guard against future regressions.
         raise PrepError(
-            f'line {line_no}: rule "{" ".join(rule.outputs)}" has no '
-            f'POOL assignment (set POOL = "..." or pass --default-pool)')
+            f'line {line_no}: rule "{" ".join(rule.outputs)}" has both '
+            f'EDGE and POOL set; they are mutually exclusive')
 
 
-def _emit_rule(rule: Rule, run_id: str) -> list[str]:
+def _emit_rule(rule: Rule, run_id: str,
+               vars: dict[str, str] | None = None) -> list[str]:
     '''Emit the rewritten rule: header + single wrapped command line.
 
     If the original rule had multiple command lines, they are joined
@@ -228,15 +320,38 @@ def _emit_rule(rule: Rule, run_id: str) -> list[str]:
     invocation, but we need a single process so the wrapper can
     measure one exit code.  This matches Makeflow's own advice to use
     ``;`` for multi-statement rules.
-    '''
-    original = ' ; '.join(rule.commands)
-    wrapped  = _build_wrapper_cmd(rule, run_id, original)
 
-    # Assume rule.edge and rule.pool are not None (validated above)
+    Makeflow's ``LOCAL`` keyword (``LOCAL <cmd>`` on the first command
+    line) marks the rule as "always run on the submitter, never via
+    a worker".  We honour it by NOT wrapping the command in
+    radical-edge-run; the LOCAL prefix is preserved so makeflow
+    executes the rule on the submitter itself.
+    '''
+    stripped, is_local = _strip_local(rule.commands)
+    original = ' ; '.join(stripped)
+    if is_local:
+        # makeflow handles its own $(VAR) substitution for LOCAL
+        # rules — don't pre-expand here.
+        return [rule.header_line + '\n',
+                '\t' + 'LOCAL ' + original + '\n']
+
+    wrapped  = _build_wrapper_cmd(rule, run_id, original, vars or {})
     return [rule.header_line + '\n', '\t' + wrapped + '\n']
 
 
-def _build_wrapper_cmd(rule: Rule, run_id: str, original: str) -> str:
+def _strip_local(commands: list[str]) -> tuple[list[str], bool]:
+    '''If the first command starts with ``LOCAL ``, strip that prefix
+    and return (stripped_commands, True).  Otherwise return the
+    commands unchanged and ``False``.
+    '''
+    if commands and commands[0].lstrip().startswith('LOCAL '):
+        first = commands[0].lstrip()[len('LOCAL '):]
+        return [first] + commands[1:], True
+    return commands, False
+
+
+def _build_wrapper_cmd(rule: Rule, run_id: str, original: str,
+                        vars: dict[str, str]) -> str:
     '''Produce the ``radical-edge-run ... -- sh -c '<cmd>'`` line.
 
     The original command is wrapped in ``sh -c`` so shell grammar
@@ -244,19 +359,28 @@ def _build_wrapper_cmd(rule: Rule, run_id: str, original: str) -> str:
     argument to the wrapper rather than splitting at the outer shell
     that Makeflow uses to invoke the rule.
     '''
-    parts = ['radical-edge-run',
-             f'--edge={_q(rule.edge)}',
-             f'--pool={_q(rule.pool)}',
-             f'--priority={rule.priority or 0}',
-             f'--run-id={_q(run_id)}']
-    for f in rule.inputs:
-        parts.append(f'--in {_q(f)}')
-    for f in rule.outputs:
-        parts.append(f'--out {_q(f)}')
+    parts = ['radical-edge-run']
+    # Exactly one of edge/pool is set (validated above).
+    if rule.edge is not None:
+        parts.append(f'--edge={_q(rule.edge)}')
+    else:
+        parts.append(f'--pool={_q(rule.pool)}')
+    parts.append(f'--priority={rule.priority or 0}')
+    parts.append(f'--run-id={_q(run_id)}')
+    if rule.pools:
+        parts.append(f'--pools={_q(rule.pools)}')
+    # Edge mode doesn't (yet) support input/output staging, so skip
+    # the --in/--out flags entirely — radical-edge-run would reject
+    # them at argparse time otherwise.
+    if rule.edge is None:
+        for f in rule.inputs:
+            parts.append(f'--in {_q(f)}')
+        for f in rule.outputs:
+            parts.append(f'--out {_q(f)}')
     parts.append('--')
     parts.append('sh')
     parts.append('-c')
-    parts.append(shlex.quote(original))
+    parts.append(shlex.quote(_expand_vars(original, vars)))
     return ' '.join(parts)
 
 
@@ -313,10 +437,29 @@ def main(argv: list[str] | None = None) -> int:
                     help='input .makeflow file')
     ap.add_argument('--output', '-o', type=Path,
                     help='output path (default: <input>.prepped)')
-    ap.add_argument('--default-edge',     dest='default_edge')
-    ap.add_argument('--default-pool',     dest='default_pool')
+    # A rule must end up targeting either an edge or a pool, never
+    # both — these CLI defaults follow the same XOR.
+    target_default = ap.add_mutually_exclusive_group()
+    target_default.add_argument('--default-edge', dest='default_edge',
+                    default=None,
+                    help='Default --edge for each rule (transparent proxy '
+                         'to that edge\'s rhapsody).  Mutually exclusive '
+                         'with --default-pool.')
+    target_default.add_argument('--default-pool', dest='default_pool',
+                    default=None,
+                    help='Default --pool for each rule (dispatcher-managed '
+                         'pilot fleet).  Mutually exclusive with '
+                         '--default-edge.')
     ap.add_argument('--default-priority', dest='default_priority',
                     type=int, default=0)
+    ap.add_argument('--pools',            dest='pools_file',
+                    help='Path to a pools.json declaring the workflow\'s '
+                         'pools.  Forwarded to radical-edge-run on every '
+                         'generated rule (--pools=<path>).  Without this, '
+                         'rules use the dispatcher\'s built-in "default" '
+                         'pool — which usually isn\'t what you want.  '
+                         'Can also be set via POOLS = "..." in the '
+                         'makeflow file.')
     ap.add_argument('--run-id', dest='run_id',
                     help='override run_id (default: sha1(abs_path + mtime))')
 
@@ -327,10 +470,17 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
 
+    # Resolve pools path to absolute so the generated rules work
+    # regardless of the makeflow client's cwd.
+    pools_file = args.pools_file
+    if pools_file:
+        pools_file = str(Path(pools_file).resolve())
+
     opts = PrepOptions(
         default_edge     = args.default_edge,
         default_pool     = args.default_pool,
         default_priority = args.default_priority,
+        pools_file       = pools_file,
     )
     run_id = args.run_id or compute_run_id(args.input)
 

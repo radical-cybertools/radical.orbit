@@ -40,7 +40,8 @@ from .client                            import BridgeClient, PluginClient
 from .plugin_base                       import Plugin
 from .plugin_session_base               import PluginSession
 from .task_dispatcher_config            import (
-    PoolConfig, PilotSize, PoolConfigError, load_pools,
+    DEFAULT_POOL_NAME, PoolConfig, PilotSize, PoolConfigError,
+    default_pool_config, parse_pools,
 )
 from .task_dispatcher_state             import (
     PilotRecord, TaskRecord, StateLog,
@@ -60,12 +61,17 @@ log = logging.getLogger('radical.edge')
 # Defaults
 # ---------------------------------------------------------------------------
 
-_DEFAULT_CONFIG_PATH = Path('~/.radical/edge/task_dispatcher/pools.json'
-                            ).expanduser()
 _DEFAULT_STATE_ROOT  = Path('~/.radical/edge/task_dispatcher/state'
                             ).expanduser()
 _DEFAULT_SCRATCH_ROOT = Path('~/.radical/edge/task_dispatcher/scratch'
                              ).expanduser()
+
+# State-directory pruning: directories whose mtime is older than this
+# threshold AND whose pool is no longer in self._pool_states get
+# deleted by the background sweeper (memory/project_bridge_dispatcher.md
+# Phase 5).
+_STATE_PRUNE_DAYS    = 30
+_SWEEP_INTERVAL_SEC  = 86400.0   # 1 day
 
 # Tick frequency for strategy.on_tick loops
 _TICK_INTERVAL_SEC = 5.0
@@ -82,52 +88,6 @@ _HANDSHAKE_TIMEOUT_SEC = 300.0  # 5 min, adjusted per observed lag history
 #   DONE              → return cached (crash-recovery)
 #   FAILED/CANCELED   → overwrite, re-execute (Makeflow retry)
 #   RUNNING/QUEUED    → attach to existing wait (wrapper reconnect)
-
-
-# ---------------------------------------------------------------------------
-# Local sibling-plugin client — bypasses the bridge for in-process calls
-# ---------------------------------------------------------------------------
-
-class _LocalPSIJClient:
-    '''In-process adapter for ``PluginPSIJ`` with the same surface the
-    dispatcher uses on ``PSIJClient``.
-
-    The dispatcher and ``PluginPSIJ`` live in the same process; routing
-    same-edge calls through the bridge would deadlock the asyncio loop
-    (sync HTTP → bridge → WS back to ourselves while the loop is blocked).
-    This adapter calls the underlying ``PSIJSession`` methods directly.
-
-    Only the no-tunnel ``submit_tunneled`` path is supported; the dispatcher
-    always passes ``tunnel=False`` (the child edge opens its own outbound
-    tunnel — see CLAUDE.md §Tunnel implementation).
-    '''
-
-    def __init__(self, plugin: Any) -> None:
-        self._plugin       = plugin
-        self.sid: str | None = None
-
-    async def register_session(self) -> None:
-        sid = f'session.{uuid.uuid4().hex[:8]}'
-        self._plugin._sessions[sid] = self._plugin._create_session(sid)
-        self._plugin._session_last_access[sid] = time.time()
-        self._plugin._ensure_cleanup_task()
-        self.sid = sid
-
-    async def submit_tunneled(self, job_spec: dict, executor: str,
-                              tunnel: bool) -> dict:
-        if tunnel:
-            raise NotImplementedError(
-                '_LocalPSIJClient: tunnel=True is not supported '
-                '(use bridge path or extend the local adapter)')
-        session = self._plugin._sessions[self.sid]
-        return await session.submit_job(job_spec, executor)
-
-    async def cancel_job(self, job_id: str) -> dict:
-        return await self._plugin._sessions[self.sid].cancel_job(job_id)
-
-    async def get_job_status(self, job_id: str, **kwargs: Any) -> dict:
-        return await self._plugin._sessions[self.sid].get_job_status(
-            job_id, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +264,23 @@ class TaskDispatcherSession(PluginSession):
 class TaskDispatcherClient(PluginClient):
     '''Application-side client for the task dispatcher plugin.'''
 
+    def register_session(self, pools: list | dict | None = None,
+                         **_kwargs: Any) -> None:
+        '''Register a session, optionally declaring per-workflow pools.
+
+        *pools* may be a list of pool-config dicts (matches the
+        ``pools.json`` ``pools`` field) or a dict containing a
+        ``pools`` key.  None registers without declaring pools, which
+        causes the dispatcher to auto-materialise its built-in
+        ``default`` pool (idempotent across sessions).
+        '''
+        body: dict = {}
+        if pools is not None:
+            body['pools'] = pools
+        resp = self._http.post(self._url('register_session'), json=body)
+        self._raise(resp)
+        self._sid = resp.json()['sid']
+
     def list_pools(self) -> dict:
         '''List configured pools and their live state (session-less).'''
         resp = self._http.get(self._url('pools'))
@@ -317,14 +294,24 @@ class TaskDispatcherClient(PluginClient):
         self._raise(resp)
         return resp.json()
 
-    def submit_task(self, pool: str, task_id: str, cmd: list[str],
-                    cwd: str, *, priority: int = 0,
+    def submit_task(self, task_id: str, cmd: list[str], cwd: str, *,
+                    pool: str | None = None, edge: str | None = None,
+                    priority: int = 0,
                     inputs: list[str] | None = None,
                     outputs: list[str] | None = None) -> dict:
-        '''Submit one task to the dispatcher.'''
+        '''Submit one task to the dispatcher.
+
+        Exactly one of *pool* or *edge* must be given:
+            - *pool*: route through a dispatcher-managed pilot pool.
+            - *edge*: bypass pool management and run directly on the
+              target edge's rhapsody plugin.  Inputs/outputs are not
+              supported in this mode (yet).
+        '''
         self._require_session()
-        payload = {
-            'pool'    : pool,
+        if bool(pool) == bool(edge):
+            raise ValueError(
+                'submit_task requires exactly one of pool=... or edge=...')
+        payload: dict = {
             'task_id' : task_id,
             'cmd'     : cmd,
             'cwd'     : cwd,
@@ -332,6 +319,10 @@ class TaskDispatcherClient(PluginClient):
             'inputs'  : inputs or [],
             'outputs' : outputs or [],
         }
+        if pool is not None:
+            payload['pool'] = pool
+        else:
+            payload['edge'] = edge
         resp = self._http.post(self._url(f'submit/{self.sid}'), json=payload)
         self._raise(resp, f'submit task {task_id!r}')
         return resp.json()
@@ -393,35 +384,50 @@ class PluginTaskDispatcher(Plugin):
     client_class  = TaskDispatcherClient
     version       = '0.0.1'
 
+    ui_config = {
+        'icon'          : '📦',
+        'title'         : 'Task Dispatcher',
+        'description'   : 'Pluggable autoscaling task dispatcher: pools, pilots, strategies.',
+        'refresh_button': True,
+    }
+
     @classmethod
     def is_enabled(cls, app: FastAPI) -> bool:
-        '''Login or standalone hosts only.
+        '''Bridge hosts only.
 
-        The dispatcher submits pilot jobs; pilots are *other* edges that
-        run inside allocations.  Running the dispatcher on a compute
-        node would be a category error; the bridge has its own role.
+        The dispatcher is a bridge-side plugin: it owns the global
+        pool/pilot/task state, observes topology events directly, and
+        proxies psij calls out to login-node edges that submit batch
+        jobs.  Running it on an edge would put it in the wrong half of
+        the architecture — see ``memory/project_bridge_dispatcher.md``.
         '''
         from .utils import host_role
-        return host_role(app)['role'] in ('login', 'standalone')
+        return host_role(app)['role'] == 'bridge'
 
     def __init__(self, app: FastAPI,
                  instance_name: str = 'task_dispatcher',
-                 config_path: str | os.PathLike | None = None,
                  state_root: str | os.PathLike | None = None,
                  scratch_root: str | os.PathLike | None = None) -> None:
         super().__init__(app, instance_name)
 
-        self._config_path  = Path(
-            config_path or os.environ.get(
-                'RADICAL_EDGE_TASK_DISPATCHER_CONFIG',
-                _DEFAULT_CONFIG_PATH))
         self._state_root   = Path(state_root   or _DEFAULT_STATE_ROOT)
         self._scratch_root = Path(scratch_root or _DEFAULT_SCRATCH_ROOT)
 
-        # Pool state, keyed by pool name.  Empty if config file missing
-        # (documented: dispatcher simply has no pools to submit to).
-        self._pool_states: dict[str, PoolState] = {}
-        self._load_pool_states()
+        # Map of edge_name → set of loaded plugin names, updated on
+        # every bridge topology event.  Used to (a) auto-resolve a
+        # pool's edge_name when it's None, and (b) validate the target
+        # of an edge-mode task submission.
+        self._connected_edges: dict[str, set[str]] = {}
+
+        # Edge-mode task tracking: task_id → target_edge_name.  Edge
+        # mode bypasses pool state — the dispatcher is a transparent
+        # proxy to the target edge's rhapsody.  This dict lets get/
+        # cancel routes know which edge to forward to.  Entries are
+        # cleared when the task reaches a terminal state (via the SSE
+        # callback).  Not persisted: bridge restart loses edge-mode
+        # in-flight tracking (consistent with the deferred restart-
+        # recovery decision).
+        self._edge_mode_tasks: dict[str, str] = {}
 
         # BridgeClient lazily created when we need to reach other edges
         # or subscribe to SSE.  Lifetime managed by _ensure_started.
@@ -432,9 +438,19 @@ class PluginTaskDispatcher(Plugin):
         # can find the right TaskRecord when a pilot reports completion.
         self._uid_to_task: dict[str, tuple[str, str]] = {}
 
-        # Background loops (tick, handshake-timeout sweeper)
+        # Background loops (tick, handshake-timeout sweeper, state
+        # prune).  Loops don't actually run until _ensure_started is
+        # called from the first request handler — _main_loop stays None
+        # until then.
         self._loops_started = False
         self._loops_tasks: list[asyncio.Task] = []
+        self._main_loop: asyncio.AbstractEventLoop | None = None
+
+        # Pool state, keyed by pool name.  Empty at startup; sessions
+        # declare pools via :meth:`register_session` (per-workflow
+        # config, not operator-managed).  See
+        # memory/project_bridge_dispatcher.md (Phase 5).
+        self._pool_states: dict[str, PoolState] = {}
 
         # Routes
         self.add_route_get  ('pools',                         self._route_pools)
@@ -447,37 +463,92 @@ class PluginTaskDispatcher(Plugin):
         self.add_route_get  ('stage_out/{sid}/{task_id}/{filename}',
                              self._route_stage_out)
 
-    # -- loading --------------------------------------------------------
+    # -- materialisation ------------------------------------------------
 
-    def _load_pool_states(self) -> None:
-        '''Load ``pools.json`` and instantiate :class:`PoolState` per pool.
+    def _materialise_pool(self, cfg: PoolConfig) -> 'PoolState':
+        '''Create a :class:`PoolState` from *cfg* and register it.
 
-        A missing file is non-fatal: the dispatcher runs with zero pools.
-        Submission attempts will fail with a clear error until pools are
-        configured.
+        - Resolves ``edge_name=None`` via :meth:`_pick_edge_name` against
+          the current topology snapshot.  Stores the resolved name back
+          onto *cfg*; if no edge is available, leaves it None and lets
+          the pilot-submit path bail later.
+        - If a pool with the same ``name`` already exists, validates
+          that the configs match (see :meth:`_pool_configs_compatible`)
+          and returns the existing :class:`PoolState`.  Mismatch raises
+          :class:`HTTPException` 409.
+        - If the dispatcher's tick-loop machinery is already running,
+          starts a tick loop for the new pool.
         '''
-        if not self._config_path.is_file():
-            log.info('[%s] no pool config at %s; dispatcher starts empty',
-                     self.instance_name, self._config_path)
-            return
+        if cfg.edge_name is None:
+            picked = self._pick_edge_name()
+            if picked:
+                cfg.edge_name = picked
+                log.info('[%s] pool %r: edge_name auto-resolved to %r',
+                         self.instance_name, cfg.name, picked)
 
-        try:
-            pool_configs = load_pools(self._config_path)
-        except PoolConfigError as e:
-            log.error('[%s] failed to load %s: %s',
-                      self.instance_name, self._config_path, e)
-            raise
+        existing = self._pool_states.get(cfg.name)
+        if existing is not None:
+            if not self._pool_configs_compatible(existing.config, cfg):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(f'pool {cfg.name!r} already exists with a '
+                            f'different config; declare with a unique '
+                            f'name or align with the existing pool'))
+            return existing
 
-        for name, cfg in pool_configs.items():
-            state_dir    = self._state_root / name
-            scratch_base = (Path(cfg.scratch_base).expanduser()
-                            if cfg.scratch_base
-                            else self._scratch_root / name)
-            self._pool_states[name] = PoolState(
-                cfg, state_dir, scratch_base, self)
-            log.info('[%s] loaded pool %r (strategy=%s, sizes=%s)',
-                     self.instance_name, name, cfg.strategy,
-                     sorted(cfg.pilot_sizes))
+        # Encode (name, edge) in the state-dir path so renames are safe
+        # and pools across edges (future) don't collide on disk.
+        edge_tag     = cfg.edge_name or 'unbound'
+        state_dir    = self._state_root / f'{cfg.name}__{edge_tag}'
+        scratch_base = (Path(cfg.scratch_base).expanduser()
+                        if cfg.scratch_base
+                        else self._scratch_root / cfg.name)
+        ps = PoolState(cfg, state_dir, scratch_base, self)
+        self._pool_states[cfg.name] = ps
+        log.info('[%s] materialised pool %r → edge %r '
+                 '(strategy=%s, sizes=%s)',
+                 self.instance_name, cfg.name, cfg.edge_name,
+                 cfg.strategy, sorted(cfg.pilot_sizes))
+
+        # If the dispatcher is already running, kick off this pool's
+        # tick loop right away (otherwise _ensure_started will catch it).
+        if self._loops_started and self._main_loop:
+            self._loops_tasks.append(
+                self._main_loop.create_task(self._tick_loop(ps)))
+        return ps
+
+    def _pool_configs_compatible(self, a: PoolConfig,
+                                 b: PoolConfig) -> bool:
+        '''Two configs are compatible if all structural fields match.
+
+        Conflict policy is strict reject (see
+        memory/project_bridge_dispatcher.md).  Any difference in name,
+        edge_name, queue, account, sizes, strategy, or min/max pilots
+        counts as a conflict.
+        '''
+        return (a.name            == b.name
+            and a.edge_name       == b.edge_name
+            and a.queue           == b.queue
+            and a.account         == b.account
+            and a.pilot_sizes     == b.pilot_sizes
+            and a.default_size    == b.default_size
+            and a.min_pilots      == b.min_pilots
+            and a.max_pilots      == b.max_pilots
+            and a.strategy        == b.strategy
+            and a.strategy_config == b.strategy_config
+            and a.scratch_base    == b.scratch_base)
+
+    def _pick_edge_name(self) -> str | None:
+        '''Auto-pick an edge_name when a pool was declared without one.
+
+        Policy: lexically first connected edge that isn't us (the
+        bridge edge).  Returns ``None`` if no eligible edge is
+        available; the caller decides whether to defer or fail.
+        '''
+        self_edge = getattr(self._app.state, 'edge_name', None)
+        candidates = sorted(e for e in self._connected_edges
+                            if e != self_edge)
+        return candidates[0] if candidates else None
 
     # -- lifecycle ------------------------------------------------------
 
@@ -499,6 +570,8 @@ class PluginTaskDispatcher(Plugin):
                 self._tick_loop(pool_state)))
         self._loops_tasks.append(loop.create_task(
             self._handshake_sweeper()))
+        self._loops_tasks.append(loop.create_task(
+            self._state_sweeper()))
 
         # Spin up the bridge client + SSE subscription in a worker thread
         # — BridgeClient uses blocking httpx under the hood.
@@ -581,7 +654,137 @@ class PluginTaskDispatcher(Plugin):
         avg = sum(history) / len(history)
         return max(_HANDSHAKE_TIMEOUT_SEC, 2 * avg)
 
+    async def _state_sweeper(self) -> None:
+        '''Prune state directories for pools no longer active.
+
+        Daily sweep: any subdir of ``self._state_root`` whose name is
+        not in the active pool set AND whose newest mtime is older
+        than ``_STATE_PRUNE_DAYS`` gets removed.  Workflow state for
+        terminated pools is kept for 30 days so post-mortem debugging
+        is possible; older state is dead weight.
+        '''
+        # First sweep shortly after startup so a restart with stale
+        # state on disk doesn't wait a full day to clean up.
+        await asyncio.sleep(60.0)
+        while True:
+            try:
+                self._prune_stale_state_dirs()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                log.exception('[%s] state sweeper error: %s',
+                              self.instance_name, e)
+            try:
+                await asyncio.sleep(_SWEEP_INTERVAL_SEC)
+            except asyncio.CancelledError:
+                return
+
+    def _prune_stale_state_dirs(self) -> None:
+        '''Synchronous worker for :meth:`_state_sweeper`.
+
+        A directory is pruned iff:
+        1. it isn't backing an active pool (not in
+           ``self._pool_states``), AND
+        2. its most-recently-touched file is older than
+           ``_STATE_PRUNE_DAYS`` days.
+
+        Active pools' state-dir names follow the
+        ``<pool>__<edge_or_'unbound'>`` scheme from
+        :meth:`_materialise_pool`.  Pools that don't fit that scheme
+        (e.g. older state from previous versions) are simply
+        candidates for pruning by virtue of not being in the active
+        set — that's the intended garbage-collection.
+        '''
+        import shutil
+        if not self._state_root.exists():
+            return
+        cutoff = time.time() - _STATE_PRUNE_DAYS * 86400
+        active = {
+            f'{ps.config.name}__{ps.config.edge_name or "unbound"}'
+            for ps in self._pool_states.values()
+        }
+        for entry in self._state_root.iterdir():
+            if not entry.is_dir() or entry.name in active:
+                continue
+            try:
+                mtimes = [p.stat().st_mtime for p in entry.iterdir()]
+            except (FileNotFoundError, PermissionError):
+                continue
+            if not mtimes:
+                continue
+            if max(mtimes) >= cutoff:
+                continue
+            try:
+                shutil.rmtree(entry)
+                log.info('[%s] pruned stale state dir %s',
+                         self.instance_name, entry)
+            except OSError as e:
+                log.warning('[%s] could not prune %s: %s',
+                            self.instance_name, entry, e)
+
     # -- routes --------------------------------------------------------
+
+    async def register_session(self, request: Request) -> dict:
+        '''Override the base ``register_session`` to accept per-session
+        pool declarations.
+
+        Request body (JSON, all fields optional)::
+
+            {
+              "pools": [<PoolConfig>, ...]   # same shape as pools.json
+            }
+
+        Materialisation semantics:
+
+        - Each declared pool is parsed via the same loader as pools.json.
+        - For each pool, if a pool with the same name already exists,
+          its config is checked against the new declaration:
+            * compatible  → session attaches to the existing pool
+            * incompatible → request rejected with HTTP 409
+        - If no pools are declared AND no pool named ``default`` exists
+          yet, the dispatcher auto-materialises a ``default`` pool
+          (see :func:`task_dispatcher_config.default_pool_config`).
+
+        Pools materialise into ``self._pool_states`` (plugin-level), so
+        they outlive the session.  Sessions never own pilots.
+        '''
+        self._ensure_started()
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+
+        pools_body = body.get('pools')
+
+        if pools_body is not None:
+            # Wrap into the loader's expected shape if needed.
+            if isinstance(pools_body, list):
+                wrapped = {'pools': pools_body}
+            elif isinstance(pools_body, dict) and 'pools' in pools_body:
+                wrapped = pools_body
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="'pools' must be a list or {'pools': [...]}")
+            try:
+                configs = parse_pools(wrapped, source='register_session')
+            except PoolConfigError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            for cfg in configs.values():
+                self._materialise_pool(cfg)
+        elif DEFAULT_POOL_NAME not in self._pool_states:
+            # No pools declared; auto-materialise the default once.
+            self._materialise_pool(default_pool_config())
+
+        # Hand off to the base sid-allocation logic.
+        sid = f'session.{uuid.uuid4().hex[:8]}'
+        self._sessions[sid] = self._create_session(sid)
+        self._session_last_access[sid] = time.time()
+        self._ensure_cleanup_task()
+        log.info('[%s] Registered session %s', self.instance_name, sid)
+        return {'sid': sid}
 
     async def _route_pools(self, request: Request) -> dict:
         '''List all configured pools.  Session-less.'''
@@ -621,16 +824,28 @@ class PluginTaskDispatcher(Plugin):
         self._require_known_session(sid)
         body = await request.json()
 
-        pool_name = body.get('pool')
-        task_id   = body.get('task_id')
-        cmd       = body.get('cmd')
-        cwd       = body.get('cwd')
+        pool_name   = body.get('pool')
+        target_edge = body.get('edge')
+        task_id     = body.get('task_id')
+        cmd         = body.get('cmd')
+        cwd         = body.get('cwd')
 
-        if not pool_name or not task_id or not cmd or not cwd:
+        # Mutual exclusion: exactly one of 'pool' / 'edge' is required.
+        if bool(pool_name) == bool(target_edge):
             raise HTTPException(
                 status_code=400,
-                detail="submit requires 'pool', 'task_id', 'cmd', 'cwd'")
+                detail="submit requires exactly one of 'pool' or 'edge'")
+        if not task_id or not cmd or not cwd:
+            raise HTTPException(
+                status_code=400,
+                detail="submit requires 'task_id', 'cmd', 'cwd'")
 
+        # ---------- edge mode: transparent proxy to target's rhapsody ----
+        if target_edge:
+            return await self._route_submit_edge_mode(
+                target_edge, task_id, cmd, cwd, body)
+
+        # ---------- pool mode: dispatcher-managed pilot fleet ------------
         pool_state = self._pool_states.get(pool_name)
         if not pool_state:
             raise HTTPException(
@@ -683,10 +898,94 @@ class PluginTaskDispatcher(Plugin):
 
         return self._task_dict(record)
 
+    async def _route_submit_edge_mode(
+            self, target_edge: str, task_id: str,
+            cmd: list, cwd: str, body: dict) -> dict:
+        '''Edge-mode submit: transparent proxy to target's rhapsody.
+
+        No pool, no state log, no pilot fleet — the dispatcher just
+        forwards the task to the target edge's rhapsody session and
+        records ``task_id -> target_edge`` so subsequent get/cancel
+        can route back.  The mapping is cleared when the task hits a
+        terminal state (see :meth:`_on_rhapsody_task_status`).
+
+        The target edge's rhapsody plugin owns the backend choice —
+        the dispatcher doesn't pass a ``backends`` list so the edge's
+        own configured default applies.
+        '''
+        plugins = self._connected_edges.get(target_edge)
+        if plugins is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f'unknown edge: {target_edge}')
+        if 'rhapsody' not in plugins:
+            raise HTTPException(
+                status_code=503,
+                detail=f'edge {target_edge} cannot run tasks')
+        if body.get('inputs') or body.get('outputs'):
+            raise HTTPException(
+                status_code=400,
+                detail='stage_in/stage_out not supported for '
+                       'edge-mode tasks (yet)')
+
+        rh = await asyncio.to_thread(self._get_rhapsody_client, target_edge)
+        if rh is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f'rhapsody client unavailable on {target_edge}')
+
+        task_dict = {
+            'uid'       : task_id,
+            'executable': cmd[0] if cmd else '',
+            'arguments' : list(cmd[1:]) if len(cmd) > 1 else [],
+            'cwd'       : cwd,
+            'task_backend_specific_kwargs': {'cwd': cwd},
+        }
+        try:
+            result = await asyncio.to_thread(rh.submit_tasks, [task_dict])
+        except Exception as e:
+            log.exception('[%s] edge-mode submit to %s failed: %s',
+                          self.instance_name, target_edge, e)
+            raise HTTPException(
+                status_code=502,
+                detail=f'rhapsody submit failed on '
+                       f'{target_edge}: {e}') from e
+
+        self._edge_mode_tasks[task_id] = target_edge
+        # Map rhapsody uid (== task_id here) to the edge for terminal
+        # cleanup via the SSE callback.
+        return {
+            'task_id': task_id,
+            'edge'   : target_edge,
+            'state'  : TASK_RUNNING,
+            'cmd'    : list(cmd),
+            'cwd'    : str(cwd),
+            'result' : result[0] if result else None,
+        }
+
     async def _route_get_task(self, request: Request) -> dict:
         self._ensure_started()
         self._require_known_session(request.path_params['sid'])
         task_id = request.path_params['task_id']
+
+        # Edge mode: forward to the target edge's rhapsody.
+        edge_name = self._edge_mode_tasks.get(task_id)
+        if edge_name is not None:
+            rh = await asyncio.to_thread(
+                self._get_rhapsody_client, edge_name)
+            if rh is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f'rhapsody client unavailable on {edge_name}')
+            try:
+                info = await asyncio.to_thread(rh.get_task, task_id)
+            except Exception as e:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f'rhapsody get_task failed on '
+                           f'{edge_name}: {e}') from e
+            return {'task_id': task_id, 'edge': edge_name, 'result': info}
+
         for ps in self._pool_states.values():
             rec = ps.tasks.get(task_id)
             if rec is not None:
@@ -698,6 +997,24 @@ class PluginTaskDispatcher(Plugin):
         self._ensure_started()
         self._require_known_session(request.path_params['sid'])
         task_id = request.path_params['task_id']
+
+        # Edge mode: forward cancel to the target edge's rhapsody.
+        edge_name = self._edge_mode_tasks.get(task_id)
+        if edge_name is not None:
+            rh = await asyncio.to_thread(
+                self._get_rhapsody_client, edge_name)
+            if rh is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f'rhapsody client unavailable on {edge_name}')
+            try:
+                info = await asyncio.to_thread(rh.cancel_task, task_id)
+            except Exception as e:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f'rhapsody cancel_task failed on '
+                           f'{edge_name}: {e}') from e
+            return {'task_id': task_id, 'edge': edge_name, 'result': info}
 
         for ps in self._pool_states.values():
             rec = ps.tasks.get(task_id)
@@ -711,6 +1028,12 @@ class PluginTaskDispatcher(Plugin):
         self._require_known_session(request.path_params['sid'])
         task_id = request.path_params['task_id']
         body    = await request.json()
+
+        if task_id in self._edge_mode_tasks:
+            raise HTTPException(
+                status_code=400,
+                detail='stage_in/stage_out not supported for '
+                       'edge-mode tasks (yet)')
 
         pool_name   = body.get('pool')
         filename    = body.get('filename')
@@ -759,6 +1082,12 @@ class PluginTaskDispatcher(Plugin):
         task_id  = request.path_params['task_id']
         filename = request.path_params['filename']
 
+        if task_id in self._edge_mode_tasks:
+            raise HTTPException(
+                status_code=400,
+                detail='stage_in/stage_out not supported for '
+                       'edge-mode tasks (yet)')
+
         if '/' in filename or '\\' in filename or filename in ('', '.', '..'):
             raise HTTPException(
                 status_code=400,
@@ -794,10 +1123,23 @@ class PluginTaskDispatcher(Plugin):
         Capacity is taken from the pool's pilot-size config (good enough
         for the static-allocation case; runtime capacity discovery would
         re-introduce a handshake).
+
+        Also caches each connected edge's plugin set so other code
+        paths (auto-resolution of ``PoolConfig.edge_name`` when None;
+        validation of edge-mode task submissions) have live topology.
         '''
+        # Build {edge_name: set(plugin_names)}.  Topology payload's
+        # 'plugins' field is sometimes a list, sometimes a dict
+        # (depending on serialisation path); accept both.
+        new: dict[str, set[str]] = {}
+        for name, info in (edges or {}).items():
+            plugins = (info or {}).get('plugins', [])
+            if isinstance(plugins, dict):
+                plugins = list(plugins.keys())
+            new[name] = set(plugins)
+        self._connected_edges = new
         if not self._loops_started:
             return
-        connected = set(edges or {})
         for ps in self._pool_states.values():
             for pilot in list(ps.pilots.values()):
                 if pilot.state != PILOT_PENDING and \
@@ -805,7 +1147,7 @@ class PluginTaskDispatcher(Plugin):
                     continue
                 if not pilot.child_edge_name:
                     continue
-                if pilot.child_edge_name not in connected:
+                if pilot.child_edge_name not in new:
                     continue
 
                 size = ps.config.pilot_sizes.get(pilot.size_key)
@@ -874,25 +1216,35 @@ class PluginTaskDispatcher(Plugin):
             self._do_pilot_cancel(pool_state, record),
             self._main_loop)
 
-    def _get_psij_client(self) -> Any:
-        '''Return a :class:`PSIJClient`-shaped helper for our own edge.
+    def _get_psij_client(self, edge_name: str) -> Any:
+        '''Return a :class:`PSIJClient`-shaped helper targeting *edge_name*.
 
-        Goes directly to the in-process ``PluginPSIJ`` instance — routing
-        same-edge calls through the bridge would deadlock (sync HTTP →
-        bridge → WS back to ourselves while the asyncio loop is blocked).
+        Goes through the bridge (``self._bc.get_edge_client(edge_name)``).
+        The returned client's methods are synchronous (httpx) — callers
+        MUST wrap each call in :func:`asyncio.to_thread` to keep the
+        dispatcher's event loop responsive (otherwise the sync HTTP
+        starves WS heartbeats and the bridge marks our connection
+        dead).  This caller-side ``to_thread`` discipline also makes
+        same-edge calls safe: the event loop continues processing the
+        proxied WS request while the blocking HTTP waits on a worker
+        thread.
 
-        Returns ``None`` if the edge service or psij plugin is not
-        available locally.
+        Returns ``None`` if the bridge client isn't ready yet or the
+        target edge / psij plugin isn't reachable.
         '''
-        edge_svc = getattr(self._app.state, 'edge_service', None)
-        if edge_svc is None:
-            return None
-        psij_plugin = edge_svc._plugins.get('psij')
-        if psij_plugin is None:
-            log.warning('[%s] psij plugin not loaded on this edge',
+        if not edge_name:
+            log.warning('[%s] _get_psij_client called with empty edge_name',
                         self.instance_name)
             return None
-        return _LocalPSIJClient(psij_plugin)
+        bc = self._wait_for_bc()
+        if bc is None:
+            return None
+        try:
+            return bc.get_edge_client(edge_name).get_plugin('psij')
+        except Exception as e:
+            log.warning('[%s] psij client unavailable on %s: %s',
+                        self.instance_name, edge_name, e)
+            return None
 
     def _get_rhapsody_client(self, child_edge: str,
                              backend: str | None = None) -> Any:
@@ -965,8 +1317,18 @@ class PluginTaskDispatcher(Plugin):
     async def _do_pilot_submit(self, pool_state: PoolState,
                                record: PilotRecord,
                                size: PilotSize) -> None:
-        '''Call psij on our own edge to submit the pilot job.'''
-        psij_c = self._get_psij_client()
+        '''Call psij on the pool's target edge to submit the pilot job.'''
+        edge_name = pool_state.config.edge_name
+        if not edge_name:
+            self._mark_pilot_failed(
+                pool_state, record,
+                f'pool {pool_state.config.name!r} has no edge_name set')
+            return
+
+        # All psij client construction goes through sync httpx via the
+        # bridge — do it in a worker thread to keep the asyncio loop
+        # free (also avoids deadlock on same-edge round-trips).
+        psij_c = await asyncio.to_thread(self._get_psij_client, edge_name)
         if psij_c is None:
             self._mark_pilot_failed(
                 pool_state, record, 'psij client unavailable')
@@ -981,12 +1343,10 @@ class PluginTaskDispatcher(Plugin):
             pool_state, size, child_edge, env)
 
         try:
-            if not getattr(psij_c, 'sid', None):
-                await psij_c.register_session()
             from .batch_system import detect_batch_system
             executor = detect_batch_system().psij_executor
-            result   = await psij_c.submit_tunneled(
-                job_spec, executor, False)
+            result   = await asyncio.to_thread(
+                psij_c.submit_tunneled, job_spec, executor, 'none')
         except Exception as e:
             log.exception('[%s] psij submit_tunneled failed for %s: %s',
                           self.instance_name, record.pid, e)
@@ -1014,14 +1374,16 @@ class PluginTaskDispatcher(Plugin):
                                record: PilotRecord) -> None:
         if record.is_terminal():
             return
-        psij_c = self._get_psij_client()
-        if psij_c is None or not record.psij_job_id:
+        edge_name = pool_state.config.edge_name
+        if not edge_name or not record.psij_job_id:
+            self._mark_pilot_failed(pool_state, record, 'cancel requested')
+            return
+        psij_c = await asyncio.to_thread(self._get_psij_client, edge_name)
+        if psij_c is None:
             self._mark_pilot_failed(pool_state, record, 'cancel requested')
             return
         try:
-            if not getattr(psij_c, 'sid', None):
-                await psij_c.register_session()
-            await psij_c.cancel_job(record.psij_job_id)
+            await asyncio.to_thread(psij_c.cancel_job, record.psij_job_id)
         except Exception as e:
             log.warning('[%s] psij cancel failed for %s: %s',
                         self.instance_name, record.pid, e)
@@ -1032,13 +1394,15 @@ class PluginTaskDispatcher(Plugin):
         '''Sweeper path: query psij state for an overdue pilot.'''
         if record.is_terminal():
             return
-        psij_c = self._get_psij_client()
-        if psij_c is None or not record.psij_job_id:
+        edge_name = pool_state.config.edge_name
+        if not edge_name or not record.psij_job_id:
+            return
+        psij_c = await asyncio.to_thread(self._get_psij_client, edge_name)
+        if psij_c is None:
             return
         try:
-            if not getattr(psij_c, 'sid', None):
-                await psij_c.register_session()
-            status = await psij_c.get_job_status(record.psij_job_id)
+            status = await asyncio.to_thread(
+                psij_c.get_job_status, record.psij_job_id)
         except Exception as e:
             log.warning('[%s] psij get_job_status failed for %s: %s',
                         self.instance_name, record.pid, e)
@@ -1212,6 +1576,20 @@ class PluginTaskDispatcher(Plugin):
     def _handle_task_terminal(self, uid: str, target_state: str,
                                data: dict) -> None:
         '''Main-loop-side handler for rhapsody task completion.'''
+        # Edge-mode tasks: forget the mapping and re-emit the terminal
+        # status under the dispatcher's plugin name so clients that
+        # filter on plugin='task_dispatcher' still see the event.
+        if uid in self._edge_mode_tasks:
+            edge_name = self._edge_mode_tasks.pop(uid)
+            self._dispatch_notify('task_status', {
+                'task_id'  : uid,
+                'edge'     : edge_name,
+                'state'    : target_state,
+                'exit_code': data.get('exit_code'),
+                'error'    : data.get('error'),
+            })
+            return
+
         mapping = self._uid_to_task.pop(uid, None)
         if not mapping:
             return
@@ -1328,9 +1706,20 @@ class PluginTaskDispatcher(Plugin):
             'queue'       : ps.config.queue,
             'account'     : ps.config.account,
             'strategy'    : ps.config.strategy,
-            'pilot_sizes' : sorted(ps.config.pilot_sizes),
+            'default_size': ps.config.default_size,
+            'pilot_sizes' : {
+                name: {
+                    'nodes'           : size.nodes,
+                    'cpus_per_node'   : size.cpus_per_node,
+                    'gpus_per_node'   : size.gpus_per_node,
+                    'walltime_sec'    : size.walltime_sec,
+                    'rhapsody_backend': size.rhapsody_backend,
+                }
+                for name, size in ps.config.pilot_sizes.items()
+            },
             'live_pilots' : len(live),
             'pending_tasks': len(pending),
+            'min_pilots'  : ps.config.min_pilots,
             'max_pilots'  : ps.config.max_pilots,
         }
         if verbose:

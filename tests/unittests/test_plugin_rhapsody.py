@@ -82,6 +82,11 @@ from radical.edge.plugin_rhapsody import (  # noqa: E402
     RhapsodyClient,
 )
 
+# Capture the unpatched initialize coroutine BEFORE the autouse stub
+# fixture is applied, so the start-telemetry regression test below can
+# exercise the real method.
+_REAL_INITIALIZE = RhapsodySession.initialize
+
 
 # Stub RhapsodySession.initialize for every test in this module.
 # The background `_init_session` task runs concurrently inside the same
@@ -797,6 +802,43 @@ async def test_cancel_all_skips_terminal():
     resp = client.post(f"{plugin.namespace}/cancel_all/{sid}")
     assert resp.status_code == 200
     assert resp.json()["canceled"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Regression: RhapsodySession.initialize survives older rhapsody libs that
+# don't expose `Session.start_telemetry`.
+# ---------------------------------------------------------------------------
+#
+# Bug surfaced during the local e2e smoke (memory/project_bridge_dispatcher.md):
+# the rhapsody plugin called `self._rh_session.start_telemetry(...)`
+# unconditionally; older rhapsody installs raise AttributeError.  Fix
+# guards the call with `getattr(session, 'start_telemetry', None)`.
+
+@pytest.mark.asyncio
+async def test_initialize_without_start_telemetry(monkeypatch):
+    '''Session init must succeed when the rhapsody Session has no
+    ``start_telemetry`` method (older rhapsody installs lack it).
+    Regression for the bug surfaced during the local e2e smoke.'''
+    from radical.edge import plugin_rhapsody as prh
+
+    fake_backend = MagicMock(spec=[])  # no __await__, no register_callback
+    fake_session = MagicMock(spec=[])  # IMPORTANT: spec=[] → no start_telemetry
+
+    monkeypatch.setattr(prh.rh, 'get_backend',
+                        MagicMock(return_value=fake_backend))
+    monkeypatch.setattr(prh.rh, 'Session',
+                        MagicMock(return_value=fake_session))
+
+    sess = RhapsodySession('sess.no_telem', backend_names=['fake'])
+    # _REAL_INITIALIZE was captured at import time, before the autouse
+    # stub fixture replaced RhapsodySession.initialize.  Bind it
+    # manually to bypass the per-test stub.
+    await _REAL_INITIALIZE(sess)
+
+    assert sess._telemetry is None
+    assert sess._rh_session is fake_session
+    assert sess._init_error is None
+    assert sess._init_ready.is_set()
 
 
 if __name__ == '__main__':

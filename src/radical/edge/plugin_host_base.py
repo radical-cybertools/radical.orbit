@@ -21,7 +21,7 @@ log = logging.getLogger('radical.edge')
 # ---------------------------------------------------------------------------
 
 DEFAULT_PLUGINS_BY_ROLE: Dict[str, List[str]] = {
-    'bridge'    : ['iri*',     'staging', 'sysinfo'],
+    'bridge'    : ['iri*',     'staging', 'sysinfo', 'task_dispatcher'],
     'login'     : ['psij',     'staging', 'sysinfo', 'queue_info'],
     'compute'   : ['rhapsody', 'staging', 'sysinfo', 'queue_info'],
     'standalone': ['psij',     'staging', 'sysinfo', 'rhapsody', 'queue_info'],

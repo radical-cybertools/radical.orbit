@@ -26,18 +26,22 @@ class BridgePluginHost(PluginHostBase):
     def __init__(self, plugin_names        : List[str],
                        broadcast_fn        : Callable,
                        edge_name           : str      = 'bridge',
-                       on_topology_changed : Optional[Callable] = None):
+                       on_topology_changed : Optional[Callable] = None,
+                       bridge_url          : str      = ''):
 
         self._name                : str      = edge_name
         self._broadcast_fn        : Callable = broadcast_fn
         self._on_topology_changed : Optional[Callable] = on_topology_changed
         self._plugins             : Dict[str, Plugin] = {}
 
-        # Internal FastAPI app — plugins register routes here
+        # Internal FastAPI app — plugins register routes here.
+        # bridge_url is the bridge's own loopback-reachable URL so that
+        # bridge-hosted plugins (e.g. task_dispatcher) can construct a
+        # BridgeClient pointing at this same bridge for cross-edge calls.
         self._app = FastAPI(title='Bridge Plugin Host')
         self._app.state.edge_service = self
         self._app.state.edge_name    = edge_name
-        self._app.state.bridge_url   = ''
+        self._app.state.bridge_url   = bridge_url
         self._app.state.is_bridge    = True
 
         self._load_plugins_from_filter(plugin_names)
