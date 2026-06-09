@@ -21,6 +21,31 @@ import time
 import pytest
 
 
+def test_plugin_init_subclass_collision(caplog):
+    '''
+    Test that duplicate plugin names emit a warning during subclassing.
+    '''
+    import logging
+    # The 'radical.edge' logger runs with propagate=False (see logging_config),
+    # so caplog's root handler never sees its records.  Attach caplog's handler
+    # to the logger directly to capture regardless of propagation.
+    logger = logging.getLogger("radical.edge")
+    logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.WARNING, logger="radical.edge"):
+            class CollidingPluginA(Plugin):
+                plugin_name = "collide"
+                session_class = PluginSession
+
+            class CollidingPluginB(Plugin):
+                plugin_name = "collide"
+                session_class = PluginSession
+    finally:
+        logger.removeHandler(caplog.handler)
+
+    assert "Duplicate plugin_name 'collide' - overwriting" in caplog.text
+
+
 def test_plugin_initialization():
     '''
     Test that Plugin initializes correctly with app and name.

@@ -405,6 +405,10 @@ async def test_reverse_tunnel_watcher_happy_path(tmp_path, monkeypatch):
     fake_batch.job_nodes = lambda _nid: ['nid001']
 
     relay_file = tmp_path / 'edge-r.port'
+    # New protocol: the child writes a .req file with its hostname; the
+    # watcher reads it, then spawns ssh -R.  Simulate the child here.
+    import json
+    relay_file.with_suffix('.req').write_text(json.dumps({"hostname": "nid001"}))
 
     def fake_spawn(compute_host, bhost, bport, edge_name,
                    allocate_timeout=30.0):
@@ -453,6 +457,10 @@ async def test_reverse_tunnel_watcher_spawn_failure(tmp_path, monkeypatch):
     fake_batch.job_nodes = lambda _nid: ['nid001']
 
     relay_file = tmp_path / 'edge-rfail.port'
+    # New protocol: the child writes a .req file with its hostname; the
+    # watcher reads it, then spawns ssh -R.  Simulate the child here.
+    import json
+    relay_file.with_suffix('.req').write_text(json.dumps({"hostname": "nid001"}))
 
     def fake_spawn_raises(*a, **kw):
         raise RuntimeError("ssh: connection refused (gatewayports denied)")

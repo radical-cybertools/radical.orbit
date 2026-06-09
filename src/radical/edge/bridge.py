@@ -317,10 +317,17 @@ class Bridge:
     def _setup_middleware(self):
         # LUCID needs credentials; browsers reject credentials + wildcard
         # origin, so we list allowed origins explicitly.
+        origins = [
+            "http://localhost",
+            "http://localhost:8080",
+            "https://localhost",
+            "https://localhost:8080",
+            "https://dev-1.bv-brc.org",
+        ]
         self._app.add_middleware(
             CORSMiddleware,
             allow_credentials=True,
-            allow_origins=["https://dev-1.bv-brc.org"],
+            allow_origins=origins,
             allow_methods=["*"],
             allow_headers=["*"],
         )
