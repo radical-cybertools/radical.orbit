@@ -1,3 +1,4 @@
+
 # Radical Edge
 
 Radical Edge provides a decentralized architectural framework for seamlessly interacting with high-performance computing (HPC) nodes and executing remote computations across edge services.
@@ -7,7 +8,23 @@ Radical Edge provides a decentralized architectural framework for seamlessly int
 Radical Edge consists of three primary layers:
 1. **Bridge (`radical-edge-bridge`)**: The centralized entry hub. It maintains WebSocket connections to external Edge services, manages edge discovery, and serves as an HTTP-to-WebSocket reverse proxy forwarding REST API calls to the respective Edges.
 2. **Edge Service (`radical-edge-service`)**: Deployed directly on the compute nodes/HPC resources. It connects upstream to the Bridge via WebSocket, loading local Plugins to execute tasks natively within the remote network boundary.
-3. **Clients / Portal (`client.py` & `edge_explorer.html`)**: Developer and end-user interfaces. The Python Client SDK seamlessly orchestrates dynamic REST interactions with Plugins, while the Web Portal demonstrates direct native JavaScript browser integration with the Bridge API over HTTP.
+3. **Clients / Portal (`client.py` & `edge_explorer.html`)**: Developer and end-user interfaces. The Python Client SDK orchestrates dynamic REST interactions with Plugins, while the Web Portal demonstrates direct native JavaScript browser integration with the Bridge API over HTTP.
+
+## Deployment
+
+Create a virtualenv, conda env, or other isolated python environment of your
+choice, and `pip install radical.edge`.
+
+However, some plugins require dependencies, otherwise they won't load:
+  - psyj: `pip install psij/python`
+  - rhapsody: `pip install rhapsody-py`
+  - rose: `pip install rose`
+
+In fact, the ROSE plugin is only installed with ROSE - so that's also an example
+how 3rd party module can install `radical.edge` plugins.  Note that plugin
+dependencies are only needed on those machines on which the edge plugins are
+actually used - the bridge host and the client hosts usually don't need those.
+
 
 ## Usage (Command Line)
 
@@ -24,7 +41,7 @@ Set the appropriate environment variables:
 ```sh
 export RADICAL_BRIDGE_URL='https://localhost:8000/'
 export RADICAL_BRIDGE_CERT="`pwd`/bridge_cert.pem"
-export RADICAL_BRIDGE_KEY="`pwd`/bridge_key.pem"
+export RADICAL_BRIDGE_KEY="`pwd`/bridge_key.pem"  # only needed for the bridge
 ```
 
 ### 2. Starting the Bridge
@@ -137,11 +154,6 @@ PSI/J job submission plugin:
 - Job cancellation support
 - Custom attributes for scheduler-specific options
 
-### lucid
-RADICAL Pilot integration plugin for task-based workflows.
-
-### rhapsody
-RADICAL Rhapsody integration for workflow composition.
 
 ## Portal Integration
 
@@ -151,7 +163,7 @@ The interactive Edge Explorer interface (`src/radical/edge/data/edge_explorer.ht
 - Discovers the endpoint hierarchy leveraging the `POST /edge/list` API.
 - Implements purely client-side routing to interact with REST bindings of different edge plugins (e.g., querying `queue_info`, or submitting jobs dynamically via `psij` or `rhapsody` plugins).
 - Supports real-time updates via Server-Sent Events (SSE) from the `/events` endpoint.
-- Allows launching new edge services on remote resources via SSH and PSI/J job submission.
+- Allows launching new edge services on HPC resources via PSI/J job submission.
 - Provides bridge and edge termination controls.
 
 ## Configuration

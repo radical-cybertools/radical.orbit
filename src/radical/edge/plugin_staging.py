@@ -7,6 +7,7 @@ __license__   = 'MIT'
 
 import os
 import base64
+import binascii
 import logging
 
 from fastapi import FastAPI, HTTPException
@@ -98,7 +99,10 @@ class StagingSession(PluginSession):
         self._ensure_parent_dirs(filename)
 
         # Decode and write content
-        content = base64.b64decode(content_b64)
+        try:
+            content = base64.b64decode(content_b64)
+        except binascii.Error as e:
+            raise ValueError(f"invalid base64 content: {e}") from e
         with open(filename, 'wb') as f:
             f.write(content)
 
@@ -295,7 +299,10 @@ class StagingClient(PluginClient):
             log.info("[staging] Created local parent directories: %s", parent)
 
         # Decode and write content
-        content = base64.b64decode(data['content'])
+        try:
+            content = base64.b64decode(data['content'])
+        except binascii.Error as e:
+            raise ValueError(f"invalid base64 in server response: {e}") from e
         with open(tgt, 'wb') as f:
             f.write(content)
 
@@ -345,7 +352,7 @@ class PluginStaging(Plugin):
     Provides file transfer between client and edge filesystems.
     Supports put (upload) and get (download) operations.
     Parent directories are created automatically.
-    Never overwrites existing files.
+    Existing files are protected by default (overwrite=False).
     """
 
     plugin_name   = "staging"

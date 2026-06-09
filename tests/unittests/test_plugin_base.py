@@ -21,6 +21,23 @@ import time
 import pytest
 
 
+def test_plugin_init_subclass_collision(caplog):
+    '''
+    Test that duplicate plugin names emit a warning during subclassing.
+    '''
+    import logging
+    with caplog.at_level(logging.WARNING, logger="radical.edge"):
+        class CollidingPluginA(Plugin):
+            plugin_name = "collide"
+            session_class = PluginSession
+
+        class CollidingPluginB(Plugin):
+            plugin_name = "collide"
+            session_class = PluginSession
+
+    assert "Duplicate plugin_name 'collide' - overwriting" in caplog.text
+
+
 def test_plugin_initialization():
     '''
     Test that Plugin initializes correctly with app and name.

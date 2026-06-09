@@ -118,10 +118,18 @@ The Bridge acts as a public-facing reverse proxy that:
 
 # LUCID needs credentials; browsers reject credentials + wildcard origin,
 # so we must list allowed origins explicitly.
+origins = [
+    "http://localhost",
+    "http://localhost:8080",
+    "https://localhost",
+    "https://localhost:8080",
+    "https://dev-1.bv-brc.org",
+]
+
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=["https://dev-1.bv-brc.org"],
+    allow_origins=origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
