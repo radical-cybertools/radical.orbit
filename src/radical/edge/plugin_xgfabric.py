@@ -29,6 +29,7 @@ import httpx
 
 from fastapi import FastAPI, HTTPException, Request
 
+from .http_utils import make_async_http_client
 from .plugin_session_base import PluginSession
 from .plugin_base import Plugin
 from .client import PluginClient
@@ -178,7 +179,7 @@ class XGFabricSession(PluginSession):
         self._edge_name = edge_name or 'local'
         self._bridge_url = bridge_url
         self._bridge_cert = bridge_cert
-        self._http        = httpx.AsyncClient(verify=self._verify())
+        self._http        = make_async_http_client(verify=self._verify())
         self._connected_edges: Dict[str, Any] = {}  # Cached connected edges
         self._current_config: Optional[WorkflowConfig] = None
         self._current_resource_config: Optional[ResourceConfig] = None

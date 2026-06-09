@@ -678,27 +678,36 @@ class EdgeService(PluginHostBase):
                  port, self._bridge_url)
 
     async def _open_tunnel_reverse(self,
-                                    wait_timeout: float = 300.0) -> None:
+                                    wait_timeout: float = 15.0) -> None:
         """Reverse mode: wait for a login-side spawner to open ``ssh -R``
         and write the rendezvous file.
 
-        Two flows produce that file today:
+        We always drop a ``<edge_name>.req`` JSON file first with our
+        ``socket.gethostname()`` (the compute node SLURM placed us on)
+        and the bridge target.  Two flows consume it:
 
         * **PsiJ-launched** — the parent edge's ``plugin_psij`` watcher
-          discovers our compute hostname via ``BatchSystem.job_nodes``,
-          spawns ``ssh -R``, writes ``<edge_name>.port``.
+          reads ``.req`` to discover which compute node to ssh into,
+          spawns ``ssh -R``, writes ``<edge_name>.port``.  Gating the
+          spawn on ``.req`` (rather than on SLURM's RUNNING transition)
+          avoids picking a wrong host on multi-node allocations where
+          the script's node != ``scheduler.job_nodes()[0]``.
 
-        * **IRI-launched** — there is no parent edge on the login node,
-          so we drop a ``<edge_name>.req`` JSON sibling here with our
-          compute hostname + bridge target.  A standalone shell helper
-          (``bin/radical-edge-iri-tunnel-helper.sh``) running on the
-          login node watches the directory for ``.req`` files and does
-          the spawn+write.  PsiJ flows ignore the ``.req``.
+        * **IRI-launched** — no parent edge on the login node; a
+          standalone helper (``bin/radical-edge-iri-tunnel-helper.sh``)
+          watches the relay dir for ``.req`` files and does the
+          spawn+write.
 
-        Either way we just poll for ``<edge_name>.port`` and rewrite
+        Either way we poll for ``<edge_name>.port`` and rewrite
         ``self._bridge_url`` to ``localhost:<port>`` once it appears.
+
+        ``wait_timeout`` is the ssh-handshake budget after ``.req`` has
+        been written — short on purpose, because Dragon startup is
+        already past us by this point.  Tunnel setup is much more
+        predictable than the work that got the child to this line.
         """
         import json
+        import os
         import socket
         from urllib.parse import urlparse, urlunparse
         from . import tunnel as _tunnel
@@ -730,7 +739,20 @@ class EdgeService(PluginHostBase):
 
         deadline = asyncio.get_running_loop().time() + wait_timeout
         while asyncio.get_running_loop().time() < deadline:
-            if relay_file.exists():
+            # NFSv3 negative-lookup cache hides the parent's freshly-
+            # written .port file from our `relay_file.exists()` checks
+            # for tens of seconds.  An os.listdir on the parent dir
+            # triggers a readdir RPC which forces fresh directory
+            # attributes; on Linux NFS clients this invalidates the
+            # cached ENOENT, so we see the parent's write within one
+            # polling iteration (2s) instead of waiting for the
+            # client's acregmin (30-60s) to expire.  Same trick is
+            # applied parent-side for .req — see plugin_psij.py.
+            try:
+                dir_contents = set(os.listdir(str(relay_file.parent)))
+            except OSError:
+                dir_contents = set()
+            if relay_file.name in dir_contents:
                 try:
                     port = int(relay_file.read_text().strip())
                 except (ValueError, OSError):

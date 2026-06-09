@@ -178,19 +178,13 @@ class PSIJSession(PluginSession):
                 spec.attributes.account = attribs.get("account")
                 spec.attributes.reservation_id = attribs.get("reservation_id")
 
-            # ``node_count`` belongs on PsiJ's ResourceSpec, not on
-            # JobAttributes -- the slurm template renders --nodes from
-            # ``{{computed_node_count}}`` which is derived from
-            # ``ResourceSpecV1.node_count``.  We pass node_count alone
-            # and let PsiJ default ``processes_per_node = 1`` → one
-            # wrapper process per node (matches what the edge wrapper
-            # does).  Sending an explicit process_count=1 alongside
-            # would trip _check_constraints (1 process across N nodes
-            # is not an integer division).
+            # Resource spec: pass any ``ResourceSpecV1`` field through
+            # verbatim (``node_count``, ``exclusive_node_use``, etc).
+            # An unknown key here raises TypeError -- caller bug, not
+            # something to silently swallow.
             res = job_spec_dict.get('resources') or {}
-            node_count = res.get('node_count')
-            if node_count:
-                spec.resources = psij.ResourceSpecV1(node_count=int(node_count))
+            if res:
+                spec.resources = psij.ResourceSpecV1(**res)
 
             # Merge site defaults for PSIJ custom_attributes with the
             # caller's (caller wins on conflict).  Defaults come from the
@@ -848,6 +842,8 @@ class PluginPSIJ(Plugin):
             relay_file.unlink(missing_ok=True)  # remove stale file from previous run
             pid_file = _relay_dir() / f'{edge_name}.pid'
             pid_file.unlink(missing_ok=True)
+            req_file = _relay_dir() / f'{edge_name}.req'
+            req_file.unlink(missing_ok=True)
 
             if '--tunnel' not in args:
                 args.extend(['--tunnel', tunnel])
@@ -965,7 +961,7 @@ class PluginPSIJ(Plugin):
             mode:       ``'forward'`` or ``'reverse'``.  ``'none'``
                         callers don't reach here.
         """
-        from .batch_system import (detect_batch_system, STATE_RUNNING,
+        from .batch_system import (detect_batch_system, STATE_CANCELLED,
                                    STATE_UNKNOWN, TERMINAL_STATES)
         from . import tunnel as _tunnel
         batch = detect_batch_system()
@@ -1015,27 +1011,99 @@ class PluginPSIJ(Plugin):
                 # the job has been allocated a compute host.
                 state = await asyncio.to_thread(batch.job_state, native_id)
 
-                if mode == 'reverse' and ssh_proc is None and \
-                        state == STATE_RUNNING:
-                    nodes = await asyncio.to_thread(batch.job_nodes, native_id)
-                    if not nodes:
-                        # RUNNING but exec_host not yet visible — try again
-                        # next poll.
-                        continue
-                    compute_host = nodes[0]
-                    log.info("[psij] reverse: job %s RUNNING on %s, spawning "
-                             "ssh -R to %s:%s",
-                             native_id, compute_host, bridge_host, bridge_port)
+                # Reverse-mode spawn: gate on the child's .req file
+                # ONLY.  We deliberately do NOT require state ==
+                # RUNNING: SLURM state polling is unreliable on some
+                # clusters (squeue can return UNKNOWN/empty for the
+                # entire lifetime of a short job; observed on ODO
+                # 2026-05-11) and is a stale-at-best proxy for
+                # "child is ready".  The .req file is authoritative
+                # — it can only have been produced by the running
+                # child, on its own compute node, after
+                # socket.gethostname() returned.  State polling
+                # below still aborts the watcher when the job
+                # reaches a TERMINAL state without producing .req.
+                if mode == 'reverse' and ssh_proc is None:
+                    req_file = relay_file.with_suffix('.req')
+                    # NFSv3 caches negative lookups (file-doesn't-exist)
+                    # for tens of seconds.  After the parent's first
+                    # `req_file.exists()` returns False, the cached
+                    # ENOENT keeps returning False even after the
+                    # child writes .req on the shared FS — observed
+                    # on ODO 2026-05-11 17:10: .req appeared at +21s,
+                    # parent kept seeing False for the whole 16s
+                    # window the file was on disk.  A readdir on the
+                    # parent dir invalidates the negative-lookup
+                    # cache by forcing fresh directory attributes.
                     try:
-                        ssh_proc, port = await asyncio.to_thread(
-                            _tunnel.spawn_reverse_tunnel,
-                            compute_host, bridge_host, bridge_port, edge_name)
-                    except Exception as exc:
-                        await self._fail_tunnel(
-                            edge_name, job_id, native_id,
-                            f"reverse SSH spawn failed: {exc}")
-                        return
-                    self._tunnel_procs[edge_name] = ssh_proc
+                        dir_contents = set(
+                            os.listdir(str(req_file.parent)))
+                    except OSError:
+                        dir_contents = set()
+                    if req_file.name in dir_contents:
+                        try:
+                            import json as _json
+                            compute_host = _json.loads(
+                                req_file.read_text()).get('hostname')
+                        except (ValueError, OSError) as exc:
+                            await self._fail_tunnel(
+                                edge_name, job_id, native_id,
+                                f"reverse SSH: .req file unreadable: {exc}")
+                            return
+                        if not compute_host:
+                            await self._fail_tunnel(
+                                edge_name, job_id, native_id,
+                                "reverse SSH: .req file has no 'hostname' field")
+                            return
+                        log.info("[psij] reverse: child .req says hostname=%s "
+                                 "for job %s, spawning ssh -R to %s:%s",
+                                 compute_host, native_id, bridge_host, bridge_port)
+                        # Retry the spawn for up to ~30s.  Some
+                        # sites' compute-node sshd refuses logins
+                        # from the login node for a short window
+                        # after the job is registered (e.g.
+                        # pam_slurm_adopt rejects until the job's
+                        # cgroup is fully established).  The retry
+                        # is transport-agnostic: any spawn failure
+                        # gets a fresh attempt 1s later.  Bail out
+                        # immediately if the job goes terminal in
+                        # the meantime — no point retrying once the
+                        # allocation is gone.
+                        last_exc = None
+                        for spawn_attempt in range(30):
+                            try:
+                                ssh_proc, port = await asyncio.to_thread(
+                                    _tunnel.spawn_reverse_tunnel,
+                                    compute_host, bridge_host, bridge_port,
+                                    edge_name)
+                                break
+                            except Exception as exc:
+                                last_exc = exc
+                                if (await asyncio.to_thread(
+                                        batch.job_state, native_id)
+                                        in TERMINAL_STATES):
+                                    await self._fail_tunnel(
+                                        edge_name, job_id, native_id,
+                                        f"reverse SSH spawn failed and job "
+                                        f"went terminal: {exc}")
+                                    return
+                                if spawn_attempt == 0:
+                                    log.info("[psij] reverse: first ssh -R "
+                                             "spawn rejected (likely "
+                                             "pam_slurm_adopt race), "
+                                             "retrying: %s", exc)
+                                else:
+                                    log.debug("[psij] reverse: ssh -R spawn "
+                                              "retry %d/30: %s",
+                                              spawn_attempt + 1, exc)
+                                await asyncio.sleep(1)
+                        else:
+                            await self._fail_tunnel(
+                                edge_name, job_id, native_id,
+                                f"reverse SSH spawn failed after 30 "
+                                f"attempts: {last_exc}")
+                            return
+                        self._tunnel_procs[edge_name] = ssh_proc
 
                 if state == STATE_UNKNOWN:
                     unknown_streak += 1
@@ -1061,6 +1129,17 @@ class PluginPSIJ(Plugin):
                             edge_name, job_id, native_id,
                             f"reverse SSH spawned but rendezvous file never "
                             f"appeared (job {state})", spawn_proc=ssh_proc)
+                    elif mode == 'reverse' and state != STATE_CANCELLED:
+                        # Job hit a terminal state before the child
+                        # could write .req — surface that as a tunnel
+                        # failure so the client gets a clear error.
+                        # CANCELLED is left alone: that's a deliberate
+                        # operator-initiated outcome and shouldn't be
+                        # converted to FAILED via _fail_tunnel.
+                        await self._fail_tunnel(
+                            edge_name, job_id, native_id,
+                            f"child never wrote .req (job ended {state} "
+                            f"before reverse tunnel could be set up)")
                     return
 
                 if seen_known and unknown_streak >= UNKNOWN_TOLERANCE:
@@ -1114,6 +1193,7 @@ class PluginPSIJ(Plugin):
         finally:
             _tunnel.cleanup_tunnel(ssh_proc, edge_name)
             self._tunnel_procs.pop(edge_name, None)
+            (_relay_dir() / f'{edge_name}.req').unlink(missing_ok=True)
 
     async def _fail_tunnel(self, edge_name: str, job_id: 'str | None',
                             native_id, reason: str, spawn_proc=None) -> None:
@@ -1131,6 +1211,13 @@ class PluginPSIJ(Plugin):
         if spawn_proc is not None:
             _tunnel.cleanup_tunnel(spawn_proc, edge_name)
             self._tunnel_procs.pop(edge_name, None)
+        # Clean up the child's .req rendezvous file on every failure
+        # path, not just when an ssh proc was spawned.  Otherwise an
+        # UNKNOWN-streak / terminal-state abort that fires before we
+        # ever entered the spawn branch leaves stale .req on disk,
+        # which the next watcher run might pick up after submit-time
+        # cleanup if the user re-submits very quickly.
+        (_relay_dir() / f'{edge_name}.req').unlink(missing_ok=True)
         if job_id is not None:
             try:
                 # Use the underlying PSIJSession.cancel_job to release the
@@ -1166,6 +1253,7 @@ class PluginPSIJ(Plugin):
         self._watchers.clear()
         for edge_name, proc in list(self._tunnel_procs.items()):
             _tunnel.cleanup_tunnel(proc, edge_name)
+            (_relay_dir() / f'{edge_name}.req').unlink(missing_ok=True)
         self._tunnel_procs.clear()
 
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ROSE active learning across heterogeneous edge endpoints — interactive demo.
+Rhapsody workload across heterogeneous edge endpoints — single-target runner.
 
 Architecture
 ============
@@ -14,28 +14,36 @@ Architecture
    ╚══════════╝      ├── new edge ★          (spawned via IRI)
                      └── new edge ★          (spawned via PsiJ ↦ submit_tunneled)
 
-What this script does
----------------------
-1. Asks you which targets to use.  Targets come from two pools:
-     - edges already connected to the bridge (login-node or compute-node);
-     - IRI endpoints (NERSC, OLCF) you can reach with a bearer token.
+Usage
+-----
+::
 
-2. For each target, asks you the per-target details (queue, account,
-   walltime, …).  Defaults are best-guesses — correct them at the prompt.
+    python examples/amsc.py [<kind>:<name>] [horizontal|vertical] [<n_nodes>]
 
-3. Submits the launch jobs (or reuses ready edges).  Then waits for the
-   *first* edge to come up.
+Where ``<kind>`` is one of ``psij``, ``iri``, or ``compute``, and ``<name>``
+selects an entry in ``MACHINE_DEFAULTS`` (psij / compute) or
+``IRI_DEFAULTS`` (iri).  The optional second / third arguments override
+the slicing mode and the allocation size declared in the matching
+``*_DEFAULTS`` entry; they can appear in any order (dispatched by
+content).  Examples::
 
-4. Runs a small ROSE active-learning workflow on the first-up edge.
+    python examples/amsc.py psij:perlmutter
+    python examples/amsc.py psij:perlmutter horizontal 16
+    python examples/amsc.py psij:perlmutter vertical 8
+    python examples/amsc.py psij:thinkie
+    python examples/amsc.py iri:olcf
+    python examples/amsc.py compute:thinkie
 
-5. Tears down anything this script created.  Pre-existing edges and any
-   stragglers from our submission set are left alone — the demo keeps
-   the cleanup logic simple by design.
+With no arguments the script defaults to ``psij:perlmutter`` and the
+slicing / node-count from ``MACHINE_DEFAULTS``.
+
+The run is non-interactive: defaults are taken verbatim from the
+matching ``*_DEFAULTS`` entry, and a 7-step coloured trace is emitted
+(connect → pick → configure → submit → await → run → teardown).
 
 Prerequisites on every target machine
 -------------------------------------
 - A radical.edge install with Rhapsody and Dragon at: ``~/.amsc/ve``
-- The bridge's TLS certificate at:                    ``~/.amsc/radical.edge.cert``
 - A login host reachable from the compute node (used for ``--tunnel``)
 
 Tokens
@@ -48,10 +56,6 @@ IRI bearer tokens are read locally and live at::
 The script reads them from disk and sends them to the bridge once at
 ``iri_connect.connect()`` time.  The bridge holds them in process memory
 only — they are never written to disk on the bridge side.
-
-Run::
-
-    python examples/amsc.py
 """
 
 import asyncio
@@ -59,26 +63,20 @@ import logging
 import os
 import sys
 import time
-import uuid
 
 from collections import defaultdict
 
 from pathlib import Path
 
-import numpy as np
-
-# RADICAL Edge client + ROSE / Rhapsody bits
+# RADICAL Edge client + Rhapsody bits
 from radical.edge.client import BridgeClient
 
 import rhapsody
-from radical.asyncflow      import WorkflowEngine
-from rose.al.active_learner import SequentialActiveLearner
-from rose.metrics           import MEAN_SQUARED_ERROR_MSE
 
-# Note: sklearn / mpi4py / dragon are NOT imported at module level.
-# They are imported inside the task bodies below, so they only have to
-# be installed on the HPC side (where the tasks actually execute), not
-# on the client where this script is launched from.
+# Note: dragon / cloudpickle are NOT imported at module level.  They
+# are imported inside submit_rhapsody_workload so they only have to be
+# installed on the HPC side (where the tasks actually execute), not on
+# the client where this script is launched from.
 
 # Quiet logging: this is a demo, the print() lines tell the story.
 rhapsody.enable_logging(level=logging.WARNING)
@@ -88,29 +86,35 @@ rhapsody.enable_logging(level=logging.WARNING)
 #  Workflow knobs — edit to taste.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Which workload to run once the first edge is up.  Toggle freely:
-#   'rose'     — active-learning loop (run_rose_workflow).
-#   'rhapsody' — N matey-inference tasks via rhapsody (submit_rhapsody_workload).
-WORKLOAD           = 'rhapsody'
-
-# Demo mode: skip target discovery / configure prompts, auto-pick the
-# perlmutter PsiJ path with MACHINE_DEFAULTS values, emit a coarse
-# 7-step trace.  Set False to restore the original interactive flow.
-DEMO_MODE          = True
 N_NODES            = 16
+N_GENERATIONS      = 1   # uniform scaling factor across all task kinds
 
-# ROSE active-learning shape (mirrors examples/example_rose.py).
-N_MPI_RANKS        = 4      # MPI ranks per simulation launch
-N_SAMPLES_PER_RANK = 5      # sparse start; AL drives exploration
-N_QUERY            = 8      # query points selected per AL step
-MSE_THRESHOLD      = 0.01   # convergence target
-MAX_ITER           = 15     # hard cap on AL iterations
-
-# Rhapsody-direct workload shape (mirrors examples/run_matey.py).
-N_MATEY_TASKS        = N_NODES * 10        # GPU-bound matey inference tasks
-N_GKEYLL_TASKS       = N_NODES * 128 * 3   # CPU-bound gkeyll training tasks
+# Rhapsody workload shape (mirrors examples/run_matey.py).
+N_MATEY_TASKS        = N_NODES *  4 *  3 * N_GENERATIONS
+N_INFER_TASKS        = N_NODES *  1 *  0 * N_GENERATIONS
+N_GKEYLL_TASKS       = N_NODES * 16 *  0 * N_GENERATIONS
 MATEY_WRAPPER_NAME   = 'matey_wrapper.sh'
+INFER_WRAPPER_NAME   = 'matey_wrapper.sh'
 RHAPSODY_WORK_SUBDIR = 'rhapsody-runs'
+
+# Per-task-kind spec consumed by ``submit_rhapsody_workload``.  Each entry
+# is a tuple ``(name, n_tasks, required_app_paths, default_template)``:
+#
+#   - name                 : kind label; also the prefix on ``app_cfg`` keys
+#                            (``<name>_dir`` for cwd, ``<name>_executable`` /
+#                            ``<name>_arguments`` for overrides).
+#   - n_tasks              : how many tasks of this kind to submit.
+#   - required_app_paths   : ``app_cfg`` keys that must exist when no
+#                            ``<name>_executable`` override is set.
+#   - default_template     : ``'matey'`` / ``'infer'`` (each builds its own
+#                            basic_infer.py argv -- currently identical but
+#                            kept separate so they can diverge) or ``'gkeyll'``
+#                            (single exe, no args).
+KINDS = [
+    ('matey',  N_MATEY_TASKS,  ('matey_model_dir', 'matey_xgc_dir'), 'matey'),
+    ('infer',  N_INFER_TASKS,  ('infer_model_dir', 'infer_xgc_dir'), 'infer'),
+    ('gkeyll', N_GKEYLL_TASKS, ('gkeyll_exe',                     ), 'gkeyll'),
+]
 
 # How long we are willing to wait for the first edge to come up.
 EDGE_WAIT_SECONDS  = 30 * 60
@@ -119,14 +123,61 @@ COUNTERS = defaultdict(int)  # for unique edge names per submission endpoint
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Resource slicing — machine-independent.
+#
+#  Carves the edge's allocation into per-kind pools.  Two shapes; switch
+#  by commenting out one block and uncommenting the other.
+#
+#  - horizontal: every kind shares all nodes.  ``per_node`` is how many
+#    devices (gpu or cpu) on each node that kind owns; affinity offsets
+#    stack per device class so kinds don't collide.  Use ``'rest'`` to
+#    claim whatever's left on a device after the other kinds.
+#
+#  - vertical: kinds get disjoint node subsets, sized by ``weight``.
+#    Each kind uses its declared device class at full per-node capacity
+#    on its own nodes.
+#
+#  ``device`` is the device class that kind binds to (``'gpu'`` →
+#  ``gpu_affinity``, ``'cpu'`` → ``cpu_affinity``).  Different machines
+#  can flip the mapping (matey on cpu, gkeyll on gpu, …) by editing
+#  this block; per-machine MACHINE_DEFAULTS / IRI_DEFAULTS only carry
+#  the device totals (gpus_per_node, cores_per_node).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# --- shape A: horizontal (per-node device counts) ---------------------------
+SLICING = {
+    'mode': 'horizontal',
+    'kinds': {
+        'matey':  {'device': 'gpu', 'per_node': 4},
+        'infer':  {'device': 'gpu', 'per_node': 0},
+        'gkeyll': {'device': 'cpu', 'per_node': 0},
+    },
+}
+
+# --- shape B: vertical (whole-node weights) ---------------------------------
+# Each kind owns its node subset fully on CPU (gpu unused in this mode).
+# Selected via the CLI ``vertical`` override (see ``main`` /
+# ``_apply_cli_overrides``); ``n_nodes`` must be a multiple of
+# sum(weights) so every kind ends up with whole, non-zero node count.
+VERTICAL_SLICING = {
+    'mode': 'vertical',
+    'kinds': {
+        'matey':  {'device': 'gpu', 'weight': 3},
+        'infer':  {'device': 'gpu', 'weight': 1},
+        'gkeyll': {'device': 'cpu', 'weight': 4},
+    },
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Per-IRI-endpoint defaults.
-#  Best-guesses — correct any field below to match your account / project.
-#  Anything you set to ``None`` will be asked for at runtime.
+#  Best-guesses — edit any field below to match your account / project.
+#  Selected by ``iri:<endpoint>`` on the command line; values are taken
+#  verbatim, no prompts.
 # ─────────────────────────────────────────────────────────────────────────────
 
 IRI_DEFAULTS = {
     'nersc': {
-        'enabled'     : True,
         'iri_url'     : 'https://api.iri.nersc.gov',
         'resource_id' : 'perlmutter',
         'login_host'  : 'perlmutter.nersc.gov',
@@ -148,8 +199,8 @@ IRI_DEFAULTS = {
             'module load openmpi',
         ],
         # ``app`` carries workload-specific paths consumed by
-        # submit_rhapsody_workload (matey + gkeyll).  ``None`` means
-        # "this target does not support the rhapsody workload".
+        # submit_rhapsody_workload (matey + infer + gkeyll).  ``None``
+        # means "this target does not support the rhapsody workload".
         'app'         : {
             'matey_dir'      : '/global/u2/m/merzky/MATEY',
             'matey_model_dir': '/global/cfs/projectdirs/amsc007/zhan1668/MATEY'
@@ -157,12 +208,17 @@ IRI_DEFAULTS = {
                                '/demo_nbatchsloc100/',
             'matey_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
                                '/d3d_174310.03500/',
-            'gkeyll_dir'     : '/global/u2/m/merzky/gkeyll/amsc',
-            'gkeyll_exe'     : 'rt_gk_d3d_iwl_2x2v_p1.sh',
+            'infer_dir'      : '/global/u2/m/merzky/MATEY',
+            'infer_model_dir': '/global/cfs/projectdirs/amsc007/zhan1668/MATEY'
+                               '/models/Dev_Fusion_DemoMay_toytestonly'
+                               '/demo_nbatchsloc100/',
+            'infer_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
+                               '/d3d_174310.03500/',
+            'gkeyll_dir'     : '/global/u2/m/merzky/tcv',
+            'gkeyll_exe'     : 'tcv',
         },
     },
     'olcf': {
-        'enabled'     : True,
         'iri_url'     : 'https://amsc-open.s3m.olcf.ornl.gov',
         'resource_id' : 'odo',
         'login_host'  : 'login1.frontier.olcf.ornl.gov',
@@ -180,7 +236,6 @@ IRI_DEFAULTS = {
         'constraint'  : None,
         'reservation' : None,
         'environment' : {},
-        'setup'       : None,
         'setup'       : ['module load cray-python/3.11.7',
                         ],
         'app'         : None,
@@ -189,17 +244,15 @@ IRI_DEFAULTS = {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Per-machine defaults for PsiJ submission via existing edges, plus the
-#  ``enabled`` flag for compute / standalone edges.
-#
-#  Keys are edge names (as reported by ``bc.list_edges()``).  Anything not
-#  in this dict is treated as ``enabled=True`` with no per-host pre-fills
-#  — the prompts use their hard-coded fallback values.
+#  Per-machine defaults.  Keyed by edge name (as reported by
+#  ``bc.list_edges()``).  Used by ``psij:<name>`` (queue / account /
+#  walltime / tunnel for submitting a child edge) and by ``compute:<name>``
+#  (only the ``app`` block + ``gpus_per_node`` / ``cores_per_node`` are
+#  read in that path).  Values are taken verbatim — no prompts.
 # ─────────────────────────────────────────────────────────────────────────────
 
 MACHINE_DEFAULTS = {
     'aurora': {
-        'enabled'     : True,
         'account'     : 'Fusion-FM',
         'queue_name'  : 'debug',
         'qos'         : None,
@@ -214,7 +267,6 @@ MACHINE_DEFAULTS = {
         'app'         : None,
     },
     'perlmutter': {
-        'enabled'     : True,
         'account'     : 'amsc007_g',
         'queue_name'  : None,                    # 'gpu_ss11',
         'qos'         : 'express_amsc',
@@ -235,12 +287,17 @@ MACHINE_DEFAULTS = {
                                '/demo_nbatchsloc100/',
             'matey_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
                                '/d3d_174310.03500/',
-            'gkeyll_dir'     : '/global/u2/m/merzky/gkeyll/amsc',
-            'gkeyll_exe'     : 'rt_gk_d3d_iwl_2x2v_p1.sh',
+            'infer_dir'      : '/global/u2/m/merzky/MATEY',
+            'infer_model_dir': '/global/cfs/projectdirs/amsc007/zhan1668/MATEY'
+                               '/models/Dev_Fusion_DemoMay_toytestonly'
+                               '/demo_nbatchsloc100/',
+            'infer_xgc_dir'  : '/global/cfs/cdirs/amsc007/data/xgc'
+                               '/d3d_174310.03500/',
+            'gkeyll_dir'     : '/global/u2/m/merzky/tcv',
+            'gkeyll_exe'     : 'tcv',
         },
     },
     'odo': {
-        'enabled'     : True,
         'account'     : 'fus183',
         'queue_name'  : 'batch',
         'qos'         : None,
@@ -260,10 +317,45 @@ MACHINE_DEFAULTS = {
         'app'         : None,
     },
     'thinkie': {
-        'enabled'     : False,
-        'amsc_dir'    : None,
-        'setup'       : None,
-        'app'         : None,
+        'account'      : None,
+        'queue_name'   : None,
+        'qos'          : None,
+        'walltime_min' : 30,
+        'n_nodes'      : 1,
+        'gpus_per_node': 1,
+        'cores_per_node': 20,
+        'constraint'   : None,
+        'tunnel'       : 'none',
+        'amsc_dir'     : None,
+        'setup'        : None,
+        # Per-machine slicing override (consumed by submit_rhapsody_workload
+        # in place of the module-level ``SLICING``).  thinkie has a single
+        # GPU and can't host the default 4-GPU-per-node horizontal split,
+        # so everything runs on CPU here: matey/infer each take 1 core,
+        # gkeyll takes the remaining 18.
+        'slicing'      : {
+            'mode': 'horizontal',
+            'kinds': {
+                'matey':  {'device': 'cpu', 'per_node': 1},
+                'infer':  {'device': 'cpu', 'per_node': 1},
+                'gkeyll': {'device': 'cpu', 'per_node': 'rest'},
+            },
+        },
+        # Stand-in workloads via /bin/sleep so thinkie can drive the
+        # whole pipeline without the real matey / gkeyll binaries.  The
+        # ``<kind>_dir`` is just the cwd; ``<kind>_executable`` /
+        # ``<kind>_arguments`` override the kind-specific arg builder.
+        'app'          : {
+            'matey_dir'        : '/tmp',
+            'matey_executable' : '/bin/sleep',
+            'matey_arguments'  : ['0.1'],
+            'infer_dir'        : '/tmp',
+            'infer_executable' : '/bin/sleep',
+            'infer_arguments'  : ['0.2'],
+            'gkeyll_dir'       : '/tmp',
+            'gkeyll_executable': '/bin/sleep',
+            'gkeyll_arguments' : ['0.3'],
+        },
     },
 }
 
@@ -294,36 +386,66 @@ AMSC_DIR = Path(os.environ.get('AMSC_DIR') or Path.home() / '.amsc').expanduser(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Demo-mode output helpers.
+#  Output helpers.
 #
 #  ``step()`` prints one aligned, coloured line per coarse phase via rich.
 #  ``abort()`` prints a red ABORT line and exits non-zero — used at every
-#  fail-fast boundary in the demo flow (no Python traceback noise).
-#  ``say()`` is a print() proxy that no-ops in demo mode so chatty diagnostic
-#  lines from the underlying functions don't dilute the step trace.  In
-#  interactive mode it is plain print().
+#  fail-fast boundary so the user sees a clean error instead of a traceback.
 # ─────────────────────────────────────────────────────────────────────────────
 
 try:
     from rich.console  import Console
-    from rich.progress import (BarColumn, Progress, TaskProgressColumn,
-                               TextColumn)
+    from rich.progress import Progress, ProgressColumn, TextColumn
+    from rich.text     import Text
     _console = Console()
+
+    class _TwoBars(ProgressColumn):
+        """Two side-by-side full-cell bars (blue submitted, green done).
+
+        Both bars are ``bar_width`` cells wide.  Uses ``█`` (FULL BLOCK)
+        for filled and ``░`` (LIGHT SHADE) for empty so the bars visually
+        have the height of an uppercase character.  Reads custom task
+        fields ``submitted`` and ``done`` (both seeded via ``add_task``).
+        """
+
+        def __init__(self, bar_width=20):
+            super().__init__()
+            self.bar_width = bar_width
+
+        def _bar(self, value, total, color):
+            n = int(self.bar_width * value / total) if total else 0
+            t = Text()
+            t.append('█' * n,                    style=color)
+            t.append('░' * (self.bar_width - n), style='bar.back')
+            return t
+
+        def render(self, task):
+            total     = task.total or 0
+            submitted = task.fields.get('submitted', 0)
+            done      = task.fields.get('done',      0)
+            text = self._bar(submitted, total, 'blue')
+            text.append('  ')
+            text.append_text(self._bar(done, total, 'green'))
+            return text
+
 except ImportError:                              # pragma: no cover
-    _console  = None
-    Progress  = None
-    BarColumn = TaskProgressColumn = TextColumn = None
+    _console   = None
+    Progress   = None
+    TextColumn = None
+    _TwoBars   = None
 
 _TOTAL_STEPS = 7   # connect / pick / configure / submit / await / run / teardown
 
-def step(idx, label, detail=''):
+def step(idx, label, detail='', newline=True):
+    end = '\n' if newline else ''
     if _console:
         _console.print(
             f'[cyan]step {idx}/{_TOTAL_STEPS}[/cyan]  '
             f'[bold]{label:<20}[/bold]  '
-            f'[bright_white]{detail}[/bright_white]')
+            f'[bright_white]{detail}[/bright_white]',
+            end=end)
     else:
-        print(f'step {idx}/{_TOTAL_STEPS}  {label:<20}  {detail}')
+        print(f'step {idx}/{_TOTAL_STEPS}  {label:<20}  {detail}', end=end)
 
 def abort(msg):
     """Print a red ABORT line and exit with status 1.  No traceback."""
@@ -333,242 +455,65 @@ def abort(msg):
         print(f'ABORT  {msg}')
     sys.exit(1)
 
-def say(*args, **kwargs):
-    """Chatty print, suppressed in demo mode."""
-    if not DEMO_MODE:
-        print(*args, **kwargs)
 
-
-def _make_progress(n_matey, n_gkeyll):
+def _make_progress(n_matey, n_infer, n_gkeyll):
     """Build the rhapsody workload's progress display.
 
     Returns ``(progress, tids)`` where *progress* is a ``rich.Progress``
     (or ``None`` when rich is unavailable) and *tids* maps each active
-    kind to its task id.  Drive it with::
+    kind to its task id.  Each line shows two bars (blue=submitted,
+    green=done) plus a numeric trailer.  Drive it with::
 
         progress.update(tids[kind], advance=1,
-                        done=counts[kind]['done'],
-                        failed=counts[kind]['failed'])
+                        submitted=counts[kind]['submitted'],
+                        done     =counts[kind]['done'],
+                        failed   =counts[kind]['failed'])
     """
     if Progress is None or _console is None:
         return None, {}
 
     progress = Progress(
-        TextColumn("  [cyan]{task.fields[label]:<6s}[/cyan]"),
-        BarColumn(bar_width=20),
-        TaskProgressColumn(),
+        TextColumn("  [cyan]{task.fields[label]:<9s}[/cyan]"),
+        _TwoBars(bar_width=20),
         TextColumn(
-            "[bright_white]{task.fields[done]:>6d}[/bright_white] / "
-            "[bright_white]{task.total:>6d}[/bright_white] done, "
-            "[red]{task.fields[failed]:>6d}[/red] failed"),
+            "[blue]{task.fields[submitted]:>6d}[/blue] sub  "
+            "[green]{task.fields[done]:>6d}[/green] done  "
+            "[red]{task.fields[failed]:>6d}[/red] fail  / "
+            "[bright_white]{task.total:>6d}[/bright_white]"),
         console=_console,
     )
     tids = {}
-    for kind, n in (('matey', n_matey), ('gkeyll', n_gkeyll)):
+    for kind, n in (('gkeyll', n_gkeyll),
+                    ('matey',  n_matey),
+                    ('infer',  n_infer)):
         if n > 0:
             tids[kind] = progress.add_task('', total=n, label=kind,
-                                           done=0, failed=0)
+                                           submitted=0, done=0, failed=0)
     return progress, tids
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Tiny prompt helpers.
-#
-#  All user interaction goes through these four functions.  They use plain
-#  ``input()`` for now; swap them out for ``rich`` / ``questionary`` /
-#  ``prompt_toolkit`` later without touching the rest of the script.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def ask(prompt, default=None):
-    """Ask for a string, returning ``default`` when the user just hits Enter."""
-    suffix = f' [{default}]' if default is not None else ''
-    answer = input(f'{prompt}{suffix}: ').strip()
-    return answer or (default if default is not None else '')
-
-
-def ask_int(prompt, default):
-    """Ask for an integer, falling back to ``default`` on empty input."""
-    while True:
-        raw = ask(prompt, str(default))
-        try:               return int(raw)
-        except ValueError: print(f'  not an integer: {raw!r} — try again')
-
-
-def confirm(prompt, default=True):
-    """Yes/no confirmation; default applies on empty input."""
-    suffix = ' [Y/n]' if default else ' [y/N]'
-    while True:
-        answer = input(f'{prompt}{suffix}: ').strip().lower()
-        if not answer:           return default
-        if answer in ('y', 'yes'): return True
-        if answer in ('n', 'no'):  return False
-        print('  please answer y or n')
-
-
-_TUNNEL_MODES = ('none', 'forward', 'reverse')
-
-
-def _ask_tunnel(default):
-    """Prompt for an SSH tunnel mode, validating against the allowed values."""
-    if default not in _TUNNEL_MODES:
-        default = 'forward'
-    while True:
-        raw = ask('  ssh tunnel direction (none/forward/reverse)', default)
-        if raw in _TUNNEL_MODES:
-            return raw
-        print(f'  invalid: {raw!r} — pick one of {_TUNNEL_MODES}')
-
-
-def select_many(items, prompt):
-    """Numbered multi-select.  Returns the selected items in input order.
-
-    ``items`` is a list of (label, value) tuples.  Empty input selects
-    nothing; ``all`` selects everything.
-    """
-    if not items:
-        return []
-    print(f'\n{prompt}')
-    for i, (label, _) in enumerate(items, start=1):
-        print(f'  {i:2d}) {label}')
-    raw = ask('  enter numbers (e.g. "1 3 5"), "all", or empty for none', '')
-    if raw.lower() == 'all':
-        return [v for _, v in items]
-    picks = []
-    for tok in raw.split():
-        try:
-            idx = int(tok)
-        except ValueError:
-            print(f'  ignored non-numeric: {tok!r}')
-            continue
-        if 1 <= idx <= len(items): picks.append(items[idx - 1][1])
-        else:                      print(f'  ignored out-of-range: {idx}')
-    return picks
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Target discovery.
-#
-#  A "target" is a place we can either reuse or launch an edge service on.
-#  Three flavours:
-#
-#    - 'compute' : pre-existing edge already on a compute node — ready to run
-#    - 'login'   : pre-existing edge on a login node — we'll submit via PsiJ
-#    - 'iri'     : an IRI endpoint we'll connect to and submit a job through
-# ─────────────────────────────────────────────────────────────────────────────
-
-def discover_targets(bc):
-    """Return a list of ``(label, descriptor_dict)`` for every viable target.
-
-    The bridge itself appears in ``bc.list_edges()`` whenever it hosts plugins
-    (e.g. ``iri_connect``); we filter it out — the bridge is not a target.
-    """
-    targets = []
-
-    # 1. Existing edges
-    for name in bc.list_edges():
-        if name == 'bridge':
-            continue
-        if not MACHINE_DEFAULTS.get(name, {}).get('enabled', True):
-            print(f'  (skipped {name}: disabled in MACHINE_DEFAULTS)')
-            continue
-        edge    = bc.get_edge_client(name)
-        plugins = edge.list_plugins()
-
-        # We need rhapsody to run ROSE tasks (compute-node case) or psij
-        # plus an actual scheduler to submit a child edge (login-node case).
-        has_rhapsody = 'rhapsody' in plugins
-        has_psij     = 'psij'     in plugins
-
-        # Ask the edge what role / scheduler it thinks it has (added to
-        # plugin_sysinfo for exactly this).  Tolerate sysinfo absence.
-        try:
-            info      = edge.get_plugin('sysinfo').host_role()
-            role      = info.get('role',          'unknown')
-            scheduler = info.get('scheduler',     'none')
-            executor  = info.get('psij_executor', 'local')
-        except Exception:
-            role, scheduler, executor = 'unknown', 'none', 'local'
-
-        # Compute-mode targets — the edge can run ROSE tasks directly.
-        # That covers compute-node edges (inside an allocation) and
-        # standalone hosts (laptops / workstations); both load Rhapsody by
-        # default per the plugin matrix.
-        #
-        # Login-mode targets — the edge has a real batch scheduler and can
-        # submit a child edge via PsiJ.  ``executor`` came straight from
-        # sysinfo.host_role()['psij_executor'] so it matches what PsiJ
-        # expects (slurm / pbs / …) regardless of subclass naming.
-        if role in ('compute', 'standalone') and has_rhapsody:
-            targets.append((
-                f'[ready]    edge {name} ({role}, will run tasks here)',
-                {'kind': 'compute', 'edge_name': name}))
-        elif role == 'login' and has_psij:
-            targets.append((
-                f'[psij]     edge {name} (login node {scheduler}, '
-                f'will submit a child via PsiJ)',
-                {'kind'     : 'login',
-                 'edge_name': name,
-                 'executor' : executor}))
-        # else: not a viable target for AMSC (missing plugins, unknown role, …).
-
-    # 2. IRI endpoints.  iri_connect lives on the bridge.
-    try:
-        cx = bc.get_edge_client('bridge').get_plugin('iri_connect')
-        for ep_key, ep_info in cx.list_endpoints().items():
-            if not IRI_DEFAULTS.get(ep_key, {}).get('enabled', True):
-                print(f'  (skipped iri:{ep_key}: disabled in IRI_DEFAULTS)')
-                continue
-            note = ' (already connected)' if ep_info.get('connected') \
-                                          else ' (will submit a job)'
-            label = (f'[iri]      {ep_key} — IRI endpoint at '
-                     f'{ep_info["label"]}{note}')
-            targets.append((label, {'kind': 'iri', 'endpoint': ep_key}))
-    except Exception as exc:
-        print(f'  (iri_connect unavailable: {exc})')
-
-    return targets
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  IRI launch path.
 #
 #  Steps:
-#    1. Ask the user to confirm/override defaults for this endpoint.
-#    2. Read the bearer token from ~/.amsc/token_<endpoint>.
-#    3. iri_connect.connect(...) — creates a dynamic iri.<endpoint> plugin
+#    1. Read the bearer token from ~/.amsc/token_<endpoint>.
+#    2. iri_connect.connect(...) — creates a dynamic iri.<endpoint> plugin
 #       on the bridge and returns an IRIInstanceClient bound to it.
-#    4. Submit a job whose executable is radical-edge-wrapper.sh.  The job
+#    3. Submit a job whose executable is radical-edge-wrapper.sh.  The job
 #       will WS-connect back to the bridge; if --tunnel is set, the child
 #       opens an outbound SSH tunnel to ``login_host`` first.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def configure_iri(endpoint):
-    """Walk the user through the per-endpoint settings."""
-    d = dict(IRI_DEFAULTS[endpoint])  # local copy
-    print(f'\n— Configure IRI endpoint: {endpoint} —')
-    d['resource_id']  = ask     ('  resource id',          d['resource_id'])
-    d['account']      = ask     ('  account / project',    d['account']) or None
-    # OLCF rejects submissions without a top-level ``directory``; NERSC
-    # accepts an empty value.  Empty input means "do not send the field".
-    d['workdir']      = ask     ('  working directory (or empty)',
-                                  d['workdir'] or '') or None
-    d['home_dir']     = ask     ('  user $HOME on the target',
-                                  d.get('home_dir') or '') or None
-    d['queue_name']   = ask     ('  queue / partition',    d['queue_name'])
-    d['walltime_min'] = ask_int ('  walltime (minutes)',   d['walltime_min'])
-    d['n_nodes']      = ask_int ('  number of nodes',      d['n_nodes'])
-    d['constraint']   = ask     ('  constraint (or empty)', d['constraint'] or '') or None
-    d['reservation']  = ask     ('  reservation (or empty)', d['reservation'] or '') or None
-    d['login_host']   = ask     ('  login host (for --tunnel forward)',
-                                  d['login_host'])
-    d['tunnel']       = _ask_tunnel(d.get('tunnel'))
-    if not d['account']:
+def _validate_iri_cfg(endpoint, cfg):
+    """Sanity-check the IRI_DEFAULTS entry before we try to launch."""
+    if not cfg.get('account'):
         raise RuntimeError(f'IRI {endpoint}: account/project is required')
-    if not d['home_dir']:
+    if not cfg.get('home_dir'):
         raise RuntimeError(f'IRI {endpoint}: home_dir on target is required '
-                           f'(used to resolve <home>/{d.get("amsc_dir") or ".amsc"}'
+                           f'(used to resolve <home>/'
+                           f'{cfg.get("amsc_dir") or ".amsc"}'
                            f'/ve/bin/radical-edge-wrapper.sh)')
-    return d
 
 
 def read_token(endpoint):
@@ -671,50 +616,10 @@ def launch_iri(bc, endpoint, cfg, bridge_url):
 # ─────────────────────────────────────────────────────────────────────────────
 #  PsiJ launch path (existing login-node edges).
 #
-#  Steps:
-#    1. Ask the parent edge's queue_info plugin for default account / queue
-#       hints (when available) and let the user override.
-#    2. Build a minimal job spec; submit_tunneled adds --tunnel --tunnel-via
-#       automatically when ``tunnel=True``.
+#  ``cfg`` is a copy of ``MACHINE_DEFAULTS[edge_name]`` with ``executor``
+#  spliced in.  ``submit_tunneled`` adds --tunnel / --tunnel-via to the
+#  child argv automatically per ``cfg['tunnel']``.
 # ─────────────────────────────────────────────────────────────────────────────
-
-def configure_psij(edge_name, executor):
-    """Walk the user through the per-target settings for a login-node edge.
-
-    The PsiJ ``executor`` (slurm/pbs) was already detected from the
-    edge's sysinfo.host_role() during discovery and is passed in here.
-    Per-host pre-fills come from ``MACHINE_DEFAULTS`` when present.
-    """
-    d = MACHINE_DEFAULTS.get(edge_name, {})
-    print(f'\n— Configure PsiJ submission via edge: {edge_name} '
-          f'(executor: {executor}) —')
-
-    cfg = {
-        'executor'    : executor,
-        'queue_name'  : ask     ('  queue / partition',
-                                  d.get('queue_name', 'debug')),
-        'account'     : ask     ('  account / project',
-                                  d.get('account', '') or '') or None,
-        'walltime_min': ask_int ('  walltime (minutes)',
-                                  d.get('walltime_min', 30)),
-        'n_nodes'     : ask_int ('  number of nodes',
-                                  d.get('n_nodes', 1)),
-        'constraint'  : ask     ('  constraint (or empty)',
-                                  d.get('constraint') or '') or None,
-        'tunnel'      : _ask_tunnel(d.get('tunnel')),
-        # Carried verbatim from MACHINE_DEFAULTS — not prompted.
-        'amsc_dir'    : d.get('amsc_dir'),
-        'setup'       : list(d.get('setup') or []),
-        'gpus_per_node': d.get('gpus_per_node'),
-        'cores_per_node': d.get('cores_per_node'),
-        'qos'         : d.get('qos'),
-        'app'         : d.get('app'),
-    }
-    if not cfg['account']:
-        raise RuntimeError(f'edge {edge_name}: account/project is required')
-    return cfg
-
-
 def launch_psij(bc, edge_name, cfg, bridge_url):
     """Submit a child edge via the parent edge's PsiJ plugin."""
     edge = bc.get_edge_client(edge_name)
@@ -749,15 +654,6 @@ def launch_psij(bc, edge_name, cfg, bridge_url):
         custom_attrs[f'{cfg["executor"]}.gpus-per-node'] = str(cfg['gpus_per_node'])
     if cfg.get('qos'):
         custom_attrs[f'{cfg["executor"]}.qos'] = cfg['qos']
-    # ``--nodes=N`` is rendered by PsiJ from spec.resources (set in the
-    # job_spec below) -- a single occurrence avoids the duplicated
-    # ``--nodes`` lines SLURM appears to resolve first-wins on.  We
-    # override ``--ntasks`` here to flip PsiJ's derived
-    # ``process_count = node_count`` (16 tasks across 16 nodes) back
-    # to one wrapper on the head node; Dragon spawns the rest.  SLURM
-    # honours last-wins for ``--ntasks``, so this works.
-    custom_attrs[f'{cfg["executor"]}.ntasks'] = '1'
-
     # Cert is left to the child edge to resolve from
     # ``~/.radical/edge/bridge_cert.pem`` on the target (or via
     # $RADICAL_BRIDGE_CERT if explicitly set there).  Only the bridge
@@ -775,20 +671,20 @@ def launch_psij(bc, edge_name, cfg, bridge_url):
         'arguments'         : ['--name', child_name, '--url', bridge_url],
         'attributes'        : attrs,
         'custom_attributes' : custom_attrs,
-        # plugin_psij translates ``resources.node_count`` into
-        # ``ResourceSpecV1(node_count=N)``; PsiJ then renders
-        # ``--nodes=N`` (single occurrence) and derives
-        # ``--ntasks=N --ntasks-per-node=1``.  We flip --ntasks back to
-        # 1 via custom_attributes -- see the slurm.ntasks comment above.
-        'resources'         : {'node_count': cfg['n_nodes']},
+        # ``exclusive_node_use=True`` forces SLURM to allocate whole
+        # nodes regardless of the ``ntasks / ntasks-per-node`` arithmetic
+        # PsiJ derives from ``node_count``.  Without it, the trio
+        # (nodes=N, ntasks=N, ppn=1) is internally consistent but slurm
+        # site policy / job_submit hooks can collapse the allocation
+        # to the smallest node count that satisfies ntasks -- which is
+        # 1.  ``--exclusive`` short-circuits that.
+        'resources'         : {'node_count'        : cfg['n_nodes'],
+                               'exclusive_node_use': True},
         'environment'       : env,
     }
 
-    say(f'  submitting PsiJ job via {edge_name} (executor: {cfg["executor"]}, '
-        f'edge name: {child_name})…')
     res = psij.submit_tunneled(job_spec, executor=cfg['executor'],
                                tunnel=cfg['tunnel'])
-    say(f'  PsiJ job_id: {res["job_id"]}')
 
     return {
         'kind'       : 'psij',
@@ -808,313 +704,299 @@ def launch_psij(bc, edge_name, cfg, bridge_url):
 #  better than wiring up an SSE callback bridge to asyncio.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def wait_for_first_edge(bc, expected_names, timeout=EDGE_WAIT_SECONDS,
-                        poll=3.0, heartbeat=30.0):
-    """Block until any name in *expected_names* appears in ``bc.list_edges()``.
-
-    Returns the winning name, or raises TimeoutError after *timeout* seconds.
-    Prints a heartbeat at most every ``heartbeat`` seconds so we don't
-    spam the screen during long queue waits.
-    """
-    if not expected_names:
-        raise RuntimeError('no expected edges — nothing to wait for')
-
-    say(f'\n— Waiting for first edge to come up '
-        f'(any of: {", ".join(expected_names)}) —')
-    start_time = time.time()
-    last_beat  = start_time
-    while time.time() - start_time < timeout:
-        live = set(bc.list_edges())
-        for name in expected_names:
-            if name in live:
-                return name
-        time.sleep(poll)
-        if time.time() - last_beat >= heartbeat:
-            elapsed = int(time.time() - start_time)
-            say(f'  …{elapsed}s elapsed, {timeout - elapsed}s left')
-            last_beat = time.time()
-    raise TimeoutError(f'no edge appeared within {timeout}s; '
-                       f'expected one of {expected_names}')
+def _heartbeat_dot():
+    """Print a single dot to stdout; passed to ``bc.wait_for_edge`` so
+    a long queue wait shows visible progress without spamming the
+    screen."""
+    sys.stdout.write('.')
+    sys.stdout.flush()
 
 
-def _find_perlmutter_psij(bc):
-    """Locate a connected perlmutter login-edge with the PsiJ plugin.
-
-    Returns ``(edge_name, executor)`` or ``None``.  Used by demo mode to
-    auto-pick the only target it cares about, without going through the
-    interactive ``discover_targets`` / ``select_many`` flow.
-    """
-    if 'perlmutter' not in set(bc.list_edges()):
-        return None
-    edge    = bc.get_edge_client('perlmutter')
-    plugins = edge.list_plugins()
-    if 'psij' not in plugins:
-        return None
+def _wait_for_edge(bc, name):
+    """``bc.wait_for_edge`` wrapper that adds the demo's heartbeat-dot
+    progress UI and guarantees a trailing newline on either path."""
     try:
-        info     = edge.get_plugin('sysinfo').host_role()
-        executor = info.get('psij_executor', 'slurm')
-    except Exception:
-        executor = 'slurm'
-    return ('perlmutter', executor)
+        return bc.wait_for_edge([name], timeout=EDGE_WAIT_SECONDS,
+                                on_heartbeat=_heartbeat_dot)
+    finally:
+        sys.stdout.write('\n')
+        sys.stdout.flush()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  ROSE workflow body.  Mirrors examples/example_rose.py — only difference:
-#  it targets a specific edge_name passed in by the launcher.
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def run_rose_workflow(bridge_url, edge_name, cfg=None):
-    """Run the active-learning loop using the named edge as a Dragon backend.
-
-    *cfg* (the matched per-target config dict) is accepted for signature
-    parity with :func:`submit_rhapsody_workload` and currently unused.
-
-    Closure discipline (from example_rose.py): every task captures only
-    ``ddict_descriptor`` (a plain str) and re-derives the current iteration
-    from sentinel keys in the DDict — no live object references.
-    """
-    print(f'\n— Running ROSE on edge "{edge_name}" (bridge: {bridge_url}) —')
-
-    # 1. Engine + active learner
-    backend   = rhapsody.get_backend('edge', bridge_url=bridge_url,
-                                     edge_name=edge_name)
-    engine    = await backend
-    asyncflow = await WorkflowEngine.create(engine)
-    acl       = SequentialActiveLearner(asyncflow)
-
-    # 2. Shared DDict for cross-task state
-    @asyncflow.function_task
-    async def create_ddict() -> str:
-        from dragon.data.ddict.ddict import DDict
-        ddict = DDict(managers_per_node=1, n_nodes=1,
-                      total_mem=512 * 1024 * 1024,
-                      wait_for_keys=True,
-                      working_set_size=MAX_ITER + 2)
-        return ddict.serialize()
-
-    ddict_descriptor = await create_ddict()
-    print(f'  DDict ready (descriptor prefix: {ddict_descriptor[:32]}…)')
-
-    # 3. Tasks — captured closure: ddict_descriptor (str) only.
-    @acl.simulation_task(as_executable=False)
-    async def simulation(*args,
-                         task_description={"process_templates": [(N_MPI_RANKS, {})]}):
-
-        import sys, traceback
-        try:
-            from mpi4py import MPI
-            from dragon.data.ddict.ddict import DDict
-        except Exception:
-            sys.stderr.write("=== SIM IMPORT FAILED ===\n")
-            traceback.print_exc(file=sys.stderr)
-            sys.stderr.flush()
-            raise
-
-        from mpi4py import MPI
-        from dragon.data.ddict.ddict import DDict
-
-        comm  = MPI.COMM_WORLD
-        rank  = comm.Get_rank()
-        size  = comm.Get_size()
-        ddict = DDict.attach(ddict_descriptor)
-
-        iteration = 0
-        while f"sim_meta_iter_{iteration}" in ddict:
-            iteration += 1
-
-        prev_iter = iteration - 1
-        query_key = f"query_points_iter_{prev_iter}"
-
-        if prev_iter >= 0 and query_key in ddict:
-            all_query = ddict[query_key]
-            X_local   = all_query[rank::size]
-            rng       = np.random.default_rng(seed=rank + iteration * size)
-            y_local   = (np.sin(X_local) * np.sin(5 * X_local)
-                         + rng.normal(0.0, 0.1, X_local.shape))
-        else:
-            rng     = np.random.default_rng(seed=rank + iteration * size)
-            X_local = rng.uniform(0.0, 2.0 * np.pi, (N_SAMPLES_PER_RANK, 1))
-            y_local = (np.sin(X_local) * np.sin(5 * X_local)
-                       + rng.normal(0.0, 0.1, X_local.shape))
-
-        ddict[f"sim_rank_{rank}_iter_{iteration}"] = {"X": X_local, "y": y_local}
-        comm.Barrier()
-        if rank == 0:
-            ddict[f"sim_meta_iter_{iteration}"] = {
-                "n_ranks"           : size,
-                "n_samples_per_rank": len(X_local),
-            }
-            print(f'[sim]   iter={iteration} ranks={size} '
-                  f'pts={size * len(X_local)}', flush=True)
-        ddict.detach()
-        return {}
-
-    @acl.training_task(as_executable=False)
-    async def training(*args):
-        # sklearn lives only on the HPC side; import inside the task.
-        from sklearn.gaussian_process         import GaussianProcessRegressor
-        from sklearn.gaussian_process.kernels import RBF, WhiteKernel
-        from sklearn.metrics                  import mean_squared_error
-        from dragon.data.ddict.ddict          import DDict
-        ddict = DDict.attach(ddict_descriptor)
-
-        iteration = 0
-        while f"sim_meta_iter_{iteration}" in ddict:
-            iteration += 1
-        iteration -= 1
-
-        # Accumulate samples from ALL completed iterations — active learning
-        # trains on the cumulative labeled set, not just the latest batch.
-        X_parts, y_parts = [], []
-        for it in range(iteration + 1):
-            meta = ddict[f"sim_meta_iter_{it}"]
-            for rank in range(meta["n_ranks"]):
-                data = ddict[f"sim_rank_{rank}_iter_{it}"]
-                X_parts.append(data["X"])
-                y_parts.append(data["y"])
-        X_train = np.vstack(X_parts)
-        y_train = np.vstack(y_parts).ravel()
-
-        kernel = (RBF(length_scale=0.3, length_scale_bounds=(0.01, 5.0))
-                  + WhiteKernel(noise_level=1e-2))
-        gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=10,
-                                      normalize_y=True)
-        gp.fit(X_train, y_train)
-
-        X_test = np.linspace(0.0, 2.0 * np.pi, 300).reshape(-1, 1)
-        y_pred = gp.predict(X_test)
-        y_true = (np.sin(X_test) * np.sin(5 * X_test)).ravel()
-        mse    = float(mean_squared_error(y_true, y_pred))
-
-        ddict[f"model_iter_{iteration}"] = gp
-        ddict[f"mse_iter_{iteration}"]   = mse
-        print(f'[train] iter={iteration} n={len(X_train)} MSE={mse:.6f}',
-              flush=True)
-        ddict.detach()
-        return {}
-
-    @acl.active_learn_task(as_executable=False)
-    async def active_learn(*args):
-        from dragon.data.ddict.ddict import DDict
-        ddict = DDict.attach(ddict_descriptor)
-
-        iteration = 0
-        while f"model_iter_{iteration}" in ddict:
-            iteration += 1
-        iteration -= 1
-
-        gp = ddict[f"model_iter_{iteration}"]
-        X_candidates  = np.linspace(0.0, 2.0 * np.pi, 500).reshape(-1, 1)
-        _, std        = gp.predict(X_candidates, return_std=True)
-        top_idx       = np.argsort(std)[-N_QUERY:]
-        ddict[f"query_points_iter_{iteration}"] = X_candidates[top_idx]
-        print(f'[active] iter={iteration} mean_unc={std.mean():.4f} '
-              f'max_unc={std.max():.4f} n_query={N_QUERY}', flush=True)
-        ddict.detach()
-        return {"mean_uncertainty": float(std.mean()),
-                "max_uncertainty" : float(std.max())}
-
-    @acl.as_stop_criterion(metric_name=MEAN_SQUARED_ERROR_MSE,
-                           threshold=MSE_THRESHOLD, as_executable=False)
-    async def check_mse(*args) -> float:
-        from dragon.data.ddict.ddict import DDict
-        ddict = DDict.attach(ddict_descriptor)
-        iteration = 0
-        while f"mse_iter_{iteration}" in ddict:
-            iteration += 1
-        iteration -= 1
-        mse: float = ddict[f"mse_iter_{iteration}"]
-        ddict.detach()
-        return mse
-
-    # 4. Run
-    print('\nStarting ROSE active-learning loop\n' + '─' * 60)
-    final_state = None
-    async for state in acl.start(max_iter=MAX_ITER):
-        final_state = state
-        print(f'  ROSE iter={state.iteration:2d}  MSE={state.metric_value:.6f}  '
-              f'mean_unc={state.mean_uncertainty}  stop={state.should_stop}')
-        if state.should_stop:
-            break
-
-    # 5. Cleanup
-    @asyncflow.function_task
-    async def destroy_ddict(desc):
-        from dragon.data.ddict.ddict import DDict
-        DDict.attach(desc).destroy()
-
-    await destroy_ddict(ddict_descriptor)
-    await acl.shutdown()
-
-    if final_state and final_state.metric_history:
-        print('\n── Convergence ' + '─' * 50)
-        for i, mse in enumerate(final_state.metric_history):
-            print(f'  iter {i:2d} │ MSE = {mse:.6f}')
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Rhapsody-direct workload (alternative to ROSE).
+#  Rhapsody workload.
 #
-#  Mirrors examples/run_matey.py: submits N matey-inference tasks against
-#  the named edge as a rhapsody backend, with a semaphore-limited
-#  concurrency cap and per-task GPU-affinity round-robin.  Goes through
-#  the edge backend (bridge -> edge -> rhapsody plugin -> V3) — same
-#  transport as run_rose_workflow.
+#  Submits matey + infer + gkeyll task families against the named edge
+#  as a rhapsody backend.  Resources are carved up per ``SLICING`` (see
+#  top of file) into per-kind pools: each kind gets its own per-host
+#  affinity range (horizontal) or its own disjoint node subset
+#  (vertical), and its own semaphore sized to the resulting cap.
 #
 #  Per-target requirements (see ``app`` field in IRI_DEFAULTS /
 #  MACHINE_DEFAULTS):
-#    * ``app.matey_dir``       — host directory containing
-#                                ``matey_wrapper.sh`` and
-#                                ``basic_inference.py``.
-#    * ``app.matey_model_dir`` — passed as ``--model_dir``.
-#    * ``app.matey_xgc_dir``   — passed as ``--newxgc_dir``.
-#    * ``gpus_per_node``       — used to derive concurrency
-#                                (``len(nodelist) * gpus_per_node``) and
-#                                the per-task ``gpu_affinity`` index.
+#    * ``app.matey_dir / matey_model_dir / matey_xgc_dir``  — matey paths
+#    * ``app.infer_dir / infer_model_dir / infer_xgc_dir``  — infer paths
+#    * ``app.gkeyll_dir / gkeyll_exe``                      — gkeyll paths
+#    * ``gpus_per_node`` / ``cores_per_node``               — device totals
+#                                                             carved by SLICING
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
-    """Submit matey-inference + gkeyll tasks via the named edge.
+def _compute_slices(slicing, n_hosts, gpus_per_node, cores_per_node, nodelist):
+    """Carve the allocation into per-kind pools according to *slicing*.
 
-    Two task families share one Session and run concurrently, mixed by
-    independent Semaphores: matey scales by GPU count (``n_hosts *
-    gpus_per_node``), gkeyll by core count (``n_hosts * cores_per_node``),
-    where ``n_hosts = len(nodelist)``.
+    Returns ``{kind: {hosts, device, affinity_start, affinity_count, cap}}``.
+    ``cap`` is total concurrency for that kind; a kind with zero cap is
+    skipped at workload time.
+    """
+    mode  = slicing.get('mode')
+    kinds = slicing.get('kinds', {})
+
+    if mode == 'horizontal':
+        # Every kind shares all nodes; affinity offsets stack per device.
+        per_device_total = {'gpu': gpus_per_node, 'cpu': cores_per_node}
+        per_node  = {}                              # kind -> int slots/host
+        rest_kind = {'gpu': None, 'cpu': None}      # at most one rest per device
+        used      = {'gpu': 0, 'cpu': 0}
+        for kind, spec in kinds.items():
+            dev = spec['device']
+            pn  = spec.get('per_node', 0)
+            if pn == 'rest':
+                if rest_kind[dev] is not None:
+                    raise RuntimeError(
+                        f"SLICING: multiple 'rest' on device {dev!r} "
+                        f"({rest_kind[dev]!r} and {kind!r})")
+                rest_kind[dev] = kind
+                per_node[kind] = None
+            else:
+                per_node[kind] = int(pn)
+                used[dev]     += int(pn)
+        for dev, kind in rest_kind.items():
+            if kind is not None:
+                per_node[kind] = max(0, per_device_total[dev] - used[dev])
+
+        cursor = {'gpu': 0, 'cpu': 0}
+        slices = {}
+        for kind, spec in kinds.items():
+            dev = spec['device']
+            pn  = per_node[kind]
+            slices[kind] = {
+                'hosts'         : list(nodelist),
+                'device'        : dev,
+                'affinity_start': cursor[dev],
+                'affinity_count': pn,
+                'cap'           : n_hosts * pn,
+            }
+            cursor[dev] += pn
+        return slices
+
+    if mode == 'vertical':
+        # Disjoint node subsets by weight; each kind owns its nodes fully.
+        # We reject any allocation that would leave a remainder after the
+        # weight-based split (so we never silently drop nodes) and any
+        # allocation where a kind would end up with zero nodes.  In
+        # practice this means ``n_nodes`` must be a multiple of the
+        # ``sum(weights)`` declared in ``VERTICAL_SLICING``.
+        weights_raw = {k: kinds[k].get('weight', 0) for k in kinds}
+        bad = {k: v for k, v in weights_raw.items() if not isinstance(v, int)}
+        if bad:
+            hint = (" ('rest' is only supported in horizontal slicing)"
+                    if 'rest' in bad.values() else "")
+            abort(f"vertical slicing: non-integer weight(s): {bad}{hint}")
+        weights = {k: int(v) for k, v in weights_raw.items()}
+        zeros   = [k for k, w in weights.items() if w <= 0]
+        if zeros:
+            abort(f"vertical slicing: kinds with zero or missing weight: "
+                  f"{zeros} (got {weights})")
+        total_w = sum(weights.values())
+        if n_hosts % total_w != 0:
+            abort(f"vertical slicing: n_nodes={n_hosts} is not a multiple "
+                  f"of sum(weights)={total_w} (weights={weights}); pick a "
+                  f"compatible n_nodes")
+        n_each = {k: (n_hosts * w) // total_w for k, w in weights.items()}
+        # Defense in depth: covers n_hosts == 0 (which slips past the
+        # modulo check) and any future-weights edge case.
+        zero_alloc = [k for k, n in n_each.items() if n == 0]
+        if zero_alloc:
+            abort(f"vertical slicing: kinds with zero-node allocation: "
+                  f"{zero_alloc} (n_nodes={n_hosts}, weights={weights}); "
+                  f"need n_nodes >= sum(weights)={total_w}")
+
+        cursor = 0
+        slices = {}
+        for kind, spec in kinds.items():
+            n            = n_each[kind]
+            dev          = spec['device']
+            cap_per_host = gpus_per_node if dev == 'gpu' else cores_per_node
+            hosts        = list(nodelist[cursor:cursor + n])
+            cursor      += n
+            slices[kind] = {
+                'hosts'         : hosts,
+                'device'        : dev,
+                'affinity_start': 0,
+                'affinity_count': cap_per_host,
+                'cap'           : len(hosts) * cap_per_host,
+            }
+        return slices
+
+    raise RuntimeError(
+        f"SLICING.mode={mode!r} (expected 'horizontal' or 'vertical')")
+
+
+def _render_slicing(slicing_mode, slices, gpus_per_node, cores_per_node,
+                    nodelist, active_kinds):
+    """ASCII visualization of the resource carve-up, wrapped in a titled
+    panel.
+
+    Horizontal (uniform per-node): one template + ``×N`` for the node
+    count.  Vertical (disjoint node subsets, CPU-only by current design):
+    one line per kind with its node range.
+
+    Yellow is reserved for structural / non-task text; each kind gets
+    its own colour (matey=magenta, infer=cyan, gkeyll=green).
+    """
+    if not _console:
+        return
+
+    from rich.panel import Panel
+
+    glyph = {'matey': 'M', 'infer': 'I', 'gkeyll': 'G'}
+    color = {'matey': 'magenta', 'infer': 'cyan', 'gkeyll': 'green'}
+    Y     = 'yellow'
+
+    lines = []
+
+    if slicing_mode == 'horizontal':
+        n_hosts = len(nodelist)
+        lines.append(f'[{Y}]each of {n_hosts} nodes:[/{Y}]')
+
+        gpu_slots = [None] * (gpus_per_node  or 0)
+        cpu_slots = [None] * (cores_per_node or 0)
+        for name in active_kinds:
+            sl       = slices[name]
+            slot_arr = gpu_slots if sl['device'] == 'gpu' else cpu_slots
+            for i in range(sl['affinity_start'],
+                           sl['affinity_start'] + sl['affinity_count']):
+                if i < len(slot_arr):
+                    slot_arr[i] = name
+
+        def _row(label, slots):
+            if not slots or not any(slots):
+                return
+            # Short rows (≤ 8 slots) list each slot; longer ones run-length
+            # compress contiguous same-kind runs (typical for cpu(128)).
+            if len(slots) <= 8:
+                cells = ' '.join(
+                    f'[{color[s]}]{glyph[s]}[/{color[s]}]' if s
+                    else f'[{Y}]·[/{Y}]'
+                    for s in slots)
+            else:
+                parts = []
+                i = 0
+                while i < len(slots):
+                    k, j = slots[i], i
+                    while j < len(slots) and slots[j] == k:
+                        j += 1
+                    run = j - i
+                    if k:
+                        parts.append(
+                            f'[{color[k]}]{glyph[k]}[/{color[k]}] '
+                            f'[{Y}]×{run}[/{Y}]')
+                    else:
+                        parts.append(f'[{Y}]·×{run}[/{Y}]')
+                    i = j
+                cells = '  '.join(parts)
+            pad = f'{label}:'.ljust(9)
+            lines.append(f'  [{Y}]{pad}[/{Y}]  {cells}')
+
+        if gpus_per_node:
+            _row(f'gpu({gpus_per_node})',  gpu_slots)
+        if cores_per_node:
+            _row(f'cpu({cores_per_node})', cpu_slots)
+
+        title = 'horizontal slicing'
+
+    elif slicing_mode == 'vertical':
+        # Cursor accumulates across ALL declared kinds so displayed
+        # (start..end) indices match the underlying nodelist offsets
+        # even when some kinds are inactive but still consume nodes.
+        cursor = 0
+        for name, sl in slices.items():
+            n = len(sl['hosts'])
+            if name in active_kinds and n > 0:
+                start, end = cursor, cursor + n - 1
+                lines.append(
+                    f'  [{color[name]}]{name:<7s}[/{color[name]}] '
+                    f'[{Y}]×{n} nodes ({start}..{end})[/{Y}]')
+            cursor += n
+
+        title = 'vertical slicing'
+
+    else:
+        return
+
+    if not lines:
+        return
+
+    from rich.padding import Padding
+    from rich.table   import Table
+    from rich.text    import Text
+
+    panel = Panel('\n'.join(lines),
+                  title=f'[{Y}]{title}[/{Y}]',
+                  title_align='left',
+                  border_style=Y,
+                  expand=False)
+
+    _console.print()                                   # empty line before
+
+    if slicing_mode == 'horizontal':
+        # M / I / G are opaque without a legend.  Render box + legend
+        # side-by-side via an invisible 2-column grid; vertical mode has
+        # full kind names inline so it doesn't need this.
+        legend_md = '\n'.join(
+            f'[{color[k]}]{glyph[k]}[/{color[k]}] [{Y}]=[/{Y}] '
+            f'[{color[k]}]{k}[/{color[k]}]'
+            for k in ('matey', 'infer', 'gkeyll')
+            if k in active_kinds)
+        grid = Table.grid(padding=(0, 3))
+        grid.add_column()
+        grid.add_column()
+        grid.add_row(panel, Text.from_markup(legend_md))
+        _console.print(Padding(grid, (0, 0, 0, 2)))
+    else:
+        _console.print(Padding(panel, (0, 0, 0, 2)))
+
+
+async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
+    """Submit the active task kinds (per ``KINDS``) via the named edge.
+
+    All active kinds share one Session and run concurrently, each behind
+    its own semaphore sized to the per-kind cap from
+    ``_compute_slices(SLICING, ...)``.  Each task's policy pins it to a
+    (host, gpu/cpu) slot via ``Policy.Placement.HOST_NAME`` so dragon's
+    scheduler is forced onto the slot we picked.
 
     *nodelist* is the list of compute hostnames in the edge's allocation
-    (from ``queue_info.nodelist()``).  Each task's policy pins it to a
-    specific (host, gpu/core) slot via ``Policy.Placement.HOST_NAME``,
-    so dragon's scheduler is forced onto the slot we picked rather than
-    relying on its internal round-robin.
-
-    Either family is skipped when its config block / resource count is
-    absent or zero; bails if neither has anything to do.
+    (from ``queue_info.nodelist()``).  Kinds whose slice yields zero cap
+    or whose ``app`` paths are absent are silently skipped; bails when
+    nothing remains.
     """
     app_cfg = (cfg or {}).get('app')
     if not app_cfg:
         raise RuntimeError(
             f"target {edge_name!r} has no 'app' config block — "
-            "the rhapsody workload is not supported here.  Either "
-            "set WORKLOAD='rose' or populate IRI_DEFAULTS / "
-            "MACHINE_DEFAULTS['app'] for this target.")
+            "the rhapsody workload is not supported here.  Populate "
+            "IRI_DEFAULTS / MACHINE_DEFAULTS['app'] for this target.")
 
     n_hosts        = len(nodelist) or 1
     gpus_per_node  = cfg.get('gpus_per_node')  or 0
     cores_per_node = cfg.get('cores_per_node') or 0
-    n_gpus         = n_hosts * gpus_per_node
-    n_cores        = n_hosts * cores_per_node
-
-    has_matey = (n_gpus > 0 and N_MATEY_TASKS > 0
-                 and all(app_cfg.get(k) for k in
-                         ('matey_dir', 'matey_model_dir', 'matey_xgc_dir')))
-    has_gkeyll = (n_cores > 0 and N_GKEYLL_TASKS > 0
-                  and all(app_cfg.get(k) for k in ('gkeyll_dir', 'gkeyll_exe')))
-
-    if not (has_matey or has_gkeyll):
-        raise RuntimeError(
-            f"target {edge_name!r}: nothing to run.  Need either "
-            "(gpus_per_node > 0 + N_MATEY_TASKS > 0 + matey_* paths) "
-            "or (cores_per_node > 0 + N_GKEYLL_TASKS > 0 + gkeyll_dir/exe).")
+    # Per-machine ``slicing`` overrides the module-level default — used
+    # by thinkie (CPU-only on a 1-GPU laptop) and any future per-target
+    # tweak.  Falls back to the global SLICING for everyone else.
+    slicing = cfg.get('slicing') or SLICING
+    slices  = _compute_slices(slicing, n_hosts,
+                              gpus_per_node, cores_per_node, nodelist)
 
     # Lazy imports: dragon's Policy + cloudpickle are only needed when the
     # rhapsody workload actually runs; this lets amsc.py parse on client
@@ -1135,103 +1017,153 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
         raw = {'process_template': {'cwd': cwd, 'policy': policy}}
         return 'cloudpickle::' + base64.b64encode(cloudpickle.dumps(raw)).decode()
 
-    matey_tasks  = []
-    gkeyll_tasks = []
-
-    if has_matey:
-        matey_dir  = app_cfg['matey_dir'].rstrip('/')
-        matey_wrap = f'{matey_dir}/{MATEY_WRAPPER_NAME}'
-        matey_wd   = f'{matey_dir}/{RHAPSODY_WORK_SUBDIR}'
-        matey_args = [
-            'python', f'{matey_dir}/examples/basic_inference.py',
-            '--model_dir',  app_cfg['matey_model_dir'],
-            '--use_ddp',
-            '--on_perlmutter',
-            '--AR',
-            '--leadtime',   '5',
-            '--newxgc_dir', app_cfg['matey_xgc_dir'],
-        ]
-        matey_tasks = [
-            ComputeTask(
-                executable=matey_wrap,
-                arguments=matey_args,
+    def _make_tasks(kind, n_tasks, executable, arguments, wd):
+        sl    = slices[kind]
+        hosts = sl['hosts']
+        nh    = len(hosts) or 1
+        pc    = sl['affinity_count'] or 1
+        affinity_field = ('gpu_affinity' if sl['device'] == 'gpu'
+                          else 'cpu_affinity')
+        tasks = []
+        for i in range(n_tasks):
+            host = hosts[i % nh]
+            slot = sl['affinity_start'] + ((i // nh) % pc)
+            policy_kwargs = {
+                'placement': Policy.Placement.HOST_NAME,
+                'host_name': host,
+                affinity_field: [slot],
+            }
+            tasks.append(ComputeTask(
+                uid=f'{kind}.{i:04d}',
+                executable=executable,
+                arguments=arguments,
                 capture_stdio=True,
-                task_backend_specific_kwargs=_pack_psk(matey_wd, Policy(
-                    placement=Policy.Placement.HOST_NAME,
-                    host_name=nodelist[i % n_hosts],
-                    gpu_affinity=[(i // n_hosts) % gpus_per_node])),
+                task_backend_specific_kwargs=_pack_psk(wd,
+                                                Policy(**policy_kwargs)),
                 _pickled_fields=['task_backend_specific_kwargs'],
-            )
-            for i in range(N_MATEY_TASKS)
-        ]
+            ))
+        return tasks
 
-    if has_gkeyll:
-        gkeyll_dir = app_cfg['gkeyll_dir'].rstrip('/')
-        gkeyll_exe = f'{gkeyll_dir}/{app_cfg["gkeyll_exe"]}'
-        gkeyll_wd  = f'{gkeyll_dir}/{RHAPSODY_WORK_SUBDIR}'
-        gkeyll_tasks = [
-            ComputeTask(
-                executable=gkeyll_exe,
-                arguments=[],
-                capture_stdio=True,
-                task_backend_specific_kwargs=_pack_psk(gkeyll_wd, Policy(
-                    placement=Policy.Placement.HOST_NAME,
-                    host_name=nodelist[i % n_hosts],
-                    cpu_affinity=[(i // n_hosts) % cores_per_node])),
-                _pickled_fields=['task_backend_specific_kwargs'],
-            )
-            for i in range(N_GKEYLL_TASKS)
-        ]
+    # Build per-kind (executable, arguments) — one loop over KINDS replaces
+    # three near-identical if-blocks.  A kind is skipped when its slice cap
+    # is zero, its task count is zero, ``<name>_dir`` is missing, or
+    # (without an explicit ``<name>_executable`` override) its default
+    # paths aren't all populated.
+    tasks_by_kind = {}
+    for name, n_tasks, default_paths, template in KINDS:
+        sl = slices.get(name, {})
+        if sl.get('cap', 0) <= 0 or n_tasks <= 0:
+            continue
+        if not app_cfg.get(f'{name}_dir'):
+            continue
+        has_override = bool(app_cfg.get(f'{name}_executable'))
+        if not has_override and not all(app_cfg.get(k) for k in default_paths):
+            continue
+        app_dir = app_cfg[f'{name}_dir'].rstrip('/')
+        wd      = f'{app_dir}/{RHAPSODY_WORK_SUBDIR}'
+        if has_override:
+            exe  = app_cfg[f'{name}_executable']
+            args = list(app_cfg.get(f'{name}_arguments') or [])
+        elif template == 'matey':
+            exe  = f'{app_dir}/{MATEY_WRAPPER_NAME}'
+            args = [
+                'python', f'{app_dir}/examples/basic_inference.py',
+                '--model_dir',  app_cfg['matey_model_dir'],
+                '--use_ddp',
+                '--on_perlmutter',
+                '--AR',
+                '--leadtime',   '5',
+                '--newxgc_dir', app_cfg['matey_xgc_dir'],
+            ]
+        elif template == 'infer':
+            exe  = f'{app_dir}/{INFER_WRAPPER_NAME}'
+            args = [
+                'python', f'{app_dir}/examples/basic_inference.py',
+                '--model_dir',  app_cfg['infer_model_dir'],
+                '--use_ddp',
+                '--on_perlmutter',
+                '--AR',
+                '--leadtime',   '5',
+                '--newxgc_dir', app_cfg['infer_xgc_dir'],
+            ]
+        else:  # 'gkeyll'
+            exe  = f'{app_dir}/{app_cfg["gkeyll_exe"]}'
+            args = []
+        tasks_by_kind[name] = _make_tasks(name, n_tasks, exe, args, wd)
 
-    say(f'\n— Running rhapsody workload on edge "{edge_name}" '
-        f'(bridge: {bridge_url}) —')
-    if has_matey:
-        say(f'  matey  : {len(matey_tasks)} tasks, concurrency {n_gpus} '
-            f'({n_hosts} host x {gpus_per_node} gpu)')
-        say(f'           wrapper={matey_wrap}, cwd={matey_wd}')
-    if has_gkeyll:
-        say(f'  gkeyll : {len(gkeyll_tasks)} tasks, concurrency {n_cores} '
-            f'({n_hosts} host x {cores_per_node} core)')
-        say(f'           exe={gkeyll_exe}, cwd={gkeyll_wd}')
+    if not tasks_by_kind:
+        raise RuntimeError(
+            f"target {edge_name!r}: nothing to run.  Need a non-zero "
+            "SLICING cap and matching app paths for at least one kind.")
+
+    _render_slicing(slicing.get('mode'), slices,
+                    gpus_per_node, cores_per_node, nodelist,
+                    list(tasks_by_kind.keys()))
 
     backend = await rhapsody.get_backend(
         'edge', bridge_url=bridge_url, edge_name=edge_name)
 
-    # Per-kind counters, inspected after gather for the summary line.
-    counts = {'matey':  {'done': 0, 'failed': 0},
-              'gkeyll': {'done': 0, 'failed': 0}}
+    counts = {name: {'submitted': 0, 'done': 0, 'failed': 0}
+              for name in tasks_by_kind}
 
     # ``Session(work_dir=…)`` is a client-side setting (rhapsody calls
     # ``os.makedirs(backend._work_dir)`` locally) — we can't pass the
-    # remote matey/gkeyll paths there.  Per-task ``cwd`` rides through
-    # the ``process_template`` instead.
-    progress, tids = _make_progress(len(matey_tasks), len(gkeyll_tasks))
+    # remote per-kind paths there.  Per-task ``cwd`` rides through the
+    # ``process_template`` instead.
+    progress, tids = _make_progress(
+        len(tasks_by_kind.get('matey',  ())),
+        len(tasks_by_kind.get('infer',  ())),
+        len(tasks_by_kind.get('gkeyll', ())))
 
     async with Session(backends=[backend]) as session:
-        # Use 1 as a no-op cap when a kind isn't running (its task list is
-        # empty, so no coro will ever acquire that semaphore).
-        sem_gpu  = asyncio.Semaphore(n_gpus  or 1)
-        sem_core = asyncio.Semaphore(n_cores or 1)
+        sems = {name: asyncio.Semaphore(slices[name]['cap'] or 1)
+                for name in tasks_by_kind}
 
-        async def run_one(task, kind, sem):
-            async with sem:
+        async def run_one(task, kind):
+            async with sems[kind]:
+                # Count slot-occupancy, not flush-completion: bump
+                # ``submitted`` the moment we acquire the kind's semaphore
+                # (= a resource slot is in use), before the rhapsody-edge
+                # batch-flush queue starts processing.  Without this, all
+                # three bars stall at the same flush boundary
+                # (batch_limit=1024 in rhapsody-edge) because that's
+                # where the ``await session.submit_tasks`` first actually
+                # blocks; users read this as a stuck progress bar.
+                counts[kind]['submitted'] += 1
+                if progress and kind in tids:
+                    progress.update(tids[kind],
+                                    submitted=counts[kind]['submitted'])
                 await session.submit_tasks([task])
                 try:
                     await task
                     counts[kind]['done'] += 1
                 except BaseException:
                     counts[kind]['failed'] += 1
-                if progress:
+                if progress and kind in tids:
                     c = counts[kind]
                     progress.update(tids[kind], advance=1,
                                     done=c['done'], failed=c['failed'])
 
-        coros  = [run_one(t, 'matey',  sem_gpu)  for t in matey_tasks]
-        coros += [run_one(t, 'gkeyll', sem_core) for t in gkeyll_tasks]
+        # Round-robin interleave across kinds so the rhapsody-edge
+        # backend's single FIFO flush channel sees one task from each
+        # active kind per round, not all of one kind first.  Without
+        # this, the matey/infer bars fill before any gkeyll task is
+        # even submitted -- the cap semaphores are per-kind, but the
+        # submit channel is shared.  Each kind's per-task order is
+        # preserved; once a kind runs out, the round skips it and the
+        # longest kind tails out alone.
+        from itertools import zip_longest
+        _sentinel = object()
+        per_kind  = [[run_one(t, name) for t in tasks]
+                     for name, tasks in tasks_by_kind.items()]
+        coros = [c for tup in zip_longest(*per_kind, fillvalue=_sentinel)
+                   for c in tup if c is not _sentinel]
 
         if progress:
+            _console.print()
             with progress:
                 await asyncio.gather(*coros, return_exceptions=True)
+            _console.print()
         else:
             await asyncio.gather(*coros, return_exceptions=True)
 
@@ -1241,18 +1173,20 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def teardown(bc, created):
-    """Cancel jobs we submitted and disconnect IRI endpoints we connected."""
-    say('\n— Tearing down resources we created —')
+    """Cancel jobs we submitted and disconnect IRI endpoints we connected.
 
+    All output is detail under the step 7 header; the step trace itself is
+    printed by the caller.  Per-item failures are non-fatal — we always
+    push through to the next item.
+    """
     # 1. Cancel IRI jobs
     for c in created:
         if c['kind'] != 'iri':
             continue
         try:
             c['iri'].cancel_job(c['resource_id'], c['job_id'])
-            say(f'  cancelled IRI job {c["job_id"]}@{c["endpoint"]}')
         except Exception as exc:
-            say(f'  could not cancel IRI job {c["job_id"]}: {exc}')
+            print(f'  could not cancel IRI job {c["job_id"]}: {exc}')
 
     # 2. Cancel PsiJ jobs
     for c in created:
@@ -1260,9 +1194,8 @@ def teardown(bc, created):
             continue
         try:
             c['psij'].cancel_job(c['job_id'])
-            say(f'  cancelled PsiJ job {c["job_id"]} on {c["parent_edge"]}')
         except Exception as exc:
-            say(f'  could not cancel PsiJ job {c["job_id"]}: {exc}')
+            print(f'  could not cancel PsiJ job {c["job_id"]}: {exc}')
 
     # 3. Disconnect IRI endpoints
     iri_eps = {c['endpoint'] for c in created if c['kind'] == 'iri'}
@@ -1271,202 +1204,265 @@ def teardown(bc, created):
         for ep in iri_eps:
             try:
                 cx.disconnect(ep)
-                say(f'  disconnected IRI endpoint {ep}')
             except Exception as exc:
-                say(f'  could not disconnect IRI {ep}: {exc}')
+                print(f'  could not disconnect IRI {ep}: {exc}')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Demo-mode driver — auto-pick perlmutter PsiJ, no prompts, 7-step trace.
+#  Single-target driver — non-interactive, fail-fast, 7-step trace.
+#
+#  ``kind`` selects the launch path: ``psij`` (submit a child edge via an
+#  existing login-edge), ``iri`` (submit via an IRI endpoint), or
+#  ``compute`` (re-use an already-connected compute/standalone edge).
+#  Every error boundary calls ``abort()`` so the user sees a one-line
+#  reason, not a Python traceback.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _main_demo(bc, bridge_url):
-    """Auto-run the perlmutter PsiJ path with MACHINE_DEFAULTS values.
+_VALID_KINDS = ('psij', 'iri', 'compute')
 
-    Fail-fast at every boundary via ``abort()`` — no Python tracebacks.
-    Mirrors the interactive flow's structure but skips ``select_many``
-    and ``configure_psij`` (defaults are taken verbatim) and skips IRI
-    target discovery entirely.
+
+def _parse_target_arg(arg):
+    """Return ``(kind, name)`` from a ``<kind>:<name>`` string.
+
+    With ``arg is None`` the default ``('psij', 'perlmutter')`` is
+    returned — matches the historical demo-mode default.
+    """
+    if not arg:
+        return 'psij', 'perlmutter'
+    if ':' not in arg:
+        abort(f"target argument must be '<kind>:<name>': got {arg!r}")
+    kind, _, name = arg.partition(':')
+    if kind not in _VALID_KINDS:
+        abort(f"target kind must be one of {_VALID_KINDS}: got {kind!r}")
+    if not name:
+        abort(f'empty name in target argument {arg!r}')
+    return kind, name
+
+
+def _resolve_executor(bc, edge_name):
+    """Ask the edge's sysinfo plugin what PsiJ executor it expects."""
+    try:
+        info = bc.get_edge_client(edge_name).get_plugin('sysinfo').host_role()
+        return info.get('psij_executor', 'local')
+    except Exception:
+        return 'local'
+
+
+def _step_configure(cfg):
+    """Step 3: one-line ``configure`` summary derived from cfg."""
+    qos_str = f', qos={cfg["qos"]}' if cfg.get('qos') else ''
+    step(3, 'configure',
+         f'{cfg.get("n_nodes", "?")} node x '
+         f'{cfg.get("gpus_per_node", "?")} gpu x '
+         f'{cfg.get("cores_per_node", "?")} core, '
+         f'{cfg.get("walltime_min", "?")}m walltime, '
+         f'queue={cfg.get("queue_name", "?")}{qos_str}')
+
+
+def _step_run(bc, bridge_url, edge_name, cfg):
+    """Steps 6 + the actual workload run.
+
+    Resolves the nodelist via the edge's queue_info plugin, prints the
+    step 6 summary, then calls ``submit_rhapsody_workload``.  When
+    queue_info is absent or reports an empty allocation (workstation /
+    no batch system case), falls back to a single-node ``['localhost']``
+    nodelist so dragon's HOST_NAME placement still has a target to bind.
+    """
+    try:
+        nodelist = bc.get_edge_client(edge_name) \
+                     .get_plugin('queue_info').nodelist()
+    except Exception:
+        nodelist = []
+    if not nodelist:
+        nodelist = ['localhost']
+    n_hosts = len(nodelist)
+    slicing = cfg.get('slicing') or SLICING
+    slices  = _compute_slices(slicing, n_hosts,
+                              cfg.get('gpus_per_node')  or 0,
+                              cfg.get('cores_per_node') or 0,
+                              nodelist)
+    step(6, 'run rhapsody',
+         f'{n_hosts} hosts  '
+         f'matey {N_MATEY_TASKS} (cap {slices["matey"]["cap"]})  '
+         f'infer {N_INFER_TASKS} (cap {slices["infer"]["cap"]})  '
+         f'gkeyll {N_GKEYLL_TASKS} (cap {slices["gkeyll"]["cap"]})')
+    try:
+        asyncio.run(submit_rhapsody_workload(
+            bridge_url, edge_name, cfg, nodelist))
+    except Exception as exc:
+        abort(f'workload failed: {exc}')
+
+
+def _apply_cli_overrides(cfg, mode, n_nodes):
+    """Apply optional CLI overrides onto a freshly-loaded target ``cfg``.
+
+    ``mode`` (``'horizontal'`` / ``'vertical'`` / None) swaps in the
+    matching module-level template (``SLICING`` / ``VERTICAL_SLICING``)
+    in place of any per-target slicing.  This is a whole-template swap,
+    not just a mode-string patch: the per-kind ``per_node`` (horizontal)
+    and ``weight`` (vertical) fields differ between templates.
+    ``n_nodes`` (int / None) replaces ``cfg['n_nodes']``.  Either may be
+    None to leave the corresponding cfg field untouched.
+    """
+    if n_nodes is not None:
+        cfg['n_nodes'] = n_nodes
+    if mode == 'horizontal':
+        cfg['slicing'] = SLICING
+    elif mode == 'vertical':
+        cfg['slicing'] = VERTICAL_SLICING
+
+
+def _main_target(bc, bridge_url, kind, name,
+                 slicing_mode=None, n_nodes=None):
+    """Run the workload against ``<kind>:<name>``.
+
+    All three branches share the step 3/6/7 helpers; only the launch
+    (steps 4-5) differs:
+
+      - ``psij``    : submit a child edge via the login-edge's PsiJ plugin
+      - ``iri``     : submit via the named IRI endpoint
+      - ``compute`` : re-use the named edge directly (no submission)
     """
     step(1, 'connect bridge', bridge_url)
 
-    target = _find_perlmutter_psij(bc)
-    if not target:
-        abort("no 'perlmutter' login edge with PsiJ found in bridge "
-              "topology.  Start the parent edge on Perlmutter first.")
-    edge_name, executor = target
-    step(2, 'pick target', f'{edge_name} (psij/{executor})')
+    live_edges = set(bc.list_edges())
+    created    = []
 
-    cfg = dict(MACHINE_DEFAULTS['perlmutter'])
-    cfg['executor'] = executor
-    qos_str = f', qos={cfg["qos"]}' if cfg.get('qos') else ''
-    step(3, 'configure',
-         f'{cfg["n_nodes"]} node x {cfg["gpus_per_node"]} gpu '
-         f'x {cfg["cores_per_node"]} core, {cfg["walltime_min"]}m walltime, '
-         f'queue={cfg["queue_name"]}{qos_str}')
+    if kind == 'psij':
+        if name not in live_edges:
+            abort(f"no edge {name!r} connected to bridge.  "
+                  f"Start the parent edge first.")
+        if name not in MACHINE_DEFAULTS:
+            abort(f"no MACHINE_DEFAULTS entry for {name!r}")
+        if 'psij' not in bc.get_edge_client(name).list_plugins():
+            abort(f"edge {name!r} has no psij plugin")
 
-    created = []
-    try:
-        try:
-            rec = launch_psij(bc, edge_name, cfg, bridge_url)
-        except Exception as exc:
-            abort(f'launch_psij failed: {exc}')
-        created.append(rec)
-        step(4, 'submit child edge',
-             f'job={rec["job_id"][:8]}…  edge={rec["edge_name"]}')
+        executor = _resolve_executor(bc, name)
+        step(2, 'pick target', f'{name} (psij/{executor})')
 
-        t0 = time.time()
-        try:
-            first = wait_for_first_edge(bc, [rec['edge_name']])
-        except Exception as exc:
-            abort(f'wait_for_first_edge failed: {exc}')
-        step(5, 'await child edge', f'up after {int(time.time() - t0)}s')
-
-        # Fetch the child edge's allocated hostnames via queue_info.  These
-        # become the ``host_name`` field of each task's Policy in step 6,
-        # so dragon's scheduler is forced onto a (host, gpu/cpu) slot we
-        # picked rather than relying on its internal round-robin.
-        try:
-            nodelist = bc.get_edge_client(first).get_plugin('queue_info').nodelist()
-        except Exception as exc:
-            abort(f'queue_info.nodelist failed: {exc}')
-        if not nodelist:
-            abort(f'edge {first!r} reported empty nodelist (queue_info not '
-                  f'loaded, or edge not inside a batch allocation)')
-        n_hosts = len(nodelist)
-        n_gpus  = n_hosts * (cfg.get('gpus_per_node')  or 0)
-        n_cores = n_hosts * (cfg.get('cores_per_node') or 0)
-        step(6, 'run rhapsody',
-             f'{n_hosts} hosts  '
-             f'matey {N_MATEY_TASKS} (cap {n_gpus})  '
-             f'gkeyll {N_GKEYLL_TASKS} (cap {n_cores})')
+        cfg = dict(MACHINE_DEFAULTS[name])
+        cfg['executor'] = executor
+        _apply_cli_overrides(cfg, slicing_mode, n_nodes)
+        _step_configure(cfg)
 
         try:
-            asyncio.run(submit_rhapsody_workload(
-                bridge_url, first, rec.get('cfg') or cfg, nodelist))
-        except Exception as exc:
-            abort(f'workload failed: {exc}')
+            try:
+                rec = launch_psij(bc, name, cfg, bridge_url)
+            except Exception as exc:
+                abort(f'launch_psij failed: {exc}')
+            created.append(rec)
+            step(4, 'submit child edge',
+                 f'job={rec["job_id"][:8]}…  edge={rec["edge_name"]}',
+                 newline=False)
 
-    finally:
-        step(7, 'teardown', f'cancelling {len(created)} psij job(s)')
-        teardown(bc, created)
+            t0 = time.time()
+            try:
+                first = _wait_for_edge(bc, rec['edge_name'])
+            except Exception as exc:
+                abort(f'wait_for_edge failed: {exc}')
+            step(5, 'await child edge', f'up after {int(time.time() - t0)}s')
+
+            _step_run(bc, bridge_url, first, rec.get('cfg') or cfg)
+        finally:
+            step(7, 'teardown', f'cancelling {len(created)} psij job(s)')
+            teardown(bc, created)
+
+    elif kind == 'iri':
+        if name not in IRI_DEFAULTS:
+            abort(f"no IRI_DEFAULTS entry for {name!r}")
+        step(2, 'pick target', f'iri:{name}')
+
+        cfg = dict(IRI_DEFAULTS[name])
+        try:
+            _validate_iri_cfg(name, cfg)
+        except Exception as exc:
+            abort(str(exc))
+        _apply_cli_overrides(cfg, slicing_mode, n_nodes)
+        _step_configure(cfg)
+
+        try:
+            try:
+                rec = launch_iri(bc, name, cfg, bridge_url)
+            except Exception as exc:
+                abort(f'launch_iri failed: {exc}')
+            created.append(rec)
+            step(4, 'submit child edge',
+                 f'job={rec["job_id"][:8]}…  edge={rec["edge_name"]}',
+                 newline=False)
+
+            t0 = time.time()
+            try:
+                first = _wait_for_edge(bc, rec['edge_name'])
+            except Exception as exc:
+                abort(f'wait_for_edge failed: {exc}')
+            step(5, 'await child edge', f'up after {int(time.time() - t0)}s')
+
+            _step_run(bc, bridge_url, first, rec.get('cfg') or cfg)
+        finally:
+            step(7, 'teardown', f'cancelling {len(created)} iri job(s)')
+            teardown(bc, created)
+
+    elif kind == 'compute':
+        if name not in live_edges:
+            abort(f"no edge {name!r} connected to bridge")
+        if 'rhapsody' not in bc.get_edge_client(name).list_plugins():
+            abort(f"edge {name!r} has no rhapsody plugin")
+        if name not in MACHINE_DEFAULTS:
+            abort(f"no MACHINE_DEFAULTS entry for {name!r} (need 'app' block)")
+        step(2, 'pick target', f'{name} (compute)')
+
+        cfg = dict(MACHINE_DEFAULTS[name])
+        _apply_cli_overrides(cfg, slicing_mode, n_nodes)
+        _step_configure(cfg)
+
+        step(4, 'submit child edge', 'reusing existing edge')
+        step(5, 'await child edge',  'already up')
+        _step_run(bc, bridge_url, name, cfg)
+        step(7, 'teardown',          'nothing to cancel')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Main — linear top-to-bottom flow.
+#  Main — parse arg, dispatch.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    """Top-level driver.  Synchronous on purpose: only the ROSE workflow
-    body needs an event loop, and that's spun up explicitly with
-    ``asyncio.run()`` further down."""
-    # Single-instance guard.  Concurrent amsc.py runs interleave their log
-    # output and step on each other's plugin sessions; refuse to start a
-    # second one.  flock is held until this process exits (kernel auto-
-    # releases on close).
-    import fcntl
-    _lock = open('/tmp/amsc.lock', 'w')
-    try:    fcntl.flock(_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        sys.exit('another amsc.py is already running; kill it first.')
+    """Top-level driver.  Synchronous on purpose: only the rhapsody
+    workload body needs an event loop, and that's spun up explicitly
+    with ``asyncio.run()`` inside ``_step_run``."""
 
-    # 1. Connect to the bridge.  BridgeClient self-resolves URL + cert
-    #    via radical.edge.utils (CLI > env > file).
+    print()
+    if len(sys.argv) > 4:
+        abort(f'expected at most 3 arguments (got {len(sys.argv) - 1})')
+
+    # Positional args dispatched by content (any order):
+    #   target  : ``<kind>:<name>``       (e.g. ``psij:perlmutter``)
+    #   mode    : ``horizontal`` / ``vertical``
+    #   n_nodes : positive integer
+    target_arg = slicing_mode = n_nodes = None
+    for a in sys.argv[1:]:
+        if ':' in a and target_arg is None:
+            target_arg = a
+        elif a in ('horizontal', 'vertical') and slicing_mode is None:
+            slicing_mode = a
+        elif a.isdigit() and n_nodes is None:
+            n_nodes = int(a)
+            if n_nodes <= 0:
+                abort(f'n_nodes must be positive: got {n_nodes!r}')
+        else:
+            abort(f'unrecognized or duplicate argument: {a!r}')
+
+    kind, name = _parse_target_arg(target_arg)
+
+    # BridgeClient self-resolves URL + cert via radical.edge.utils
+    # (CLI > env > file).
     bc         = BridgeClient()
     bridge_url = bc.url
-
-    if DEMO_MODE:
-        try:
-            _main_demo(bc, bridge_url)
-        finally:
-            bc.close()
-        return
-
-    print(f'Bridge: {bridge_url}')
     try:
-        # 2. Discover targets and prompt for selection.
-        targets = discover_targets(bc)
-        if not targets:
-            sys.exit('No usable targets discovered.  '
-                     'Start at least one edge or expose iri_connect.')
-
-        picks = select_many(targets, 'Pick targets to use:')
-        if not picks:
-            sys.exit('No targets selected.')
-
-        # 3. Configure + launch each pick.  Pre-existing compute-node edges
-        #    require no submission.  Each target's launch is wrapped in a
-        #    try/except: a failed launch (bad project, queue rejected, …)
-        #    logs a one-liner and the loop moves on to the next target.
-        #    Whatever WAS launched successfully is still tracked in
-        #    ``created`` so the teardown in the outer ``finally`` cleans
-        #    it up even if a later target raises.
-        created        = []          # things we will need to tear down
-        expected_edges = []          # edge names we expect to come up
-
-        try:
-            for t in picks:
-                try:
-                    if t['kind'] == 'compute':
-                        expected_edges.append(t['edge_name'])
-                        print(f'\n— Reusing ready edge: {t["edge_name"]} —')
-
-                    elif t['kind'] == 'iri':
-                        cfg = configure_iri(t['endpoint'])
-                        rec = launch_iri(bc, t['endpoint'], cfg, bridge_url)
-                        created.append(rec)
-                        expected_edges.append(rec['edge_name'])
-
-                    elif t['kind'] == 'login':
-                        cfg = configure_psij(t['edge_name'], t['executor'])
-                        rec = launch_psij(bc, t['edge_name'], cfg, bridge_url)
-                        created.append(rec)
-                        expected_edges.append(rec['edge_name'])
-                except Exception as exc:
-                    label = t.get('edge_name') or t.get('endpoint') or repr(t)
-                    print(f'\n— launch failed for {label}: {exc} —')
-                    print('  (continuing with remaining targets)')
-
-            # 4. Wait for the first edge to register, then run the workflow.
-            if not expected_edges:
-                sys.exit('No targets launched successfully — nothing to run.')
-            first = wait_for_first_edge(bc, expected_edges)
-            print(f'\n— First edge up: {first} —')
-            matched = next((r for r in created if r.get('edge_name') == first),
-                           None)
-            matched_cfg = (matched or {}).get('cfg') or {}
-
-            if WORKLOAD == 'rose':
-                asyncio.run(run_rose_workflow(bridge_url, first, matched_cfg))
-            elif WORKLOAD == 'rhapsody':
-                # See _main_demo for why we fetch the nodelist here.
-                try:
-                    nodelist = bc.get_edge_client(first) \
-                                 .get_plugin('queue_info').nodelist()
-                except Exception as exc:
-                    sys.exit(f'queue_info.nodelist failed for {first}: {exc}')
-                if not nodelist:
-                    sys.exit(f'edge {first!r} reported empty nodelist '
-                             '(queue_info not loaded, or edge not in alloc)')
-                asyncio.run(submit_rhapsody_workload(bridge_url, first,
-                                                    matched_cfg, nodelist))
-            else:
-                sys.exit(f'unknown WORKLOAD={WORKLOAD!r} '
-                         f"(expected 'rose' or 'rhapsody')")
-
-        finally:
-            # 5. Tear down what we created — runs whether the workflow
-            #    finished, raised, or we never got that far.  Stragglers
-            #    from our submission set keep running idle until their
-            #    walltime expires (simpler than racing cancels).
-            teardown(bc, created)
-
+        _main_target(bc, bridge_url, kind, name,
+                     slicing_mode=slicing_mode, n_nodes=n_nodes)
     finally:
         bc.close()
-
-    # Only printed when the run completed without an unhandled exception.
-    # If the workflow or teardown raised, the traceback is the last word.
-    print('\nDone.')
+        print()
 
 
 if __name__ == '__main__':

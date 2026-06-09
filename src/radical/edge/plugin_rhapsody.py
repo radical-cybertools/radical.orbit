@@ -196,6 +196,35 @@ class RhapsodySession(PluginSession):
             self._init_ready.set()
             log.info("[%s] Session initialization complete", self._sid)
 
+            # Probe: log Dragon's view of node hostnames so we can compare
+            # against what queue_info.nodelist() / amsc.py is using for
+            # Policy(host_name=…).  A mismatch silently turns HOST_NAME
+            # placement into a no-op and tasks pile up on whichever node
+            # Dragon's default policy lands them.
+            #
+            # ``System().nodes`` returns huids (int).  ``Node(huid)``
+            # wraps each one and exposes ``.hostname``.
+            try:
+                from dragon.native.machine import (
+                    System as _DragonSystem, Node as _DragonNode)
+                _dragon_hosts = [str(_DragonNode(h).hostname)
+                                 for h in _DragonSystem().nodes]
+                log.info("[%s] dragon System().nodes hostnames: %s",
+                         self._sid, _dragon_hosts)
+                # Probe accelerator visibility — if Policy(gpu_affinity=…)
+                # is being silently dropped, dragon's _get_gpu_affinity
+                # filters our request against node.accelerators.device_list
+                # (== Node.gpus).  Empty/None/wrong-vocabulary list here
+                # explains why CUDA_VISIBLE_DEVICES never gets set.
+                for _h in _DragonSystem().nodes:
+                    _n = _DragonNode(_h)
+                    log.info("[%s] dragon node %s: gpus=%s vendor=%s env=%s",
+                             self._sid, _n.hostname,
+                             _n.gpus, _n.gpu_vendor, _n.gpu_env_str)
+            except Exception as _e:
+                log.info("[%s] dragon hostname probe skipped: %s",
+                         self._sid, _e)
+
         except Exception as e:
             self._init_error = str(e)
             self._init_ready.set()  # unblock waiters

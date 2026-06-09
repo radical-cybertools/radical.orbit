@@ -92,9 +92,12 @@ import logging
 import urllib3
 import json
 import itertools
+
+from .http_utils import make_http_client
 import threading
 
-from typing import Any, Dict, List, Optional, Callable, Tuple
+import time as _time
+from typing import Any, Dict, Iterable, List, Optional, Callable, Tuple, Union
 
 from . import _prof as rprof
 
@@ -205,7 +208,7 @@ class BridgeClient:
             self._prof.prof('client_recv', uid=req_id,
                             state=str(response.status_code))
 
-        self._http: httpx.Client = httpx.Client(
+        self._http: httpx.Client = make_http_client(
             base_url=self._url,
             verify=self._cert if self._cert else False,
             # Match the bridge's REQUEST_TIMEOUT (600s).  Submit batches
@@ -385,6 +388,55 @@ class BridgeClient:
         data = resp.json().get('data', {})
         edges = data.get('edges', {})
         return list(edges.keys())
+
+    def wait_for_edge(self,
+                      names: Union[str, Iterable[str]],
+                      timeout: float = 1800.0,
+                      poll: float = 3.0,
+                      on_heartbeat: Optional[Callable[[], None]] = None,
+                      heartbeat_interval: float = 10.0,
+                      ) -> str:
+        """Block until any of *names* appears in :meth:`list_edges`.
+
+        Args:
+            names:              Edge name or iterable of names to wait for.
+            timeout:            Maximum seconds to wait.
+            poll:               Seconds between :meth:`list_edges` polls.
+            on_heartbeat:       Optional callback fired at most every
+                                ``heartbeat_interval`` seconds while we
+                                are still waiting.  Useful for printing
+                                progress dots during long queue waits;
+                                kept outside this class so the API
+                                doesn't touch stdout.
+            heartbeat_interval: Minimum seconds between heartbeat
+                                callbacks; ignored when on_heartbeat
+                                is None.
+
+        Returns:
+            The first name from *names* observed live.
+
+        Raises:
+            TimeoutError: No expected name appeared within *timeout*.
+            ValueError:   *names* is empty.
+        """
+        expected = [names] if isinstance(names, str) else list(names)
+        if not expected:
+            raise ValueError('no edge names — nothing to wait for')
+
+        start_t = _time.time()
+        last_hb = start_t
+        while _time.time() - start_t < timeout:
+            live = set(self.list_edges())
+            for name in expected:
+                if name in live:
+                    return name
+            _time.sleep(poll)
+            if on_heartbeat is not None \
+                    and _time.time() - last_hb >= heartbeat_interval:
+                on_heartbeat()
+                last_hb = _time.time()
+        raise TimeoutError(f'no edge appeared within {timeout}s; '
+                           f'expected one of {expected}')
 
     def get_edge_client(self, edge_id: str) -> "EdgeClient":
         """
