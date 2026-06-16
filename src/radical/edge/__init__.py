@@ -39,6 +39,11 @@ try:
 except ImportError:
     pass
 
+try:
+    from .plugin_globus import PluginGlobus  # noqa: F401
+except ImportError:
+    pass
+
 
 # ── Version (generated at install time) ──────────────────────────────────────
 
