@@ -245,6 +245,10 @@ class GlobusSession(PluginSession):
         res     = _as_dict(await self._call(
             self._tc.submit_transfer, tdata, context='submit_transfer'))
         task_id = res.get('task_id')
+        if not task_id:
+            raise HTTPException(
+                status_code=502,
+                detail='Globus submit_transfer: missing task_id in response')
 
         self._tasks[task_id] = {'status': 'ACTIVE', 'label': label or ''}
         self._start_polling()
