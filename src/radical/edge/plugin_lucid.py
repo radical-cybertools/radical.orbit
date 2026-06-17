@@ -171,8 +171,8 @@ class PluginLucid(Plugin):
     @classmethod
     def is_enabled(cls, app: FastAPI) -> bool:
         """Lucid loads on compute nodes only (RADICAL Pilot)."""
-        from .batch_system import detect_batch_system
-        return detect_batch_system().in_allocation()
+        from .utils import host_role
+        return host_role(app)['role'] == 'compute'
 
     def __init__(self, app: FastAPI):
         """

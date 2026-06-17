@@ -39,3 +39,8 @@ nosetests.xml
 .project
 .pydevproject
 .idea
+.vscode
+
+# System
+.DS_Store
+Thumbs.db

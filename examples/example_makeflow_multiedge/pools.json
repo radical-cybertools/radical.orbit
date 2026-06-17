@@ -1,0 +1,50 @@
+{
+  "pools": [
+    {
+      "name": "cpu",
+      "queue": "batch",
+      "account": null,
+      "default_size": "small",
+      "pilot_sizes": {
+        "small": {
+          "nodes": 1,
+          "cpus_per_node": 4,
+          "walltime_sec": 1800,
+          "rhapsody_backend": "concurrent"
+        },
+        "large": {
+          "nodes": 2,
+          "cpus_per_node": 8,
+          "walltime_sec": 3600,
+          "rhapsody_backend": "concurrent"
+        }
+      },
+      "min_pilots": 0,
+      "max_pilots": 2,
+      "strategy": "conservative",
+      "strategy_config": {
+        "min_dwell_sec": 20,
+        "max_in_flight_submissions": 1,
+        "router_preference": "least_loaded"
+      }
+    },
+    {
+      "name": "gpu",
+      "queue": "gpu",
+      "account": null,
+      "default_size": "single",
+      "pilot_sizes": {
+        "single": {
+          "nodes": 1,
+          "cpus_per_node": 16,
+          "gpus_per_node": 1,
+          "walltime_sec": 3600,
+          "rhapsody_backend": "concurrent"
+        }
+      },
+      "min_pilots": 0,
+      "max_pilots": 1,
+      "strategy": "conservative"
+    }
+  ]
+}

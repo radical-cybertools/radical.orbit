@@ -1,0 +1,50 @@
+# ============================================================================
+#  Four-rule Makeflow across two pools on two edges.
+#
+#  Rule graph:
+#
+#     gen (edge_a, cpu)
+#         │
+#         ▼
+#     clean (edge_a, cpu)
+#         │            ──► cross-edge file transfer
+#         ▼
+#     analyze (edge_b, gpu)
+#         │            ──► cross-edge file transfer
+#         ▼
+#     summarize (edge_a, cpu)
+#
+#  The commands use only coreutils so the example runs anywhere.  The
+#  point is the DAG shape — two cross-edge transitions bounce their
+#  intermediate files through the client, demonstrating the
+#  dispatcher's staging pass-through without a shared filesystem.
+# ============================================================================
+
+# -- Pool 1: CPU pool on edge_a -----------------------------------------------
+EDGE = "edge_a"
+POOL = "cpu"
+PRIORITY = 0
+
+raw.txt:
+	head -c 256 /dev/urandom | base64 > raw.txt
+
+clean.txt: raw.txt
+	tr -cd 'A-Za-z0-9\n' < raw.txt > clean.txt
+
+# -- Pool 2: GPU pool on edge_b -----------------------------------------------
+EDGE = "edge_b"
+POOL = "gpu"
+PRIORITY = 10
+
+# "analyze" would be a real GPU kernel in a real workflow; here we just
+# count characters so the DAG can run with only coreutils installed.
+counts.txt: clean.txt
+	wc -c < clean.txt > counts.txt
+
+# -- Back to edge_a for final aggregation -------------------------------------
+EDGE = "edge_a"
+POOL = "cpu"
+PRIORITY = 20
+
+summary.txt: clean.txt counts.txt
+	printf "characters: " > summary.txt ; cat counts.txt >> summary.txt ; echo "sample:" >> summary.txt ; head -c 40 clean.txt >> summary.txt ; echo >> summary.txt

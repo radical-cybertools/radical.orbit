@@ -227,6 +227,21 @@ setup_args = {
     'data_files'         : data,
     'cmdclass'           : {'upload'        : RunTwine,
                             'build_scripts' : BuildScripts},
+    'entry_points'       : {
+        # Pluggable task-dispatcher strategies.  In-tree strategies are
+        # also discoverable via the built-in registry in
+        # ``task_dispatcher_strategy.py::_builtin_strategies`` so they
+        # work in editable/uninstalled checkouts; entry points matter
+        # mainly for third-party strategies shipped as separate packages.
+        'radical.edge.task_dispatcher.strategies': [
+            'conservative = '
+            'radical.edge.task_dispatcher_strategy_conservative'
+            ':ConservativeStrategy',
+            'aggressive_scale_to_backlog = '
+            'radical.edge.task_dispatcher_strategy_examples'
+            ':AggressiveScaleToBacklogStrategy',
+        ],
+    },
 }
 
 

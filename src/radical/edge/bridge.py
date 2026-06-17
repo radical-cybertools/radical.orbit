@@ -236,7 +236,8 @@ class Bridge:
 
                 self.bridge_plugin_host = BridgePluginHost(
                     names, self._broadcast_event, BRIDGE_EDGE_NAME,
-                    on_topology_changed=_on_topology_changed)
+                    on_topology_changed=_on_topology_changed,
+                    bridge_url=self._url)
                 self.endpoints['edges'][BRIDGE_EDGE_NAME] = \
                     self.bridge_plugin_host.get_topology_info()
                 self._plugin_ui_module_js.update(

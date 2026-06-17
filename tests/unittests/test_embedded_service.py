@@ -145,8 +145,17 @@ async def test_embedded_service_tls_hostname_fallback(monkeypatch, tmp_path, cap
 
     monkeypatch.setattr(service_mod.websockets, 'connect', fake_connect)
 
-    with caplog.at_level(logging.WARNING, logger="radical.edge"):
-        await service.run()
+    # The 'radical.edge' logger is configured with propagate=False (see
+    # logging_config.configure_logging), so caplog's root handler never
+    # sees its records.  Attach caplog's handler to that logger directly
+    # for the duration of the call instead of relying on propagation.
+    re_logger = logging.getLogger("radical.edge")
+    re_logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.WARNING, logger="radical.edge"):
+            await service.run()
+    finally:
+        re_logger.removeHandler(caplog.handler)
 
     assert len(ssl_contexts) == 2
     assert ssl_contexts[0].check_hostname is True

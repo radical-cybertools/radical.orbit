@@ -167,9 +167,14 @@ class RhapsodySession(PluginSession):
 
             self._rh_session = rh.Session(backends=backends, uid=self._sid)
 
-            self._telemetry = await self._rh_session.start_telemetry(
-                resource_poll_interval=0.1, checkpoint_path=f"telemetry-output"
-                )
+            # start_telemetry only exists on newer rhapsody; older
+            # installs don't support it. Skip silently if unavailable.
+            self._telemetry = None
+            start_telemetry = getattr(self._rh_session, 'start_telemetry', None)
+            if start_telemetry is not None:
+                self._telemetry = await start_telemetry(
+                    resource_poll_interval=0.1,
+                    checkpoint_path="telemetry-output")
 
             # Register state-change callbacks for intermediate notifications
             self._notified_states: dict[str, str] = {}
@@ -1355,11 +1360,8 @@ class PluginRhapsody(Plugin):
         standalone hosts (no batch system at all).  Both can host Dragon
         workers; bridges and login nodes deliberately don't load Rhapsody.
         """
-        if getattr(app.state, 'is_bridge', False):
-            return False
-        from .batch_system import detect_batch_system
-        bs = detect_batch_system()
-        return bs.in_allocation() or bs.name == 'none'
+        from .utils import host_role
+        return host_role(app)['role'] in ('compute', 'standalone')
 
     def __init__(self, app: FastAPI, instance_name: str = "rhapsody"):
         super().__init__(app, instance_name)
@@ -1387,6 +1389,16 @@ class PluginRhapsody(Plugin):
             data = {}
 
         backend_names       = data.get('backends')
+        # Edge-startup default: when the client doesn't specify a
+        # backend, honour $RADICAL_EDGE_RHAPSODY_BACKEND so the edge
+        # operator can pick the right backend at service launch time
+        # (e.g. 'concurrent' on a laptop without Dragon).  Falls back
+        # to the session class's own default ('dragon_v3') if neither
+        # is set.
+        if not backend_names:
+            env_backend = os.environ.get('RADICAL_EDGE_RHAPSODY_BACKEND')
+            if env_backend:
+                backend_names = [env_backend]
         notify_batch_window = data.get('notify_batch_window',
                                        NOTIFY_BATCH_WINDOW)
         notify_batch_size   = data.get('notify_batch_size',

@@ -35,7 +35,7 @@ def test_staging_session_put_creates_parent_dirs(tmp_path):
     content_b64 = base64.b64encode(content).decode('ascii')
 
     import asyncio
-    result = asyncio.get_event_loop().run_until_complete(
+    result = asyncio.run(
         session.put_file(str(nested_path), content_b64)
     )
 
@@ -54,7 +54,7 @@ def test_staging_session_put_success(tmp_path):
     content_b64 = base64.b64encode(content).decode('ascii')
 
     import asyncio
-    result = asyncio.get_event_loop().run_until_complete(
+    result = asyncio.run(
         session.put_file(str(target), content_b64)
     )
 
@@ -75,7 +75,7 @@ def test_staging_session_put_target_exists_raises(tmp_path):
 
     import asyncio
     with pytest.raises(FileExistsError) as exc_info:
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             session.put_file(str(target), content_b64)
         )
 
@@ -90,7 +90,7 @@ def test_staging_session_put_relative_path_raises(tmp_path):
 
     import asyncio
     with pytest.raises(ValueError) as exc_info:
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             session.put_file("relative/path.txt", content_b64)
         )
 
@@ -107,7 +107,7 @@ def test_staging_session_get_success(tmp_path):
     source.write_bytes(content)
 
     import asyncio
-    result = asyncio.get_event_loop().run_until_complete(
+    result = asyncio.run(
         session.get_file(str(source))
     )
 
@@ -125,7 +125,7 @@ def test_staging_session_get_not_found_raises(tmp_path):
 
     import asyncio
     with pytest.raises(FileNotFoundError) as exc_info:
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             session.get_file(str(missing))
         )
 
@@ -138,7 +138,7 @@ def test_staging_session_get_relative_path_raises(tmp_path):
 
     import asyncio
     with pytest.raises(ValueError) as exc_info:
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             session.get_file("relative/path.txt")
         )
 
@@ -254,7 +254,7 @@ def test_staging_session_list_success(tmp_path):
     (tmp_path / "subdir" / "nested.txt").write_text("nested")
 
     import asyncio
-    result = asyncio.get_event_loop().run_until_complete(
+    result = asyncio.run(
         session.list_dir(str(tmp_path))
     )
 
@@ -287,7 +287,7 @@ def test_staging_session_list_empty_dir(tmp_path):
     empty_dir.mkdir()
 
     import asyncio
-    result = asyncio.get_event_loop().run_until_complete(
+    result = asyncio.run(
         session.list_dir(str(empty_dir))
     )
 
@@ -303,7 +303,7 @@ def test_staging_session_list_not_found_raises(tmp_path):
 
     import asyncio
     with pytest.raises(FileNotFoundError) as exc_info:
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             session.list_dir(str(missing))
         )
 
@@ -320,7 +320,7 @@ def test_staging_session_list_not_a_directory_raises(tmp_path):
 
     import asyncio
     with pytest.raises(NotADirectoryError) as exc_info:
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             session.list_dir(str(file_path))
         )
 
@@ -333,7 +333,7 @@ def test_staging_session_list_relative_path_raises(tmp_path):
 
     import asyncio
     with pytest.raises(ValueError) as exc_info:
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             session.list_dir("relative/path")
         )
 

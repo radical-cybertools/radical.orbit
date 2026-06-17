@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""radical-edge-makeflow — one-shot prep + makeflow.
+
+Convenience wrapper around ``radical-edge-makeflow-prep`` and the
+``makeflow`` binary.  Preprocesses the input in a temporary directory,
+then invokes ``makeflow`` with any passthrough flags.
+
+Usage:
+    radical-edge-makeflow INPUT.makeflow [-- makeflow-args...]
+    radical-edge-makeflow --default-edge=e --default-pool=p INPUT.makeflow
+
+Examples:
+    radical-edge-makeflow workflow.makeflow
+    radical-edge-makeflow workflow.makeflow -- -T local -j 4
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+from pathlib import Path
+
+
+def _split_argv(argv: list[str]) -> tuple[list[str], list[str]]:
+    '''Split at the first ``--`` separator.  Passthrough args default
+    to empty if no ``--`` is given.
+    '''
+    try:
+        sep = argv.index('--')
+    except ValueError:
+        return argv[1:], []
+    return argv[1:sep], argv[sep + 1:]
+
+
+def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv
+
+    prep_args, makeflow_args = _split_argv(argv)
+
+    ap = argparse.ArgumentParser(
+        prog='radical-edge-makeflow',
+        description='Preprocess and run a .makeflow via the task dispatcher.')
+    ap.add_argument('input', type=Path,
+                    help='input .makeflow file')
+    ap.add_argument('--default-edge',     dest='default_edge')
+    ap.add_argument('--default-pool',     dest='default_pool')
+    ap.add_argument('--default-priority', dest='default_priority',
+                    type=int, default=0)
+    ap.add_argument('--keep-prepped', action='store_true',
+                    help='keep the preprocessed .makeflow (default: delete)')
+    args = ap.parse_args(prep_args)
+
+    if not args.input.is_file():
+        print(f'radical-edge-makeflow: input not found: {args.input}',
+              file=sys.stderr)
+        return 2
+
+    makeflow_bin = shutil.which('makeflow')
+    if makeflow_bin is None:
+        print('radical-edge-makeflow: makeflow binary not found in PATH',
+              file=sys.stderr)
+        return 2
+
+    with tempfile.TemporaryDirectory(prefix='radical-edge-makeflow-') as td:
+        prepped = Path(td) / (args.input.name + '.prepped')
+
+        prep_cmd = [_find_prep(), str(args.input), '-o', str(prepped)]
+        if args.default_edge:
+            prep_cmd += ['--default-edge', args.default_edge]
+        if args.default_pool:
+            prep_cmd += ['--default-pool', args.default_pool]
+        if args.default_priority:
+            prep_cmd += ['--default-priority', str(args.default_priority)]
+
+        rc = subprocess.call(prep_cmd)
+        if rc != 0:
+            return rc
+
+        if args.keep_prepped:
+            keep = args.input.with_suffix(args.input.suffix + '.prepped')
+            shutil.copy2(prepped, keep)
+            print(f'kept prepped file at {keep}', file=sys.stderr)
+
+        # Hand off to makeflow.  Our prepped file may live in a
+        # temp dir; set cwd to the user's working dir so relative
+        # inputs/outputs resolve where the user expects.
+        return subprocess.call(
+            [makeflow_bin, str(prepped)] + makeflow_args,
+            cwd=os.getcwd())
+
+
+def _find_prep() -> str:
+    '''Locate ``radical-edge-makeflow-prep``.
+
+    Normally it lives next to us on ``PATH`` after install.  Fall back
+    to the adjacent file for in-tree invocations.
+    '''
+    found = shutil.which('radical-edge-makeflow-prep')
+    if found:
+        return found
+    candidate = Path(__file__).resolve().with_name(
+        'radical-edge-makeflow-prep')
+    if candidate.is_file():
+        return str(candidate)
+    raise FileNotFoundError(
+        'radical-edge-makeflow-prep not found; install the package or '
+        'ensure it is on PATH')
+
+
+if __name__ == '__main__':
+    sys.exit(main())
