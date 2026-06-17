@@ -306,7 +306,7 @@ def make_queue_info(batch=None, conf_path=None) -> 'QueueInfo':
     # site specializations like AuroraPBSBatchSystem (name='pbs-aurora',
     # psij_executor='pbs') still route to the PBS queue_info backend.
     if batch.psij_executor == 'slurm':
-        from .queue_info_slurm import QueueInfoSlurm
+        from .queue_info_slurm import QueueInfoSlurm  # noqa: F811
         return QueueInfoSlurm(slurm_conf=conf_path)
     if batch.psij_executor == 'pbs':
         from .queue_info_pbs import QueueInfoPBSPro

@@ -25,8 +25,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import httpx
-
 from fastapi import FastAPI, HTTPException, Request
 
 from .http_utils import make_async_http_client

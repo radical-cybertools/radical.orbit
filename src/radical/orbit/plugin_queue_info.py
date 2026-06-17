@@ -117,7 +117,7 @@ class QueueInfoSession(PluginSession):
         try:
             await asyncio.to_thread(batch.cancel, job_id)
         except RuntimeError as exc:
-            raise HTTPException(status_code=500, detail=str(exc))
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
         return {'job_id': job_id, 'status': 'canceled'}
 
     async def list_allocations(self, user=None, force=False):
@@ -402,7 +402,7 @@ class PluginQueueInfo(Plugin):
             alloc = await asyncio.to_thread(self.get_job_allocation)
             return {'allocation': alloc}
         except RuntimeError as exc:
-            raise HTTPException(status_code=500, detail=str(exc))
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     async def nodelist_endpoint(self, request: Request) -> dict:
         """Session-less endpoint: expanded hostnames in *this* endpoint's allocation.

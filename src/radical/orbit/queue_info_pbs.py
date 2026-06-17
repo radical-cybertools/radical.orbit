@@ -144,7 +144,8 @@ def _user_groups(user: str) -> set:
     Returns an empty set on any resolver failure.
     """
     try:
-        import pwd, grp, os  # local import; stdlib only
+        import pwd  # local import; stdlib only
+        import grp
         pw = pwd.getpwnam(user)
         gids = os.getgrouplist(user, pw.pw_gid)
         names = set()

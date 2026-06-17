@@ -86,7 +86,6 @@ Register for endpoint connect/disconnect events::
     client.register_topology_callback(on_topology_change)
 """
 
-import os
 import httpx
 import logging
 import urllib3

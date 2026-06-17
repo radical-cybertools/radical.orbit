@@ -29,8 +29,8 @@ ignore          =
      C901,
      # Do not use bare 'except'
      E722,
-     # allow line breaks after binary operators
-     W504,
+     # allow line breaks before/after binary operators
+     W503, W504,
      # allow lambda assignment (used for partial callbacks)
      E731,
      # multiple statements per lin

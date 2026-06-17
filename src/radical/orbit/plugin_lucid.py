@@ -7,7 +7,6 @@ __license__   = 'MIT'
 
 
 import asyncio
-import os
 
 from fastapi import FastAPI
 from starlette.requests import Request

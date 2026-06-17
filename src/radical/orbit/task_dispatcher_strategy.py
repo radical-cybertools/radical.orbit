@@ -193,21 +193,18 @@ class DispatchStrategy(ABC):
     def on_task_arrived(self, ctx: StrategyContext,
                         task: 'TaskRecord') -> None:
         '''A new task entered the pending queue.'''
-        ...
 
     @abstractmethod
     def on_pilot_state(self, ctx: StrategyContext,
                        pilot: 'PilotRecord',
                        old_state: str, new_state: str) -> None:
         '''A pilot transitioned (PENDING → STARTING → ACTIVE → DONE/FAILED).'''
-        ...
 
     @abstractmethod
     def on_task_finished(self, ctx: StrategyContext,
                          task: 'TaskRecord',
                          pilot: 'PilotRecord') -> None:
         '''A task reached terminal state.  Pilot has freed capacity.'''
-        ...
 
     def on_tick(self, ctx: StrategyContext) -> None:
         '''Periodic wake-up (~5 s).  Default no-op.
@@ -229,7 +226,6 @@ class DispatchStrategy(ABC):
         A strategy may drain multiple tasks per event by returning one
         pair per call.
         '''
-        ...
 
     def should_terminate_pilot(self, ctx: StrategyContext,
                                pilot: 'PilotRecord') -> bool:

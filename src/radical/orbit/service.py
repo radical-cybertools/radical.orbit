@@ -4,7 +4,6 @@ import base64
 import json
 import logging
 import os
-import pathlib
 import random
 import ssl
 import socket
@@ -75,7 +74,6 @@ class RequestShim:
         else:
             self._decoded = json.loads(self._body) if self._body else {}
         return self._decoded
-
 
 
 # Re-export for backward compatibility (bridge_plugin_host.py, tests, etc.)
@@ -726,9 +724,6 @@ class EndpointService(PluginHostBase):
         already past us by this point.  Tunnel setup is much more
         predictable than the work that got the child to this line.
         """
-        import json
-        import os
-        import socket
         from urllib.parse import urlparse, urlunparse
         from . import tunnel as _tunnel
 

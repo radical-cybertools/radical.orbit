@@ -315,7 +315,7 @@ class RhapsodySession(PluginSession):
             except (ImportError, AttributeError) as e:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"cannot resolve function '{fn}': {e}")
+                    detail=f"cannot resolve function '{fn}': {e}") from e
 
         return td
 
