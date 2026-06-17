@@ -8,16 +8,16 @@ Demonstrates the queue_info plugin which exposes SLURM queue information,
 job listings, and allocation data via REST.
 
 Usage:
-  # default — connects to the first registered edge
+  # default — connects to the first registered endpoint
   ./examples/01_queue_info.py
 
   # multi-cluster — load a second plugin instance with a custom name
   ./examples/01_queue_info.py --name=frontier --slurm_conf=/etc/slurm/frontier.conf
 
 Prerequisites:
-  - Bridge running   (bin/radical-edge-bridge.py)
-  - Edge running     (bin/radical-edge-service.py)
-  - SLURM commands available on the edge node (sinfo, squeue, sacctmgr)
+  - Bridge running   (bin/orbit-bridge.py)
+  - Endpoint running     (bin/orbit-endpoint.py)
+  - SLURM commands available on the endpoint node (sinfo, squeue, sacctmgr)
 """
 
 import argparse
@@ -38,7 +38,7 @@ def main():
     parser.add_argument('--name',   default=None,
                         help='Plugin name (for multi-cluster setups)')
     parser.add_argument('--slurm_conf', default=None,
-                        help='Path to slurm.conf on the edge node')
+                        help='Path to slurm.conf on the endpoint node')
     parser.add_argument('--queue',  default=None,
                         help='Partition name for job listing')
     parser.add_argument('--user',   default=None,
@@ -67,7 +67,7 @@ def main():
         if args.slurm_conf:
             params['slurm_conf'] = args.slurm_conf
 
-        r    = http.post(f"{args.bridge}/edge/load_plugin/radical.queue_info",
+        r    = http.post(f"{args.bridge}/endpoint/load_plugin/radical.queue_info",
                          params=params)
         data = check(r, "load_plugin")
         ns   = data['namespace']

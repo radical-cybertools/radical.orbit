@@ -32,7 +32,7 @@
   </defs>
 
   <!-- Title -->
-  <text x="800" y="40" class="title-text" text-anchor="middle" font-size="24">Radical Edge System Architecture</text>
+  <text x="800" y="40" class="title-text" text-anchor="middle" font-size="24">ORBIT System Architecture</text>
 
   <!-- ============ PORTAL NODE ============ -->
   <g id="portal-node">
@@ -45,15 +45,15 @@
     <text x="100" y="215" class="small-text">Runtime: httpx.Client</text>
     <text x="100" y="240" class="small-text">Operations:</text>
     <text x="120" y="265" class="small-text">• Makes HTTP/HTTPS requests</text>
-    <text x="120" y="290" class="small-text">• Calls /edge/load_plugin/{pname}</text>
-    <text x="120" y="315" class="small-text">• Calls /edge/list</text>
+    <text x="120" y="290" class="small-text">• Calls /endpoint/load_plugin/{pname}</text>
+    <text x="120" y="315" class="small-text">• Calls /endpoint/list</text>
     <text x="120" y="340" class="small-text">• Uses cert.pem for TLS verification</text>
   </g>
 
-  <!-- ============ EDGE HOST NODE ============ -->
+  <!-- ============ ENDPOINT HOST NODE ============ -->
   <g id="bridge-node">
     <rect x="570" y="100" width="420" height="520" class="node-box" rx="10"/>
-    <text x="590" y="135" class="title-text">Open Edge Host</text>
+    <text x="590" y="135" class="title-text">Open Endpoint Host</text>
     
     <!-- Bridge Component -->
     <rect x="600" y="160" width="360" height="440" class="component-box" rx="5"/>
@@ -61,21 +61,21 @@
     <text x="620" y="215" class="small-text">Runtime: FastAPI (uvicorn), Port 8000 (HTTPS)</text>
     
     <text x="620" y="245" class="small-text" font-weight="bold">HTTP Endpoints:</text>
-    <text x="640" y="270" class="small-text">POST /edge/list</text>
-    <text x="640" y="295" class="small-text">/{full_path:path} → proxy to Edge via WebSocket</text>
+    <text x="640" y="270" class="small-text">POST /endpoint/list</text>
+    <text x="640" y="295" class="small-text">/{full_path:path} → proxy to Endpoint via WebSocket</text>
     
     <text x="620" y="325" class="small-text" font-weight="bold">WebSocket Endpoint:</text>
-    <text x="640" y="350" class="small-text">/register (accepts connections from Edge)</text>
+    <text x="640" y="350" class="small-text">/register (accepts connections from Endpoint)</text>
     
     <text x="620" y="380" class="small-text" font-weight="bold">State:</text>
-    <text x="640" y="405" class="small-text">endpoints: Dict[edge_uid, Dict[ep_uid, endpoint]]</text>
-    <text x="640" y="430" class="small-text">edge_ws: WebSocket connection to Edge</text>
+    <text x="640" y="405" class="small-text">endpoints: Dict[endpoint_uid, Dict[ep_uid, endpoint]]</text>
+    <text x="640" y="430" class="small-text">endpoint_ws: WebSocket connection to Endpoint</text>
     <text x="640" y="455" class="small-text">pending: Dict[req_id, Future] for responses</text>
     
     <text x="620" y="485" class="small-text" font-weight="bold">Functions:</text>
     <text x="640" y="510" class="small-text">• Receives client requests via HTTPS</text>
     <text x="640" y="535" class="small-text">• Wraps as JSON messages with req_id</text>
-    <text x="640" y="560" class="small-text">• Sends via WebSocket to Edge Service</text>
+    <text x="640" y="560" class="small-text">• Sends via WebSocket to Endpoint Service</text>
     <text x="640" y="585" class="small-text">• Returns responses to client</text>
   </g>
 
@@ -92,24 +92,24 @@
     <rect x="1170" y="100" width="380" height="780" class="node-box" rx="10"/>
     <text x="1190" y="135" class="title-text">HPC Cluster (Compute Node)</text>
     
-    <!-- Edge Service Component -->
+    <!-- Endpoint Service Component -->
     <rect x="1200" y="160" width="320" height="400" class="component-box" rx="5"/>
-    <text x="1220" y="190" class="label-text" font-weight="bold">Edge Service</text>
+    <text x="1220" y="190" class="label-text" font-weight="bold">Endpoint Service</text>
     <text x="1220" y="215" class="small-text">Runtime: FastAPI (uvicorn), Port 8001 (local)</text>
     
     <text x="1220" y="245" class="small-text" font-weight="bold">Components:</text>
-    <text x="1240" y="270" class="small-text">EdgeService class</text>
+    <text x="1240" y="270" class="small-text">EndpointService class</text>
     <text x="1240" y="295" class="small-text">main_loop() - manages WebSocket</text>
     <text x="1240" y="320" class="small-text">handle_request() - processes requests</text>
     
     <text x="1220" y="350" class="small-text" font-weight="bold">Endpoints:</text>
-    <text x="1240" y="375" class="small-text">POST /edge/load_plugin/{pname}</text>
+    <text x="1240" y="375" class="small-text">POST /endpoint/load_plugin/{pname}</text>
     <text x="1240" y="400" class="small-text">(Plugins add additional endpoints)</text>
     
     <text x="1220" y="430" class="small-text" font-weight="bold">State:</text>
     <text x="1240" y="455" class="small-text">_ws: WebSocket to Bridge</text>
     <text x="1240" y="480" class="small-text">_http: httpx.AsyncClient (loopback)</text>
-    <text x="1240" y="505" class="small-text">_uuid: edge_uid (unique identifier)</text>
+    <text x="1240" y="505" class="small-text">_uuid: endpoint_uid (unique identifier)</text>
     <text x="1240" y="530" class="small-text">_plugins: Dict[pname, plugin_instance]</text>
     
     <!-- Plugins -->
@@ -122,7 +122,7 @@
     <text x="1260" y="750" class="small-text">• Additional routes registered to app</text>
     <text x="1260" y="775" class="small-text">• Plugin-specific functionality</text>
     <text x="1220" y="805" class="small-text" font-style="italic">Plugins are dynamically loaded via</text>
-    <text x="1220" y="830" class="small-text" font-style="italic">/edge/load_plugin/{pname} endpoint</text>
+    <text x="1220" y="830" class="small-text" font-style="italic">/endpoint/load_plugin/{pname} endpoint</text>
   </g>
 
   <!-- ============ CONNECTIONS ============ -->
@@ -154,15 +154,15 @@
     <rect x="50" y="430" width="380" height="320" class="info-box" rx="5"/>
     <text x="70" y="460" class="label-text" font-weight="bold">Communication Flow:</text>
     <text x="70" y="490" class="small-text" font-weight="bold">Connection Establishment:</text>
-    <text x="90" y="515" class="small-text">1. Edge Service connects to Bridge via WSS</text>
-    <text x="90" y="540" class="small-text">2. Sends register message with edge_uid</text>
+    <text x="90" y="515" class="small-text">1. Endpoint Service connects to Bridge via WSS</text>
+    <text x="90" y="540" class="small-text">2. Sends register message with endpoint_uid</text>
     <text x="90" y="565" class="small-text">3. WebSocket remains open (persistent tunnel)</text>
     
     <text x="70" y="600" class="small-text" font-weight="bold">Request Processing:</text>
     <text x="90" y="625" class="small-text">4. Client sends HTTPS request to Bridge</text>
     <text x="90" y="650" class="small-text">5. Bridge wraps in JSON message with req_id</text>
-    <text x="90" y="675" class="small-text">6. Bridge sends message via WebSocket to Edge</text>
-    <text x="90" y="700" class="small-text">7. Edge forwards to local FastAPI (loopback)</text>
+    <text x="90" y="675" class="small-text">6. Bridge sends message via WebSocket to Endpoint</text>
+    <text x="90" y="700" class="small-text">7. Endpoint forwards to local FastAPI (loopback)</text>
     <text x="90" y="725" class="small-text">8. Response flows back via WebSocket to Bridge</text>
   </g>
 
@@ -173,7 +173,7 @@
     <text x="90" y="840" class="small-text">• Reverse tunnel bypasses firewall</text>
     <text x="90" y="865" class="small-text">• Request/response matching via req_id (UUID)</text>
     <text x="90" y="890" class="small-text">• Binary-safe (base64 encoding for binary data)</text>
-    <text x="90" y="915" class="small-text">• TLS encryption: Client↔Bridge, Bridge↔Edge</text>
+    <text x="90" y="915" class="small-text">• TLS encryption: Client↔Bridge, Bridge↔Endpoint</text>
     <text x="90" y="940" class="small-text">• Dynamic plugin loading and registration</text>
     <text x="90" y="965" class="small-text">• Concurrent request processing (queue + workers)</text>
   </g>
@@ -187,7 +187,7 @@
     <text x="610" y="785" class="mono-text">{ "type": "request",</text>
     <text x="625" y="810" class="mono-text">"req_id": "uuid-string",</text>
     <text x="625" y="835" class="mono-text">"method": "POST",</text>
-    <text x="625" y="860" class="mono-text">"path": "/edge/load_plugin/radical.lucid",</text>
+    <text x="625" y="860" class="mono-text">"path": "/endpoint/load_plugin/radical.lucid",</text>
     <text x="625" y="885" class="mono-text">"headers": {...},</text>
     <text x="625" y="910" class="mono-text">"is_binary": false,</text>
     <text x="625" y="935" class="mono-text">"body": "..." }</text>

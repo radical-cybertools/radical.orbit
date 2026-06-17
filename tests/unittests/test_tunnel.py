@@ -1,5 +1,5 @@
 """Unit tests for the SSH tunnel helper and the compute-side
-EdgeService._open_tunnel flow."""
+EndpointService._open_tunnel flow."""
 
 import asyncio
 import io
@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from radical.edge import tunnel as _tunnel
+from radical.orbit import tunnel as _tunnel
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +72,7 @@ def test_spawn_tunnel_uses_picked_port(tmp_path, monkeypatch,
     with patch('subprocess.Popen', return_value=proc) as popen:
         got_proc, got_port = _tunnel.spawn_tunnel(
             login_host='login01', bridge_host='bridge',
-            bridge_port=8000, edge_name='myedge')
+            bridge_port=8000, endpoint_name='myendpoint')
 
     assert got_port == port
     assert got_proc is proc
@@ -85,8 +85,8 @@ def test_spawn_tunnel_uses_picked_port(tmp_path, monkeypatch,
     assert '-R' not in argv
     assert argv[-1] == 'login01'
 
-    assert (tmp_path / 'myedge.port').read_text() == str(port)
-    assert (tmp_path / 'myedge.pid').read_text()  == '4321'
+    assert (tmp_path / 'myendpoint.port').read_text() == str(port)
+    assert (tmp_path / 'myendpoint.pid').read_text()  == '4321'
 
 
 def test_spawn_tunnel_raises_when_ssh_exits(tmp_path, monkeypatch):
@@ -169,18 +169,18 @@ def test_parse_allocated_port_times_out_without_output():
 
 
 # ---------------------------------------------------------------------------
-# EdgeService._open_tunnel
+# EndpointService._open_tunnel
 # ---------------------------------------------------------------------------
 
-def _make_edge_service(bridge_url='http://bridge:8000', tunnel_via=None):
-    """Build an EdgeService without going through the plugin loader.
+def _make_endpoint_service(bridge_url='http://bridge:8000', tunnel_via=None):
+    """Build an EndpointService without going through the plugin loader.
 
     Default URL uses ``http://`` (not ``https://``) so the cert
     resolution path is skipped — these tests don't exercise TLS.
     """
-    from radical.edge.service import EdgeService
-    with patch('radical.edge.service.EdgeService._load_plugins_from_filter'):
-        svc = EdgeService(bridge_url=bridge_url, name='edge1',
+    from radical.orbit.service import EndpointService
+    with patch('radical.orbit.service.EndpointService._load_plugins_from_filter'):
+        svc = EndpointService(bridge_url=bridge_url, name='endpoint1',
                           tunnel='forward', tunnel_via=tunnel_via)
     return svc
 
@@ -191,7 +191,7 @@ def test_open_tunnel_uses_explicit_via(tmp_path, monkeypatch,
     for k in ('PBS_O_HOST', 'SLURM_SUBMIT_HOST'):
         monkeypatch.delenv(k, raising=False)
     port = patch_port_and_listener
-    svc = _make_edge_service(tunnel_via='login42')
+    svc = _make_endpoint_service(tunnel_via='login42')
 
     proc = _FakeProc()
     with patch('subprocess.Popen', return_value=proc):
@@ -207,7 +207,7 @@ def test_open_tunnel_falls_back_to_pbs_o_host(tmp_path, monkeypatch,
     monkeypatch.setenv('PBS_O_HOST', 'aurora-uan-0010')
     monkeypatch.delenv('SLURM_SUBMIT_HOST', raising=False)
     port = patch_port_and_listener
-    svc = _make_edge_service()
+    svc = _make_endpoint_service()
 
     proc = _FakeProc()
     with patch('subprocess.Popen', return_value=proc) as popen:
@@ -222,7 +222,7 @@ def test_open_tunnel_falls_back_to_slurm_submit_host(tmp_path, monkeypatch,
     monkeypatch.setattr(_tunnel, 'RELAY_BASE', tmp_path)
     monkeypatch.delenv('PBS_O_HOST', raising=False)
     monkeypatch.setenv('SLURM_SUBMIT_HOST', 'login3')
-    svc = _make_edge_service()
+    svc = _make_endpoint_service()
 
     proc = _FakeProc()
     with patch('subprocess.Popen', return_value=proc) as popen:
@@ -235,7 +235,7 @@ def test_open_tunnel_raises_without_login_host(tmp_path, monkeypatch):
     monkeypatch.setattr(_tunnel, 'RELAY_BASE', tmp_path)
     for k in ('PBS_O_HOST', 'SLURM_SUBMIT_HOST'):
         monkeypatch.delenv(k, raising=False)
-    svc = _make_edge_service()
+    svc = _make_endpoint_service()
 
     with pytest.raises(RuntimeError, match='no login host'):
         asyncio.run(svc._open_tunnel_forward())
@@ -243,7 +243,7 @@ def test_open_tunnel_raises_without_login_host(tmp_path, monkeypatch):
 
 def test_stop_terminates_tunnel_process(tmp_path, monkeypatch):
     monkeypatch.setattr(_tunnel, 'RELAY_BASE', tmp_path)
-    svc = _make_edge_service(tunnel_via='login42')
+    svc = _make_endpoint_service(tunnel_via='login42')
     fake_proc = MagicMock()
     fake_proc.wait.return_value = 0
     svc._tunnel_proc = fake_proc

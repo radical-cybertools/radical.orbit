@@ -24,23 +24,23 @@ The plugin consists of three layers:
    and ``sacctmgr`` with ``--json`` output and parses the results.
 
 ``PluginQueueInfo``
-   Edge plugin that exposes the backend via REST endpoints and manages
+   Endpoint plugin that exposes the backend via REST endpoints and manages
    per-client sessions.
 
 
 Multi-cluster support
 =====================
 
-Multiple instances of the plugin can be loaded on a single edge service,
+Multiple instances of the plugin can be loaded on a single endpoint service,
 each targeting a different SLURM cluster:
 
 .. code-block:: bash
 
    # load for cluster A
-   curl -X POST "https://bridge:8000/edge/load_plugin/radical.queue_info?name=cluster_a&slurm_conf=/etc/slurm/cluster_a.conf"
+   curl -X POST "https://bridge:8000/endpoint/load_plugin/radical.queue_info?name=cluster_a&slurm_conf=/etc/slurm/cluster_a.conf"
 
    # load for cluster B
-   curl -X POST "https://bridge:8000/edge/load_plugin/radical.queue_info?name=cluster_b&slurm_conf=/etc/slurm/cluster_b.conf"
+   curl -X POST "https://bridge:8000/endpoint/load_plugin/radical.queue_info?name=cluster_b&slurm_conf=/etc/slurm/cluster_b.conf"
 
 Each instance gets its own namespace, client pool, and cache.
 
@@ -174,4 +174,4 @@ Extending to other batch systems
 Subclass ``QueueInfo`` and implement ``_collect_info``,
 ``_collect_jobs``, and ``_collect_allocations``.  Register the new
 backend class alongside ``QueueInfoSlurm`` in
-``src/radical/edge/queue_info.py``.
+``src/radical/orbit/queue_info.py``.

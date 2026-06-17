@@ -6,8 +6,8 @@ import pytest
 
 from fastapi import FastAPI
 
-from radical.edge.plugin_base      import Plugin
-from radical.edge.plugin_host_base import (
+from radical.orbit.plugin_base      import Plugin
+from radical.orbit.plugin_host_base import (
     PluginHostBase,
     _resolve_plugin_names,
     _discover_entry_points,

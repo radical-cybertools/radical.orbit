@@ -91,7 +91,7 @@ async def test_watch_task_isolation_between_sessions():
     Verifies that _watch_task for session 1 doesn't interfere with session 2.
     Both sessions should be completely independent.
     """
-    from radical.edge.plugin_rhapsody import RhapsodySession
+    from radical.orbit.plugin_rhapsody import RhapsodySession
 
     notify_calls = []
 

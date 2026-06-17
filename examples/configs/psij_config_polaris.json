@@ -1,5 +1,5 @@
 {
-    "edge_id_prefix": "polaris",
+    "endpoint_id_prefix": "polaris",
     "job_executor": "pbs",
     "job_spec": {
         "executable": "/bin/sleep",

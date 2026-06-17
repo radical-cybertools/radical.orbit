@@ -48,7 +48,7 @@ Name resolution happens in three stages (see
    ``aggressive_scale_to_backlog`` strategy so they work without a
    ``pip install`` step in editable checkouts.
 3. Otherwise Python entry points in the
-   ``radical.edge.task_dispatcher.strategies`` group are consulted.
+   ``radical.orbit.task_dispatcher.strategies`` group are consulted.
    This is how third-party strategies shipped as separate packages
    become discoverable.
 
@@ -113,7 +113,7 @@ actual psij submission / bridge call happens on a worker.
 
 ### ``conservative`` (default)
 
-File: ``src/radical/edge/task_dispatcher_strategy_conservative.py``.
+File: ``src/radical/orbit/task_dispatcher_strategy_conservative.py``.
 
 Favors efficient utilization over low latency.
 
@@ -137,7 +137,7 @@ Config knobs:
 
 ### ``aggressive_scale_to_backlog``
 
-File: ``src/radical/edge/task_dispatcher_strategy_examples.py``.
+File: ``src/radical/orbit/task_dispatcher_strategy_examples.py``.
 
 Favors low queue latency over efficient utilization.  Demonstration /
 research reference.
@@ -165,9 +165,9 @@ Subclass ``DispatchStrategy`` and implement the abstract methods.  The
 minimum:
 
 ```python
-from radical.edge.task_dispatcher_strategy import (
+from radical.orbit.task_dispatcher_strategy import (
     DispatchStrategy, StrategyContext)
-from radical.edge.task_dispatcher_state    import (
+from radical.orbit.task_dispatcher_state    import (
     PILOT_ACTIVE, TASK_QUEUED)
 
 
@@ -197,7 +197,7 @@ or register it as an entry point and use its short name:
 
 ```toml
 # pyproject.toml in your package
-[project.entry-points."radical.edge.task_dispatcher.strategies"]
+[project.entry-points."radical.orbit.task_dispatcher.strategies"]
 my_strategy = "my_package.my_module:MyStrategy"
 ```
 
@@ -235,8 +235,8 @@ under a burst, conservative never terminates pilots, etc.).
 
 Marked with ``FIXME(per-task-backend)`` in code:
 
-- ``src/radical/edge/plugin_task_dispatcher.py::PluginTaskDispatcher._assign``
-- ``src/radical/edge/task_dispatcher_strategy.py::DispatchStrategy``
+- ``src/radical/orbit/plugin_task_dispatcher.py::PluginTaskDispatcher._assign``
+- ``src/radical/orbit/task_dispatcher_strategy.py::DispatchStrategy``
 
 A natural next hook would be
 ``strategy.pick_backend(ctx, task, pilot) -> str | None``, letting a

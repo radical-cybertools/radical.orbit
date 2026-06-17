@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Generate RP-style plots from radical.prof Edge profile data.
+Generate RP-style plots from radical.prof Endpoint profile data.
 
-Reads client.prof, bridge.prof, edge.prof from a directory, combines
+Reads client.prof, bridge.prof, endpoint.prof from a directory, combines
 them into a single timeline, and produces 8 plots:
 
   Infrastructure (req.* UIDs):
@@ -11,7 +11,7 @@ them into a single timeline, and produces 8 plots:
     plot_conc.png   — concurrent requests per phase (step plot)
     plot_rate.png   — request throughput rate
 
-  End-to-end tasks (per task UID, client + edge events):
+  End-to-end tasks (per task UID, client + endpoint events):
     plot_rh_state.png — per-task event timeline (submit → complete)
     plot_rh_dur.png   — per-task phase durations (log scale)
     plot_rh_conc.png  — per-phase task concurrency (step plot)
@@ -71,7 +71,7 @@ plt.rcParams.update(_STYLE)
 def load_profiles(prof_dir):
     """Find and load .prof files, return combined timeline."""
 
-    patterns = ['client.prof', 'client.task.prof', 'bridge.prof', 'edge.prof']
+    patterns = ['client.prof', 'client.task.prof', 'bridge.prof', 'endpoint.prof']
     prof_files = []
     for pat in patterns:
         prof_files.extend(glob.glob(os.path.join(prof_dir, pat)))
@@ -87,7 +87,7 @@ def load_profiles(prof_dir):
     for f in prof_files:
         print(f"  {f}")
 
-    profs = rprof.read_profiles(prof_files, sid='edge.benchmark')
+    profs = rprof.read_profiles(prof_files, sid='endpoint.benchmark')
     combined, _ = rprof.combine_profiles(profs)
     return combined
 
@@ -119,7 +119,7 @@ def build_task_events(combined):
     """Index end-to-end task events by task UID.
 
     Collects events from both client-side (task_submit, task_batch_flush,
-    task_complete) and edge-side (rh_task_exec, rh_task_done,
+    task_complete) and endpoint-side (rh_task_exec, rh_task_done,
     notify_queue, notify_flush) profiles.
 
     Returns:
@@ -175,10 +175,10 @@ INFRA_EVENT_LIST = [
     ('client_send',       'client send'),
     ('bridge_recv',       'bridge recv'),
     ('bridge_ws_sent',    'bridge WS sent'),
-    ('edge_recv',         'edge recv'),
-    ('edge_handler',      'edge handler'),
-    ('edge_handler_done', 'edge handler done'),
-    ('edge_ws_sent',      'edge WS sent'),
+    ('endpoint_recv',         'endpoint recv'),
+    ('endpoint_handler',      'endpoint handler'),
+    ('endpoint_handler_done', 'endpoint handler done'),
+    ('endpoint_ws_sent',      'endpoint WS sent'),
     ('bridge_reply',      'bridge reply'),
     ('client_recv',       'client recv'),
 ]
@@ -187,11 +187,11 @@ INFRA_EVENT_LIST = [
 INFRA_PHASES = [
     ('client_send',       'bridge_recv',       'client -> bridge'),
     ('bridge_recv',       'bridge_ws_sent',    'bridge inbound'),
-    ('bridge_ws_sent',    'edge_recv',         'bridge -> edge WS'),
-    ('edge_recv',         'edge_handler',      'edge routing'),
-    ('edge_handler',      'edge_handler_done', 'edge handler'),
-    ('edge_handler_done', 'edge_ws_sent',      'edge outbound'),
-    ('edge_ws_sent',      'bridge_reply',      'bridge outbound'),
+    ('bridge_ws_sent',    'endpoint_recv',         'bridge -> endpoint WS'),
+    ('endpoint_recv',         'endpoint_handler',      'endpoint routing'),
+    ('endpoint_handler',      'endpoint_handler_done', 'endpoint handler'),
+    ('endpoint_handler_done', 'endpoint_ws_sent',      'endpoint outbound'),
+    ('endpoint_ws_sent',      'bridge_reply',      'bridge outbound'),
     ('bridge_reply',      'client_recv',       'bridge -> client'),
 ]
 
@@ -203,7 +203,7 @@ def plot_infra_state(requests, prof_dir):
     for rid in requests:
         events = requests[rid]['_events']
         t0 = events.get('client_send', events.get('bridge_recv',
-             events.get('edge_recv')))
+             events.get('endpoint_recv')))
         if t0 is None:
             continue
         tstamps = [events.get(evt, np.nan) for evt, _ in INFRA_EVENT_LIST]
@@ -325,8 +325,8 @@ def plot_infra_rate(requests, prof_dir):
 
     metrics = {
         'bridge recv':   'bridge_recv',
-        'handler start': 'edge_handler',
-        'handler done':  'edge_handler_done',
+        'handler start': 'endpoint_handler',
+        'handler done':  'endpoint_handler_done',
         'client recv':   'client_recv',
     }
     metric_colors = {
@@ -360,9 +360,9 @@ def plot_infra_rate(requests, prof_dir):
         if not ts:
             continue
         rel = [(t - global_t0) for t in ts]
-        counts, edges = np.histogram(rel, bins=bins)
+        counts, endpoints = np.histogram(rel, bins=bins)
         rate    = counts / bin_width
-        centers = (edges[:-1] + edges[1:]) / 2 * 1000
+        centers = (endpoints[:-1] + endpoints[1:]) / 2 * 1000
         ax.plot(centers, rate, label=m, color=metric_colors[m])
 
     ax.set_xlabel('time (ms)')
@@ -383,8 +383,8 @@ def plot_infra_rate(requests, prof_dir):
 TASK_EVENT_LIST = [
     ('task_submit',      'client submit'),
     ('task_batch_flush', 'client flush'),
-    ('rh_task_exec',     'edge exec'),
-    ('rh_task_done',     'edge done'),
+    ('rh_task_exec',     'endpoint exec'),
+    ('rh_task_done',     'endpoint done'),
     ('notify_queue',     'notify queue'),
     ('notify_flush',     'notify flush'),
     ('task_complete',    'client complete'),
@@ -538,14 +538,14 @@ def plot_rh_rate(task_events, prof_dir):
 
     metrics = {
         'client submit': 'task_submit',
-        'edge exec':     'rh_task_exec',
-        'edge done':     'rh_task_done',
+        'endpoint exec':     'rh_task_exec',
+        'endpoint done':     'rh_task_done',
         'client done':   'task_complete',
     }
     metric_colors = {
         'client submit': '#4e79a7',
-        'edge exec':     '#f28e2b',
-        'edge done':     '#59a14f',
+        'endpoint exec':     '#f28e2b',
+        'endpoint done':     '#59a14f',
         'client done':   '#e15759',
     }
 
@@ -573,9 +573,9 @@ def plot_rh_rate(task_events, prof_dir):
         if not ts:
             continue
         rel = [(t - global_t0) for t in ts]
-        counts, edges = np.histogram(rel, bins=bins)
+        counts, endpoints = np.histogram(rel, bins=bins)
         rate    = counts / bin_width
-        centers = (edges[:-1] + edges[1:]) / 2 * 1000
+        centers = (endpoints[:-1] + endpoints[1:]) / 2 * 1000
         ax.plot(centers, rate, label=m, color=metric_colors[m])
 
     ax.set_xlabel('time (ms)')

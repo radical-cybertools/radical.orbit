@@ -7,7 +7,7 @@ import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
-from radical.edge.plugin_staging import PluginStaging, StagingSession
+from radical.orbit.plugin_staging import PluginStaging, StagingSession
 
 
 def test_plugin_staging_init():
@@ -476,7 +476,7 @@ def test_check_target_not_exists_ok(tmp_path):
 def test_staging_client_put_no_session(tmp_path):
     """StagingClient.put() must raise if no session is active."""
     import httpx
-    from radical.edge.plugin_staging import StagingClient
+    from radical.orbit.plugin_staging import StagingClient
     http = httpx.Client(base_url="http://fake")
     client = StagingClient(http, "/staging")
     with pytest.raises(RuntimeError, match="session"):
@@ -486,7 +486,7 @@ def test_staging_client_put_no_session(tmp_path):
 def test_staging_client_put_local_not_found(tmp_path):
     """StagingClient.put() raises FileNotFoundError for missing local file."""
     import httpx
-    from radical.edge.plugin_staging import StagingClient
+    from radical.orbit.plugin_staging import StagingClient
     http = httpx.Client(base_url="http://fake")
     client = StagingClient(http, "/staging")
     client._sid = "fake-sid"

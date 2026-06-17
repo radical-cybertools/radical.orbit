@@ -14,9 +14,9 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      RADICAL_EDGE_IMAGE: radicalcybertools/radical.edge
-      RADICAL_EDGE_TAG: dev
-      RADICAL_EDGE_BRANCH: ${{ github.base_ref || 'devel' }}
+      RADICAL_ORBIT_IMAGE: radicalcybertools/radical.orbit
+      RADICAL_ORBIT_TAG: dev
+      RADICAL_ORBIT_BRANCH: ${{ github.base_ref || 'devel' }}
       RADICAL_BRIDGE_HOSTNAME: bridge
 
     defaults:
@@ -36,27 +36,27 @@ jobs:
           context: examples/docker
           push: false
           load: true
-          tags: ${{ env.RADICAL_EDGE_IMAGE }}:${{ env.RADICAL_EDGE_TAG }}
+          tags: ${{ env.RADICAL_ORBIT_IMAGE }}:${{ env.RADICAL_ORBIT_TAG }}
           build-args: |
             GENERATE_BRIDGE_CERT=true
             BRIDGE_HOSTNAME=${{ env.RADICAL_BRIDGE_HOSTNAME }}
-            RADICAL_EDGE_BRANCH=${{ env.RADICAL_EDGE_BRANCH }}
+            RADICAL_ORBIT_BRANCH=${{ env.RADICAL_ORBIT_BRANCH }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Start containers
         run: docker compose up -d --no-build --wait
 
-      - name: Wait for edge service to connect
+      - name: Wait for endpoint service to connect
         run: |
           timeout 60 bash -c \
-            'until docker compose logs edge 2>&1 | \
+            'until docker compose logs endpoint 2>&1 | \
              grep -q "Connected"; do sleep 2; done'
 
       - name: Run example (sysinfo)
         run: |
-          docker exec radical-edge-client bash -c \
-            "cd /app/radical.edge/examples && \
+          docker exec orbit-client bash -c \
+            "cd /app/radical.orbit/examples && \
              python3 example_sysinfo.py"
 
       - name: Show logs on failure

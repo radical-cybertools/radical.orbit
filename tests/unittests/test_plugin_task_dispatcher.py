@@ -4,7 +4,7 @@ Focus: plugin-level behavior that does not require a live bridge —
 routing decisions, cached-state idempotency, stage_in/stage_out,
 pilot_handshake binding, and strategy interaction.
 
-All network paths (BridgeClient → psij / rhapsody on remote edges) are
+All network paths (BridgeClient → psij / rhapsody on remote endpoints) are
 stubbed; the plugin's in-process state is exercised directly.
 """
 
@@ -18,11 +18,11 @@ import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
-from radical.edge.plugin_task_dispatcher import (
+from radical.orbit.plugin_task_dispatcher import (
     PluginTaskDispatcher, PoolState,
 )
-from radical.edge.task_dispatcher_config import PoolConfig, PilotSize
-from radical.edge.task_dispatcher_state   import (
+from radical.orbit.task_dispatcher_config import PoolConfig, PilotSize
+from radical.orbit.task_dispatcher_state   import (
     PilotRecord, TaskRecord,
     PILOT_PENDING, PILOT_ACTIVE, PILOT_FAILED, PILOT_DONE,
     TASK_QUEUED, TASK_RUNNING, TASK_DONE, TASK_FAILED, TASK_CANCELED,
@@ -39,7 +39,7 @@ def _make_pool_cfg(*, pool_name: str = 'cpu',
     """Build a test-fixture PoolConfig (matches the old _write_pools_json shape)."""
     return PoolConfig(
         name         = pool_name,
-        edge_name    = 'edge0',
+        endpoint_name    = 'endpoint0',
         queue        = 'batch',
         account      = 'proj',
         pilot_sizes  = {
@@ -64,7 +64,7 @@ def _make_plugin(tmp_path: Path, *, pool_name: str = 'cpu',
     tests that need a dispatcher with zero pools.
     """
     app = FastAPI()
-    app.state.edge_name  = 'edge0'
+    app.state.endpoint_name  = 'endpoint0'
     app.state.bridge_url = 'https://localhost:9999'
 
     plugin = PluginTaskDispatcher(
@@ -85,13 +85,13 @@ class TestInit:
 
     def test_is_enabled_on_bridge(self):
         """is_enabled returns True when host role is 'bridge'."""
-        with patch('radical.edge.utils.host_role') as m:
+        with patch('radical.orbit.utils.host_role') as m:
             m.return_value = {'role': 'bridge'}
             assert PluginTaskDispatcher.is_enabled(FastAPI()) is True
 
     def test_is_enabled_false_off_bridge(self):
         """is_enabled returns False on login / compute / standalone hosts."""
-        with patch('radical.edge.utils.host_role') as m:
+        with patch('radical.orbit.utils.host_role') as m:
             for role in ('login', 'compute', 'standalone'):
                 m.return_value = {'role': role}
                 assert PluginTaskDispatcher.is_enabled(FastAPI()) is False, \
@@ -182,7 +182,7 @@ class TestSessionDrivenPools:
     def _pool_dict(self, **overrides):
         d = {
             'name'        : 'gpu',
-            'edge_name'   : 'edge_remote',
+            'endpoint_name'   : 'endpoint_remote',
             'queue'       : 'batch',
             'account'     : None,
             'default_size': 's',
@@ -203,7 +203,7 @@ class TestSessionDrivenPools:
                                 body={'pools': [self._pool_dict()]})
         assert sid
         assert 'gpu' in plugin._pool_states
-        assert plugin._pool_states['gpu'].config.edge_name == 'edge_remote'
+        assert plugin._pool_states['gpu'].config.endpoint_name == 'endpoint_remote'
 
     def test_session_with_no_pools_materialises_default(self, tmp_path: Path):
         _, plugin = _make_plugin(tmp_path, write_config=False)
@@ -260,7 +260,7 @@ class TestStateSweeper:
         _, plugin = _make_plugin(tmp_path, write_config=False)
         state_root = tmp_path / 'state'
         state_root.mkdir(exist_ok=True)
-        stale = state_root / 'oldpool__edge_gone'
+        stale = state_root / 'oldpool__endpoint_gone'
         stale.mkdir()
         (stale / 'pilot.log').write_text('{}\n')
         # Age the only file in the dir to 40 days old.
@@ -274,8 +274,8 @@ class TestStateSweeper:
         '''A dir matching an active pool is NEVER pruned, even if old.'''
         import os
         _, plugin = _make_plugin(tmp_path)   # 'cpu' pool active
-        # _make_plugin built state at state/cpu__edge0/ as part of PoolState init.
-        active_dir = tmp_path / 'state' / 'cpu__edge0'
+        # _make_plugin built state at state/cpu__endpoint0/ as part of PoolState init.
+        active_dir = tmp_path / 'state' / 'cpu__endpoint0'
         if active_dir.exists():
             for p in active_dir.iterdir():
                 old = (active_dir.stat().st_mtime - 365 * 86400)
@@ -288,7 +288,7 @@ class TestStateSweeper:
         _, plugin = _make_plugin(tmp_path, write_config=False)
         state_root = tmp_path / 'state'
         state_root.mkdir(exist_ok=True)
-        fresh = state_root / 'recent__edge_x'
+        fresh = state_root / 'recent__endpoint_x'
         fresh.mkdir()
         (fresh / 'pilot.log').write_text('{}\n')
         plugin._prune_stale_state_dirs()
@@ -311,15 +311,15 @@ class TestBridgeHostLoadsDispatcher:
 
     @pytest.fixture
     def host(self, tmp_path: Path, monkeypatch):
-        from radical.edge.bridge_plugin_host import BridgePluginHost
+        from radical.orbit.bridge_plugin_host import BridgePluginHost
         # Steer the dispatcher's default state/scratch roots at tmp_path
         # so the host's auto-built plugin doesn't pollute $HOME.
         monkeypatch.setenv('RADICAL_BRIDGE_URL', 'https://localhost:9999')
         monkeypatch.setattr(
-            'radical.edge.plugin_task_dispatcher._DEFAULT_STATE_ROOT',
+            'radical.orbit.plugin_task_dispatcher._DEFAULT_STATE_ROOT',
             tmp_path / 'state')
         monkeypatch.setattr(
-            'radical.edge.plugin_task_dispatcher._DEFAULT_SCRATCH_ROOT',
+            'radical.orbit.plugin_task_dispatcher._DEFAULT_SCRATCH_ROOT',
             tmp_path / 'scratch')
         broadcasts: list = []
 
@@ -329,7 +329,7 @@ class TestBridgeHostLoadsDispatcher:
         host = BridgePluginHost(
             plugin_names=['task_dispatcher'],
             broadcast_fn=broadcast,
-            edge_name='bridge',
+            endpoint_name='bridge',
             bridge_url='https://localhost:9999')
         return host
 
@@ -369,7 +369,7 @@ class TestBridgeHostLoadsDispatcher:
 
     def test_dispatcher_is_bridge_role(self, host):
         '''The dispatcher's is_enabled returns True under the bridge host.'''
-        from radical.edge.plugin_task_dispatcher import PluginTaskDispatcher
+        from radical.orbit.plugin_task_dispatcher import PluginTaskDispatcher
         assert PluginTaskDispatcher.is_enabled(host._app) is True
 
 
@@ -617,14 +617,14 @@ class TestStagingRoutes:
 
 class TestTopologyBinding:
 
-    def _new_pending(self, plugin, pid='p.1', child='edge0_p.1',
+    def _new_pending(self, plugin, pid='p.1', child='endpoint0_p.1',
                     state=PILOT_PENDING):
         ps = plugin._pool_states['cpu']
         ps.pilots[pid] = PilotRecord(
             pid=pid, pool='cpu', size_key='s',
             rhapsody_backend='concurrent',
             state=state, submitted_at=100.0,
-            child_edge_name=child)
+            child_endpoint_name=child)
         return ps
 
     def test_topology_binds_pending_pilot(self, tmp_path: Path):
@@ -633,14 +633,14 @@ class TestTopologyBinding:
         ps = self._new_pending(plugin)
         with patch.object(ps.strategy, 'on_pilot_state') as spy:
             asyncio.run(plugin.on_topology_change(
-                {'edge0_p.1': {'plugins': ['rhapsody']}}))
+                {'endpoint0_p.1': {'plugins': ['rhapsody']}}))
         assert ps.pilots['p.1'].state == PILOT_ACTIVE
         # capacity = nodes(1) * cpus_per_node(4) from _make_plugin's pool
         assert ps.pilots['p.1'].capacity == 4
         assert ps.pilots['p.1'].active_at is not None
         spy.assert_called_once()
 
-    def test_topology_ignores_unknown_edges(self, tmp_path: Path):
+    def test_topology_ignores_unknown_endpoints(self, tmp_path: Path):
         _, plugin = _make_plugin(tmp_path)
         plugin._loops_started = True
         ps = self._new_pending(plugin)
@@ -653,7 +653,7 @@ class TestTopologyBinding:
         plugin._loops_started = True
         ps = self._new_pending(plugin, state=PILOT_FAILED)
         asyncio.run(plugin.on_topology_change(
-            {'edge0_p.1': {'plugins': ['rhapsody']}}))
+            {'endpoint0_p.1': {'plugins': ['rhapsody']}}))
         assert ps.pilots['p.1'].state == PILOT_FAILED   # unchanged
 
     def test_topology_no_op_before_started(self, tmp_path: Path):
@@ -661,7 +661,7 @@ class TestTopologyBinding:
         # Don't flip _loops_started — emulate startup race
         ps = self._new_pending(plugin)
         asyncio.run(plugin.on_topology_change(
-            {'edge0_p.1': {'plugins': ['rhapsody']}}))
+            {'endpoint0_p.1': {'plugins': ['rhapsody']}}))
         assert ps.pilots['p.1'].state == PILOT_PENDING
 
 
@@ -757,7 +757,7 @@ class TestDispatchDrain:
             pid='p.1', pool='cpu', size_key='s',
             rhapsody_backend='concurrent',
             state=PILOT_ACTIVE, capacity=4, in_flight=0,
-            child_edge_name='edge0_p.1',
+            child_endpoint_name='endpoint0_p.1',
             walltime_deadline=10_000.0, submitted_at=0.0, active_at=10.0)
 
         # Prevent the async rhapsody submit from running
@@ -797,7 +797,7 @@ class TestPilotSubmitTunnelArg:
         psij_mock.submit_tunneled.return_value = {'job_id': 'fake-jid'}
 
         with patch.object(plugin, '_get_psij_client', return_value=psij_mock), \
-             patch('radical.edge.batch_system.detect_batch_system') as bs:
+             patch('radical.orbit.batch_system.detect_batch_system') as bs:
             bs.return_value.psij_executor = 'local'
             asyncio.run(plugin._do_pilot_submit(ps, record, size))
 
@@ -811,22 +811,22 @@ class TestPilotSubmitTunnelArg:
 
 
 # ---------------------------------------------------------------------------
-# Edge-mode submit (transparent proxy to a target edge's rhapsody)
+# Endpoint-mode submit (transparent proxy to a target endpoint's rhapsody)
 # ---------------------------------------------------------------------------
 
-class TestEdgeModeSubmit:
-    '''Submit/get/cancel paths that target an edge directly (no pool).
+class TestEndpointModeSubmit:
+    '''Submit/get/cancel paths that target an endpoint directly (no pool).
 
     These tests stub :meth:`_get_rhapsody_client` so no real bridge or
-    HTTP traffic is needed.  ``_connected_edges`` is poked directly to
+    HTTP traffic is needed.  ``_connected_endpoints`` is poked directly to
     simulate a topology update (the test client doesn't run the bridge
     WS subscription thread).
     '''
 
-    def _seed_topology(self, plugin, edge_plugins: dict):
-        '''Populate ``_connected_edges`` as on_topology_change would.'''
-        plugin._connected_edges = {
-            name: set(plugins) for name, plugins in edge_plugins.items()
+    def _seed_topology(self, plugin, endpoint_plugins: dict):
+        '''Populate ``_connected_endpoints`` as on_topology_change would.'''
+        plugin._connected_endpoints = {
+            name: set(plugins) for name, plugins in endpoint_plugins.items()
         }
 
     def test_xor_neither_set_400(self, tmp_path: Path):
@@ -844,67 +844,67 @@ class TestEdgeModeSubmit:
         client = TestClient(app)
         sid = _register_session(client, plugin)
         r = client.post(f'{plugin.namespace}/submit/{sid}', json={
-            'pool': 'cpu', 'edge': 'edge_x',
+            'pool': 'cpu', 'endpoint': 'endpoint_x',
             'task_id': 't.1', 'cmd': ['/bin/echo', 'hi'],
             'cwd': '/tmp'})
         assert r.status_code == 400
         assert 'exactly one' in r.text
 
-    def test_unknown_edge_404(self, tmp_path: Path):
+    def test_unknown_endpoint_404(self, tmp_path: Path):
         app, plugin = _make_plugin(tmp_path)
         client = TestClient(app)
         sid = _register_session(client, plugin)
-        self._seed_topology(plugin, {})   # no edges connected
+        self._seed_topology(plugin, {})   # no endpoints connected
         r = client.post(f'{plugin.namespace}/submit/{sid}', json={
-            'edge': 'ghost', 'task_id': 't.1',
+            'endpoint': 'ghost', 'task_id': 't.1',
             'cmd': ['/bin/echo', 'hi'], 'cwd': '/tmp'})
         assert r.status_code == 404
-        assert 'unknown edge: ghost' in r.text
+        assert 'unknown endpoint: ghost' in r.text
 
-    def test_edge_without_rhapsody_503(self, tmp_path: Path):
+    def test_endpoint_without_rhapsody_503(self, tmp_path: Path):
         app, plugin = _make_plugin(tmp_path)
         client = TestClient(app)
         sid = _register_session(client, plugin)
-        self._seed_topology(plugin, {'edge_dumb': ['sysinfo']})
+        self._seed_topology(plugin, {'endpoint_dumb': ['sysinfo']})
         r = client.post(f'{plugin.namespace}/submit/{sid}', json={
-            'edge': 'edge_dumb', 'task_id': 't.1',
+            'endpoint': 'endpoint_dumb', 'task_id': 't.1',
             'cmd': ['/bin/echo', 'hi'], 'cwd': '/tmp'})
         assert r.status_code == 503
         assert 'cannot run tasks' in r.text
 
-    def test_rejects_inputs_in_edge_mode(self, tmp_path: Path):
+    def test_rejects_inputs_in_endpoint_mode(self, tmp_path: Path):
         app, plugin = _make_plugin(tmp_path)
         client = TestClient(app)
         sid = _register_session(client, plugin)
-        self._seed_topology(plugin, {'edge_r': ['rhapsody']})
+        self._seed_topology(plugin, {'endpoint_r': ['rhapsody']})
         rh_mock = MagicMock()
         rh_mock.submit_tasks.return_value = [{'uid': 't.1', 'state': 'NEW'}]
         with patch.object(plugin, '_get_rhapsody_client',
                           return_value=rh_mock):
             r = client.post(f'{plugin.namespace}/submit/{sid}', json={
-                'edge': 'edge_r', 'task_id': 't.1',
+                'endpoint': 'endpoint_r', 'task_id': 't.1',
                 'cmd': ['/bin/echo', 'hi'], 'cwd': '/tmp',
                 'inputs': ['a']})
         assert r.status_code == 400
         assert 'staging not supported' in r.text or \
-               'not supported for edge-mode' in r.text
+               'not supported for endpoint-mode' in r.text
 
     def test_proxy_submit_invokes_rhapsody(self, tmp_path: Path):
         app, plugin = _make_plugin(tmp_path)
         client = TestClient(app)
         sid = _register_session(client, plugin)
-        self._seed_topology(plugin, {'edge_r': ['rhapsody', 'sysinfo']})
+        self._seed_topology(plugin, {'endpoint_r': ['rhapsody', 'sysinfo']})
         rh_mock = MagicMock()
         rh_mock.submit_tasks.return_value = [{'uid': 't.1', 'state': 'NEW'}]
         with patch.object(plugin, '_get_rhapsody_client',
                           return_value=rh_mock):
             r = client.post(f'{plugin.namespace}/submit/{sid}', json={
-                'edge': 'edge_r', 'task_id': 't.1',
+                'endpoint': 'endpoint_r', 'task_id': 't.1',
                 'cmd': ['/bin/sleep', '0'], 'cwd': '/tmp'})
         assert r.status_code == 200, r.text
         body = r.json()
         assert body['task_id'] == 't.1'
-        assert body['edge'] == 'edge_r'
+        assert body['endpoint'] == 'endpoint_r'
         # Rhapsody saw the task with the same uid + cwd carried via
         # backend_specific_kwargs (so rhapsody's concurrent backend
         # picks the right working dir).
@@ -913,14 +913,14 @@ class TestEdgeModeSubmit:
         assert submitted[0]['uid'] == 't.1'
         assert submitted[0]['executable'] == '/bin/sleep'
         assert submitted[0]['arguments'] == ['0']
-        # Edge-mode mapping recorded so get/cancel can route back.
-        assert plugin._edge_mode_tasks.get('t.1') == 'edge_r'
+        # Endpoint-mode mapping recorded so get/cancel can route back.
+        assert plugin._endpoint_mode_tasks.get('t.1') == 'endpoint_r'
 
-    def test_get_task_forwards_to_target_edge(self, tmp_path: Path):
+    def test_get_task_forwards_to_target_endpoint(self, tmp_path: Path):
         app, plugin = _make_plugin(tmp_path)
         client = TestClient(app)
         sid = _register_session(client, plugin)
-        plugin._edge_mode_tasks['t.1'] = 'edge_r'
+        plugin._endpoint_mode_tasks['t.1'] = 'endpoint_r'
         rh_mock = MagicMock()
         rh_mock.get_task.return_value = {'uid': 't.1', 'state': 'RUNNING'}
         with patch.object(plugin, '_get_rhapsody_client',
@@ -929,15 +929,15 @@ class TestEdgeModeSubmit:
         assert r.status_code == 200, r.text
         body = r.json()
         assert body['task_id'] == 't.1'
-        assert body['edge'] == 'edge_r'
+        assert body['endpoint'] == 'endpoint_r'
         assert body['result']['state'] == 'RUNNING'
         rh_mock.get_task.assert_called_once_with('t.1')
 
-    def test_cancel_task_forwards_to_target_edge(self, tmp_path: Path):
+    def test_cancel_task_forwards_to_target_endpoint(self, tmp_path: Path):
         app, plugin = _make_plugin(tmp_path)
         client = TestClient(app)
         sid = _register_session(client, plugin)
-        plugin._edge_mode_tasks['t.1'] = 'edge_r'
+        plugin._endpoint_mode_tasks['t.1'] = 'endpoint_r'
         rh_mock = MagicMock()
         rh_mock.cancel_task.return_value = {'uid': 't.1', 'state': 'CANCELED'}
         with patch.object(plugin, '_get_rhapsody_client',
@@ -946,32 +946,32 @@ class TestEdgeModeSubmit:
         assert r.status_code == 200, r.text
         rh_mock.cancel_task.assert_called_once_with('t.1')
 
-    def test_stage_in_rejects_edge_mode_task(self, tmp_path: Path):
+    def test_stage_in_rejects_endpoint_mode_task(self, tmp_path: Path):
         app, plugin = _make_plugin(tmp_path)
         client = TestClient(app)
         sid = _register_session(client, plugin)
-        plugin._edge_mode_tasks['t.1'] = 'edge_r'
+        plugin._endpoint_mode_tasks['t.1'] = 'endpoint_r'
         r = client.post(
             f'{plugin.namespace}/stage_in/{sid}/t.1',
             json={'pool': 'cpu', 'filename': 'x.txt',
                   'content_b64': base64.b64encode(b'hi').decode('ascii')})
         assert r.status_code == 400
-        assert 'edge-mode' in r.text
+        assert 'endpoint-mode' in r.text
 
-    def test_terminal_clears_edge_mode_mapping(self, tmp_path: Path):
+    def test_terminal_clears_endpoint_mode_mapping(self, tmp_path: Path):
         '''Terminal notification removes the mapping and re-emits status.'''
         _, plugin = _make_plugin(tmp_path)
-        plugin._edge_mode_tasks['t.1'] = 'edge_r'
+        plugin._endpoint_mode_tasks['t.1'] = 'endpoint_r'
         notified: list = []
         plugin._dispatch_notify = lambda topic, data: notified.append(
             (topic, data))   # type: ignore[method-assign]
         plugin._handle_task_terminal(
             't.1', TASK_DONE, {'exit_code': 0, 'error': None})
-        assert 't.1' not in plugin._edge_mode_tasks
+        assert 't.1' not in plugin._endpoint_mode_tasks
         assert len(notified) == 1
         topic, data = notified[0]
         assert topic == 'task_status'
         assert data['task_id'] == 't.1'
-        assert data['edge']    == 'edge_r'
+        assert data['endpoint']    == 'endpoint_r'
         assert data['state']   == TASK_DONE
         assert data['exit_code'] == 0

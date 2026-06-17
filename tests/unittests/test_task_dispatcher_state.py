@@ -7,7 +7,7 @@ line recovery, schema-additive replay.
 import json
 from pathlib import Path
 
-from radical.edge.task_dispatcher_state import (
+from radical.orbit.task_dispatcher_state import (
     PilotRecord, TaskRecord, StateLog,
     PILOT_PENDING, PILOT_STARTING, PILOT_ACTIVE, PILOT_DONE, PILOT_FAILED,
     PILOT_TERMINAL_STATES, PILOT_LIVE_STATES,

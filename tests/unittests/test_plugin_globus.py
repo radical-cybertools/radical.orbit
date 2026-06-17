@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 from fastapi import FastAPI, HTTPException
 
-from radical.edge.plugin_globus import (
+from radical.orbit.plugin_globus import (
     PluginGlobus,
     GlobusSession,
     detect_local_collection,
@@ -24,11 +24,11 @@ from radical.edge.plugin_globus import (
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def edge_app():
+def endpoint_app():
     app = FastAPI()
     app.state.is_bridge    = False
-    app.state.edge_service = MagicMock()
-    app.state.edge_name    = 'edge1'
+    app.state.endpoint_service = MagicMock()
+    app.state.endpoint_name    = 'endpoint1'
     app.state.bridge_url   = ''
     return app
 
@@ -37,13 +37,13 @@ def edge_app():
 def bridge_app():
     app = FastAPI()
     app.state.is_bridge    = True
-    app.state.edge_service = MagicMock()
+    app.state.endpoint_service = MagicMock()
     return app
 
 
 def _make_session(local_collection=None):
     '''Build a GlobusSession with globus_sdk patched, then a fake TransferClient.'''
-    with patch('radical.edge.plugin_globus.globus_sdk') as gs:
+    with patch('radical.orbit.plugin_globus.globus_sdk') as gs:
         session = GlobusSession('s1', access_token='tok',
                                 local_collection=local_collection)
     session._tc = MagicMock()
@@ -51,20 +51,20 @@ def _make_session(local_collection=None):
 
 
 # ---------------------------------------------------------------------------
-# is_enabled — edge-only
+# is_enabled — endpoint-only
 # ---------------------------------------------------------------------------
 
-def test_is_enabled_edge(edge_app):
-    assert PluginGlobus.is_enabled(edge_app) is True
+def test_is_enabled_endpoint(endpoint_app):
+    assert PluginGlobus.is_enabled(endpoint_app) is True
 
 
 def test_is_enabled_bridge(bridge_app):
     assert PluginGlobus.is_enabled(bridge_app) is False
 
 
-def test_is_disabled_without_sdk(edge_app):
-    with patch('radical.edge.plugin_globus.globus_sdk', None):
-        assert PluginGlobus.is_enabled(edge_app) is False
+def test_is_disabled_without_sdk(endpoint_app):
+    with patch('radical.orbit.plugin_globus.globus_sdk', None):
+        assert PluginGlobus.is_enabled(endpoint_app) is False
 
 
 # ---------------------------------------------------------------------------
@@ -72,14 +72,14 @@ def test_is_disabled_without_sdk(edge_app):
 # ---------------------------------------------------------------------------
 
 def test_session_access_token():
-    with patch('radical.edge.plugin_globus.globus_sdk') as gs:
+    with patch('radical.orbit.plugin_globus.globus_sdk') as gs:
         GlobusSession('s1', access_token='tok')
         gs.AccessTokenAuthorizer.assert_called_once_with('tok')
         gs.RefreshTokenAuthorizer.assert_not_called()
 
 
 def test_session_refresh_token():
-    with patch('radical.edge.plugin_globus.globus_sdk') as gs:
+    with patch('radical.orbit.plugin_globus.globus_sdk') as gs:
         GlobusSession('s1', refresh_token='rt', client_id='cid')
         gs.NativeAppAuthClient.assert_called_once_with('cid')
         gs.RefreshTokenAuthorizer.assert_called_once()
@@ -87,7 +87,7 @@ def test_session_refresh_token():
 
 
 def test_session_no_credential():
-    with patch('radical.edge.plugin_globus.globus_sdk'):
+    with patch('radical.orbit.plugin_globus.globus_sdk'):
         with pytest.raises(ValueError, match='provide either'):
             GlobusSession('s1')
 
@@ -124,7 +124,7 @@ async def test_submit_transfer():
     session._tc.submit_transfer.return_value = {
         'task_id': 't1', 'submission_id': 'sub1'}
 
-    with patch('radical.edge.plugin_globus.globus_sdk') as gs:
+    with patch('radical.orbit.plugin_globus.globus_sdk') as gs:
         result = await session.submit_transfer(
             'src-uuid', 'dst-uuid',
             [{'source': '/a', 'destination': '/b'}], label='job')
@@ -146,7 +146,7 @@ async def test_submit_transfer_no_items():
 @pytest.mark.asyncio
 async def test_submit_transfer_bad_item():
     session = _make_session()
-    with patch('radical.edge.plugin_globus.globus_sdk'):
+    with patch('radical.orbit.plugin_globus.globus_sdk'):
         with pytest.raises(HTTPException) as exc:
             await session.submit_transfer('s', 'd', [{'source': '/a'}])
     assert exc.value.status_code == 400
@@ -194,7 +194,7 @@ async def test_submit_delete():
     session = _make_session()
     session._tc.submit_delete.return_value = {'task_id': 'd1'}
 
-    with patch('radical.edge.plugin_globus.globus_sdk') as gs:
+    with patch('radical.orbit.plugin_globus.globus_sdk') as gs:
         result = await session.submit_delete('coll', ['/x'], recursive=True)
 
     assert result['task_id'] == 'd1'
@@ -258,34 +258,34 @@ def test_as_dict_plain_dict():
 # ---------------------------------------------------------------------------
 
 def test_detect_env_first(monkeypatch):
-    monkeypatch.setenv('RADICAL_EDGE_GLOBUS_COLLECTION', 'env-uuid')
-    with patch('radical.edge.plugin_globus.globus_sdk') as gs:
+    monkeypatch.setenv('RADICAL_ORBIT_GLOBUS_COLLECTION', 'env-uuid')
+    with patch('radical.orbit.plugin_globus.globus_sdk') as gs:
         assert detect_local_collection() == 'env-uuid'
         gs.LocalGlobusConnectPersonal.assert_not_called()
 
 
 def test_detect_gcp(monkeypatch):
-    monkeypatch.delenv('RADICAL_EDGE_GLOBUS_COLLECTION', raising=False)
-    with patch('radical.edge.plugin_globus.globus_sdk') as gs:
+    monkeypatch.delenv('RADICAL_ORBIT_GLOBUS_COLLECTION', raising=False)
+    with patch('radical.orbit.plugin_globus.globus_sdk') as gs:
         gs.LocalGlobusConnectPersonal.return_value.endpoint_id = 'gcp-uuid'
         assert detect_local_collection() == 'gcp-uuid'
 
 
 def test_detect_config_file(monkeypatch, tmp_path):
-    monkeypatch.delenv('RADICAL_EDGE_GLOBUS_COLLECTION', raising=False)
+    monkeypatch.delenv('RADICAL_ORBIT_GLOBUS_COLLECTION', raising=False)
     cfg = tmp_path / 'globus.json'
     cfg.write_text('{"local_collection": "cfg-uuid"}')
-    with patch('radical.edge.plugin_globus.globus_sdk') as gs:
+    with patch('radical.orbit.plugin_globus.globus_sdk') as gs:
         gs.LocalGlobusConnectPersonal.return_value.endpoint_id = None
-        with patch('radical.edge.plugin_globus.GLOBUS_CONFIG_FILE', str(cfg)):
+        with patch('radical.orbit.plugin_globus.GLOBUS_CONFIG_FILE', str(cfg)):
             assert detect_local_collection() == 'cfg-uuid'
 
 
 def test_detect_none(monkeypatch):
-    monkeypatch.delenv('RADICAL_EDGE_GLOBUS_COLLECTION', raising=False)
-    with patch('radical.edge.plugin_globus.globus_sdk') as gs:
+    monkeypatch.delenv('RADICAL_ORBIT_GLOBUS_COLLECTION', raising=False)
+    with patch('radical.orbit.plugin_globus.globus_sdk') as gs:
         gs.LocalGlobusConnectPersonal.return_value.endpoint_id = None
-        with patch('radical.edge.plugin_globus.GLOBUS_CONFIG_FILE',
+        with patch('radical.orbit.plugin_globus.GLOBUS_CONFIG_FILE',
                    '/nonexistent/globus.json'):
             assert detect_local_collection() is None
 
@@ -299,8 +299,8 @@ def test_ui_module_present():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_register_session_requires_credential(edge_app):
-    plugin  = PluginGlobus(edge_app)
+async def test_register_session_requires_credential(endpoint_app):
+    plugin  = PluginGlobus(endpoint_app)
     request = MagicMock()
     request.json = MagicMock(return_value={})
     # request.json is awaited in the handler
@@ -313,26 +313,26 @@ async def test_register_session_requires_credential(edge_app):
 
 
 @pytest.mark.asyncio
-async def test_register_session_access_token(edge_app):
-    plugin  = PluginGlobus(edge_app)
+async def test_register_session_access_token(endpoint_app):
+    plugin  = PluginGlobus(endpoint_app)
     request = MagicMock()
     async def _json():
         return {'access_token': 'tok'}
     request.json = _json
-    with patch('radical.edge.plugin_globus.globus_sdk'):
+    with patch('radical.orbit.plugin_globus.globus_sdk'):
         result = await plugin.register_session(request)
     assert result['sid'] in plugin._sessions
 
 
 @pytest.mark.asyncio
-async def test_register_session_default_collection(edge_app):
-    plugin = PluginGlobus(edge_app)
+async def test_register_session_default_collection(endpoint_app):
+    plugin = PluginGlobus(endpoint_app)
     plugin._default_collection = 'cfg-uuid'
     request = MagicMock()
     async def _json():
         return {'access_token': 'tok'}
     request.json = _json
-    with patch('radical.edge.plugin_globus.globus_sdk'):
+    with patch('radical.orbit.plugin_globus.globus_sdk'):
         result  = await plugin.register_session(request)
     session = plugin._sessions[result['sid']]
     assert session._local_collection == 'cfg-uuid'
@@ -343,8 +343,8 @@ async def test_register_session_default_collection(edge_app):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_submit_route(edge_app):
-    plugin = PluginGlobus(edge_app)
+async def test_submit_route(endpoint_app):
+    plugin = PluginGlobus(endpoint_app)
     session = _make_session()
     session._tc.submit_transfer.return_value = {'task_id': 't9'}
     plugin._sessions['sX'] = session
@@ -357,6 +357,6 @@ async def test_submit_route(edge_app):
                 'items': [{'source': '/a', 'destination': '/b'}]}
     request.json = _json
 
-    with patch('radical.edge.plugin_globus.globus_sdk'):
+    with patch('radical.orbit.plugin_globus.globus_sdk'):
         result = await plugin.submit_transfer(request)
     assert result['task_id'] == 't9'

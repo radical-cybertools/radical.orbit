@@ -4,42 +4,42 @@ Tests for Pydantic WebSocket message models.
 import pytest
 from pydantic import ValidationError
 
-from radical.edge.models import (
+from radical.orbit.models import (
     RegisterMessage, ResponseMessage, NotificationMessage, PongMessage,
     RequestMessage, PingMessage, ErrorMessage,
-    parse_edge_message, parse_bridge_message
+    parse_endpoint_message, parse_bridge_message
 )
 
 
-class TestEdgeToBridgeMessages:
-    """Tests for messages sent from Edge to Bridge."""
+class TestEndpointToBridgeMessages:
+    """Tests for messages sent from Endpoint to Bridge."""
 
     def test_register_message_minimal(self):
         """Test RegisterMessage with minimal fields."""
-        msg = RegisterMessage(edge_name="test-edge")
+        msg = RegisterMessage(endpoint_name="test-endpoint")
         assert msg.type == "register"
-        assert msg.edge_name == "test-edge"
+        assert msg.endpoint_name == "test-endpoint"
         assert msg.endpoint == {}
         assert msg.plugins == {}
 
     def test_register_message_with_plugins(self):
         """Test RegisterMessage with plugin data."""
         msg = RegisterMessage(
-            edge_name="test-edge",
-            plugins={"sysinfo": {"namespace": "/test-edge/sysinfo", "version": "1.0"}}
+            endpoint_name="test-endpoint",
+            plugins={"sysinfo": {"namespace": "/test-endpoint/sysinfo", "version": "1.0"}}
         )
         assert "sysinfo" in msg.plugins
-        assert msg.plugins["sysinfo"]["namespace"] == "/test-edge/sysinfo"
+        assert msg.plugins["sysinfo"]["namespace"] == "/test-endpoint/sysinfo"
 
     def test_register_message_serialization(self):
         """Test RegisterMessage JSON serialization."""
         msg = RegisterMessage(
-            edge_name="test-edge",
+            endpoint_name="test-endpoint",
             plugins={"psij": {"version": "0.1"}},
         )
         data = msg.model_dump()
         assert data["type"] == "register"
-        assert data["edge_name"] == "test-edge"
+        assert data["endpoint_name"] == "test-endpoint"
         assert "psij" in data["plugins"]
 
     def test_response_message(self):
@@ -68,13 +68,13 @@ class TestEdgeToBridgeMessages:
     def test_notification_message(self):
         """Test NotificationMessage creation."""
         msg = NotificationMessage(
-            edge="test-edge",
+            endpoint="test-endpoint",
             plugin="rhapsody",
             topic="task_status",
             data={"uid": "task-123", "state": "COMPLETED"}
         )
         assert msg.type == "notification"
-        assert msg.edge == "test-edge"
+        assert msg.endpoint == "test-endpoint"
         assert msg.plugin == "rhapsody"
         assert msg.data["uid"] == "task-123"
 
@@ -84,8 +84,8 @@ class TestEdgeToBridgeMessages:
         assert msg.type == "pong"
 
 
-class TestBridgeToEdgeMessages:
-    """Tests for messages sent from Bridge to Edge."""
+class TestBridgeToEndpointMessages:
+    """Tests for messages sent from Bridge to Endpoint."""
 
     def test_request_message(self):
         """Test RequestMessage creation."""
@@ -121,9 +121,9 @@ class TestBridgeToEdgeMessages:
 
     def test_error_message(self):
         """Test ErrorMessage creation."""
-        msg = ErrorMessage(message="Edge name already in use")
+        msg = ErrorMessage(message="Endpoint name already in use")
         assert msg.type == "error"
-        assert msg.message == "Edge name already in use"
+        assert msg.message == "Endpoint name already in use"
 
 
 class TestMessageParsing:
@@ -131,10 +131,10 @@ class TestMessageParsing:
 
     def test_parse_register_message(self):
         """Test parsing a register message."""
-        data = {"type": "register", "edge_name": "test-edge", "endpoint": {}}
-        msg = parse_edge_message(data)
+        data = {"type": "register", "endpoint_name": "test-endpoint", "endpoint": {}}
+        msg = parse_endpoint_message(data)
         assert isinstance(msg, RegisterMessage)
-        assert msg.edge_name == "test-edge"
+        assert msg.endpoint_name == "test-endpoint"
 
     def test_parse_response_message(self):
         """Test parsing a response message."""
@@ -145,7 +145,7 @@ class TestMessageParsing:
             "headers": {},
             "body": "ok"
         }
-        msg = parse_edge_message(data)
+        msg = parse_endpoint_message(data)
         assert isinstance(msg, ResponseMessage)
         assert msg.status == 200
 
@@ -153,20 +153,20 @@ class TestMessageParsing:
         """Test parsing a notification message."""
         data = {
             "type": "notification",
-            "edge": "test-edge",
+            "endpoint": "test-endpoint",
             "plugin": "psij",
             "topic": "job_status",
             "data": {"job_id": "j123"}
         }
-        msg = parse_edge_message(data)
+        msg = parse_endpoint_message(data)
         assert isinstance(msg, NotificationMessage)
-        assert msg.edge == "test-edge"
+        assert msg.endpoint == "test-endpoint"
         assert msg.topic == "job_status"
 
     def test_parse_pong_message(self):
         """Test parsing a pong message."""
         data = {"type": "pong"}
-        msg = parse_edge_message(data)
+        msg = parse_endpoint_message(data)
         assert isinstance(msg, PongMessage)
 
     def test_parse_request_message(self):
@@ -193,11 +193,11 @@ class TestMessageParsing:
         msg = parse_bridge_message(data)
         assert isinstance(msg, ErrorMessage)
 
-    def test_parse_unknown_edge_message(self):
-        """Test parsing an unknown edge message type."""
+    def test_parse_unknown_endpoint_message(self):
+        """Test parsing an unknown endpoint message type."""
         data = {"type": "unknown"}
-        with pytest.raises(ValueError, match="Unknown edge message type"):
-            parse_edge_message(data)
+        with pytest.raises(ValueError, match="Unknown endpoint message type"):
+            parse_endpoint_message(data)
 
     def test_parse_unknown_bridge_message(self):
         """Test parsing an unknown bridge message type."""

@@ -2,9 +2,9 @@
 REST API Reference
 ******************
 
-This document lists all REST endpoints exposed by the RADICAL Edge system.
+This document lists all REST endpoints exposed by the ORBIT system.
 All bridge endpoints are reachable at ``http(s)://<bridge_host>:<port>/``.
-Plugin endpoints are prefixed with ``/<edge_name>/<plugin_name>/``.
+Plugin endpoints are prefixed with ``/<endpoint_name>/<plugin_name>/``.
 
 Bridge Endpoints
 ================
@@ -25,11 +25,11 @@ These routes are served directly by the bridge process.
      - ``/events``
      - SSE stream for real-time notifications and topology changes
    * - ``POST``
-     - ``/edge/list``
-     - List connected edges and their plugins. Returns ``{"data": {"edges": {name: {plugins: {...}}}}}``
+     - ``/endpoint/list``
+     - List connected endpoints and their plugins. Returns ``{"data": {"endpoints": {name: {plugins: {...}}}}}``
    * - ``POST``
-     - ``/edge/disconnect/{name}``
-     - Gracefully disconnect an edge and terminate it
+     - ``/endpoint/disconnect/{name}``
+     - Gracefully disconnect an endpoint and terminate it
    * - ``POST``
      - ``/bridge/terminate``
      - Terminate the bridge process
@@ -37,11 +37,11 @@ These routes are served directly by the bridge process.
      - ``/plugins/{filename}``
      - Serve a JS plugin module file (used by Explorer UI)
    * - ``GET``
-     - ``/{edge_name}/{plugin}/{path}``
-     - Proxy a GET request to a plugin on the named edge
+     - ``/{endpoint_name}/{plugin}/{path}``
+     - Proxy a GET request to a plugin on the named endpoint
    * - ``POST``
-     - ``/{edge_name}/{plugin}/{path}``
-     - Proxy a POST request to a plugin on the named edge
+     - ``/{endpoint_name}/{plugin}/{path}``
+     - Proxy a POST request to a plugin on the named endpoint
 
 SSE Event Format
 ----------------
@@ -49,14 +49,14 @@ SSE Event Format
 The ``/events`` stream sends JSON-encoded events::
 
     data: {"topic": "notification", "data": {
-        "edge":   "my_edge",
+        "endpoint":   "my_endpoint",
         "plugin": "psij",
         "topic":  "job_status",
         "data":   { ... plugin-specific ... }
     }}
 
     data: {"topic": "topology", "data": {
-        "edges": {"my_edge": {"plugins": ["sysinfo", "psij"]}}
+        "endpoints": {"my_endpoint": {"plugins": ["sysinfo", "psij"]}}
     }}
 
 
@@ -204,7 +204,7 @@ without requiring a session.
      - Returns ``{"available": true/false}`` — whether SLURM is present
    * - ``GET``
      - ``job_allocation``
-     - Returns current job allocation of the **edge** process (see below)
+     - Returns current job allocation of the **endpoint** process (see below)
    * - ``GET``
      - ``get_info/{sid}``
      - Partition and allocation info
@@ -223,13 +223,13 @@ without requiring a session.
 
 ``job_allocation`` response::
 
-    # Edge running on a login node (no SLURM job):
+    # Endpoint running on a login node (no SLURM job):
     {"allocation": null}
 
-    # Edge running inside a SLURM job allocation:
+    # Endpoint running inside a SLURM job allocation:
     {"allocation": {"n_nodes": 4, "runtime": 3600}}
 
-    # Edge running inside a SLURM job with unlimited walltime:
+    # Endpoint running inside a SLURM job with unlimited walltime:
     {"allocation": {"n_nodes": 4, "runtime": null}}
 
 ``n_nodes`` is the number of nodes in the allocation; ``runtime`` is the
@@ -272,10 +272,10 @@ Namespace: ``staging``
      - Description
    * - ``POST``
      - ``put/{sid}``
-     - Upload a file to the edge. Body: ``{"src": "/local/path", "tgt": "/remote/path"}``
+     - Upload a file to the endpoint. Body: ``{"src": "/local/path", "tgt": "/remote/path"}``
    * - ``POST``
      - ``get/{sid}``
-     - Download a file from the edge. Body: ``{"src": "/remote/path", "tgt": "/local/path"}``
+     - Download a file from the endpoint. Body: ``{"src": "/remote/path", "tgt": "/local/path"}``
    * - ``GET``
      - ``list/{sid}``
      - List files in the session staging area

@@ -25,19 +25,19 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from radical.edge.task_dispatcher_config   import PoolConfig, PilotSize
-from radical.edge.task_dispatcher_state    import (
+from radical.orbit.task_dispatcher_config   import PoolConfig, PilotSize
+from radical.orbit.task_dispatcher_state    import (
     PilotRecord, TaskRecord,
     PILOT_PENDING, PILOT_ACTIVE, PILOT_DONE,
     TASK_QUEUED, TASK_RUNNING, TASK_DONE,
 )
-from radical.edge.task_dispatcher_strategy import (
+from radical.orbit.task_dispatcher_strategy import (
     DispatchStrategy, StrategyContext,
 )
-from radical.edge.task_dispatcher_strategy_conservative import (
+from radical.orbit.task_dispatcher_strategy_conservative import (
     ConservativeStrategy,
 )
-from radical.edge.task_dispatcher_strategy_examples import (
+from radical.orbit.task_dispatcher_strategy_examples import (
     AggressiveScaleToBacklogStrategy,
 )
 

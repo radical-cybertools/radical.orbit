@@ -25,7 +25,7 @@ import os
 import sys
 import time
 
-from radical.edge.client import BridgeClient
+from radical.orbit.client import BridgeClient
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -89,7 +89,7 @@ def build_job_spec(cfg):
     spec = {
         'executable' : '/bin/bash',
         'arguments'  : ['-lc', 'echo "IRI test: $(hostname) $(date)"'],
-        'name'       : 'edge-iri-test',
+        'name'       : 'endpoint-iri-test',
         'resources'  : {'node_count': 1, 'process_count': 1},
         'attributes' : attrs,
     }
@@ -166,7 +166,7 @@ def main():
 
     print(f'Connecting to bridge (endpoint: {cfg["endpoint"]})…')
     bc     = BridgeClient()
-    bridge = bc.get_edge_client('bridge')
+    bridge = bc.get_endpoint_client('bridge')
     cx     = bridge.get_plugin('iri_connect')
 
     print('Available endpoints:')
@@ -179,7 +179,7 @@ def main():
     print(f'  instance session: {iri.sid}')
 
     iri.register_notification_callback(
-        lambda edge, plugin, topic, data:
+        lambda endpoint, plugin, topic, data:
             print(f'  [notification] job {data["job_id"]}: {data["state"]}'),
         topic='job_status')
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Rhapsody workload across heterogeneous edge endpoints — single-target runner.
+Rhapsody workload across heterogeneous endpoint endpoints — single-target runner.
 
 Architecture
 ============
@@ -9,10 +9,10 @@ Architecture
         │
         │  HTTPS / WebSocket
         ▼
-   ╔══════════╗      ┌── pre-existing edge   (HPC compute node, ready to run)
-   ║  Bridge  ║─────►├── pre-existing edge   (HPC login node, runs PsiJ)
-   ╚══════════╝      ├── new edge ★          (spawned via IRI)
-                     └── new edge ★          (spawned via PsiJ ↦ submit_tunneled)
+   ╔══════════╗      ┌── pre-existing endpoint   (HPC compute node, ready to run)
+   ║  Bridge  ║─────►├── pre-existing endpoint   (HPC login node, runs PsiJ)
+   ╚══════════╝      ├── new endpoint ★          (spawned via IRI)
+                     └── new endpoint ★          (spawned via PsiJ ↦ submit_tunneled)
 
 Usage
 -----
@@ -43,7 +43,7 @@ matching ``*_DEFAULTS`` entry, and a 7-step coloured trace is emitted
 
 Prerequisites on every target machine
 -------------------------------------
-- A radical.edge install with Rhapsody and Dragon at: ``~/.amsc/ve``
+- A radical.orbit install with Rhapsody and Dragon at: ``~/.amsc/ve``
 - A login host reachable from the compute node (used for ``--tunnel``)
 
 Tokens
@@ -68,8 +68,8 @@ from collections import defaultdict
 
 from pathlib import Path
 
-# RADICAL Edge client + Rhapsody bits
-from radical.edge.client import BridgeClient
+# ORBIT client + Rhapsody bits
+from radical.orbit.client import BridgeClient
 
 import rhapsody
 
@@ -116,16 +116,16 @@ KINDS = [
     ('gkeyll', N_GKEYLL_TASKS, ('gkeyll_exe',                     ), 'gkeyll'),
 ]
 
-# How long we are willing to wait for the first edge to come up.
-EDGE_WAIT_SECONDS  = 30 * 60
+# How long we are willing to wait for the first endpoint to come up.
+ENDPOINT_WAIT_SECONDS  = 30 * 60
 
-COUNTERS = defaultdict(int)  # for unique edge names per submission endpoint
+COUNTERS = defaultdict(int)  # for unique endpoint names per submission endpoint
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Resource slicing — machine-independent.
 #
-#  Carves the edge's allocation into per-kind pools.  Two shapes; switch
+#  Carves the endpoint's allocation into per-kind pools.  Two shapes; switch
 #  by commenting out one block and uncommenting the other.
 #
 #  - horizontal: every kind shares all nodes.  ``per_node`` is how many
@@ -244,9 +244,9 @@ IRI_DEFAULTS = {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Per-machine defaults.  Keyed by edge name (as reported by
-#  ``bc.list_edges()``).  Used by ``psij:<name>`` (queue / account /
-#  walltime / tunnel for submitting a child edge) and by ``compute:<name>``
+#  Per-machine defaults.  Keyed by endpoint name (as reported by
+#  ``bc.list_endpoints()``).  Used by ``psij:<name>`` (queue / account /
+#  walltime / tunnel for submitting a child endpoint) and by ``compute:<name>``
 #  (only the ``app`` block + ``gpus_per_node`` / ``cores_per_node`` are
 #  read in that path).  Values are taken verbatim — no prompts.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -369,12 +369,12 @@ MACHINE_DEFAULTS = {
 #
 #  Per-target ``amsc_dir`` (target-side) is a path component (relative
 #  to the target's ``$HOME``) under which the install script laid down
-#  ``ve/bin/radical-edge-wrapper.sh``.  Defaults to ``.amsc``; override
+#  ``ve/bin/orbit-endpoint-wrapper.sh``.  Defaults to ``.amsc``; override
 #  per target via the ``amsc_dir`` field in IRI_DEFAULTS / MACHINE_DEFAULTS.
 #
-#  Bridge cert is no longer plumbed by this script — child edges
-#  resolve it via radical.edge's CLI > env > file precedence (default
-#  file path: ``~/.radical/edge/bridge_cert.pem`` on each target).
+#  Bridge cert is no longer plumbed by this script — child endpoints
+#  resolve it via radical.orbit's CLI > env > file precedence (default
+#  file path: ``~/.radical/orbit/bridge_cert.pem`` on each target).
 #
 #  Why not pass ``~/.amsc/...`` and let bash expand it?  PsiJ's
 #  ``single_launch.sh`` quotes the executable arg, so the literal ``~``
@@ -500,7 +500,7 @@ def _make_progress(n_matey, n_infer, n_gkeyll):
 #    1. Read the bearer token from ~/.amsc/token_<endpoint>.
 #    2. iri_connect.connect(...) — creates a dynamic iri.<endpoint> plugin
 #       on the bridge and returns an IRIInstanceClient bound to it.
-#    3. Submit a job whose executable is radical-edge-wrapper.sh.  The job
+#    3. Submit a job whose executable is orbit-endpoint-wrapper.sh.  The job
 #       will WS-connect back to the bridge; if --tunnel is set, the child
 #       opens an outbound SSH tunnel to ``login_host`` first.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -513,7 +513,7 @@ def _validate_iri_cfg(endpoint, cfg):
         raise RuntimeError(f'IRI {endpoint}: home_dir on target is required '
                            f'(used to resolve <home>/'
                            f'{cfg.get("amsc_dir") or ".amsc"}'
-                           f'/ve/bin/radical-edge-wrapper.sh)')
+                           f'/ve/bin/orbit-endpoint-wrapper.sh)')
 
 
 def read_token(endpoint):
@@ -530,21 +530,21 @@ def read_token(endpoint):
 
 
 def launch_iri(bc, endpoint, cfg, bridge_url):
-    """Connect to the IRI endpoint and submit a job that starts an edge.
+    """Connect to the IRI endpoint and submit a job that starts an endpoint.
 
-    Returns ``(iri_client, job_id, edge_name)`` so we can cancel later.
+    Returns ``(iri_client, job_id, endpoint_name)`` so we can cancel later.
     """
     # Connect (idempotent — 409 returns the existing instance's client).
-    cx    = bc.get_edge_client('bridge').get_plugin('iri_connect')
+    cx    = bc.get_endpoint_client('bridge').get_plugin('iri_connect')
     token = read_token(endpoint)
     iri   = cx.connect(endpoint=endpoint, token=token)
 
-    # Pick a unique edge name so we can spot it in topology updates.
-    edge_name = f'{endpoint}.{COUNTERS[endpoint]}'
+    # Pick a unique endpoint name so we can spot it in topology updates.
+    endpoint_name = f'{endpoint}.{COUNTERS[endpoint]}'
     COUNTERS[endpoint] += 1
 
-    # Build the radical-edge-service.py CLI.  See bin/radical-edge-service.py.
-    args = ['--name', edge_name, '--url', bridge_url]
+    # Build the orbit-endpoint.py CLI.  See bin/orbit-endpoint.py.
+    args = ['--name', endpoint_name, '--url', bridge_url]
     if cfg['tunnel']:
         args += ['--tunnel', '--tunnel-via', cfg['login_host']]
 
@@ -571,10 +571,10 @@ def launch_iri(bc, endpoint, cfg, bridge_url):
     # bash as a path component and never expands.
     home    = cfg['home_dir'].rstrip('/')
     amsc    = (cfg.get('amsc_dir') or '.amsc').strip('/')
-    wrapper = f'{home}/{amsc}/ve/bin/radical-edge-wrapper.sh'
+    wrapper = f'{home}/{amsc}/ve/bin/orbit-endpoint-wrapper.sh'
 
-    # Cert resolution is delegated to the child edge: it falls back to
-    # ``~/.radical/edge/bridge_cert.pem`` (or $RADICAL_BRIDGE_CERT if
+    # Cert resolution is delegated to the child endpoint: it falls back to
+    # ``~/.radical/orbit/bridge_cert.pem`` (or $RADICAL_BRIDGE_CERT if
     # set on the target side).  We only inject the bridge URL — that
     # changes per bridge run and the file fallback would be stale.
     env = {'RADICAL_BRIDGE_URL': bridge_url}
@@ -582,12 +582,12 @@ def launch_iri(bc, endpoint, cfg, bridge_url):
     # Site-specific shell snippet — module loads, env exports, etc.
     # The wrapper ``eval``s this *before* exec-ing dragon / python.
     if cfg.get('setup'):
-        env['RADICAL_EDGE_SETUP'] = '; '.join(cfg['setup'])
+        env['RADICAL_ORBIT_SETUP'] = '; '.join(cfg['setup'])
 
     job_spec = {
         'executable' : wrapper,
         'arguments'  : args,
-        'name'       : edge_name,
+        'name'       : endpoint_name,
         'resources'  : {'node_count': cfg['n_nodes']},
         'attributes' : attrs,
         'environment': env,
@@ -598,7 +598,7 @@ def launch_iri(bc, endpoint, cfg, bridge_url):
         job_spec['directory'] = cfg['workdir']
 
     print(f'  submitting IRI job ({endpoint} → {cfg["resource_id"]}, '
-          f'edge name: {edge_name})…')
+          f'endpoint name: {endpoint_name})…')
     job = iri.submit_job(cfg['resource_id'], job_spec)
     print(f'  IRI job_id: {job["job_id"]}')
 
@@ -608,33 +608,33 @@ def launch_iri(bc, endpoint, cfg, bridge_url):
         'endpoint'   : endpoint,
         'resource_id': cfg['resource_id'],
         'job_id'     : job['job_id'],
-        'edge_name'  : edge_name,
+        'endpoint_name'  : endpoint_name,
         'cfg'        : cfg,
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  PsiJ launch path (existing login-node edges).
+#  PsiJ launch path (existing login-node endpoints).
 #
-#  ``cfg`` is a copy of ``MACHINE_DEFAULTS[edge_name]`` with ``executor``
+#  ``cfg`` is a copy of ``MACHINE_DEFAULTS[endpoint_name]`` with ``executor``
 #  spliced in.  ``submit_tunneled`` adds --tunnel / --tunnel-via to the
 #  child argv automatically per ``cfg['tunnel']``.
 # ─────────────────────────────────────────────────────────────────────────────
-def launch_psij(bc, edge_name, cfg, bridge_url):
-    """Submit a child edge via the parent edge's PsiJ plugin."""
-    edge = bc.get_edge_client(edge_name)
-    psij = edge.get_plugin('psij')
+def launch_psij(bc, endpoint_name, cfg, bridge_url):
+    """Submit a child endpoint via the parent endpoint's PsiJ plugin."""
+    endpoint = bc.get_endpoint_client(endpoint_name)
+    psij = endpoint.get_plugin('psij')
 
-    # Resolve $HOME on the target via the login-edge's sysinfo plugin.
+    # Resolve $HOME on the target via the login-endpoint's sysinfo plugin.
     # Login and compute share $HOME via NFS/Lustre on every site we
-    # care about, so the login-edge's home is also the compute job's.
-    home    = edge.get_plugin('sysinfo').homedir().rstrip('/')
+    # care about, so the login-endpoint's home is also the compute job's.
+    home    = endpoint.get_plugin('sysinfo').homedir().rstrip('/')
     amsc    = (cfg.get('amsc_dir') or '.amsc').strip('/')
-    wrapper = f'{home}/{amsc}/ve/bin/radical-edge-wrapper.sh'
+    wrapper = f'{home}/{amsc}/ve/bin/orbit-endpoint-wrapper.sh'
 
-    # Unique name for the child edge.
-    COUNTERS[edge_name] += 1
-    child_name = f'{edge_name}.{COUNTERS[edge_name]}'
+    # Unique name for the child endpoint.
+    COUNTERS[endpoint_name] += 1
+    child_name = f'{endpoint_name}.{COUNTERS[endpoint_name]}'
 
     attrs = {
         'queue_name': cfg['queue_name'],
@@ -654,15 +654,15 @@ def launch_psij(bc, edge_name, cfg, bridge_url):
         custom_attrs[f'{cfg["executor"]}.gpus-per-node'] = str(cfg['gpus_per_node'])
     if cfg.get('qos'):
         custom_attrs[f'{cfg["executor"]}.qos'] = cfg['qos']
-    # Cert is left to the child edge to resolve from
-    # ``~/.radical/edge/bridge_cert.pem`` on the target (or via
+    # Cert is left to the child endpoint to resolve from
+    # ``~/.radical/orbit/bridge_cert.pem`` on the target (or via
     # $RADICAL_BRIDGE_CERT if explicitly set there).  Only the bridge
     # URL — which changes per bridge run — is injected here.
     env = {'RADICAL_BRIDGE_URL': bridge_url}
     # Site-specific shell snippet — module loads, env exports, etc.
     # The wrapper ``eval``s this *before* exec-ing dragon / python.
     if cfg.get('setup'):
-        env['RADICAL_EDGE_SETUP'] = '; '.join(cfg['setup'])
+        env['RADICAL_ORBIT_SETUP'] = '; '.join(cfg['setup'])
 
     job_spec = {
         'executable'        : wrapper,
@@ -689,34 +689,34 @@ def launch_psij(bc, edge_name, cfg, bridge_url):
     return {
         'kind'       : 'psij',
         'psij'       : psij,
-        'parent_edge': edge_name,
+        'parent_endpoint': endpoint_name,
         'job_id'     : res['job_id'],
-        'edge_name'  : res.get('edge_name', child_name),
+        'endpoint_name'  : res.get('endpoint_name', child_name),
         'cfg'        : cfg,
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Wait for the first edge to register.
+#  Wait for the first endpoint to register.
 #
-#  We poll the bridge's edge list every few seconds and return the first
+#  We poll the bridge's endpoint list every few seconds and return the first
 #  expected name we see.  Polling is dumb but readable; for a demo this is
 #  better than wiring up an SSE callback bridge to asyncio.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _heartbeat_dot():
-    """Print a single dot to stdout; passed to ``bc.wait_for_edge`` so
+    """Print a single dot to stdout; passed to ``bc.wait_for_endpoint`` so
     a long queue wait shows visible progress without spamming the
     screen."""
     sys.stdout.write('.')
     sys.stdout.flush()
 
 
-def _wait_for_edge(bc, name):
-    """``bc.wait_for_edge`` wrapper that adds the demo's heartbeat-dot
+def _wait_for_endpoint(bc, name):
+    """``bc.wait_for_endpoint`` wrapper that adds the demo's heartbeat-dot
     progress UI and guarantees a trailing newline on either path."""
     try:
-        return bc.wait_for_edge([name], timeout=EDGE_WAIT_SECONDS,
+        return bc.wait_for_endpoint([name], timeout=ENDPOINT_WAIT_SECONDS,
                                 on_heartbeat=_heartbeat_dot)
     finally:
         sys.stdout.write('\n')
@@ -726,7 +726,7 @@ def _wait_for_edge(bc, name):
 # ─────────────────────────────────────────────────────────────────────────────
 #  Rhapsody workload.
 #
-#  Submits matey + infer + gkeyll task families against the named edge
+#  Submits matey + infer + gkeyll task families against the named endpoint
 #  as a rhapsody backend.  Resources are carved up per ``SLICING`` (see
 #  top of file) into per-kind pools: each kind gets its own per-host
 #  affinity range (horizontal) or its own disjoint node subset
@@ -814,7 +814,7 @@ def _compute_slices(slicing, n_hosts, gpus_per_node, cores_per_node, nodelist):
                   f"compatible n_nodes")
         n_each = {k: (n_hosts * w) // total_w for k, w in weights.items()}
         # Defense in depth: covers n_hosts == 0 (which slips past the
-        # modulo check) and any future-weights edge case.
+        # modulo check) and any future-weights endpoint case.
         zero_alloc = [k for k, n in n_each.items() if n == 0]
         if zero_alloc:
             abort(f"vertical slicing: kinds with zero-node allocation: "
@@ -967,8 +967,8 @@ def _render_slicing(slicing_mode, slices, gpus_per_node, cores_per_node,
         _console.print(Padding(panel, (0, 0, 0, 2)))
 
 
-async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
-    """Submit the active task kinds (per ``KINDS``) via the named edge.
+async def submit_rhapsody_workload(bridge_url, endpoint_name, cfg, nodelist):
+    """Submit the active task kinds (per ``KINDS``) via the named endpoint.
 
     All active kinds share one Session and run concurrently, each behind
     its own semaphore sized to the per-kind cap from
@@ -976,7 +976,7 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
     (host, gpu/cpu) slot via ``Policy.Placement.HOST_NAME`` so dragon's
     scheduler is forced onto the slot we picked.
 
-    *nodelist* is the list of compute hostnames in the edge's allocation
+    *nodelist* is the list of compute hostnames in the endpoint's allocation
     (from ``queue_info.nodelist()``).  Kinds whose slice yields zero cap
     or whose ``app`` paths are absent are silently skipped; bails when
     nothing remains.
@@ -984,7 +984,7 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
     app_cfg = (cfg or {}).get('app')
     if not app_cfg:
         raise RuntimeError(
-            f"target {edge_name!r} has no 'app' config block — "
+            f"target {endpoint_name!r} has no 'app' config block — "
             "the rhapsody workload is not supported here.  Populate "
             "IRI_DEFAULTS / MACHINE_DEFAULTS['app'] for this target.")
 
@@ -1012,7 +1012,7 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
         dragon ``Policy`` is a C-extension object that msgpack can't serialise.
         We ride through rhapsody's existing ``_pickled_fields`` escape hatch:
         encode the whole kwargs dict as ``cloudpickle::<b64>`` here and let
-        the rhapsody plugin's ``_deserialize_task`` unpickle it on the edge.
+        the rhapsody plugin's ``_deserialize_task`` unpickle it on the endpoint.
         """
         raw = {'process_template': {'cwd': cwd, 'policy': policy}}
         return 'cloudpickle::' + base64.b64encode(cloudpickle.dumps(raw)).decode()
@@ -1093,7 +1093,7 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
 
     if not tasks_by_kind:
         raise RuntimeError(
-            f"target {edge_name!r}: nothing to run.  Need a non-zero "
+            f"target {endpoint_name!r}: nothing to run.  Need a non-zero "
             "SLICING cap and matching app paths for at least one kind.")
 
     _render_slicing(slicing.get('mode'), slices,
@@ -1101,7 +1101,7 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
                     list(tasks_by_kind.keys()))
 
     backend = await rhapsody.get_backend(
-        'edge', bridge_url=bridge_url, edge_name=edge_name)
+        'orbit', bridge_url=bridge_url, endpoint_name=endpoint_name)
 
     counts = {name: {'submitted': 0, 'done': 0, 'failed': 0}
               for name in tasks_by_kind}
@@ -1123,10 +1123,10 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
             async with sems[kind]:
                 # Count slot-occupancy, not flush-completion: bump
                 # ``submitted`` the moment we acquire the kind's semaphore
-                # (= a resource slot is in use), before the rhapsody-edge
+                # (= a resource slot is in use), before the rhapsody-endpoint
                 # batch-flush queue starts processing.  Without this, all
                 # three bars stall at the same flush boundary
-                # (batch_limit=1024 in rhapsody-edge) because that's
+                # (batch_limit=1024 in rhapsody-endpoint) because that's
                 # where the ``await session.submit_tasks`` first actually
                 # blocks; users read this as a stuck progress bar.
                 counts[kind]['submitted'] += 1
@@ -1144,7 +1144,7 @@ async def submit_rhapsody_workload(bridge_url, edge_name, cfg, nodelist):
                     progress.update(tids[kind], advance=1,
                                     done=c['done'], failed=c['failed'])
 
-        # Round-robin interleave across kinds so the rhapsody-edge
+        # Round-robin interleave across kinds so the rhapsody-endpoint
         # backend's single FIFO flush channel sees one task from each
         # active kind per round, not all of one kind first.  Without
         # this, the matey/infer bars fill before any gkeyll task is
@@ -1200,7 +1200,7 @@ def teardown(bc, created):
     # 3. Disconnect IRI endpoints
     iri_eps = {c['endpoint'] for c in created if c['kind'] == 'iri'}
     if iri_eps:
-        cx = bc.get_edge_client('bridge').get_plugin('iri_connect')
+        cx = bc.get_endpoint_client('bridge').get_plugin('iri_connect')
         for ep in iri_eps:
             try:
                 cx.disconnect(ep)
@@ -1211,9 +1211,9 @@ def teardown(bc, created):
 # ─────────────────────────────────────────────────────────────────────────────
 #  Single-target driver — non-interactive, fail-fast, 7-step trace.
 #
-#  ``kind`` selects the launch path: ``psij`` (submit a child edge via an
-#  existing login-edge), ``iri`` (submit via an IRI endpoint), or
-#  ``compute`` (re-use an already-connected compute/standalone edge).
+#  ``kind`` selects the launch path: ``psij`` (submit a child endpoint via an
+#  existing login-endpoint), ``iri`` (submit via an IRI endpoint), or
+#  ``compute`` (re-use an already-connected compute/standalone endpoint).
 #  Every error boundary calls ``abort()`` so the user sees a one-line
 #  reason, not a Python traceback.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1239,10 +1239,10 @@ def _parse_target_arg(arg):
     return kind, name
 
 
-def _resolve_executor(bc, edge_name):
-    """Ask the edge's sysinfo plugin what PsiJ executor it expects."""
+def _resolve_executor(bc, endpoint_name):
+    """Ask the endpoint's sysinfo plugin what PsiJ executor it expects."""
     try:
-        info = bc.get_edge_client(edge_name).get_plugin('sysinfo').host_role()
+        info = bc.get_endpoint_client(endpoint_name).get_plugin('sysinfo').host_role()
         return info.get('psij_executor', 'local')
     except Exception:
         return 'local'
@@ -1259,17 +1259,17 @@ def _step_configure(cfg):
          f'queue={cfg.get("queue_name", "?")}{qos_str}')
 
 
-def _step_run(bc, bridge_url, edge_name, cfg):
+def _step_run(bc, bridge_url, endpoint_name, cfg):
     """Steps 6 + the actual workload run.
 
-    Resolves the nodelist via the edge's queue_info plugin, prints the
+    Resolves the nodelist via the endpoint's queue_info plugin, prints the
     step 6 summary, then calls ``submit_rhapsody_workload``.  When
     queue_info is absent or reports an empty allocation (workstation /
     no batch system case), falls back to a single-node ``['localhost']``
     nodelist so dragon's HOST_NAME placement still has a target to bind.
     """
     try:
-        nodelist = bc.get_edge_client(edge_name) \
+        nodelist = bc.get_endpoint_client(endpoint_name) \
                      .get_plugin('queue_info').nodelist()
     except Exception:
         nodelist = []
@@ -1288,7 +1288,7 @@ def _step_run(bc, bridge_url, edge_name, cfg):
          f'gkeyll {N_GKEYLL_TASKS} (cap {slices["gkeyll"]["cap"]})')
     try:
         asyncio.run(submit_rhapsody_workload(
-            bridge_url, edge_name, cfg, nodelist))
+            bridge_url, endpoint_name, cfg, nodelist))
     except Exception as exc:
         abort(f'workload failed: {exc}')
 
@@ -1319,23 +1319,23 @@ def _main_target(bc, bridge_url, kind, name,
     All three branches share the step 3/6/7 helpers; only the launch
     (steps 4-5) differs:
 
-      - ``psij``    : submit a child edge via the login-edge's PsiJ plugin
+      - ``psij``    : submit a child endpoint via the login-endpoint's PsiJ plugin
       - ``iri``     : submit via the named IRI endpoint
-      - ``compute`` : re-use the named edge directly (no submission)
+      - ``compute`` : re-use the named endpoint directly (no submission)
     """
     step(1, 'connect bridge', bridge_url)
 
-    live_edges = set(bc.list_edges())
+    live_endpoints = set(bc.list_endpoints())
     created    = []
 
     if kind == 'psij':
-        if name not in live_edges:
-            abort(f"no edge {name!r} connected to bridge.  "
-                  f"Start the parent edge first.")
+        if name not in live_endpoints:
+            abort(f"no endpoint {name!r} connected to bridge.  "
+                  f"Start the parent endpoint first.")
         if name not in MACHINE_DEFAULTS:
             abort(f"no MACHINE_DEFAULTS entry for {name!r}")
-        if 'psij' not in bc.get_edge_client(name).list_plugins():
-            abort(f"edge {name!r} has no psij plugin")
+        if 'psij' not in bc.get_endpoint_client(name).list_plugins():
+            abort(f"endpoint {name!r} has no psij plugin")
 
         executor = _resolve_executor(bc, name)
         step(2, 'pick target', f'{name} (psij/{executor})')
@@ -1351,16 +1351,16 @@ def _main_target(bc, bridge_url, kind, name,
             except Exception as exc:
                 abort(f'launch_psij failed: {exc}')
             created.append(rec)
-            step(4, 'submit child edge',
-                 f'job={rec["job_id"][:8]}…  edge={rec["edge_name"]}',
+            step(4, 'submit child endpoint',
+                 f'job={rec["job_id"][:8]}…  endpoint={rec["endpoint_name"]}',
                  newline=False)
 
             t0 = time.time()
             try:
-                first = _wait_for_edge(bc, rec['edge_name'])
+                first = _wait_for_endpoint(bc, rec['endpoint_name'])
             except Exception as exc:
-                abort(f'wait_for_edge failed: {exc}')
-            step(5, 'await child edge', f'up after {int(time.time() - t0)}s')
+                abort(f'wait_for_endpoint failed: {exc}')
+            step(5, 'await child endpoint', f'up after {int(time.time() - t0)}s')
 
             _step_run(bc, bridge_url, first, rec.get('cfg') or cfg)
         finally:
@@ -1386,16 +1386,16 @@ def _main_target(bc, bridge_url, kind, name,
             except Exception as exc:
                 abort(f'launch_iri failed: {exc}')
             created.append(rec)
-            step(4, 'submit child edge',
-                 f'job={rec["job_id"][:8]}…  edge={rec["edge_name"]}',
+            step(4, 'submit child endpoint',
+                 f'job={rec["job_id"][:8]}…  endpoint={rec["endpoint_name"]}',
                  newline=False)
 
             t0 = time.time()
             try:
-                first = _wait_for_edge(bc, rec['edge_name'])
+                first = _wait_for_endpoint(bc, rec['endpoint_name'])
             except Exception as exc:
-                abort(f'wait_for_edge failed: {exc}')
-            step(5, 'await child edge', f'up after {int(time.time() - t0)}s')
+                abort(f'wait_for_endpoint failed: {exc}')
+            step(5, 'await child endpoint', f'up after {int(time.time() - t0)}s')
 
             _step_run(bc, bridge_url, first, rec.get('cfg') or cfg)
         finally:
@@ -1403,10 +1403,10 @@ def _main_target(bc, bridge_url, kind, name,
             teardown(bc, created)
 
     elif kind == 'compute':
-        if name not in live_edges:
-            abort(f"no edge {name!r} connected to bridge")
-        if 'rhapsody' not in bc.get_edge_client(name).list_plugins():
-            abort(f"edge {name!r} has no rhapsody plugin")
+        if name not in live_endpoints:
+            abort(f"no endpoint {name!r} connected to bridge")
+        if 'rhapsody' not in bc.get_endpoint_client(name).list_plugins():
+            abort(f"endpoint {name!r} has no rhapsody plugin")
         if name not in MACHINE_DEFAULTS:
             abort(f"no MACHINE_DEFAULTS entry for {name!r} (need 'app' block)")
         step(2, 'pick target', f'{name} (compute)')
@@ -1415,8 +1415,8 @@ def _main_target(bc, bridge_url, kind, name,
         _apply_cli_overrides(cfg, slicing_mode, n_nodes)
         _step_configure(cfg)
 
-        step(4, 'submit child edge', 'reusing existing edge')
-        step(5, 'await child edge',  'already up')
+        step(4, 'submit child endpoint', 'reusing existing endpoint')
+        step(5, 'await child endpoint',  'already up')
         _step_run(bc, bridge_url, name, cfg)
         step(7, 'teardown',          'nothing to cancel')
 
@@ -1453,7 +1453,7 @@ def main():
 
     kind, name = _parse_target_arg(target_arg)
 
-    # BridgeClient self-resolves URL + cert via radical.edge.utils
+    # BridgeClient self-resolves URL + cert via radical.orbit.utils
     # (CLI > env > file).
     bc         = BridgeClient()
     bridge_url = bc.url

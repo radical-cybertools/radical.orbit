@@ -7,8 +7,8 @@ __copyright__ = 'Copyright 2024, RADICAL@Rutgers'
 __license__   = 'MIT'
 
 
-import radical.edge
-from radical.edge.plugin_queue_info import PluginQueueInfo, QueueInfoSession
+import radical.orbit
+from radical.orbit.plugin_queue_info import PluginQueueInfo, QueueInfoSession
 
 import pytest
 from unittest.mock import Mock, AsyncMock, patch
@@ -151,7 +151,7 @@ async def test_queue_info_session_list_allocations_with_user():
     mock_backend.list_allocations.assert_called_once_with("testuser", True)
 
 
-@patch('radical.edge.plugin_queue_info.make_queue_info')
+@patch('radical.orbit.plugin_queue_info.make_queue_info')
 def test_plugin_queue_info_initialization(mock_factory):
     '''
     Test PluginQueueInfo initialization.
@@ -177,7 +177,7 @@ def test_plugin_queue_info_initialization(mock_factory):
     assert any("list_allocations" in p for p in route_pats)
 
 
-@patch('radical.edge.plugin_queue_info.make_queue_info')
+@patch('radical.orbit.plugin_queue_info.make_queue_info')
 def test_plugin_queue_info_custom_name_and_conf(mock_factory):
     '''
     Test PluginQueueInfo with custom name and backend config (slurm_conf
@@ -195,7 +195,7 @@ def test_plugin_queue_info_custom_name_and_conf(mock_factory):
 
 
 @pytest.mark.asyncio
-@patch('radical.edge.plugin_queue_info.make_queue_info')
+@patch('radical.orbit.plugin_queue_info.make_queue_info')
 async def test_plugin_queue_info_register_session(mock_factory):
     '''
     Test registering a new session.
@@ -218,7 +218,7 @@ async def test_plugin_queue_info_register_session(mock_factory):
 
 
 @pytest.mark.asyncio
-@patch('radical.edge.plugin_queue_info.make_queue_info')
+@patch('radical.orbit.plugin_queue_info.make_queue_info')
 async def test_plugin_queue_info_unregister_session(mock_factory):
     '''
     Test unregistering a session.
@@ -240,7 +240,7 @@ async def test_plugin_queue_info_unregister_session(mock_factory):
 
 
 @pytest.mark.asyncio
-@patch('radical.edge.plugin_queue_info.make_queue_info')
+@patch('radical.orbit.plugin_queue_info.make_queue_info')
 async def test_plugin_queue_info_get_info(mock_factory):
     '''
     Test get_info endpoint.
@@ -270,7 +270,7 @@ async def test_plugin_queue_info_get_info(mock_factory):
 
 
 @pytest.mark.asyncio
-@patch('radical.edge.plugin_queue_info.make_queue_info')
+@patch('radical.orbit.plugin_queue_info.make_queue_info')
 async def test_plugin_queue_info_list_jobs(mock_factory):
     '''
     Test list_jobs endpoint.
@@ -300,7 +300,7 @@ async def test_plugin_queue_info_list_jobs(mock_factory):
 
 
 @pytest.mark.asyncio
-@patch('radical.edge.plugin_queue_info.make_queue_info')
+@patch('radical.orbit.plugin_queue_info.make_queue_info')
 async def test_plugin_queue_info_list_allocations(mock_factory):
     '''
     Test list_allocations endpoint.
@@ -330,7 +330,7 @@ async def test_plugin_queue_info_list_allocations(mock_factory):
 
 
 @pytest.mark.asyncio
-@patch('radical.edge.plugin_queue_info.make_queue_info')
+@patch('radical.orbit.plugin_queue_info.make_queue_info')
 async def test_plugin_queue_info_unknown_session_error(mock_factory):
     '''
     Test that operations on unknown session raise HTTPException.
@@ -353,11 +353,11 @@ async def test_plugin_queue_info_unknown_session_error(mock_factory):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-@patch('radical.edge.batch_system_slurm.subprocess.run')
+@patch('radical.orbit.batch_system_slurm.subprocess.run')
 async def test_queue_info_session_cancel_job_success(mock_run):
     """cancel_job dispatches to the active batch system (SLURM here)."""
-    from radical.edge import batch_system as _bs
-    from radical.edge.batch_system_slurm import SlurmBatchSystem
+    from radical.orbit import batch_system as _bs
+    from radical.orbit.batch_system_slurm import SlurmBatchSystem
     _bs._DETECTED = SlurmBatchSystem()
     try:
         mock_run.return_value = Mock(returncode=0, stderr='')
@@ -373,12 +373,12 @@ async def test_queue_info_session_cancel_job_success(mock_run):
 
 
 @pytest.mark.asyncio
-@patch('radical.edge.batch_system_slurm.subprocess.run')
+@patch('radical.orbit.batch_system_slurm.subprocess.run')
 async def test_queue_info_session_cancel_job_failure(mock_run):
     """cancel_job raises HTTPException on scheduler failure."""
     from fastapi import HTTPException
-    from radical.edge import batch_system as _bs
-    from radical.edge.batch_system_slurm import SlurmBatchSystem
+    from radical.orbit import batch_system as _bs
+    from radical.orbit.batch_system_slurm import SlurmBatchSystem
     _bs._DETECTED = SlurmBatchSystem()
     try:
         mock_run.return_value = Mock(returncode=1, stderr='Job not found')
@@ -409,7 +409,7 @@ async def test_queue_info_session_list_all_jobs():
 def _make_queue_info_client(json_resp, status_code=200):
     """Return a QueueInfoClient backed by a mock httpx.Client."""
     import httpx
-    from radical.edge.plugin_queue_info import QueueInfoClient
+    from radical.orbit.plugin_queue_info import QueueInfoClient
     mock_resp = Mock()
     mock_resp.is_error = (status_code >= 400)
     mock_resp.status_code = status_code

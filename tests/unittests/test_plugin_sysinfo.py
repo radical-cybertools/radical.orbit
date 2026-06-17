@@ -4,7 +4,7 @@ import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
-from radical.edge.plugin_sysinfo import PluginSysInfo, SysInfoProvider
+from radical.orbit.plugin_sysinfo import PluginSysInfo, SysInfoProvider
 
 
 def test_plugin_sysinfo_init():
@@ -98,7 +98,7 @@ async def test_endpoint():
 import re
 
 from unittest.mock import patch
-from radical.edge.batch_system import reset_detection
+from radical.orbit.batch_system import reset_detection
 
 
 _PY_VERSION_RE = re.compile(r'^\d+\.\d+\.\d+$')
@@ -175,7 +175,7 @@ def test_host_role_compute_pbs(monkeypatch):
         return '/usr/bin/qstat' if cmd == 'qstat' else None
     # Pin the Aurora marker absent so the generic PBS backend is selected.
     with patch('shutil.which', side_effect=_which), \
-         patch('radical.edge.batch_system_pbs.os.path.isdir',
+         patch('radical.orbit.batch_system_pbs.os.path.isdir',
                return_value=False):
         role = _host_role(FastAPI())
     assert role == {'role': 'compute', 'scheduler': 'pbs',
@@ -190,7 +190,7 @@ def test_host_role_compute_pbs_aurora(monkeypatch):
         return '/usr/bin/qstat' if cmd == 'qstat' else None
     # Aurora marker present -> AuroraPBSBatchSystem wins.
     with patch('shutil.which', side_effect=_which), \
-         patch('radical.edge.batch_system_pbs.os.path.isdir',
+         patch('radical.orbit.batch_system_pbs.os.path.isdir',
                return_value=True):
         role = _host_role(FastAPI())
     assert role == {'role': 'compute', 'scheduler': 'pbs-aurora',
@@ -199,7 +199,7 @@ def test_host_role_compute_pbs_aurora(monkeypatch):
 
 def test_host_role_client():
     """SysInfoClient.host_role() returns the same shape as the route."""
-    from radical.edge.plugin_sysinfo import SysInfoClient
+    from radical.orbit.plugin_sysinfo import SysInfoClient
     app = FastAPI()
     plugin = PluginSysInfo(app)
     http   = TestClient(app)

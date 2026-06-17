@@ -745,7 +745,7 @@
       ctx.globalAlpha = 1;
     }
 
-    // Handle bar straddling the fill top edge — easy to grab visually.
+    // Handle bar straddling the fill top endpoint — easy to grab visually.
     ctx.fillStyle = color;
     rr(s.x - 4, fillY - 1.5, s.w + 8, 3, 1);
     ctx.fill();
@@ -891,7 +891,7 @@
     if (mode === m) return;
 
     // Wipe the board.  Each running/flying tile is converted into a fading
-    // tile that drops past the bottom edge of the canvas.  Slots reset to
+    // tile that drops past the bottom endpoint of the canvas.  Slots reset to
     // free so the new partition starts from a blank board after the wipe.
     for (const f of flying) {
       const p = flyingPos(f);

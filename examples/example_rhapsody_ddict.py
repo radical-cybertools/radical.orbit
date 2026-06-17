@@ -4,16 +4,16 @@ Example: DDict Data Exchange Between Tasks
 ===========================================
 
 Demonstrates two Dragon tasks exchanging data via a shared DDict
-(distributed dictionary) through the RADICAL Edge bridge.
+(distributed dictionary) through the ORBIT bridge.
 
 Task 1 (producer) creates a DDict, writes data, and returns the
 serialized descriptor.  Task 2 (consumer) attaches to the same DDict
 via that descriptor, reads the data, and destroys the DDict.
 
 Prerequisites:
-  - A Radical Edge bridge is running (RADICAL_BRIDGE_URL set).
-  - An edge service is connected with the Rhapsody plugin loaded.
-  - Dragon runtime is active on the edge node.
+  - A ORBIT bridge is running (RADICAL_BRIDGE_URL set).
+  - An endpoint service is connected with the Rhapsody plugin loaded.
+  - Dragon runtime is active on the endpoint node.
 
 Usage:
   python examples/example_rhapsody_ddict.py
@@ -24,7 +24,7 @@ import asyncio
 import rhapsody
 
 
-# -- task functions (executed on the edge inside Dragon) --------------------
+# -- task functions (executed on the endpoint inside Dragon) --------------------
 
 async def producer():
     """Create a shared DDict, write data, return its serialized descriptor."""
@@ -52,14 +52,14 @@ async def consumer(dd_serial):
 
 async def main():
 
-    # Edge auto-discovery: ``get_backend('edge')`` with no args resolves
-    # the bridge URL via radical.edge.utils and selects the first
-    # connected edge advertising the rhapsody plugin.  ``await backend``
+    # Endpoint auto-discovery: ``get_backend('orbit')`` with no args resolves
+    # the bridge URL via radical.orbit.utils and selects the first
+    # connected endpoint advertising the rhapsody plugin.  ``await backend``
     # raises RuntimeError if no candidate is found.
-    backend = rhapsody.get_backend('edge')
+    backend = rhapsody.get_backend('orbit')
     backend = await backend
     print(f"Bridge: {backend._bridge_url}")
-    print(f"Edge:   {backend._edge_name}")
+    print(f"Endpoint:   {backend._endpoint_name}")
 
     session = rhapsody.Session(backends=[backend])
 

@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 
-from radical.edge import BridgeClient
+from radical.orbit import BridgeClient
 
 
 def main():
 
     bc = BridgeClient()
-    eids = bc.list_edges()
+    eids = bc.list_endpoints()
 
     if not eids:
-        print("No edges found.")
+        print("No endpoints found.")
         return
 
     eid = eids[0]
-    print(f"Using edge: {eid}")
+    print(f"Using endpoint: {eid}")
 
-    ec = bc.get_edge_client(eid)
+    ec = bc.get_endpoint_client(eid)
     lucid = ec.get_plugin('lucid')
 
     print("Submitting pilot...")

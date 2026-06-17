@@ -1,19 +1,19 @@
 
-# Radical Edge
+# ORBIT
 
-Radical Edge provides a decentralized architectural framework for seamlessly interacting with high-performance computing (HPC) nodes and executing remote computations across edge services.
+ORBIT provides a decentralized architectural framework for seamlessly interacting with high-performance computing (HPC) nodes and executing remote computations across endpoint services.
 
 ## Architecture
 
-Radical Edge consists of three primary layers:
-1. **Bridge (`radical-edge-bridge`)**: The centralized entry hub. It maintains WebSocket connections to external Edge services, manages edge discovery, and serves as an HTTP-to-WebSocket reverse proxy forwarding REST API calls to the respective Edges.
-2. **Edge Service (`radical-edge-service`)**: Deployed directly on the compute nodes/HPC resources. It connects upstream to the Bridge via WebSocket, loading local Plugins to execute tasks natively within the remote network boundary.
-3. **Clients / Portal (`client.py` & `edge_explorer.html`)**: Developer and end-user interfaces. The Python Client SDK orchestrates dynamic REST interactions with Plugins, while the Web Portal demonstrates direct native JavaScript browser integration with the Bridge API over HTTP.
+ORBIT consists of three primary layers:
+1. **Bridge (`orbit-bridge`)**: The centralized entry hub. It maintains WebSocket connections to external Endpoint services, manages endpoint discovery, and serves as an HTTP-to-WebSocket reverse proxy forwarding REST API calls to the respective Endpoints.
+2. **Endpoint Service (`orbit-endpoint`)**: Deployed directly on the compute nodes/HPC resources. It connects upstream to the Bridge via WebSocket, loading local Plugins to execute tasks natively within the remote network boundary.
+3. **Clients / Portal (`client.py` & `orbit_explorer.html`)**: Developer and end-user interfaces. The Python Client SDK orchestrates dynamic REST interactions with Plugins, while the Web Portal demonstrates direct native JavaScript browser integration with the Bridge API over HTTP.
 
 ## Deployment
 
 Create a virtualenv, conda env, or other isolated python environment of your
-choice, and `pip install radical.edge`.
+choice, and `pip install radical.orbit`.
 
 However, some plugins require dependencies, otherwise they won't load:
   - psyj: `pip install psij/python`
@@ -21,8 +21,8 @@ However, some plugins require dependencies, otherwise they won't load:
   - rose: `pip install rose`
 
 In fact, the ROSE plugin is only installed with ROSE - so that's also an example
-how 3rd party module can install `radical.edge` plugins.  Note that plugin
-dependencies are only needed on those machines on which the edge plugins are
+how 3rd party module can install `radical.orbit` plugins.  Note that plugin
+dependencies are only needed on those machines on which the endpoint plugins are
 actually used - the bridge host and the client hosts usually don't need those.
 
 
@@ -31,18 +31,18 @@ actually used - the bridge host and the client hosts usually don't need those.
 ### 1. Generating Certificates (Dev)
 
 Write the cert + key directly into the default config dir
-(`~/.radical/edge/`) — that way the bridge, edges, and clients all
+(`~/.radical/orbit/`) — that way the bridge, endpoints, and clients all
 find them with **no env vars set**.  Replace `95.217.193.116` with
 your bridge's public IP.
 
 ```sh
-mkdir -p ~/.radical/edge
+mkdir -p ~/.radical/orbit
 openssl req -x509 -nodes -days 3650 -newkey rsa:4096 \
-        -keyout ~/.radical/edge/bridge_key.pem \
-        -out    ~/.radical/edge/bridge_cert.pem \
+        -keyout ~/.radical/orbit/bridge_key.pem \
+        -out    ~/.radical/orbit/bridge_cert.pem \
         -subj   "/CN=95.217.193.116" \
         -addext "subjectAltName = IP:95.217.193.116,DNS:localhost,IP:127.0.0.1"
-chmod 0600 ~/.radical/edge/bridge_key.pem
+chmod 0600 ~/.radical/orbit/bridge_key.pem
 ```
 
 `chmod 0600` is mandatory: the bridge refuses to start if the key
@@ -63,19 +63,19 @@ precedence rules (CLI > env > file).
 ### 2. Starting the Bridge
 The Bridge server exposes a REST API and a WebSocket endpoint (`/register`):
 ```sh
-./bin/radical-edge-bridge.py
+./bin/orbit-bridge.py
 ```
 
-### 3. Starting the Edge Service
-Start the edge service (ideally on your target HPC node) pointing to the running Bridge:
+### 3. Starting the Endpoint Service
+Start the endpoint service (ideally on your target HPC node) pointing to the running Bridge:
 ```sh
-./bin/radical-edge-service.py --name my-edge --url wss://localhost:8000
+./bin/orbit-endpoint.py --name my-endpoint --url wss://localhost:8000
 ```
 
 #### Using the Wrapper Script
-For launching edge services via batch job schedulers (e.g., SLURM), use the wrapper script which properly sets up the environment:
+For launching endpoint services via batch job schedulers (e.g., SLURM), use the wrapper script which properly sets up the environment:
 ```sh
-./bin/radical-edge-wrapper.sh --url wss://bridge.example.org:8000 --name my-hpc-edge
+./bin/orbit-endpoint-wrapper.sh --url wss://bridge.example.org:8000 --name my-hpc-endpoint
 ```
 
 The wrapper script automatically detects and exports the correct `PYTHONPATH` for the installed modules.
@@ -90,21 +90,21 @@ The wrapper script automatically detects and exports the correct `PYTHONPATH` fo
 The Bridge serves as an HTTP proxy with the following management endpoints:
 
 ### Management Endpoints
-- `GET /` - Fetches the interactive Edge Explorer UI.
-- `POST /edge/list` - Returns a JSON structure describing all currently connected Edges and their loaded Plugins namespaces.
-- `POST /edge/disconnect/{edge_name}` - Disconnect a specific edge service from the bridge.
-- `POST /bridge/terminate` - Terminate the bridge process (edges remain running).
+- `GET /` - Fetches the interactive ORBIT Explorer UI.
+- `POST /endpoint/list` - Returns a JSON structure describing all currently connected Endpoints and their loaded Plugins namespaces.
+- `POST /endpoint/disconnect/{endpoint_name}` - Disconnect a specific endpoint service from the bridge.
+- `POST /bridge/terminate` - Terminate the bridge process (endpoints remain running).
 - `GET /events` - Server-Sent Events (SSE) endpoint for real-time notifications.
 
 ### Proxy Routes
-- `/*` - All other routes are parsed by the Bridge to extract the targeted `{edge_name}` and `{namespace}` path. Requests are tunneled via WebSocket directly to that Edge's registered internal FastAPI app.
+- `/*` - All other routes are parsed by the Bridge to extract the targeted `{endpoint_name}` and `{namespace}` path. Requests are tunneled via WebSocket directly to that Endpoint's registered internal FastAPI app.
 
 ## Plugin Structure
 
-Plugins dynamically extend an Edge's capabilities. A Plugin implementation combines three core components:
+Plugins dynamically extend an Endpoint's capabilities. A Plugin implementation combines three core components:
 
 ### 1. The Plugin Class (REST API)
-Inherits from `Plugin`. It binds directly to the Edge's internal `FastAPI` application to register routes. Routes must be stateless or manage state by instantiating discrete Sessions (e.g. `POST /register_session`).
+Inherits from `Plugin`. It binds directly to the Endpoint's internal `FastAPI` application to register routes. Routes must be stateless or manage state by instantiating discrete Sessions (e.g. `POST /register_session`).
 
 ### 2. The Session Class
 Inherits from `PluginSession`. Represents a stateful context for a specific plugin client execution instance. Handles backend resources, concurrent job futures, and scoped operational contexts required across subsequent API calls by the same user.
@@ -112,9 +112,9 @@ Inherits from `PluginSession`. Represents a stateful context for a specific plug
 ### 3. Client API Shim (`client.py`)
 Inherits from `PluginClient`. An abstraction layer enabling local Python developers to effortlessly instantiate new sessions and seamlessly invoke the REST API operations behind native Python instance methods (without manually unpacking JSON responses).
 
-## Programming with Radical Edge
+## Programming with ORBIT
 
-You can interact with Edge services pragmatically using the Python `BridgeClient` SDK. Example scripts reside in the `examples/` directory.
+You can interact with Endpoint services pragmatically using the Python `BridgeClient` SDK. Example scripts reside in the `examples/` directory.
 
 ### Submitting PsiJ Jobs
 The `psij` plugin exposes a normalized interface for interacting with different HPC batch system schedulers via PSI/J.
@@ -173,14 +173,14 @@ PSI/J job submission plugin:
 
 ## Portal Integration
 
-The interactive Edge Explorer interface (`src/radical/edge/data/edge_explorer.html`) provides a comprehensive browser-based client for interacting with the Bridge HTTP interface.
+The interactive ORBIT Explorer interface (`src/radical/orbit/data/orbit_explorer.html`) provides a comprehensive browser-based client for interacting with the Bridge HTTP interface.
 
 - Served dynamically via `GET /` on the Bridge.
-- Discovers the endpoint hierarchy leveraging the `POST /edge/list` API.
-- Implements purely client-side routing to interact with REST bindings of different edge plugins (e.g., querying `queue_info`, or submitting jobs dynamically via `psij` or `rhapsody` plugins).
+- Discovers the endpoint hierarchy leveraging the `POST /endpoint/list` API.
+- Implements purely client-side routing to interact with REST bindings of different endpoint plugins (e.g., querying `queue_info`, or submitting jobs dynamically via `psij` or `rhapsody` plugins).
 - Supports real-time updates via Server-Sent Events (SSE) from the `/events` endpoint.
-- Allows launching new edge services on HPC resources via PSI/J job submission.
-- Provides bridge and edge termination controls.
+- Allows launching new endpoint services on HPC resources via PSI/J job submission.
+- Provides bridge and endpoint termination controls.
 
 ## Configuration
 
@@ -189,13 +189,13 @@ The interactive Edge Explorer interface (`src/radical/edge/data/edge_explorer.ht
 The bridge URL, TLS cert, and TLS key are resolved with this
 precedence:
 
-> **CLI flag > environment variable > file under `~/.radical/edge/`**
+> **CLI flag > environment variable > file under `~/.radical/orbit/`**
 
 | Item | Env var               | Default file                      |
 |------|-----------------------|-----------------------------------|
-| URL  | `RADICAL_BRIDGE_URL`  | `~/.radical/edge/bridge.url`      |
-| Cert | `RADICAL_BRIDGE_CERT` | `~/.radical/edge/bridge_cert.pem` |
-| Key  | `RADICAL_BRIDGE_KEY`  | `~/.radical/edge/bridge_key.pem`  |
+| URL  | `RADICAL_BRIDGE_URL`  | `~/.radical/orbit/bridge.url`      |
+| Cert | `RADICAL_BRIDGE_CERT` | `~/.radical/orbit/bridge_cert.pem` |
+| Key  | `RADICAL_BRIDGE_KEY`  | `~/.radical/orbit/bridge_key.pem`  |
 
 
 Behaviour notes:
@@ -206,7 +206,7 @@ Behaviour notes:
   binds advertise that literal address.  The bridge writes
   `bridge.url` only when the file does not already exist, so a stale
   file the operator placed for a different bridge is never clobbered.
-  Edges / clients raise `ValueError` if no URL resolves.
+  Endpoints / clients raise `ValueError` if no URL resolves.
 - **Cert / key**: never auto-written; the operator places them.
   Required for `https://` / `wss://` URLs; ignored entirely for
   `http://` / `ws://`.
@@ -216,7 +216,7 @@ Behaviour notes:
 ### Bridge CLI Args
 
 ```
-radical-edge-bridge.py [options]
+orbit-bridge.py [options]
   --cert CERT    TLS cert path                  (CLI > env > file)
   --key  KEY     TLS key path; mode 0o600       (CLI > env > file)
   --host HOST    Bind address (default: 0.0.0.0)
@@ -224,11 +224,11 @@ radical-edge-bridge.py [options]
   -p PLUGINS     Bridge-hosted plugins (default: role default set)
 ```
 
-### Edge Service CLI Args
+### Endpoint Service CLI Args
 
 ```
-radical-edge-service.py [options]
-  --name NAME         Edge name (shown in Explorer and /edge/list)
+orbit-endpoint.py [options]
+  --name NAME         Endpoint name (shown in Explorer and /endpoint/list)
   --url  URL          Bridge URL                 (CLI > env > file)
   --cert CERT         TLS cert path              (CLI > env > file)
   -p PLUGINS          Comma-separated plugins to load
@@ -243,22 +243,22 @@ radical-edge-service.py [options]
 Set the standard Python logging level via environment or launcher:
 
 ```sh
-RADICAL_LOG_LVL=DEBUG ./bin/radical-edge-bridge.py
+RADICAL_LOG_LVL=DEBUG ./bin/orbit-bridge.py
 ```
 
-Or in code: `logging.getLogger("radical.edge").setLevel(logging.DEBUG)`.
+Or in code: `logging.getLogger("radical.orbit").setLevel(logging.DEBUG)`.
 
 
 ## Troubleshooting
 
-**Edge connects but no plugins appear in the Explorer**
-: The plugin failed to import. Check the edge service log for `ImportError` or missing dependencies. Plugins with missing optional dependencies (e.g. PsiJ not installed) are silently skipped.
+**Endpoint connects but no plugins appear in the Explorer**
+: The plugin failed to import. Check the endpoint service log for `ImportError` or missing dependencies. Plugins with missing optional dependencies (e.g. PsiJ not installed) are silently skipped.
 
 **Notifications not arriving (job/task table stops updating)**
 : The SSE connection dropped. Refresh the page to reconnect. The Explorer reconnects automatically on topology changes but not on SSE stream errors.
 
 **Job stuck in SUBMITTED state indefinitely**
-: The PsiJ executor may be misconfigured. Check the edge log for PsiJ errors. For SLURM, verify the account and queue names are valid with `sinfo` and `sacctmgr`.
+: The PsiJ executor may be misconfigured. Check the endpoint log for PsiJ errors. For SLURM, verify the account and queue names are valid with `sinfo` and `sacctmgr`.
 
 **SSL verification error when connecting**
-: For `https://` / `wss://` URLs the cert is required — `BridgeClient` and edge services raise `ValueError` if no cert is resolved (CLI > env > file).  Either set `RADICAL_BRIDGE_CERT` to the `.pem` from setup, drop the file at `~/.radical/edge/bridge_cert.pem`, or use a plain `http://` / `ws://` URL (cert resolution is then skipped entirely — dev mode only).
+: For `https://` / `wss://` URLs the cert is required — `BridgeClient` and endpoint services raise `ValueError` if no cert is resolved (CLI > env > file).  Either set `RADICAL_BRIDGE_CERT` to the `.pem` from setup, drop the file at `~/.radical/orbit/bridge_cert.pem`, or use a plain `http://` / `ws://` URL (cert resolution is then skipped entirely — dev mode only).

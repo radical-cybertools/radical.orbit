@@ -1,10 +1,10 @@
 x-common-build: &common-build
-  image: ${RADICAL_EDGE_IMAGE:-radicalcybertools/radical.edge}:${RADICAL_EDGE_TAG:-latest}
+  image: ${RADICAL_ORBIT_IMAGE:-radicalcybertools/radical.orbit}:${RADICAL_ORBIT_TAG:-latest}
   build:
     context: .
     dockerfile: Dockerfile
     args:
-      RADICAL_EDGE_BRANCH: ${RADICAL_EDGE_BRANCH:-master}
+      RADICAL_ORBIT_BRANCH: ${RADICAL_ORBIT_BRANCH:-master}
 
 services:
   bridge:
@@ -16,7 +16,7 @@ services:
         BRIDGE_HOSTNAME: ${RADICAL_BRIDGE_HOSTNAME:-bridge}
     container_name: radical-bridge
     hostname: ${RADICAL_BRIDGE_HOSTNAME:-bridge}
-    command: [ "radical-edge-bridge.py" ]
+    command: [ "orbit-bridge.py" ]
     healthcheck:
       test:
         - CMD-SHELL
@@ -29,24 +29,24 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - radical-edge-volume:/app
+      - orbit-volume:/app
     networks:
-      - radical-edge-network
+      - orbit-network
 
-  edge:
+  endpoint:
     <<: *common-build
     build:
       args:
         GENERATE_BRIDGE_CERT: "false"
-    container_name: radical-edge
-    hostname: edge
+    container_name: orbit
+    hostname: endpoint
     environment:
       - RADICAL_BRIDGE_URL=https://${RADICAL_BRIDGE_HOSTNAME:-bridge}:8000
-    command: [ "radical-edge-service.py" ]
+    command: [ "orbit-endpoint.py" ]
     volumes:
-      - radical-edge-volume:/app:ro
+      - orbit-volume:/app:ro
     networks:
-      - radical-edge-network
+      - orbit-network
     depends_on:
       bridge:
         condition: service_healthy
@@ -56,25 +56,25 @@ services:
     build:
       args:
         GENERATE_BRIDGE_CERT: "false"
-    container_name: radical-edge-client
+    container_name: orbit-client
     hostname: client
     environment:
       - RADICAL_BRIDGE_URL=https://${RADICAL_BRIDGE_HOSTNAME:-bridge}:8000
     command: [ "tail", "-f", "/dev/null" ]
     volumes:
-      - radical-edge-volume:/app:ro
+      - orbit-volume:/app:ro
     networks:
-      - radical-edge-network
+      - orbit-network
     depends_on:
       bridge:
         condition: service_healthy
-      edge:
+      endpoint:
         condition: service_started
 
 volumes:
-  radical-edge-volume:
-    name: radical-edge-volume
+  orbit-volume:
+    name: orbit-volume
 
 networks:
-  radical-edge-network:
-    name: radical-edge-network
+  orbit-network:
+    name: orbit-network

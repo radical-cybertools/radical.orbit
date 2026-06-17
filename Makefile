@@ -50,7 +50,7 @@ help:
 
 
 
-PROJECT_NAME = radical.edge
+PROJECT_NAME = radical.orbit
 
 PWD    = $(shell pwd)
 VE     = $(PWD)/ve
@@ -98,10 +98,10 @@ docs::  doc
 doc::   install
 	$(PIP) install sphinx
 	sh -c '. $(VE)/bin/activate; make -C docs html'
-	@echo "Copying docs to share/radical.edge/docs/"
-	rm -rf share/radical.edge/docs
-	mkdir -p share/radical.edge/docs
-	cp -r docs/build/html/* share/radical.edge/docs/
+	@echo "Copying docs to share/radical.orbit/docs/"
+	rm -rf share/radical.orbit/docs
+	mkdir -p share/radical.orbit/docs
+	cp -r docs/build/html/* share/radical.orbit/docs/
 
 
 .PHONY: pylint
@@ -153,7 +153,7 @@ prep_git:
 	@echo "  * Join the RADICAL project at https://github.com/radical-cybertools/ "
 	@echo "    On Problems, contact Ole or Andre (ole.weidner@rutgers.edu, andre@merzky.net)."
 	@read reply
-	@echo "  * Create a new repository in the RADICAL project named 'radical.radical.edge' at"
+	@echo "  * Create a new repository in the RADICAL project named 'radical.orbit' at"
 	@echo "        https://github.com/organizations/radical-cybertools/repositories/new "
 	@echo "    On Problems, contact Ole or Andre (ole.weidner@rutgers.edu, andre@merzky.net)."
 	@read reply
@@ -161,16 +161,16 @@ prep_git:
 	@echo "        git init"
 	@echo "        git add * .gitignore"
 	@echo "        git commit -m  'initial commit'"
-	@echo "        git remote add origin git@github.com:radical-cybertools/radical.radical.edge.git"
+	@echo "        git remote add origin git@github.com:radical-cybertools/radical.orbit.git"
 	@echo "        git push origin master"
 	@read reply
 	@echo "  * Check the README content on "
-	@echo "        https://github.com/radical-cybertools/radical.radical.edge"
+	@echo "        https://github.com/radical-cybertools/radical.orbit"
 	@read reply
 	@echo "  * Make sure to 'watch' that repository (button on upper right)"
 	@read reply
 	@echo "  * Use the issue tracker on github, at "
-	@echo "        https://github.com/radical-cybertools/radical.radical.edge/issues"
+	@echo "        https://github.com/radical-cybertools/radical.orbit/issues"
 	@read reply
 	@echo "  * Git setup is now done."
 	@read reply
@@ -213,8 +213,8 @@ prep_pypi:
 	@echo "  * Make sure the uploaded package works as expected:"
 	@echo "      * create a new virtualenv via 'virtualenv test_ve'"
 	@echo "      * use that virtualenv via 'source test_ve/bin/activate'"
-	@echo "      * install your package from pypi, via 'pip install --upgrade radical.radical.edge'"
-	@echo "      * ensure basic functionality, eg. via 'radical-radical.edge-version'"
+	@echo "      * install your package from pypi, via 'pip install --upgrade radical.orbit'"
+	@echo "      * ensure basic functionality, eg. via 'radical-radical.orbit-version'"
 	@read reply
 	@echo "  * Pypi setup is now done."
 	@read reply
@@ -237,10 +237,10 @@ prep_rtd:
 	@echo "  * select 'Add Project' from top-left drop-down menu"
 	@read reply
 	@echo "  * use the following settings:"
-	@echo "      * name     : radical.radical.edge"
-	@echo "      * git url  : https://github.com/radical-cybertools/radical.radical.edge.git"
+	@echo "      * name     : radical.orbit"
+	@echo "      * git url  : https://github.com/radical-cybertools/radical.orbit.git"
 	@echo "      * doc type : sphinx"
-	@echo "      * home page: https://github.com/radical-cybertools/radical.radical.edge/"
+	@echo "      * home page: https://github.com/radical-cybertools/radical.orbit/"
 	@read reply
 	@echo
 	@echo "  * after project creation, select the 'Admin' tab and set/add:"
@@ -268,10 +268,10 @@ prep_jenkins:
 	@echo "  * Use that account to login to http://testing.saga-project.org:8080/"
 	@read reply
 	@echo "  * Add new Jenkins job at http://testing.saga-project.org:8080/view/All/newJob"
-	@echo "      * name     : radical.radical.edge"
+	@echo "      * name     : radical.orbit"
 	@echo "      * copy job : radical.utils"
 	@read reply
-	@echo "  * In the job configuration, search for 'utils' and replace with 'radical.edge'."
+	@echo "  * In the job configuration, search for 'utils' and replace with 'radical.orbit'."
 	@read reply
 	@echo "  * Add you email to the mail notifications."
 	@read reply

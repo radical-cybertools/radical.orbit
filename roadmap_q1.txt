@@ -1,6 +1,6 @@
-# RADICAL-Edge Q1 2026 Work Plan
+# ORBIT Q1 2026 Work Plan
 
-This document maps the **Q1 2026 GitHub milestones and issues** for **RADICAL‑Edge (RD)** to the
+This document maps the **Q1 2026 GitHub milestones and issues** for **RADICAL‑Endpoint (RD)** to the
 existing roadmap and to the broader RHAPSODY / ROSE / xGFabric context.
 It is intentionally limited to **Q1 only** and reflects **single‑developer realism** with
 selective support from additional contributors.
@@ -12,8 +12,8 @@ selective support from additional contributors.
 Q1 focuses on establishing **service infrastructure, plugin baselines, and first integrations**
 that enable later work on RHAPSODY, ROSE, and xGFabric without committing to full implementations.
 
-RADICAL‑Edge acts as the **enabling substrate**:
-- secure Bridge/Edge communication,
+RADICAL‑Endpoint acts as the **enabling substrate**:
+- secure Bridge/Endpoint communication,
 - plugin‑based service exposure,
 - protocol stability,
 - early integration paths.
@@ -26,7 +26,7 @@ RADICAL‑Edge acts as the **enabling substrate**:
 |---------|------|------|
 | **M1** | Feb 9 – Mar 8 | Plugin baseline, protocol clarity, early RHAPSODY/ROSE paths |
 | **M2** | Mar 9 – Apr 5 | xGFabric path, plugin hardening, error semantics |
-| **M3** | Apr 6 – Apr 30 | Multi‑edge consolidation, concurrency, robustness |
+| **M3** | Apr 6 – Apr 30 | Multi‑endpoint consolidation, concurrency, robustness |
 
 ---
 
@@ -40,11 +40,11 @@ RADICAL‑Edge acts as the **enabling substrate**:
 ### Issues
 
 - **Audit & document plugin base**
-- **Edge/Bridge protocol specification**
+- **Endpoint/Bridge protocol specification**
 - **RHAPSODY request/response mapping**
 - **RHAPSODY plugin skeleton**
 - **ROSE integration prep (control‑plane stubs)**
-- **Integration test harness (Edge ↔ mock backend)**
+- **Integration test harness (Endpoint ↔ mock backend)**
 - **CI baseline (lint/typecheck/tests)**
 - **xGFabric usage walkthrough (client‑driven)**
 
@@ -75,15 +75,15 @@ end‑to‑end demo path.
 
 ---
 
-## Milestone M3 — Consolidation & Multi‑Edge Readiness
+## Milestone M3 — Consolidation & Multi‑Endpoint Readiness
 
 **Roadmap alignment:**  
-- RD: “Multi‑edge support”, “Routing”, “Concurrency control”  
+- RD: “Multi‑endpoint support”, “Routing”, “Concurrency control”  
 - RHAPSODY / ROSE: “Concurrent service interaction readiness”
 
 ### Issues
 
-- **Multi‑edge registry & heartbeat tracking**
+- **Multi‑endpoint registry & heartbeat tracking**
 - **Routing policy v1 (capabilities + failover)**
 - **RHAPSODY plugin concurrency handling**
 - **xGFabric multi‑resource example**
@@ -91,7 +91,7 @@ end‑to‑end demo path.
 - **Security & robustness sweep**
 
 **Outcome:**  
-RADICAL‑Edge is prepared for multi‑edge operation, concurrent service use, and downstream
+RADICAL‑Endpoint is prepared for multi‑endpoint operation, concurrent service use, and downstream
 production hardening in later quarters.
 
 ---
@@ -105,5 +105,5 @@ production hardening in later quarters.
 ---
 
 *This document is meant to accompany the GitHub milestones and issues created for Q1 2026
-and should be read together with the RADICAL‑Edge roadmap.*
+and should be read together with the RADICAL‑Endpoint roadmap.*
 

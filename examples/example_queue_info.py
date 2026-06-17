@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 
-from radical.edge import BridgeClient
+from radical.orbit import BridgeClient
 
 
 def main():
 
     bc   = BridgeClient()
-    eids = bc.list_edges()
-    print(f"Found {len(eids)} Edge(s): {eids}")
+    eids = bc.list_endpoints()
+    print(f"Found {len(eids)} Endpoint(s): {eids}")
 
     for eid in eids:
-        ec = bc.get_edge_client(eid)
+        ec = bc.get_endpoint_client(eid)
         plugins = ec.list_plugins()
         if not plugins.get('queue_info', {}).get('enabled', False):
             print(f"\n[{eid}] No batch scheduler available — skipping")
@@ -53,7 +53,7 @@ def _fmt_elapsed(seconds):
 
 def render_queues(eid, queues):
     print(f"\n{'=' * 80}")
-    print(f" Edge: {eid}  —  {len(queues)} partition(s)")
+    print(f" Endpoint: {eid}  —  {len(queues)} partition(s)")
     print(f"{'=' * 80}")
     print(f"  {'Partition':<18} {'State':<8} {'Nodes(tot/avail/idle)':>22} "
           f"{'CPUs':>6} {'Mem(GB)':>8} {'GPUs':>5} {'TimeLimit':>10}")

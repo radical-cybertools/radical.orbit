@@ -2,7 +2,7 @@ FROM python:3.10-slim
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONNOUSERSITE=True
-ENV PATH="/opt/ve_edge/bin:$PATH"
+ENV PATH="/opt/ve_endpoint/bin:$PATH"
 ENV RADICAL_BRIDGE_CERT="/app/private/bridge_cert.pem"
 ENV RADICAL_BRIDGE_KEY="/app/private/bridge_key.pem"
 
@@ -18,15 +18,15 @@ RUN apt-get update -y && \
         sudo && \
     rm -rf /var/lib/apt/lists/*
 
-RUN python3 -m venv /opt/ve_edge
+RUN python3 -m venv /opt/ve_endpoint
 
 WORKDIR /app
 
-ARG RADICAL_EDGE_BRANCH=master
-RUN git clone -b ${RADICAL_EDGE_BRANCH} https://github.com/radical-cybertools/radical.edge.git
+ARG RADICAL_ORBIT_BRANCH=master
+RUN git clone -b ${RADICAL_ORBIT_BRANCH} https://github.com/radical-cybertools/radical.orbit.git
 
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
-    pip install --no-cache-dir /app/radical.edge
+    pip install --no-cache-dir /app/radical.orbit
 
 ARG GENERATE_BRIDGE_CERT=false
 ARG BRIDGE_IP=127.0.0.1

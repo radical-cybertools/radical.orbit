@@ -2,14 +2,14 @@
 """
 XGFabric Workflow Client
 
-Connects to the bridge, starts an XGFabric workflow on the specified edge,
+Connects to the bridge, starts an XGFabric workflow on the specified endpoint,
 and watches execution to completion via SSE notifications.
 
 Usage:
     python examples/xgfabric.py [options]
 
 Examples:
-    python examples/xgfabric.py --bridge-url https://bridge:8000 --edge thinkie
+    python examples/xgfabric.py --bridge-url https://bridge:8000 --endpoint thinkie
     python examples/xgfabric.py -w myworkflow -r myresource
     RADICAL_BRIDGE_URL=https://bridge:8000 python examples/xgfabric.py
 """
@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 
-from radical.edge import BridgeClient
+from radical.orbit import BridgeClient
 
 logging.basicConfig(level=logging.DEBUG, format='%(levelname)s %(name)s %(message)s')
 
@@ -81,15 +81,15 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     # URL/cert default to None so BridgeClient self-resolves via
-    # radical.edge.utils (CLI > env > file).
+    # radical.orbit.utils (CLI > env > file).
     parser.add_argument('-u', '--bridge-url',  default=None,
                         help='Bridge URL  (CLI > $RADICAL_BRIDGE_URL > '
-                             '~/.radical/edge/bridge.url).')
+                             '~/.radical/orbit/bridge.url).')
     parser.add_argument('-c', '--bridge-cert', default=None,
                         help='Bridge CA cert path  (CLI > $RADICAL_BRIDGE_CERT '
-                             '> ~/.radical/edge/bridge_cert.pem).')
-    parser.add_argument('-e', '--edge',     default='local',
-                        help='Edge name where xgfabric plugin is running')
+                             '> ~/.radical/orbit/bridge_cert.pem).')
+    parser.add_argument('-e', '--endpoint',     default='local',
+                        help='Endpoint name where xgfabric plugin is running')
     parser.add_argument('-w', '--workflow', default='__default__',
                         help='Workflow config name or path (__default__ = built-in)')
     parser.add_argument('-r', '--resource', default='__default__',
@@ -99,7 +99,7 @@ def main():
     print(args)
 
     bc  = BridgeClient(url=args.bridge_url, cert=args.bridge_cert)
-    ec  = bc.get_edge_client(args.edge)
+    ec  = bc.get_endpoint_client(args.endpoint)
     xgf = ec.get_plugin('xgfabric')
 
 
@@ -107,11 +107,11 @@ def main():
     last_data = {}
     seen_logs = set()   # timestamps of log entries already printed
 
-    def on_topology(edges):
+    def on_topology(endpoints):
         ts = time.strftime('%H:%M:%S')
-        print(f"[{ts}] topology: {list(edges.keys())}", flush=True)
+        print(f"[{ts}] topology: {list(endpoints.keys())}", flush=True)
 
-    def on_status(edge, plugin, topic, data):
+    def on_status(endpoint, plugin, topic, data):
         last_data.update(data)
 
         # Print any new error log entries immediately
@@ -131,7 +131,7 @@ def main():
     try:
         # Show initial cluster/config state before starting
         print(f"Connecting to bridge: {args.bridge_url}")
-        print(f"Edge: {args.edge}  Workflow: {args.workflow}  Resource: {args.resource}")
+        print(f"Endpoint: {args.endpoint}  Workflow: {args.workflow}  Resource: {args.resource}")
         _print_status(xgf.get_status())
 
         # Register for topology and workflow notifications

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from radical.edge import BridgeClient
+from radical.orbit import BridgeClient
 
 
 def bytes2human(n):
@@ -20,11 +20,11 @@ def bytes2human(n):
 def main():
 
     bc = BridgeClient()
-    eids = bc.list_edges()
-    print(f"Found {len(eids)} Edge(s): {eids}")
+    eids = bc.list_endpoints()
+    print(f"Found {len(eids)} Endpoint(s): {eids}")
 
     for eid in eids:
-        ec = bc.get_edge_client(eid)
+        ec = bc.get_endpoint_client(eid)
         si = ec.get_plugin('sysinfo')
 
         metrics = si.get_metrics()
@@ -40,7 +40,7 @@ def render_metrics(eid: str, m: dict):
     kernel = system.get('kernel', '?')
 
     print("\n" + "=" * 62)
-    print(f" Edge: {eid} | Host: {hostname} | OS: {kernel}")
+    print(f" Endpoint: {eid} | Host: {hostname} | OS: {kernel}")
 
     # CPU Table
     cpu = m.get('cpu', {})

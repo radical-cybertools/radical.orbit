@@ -5,7 +5,7 @@ Unit tests for the UI schema module.
 import pytest
 from pydantic import ValidationError
 
-from radical.edge.ui_schema import (
+from radical.orbit.ui_schema import (
     UIConfig, UIForm, UIField, UIMonitor, UINotifications,
     UIFieldOption, UIFormSubmit, ui_config_to_dict, validate_ui_config
 )
@@ -248,7 +248,7 @@ class TestPluginUIConfigs:
     """Test that existing plugins have valid ui_configs."""
 
     def test_sysinfo_ui_config(self):
-        from radical.edge.plugin_sysinfo import PluginSysInfo
+        from radical.orbit.plugin_sysinfo import PluginSysInfo
         ui = PluginSysInfo.ui_config
         assert ui["icon"] == "🖥️"
         assert ui["title"] == "System Info"
@@ -256,13 +256,13 @@ class TestPluginUIConfigs:
         assert len(ui["monitors"]) == 1
 
     def test_queue_info_ui_config(self):
-        from radical.edge.plugin_queue_info import PluginQueueInfo
+        from radical.orbit.plugin_queue_info import PluginQueueInfo
         ui = PluginQueueInfo.ui_config
         assert ui["icon"] == "📋"
         assert ui["title"] == "Queue Info"
 
     def test_psij_ui_config(self):
-        from radical.edge.plugin_psij import PluginPSIJ
+        from radical.orbit.plugin_psij import PluginPSIJ
         ui = PluginPSIJ.ui_config
         assert ui["icon"] == "🚀"
         assert ui["title"] == "PsiJ Jobs"
@@ -273,7 +273,7 @@ class TestPluginUIConfigs:
 
     def test_rhapsody_ui_config(self):
         try:
-            from radical.edge.plugin_rhapsody import PluginRhapsody
+            from radical.orbit.plugin_rhapsody import PluginRhapsody
         except ImportError:
             pytest.skip("rhapsody not installed")
 
@@ -285,13 +285,13 @@ class TestPluginUIConfigs:
 
     def test_lucid_ui_config(self):
         pytest.importorskip('radical.pilot')
-        from radical.edge.plugin_lucid import PluginLucid
+        from radical.orbit.plugin_lucid import PluginLucid
         ui = PluginLucid.ui_config
         assert ui["icon"] == "🧠"
         assert ui["stub_message"] is not None
 
     def test_xgfabric_ui_config(self):
-        from radical.edge.plugin_xgfabric import PluginXGFabric
+        from radical.orbit.plugin_xgfabric import PluginXGFabric
         ui = PluginXGFabric.ui_config
         assert ui["icon"] == "🌊"
         assert ui["title"] == "XGFabric Workflow"

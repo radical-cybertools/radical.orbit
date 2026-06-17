@@ -4,7 +4,7 @@ Example: Rhapsody Task Throughput Benchmark
 ===========================================
 
 Measures task throughput for different batch sizes using the Rhapsody
-Session/Task API with the Edge execution backend.  All bridge
+Session/Task API with the Endpoint execution backend.  All bridge
 interactions are handled by the backend — no direct BridgeClient usage.
 
 Runs two passes: one with identical (homogeneous) tasks and one with
@@ -12,9 +12,9 @@ per-task arguments (heterogeneous) to compare template-compressed vs
 regular batched submit paths.
 
 Prerequisites:
-  - A Radical Edge bridge is running (RADICAL_BRIDGE_URL set).
-  - An edge service is connected with the Rhapsody plugin loaded.
-  - The ``rhapsody`` package is installed on both client and edge.
+  - A ORBIT bridge is running (RADICAL_BRIDGE_URL set).
+  - An endpoint service is connected with the Rhapsody plugin loaded.
+  - The ``rhapsody`` package is installed on both client and endpoint.
 
 Usage:
   python examples/example_rhapsody_throughput.py [batch_sizes...]
@@ -131,17 +131,17 @@ async def main():
                        16384, 32768, 65536
                        ]
 
-    # ---- set up Rhapsody session with Edge backend ---
-    # Edge auto-discovery: ``get_backend('edge')`` with no
-    # ``bridge_url`` / ``edge_name`` resolves the bridge URL via
-    # radical.edge.utils and selects the first connected edge
+    # ---- set up Rhapsody session with Endpoint backend ---
+    # Endpoint auto-discovery: ``get_backend('orbit')`` with no
+    # ``bridge_url`` / ``endpoint_name`` resolves the bridge URL via
+    # radical.orbit.utils and selects the first connected endpoint
     # advertising the rhapsody plugin.  ``await backend`` raises
     # RuntimeError if no candidate is found.
-    backend = rhapsody.get_backend('edge', backends=['noop'])
+    backend = rhapsody.get_backend('orbit', backends=['noop'])
     backend = await backend       # async init (registers remote session)
 
     out(f"Bridge:  {backend._bridge_url}")
-    out(f"Edge:    {backend._edge_name}")
+    out(f"Endpoint:    {backend._endpoint_name}")
     out(f"Batches: {batch_sizes}")
 
     session = rhapsody.Session(backends=[backend])

@@ -2,7 +2,7 @@
 """
 Analyze Rhapsody plugin profiling from radical.prof files.
 
-Reads client.prof, bridge.prof, edge.prof from a directory, extracts
+Reads client.prof, bridge.prof, endpoint.prof from a directory, extracts
 Rhapsody-specific profiling events, and reports per-phase latency
 statistics with dedicated plots.
 
@@ -48,7 +48,7 @@ TASK_PHASES = [
 
 def _load_profiles(prof_dir):
     """Find and load .prof files, return combined timeline."""
-    patterns = ['client.prof', 'client.task.prof', 'bridge.prof', 'edge.prof']
+    patterns = ['client.prof', 'client.task.prof', 'bridge.prof', 'endpoint.prof']
     prof_files = []
     for pat in patterns:
         found = glob.glob(os.path.join(prof_dir, pat))
@@ -66,7 +66,7 @@ def _load_profiles(prof_dir):
         print(f"  {f}")
     print()
 
-    profs = rprof.read_profiles(prof_files, sid='edge.benchmark')
+    profs = rprof.read_profiles(prof_files, sid='endpoint.benchmark')
     combined, _ = rprof.combine_profiles(profs)
     return combined
 
@@ -78,7 +78,7 @@ def _build_events(combined):
       - req_events:  batch_id -> {event_name: timestamp, '_msg': {event: msg}}
       - task_events: task_uid -> {event_name: timestamp}
     """
-    # Events keyed by individual task UID (client + edge)
+    # Events keyed by individual task UID (client + endpoint)
     TASK_EVENT_NAMES = {
         'task_submit', 'task_batch_flush', 'task_complete',
         'rh_task_exec', 'rh_task_done',
@@ -97,7 +97,7 @@ def _build_events(combined):
         if not uid:
             continue
 
-        # Task-level events (client + edge)
+        # Task-level events (client + endpoint)
         if event in TASK_EVENT_NAMES:
             if uid not in task_events:
                 task_events[uid] = {}

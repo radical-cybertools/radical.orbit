@@ -3,7 +3,7 @@
 Example: Rhapsody Individual Task Submission
 =============================================
 
-Submits tasks one-by-one through the Edge Rhapsody backend.  The Edge
+Submits tasks one-by-one through the Endpoint Rhapsody backend.  The Endpoint
 backend collects individually submitted tasks over a short time window
 and flushes them as bulk HTTP requests, so single-task submit calls
 still achieve high throughput.
@@ -17,8 +17,8 @@ Usage:
   --tasks N                  Number of tasks (default 8192)
   --batch-window SEC         Client submit batch window (default 0.05)
   --batch-limit N            Client submit batch size limit (default 1024)
-  --notify-window SEC        Edge notification batch window (default 0.05)
-  --notify-limit N           Edge notification batch size (default 256)
+  --notify-window SEC        Endpoint notification batch window (default 0.05)
+  --notify-limit N           Endpoint notification batch size (default 256)
 """
 
 import argparse
@@ -52,14 +52,14 @@ async def main():
 
     args = parse_args()
 
-    # ---- set up Rhapsody session with Edge backend ---
-    # Edge auto-discovery: ``get_backend('edge')`` with no
-    # ``bridge_url`` / ``edge_name`` resolves the bridge URL via
-    # radical.edge.utils and selects the first connected edge
+    # ---- set up Rhapsody session with Endpoint backend ---
+    # Endpoint auto-discovery: ``get_backend('orbit')`` with no
+    # ``bridge_url`` / ``endpoint_name`` resolves the bridge URL via
+    # radical.orbit.utils and selects the first connected endpoint
     # advertising the rhapsody plugin.  ``await backend`` raises
     # RuntimeError if no candidate is found.
     backend = rhapsody.get_backend(
-        'edge',
+        'orbit',
         backends=['noop'],
         batch_window=args.batch_window,
         batch_limit=args.batch_limit,
@@ -69,7 +69,7 @@ async def main():
     backend = await backend
 
     print(f"Bridge:         {backend._bridge_url}")
-    print(f"Edge:           {backend._edge_name}")
+    print(f"Endpoint:           {backend._endpoint_name}")
     print(f"Tasks:          {args.tasks}")
     print(f"Batch window:   {args.batch_window}s")
     print(f"Batch limit:    {args.batch_limit}")

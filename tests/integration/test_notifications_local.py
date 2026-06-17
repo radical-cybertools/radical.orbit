@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """End-to-end notification reproducer that runs entirely on localhost.
 
-Spawns a bridge + a single edge as subprocesses, submits one tiny job
+Spawns a bridge + a single endpoint as subprocesses, submits one tiny job
 through the ``psij`` plugin (``local`` executor), and asserts that a
 terminal ``job_status`` notification reaches the BridgeClient via SSE
 within a small timeout.
 
-The point is to exercise the full Plugin -> EdgeService.send_notification
+The point is to exercise the full Plugin -> EndpointService.send_notification
 -> WS -> Bridge._broadcast_event -> SSE -> BridgeClient._listen_sse
 -> registered-callback path on a single machine, with no Dragon, no
 SLURM, no tunnel — so a regression in that path can be reproduced and
@@ -32,10 +32,10 @@ from pathlib import Path
 
 
 REPO_ROOT  = Path(__file__).resolve().parents[2]
-BIN_BRIDGE = REPO_ROOT / 'bin' / 'radical-edge-bridge.py'
-BIN_EDGE   = REPO_ROOT / 'bin' / 'radical-edge-service.py'
+BIN_BRIDGE = REPO_ROOT / 'bin' / 'orbit-bridge.py'
+BIN_ENDPOINT   = REPO_ROOT / 'bin' / 'orbit-endpoint.py'
 
-EDGE_NAME       = 'test-edge-local'
+ENDPOINT_NAME       = 'test-endpoint-local'
 NOTIF_TIMEOUT_S = 30.0   # generous: covers slow PsiJ local startup
 
 
@@ -90,7 +90,7 @@ def _make_self_signed(certdir: Path) -> tuple:
 
 
 def run_test() -> int:
-    tmpdir = tempfile.mkdtemp(prefix='radical-edge-test-')
+    tmpdir = tempfile.mkdtemp(prefix='orbit-test-')
     cert, key = _make_self_signed(Path(tmpdir))
     cert_path, key_path = str(cert), str(key)
 
@@ -102,7 +102,7 @@ def run_test() -> int:
     env.update(
         RADICAL_BRIDGE_URL=bridge_url,
         RADICAL_BRIDGE_CERT=cert_path,
-        RADICAL_EDGE_LOG_LEVEL='DEBUG',
+        RADICAL_ORBIT_LOG_LEVEL='DEBUG',
     )
 
     bridge_proc = subprocess.Popen(
@@ -113,57 +113,57 @@ def run_test() -> int:
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     _drain(bridge_proc.stdout, 'bridge')
 
-    edge_proc = None
+    endpoint_proc = None
     try:
         _wait_for_port('localhost', port, timeout=10.0)
 
-        edge_proc = subprocess.Popen(
-            [sys.executable, str(BIN_EDGE),
-             '--name', EDGE_NAME,
+        endpoint_proc = subprocess.Popen(
+            [sys.executable, str(BIN_ENDPOINT),
+             '--name', ENDPOINT_NAME,
              '--url', bridge_url,
              '--plugins', 'psij',
              '--log-level', 'DEBUG'],
             env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        _drain(edge_proc.stdout, 'edge')
+        _drain(endpoint_proc.stdout, 'endpoint')
 
         # Late imports so logging picks up the env above.
-        from radical.edge.client import BridgeClient
+        from radical.orbit.client import BridgeClient
 
         client = BridgeClient(url=bridge_url, cert=cert_path)
         # Make SSE listener errors visible (otherwise they're DEBUG-only).
-        logging.getLogger('radical.edge').setLevel(logging.DEBUG)
-        logging.getLogger('radical.edge.client').setLevel(logging.DEBUG)
+        logging.getLogger('radical.orbit').setLevel(logging.DEBUG)
+        logging.getLogger('radical.orbit.client').setLevel(logging.DEBUG)
 
-        # Wait for the edge to register over WS.  Use the topology
+        # Wait for the endpoint to register over WS.  Use the topology
         # callback the BridgeClient already exposes.
-        edge_seen = threading.Event()
-        def on_topology(edges):
-            if EDGE_NAME in edges:
-                edge_seen.set()
+        endpoint_seen = threading.Event()
+        def on_topology(endpoints):
+            if ENDPOINT_NAME in endpoints:
+                endpoint_seen.set()
         client.register_topology_callback(on_topology)
 
-        if not edge_seen.wait(timeout=15.0):
-            # fall back to polling list_edges in case the topology
+        if not endpoint_seen.wait(timeout=15.0):
+            # fall back to polling list_endpoints in case the topology
             # event was missed (e.g. SSE listener not yet warm).
             for _ in range(50):
                 try:
-                    if EDGE_NAME in client.list_edges():
-                        edge_seen.set()
+                    if ENDPOINT_NAME in client.list_endpoints():
+                        endpoint_seen.set()
                         break
                 except Exception:
                     pass
                 time.sleep(0.1)
-        if not edge_seen.is_set():
-            print("FAIL: edge did not register on bridge", file=sys.stderr)
+        if not endpoint_seen.is_set():
+            print("FAIL: endpoint did not register on bridge", file=sys.stderr)
             return 1
 
-        edge = client.get_edge_client(EDGE_NAME)
-        psij = edge.get_plugin('psij')
+        endpoint = client.get_endpoint_client(ENDPOINT_NAME)
+        psij = endpoint.get_plugin('psij')
 
         notifications = []
         terminal_seen = threading.Event()
 
-        def on_job_status(edge_id, plugin_name, topic, data):
+        def on_job_status(endpoint_id, plugin_name, topic, data):
             notifications.append((topic, data))
             state = (data or {}).get('state') or (data or {}).get('status')
             if state in ('DONE', 'COMPLETED', 'FAILED',
@@ -192,7 +192,7 @@ def run_test() -> int:
         return 0
 
     finally:
-        for proc, name in ((edge_proc, 'edge'), (bridge_proc, 'bridge')):
+        for proc, name in ((endpoint_proc, 'endpoint'), (bridge_proc, 'bridge')):
             if proc and proc.poll() is None:
                 proc.terminate()
                 try:

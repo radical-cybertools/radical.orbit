@@ -1,12 +1,12 @@
-# RADICAL-Edge — Docker Example
+# ORBIT — Docker Example
 
 This directory contains a `Dockerfile` and `docker-compose.yaml` to run all
-RADICAL-Edge endpoints (bridge, edge service, and client) inside separate
+ORBIT endpoints (bridge, endpoint service, and client) inside separate
 Docker containers.
 
 > [!NOTE]
 > We use the `dev` tag for the latest, but possibly unstable, configuration of
-> the RADICAL-Edge image.
+> the ORBIT image.
 
 ## Prerequisites
 
@@ -18,10 +18,10 @@ Docker containers.
 ### 1. Set environment variables
 
 ```shell
-export RADICAL_EDGE_IMAGE=radicalcybertools/radical.edge
-export RADICAL_EDGE_TAG=dev
+export RADICAL_ORBIT_IMAGE=radicalcybertools/radical.orbit
+export RADICAL_ORBIT_TAG=dev
 # for the demo we use the current `devel` branch
-export RADICAL_EDGE_BRANCH=devel
+export RADICAL_ORBIT_BRANCH=devel
 # for the demo we use the hostname for the bridge as `bridge`
 export RADICAL_BRIDGE_HOSTNAME=bridge
 ```
@@ -39,20 +39,20 @@ cd examples/docker
 docker build --build-arg GENERATE_BRIDGE_CERT=true \
              --build-arg BRIDGE_IP=127.0.0.1 \
              --build-arg BRIDGE_HOSTNAME=${RADICAL_BRIDGE_HOSTNAME} \
-             --build-arg RADICAL_EDGE_BRANCH=${RADICAL_EDGE_BRANCH} \
-             -t ${RADICAL_EDGE_IMAGE}:${RADICAL_EDGE_TAG} .
+             --build-arg RADICAL_ORBIT_BRANCH=${RADICAL_ORBIT_BRANCH} \
+             -t ${RADICAL_ORBIT_IMAGE}:${RADICAL_ORBIT_TAG} .
 ```
 
 ### 3. Start containers and run the example
 
 ```shell
-# start the bridge, edge, and client containers in the background
+# start the bridge, endpoint, and client containers in the background
 docker compose up -d
 
 # get into the client container and run the example
-docker exec -it radical-edge-client bash
+docker exec -it orbit-client bash
 
-cd /app/radical.edge/examples
+cd /app/radical.orbit/examples
 python3 example_sysinfo.py
 ```
 
@@ -71,7 +71,7 @@ running you can open the API documentation directly in a web browser:
 > used. Click **Advanced → Proceed to localhost** (or equivalent) to continue.
 
 > [!TIP]
-> When registering a new edge service through the portal (e.g., via the
+> When registering a new endpoint service through the portal (e.g., via the
 > `/register` endpoint), use the **internal Docker hostname** as the Bridge URL:
 > ```
 > https://bridge:8000
@@ -83,8 +83,8 @@ running you can open the API documentation directly in a web browser:
 ### 5. Useful commands
 
 ```shell
-# follow logs from bridge and edge containers
-docker compose logs -f bridge -f edge
+# follow logs from bridge and endpoint containers
+docker compose logs -f bridge -f endpoint
 
 # stop and remove all containers
 docker compose down

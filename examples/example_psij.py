@@ -4,7 +4,7 @@ import argparse
 import json
 import sys
 import time
-from radical.edge import BridgeClient
+from radical.orbit import BridgeClient
 
 
 def my_notification_cb(topic: str, data: dict):
@@ -15,8 +15,8 @@ def get_config(config_path: str = None) -> dict:
 
     # Default configuration
     config = {
-        "edge_id_match": None,
-        "edge_id_prefix": None,
+        "endpoint_id_match": None,
+        "endpoint_id_prefix": None,
         "job_executor": None,
         "job_spec": {
             "executable": "/bin/sleep",
@@ -54,38 +54,38 @@ def main():
     config = get_config(args.config)
 
     bc = BridgeClient()
-    eids = bc.list_edges()
+    eids = bc.list_endpoints()
 
     if not eids:
-        print("No edges found.")
+        print("No endpoints found.")
         return
 
     eid = None
-    edge_id_match = config.get("edge_id_match")
-    edge_id_prefix = config.get("edge_id_prefix")
+    endpoint_id_match = config.get("endpoint_id_match")
+    endpoint_id_prefix = config.get("endpoint_id_prefix")
     
-    if edge_id_match:
+    if endpoint_id_match:
         for _eid in eids:
-            if edge_id_match in _eid:
+            if endpoint_id_match in _eid:
                 eid = _eid
                 break
         if not eid:
-            print(f"No edge found matching '{edge_id_match}'.")
+            print(f"No endpoint found matching '{endpoint_id_match}'.")
             return
-    elif edge_id_prefix:
+    elif endpoint_id_prefix:
         for _eid in eids:
-            if _eid.startswith(edge_id_prefix):
+            if _eid.startswith(endpoint_id_prefix):
                 eid = _eid
                 break
         if not eid:
-            print(f"No edge found starting with prefix '{edge_id_prefix}'.")
+            print(f"No endpoint found starting with prefix '{endpoint_id_prefix}'.")
             return
     else:
         eid = eids[0]
 
-    print(f"Using edge: {eid}")
+    print(f"Using endpoint: {eid}")
 
-    ec = bc.get_edge_client(eid)
+    ec = bc.get_endpoint_client(eid)
     pi = ec.get_plugin('psij')
 
     # Register for asynchronous bridge notifications

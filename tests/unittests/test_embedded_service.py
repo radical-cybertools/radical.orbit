@@ -7,10 +7,10 @@ import time
 import pytest
 from unittest.mock import Mock
 
-from radical.edge.service import EdgeService
-import radical.edge as re
-import radical.edge.service as service_mod
-import radical.edge.utils as edge_utils
+from radical.orbit.service import EndpointService
+import radical.orbit as re
+import radical.orbit.service as service_mod
+import radical.orbit.utils as endpoint_utils
 
 # Configure logging for tests
 logging.basicConfig(level=logging.DEBUG)
@@ -28,8 +28,8 @@ async def test_embedded_service_async_init():
         def __init__(self, app):
             super().__init__(app, 'mock_plugin')
 
-    # EdgeService now loads registered plugins automatically
-    service = EdgeService(bridge_url="ws://localhost:0")
+    # EndpointService now loads registered plugins automatically
+    service = EndpointService(bridge_url="ws://localhost:0")
 
     assert 'mock_plugin' in service._plugins
     assert isinstance(service._plugins['mock_plugin'], MockPlugin)
@@ -43,7 +43,7 @@ async def test_embedded_service_async_init():
 async def test_embedded_service_run_stop():
     """Test service run/stop cycle (integration-like but mocked ws)."""
 
-    service = EdgeService(bridge_url="ws://localhost:0")
+    service = EndpointService(bridge_url="ws://localhost:0")
 
     # Create task for service.run()
     task = asyncio.create_task(service.run())
@@ -74,7 +74,7 @@ def test_embedded_service_sync_background():
     # before any HTTP exchange — keeps the reconnect-backoff sleep
     # short enough that ``stop()`` propagates within the test's
     # join timeout.
-    service = EdgeService(bridge_url="ws://no-such-host.invalid:1")
+    service = EndpointService(bridge_url="ws://no-such-host.invalid:1")
 
     # Start background thread
     service.start_background()
@@ -96,7 +96,7 @@ async def test_embedded_service_tls_hostname_fallback(monkeypatch, tmp_path, cap
     cert = tmp_path / 'bridge_cert.pem'
     cert.write_text('dummy cert')
 
-    monkeypatch.setattr(edge_utils, 'resolve_bridge_cert',
+    monkeypatch.setattr(endpoint_utils, 'resolve_bridge_cert',
                         lambda cli=None: (cert, 'cli'))
 
     ssl_contexts = []
@@ -118,7 +118,7 @@ async def test_embedded_service_tls_hostname_fallback(monkeypatch, tmp_path, cap
     monkeypatch.setattr(service_mod.ssl, 'create_default_context',
                         fake_create_default_context)
 
-    service = EdgeService(bridge_url="https://bridge.example:443")
+    service = EndpointService(bridge_url="https://bridge.example:443")
 
     class FakeWS:
         async def send(self, _msg):
@@ -145,14 +145,14 @@ async def test_embedded_service_tls_hostname_fallback(monkeypatch, tmp_path, cap
 
     monkeypatch.setattr(service_mod.websockets, 'connect', fake_connect)
 
-    # The 'radical.edge' logger is configured with propagate=False (see
+    # The 'radical.orbit' logger is configured with propagate=False (see
     # logging_config.configure_logging), so caplog's root handler never
     # sees its records.  Attach caplog's handler to that logger directly
     # for the duration of the call instead of relying on propagation.
-    re_logger = logging.getLogger("radical.edge")
+    re_logger = logging.getLogger("radical.orbit")
     re_logger.addHandler(caplog.handler)
     try:
-        with caplog.at_level(logging.WARNING, logger="radical.edge"):
+        with caplog.at_level(logging.WARNING, logger="radical.orbit"):
             await service.run()
     finally:
         re_logger.removeHandler(caplog.handler)

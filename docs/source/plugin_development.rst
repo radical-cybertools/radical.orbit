@@ -5,7 +5,7 @@ Plugin Development Guide
 Overview
 ========
 
-The Radical Edge plugin system lets you extend edge nodes with
+The ORBIT plugin system lets you extend endpoint nodes with
 domain-specific functionality.  Each plugin gets its own URL namespace,
 session management, and notification support out of the box.
 
@@ -17,7 +17,7 @@ Base Classes
 
 The plugin system provides three base classes:
 
-1. **Plugin** (``plugin_base.py``) — Server-side plugin registered on the edge.
+1. **Plugin** (``plugin_base.py``) — Server-side plugin registered on the endpoint.
 
    - Manages sessions, routes, and notifications
    - Auto-registers via ``plugin_name`` class attribute
@@ -32,7 +32,7 @@ The plugin system provides three base classes:
 
 3. **PluginClient** (``client.py``) — Application-side client helper.
 
-   - Wraps HTTP calls to the bridge/edge REST API
+   - Wraps HTTP calls to the bridge/endpoint REST API
    - Manages session registration and lifecycle
    - Optional: only needed for Python client usage
 
@@ -72,7 +72,7 @@ Create a session class that inherits from ``PluginSession``:
 
 .. code-block:: python
 
-    from radical.edge.plugin_session_base import PluginSession
+    from radical.orbit.plugin_session_base import PluginSession
 
     class MySession(PluginSession):
         """Server-side session for MyPlugin."""
@@ -117,10 +117,10 @@ Create a plugin class that inherits from ``Plugin``:
 
     from fastapi import FastAPI, Request
     from starlette.responses import JSONResponse
-    from radical.edge.plugin_base import Plugin
+    from radical.orbit.plugin_base import Plugin
 
     class PluginMyService(Plugin):
-        """MyService plugin for Radical Edge."""
+        """MyService plugin for ORBIT."""
 
         plugin_name   = "myservice"     # URL namespace and registry key
         session_class = MySession       # Required!
@@ -166,13 +166,13 @@ For Python client access, create a client class:
 
 .. code-block:: python
 
-    from radical.edge.client import PluginClient
+    from radical.orbit.client import PluginClient
 
     class MyServiceClient(PluginClient):
         """Client-side interface for MyService plugin."""
 
         def do_work(self, param: str) -> dict:
-            """Call do_work on the edge."""
+            """Call do_work on the endpoint."""
             if not self.sid:
                 raise RuntimeError("No active session")
 
@@ -231,7 +231,7 @@ Notifications
 -------------
 
 Sessions send notifications via ``self._notify(topic, data)``.
-Notifications flow: Session → Plugin → Edge → Bridge → SSE clients.
+Notifications flow: Session → Plugin → Endpoint → Bridge → SSE clients.
 
 .. code-block:: python
 
@@ -248,15 +248,15 @@ See the main CLAUDE.md for subscription examples (JavaScript, Python).
 Topology Updates
 ----------------
 
-Override ``on_topology_change`` to react when edges connect or disconnect:
+Override ``on_topology_change`` to react when endpoints connect or disconnect:
 
 .. code-block:: python
 
     class PluginMyService(Plugin):
-        async def on_topology_change(self, edges: dict):
-            for edge_name, info in edges.items():
+        async def on_topology_change(self, endpoints: dict):
+            for endpoint_name, info in endpoints.items():
                 plugins = info.get('plugins', [])
-                print(f"Edge {edge_name}: {plugins}")
+                print(f"Endpoint {endpoint_name}: {plugins}")
 
 UI Configuration
 ================
@@ -312,7 +312,7 @@ Required Exports
     // Unique plugin name — used for routing and session lookup
     export const name = 'myplugin';
 
-    // Return the HTML for the plugin page (called once per edge)
+    // Return the HTML for the plugin page (called once per endpoint)
     export function template() { return '<div>...</div>'; }
 
     // Return plugin-scoped CSS (injected into a <style> tag)
@@ -379,16 +379,16 @@ The ``api`` object is passed to ``init()``, ``onShow()``, and
 **Queue data cache**
 
 ``api.getQueueData()``
-    Return cached queue/allocation data for this edge (populated by
+    Return cached queue/allocation data for this endpoint (populated by
     the ``queue_info`` plugin on load), or ``undefined`` if not available.
 
 ``api.setQueueData(data)``
-    Store queue data for this edge (called by ``queue_info``).
+    Store queue data for this endpoint (called by ``queue_info``).
 
-**Edge info (read-only properties)**
+**Endpoint info (read-only properties)**
 
-``api.edgeName``
-    The name of the current edge (e.g. ``"hpc1"``).
+``api.endpointName``
+    The name of the current endpoint (e.g. ``"hpc1"``).
 
 ``api.pluginName``
     The plugin module name.
@@ -397,12 +397,12 @@ The ``api`` object is passed to ``init()``, ``onShow()``, and
     Full URL of the bridge (e.g. ``"https://bridge:8000"``).
 
 ``api.getPluginNames()``
-    Returns an array of all plugin names registered on this edge.
+    Returns an array of all plugin names registered on this endpoint.
 
-**Edge management**
+**Endpoint management**
 
-``api.disconnectEdge(event)``
-    Initiate graceful disconnection of this edge. Pass the click event
+``api.disconnectEndpoint(event)``
+    Initiate graceful disconnection of this endpoint. Pass the click event
     to prevent default and stop propagation.
 
 Notifications
@@ -456,7 +456,7 @@ Session Lifecycle
 Sessions are created on the first ``api.getSession()`` call and persist until:
 
 - The browser tab is closed or navigated away
-- The edge disconnects (all sessions are lost; the edge has no persistence)
+- The endpoint disconnects (all sessions are lost; the endpoint has no persistence)
 - The session TTL expires (default 1 hour of inactivity)
 - The client calls ``unregister_session/{sid}``
 
@@ -466,8 +466,8 @@ When ``close()`` is called on a ``PluginSession``:
 - Any background polling or watchers must be cancelled
 - The base ``super().close()`` sets the session status to inactive
 
-Sessions are **not persisted** across edge restarts. Clients must re-register
-after an edge reconnects.
+Sessions are **not persisted** across endpoint restarts. Clients must re-register
+after an endpoint reconnects.
 
 Async / Sync Guidelines
 =======================

@@ -8,8 +8,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 from fastapi import FastAPI
 
-from radical.edge.plugin_base        import Plugin
-from radical.edge.plugin_iri_connect import PluginIRIConnect
+from radical.orbit.plugin_base        import Plugin
+from radical.orbit.plugin_iri_connect import PluginIRIConnect
 
 
 # ---------------------------------------------------------------------------
@@ -39,8 +39,8 @@ def bridge_app():
     app  = FastAPI()
     host = _MockHost()
     app.state.is_bridge    = True
-    app.state.edge_service = host
-    app.state.edge_name    = 'bridge'
+    app.state.endpoint_service = host
+    app.state.endpoint_name    = 'bridge'
     app.state.bridge_url   = ''
     return app, host
 
@@ -60,7 +60,7 @@ def test_is_enabled_on_bridge(bridge_app):
     assert PluginIRIConnect.is_enabled(app) is True
 
 
-def test_is_disabled_on_edge():
+def test_is_disabled_on_endpoint():
     app = FastAPI()
     app.state.is_bridge = False
     assert PluginIRIConnect.is_enabled(app) is False

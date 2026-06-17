@@ -5,12 +5,12 @@ Example: file staging via Globus Online (Transfer API).
 Submits a transfer between two Globus collections, waits for it to finish,
 and lists the destination directory.  Globus moves the data
 collection-to-collection out of band — nothing flows through the client,
-edge, or bridge.
+endpoint, or bridge.
 
 Requirements
 ------------
-* A running bridge with at least one connected edge that loads the
-  ``globus`` plugin (needs ``globus-sdk`` installed on the edge).
+* A running bridge with at least one connected endpoint that loads the
+  ``globus`` plugin (needs ``globus-sdk`` installed on the endpoint).
 * A Globus Transfer token.  Acquire one via Globus Auth (for example with the
   Globus CLI), and export it, e.g.::
 
@@ -21,13 +21,13 @@ Collections
 -----------
 Defaults to the public **Globus Tutorial Collection 1 / 2** (GCSv5),
 overridable via ``GLOBUS_SRC`` / ``GLOBUS_DST``.  The literal ``"local"``
-resolves to the edge's configured local collection.
+resolves to the endpoint's configured local collection.
 """
 
 import os
 import time
 
-from radical.edge import BridgeClient
+from radical.orbit import BridgeClient
 
 # Public Globus tutorial collections (guest collections, world-readable demo
 # data under /home/share/godata/).  Override via env for real endpoints.
@@ -37,7 +37,7 @@ TUTORIAL_DST = '31ce9ba0-176d-45a5-add3-f37d233ba47d'
 SRC  = os.environ.get('GLOBUS_SRC', TUTORIAL_SRC)
 DST  = os.environ.get('GLOBUS_DST', TUTORIAL_DST)
 SRC_PATH = os.environ.get('GLOBUS_SRC_PATH', '/home/share/godata/')
-DST_PATH = os.environ.get('GLOBUS_DST_PATH', '/~/edge-globus-demo/')
+DST_PATH = os.environ.get('GLOBUS_DST_PATH', '/~/endpoint-globus-demo/')
 
 
 def _auth_kwargs() -> dict:
@@ -60,14 +60,14 @@ def _auth_kwargs() -> dict:
 def main():
 
     bc   = BridgeClient()
-    eids = bc.list_edges()
+    eids = bc.list_endpoints()
 
     if not eids:
-        print('No edges connected - start an edge service first')
+        print('No endpoints connected - start an endpoint service first')
         bc.close()
         return
 
-    ec     = bc.get_edge_client(eids[0])
+    ec     = bc.get_endpoint_client(eids[0])
     globus = ec.get_plugin('globus')
 
     # Register a session carrying the Globus token.
@@ -79,7 +79,7 @@ def main():
             source=SRC, destination=DST,
             items=[{'source': SRC_PATH, 'destination': DST_PATH,
                     'recursive': True}],
-            label='radical-edge globus example')
+            label='orbit globus example')
         task_id = sub['task_id']
         print(f'Submitted transfer: {task_id}')
 

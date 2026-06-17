@@ -1,15 +1,15 @@
 
-Embedding the Edge Service
+Embedding the Endpoint Service
 **************************
 
-The Radical Edge Service can be embedded directly into Python applications, supporting both
-``asyncio`` and synchronous execution models. This allows you to run the Edge Service as a
+The ORBIT Service can be embedded directly into Python applications, supporting both
+``asyncio`` and synchronous execution models. This allows you to run the Endpoint Service as a
 component within your larger application without managing a separate process or local network ports.
 
 Architecture
 ============
 
-The ``EdgeService`` class provides a self-contained service that:
+The ``EndpointService`` class provides a self-contained service that:
 
 *   Connects to the Radical Bridge via WebSocket.
 *   Hosts plugins in an internal, in-memory FastAPI application.
@@ -27,16 +27,16 @@ to run the service in a daemon thread.
 .. code-block:: python
 
    import time
-   from radical.edge import EdgeService, PluginXGFabric
+   from radical.orbit import EndpointService, PluginXGFabric
 
    def main():
        # Initialize service with desired plugins
-       service = EdgeService(
+       service = EndpointService(
            bridge_url="wss://radical-pilot.org/bridge/register",
            plugins=[PluginXGFabric]
        )
 
-       print("Starting Edge Service...")
+       print("Starting Endpoint Service...")
        # Runs the service loop in a separate daemon thread
        service.start_background()
 
@@ -61,11 +61,11 @@ in a task.
 .. code-block:: python
 
    import asyncio
-   from radical.edge import EdgeService, PluginLucid
+   from radical.orbit import EndpointService, PluginLucid
 
    async def main():
        # Initialize service
-       service = EdgeService(
+       service = EndpointService(
            bridge_url="wss://radical-pilot.org/bridge/register",
            plugins=[PluginLucid]
        )
@@ -87,7 +87,7 @@ in a task.
 API Reference
 =============
 
-.. autoclass:: radical.edge.service.EdgeService
+.. autoclass:: radical.orbit.service.EndpointService
    :members:
    :undoc-members:
    :show-inheritance:
@@ -110,8 +110,8 @@ Notes
 Developing External Plugins
 ===========================
 
-You can define custom plugins in your own modules and register them with the Edge Service.
-Inheriting from ``radical.edge.ClientManagedPlugin`` (or ``Plugin``) and defining ``plugin_name``
+You can define custom plugins in your own modules and register them with the Endpoint Service.
+Inheriting from ``radical.orbit.ClientManagedPlugin`` (or ``Plugin``) and defining ``plugin_name``
 automatically registers your plugin class.
 
 Example: Weather Plugin
@@ -123,7 +123,7 @@ Example: Weather Plugin
 
    # file: my_project/plugins/weather.py
 
-   import radical.edge as re
+   import radical.orbit as re
    from starlette.requests import Request
    from starlette.responses import JSONResponse
 
@@ -148,17 +148,17 @@ Example: Weather Plugin
 
 **2. Use the Plugin**
 
-Simply importing the plugin module registers it. You can then pass it to ``EdgeService``.
+Simply importing the plugin module registers it. You can then pass it to ``EndpointService``.
 
 .. code-block:: python
 
    # file: app.py
 
-   from radical.edge import EdgeService
+   from radical.orbit import EndpointService
    # Import triggers automatic registration
    from my_project.plugins.weather import WeatherPlugin
 
-   service = EdgeService(
+   service = EndpointService(
        bridge_url="ws://localhost:8000/register",
        plugins=[WeatherPlugin]  # Loads the plugin immediately
    )
@@ -180,13 +180,13 @@ Ensure ``psij-python`` is installed in your environment:
 
 Usage
 -----
-To use the PSIJ plugin, simply include it when initializing the ``EdgeService``.
+To use the PSIJ plugin, simply include it when initializing the ``EndpointService``.
 
 .. code-block:: python
 
-   from radical.edge import EdgeService, PluginPSIJ
+   from radical.orbit import EndpointService, PluginPSIJ
 
-   service = EdgeService(
+   service = EndpointService(
        bridge_url="wss://radical-pilot.org/bridge/register",
        plugins=[PluginPSIJ]
    )
@@ -237,10 +237,10 @@ Before submitting jobs, you must register a session to get a ``sid`` (Session ID
    import requests
 
    BRIDGE_URL = "https://localhost:8000"
-   EDGE_NAME = "my-edge"
+   ENDPOINT_NAME = "my-endpoint"
 
    # Register session
-   resp = requests.post(f"{BRIDGE_URL}/{EDGE_NAME}/psij/register_session")
+   resp = requests.post(f"{BRIDGE_URL}/{ENDPOINT_NAME}/psij/register_session")
    sid = resp.json()['sid']
 
    # Submit a job
@@ -250,11 +250,11 @@ Before submitting jobs, you must register a session to get a ``sid`` (Session ID
        "attributes": {"queue_name": "debug"}
    }
    resp = requests.post(
-       f"{BRIDGE_URL}/{EDGE_NAME}/psij/submit/{sid}",
+       f"{BRIDGE_URL}/{ENDPOINT_NAME}/psij/submit/{sid}",
        json={"job_spec": job_spec, "executor": "slurm"}
    )
    job_id = resp.json()['job_id']
 
    # Check status
-   resp = requests.get(f"{BRIDGE_URL}/{EDGE_NAME}/psij/status/{sid}/{job_id}")
+   resp = requests.get(f"{BRIDGE_URL}/{ENDPOINT_NAME}/psij/status/{sid}/{job_id}")
    print(resp.json())

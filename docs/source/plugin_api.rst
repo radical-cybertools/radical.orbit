@@ -2,7 +2,7 @@
 Plugin API Reference
 ********************
 
-This section documents all available plugins in the Radical Edge system.
+This section documents all available plugins in the ORBIT system.
 
 Base Classes
 ============
@@ -10,7 +10,7 @@ Base Classes
 PluginClient
 ------------
 
-.. autoclass:: radical.edge.plugin_client_base.PluginClient
+.. autoclass:: radical.orbit.plugin_client_base.PluginClient
    :members:
    :undoc-members:
    :show-inheritance:
@@ -18,7 +18,7 @@ PluginClient
 ClientManagedPlugin
 -------------------
 
-.. autoclass:: radical.edge.plugin_client_managed.ClientManagedPlugin
+.. autoclass:: radical.orbit.plugin_client_managed.ClientManagedPlugin
    :members:
    :undoc-members:
    :show-inheritance:
@@ -26,7 +26,7 @@ ClientManagedPlugin
 Plugin
 ------
 
-.. autoclass:: radical.edge.plugin_base.Plugin
+.. autoclass:: radical.orbit.plugin_base.Plugin
    :members:
    :undoc-members:
    :show-inheritance:
@@ -38,7 +38,7 @@ Plugins
 PluginLucid
 -----------
 
-.. automodule:: radical.edge.plugin_lucid
+.. automodule:: radical.orbit.plugin_lucid
    :members:
    :undoc-members:
    :show-inheritance:
@@ -46,7 +46,7 @@ PluginLucid
 PluginXGFabric
 --------------
 
-.. automodule:: radical.edge.plugin_xgfabric
+.. automodule:: radical.orbit.plugin_xgfabric
    :members:
    :undoc-members:
    :show-inheritance:
@@ -54,7 +54,7 @@ PluginXGFabric
 PluginQueueInfo
 ---------------
 
-.. automodule:: radical.edge.plugin_queue_info
+.. automodule:: radical.orbit.plugin_queue_info
    :members:
    :undoc-members:
    :show-inheritance:
@@ -63,7 +63,7 @@ PluginQueueInfo
 PluginSysInfo
 -------------
 
-.. automodule:: radical.edge.plugin_sysinfo
+.. automodule:: radical.orbit.plugin_sysinfo
    :members:
    :undoc-members:
    :show-inheritance:
@@ -72,7 +72,7 @@ PluginSysInfo
 PluginPSIJ
 ----------
 
-.. automodule:: radical.edge.plugin_psij
+.. automodule:: radical.orbit.plugin_psij
    :members:
    :undoc-members:
    :show-inheritance:
@@ -81,7 +81,7 @@ PluginPSIJ
 PluginRhapsody
 --------------
 
-.. automodule:: radical.edge.plugin_rhapsody
+.. automodule:: radical.orbit.plugin_rhapsody
    :members:
    :undoc-members:
    :show-inheritance:
@@ -93,7 +93,7 @@ Queue Info Backend
 QueueInfo
 ---------
 
-.. automodule:: radical.edge.queue_info
+.. automodule:: radical.orbit.queue_info
    :members:
    :undoc-members:
    :show-inheritance:

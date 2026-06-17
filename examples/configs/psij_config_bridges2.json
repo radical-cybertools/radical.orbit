@@ -1,5 +1,5 @@
 {
-    "edge_id_match": "bridges2.",
+    "endpoint_id_match": "bridges2.",
     "job_executor": "slurm",
     "job_spec": {
         "executable": "/bin/sleep",

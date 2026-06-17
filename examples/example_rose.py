@@ -1,32 +1,32 @@
 #!/usr/bin/env python3
 
 """
-ROSE active learning over RADICAL Edge
+ROSE active learning over ORBIT
 ──────────────────────────────────────
 
 A self-contained, end-to-end illustration of how to drive a ROSE
 ``SequentialActiveLearner`` workflow against a remote HPC node via the
-RADICAL Edge bridge.  The compute itself is an MPI simulation that
+ORBIT bridge.  The compute itself is an MPI simulation that
 shares state through a Dragon distributed dictionary (DDict) — but the
 focus of this example is the *plumbing*:
 
     Client (this script)
         │
-        ▼  rhapsody.get_backend('edge')      ← auto-discovers a suitable
-        │                                       edge through the bridge
+        ▼  rhapsody.get_backend('orbit')      ← auto-discovers a suitable
+        │                                       endpoint through the bridge
         ▼  WorkflowEngine.create(engine)     ← asyncflow on top
         │
         ▼  SequentialActiveLearner(asyncflow) ← ROSE driver
         │
         ▼  @acl.simulation_task / .training_task / .active_learn_task
                                               ← function tasks shipped to
-                                                the edge for execution
+                                                the endpoint for execution
 
 What makes this example interesting
 ───────────────────────────────────
-  • **Edge auto-selection** — no bridge URL or edge name hard-coded.
-    ``rhapsody.get_backend('edge')`` reads ``RADICAL_BRIDGE_URL`` from
-    the environment and picks the first connected edge that advertises
+  • **Endpoint auto-selection** — no bridge URL or endpoint name hard-coded.
+    ``rhapsody.get_backend('orbit')`` reads ``RADICAL_BRIDGE_URL`` from
+    the environment and picks the first connected endpoint that advertises
     a Rhapsody plugin (defaults: ``https://localhost:8000`` is *not*
     assumed; set ``RADICAL_BRIDGE_URL`` if your bridge runs elsewhere).
 
@@ -53,10 +53,10 @@ DDict key layout (shared across all Dragon-managed processes)
 Run
 ───
     # In one terminal: start the bridge
-    ./bin/radical-edge-bridge.py
+    ./bin/orbit-bridge.py
 
-    # In another: start an edge with the rhapsody plugin loaded
-    ./bin/radical-edge-wrapper.sh
+    # In another: start an endpoint with the rhapsody plugin loaded
+    ./bin/orbit-endpoint-wrapper.sh
 
     # Then:
     export RADICAL_BRIDGE_URL=https://localhost:8000   # optional
@@ -73,7 +73,7 @@ from sklearn.metrics                  import mean_squared_error
 
 import rhapsody
 from radical.asyncflow            import WorkflowEngine
-from radical.edge.logging_config  import configure_logging
+from radical.orbit.logging_config  import configure_logging
 from rose.al.active_learner       import SequentialActiveLearner
 from rose.metrics                 import MEAN_SQUARED_ERROR_MSE
 
@@ -90,23 +90,23 @@ MSE_THRESHOLD:      float = 0.01   # convergence target
 MAX_ITER:           int   = 15     # hard cap on iterations
 
 
-# ── 1. Edge backend ───────────────────────────────────────────────────────────
+# ── 1. Endpoint backend ───────────────────────────────────────────────────────────
 async def make_engine():
-    """Build a Rhapsody Edge backend and wrap it in an asyncflow engine.
+    """Build a Rhapsody Endpoint backend and wrap it in an asyncflow engine.
 
-    With no arguments, ``get_backend('edge')`` resolves the bridge URL
+    With no arguments, ``get_backend('orbit')`` resolves the bridge URL
     from ``$RADICAL_BRIDGE_URL`` and auto-selects the first connected
-    edge advertising an enabled ``rhapsody`` plugin.  A ``RuntimeError``
+    endpoint advertising an enabled ``rhapsody`` plugin.  A ``RuntimeError``
     surfaces from ``await backend`` if no candidate is found.
     """
-    backend = rhapsody.get_backend('edge')
+    backend = rhapsody.get_backend('orbit')
     engine  = await backend
     print(f"Bridge: {backend._bridge_url}")
-    print(f"Edge:   {backend._edge_name}")
+    print(f"Endpoint:   {backend._endpoint_name}")
     return await WorkflowEngine.create(engine)
 
 
-# ── 2. Shared-state task: create / destroy DDict on the edge ──────────────────
+# ── 2. Shared-state task: create / destroy DDict on the endpoint ──────────────────
 def make_ddict_tasks(asyncflow):
 
     @asyncflow.function_task
@@ -316,7 +316,7 @@ async def main() -> None:
     else:
         print("  (no iterations ran)")
 
-    # Cleanup — destroy the DDict on the edge (client has no Dragon runtime)
+    # Cleanup — destroy the DDict on the endpoint (client has no Dragon runtime)
     await destroy_ddict(ddict_descriptor)
     await acl.shutdown()
 

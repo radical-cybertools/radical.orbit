@@ -1,8 +1,8 @@
-"""Tests for the :class:`radical.edge.bridge.Bridge` class.
+"""Tests for the :class:`radical.orbit.bridge.Bridge` class.
 
-The bridge logic moved from ``bin/radical-edge-bridge.py`` (module-level
+The bridge logic moved from ``bin/orbit-bridge.py`` (module-level
 globals) to a class with instance attributes — these tests construct a
-``Bridge`` and poke its ``.pending`` / ``.edges`` directly.
+``Bridge`` and poke its ``.pending`` / ``.endpoints`` directly.
 """
 
 import asyncio
@@ -51,15 +51,15 @@ def make_bridge(self_signed, tmp_path, monkeypatch):
     """Factory fixture: returns a callable that builds a fresh Bridge.
 
     Resolver paths are redirected to *tmp_path* so the bridge.url write
-    on startup doesn't touch the dev's real ``~/.radical/edge/``.
+    on startup doesn't touch the dev's real ``~/.radical/orbit/``.
     """
-    from radical.edge import utils
+    from radical.orbit import utils
     monkeypatch.setattr(utils, 'URL_FILE', tmp_path / 'bridge.url')
 
     cert, key = self_signed
 
     def _build(**kwargs):
-        from radical.edge import Bridge
+        from radical.orbit import Bridge
         defaults = dict(cert=str(cert), key=str(key))
         defaults.update(kwargs)
         return Bridge(**defaults)
@@ -72,40 +72,40 @@ def make_bridge(self_signed, tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_bridge_disconnect_isolation(make_bridge):
-    """Disconnecting one edge fails only its in-flight requests.
+    """Disconnecting one endpoint fails only its in-flight requests.
 
-    Instance state (``bridge.pending`` / ``bridge.edges``) replaces what
+    Instance state (``bridge.pending`` / ``bridge.endpoints``) replaces what
     used to be module-level globals on the old bin script.
     """
     bridge = make_bridge()
     client = TestClient(bridge.app)
 
-    # Pre-seed a pending request for an unrelated edge.
+    # Pre-seed a pending request for an unrelated endpoint.
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     fut_b = loop.create_future()
-    bridge.pending["test_req_b"] = (fut_b, "edge_b")
-    bridge.edges["edge_b"]        = "mock_ws"
+    bridge.pending["test_req_b"] = (fut_b, "endpoint_b")
+    bridge.endpoints["endpoint_b"]        = "mock_ws"
 
     with client.websocket_connect("/register") as websocket:
         websocket.send_json({
             "type":      "register",
-            "edge_name": "edge_a",
-            "endpoint":  {"type": "radical.edge"},
+            "endpoint_name": "endpoint_a",
+            "endpoint":  {"type": "radical.orbit"},
         })
 
         fut_a = loop.create_future()
-        bridge.pending["test_req_a"] = (fut_a, "edge_a")
+        bridge.pending["test_req_a"] = (fut_a, "endpoint_a")
 
         # Closing the WS context manager triggers the disconnect
-        # cleanup path for edge_a only.
+        # cleanup path for endpoint_a only.
 
-    # edge_a's pending was failed with HTTPException(503).
+    # endpoint_a's pending was failed with HTTPException(503).
     assert "test_req_a" not in bridge.pending
     assert fut_a.done()
     assert isinstance(fut_a.exception(), HTTPException)
 
-    # edge_b's pending is untouched.
+    # endpoint_b's pending is untouched.
     assert "test_req_b" in bridge.pending
     assert not fut_b.done()

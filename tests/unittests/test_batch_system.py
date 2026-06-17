@@ -6,13 +6,13 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from radical.edge import batch_system as bs
-from radical.edge.batch_system import (
+from radical.orbit import batch_system as bs
+from radical.orbit.batch_system import (
     BatchSystem, NullBatchSystem, detect_batch_system, reset_detection,
     STATE_PENDING, STATE_RUNNING, STATE_DONE, STATE_FAILED,
     STATE_CANCELLED, STATE_HELD, STATE_UNKNOWN, TERMINAL_STATES)
-from radical.edge.batch_system_slurm import SlurmBatchSystem, _parse_slurm_time
-from radical.edge.batch_system_pbs import (
+from radical.orbit.batch_system_slurm import SlurmBatchSystem, _parse_slurm_time
+from radical.orbit.batch_system_pbs import (
     PBSProBatchSystem, _parse_pbs_walltime, _parse_qstat_f, _parse_exec_host)
 
 
@@ -53,7 +53,7 @@ class TestDetect:
         # without this, AuroraPBSBatchSystem (registered first) would
         # match on hosts where /opt/aurora actually exists.
         with patch('shutil.which', side_effect=_which), \
-             patch('radical.edge.batch_system_pbs.os.path.isdir',
+             patch('radical.orbit.batch_system_pbs.os.path.isdir',
                    return_value=False):
             b = detect_batch_system()
         assert isinstance(b, PBSProBatchSystem)
@@ -61,11 +61,11 @@ class TestDetect:
         assert b.psij_executor == 'pbs'
 
     def test_detects_aurora_pbs_when_marker_present(self):
-        from radical.edge.batch_system_pbs import AuroraPBSBatchSystem
+        from radical.orbit.batch_system_pbs import AuroraPBSBatchSystem
         def _which(cmd):
             return '/usr/bin/qstat' if cmd == 'qstat' else None
         with patch('shutil.which', side_effect=_which), \
-             patch('radical.edge.batch_system_pbs.os.path.isdir',
+             patch('radical.orbit.batch_system_pbs.os.path.isdir',
                    return_value=True):
             b = detect_batch_system()
         assert isinstance(b, AuroraPBSBatchSystem)

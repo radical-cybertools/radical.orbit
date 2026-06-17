@@ -21,15 +21,15 @@ from setuptools import setup, Command, find_namespace_packages
 from distutils.command.build_scripts import build_scripts as _build_scripts
 
 
-base     = 'edge'
+base     = 'orbit'
 name     = 'radical.%s'      % base
 mod_root = 'src/radical/%s/' % base
 
 scripts  = [p for p in glob('bin/*') if os.path.isfile(p)]
 root     = os.path.dirname(__file__) or '.'
 readme   = open('%s/README.md' % root, encoding='utf-8').read()
-descr    = 'RADICAL Edge connects external RCT applications with HPC resources'
-keywords = ['radical', 'cybertools', 'HPC', 'edge', 'distributed']
+descr    = 'ORBIT connects external RCT applications with HPC resources'
+keywords = ['radical', 'cybertools', 'HPC', 'orbit', 'distributed']
 
 share    = 'share/%s' % name
 data     = [('%s/examples'      % share, glob('examples/*.{py,cfg,json,sh}')),
@@ -220,7 +220,7 @@ setup_args = {
     'scripts'            : scripts,
     'package_data'       : {'': ['*.txt', '*.sh', '*.json', '*.gz', '*.c',
                                  '*.md', '*.html'],
-                            'radical.edge': ['data/*.html', 'data/*.json',
+                            'radical.orbit': ['data/*.html', 'data/*.json',
                                              'data/plugins/*.js']},
     'install_requires'   : requirements,
     'zip_safe'           : False,
@@ -233,12 +233,12 @@ setup_args = {
         # ``task_dispatcher_strategy.py::_builtin_strategies`` so they
         # work in editable/uninstalled checkouts; entry points matter
         # mainly for third-party strategies shipped as separate packages.
-        'radical.edge.task_dispatcher.strategies': [
+        'radical.orbit.task_dispatcher.strategies': [
             'conservative = '
-            'radical.edge.task_dispatcher_strategy_conservative'
+            'radical.orbit.task_dispatcher_strategy_conservative'
             ':ConservativeStrategy',
             'aggressive_scale_to_backlog = '
-            'radical.edge.task_dispatcher_strategy_examples'
+            'radical.orbit.task_dispatcher_strategy_examples'
             ':AggressiveScaleToBacklogStrategy',
         ],
     },

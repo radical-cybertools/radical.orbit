@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-Example: Rhapsody Plugin via Radical Edge
+Example: Rhapsody Plugin via ORBIT
 =========================================
 
-Submits a batch of compute tasks through the Radical Edge bridge,
+Submits a batch of compute tasks through the ORBIT bridge,
 waits for completion, and prints the results and session statistics.
 
 Prerequisites:
-  - A Radical Edge bridge is running (RADICAL_BRIDGE_URL set).
-  - An edge service is connected with the Rhapsody plugin loaded.
-  - The ``rhapsody`` package is installed on the edge node.
+  - A ORBIT bridge is running (RADICAL_BRIDGE_URL set).
+  - An endpoint service is connected with the Rhapsody plugin loaded.
+  - The ``rhapsody`` package is installed on the endpoint node.
 """
 
 import json
 import time
 
-from radical.edge import BridgeClient
+from radical.orbit import BridgeClient
 
 
 def my_notification_cb(topic: str, data: dict):
@@ -26,16 +26,16 @@ def main():
 
     # ---- connect to the bridge ----
     bc  = BridgeClient()
-    eids = bc.list_edges()
+    eids = bc.list_endpoints()
 
     if not eids:
-        print("No edges found.")
+        print("No endpoints found.")
         return
 
     eid = eids[0]
-    print(f"Using edge: {eid}")
+    print(f"Using endpoint: {eid}")
 
-    ec = bc.get_edge_client(eid)
+    ec = bc.get_endpoint_client(eid)
     rh = ec.get_plugin('rhapsody')
 
     # Register for asynchronous bridge notifications

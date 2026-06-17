@@ -8,12 +8,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import FastAPI
 
-from radical.edge.plugin_iri_instance import (
+from radical.orbit.plugin_iri_instance import (
     PluginIRIInstance,
     IRIInstanceSession,
     _iri_raise,
 )
-from radical.edge.iri_endpoints import IRI_ENDPOINTS
+from radical.orbit.iri_endpoints import IRI_ENDPOINTS
 
 
 # ---------------------------------------------------------------------------
@@ -24,8 +24,8 @@ from radical.edge.iri_endpoints import IRI_ENDPOINTS
 def bridge_app():
     app = FastAPI()
     app.state.is_bridge    = True
-    app.state.edge_service = MagicMock()
-    app.state.edge_name    = 'bridge'
+    app.state.endpoint_service = MagicMock()
+    app.state.endpoint_name    = 'bridge'
     app.state.bridge_url   = ''
     return app
 

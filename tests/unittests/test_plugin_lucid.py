@@ -11,8 +11,8 @@ import pytest
 
 pytest.importorskip('radical.pilot')
 
-import radical.edge
-from radical.edge.plugin_lucid import PluginLucid, LucidSession
+import radical.orbit
+from radical.orbit.plugin_lucid import PluginLucid, LucidSession
 
 from unittest.mock import Mock, AsyncMock, patch, MagicMock
 from fastapi import FastAPI, HTTPException
@@ -20,7 +20,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 
-@patch('radical.edge.plugin_lucid.rp')
+@patch('radical.orbit.plugin_lucid.rp')
 def test_lucid_session_initialization(mock_rp):
     '''
     Test LucidSession initialization.
@@ -47,7 +47,7 @@ def test_lucid_session_initialization(mock_rp):
 
 
 @pytest.mark.asyncio
-@patch('radical.edge.plugin_lucid.rp')
+@patch('radical.orbit.plugin_lucid.rp')
 async def test_lucid_session_close(mock_rp):
     '''
     Test closing a LucidSession.
@@ -70,7 +70,7 @@ async def test_lucid_session_close(mock_rp):
 
 
 @pytest.mark.asyncio
-@patch('radical.edge.plugin_lucid.rp')
+@patch('radical.orbit.plugin_lucid.rp')
 async def test_lucid_session_pilot_submit(mock_rp):
     '''
     Test submitting a pilot.
@@ -101,7 +101,7 @@ async def test_lucid_session_pilot_submit(mock_rp):
 
 
 @pytest.mark.asyncio
-@patch('radical.edge.plugin_lucid.rp')
+@patch('radical.orbit.plugin_lucid.rp')
 async def test_lucid_session_pilot_submit_closed_session(mock_rp):
     '''
     Test that pilot_submit raises error when session is closed.
@@ -118,7 +118,7 @@ async def test_lucid_session_pilot_submit_closed_session(mock_rp):
 
 
 @pytest.mark.asyncio
-@patch('radical.edge.plugin_lucid.rp')
+@patch('radical.orbit.plugin_lucid.rp')
 async def test_lucid_session_task_submit(mock_rp):
     '''
     Test submitting a task.
@@ -146,7 +146,7 @@ async def test_lucid_session_task_submit(mock_rp):
 
 
 @pytest.mark.asyncio
-@patch('radical.edge.plugin_lucid.rp')
+@patch('radical.orbit.plugin_lucid.rp')
 async def test_lucid_session_task_wait(mock_rp):
     '''
     Test waiting for a task.
@@ -174,7 +174,7 @@ async def test_lucid_session_task_wait(mock_rp):
     assert result["task"]["state"] == "DONE"
 
 
-@patch('radical.edge.plugin_lucid.rp')
+@patch('radical.orbit.plugin_lucid.rp')
 def test_plugin_lucid_initialization(mock_rp):
     '''
     Test PluginLucid initialization.
@@ -195,7 +195,7 @@ def test_plugin_lucid_initialization(mock_rp):
 
 
 @pytest.mark.asyncio
-@patch('radical.edge.plugin_lucid.rp')
+@patch('radical.orbit.plugin_lucid.rp')
 async def test_plugin_lucid_register_session(mock_rp):
     '''
     Test registering a new session.
@@ -218,7 +218,7 @@ async def test_plugin_lucid_register_session(mock_rp):
 
 
 @pytest.mark.asyncio
-@patch('radical.edge.plugin_lucid.rp')
+@patch('radical.orbit.plugin_lucid.rp')
 async def test_plugin_lucid_unregister_session(mock_rp):
     '''
     Test unregistering a session.
@@ -244,7 +244,7 @@ async def test_plugin_lucid_unregister_session(mock_rp):
 
 
 @pytest.mark.asyncio
-@patch('radical.edge.plugin_lucid.rp')
+@patch('radical.orbit.plugin_lucid.rp')
 async def test_plugin_lucid_pilot_submit(mock_rp):
     '''
     Test pilot submission endpoint.
@@ -283,7 +283,7 @@ async def test_plugin_lucid_pilot_submit(mock_rp):
 
 
 @pytest.mark.asyncio
-@patch('radical.edge.plugin_lucid.rp')
+@patch('radical.orbit.plugin_lucid.rp')
 async def test_plugin_lucid_task_submit(mock_rp):
     '''
     Test task submission endpoint.
@@ -319,7 +319,7 @@ async def test_plugin_lucid_task_submit(mock_rp):
 
 
 @pytest.mark.asyncio
-@patch('radical.edge.plugin_lucid.rp')
+@patch('radical.orbit.plugin_lucid.rp')
 async def test_plugin_lucid_unknown_session_error(mock_rp):
     '''
     Test that operations on unknown session raise HTTPException.
@@ -327,7 +327,7 @@ async def test_plugin_lucid_unknown_session_error(mock_rp):
     app = FastAPI()
     plugin = PluginLucid(app)
 
-    from radical.edge.plugin_session_base import PluginSession
+    from radical.orbit.plugin_session_base import PluginSession
 
     with pytest.raises(HTTPException) as exc_info:
         await plugin._forward("unknown_session", PluginSession.close)

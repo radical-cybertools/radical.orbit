@@ -2,8 +2,8 @@ import pytest
 import httpx
 from unittest.mock import MagicMock, patch
 
-from radical.edge.client import BridgeClient, EdgeClient, PluginClient
-from radical.edge.plugin_base import Plugin
+from radical.orbit.client import BridgeClient, EndpointClient, PluginClient
+from radical.orbit.plugin_base import Plugin
 
 @patch('httpx.Client.post')
 @patch('httpx.Client.get')
@@ -12,19 +12,19 @@ def test_bridge_client(mock_get, mock_post):
     mock_post.return_value.is_error = False
     mock_post.return_value.json.return_value = {
         'data': {
-            'edges': {
-                'edge1': {'plugins': {}},
-                'edge2': {'plugins': {}}
+            'endpoints': {
+                'endpoint1': {'plugins': {}},
+                'endpoint2': {'plugins': {}}
             }
         }
     }
     
     bc = BridgeClient(url="http://test")
-    edges = bc.list_edges()
-    assert edges == ['edge1', 'edge2']
+    endpoints = bc.list_endpoints()
+    assert endpoints == ['endpoint1', 'endpoint2']
 
-    edge_client = bc.get_edge_client("edge1")
-    assert edge_client._edge_id == "edge1"
+    endpoint_client = bc.get_endpoint_client("endpoint1")
+    assert endpoint_client._endpoint_id == "endpoint1"
     bc.close()
 
 class DummyPluginClient(PluginClient):
@@ -36,17 +36,17 @@ class DummyPlugin(Plugin):
 
 
 @patch('httpx.Client.post')
-def test_edge_client_get_plugin(mock_post):
+def test_endpoint_client_get_plugin(mock_post):
     Plugin._registry["dummy"] = DummyPlugin
     
     mock_post.side_effect = [
-        # First post is to edge/list
+        # First post is to endpoint/list
         MagicMock(is_error=False, json=lambda: {
             'data': {
-                'edges': {
-                    'edge1': {
+                'endpoints': {
+                    'endpoint1': {
                         'plugins': {
-                            'dummy': {'namespace': '/edge1/dummy'}
+                            'dummy': {'namespace': '/endpoint1/dummy'}
                         }
                     }
                 }
@@ -57,7 +57,7 @@ def test_edge_client_get_plugin(mock_post):
     ]
 
     bc = BridgeClient(url="http://test")
-    ec = bc.get_edge_client("edge1")
+    ec = bc.get_endpoint_client("endpoint1")
     
     plugin_client = ec.get_plugin("dummy")
     assert isinstance(plugin_client, DummyPluginClient)
@@ -75,10 +75,10 @@ def test_edge_client_get_plugin(mock_post):
 # ---------------------------------------------------------------------------
 
 def test_bridge_client_no_url_raises(tmp_path, monkeypatch):
-    """No CLI arg, no env, no file at ``~/.radical/edge/bridge.url``
+    """No CLI arg, no env, no file at ``~/.radical/orbit/bridge.url``
     → ValueError.  Redirect the resolver's file path to a tmp dir so
     we don't accidentally pick up the dev's own bridge.url."""
-    from radical.edge import utils
+    from radical.orbit import utils
     monkeypatch.delenv("RADICAL_BRIDGE_URL", raising=False)
     monkeypatch.setattr(utils, 'URL_FILE', tmp_path / 'bridge.url')
 
@@ -108,7 +108,7 @@ def test_register_callback_with_filters():
     cb = lambda e, p, t, d: None
 
     with patch.object(bc, '_ensure_listener'):
-        bc.register_callback(edge_id="hpc1", plugin_name="psij",
+        bc.register_callback(endpoint_id="hpc1", plugin_name="psij",
                              topic="job_status", callback=cb)
 
     assert ("hpc1", "psij", "job_status") in bc._callbacks
@@ -136,7 +136,7 @@ def test_unregister_callback_removes_it():
 
 def test_register_topology_callback():
     bc = BridgeClient(url="http://test")
-    cb = lambda edges: None
+    cb = lambda endpoints: None
 
     with patch.object(bc, '_ensure_listener'):
         bc.register_topology_callback(cb)
@@ -147,7 +147,7 @@ def test_register_topology_callback():
 
 def test_unregister_topology_callback():
     bc = BridgeClient(url="http://test")
-    cb = lambda edges: None
+    cb = lambda endpoints: None
 
     with patch.object(bc, '_ensure_listener'):
         bc.register_topology_callback(cb)
@@ -167,9 +167,9 @@ def test_dispatch_notification_wildcard():
     cb = lambda e, p, t, d: received.append((e, p, t, d))
     bc._callbacks[(None, None, None)] = [cb]
 
-    bc._dispatch_notification("edge1", "psij", "job_status", {"x": 1})
+    bc._dispatch_notification("endpoint1", "psij", "job_status", {"x": 1})
 
-    assert received == [("edge1", "psij", "job_status", {"x": 1})]
+    assert received == [("endpoint1", "psij", "job_status", {"x": 1})]
     bc.close()
 
 
@@ -177,10 +177,10 @@ def test_dispatch_notification_exact_match():
     bc = BridgeClient(url="http://test")
     received = []
     cb = lambda e, p, t, d: received.append(t)
-    bc._callbacks[("edge1", "psij", "job_status")] = [cb]
+    bc._callbacks[("endpoint1", "psij", "job_status")] = [cb]
 
-    bc._dispatch_notification("edge1", "psij", "job_status", {})
-    bc._dispatch_notification("edge2", "psij", "job_status", {})  # should not match
+    bc._dispatch_notification("endpoint1", "psij", "job_status", {})
+    bc._dispatch_notification("endpoint2", "psij", "job_status", {})  # should not match
 
     assert received == ["job_status"]
     bc.close()
@@ -188,9 +188,9 @@ def test_dispatch_notification_exact_match():
 
 def test_dispatch_notification_no_match_no_crash():
     bc = BridgeClient(url="http://test")
-    bc._callbacks[("edgeX", "plugin", "topic")] = [lambda e, p, t, d: None]
-    # Different edge — should not raise, just no match
-    bc._dispatch_notification("edge_other", "plugin", "topic", {})
+    bc._callbacks[("endpointX", "plugin", "topic")] = [lambda e, p, t, d: None]
+    # Different endpoint — should not raise, just no match
+    bc._dispatch_notification("endpoint_other", "plugin", "topic", {})
     bc.close()
 
 
@@ -205,20 +205,20 @@ def test_dispatch_notification_callback_exception_logged():
 
 
 # ---------------------------------------------------------------------------
-# EdgeClient.list_plugins
+# EndpointClient.list_plugins
 # ---------------------------------------------------------------------------
 
 @patch('httpx.Client.post')
-def test_edge_client_list_plugins(mock_post):
+def test_endpoint_client_list_plugins(mock_post):
     mock_post.return_value = MagicMock(
         is_error=False,
         json=lambda: {
             'data': {
-                'edges': {
-                    'edge1': {
+                'endpoints': {
+                    'endpoint1': {
                         'plugins': {
-                            'sysinfo': {'namespace': '/edge1/sysinfo'},
-                            'psij':    {'namespace': '/edge1/psij'},
+                            'sysinfo': {'namespace': '/endpoint1/sysinfo'},
+                            'psij':    {'namespace': '/endpoint1/psij'},
                         }
                     }
                 }
@@ -226,7 +226,7 @@ def test_edge_client_list_plugins(mock_post):
         }
     )
     bc = BridgeClient(url="http://test")
-    ec = bc.get_edge_client("edge1")
+    ec = bc.get_endpoint_client("endpoint1")
     plugins = ec.list_plugins()
     assert 'sysinfo' in plugins
     assert 'psij' in plugins
@@ -239,7 +239,7 @@ def test_edge_client_list_plugins(mock_post):
 
 def test_plugin_client_register_notification_no_bridge_raises():
     client = PluginClient(MagicMock(), "/base")
-    with pytest.raises(RuntimeError, match="Missing edge tracking"):
+    with pytest.raises(RuntimeError, match="Missing endpoint tracking"):
         client.register_notification_callback(lambda e, p, t, d: None)
 
 
@@ -247,7 +247,7 @@ def test_plugin_client_close_with_session_calls_unregister():
     mock_http = MagicMock()
     mock_http.post.return_value = MagicMock(is_error=False)
     client = PluginClient(mock_http, "/base",
-                          bridge_client=None, edge_id="e1", plugin_name="p1")
+                          bridge_client=None, endpoint_id="e1", plugin_name="p1")
     client._sid = "sid-abc"
     client.close()
     # unregister_session should have been called (POST to unregister)

@@ -1,11 +1,11 @@
 # pylint: disable=protected-access
-"""Unit tests for the bridge config resolver in ``radical.edge.utils``.
+"""Unit tests for the bridge config resolver in ``radical.orbit.utils``.
 
 The resolver is purely deterministic given (CLI arg, env, filesystem)
 state, so each test sets exactly that triple and asserts the outcome.
 ``DEFAULT_DIR`` (and the file-path constants derived from it) are
 monkey-patched to point at ``tmp_path`` in each test so the suite never
-touches the developer's real ``~/.radical/edge/``.
+touches the developer's real ``~/.radical/orbit/``.
 """
 
 import os
@@ -14,7 +14,7 @@ import subprocess
 
 import pytest
 
-from radical.edge import utils
+from radical.orbit import utils
 
 
 # ---------------------------------------------------------------------------

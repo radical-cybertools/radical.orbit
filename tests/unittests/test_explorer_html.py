@@ -1,5 +1,5 @@
 """
-Unit tests for edge_explorer.html consistency.
+Unit tests for orbit_explorer.html consistency.
 
 Catches accidental deletions of CSS classes and JS functions
 that are still referenced in the HTML.
@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-HTML_PATH = Path(__file__).resolve().parents[2] / "src/radical/edge/data/edge_explorer.html"
+HTML_PATH = Path(__file__).resolve().parents[2] / "src/radical/orbit/data/orbit_explorer.html"
 
 
 @pytest.fixture(scope="module")
@@ -55,11 +55,11 @@ def test_onclick_functions_defined(html):
 _SKIP_CLASSES = {
     'layoutClass',
     # form input selectors (queried by JS, styled inline or via parent)
-    'bridge-account', 'bridge-duration', 'bridge-edge-name',
+    'bridge-account', 'bridge-duration', 'bridge-endpoint-name',
     'bridge-executor', 'bridge-jobs-output', 'bridge-nodes',
     'bridge-queue', 'bridge-target',
     # JS DOM hooks
-    'edge-label', 'psij-attribute-rows', 'psij-attributes-container',
+    'endpoint-label', 'psij-attribute-rows', 'psij-attributes-container',
     'p-attr-key', 'p-attr-val',
 }
 

@@ -3,29 +3,29 @@ Tests for standardized exception types.
 """
 import pytest
 
-from radical.edge.exceptions import (
-    EdgeError,
+from radical.orbit.exceptions import (
+    EndpointError,
     SessionError, SessionNotFoundError, SessionClosedError, SessionExpiredError,
     PluginError, PluginNotFoundError, PluginInitializationError,
     ResourceNotFoundError, ConnectionError, BridgeConnectionError,
-    EdgeDisconnectedError, ValidationError, TimeoutError,
+    EndpointDisconnectedError, ValidationError, TimeoutError,
     exception_to_http_status
 )
 
 
-class TestEdgeError:
-    """Tests for base EdgeError."""
+class TestEndpointError:
+    """Tests for base EndpointError."""
 
-    def test_edge_error_basic(self):
-        """Test basic EdgeError creation."""
-        exc = EdgeError("Something failed")
+    def test_endpoint_error_basic(self):
+        """Test basic EndpointError creation."""
+        exc = EndpointError("Something failed")
         assert str(exc) == "Something failed"
         assert exc.message == "Something failed"
-        assert exc.code == "EDGE_ERROR"
+        assert exc.code == "ENDPOINT_ERROR"
 
-    def test_edge_error_custom_code(self):
-        """Test EdgeError with custom code."""
-        exc = EdgeError("Custom error", code="CUSTOM_CODE")
+    def test_endpoint_error_custom_code(self):
+        """Test EndpointError with custom code."""
+        exc = EndpointError("Custom error", code="CUSTOM_CODE")
         assert exc.code == "CUSTOM_CODE"
 
 
@@ -101,11 +101,11 @@ class TestConnectionErrors:
         assert exc.reason == "Connection refused"
         assert "Connection refused" in str(exc)
 
-    def test_edge_disconnected_error(self):
-        """Test EdgeDisconnectedError."""
-        exc = EdgeDisconnectedError("compute-node-1")
-        assert exc.edge_name == "compute-node-1"
-        assert exc.code == "EDGE_DISCONNECTED"
+    def test_endpoint_disconnected_error(self):
+        """Test EndpointDisconnectedError."""
+        exc = EndpointDisconnectedError("compute-node-1")
+        assert exc.endpoint_name == "compute-node-1"
+        assert exc.code == "ENDPOINT_DISCONNECTED"
 
 
 class TestValidationError:
@@ -179,14 +179,14 @@ class TestExceptionToHttpStatus:
         exc = BridgeConnectionError("url")
         assert exception_to_http_status(exc) == 503
 
-    def test_edge_disconnected_maps_to_503(self):
-        """Test EdgeDisconnectedError maps to 503."""
-        exc = EdgeDisconnectedError("edge")
+    def test_endpoint_disconnected_maps_to_503(self):
+        """Test EndpointDisconnectedError maps to 503."""
+        exc = EndpointDisconnectedError("endpoint")
         assert exception_to_http_status(exc) == 503
 
-    def test_generic_edge_error_maps_to_500(self):
-        """Test generic EdgeError maps to 500."""
-        exc = EdgeError("error")
+    def test_generic_endpoint_error_maps_to_500(self):
+        """Test generic EndpointError maps to 500."""
+        exc = EndpointError("error")
         assert exception_to_http_status(exc) == 500
 
     def test_unknown_exception_maps_to_500(self):

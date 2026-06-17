@@ -1,4 +1,4 @@
-"""Unit tests for bin/radical-edge-makeflow-prep.
+"""Unit tests for bin/orbit-makeflow-prep.
 
 Exercises the preprocessor's parser, directive scoping, rewrite
 semantics, and error reporting.  The script has no ``.py`` extension
@@ -16,7 +16,7 @@ import pytest
 _loader = SourceFileLoader(
     'prep_mod',
     str(Path(__file__).resolve().parents[2]
-        / 'bin' / 'radical-edge-makeflow-prep')
+        / 'bin' / 'orbit-makeflow-prep')
 )
 _spec = importlib.util.spec_from_loader('prep_mod', _loader)
 _prep = importlib.util.module_from_spec(_spec)
@@ -40,17 +40,17 @@ def _run(text: str, **opts_kwargs) -> str:
 
 class TestBasicRewrite:
 
-    def test_minimal_edge(self):
+    def test_minimal_endpoint(self):
         out = _run(
-            'EDGE = "e1"\n'
+            'ENDPOINT = "e1"\n'
             '\n'
             'out.dat: in.dat\n'
             '\t./compute in.dat out.dat\n')
-        assert 'radical-edge-run' in out
-        assert '--edge=e1' in out
+        assert 'orbit-run' in out
+        assert '--endpoint=e1' in out
         assert '--pool=' not in out
         assert '--run-id=runid0' in out
-        # Edge mode does NOT propagate --in/--out (staging unsupported).
+        # Endpoint mode does NOT propagate --in/--out (staging unsupported).
         assert '--in '  not in out
         assert '--out ' not in out
         # Original command is wrapped in sh -c to contain shell grammar
@@ -62,9 +62,9 @@ class TestBasicRewrite:
             '\n'
             'out.dat: in.dat\n'
             '\t./compute in.dat out.dat\n')
-        assert 'radical-edge-run' in out
+        assert 'orbit-run' in out
         assert '--pool=p1' in out
-        assert '--edge=' not in out
+        assert '--endpoint=' not in out
         assert '--in in.dat' in out
         assert '--out out.dat' in out
         assert "-- sh -c './compute in.dat out.dat'" in out
@@ -99,78 +99,78 @@ class TestScoping:
             'a: i1\n\tc1\n'
             'POOL = "p2"\n'
             'b: i2\n\tc2\n')
-        lines = [l for l in out.split('\n') if 'radical-edge-run' in l]
+        lines = [l for l in out.split('\n') if 'orbit-run' in l]
         assert len(lines) == 2
         assert '--pool=p1' in lines[0]
         assert '--pool=p2' in lines[1]
 
-    def test_default_edge_option(self):
-        out = _run('o: i\n\tcmd\n', default_edge='eD')
-        assert '--edge=eD' in out
+    def test_default_endpoint_option(self):
+        out = _run('o: i\n\tcmd\n', default_endpoint='eD')
+        assert '--endpoint=eD' in out
 
     def test_default_pool_option(self):
         out = _run('o: i\n\tcmd\n', default_pool='pD')
         assert '--pool=pD' in out
 
-    def test_explicit_overrides_default_edge(self):
-        out = _run('EDGE = "eX"\n'
+    def test_explicit_overrides_default_endpoint(self):
+        out = _run('ENDPOINT = "eX"\n'
                    'o: i\n\tcmd\n',
-                   default_edge='eD')
-        assert '--edge=eX' in out
-        assert '--edge=eD' not in out
+                   default_endpoint='eD')
+        assert '--endpoint=eX' in out
+        assert '--endpoint=eD' not in out
 
-    def test_explicit_pool_overrides_default_edge(self):
-        '''Setting POOL in the file clears the --default-edge scope.'''
+    def test_explicit_pool_overrides_default_endpoint(self):
+        '''Setting POOL in the file clears the --default-endpoint scope.'''
         out = _run('POOL = "pX"\n'
                    'o: i\n\tcmd\n',
-                   default_edge='eD')
+                   default_endpoint='eD')
         assert '--pool=pX' in out
-        assert '--edge=' not in out
+        assert '--endpoint=' not in out
 
 
 # ---------------------------------------------------------------------------
-# EDGE / POOL mutual exclusion
+# ENDPOINT / POOL mutual exclusion
 # ---------------------------------------------------------------------------
 
-class TestEdgePoolMutex:
+class TestEndpointPoolMutex:
 
-    def test_pool_clears_edge_scope(self):
-        '''Setting POOL after EDGE in the same scope clears EDGE.'''
+    def test_pool_clears_endpoint_scope(self):
+        '''Setting POOL after ENDPOINT in the same scope clears ENDPOINT.'''
         out = _run(
-            'EDGE = "e1"\n'
+            'ENDPOINT = "e1"\n'
             'POOL = "p1"\n'
             'o: i\n\tcmd\n')
         assert '--pool=p1' in out
-        assert '--edge=' not in out
+        assert '--endpoint=' not in out
 
-    def test_edge_clears_pool_scope(self):
-        '''Setting EDGE after POOL in the same scope clears POOL.'''
+    def test_endpoint_clears_pool_scope(self):
+        '''Setting ENDPOINT after POOL in the same scope clears POOL.'''
         out = _run(
             'POOL = "p1"\n'
-            'EDGE = "e1"\n'
+            'ENDPOINT = "e1"\n'
             'o: i\n\tcmd\n')
-        assert '--edge=e1' in out
+        assert '--endpoint=e1' in out
         assert '--pool=' not in out
 
     def test_per_rule_switching(self):
-        '''Two rules with different EDGE/POOL — each gets its own.'''
+        '''Two rules with different ENDPOINT/POOL — each gets its own.'''
         out = _run(
-            'EDGE = "e1"\n'
+            'ENDPOINT = "e1"\n'
             'a: i1\n\tc1\n'
             'POOL = "p1"\n'
             'b: i2\n\tc2\n')
-        lines = [l for l in out.split('\n') if 'radical-edge-run' in l]
+        lines = [l for l in out.split('\n') if 'orbit-run' in l]
         assert len(lines) == 2
-        assert '--edge=e1' in lines[0]
+        assert '--endpoint=e1' in lines[0]
         assert '--pool=' not in lines[0]
         assert '--pool=p1' in lines[1]
-        assert '--edge=' not in lines[1]
+        assert '--endpoint=' not in lines[1]
 
     def test_cli_default_mutex(self):
-        '''--default-edge and --default-pool cannot both be set.'''
+        '''--default-endpoint and --default-pool cannot both be set.'''
         with pytest.raises(PrepError, match='mutually exclusive'):
             _run('o: i\n\tcmd\n',
-                 default_edge='eD', default_pool='pD')
+                 default_endpoint='eD', default_pool='pD')
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +189,7 @@ class TestPoolsFile:
             'a: i\n\tc1\n'
             'b: a\n\tc2\n',
             pools_file='/wf/pools.json')
-        lines = [l for l in out.splitlines() if 'radical-edge-run' in l]
+        lines = [l for l in out.splitlines() if 'orbit-run' in l]
         assert len(lines) == 2
         for line in lines:
             assert '--pools=/wf/pools.json' in line
@@ -247,8 +247,8 @@ class TestPassThrough:
 class TestErrors:
 
     def test_rule_without_any_target(self):
-        '''Without EDGE/POOL in the file or CLI default → reject.'''
-        with pytest.raises(PrepError, match='EDGE or POOL'):
+        '''Without ENDPOINT/POOL in the file or CLI default → reject.'''
+        with pytest.raises(PrepError, match='ENDPOINT or POOL'):
             _run('o: i\n\tcmd\n')
 
     def test_rule_with_no_command(self):
@@ -299,7 +299,7 @@ class TestMultiCommand:
         # the preprocessor doesn't produce a syntactically broken line.
         # Compile-check via shlex.split:
         import shlex as _shlex
-        line = [l for l in out.split('\n') if 'radical-edge-run' in l][0]
+        line = [l for l in out.split('\n') if 'orbit-run' in l][0]
         tokens = _shlex.split(line)
         sep    = tokens.index('--')
         # After '-- sh -c', the final token should equal the original.
@@ -315,21 +315,21 @@ class TestLocalKeyword:
 
     def test_local_rule_not_wrapped(self):
         '''A rule whose command starts with ``LOCAL `` is left to
-        Makeflow (LOCAL preserved, no radical-edge-run wrapper).
+        Makeflow (LOCAL preserved, no orbit-run wrapper).
         '''
         out = _run(
-            'EDGE = "e"\n'
+            'ENDPOINT = "e"\n'
             'o: i\n'
             '\tLOCAL ./gen.sh > o\n')
         # The LOCAL keyword is preserved and the command is NOT
-        # wrapped in radical-edge-run.
+        # wrapped in orbit-run.
         assert 'LOCAL ./gen.sh > o' in out
-        assert 'radical-edge-run' not in out
+        assert 'orbit-run' not in out
 
     def test_non_local_rule_still_wrapped(self):
-        out = _run('EDGE = "e"\n'
+        out = _run('ENDPOINT = "e"\n'
                    'o: i\n\t./gen.sh\n')
-        assert 'radical-edge-run' in out
+        assert 'orbit-run' in out
         assert 'LOCAL' not in out
 
 
@@ -349,10 +349,10 @@ class TestMakeflowVarRewrite:
         out = _run(
             'SRC = "/in"\n'
             'DST = "/out"\n'
-            'EDGE = "e"\n'
+            'ENDPOINT = "e"\n'
             'o: i\n'
             '\tcp $(SRC)/file $(DST)/file\n')
-        line = [l for l in out.splitlines() if 'radical-edge-run' in l][0]
+        line = [l for l in out.splitlines() if 'orbit-run' in l][0]
         assert '$(SRC)' not in line
         assert '$(DST)' not in line
         assert '/in/file'  in line
@@ -363,10 +363,10 @@ class TestMakeflowVarRewrite:
         of getting silent empty expansions.
         '''
         out = _run(
-            'EDGE = "e"\n'
+            'ENDPOINT = "e"\n'
             'o: i\n'
             '\tcp $(NOSUCH)/x.txt /tmp/\n')
-        line = [l for l in out.splitlines() if 'radical-edge-run' in l][0]
+        line = [l for l in out.splitlines() if 'orbit-run' in l][0]
         assert '$(NOSUCH)' in line
 
     def test_local_rule_not_expanded(self):
@@ -375,7 +375,7 @@ class TestMakeflowVarRewrite:
         '''
         out = _run(
             'LOG = "/logs"\n'
-            'EDGE = "e"\n'
+            'ENDPOINT = "e"\n'
             'o: i\n'
             '\tLOCAL ./gen.sh > $(LOG)/out.log\n')
         assert '$(LOG)' in out

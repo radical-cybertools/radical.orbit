@@ -14,29 +14,29 @@
         |  WSS (outbound from HPC)
         v
   ┌─────────────┐   ┌─────────────┐
-  │  Edge (HPC) │   │  Edge (HPC) │  ← one per cluster or login node
+  │  Endpoint (HPC) │   │  Endpoint (HPC) │  ← one per cluster or login node
   └─────────────┘   └─────────────┘
 ```
 
-**Key point**: edges initiate the outbound WebSocket connection to the bridge.
+**Key point**: endpoints initiate the outbound WebSocket connection to the bridge.
 No inbound ports need to be opened on the HPC firewall.
 
 ## Bridge Setup
 
 The bridge is a single FastAPI/uvicorn process. It holds no job state — all
-session state lives in the edge processes.
+session state lives in the endpoint processes.
 
 ```sh
 # HTTP (development only)
-./bin/radical-edge-bridge.py
+./bin/orbit-bridge.py
 
 # HTTPS (production)
 export RADICAL_BRIDGE_CERT=/path/to/cert.pem
 export RADICAL_BRIDGE_KEY=/path/to/key.pem
-./bin/radical-edge-bridge.py
+./bin/orbit-bridge.py
 ```
 
-To change host/port, edit the last line of `bin/radical-edge-bridge.py`:
+To change host/port, edit the last line of `bin/orbit-bridge.py`:
 
 ```python
 uvicorn.run(app, host="0.0.0.0", port=8000, ...)
@@ -46,16 +46,16 @@ uvicorn.run(app, host="0.0.0.0", port=8000, ...)
 
 ```ini
 [Unit]
-Description=RADICAL Edge Bridge
+Description=ORBIT Bridge
 After=network.target
 
 [Service]
 Type=simple
 User=radical
-WorkingDirectory=/opt/radical-edge
-Environment=RADICAL_BRIDGE_CERT=/opt/radical-edge/certs/bridge_cert.pem
-Environment=RADICAL_BRIDGE_KEY=/opt/radical-edge/certs/bridge_key.pem
-ExecStart=/opt/radical-edge/bin/radical-edge-bridge.py
+WorkingDirectory=/opt/orbit
+Environment=RADICAL_BRIDGE_CERT=/opt/orbit/certs/bridge_cert.pem
+Environment=RADICAL_BRIDGE_KEY=/opt/orbit/certs/bridge_key.pem
+ExecStart=/opt/orbit/bin/orbit-bridge.py
 Restart=on-failure
 RestartSec=5s
 
@@ -63,45 +63,45 @@ RestartSec=5s
 WantedBy=multi-user.target
 ```
 
-## Edge Service Setup
+## Endpoint Service Setup
 
-Edges are typically launched as batch jobs via the host scheduler (SLURM, PBS)
+Endpoints are typically launched as batch jobs via the host scheduler (SLURM, PBS)
 or as long-running daemon processes on login nodes.
 
 ```sh
 # Direct launch (login node daemon)
-./bin/radical-edge-service.py \
-  --name my-hpc-edge \
+./bin/orbit-endpoint.py \
+  --name my-hpc-endpoint \
   --url  wss://bridge.example.org:8000 \
   -p     sysinfo,psij,queue_info,staging
 
 # Via SLURM batch script
-sbatch edge_job.sh
+sbatch endpoint_job.sh
 ```
 
 ### SLURM Batch Script Example
 
 ```sh
 #!/bin/bash
-#SBATCH --job-name=radical-edge
+#SBATCH --job-name=orbit
 #SBATCH --partition=service
 #SBATCH --nodes=1
 #SBATCH --time=24:00:00
 
 export RADICAL_BRIDGE_CERT=/path/to/bridge_cert.pem
 
-./bin/radical-edge-wrapper.sh \
-  --name "$SLURM_CLUSTER_NAME-edge" \
+./bin/orbit-endpoint-wrapper.sh \
+  --name "$SLURM_CLUSTER_NAME-endpoint" \
   --url  wss://bridge.example.org:8000 \
   -p     sysinfo,psij,queue_info,staging,rhapsody
 ```
 
-The wrapper script (`radical-edge-wrapper.sh`) sets up `PYTHONPATH` and
-`PATH` for the installed package before starting the edge service.
+The wrapper script (`orbit-endpoint-wrapper.sh`) sets up `PYTHONPATH` and
+`PATH` for the installed package before starting the endpoint service.
 
 ## Session Persistence
 
-**Sessions are not persisted.** When an edge disconnects and reconnects:
+**Sessions are not persisted.** When an endpoint disconnects and reconnects:
 
 - All active sessions are lost
 - The Explorer automatically refreshes its plugin list via SSE topology event
@@ -109,7 +109,7 @@ The wrapper script (`radical-edge-wrapper.sh`) sets up `PYTHONPATH` and
   `register_session()` again
 - The Explorer re-registers sessions transparently on next API call
 
-Plan for edge restarts by wrapping your client loop with a reconnection
+Plan for endpoint restarts by wrapping your client loop with a reconnection
 strategy.
 
 ## Health Checks
@@ -117,18 +117,18 @@ strategy.
 Every plugin exposes a health endpoint at `GET /{plugin}/health`:
 
 ```
-GET /my-edge/psij/health
+GET /my-endpoint/psij/health
 → {"status": "healthy", "plugin": "psij", "version": "...",
    "uptime_seconds": 3600.0, "active_sessions": 2}
 ```
 
 The bridge itself does not yet have a dedicated `/health` endpoint, but
-`GET /edge/list` returning 200 is a reliable liveness check.
+`GET /endpoint/list` returning 200 is a reliable liveness check.
 
 For load-balancer health probes:
 
 ```sh
-curl -sk https://bridge:8000/edge/list -X POST | jq .
+curl -sk https://bridge:8000/endpoint/list -X POST | jq .
 ```
 
 ## Observability
@@ -138,14 +138,14 @@ standard Python logging:
 
 ```sh
 # DEBUG logging
-RADICAL_LOG_LVL=DEBUG ./bin/radical-edge-bridge.py
+RADICAL_LOG_LVL=DEBUG ./bin/orbit-bridge.py
 ```
 
 Key log namespaces:
 
 | Namespace          | Content                                      |
 |--------------------|----------------------------------------------|
-| `radical.edge`     | Bridge, edge service, plugin base             |
-| `radical.edge.client` | Python client, SSE listener               |
+| `radical.orbit`     | Bridge, endpoint service, plugin base             |
+| `radical.orbit.client` | Python client, SSE listener               |
 
 Structured logging is not yet enabled; logs go to stderr by default.

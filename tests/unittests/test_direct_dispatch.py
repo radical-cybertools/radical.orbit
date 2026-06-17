@@ -8,7 +8,7 @@ import pytest
 
 from fastapi import HTTPException
 
-from radical.edge.service import RequestShim, EdgeService
+from radical.orbit.service import RequestShim, EndpointService
 
 
 # ---------------------------------------------------------------------------
@@ -152,22 +152,22 @@ class TestErrorResponse:
 
     def test_http_exception(self):
         exc = HTTPException(status_code=404, detail="not found")
-        resp = EdgeService._error_response("req-1", exc)
+        resp = EndpointService._error_response("req-1", exc)
         assert resp.status == 404
         body = json.loads(resp.body)
         assert body == {"detail": "not found"}
 
     def test_generic_exception(self):
         exc = RuntimeError("boom")
-        resp = EdgeService._error_response("req-2", exc)
+        resp = EndpointService._error_response("req-2", exc)
         assert resp.status == 502
         body = json.loads(resp.body)
-        assert body["error"] == "edge-invoke-failed"
+        assert body["error"] == "endpoint-invoke-failed"
         assert body["detail"] == "boom"
 
     def test_value_error(self):
         exc = ValueError("bad input")
-        resp = EdgeService._error_response("req-3", exc)
+        resp = EndpointService._error_response("req-3", exc)
         assert resp.status == 502
         body = json.loads(resp.body)
         assert "bad input" in body["detail"]

@@ -7,8 +7,8 @@ __copyright__ = 'Copyright 2024, RADICAL@Rutgers'
 __license__   = 'MIT'
 
 
-import radical.edge
-from radical.edge.plugin_xgfabric import PluginXGFabric, XGFabricSession
+import radical.orbit
+from radical.orbit.plugin_xgfabric import PluginXGFabric, XGFabricSession
 
 import pytest
 from unittest.mock import Mock, AsyncMock, patch
@@ -198,7 +198,7 @@ if __name__ == '__main__':
 # Config helper functions (pure, no I/O)
 # ---------------------------------------------------------------------------
 
-from radical.edge.plugin_xgfabric import (
+from radical.orbit.plugin_xgfabric import (
     ResourceConfig, WorkflowConfig,
     dict_to_resource_config, dict_to_config, config_to_dict,
     XGFabricClient,

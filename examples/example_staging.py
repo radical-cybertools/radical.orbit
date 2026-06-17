@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Example: File staging between client and edge.
+Example: File staging between client and endpoint.
 
 Demonstrates listing a remote directory, uploading a file, and downloading it.
 """
@@ -8,20 +8,20 @@ Demonstrates listing a remote directory, uploading a file, and downloading it.
 import os
 import tempfile
 
-from radical.edge import BridgeClient
+from radical.orbit import BridgeClient
 
 
 def main():
 
     bc   = BridgeClient()
-    eids = bc.list_edges()
+    eids = bc.list_endpoints()
 
     if not eids:
-        print("No edges connected - start an edge service first")
+        print("No endpoints connected - start an endpoint service first")
         bc.close()
         return
 
-    ec      = bc.get_edge_client(eids[0])
+    ec      = bc.get_endpoint_client(eids[0])
     staging = ec.get_plugin('staging')
 
     # Create a local test file
@@ -35,7 +35,7 @@ def main():
         print(f"Remote /tmp has {len(result['entries'])} entries")
 
         # Upload
-        remote_path = f"/tmp/edge_staging_test_{os.getpid()}.txt"
+        remote_path = f"/tmp/endpoint_staging_test_{os.getpid()}.txt"
         staging.put(local_src, remote_path)
         print(f"Uploaded: {remote_path}")
 

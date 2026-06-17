@@ -1,5 +1,5 @@
 
-# Radical Edge - 6 Month Development Roadmap
+# ORBIT - 6 Month Development Roadmap
 
 **Timeline:** February 2026 - July 2026
 **Resources:** 1 developer @ ~96 hours/month
@@ -11,7 +11,7 @@
 | Month   | Focus Area            | Deliverables                                       |
 |---------|-----------------------|----------------------------------------------------|
 | 1 (Feb) | Foundation            | Documentation, testing, stabilization, CI/CD, performance char. |
-| 2 (Mar) | Scaling               | Multi-edge, multi-client, monitoring               |
+| 2 (Mar) | Scaling               | Multi-endpoint, multi-client, monitoring               |
 | 3 (Apr) | Framework             | Plugin base class, developer tools, Lucid refactor |
 | 4 (May) | Core Plugins          | Lucid refinement, Rhapsody implementation          |
 | 5 (Jun) | Additional Plugins    | XGFabric, ATOMIC, ROSE plugins                     |
@@ -29,7 +29,7 @@
 
 ### Document Current State (24h)
 - Architecture doc (system design, data flow, security model, deployment topology)
-- API docs (Bridge endpoints, Edge endpoints, WebSocket protocol, plugin interface)
+- API docs (Bridge endpoints, Endpoint endpoints, WebSocket protocol, plugin interface)
 - Code docs (inline docstrings, README, configuration reference)
 
 ### Stabilize & Test Current State (48h)
@@ -39,24 +39,24 @@
 
 ### Development Infrastructure (24h)
 - **CI/CD:** automated testing, linting (ruff, mypy), Docker builds
-- **Dev environment:** mock edge service, integration test environment for lucid, xgfabric
+- **Dev environment:** mock endpoint service, integration test environment for lucid, xgfabric
 
 ---
 
-## Month 2: Multi-Edge & Multi-Client Support (March 2026)
+## Month 2: Multi-Endpoint & Multi-Client Support (March 2026)
 
-### Multi-Edge Service Support (56h)
-- **Registry:** persistent edge registry (edge_uid → metadata), health monitoring (heartbeat), capability advertising, dynamic routing
+### Multi-Endpoint Service Support (56h)
+- **Registry:** persistent endpoint registry (endpoint_uid → metadata), health monitoring (heartbeat), capability advertising, dynamic routing
 - **Load balancing:** route by capability, round-robin/failover
-- **Testing:** multiple edges concurrent, failover scenarios, load distribution
+- **Testing:** multiple endpoints concurrent, failover scenarios, load distribution
 
 ### Multi-Client Support (28h)
 - **Auth:** API key/token auth, client identity
-- **Isolation:** client-to-edge authorization, request routing by permissions, audit logging
+- **Isolation:** client-to-endpoint authorization, request routing by permissions, audit logging
 - **Sessions:** client WebSockets (notifications), session state
 
 ### Monitoring & Observability (12h)
-- **Metrics:** request count/latency/errors, active WebSockets, edge health
+- **Metrics:** request count/latency/errors, active WebSockets, endpoint health
 - **Logging:** structured logs, request tracing (correlation IDs)
 - **Monitoring:** expose metrics to client / portal
 
@@ -65,18 +65,18 @@
 ## Month 3: Plugin Framework & Base Class (April 2026)
 
 ### Plugin Base Class Design (20h)
-- **Interface:** required methods (`register_routes()`, `get_namespace()`, `initialize()`, `cleanup()`), optional methods (`on_edge_connect()`, `health_check()`), lifecycle mgmt, config schema
+- **Interface:** required methods (`register_routes()`, `get_namespace()`, `initialize()`, `cleanup()`), optional methods (`on_endpoint_connect()`, `health_check()`), lifecycle mgmt, config schema
 - **Discovery/loading:** plugin registry, dynamic loading, dependency mgmt, version checks
 - **Isolation:** route namespaces, resource quotas, error isolation
 
 ### Plugin Base Class Implementation (40h)
-- **Core class:** `EdgePlugin(ABC)` with abstract/concrete methods
+- **Core class:** `EndpointPlugin(ABC)` with abstract/concrete methods
 - **Manager:** load/unload plugins, state mgmt, config handling
 - **Utilities:** auth/authz decorators, serialization helpers, logging utils
 
 ### Reference Plugin & Testing (28h)
 - **Example:** "Hello World" plugin demonstrating all features, well-documented
-- **Testing:** test harness, mock edge service, radical.lucid migration to base class
+- **Testing:** test harness, mock endpoint service, radical.lucid migration to base class
 - **Docs:** plugin dev guide, API reference, best practices
 
 ### Security Review (8h)
@@ -122,7 +122,7 @@
 
 ### MCP Endpoint Integration (38h)
 - **Analysis:** MCP spec review, integration points, adapter layer design (8h)
-- **Implementation:** expose Edge as MCP tools, map plugins to MCP resources, tool/resource discovery (16h)
+- **Implementation:** expose Endpoint as MCP tools, map plugins to MCP resources, tool/resource discovery (16h)
 - **Client integration:** Claude/MCP client support, auth/authz, rate limiting (8h)
 - **Testing & docs:** protocol compliance, Claude integration, multi-client scenarios, integration guide (6h)
 

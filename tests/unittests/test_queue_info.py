@@ -9,10 +9,10 @@ import pytest
 
 from unittest.mock import patch, Mock, MagicMock
 
-from radical.edge.queue_info import (QueueInfo, QueueInfoSlurm,
+from radical.orbit.queue_info import (QueueInfo, QueueInfoSlurm,
                                      _unwrap, _parse_gpus,
                                      _UNAVAIL_STATES)
-from radical.edge.plugin_queue_info import _parse_slurm_time, PluginQueueInfo
+from radical.orbit.plugin_queue_info import _parse_slurm_time, PluginQueueInfo
 
 FIXTURES = os.path.join(os.path.dirname(__file__), '..', 'fixtures', 'slurm')
 
@@ -628,8 +628,8 @@ class TestGetJobAllocation:
         force-detect SLURM so the underlying squeue/env-var path is
         exercised regardless of the host running the tests.
         """
-        from radical.edge import batch_system as _bs
-        from radical.edge.batch_system_slurm import SlurmBatchSystem
+        from radical.orbit import batch_system as _bs
+        from radical.orbit.batch_system_slurm import SlurmBatchSystem
         _bs._DETECTED = SlurmBatchSystem()
         plugin = PluginQueueInfo.__new__(PluginQueueInfo)
         plugin._backend = Mock()
@@ -637,7 +637,7 @@ class TestGetJobAllocation:
 
     def teardown_method(self, method):
         """Clear the cached batch system between tests."""
-        from radical.edge import batch_system as _bs
+        from radical.orbit import batch_system as _bs
         _bs._DETECTED = None
 
     def test_no_job_id_returns_none(self):

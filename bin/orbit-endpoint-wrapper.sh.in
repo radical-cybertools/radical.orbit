@@ -1,0 +1,60 @@
+#!/bin/sh
+# Auto-generated at install time — do not edit.
+# Runs the ORBIT service using the Python interpreter and site-packages
+# captured when this package was installed.  When ``dragon`` is co-installed
+# in the same venv, the service is launched via ``dragon`` so plugins that
+# require the Dragon runtime (Rhapsody) initialise correctly.
+#
+# Log level is controlled by RADICAL_ORBIT_LOG_LEVEL (default: INFO).
+# Set to DEBUG before submitting to get verbose output in the job log:
+#   export RADICAL_ORBIT_LOG_LEVEL=DEBUG
+
+export PATH="@BINDIR@:${PATH}"
+export PYTHONPATH="@SITEPKGS@:${PYTHONPATH:-}"
+
+# Site-specific setup hook.  Evaluated *before* dragon-vs-python is
+# decided so the chosen interpreter inherits any module loads / env
+# tweaks the snippet performs.  The trust boundary is the same as the
+# rest of the job submission: whoever can put strings into the job
+# spec's environment can already control the exec target, so eval'ing
+# the snippet adds no new attack surface.
+if [ -n "${RADICAL_ORBIT_SETUP:-}" ]; then
+    echo "[orbit] applying RADICAL_ORBIT_SETUP: $RADICAL_ORBIT_SETUP" >&2
+    eval "$RADICAL_ORBIT_SETUP"
+fi
+
+# Anchor the dragon/python lookup to ``@BINDIR@`` (= the venv this
+# wrapper was installed into), NOT a PATH search.  RADICAL_ORBIT_SETUP
+# may legitimately ``module load`` a different python (e.g. cray-python
+# for headers / linking) and prepend it to PATH; that's for runtime
+# libraries (LD_LIBRARY_PATH), not for picking the interpreter.  We
+# always want the venv's own dragon + python.
+DRAGON_PATH="@BINDIR@/dragon"
+PYTHON_PATH="@BINDIR@/python3"
+
+# Decide whether to launch via dragon.  Use it only when:
+#   * dragon is installed in this venv,
+#   * we are NOT on a SLURM/PBS login node without an allocation —
+#     dragon's launch_selector raises in that case.
+USE_DRAGON=no
+REASON=""
+if   [ ! -x "$DRAGON_PATH" ]; then
+    REASON="dragon not installed at $DRAGON_PATH"
+elif command -v sbatch >/dev/null 2>&1 && [ -z "$SLURM_JOB_ID" ]; then
+    REASON="SLURM login node without allocation"
+elif command -v qsub   >/dev/null 2>&1 && [ -z "$PBS_JOBID"    ]; then
+    REASON="PBS login node without allocation"
+else
+    USE_DRAGON=yes
+fi
+
+# Uncomment to write a dragon.log next to the wrapper's CWD (WARNING level).
+# ARGS="-l dragon_file=WARNING"
+
+if [ "$USE_DRAGON" = "yes" ]; then
+    echo "[orbit] starting with dragon ($DRAGON_PATH)" >&2
+    exec "$DRAGON_PATH" $ARGS "@BINDIR@/orbit-endpoint.py" "$@"
+else
+    echo "[orbit] starting with python ($PYTHON_PATH) — $REASON" >&2
+    exec "$PYTHON_PATH" "@BINDIR@/orbit-endpoint.py" "$@"
+fi

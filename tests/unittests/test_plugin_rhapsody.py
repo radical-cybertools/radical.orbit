@@ -1,5 +1,5 @@
 '''
-Unit tests for the Rhapsody Edge plugin.
+Unit tests for the Rhapsody Endpoint plugin.
 
 All RHAPSODY imports are mocked so the tests do not require the rhapsody
 package to be installed.
@@ -68,7 +68,7 @@ def _patch_rhapsody():
     import sys
     sys.modules['rhapsody'] = _mock_rh
 
-    with patch('radical.edge.plugin_rhapsody.rh', _mock_rh):
+    with patch('radical.orbit.plugin_rhapsody.rh', _mock_rh):
         yield
 
     # clean up
@@ -76,7 +76,7 @@ def _patch_rhapsody():
 
 
 # Now import after the mock is in place
-from radical.edge.plugin_rhapsody import (  # noqa: E402
+from radical.orbit.plugin_rhapsody import (  # noqa: E402
     PluginRhapsody,
     RhapsodySession,
     RhapsodyClient,
@@ -516,7 +516,7 @@ async def test_function_task_cloudpickle_roundtrip():
     session._rh_session = MagicMock()
     session._rh_session.submit_tasks = AsyncMock()
 
-    # Simulate what the Edge backend (edge.py) would do
+    # Simulate what the Endpoint backend (endpoint.py) would do
     def adder(a, b):
         return a + b
 
@@ -645,7 +645,7 @@ async def test_session_close():
 
     expected = json.dumps(session._telemetry.summary.return_value, indent=4)
 
-    with patch('radical.edge.plugin_rhapsody.log') as mock_log, \
+    with patch('radical.orbit.plugin_rhapsody.log') as mock_log, \
          patch('builtins.print') as mock_print:
         result = await session.close()
 
@@ -829,7 +829,7 @@ async def test_initialize_without_start_telemetry(monkeypatch):
     '''Session init must succeed when the rhapsody Session has no
     ``start_telemetry`` method (older rhapsody installs lack it).
     Regression for the bug surfaced during the local e2e smoke.'''
-    from radical.edge import plugin_rhapsody as prh
+    from radical.orbit import plugin_rhapsody as prh
 
     fake_backend = MagicMock(spec=[])  # no __await__, no register_callback
     fake_session = MagicMock(spec=[])  # IMPORTANT: spec=[] → no start_telemetry

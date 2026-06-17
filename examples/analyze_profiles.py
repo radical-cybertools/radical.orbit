@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Analyze radical.prof profiles from an Edge throughput benchmark run.
+Analyze radical.prof profiles from an Endpoint throughput benchmark run.
 
-Reads client.prof, bridge.prof, edge.prof from a directory, combines
+Reads client.prof, bridge.prof, endpoint.prof from a directory, combines
 them into a single timeline, and reports per-phase latency statistics
 clustered by batch size and homogeneous/heterogeneous task mode.
 
@@ -12,8 +12,8 @@ Usage:
     profile_dir defaults to the current working directory.
 
 The script expects the throughput benchmark to have been run with
-RADICAL_EDGE_PROFILE=True set in all three processes (client, bridge,
-edge).
+RADICAL_ORBIT_PROFILE=True set in all three processes (client, bridge,
+endpoint).
 """
 
 import os
@@ -40,18 +40,18 @@ PHASES = [
     ('bridge_ser_done',   'bridge_ws_send',     'bridge_pre_ws_send'),
     ('bridge_ws_send',    'bridge_ws_sent',     'bridge_ws_send'),
 
-    # Edge inbound
-    ('edge_deser',        'edge_deser_done',    'edge_ws_deser'),
-    ('edge_parse',        'edge_parse_done',    'edge_pydantic'),
-    ('edge_recv',         'edge_route',         'edge_pre_route'),
-    ('edge_route',        'edge_shim',          'edge_route_match'),
-    ('edge_shim',         'edge_handler',       'edge_shim_build'),
-    ('edge_handler',      'edge_handler_done',  'edge_handler'),
+    # Endpoint inbound
+    ('endpoint_deser',        'endpoint_deser_done',    'endpoint_ws_deser'),
+    ('endpoint_parse',        'endpoint_parse_done',    'endpoint_pydantic'),
+    ('endpoint_recv',         'endpoint_route',         'endpoint_pre_route'),
+    ('endpoint_route',        'endpoint_shim',          'endpoint_route_match'),
+    ('endpoint_shim',         'endpoint_handler',       'endpoint_shim_build'),
+    ('endpoint_handler',      'endpoint_handler_done',  'endpoint_handler'),
 
-    # Edge outbound
-    ('edge_body_ser',     'edge_body_ser_done', 'edge_body_ser'),
-    ('edge_resp_ser',     'edge_resp_ser_done', 'edge_resp_model_ser'),
-    ('edge_ws_send',      'edge_ws_sent',       'edge_ws_send'),
+    # Endpoint outbound
+    ('endpoint_body_ser',     'endpoint_body_ser_done', 'endpoint_body_ser'),
+    ('endpoint_resp_ser',     'endpoint_resp_ser_done', 'endpoint_resp_model_ser'),
+    ('endpoint_ws_send',      'endpoint_ws_sent',       'endpoint_ws_send'),
 
     # Bridge outbound
     ('bridge_deser',      'bridge_deser_done',  'bridge_resp_deser'),
@@ -65,7 +65,7 @@ PHASES = [
 def _load_profiles(prof_dir):
     """Find and load .prof files, return combined timeline."""
 
-    patterns = ['client.prof', 'client.task.prof', 'bridge.prof', 'edge.prof']
+    patterns = ['client.prof', 'client.task.prof', 'bridge.prof', 'endpoint.prof']
     prof_files = []
     for pat in patterns:
         found = glob.glob(os.path.join(prof_dir, pat))
@@ -84,7 +84,7 @@ def _load_profiles(prof_dir):
         print(f"  {f}")
     print()
 
-    profs = rprof.read_profiles(prof_files, sid='edge.benchmark')
+    profs = rprof.read_profiles(prof_files, sid='endpoint.benchmark')
     combined, _ = rprof.combine_profiles(profs)
     return combined
 
@@ -124,8 +124,8 @@ def _classify_request(req_data):
     """
     msg = req_data['_msg']
 
-    # The bridge_recv or edge_recv message contains "METHOD /path"
-    route_msg = msg.get('edge_recv', msg.get('bridge_recv', ''))
+    # The bridge_recv or endpoint_recv message contains "METHOD /path"
+    route_msg = msg.get('endpoint_recv', msg.get('bridge_recv', ''))
 
     if 'submit/' in route_msg:
         # Determine batch size from body_ser_done message (byte count)
@@ -196,7 +196,7 @@ def _cluster_into_rounds(requests, durations):
         events = requests[req_id]['_events']
         return events.get('client_send',
                events.get('bridge_recv',
-               events.get('edge_recv', float('inf'))))
+               events.get('endpoint_recv', float('inf'))))
 
     sorted_ids = sorted(requests.keys(), key=_earliest)
     if not sorted_ids:
@@ -339,7 +339,7 @@ def main():
     print(f"Requests found: {len(requests)}\n")
 
     if not requests:
-        print("No request events found.  Was RADICAL_EDGE_PROFILE=True set?")
+        print("No request events found.  Was RADICAL_ORBIT_PROFILE=True set?")
         sys.exit(1)
 
     # 3. Overall statistics

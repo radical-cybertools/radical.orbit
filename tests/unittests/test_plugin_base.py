@@ -7,10 +7,10 @@ __copyright__ = 'Copyright 2024, RADICAL@Rutgers'
 __license__   = 'MIT'
 
 
-import radical.edge
-import radical.edge
-from radical.edge.plugin_base import Plugin
-from radical.edge.plugin_session_base import PluginSession
+import radical.orbit
+import radical.orbit
+from radical.orbit.plugin_base import Plugin
+from radical.orbit.plugin_session_base import PluginSession
 
 from fastapi import FastAPI, HTTPException
 from starlette.routing import Route
@@ -26,13 +26,13 @@ def test_plugin_init_subclass_collision(caplog):
     Test that duplicate plugin names emit a warning during subclassing.
     '''
     import logging
-    # The 'radical.edge' logger runs with propagate=False (see logging_config),
+    # The 'radical.orbit' logger runs with propagate=False (see logging_config),
     # so caplog's root handler never sees its records.  Attach caplog's handler
     # to the logger directly to capture regardless of propagation.
-    logger = logging.getLogger("radical.edge")
+    logger = logging.getLogger("radical.orbit")
     logger.addHandler(caplog.handler)
     try:
-        with caplog.at_level(logging.WARNING, logger="radical.edge"):
+        with caplog.at_level(logging.WARNING, logger="radical.orbit"):
             class CollidingPluginA(Plugin):
                 plugin_name = "collide"
                 session_class = PluginSession

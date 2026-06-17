@@ -5,7 +5,7 @@ Unit tests for logging_config: correlation ID, ColoredFormatter, configure_loggi
 """
 
 import logging
-from radical.edge import logging_config as lc
+from radical.orbit import logging_config as lc
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +94,7 @@ def test_configure_logging_custom_format():
     # Should not raise and should apply level
     lc.configure_logging(level=logging.DEBUG,
                          format_string="%(levelname)s | %(message)s")
-    logger = logging.getLogger("radical.edge")
+    logger = logging.getLogger("radical.orbit")
     assert logger.level == logging.DEBUG
     # Restore
     lc.configure_logging(level=logging.INFO)
@@ -102,6 +102,6 @@ def test_configure_logging_custom_format():
 
 def test_configure_logging_default_format():
     lc.configure_logging(level=logging.WARNING)
-    logger = logging.getLogger("radical.edge")
+    logger = logging.getLogger("radical.orbit")
     assert logger.level == logging.WARNING
     lc.configure_logging(level=logging.INFO)

@@ -4,7 +4,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from radical.edge.queue_info_pbs import (
+from radical.orbit.queue_info_pbs import (
     QueueInfoPBSPro, _parse_pbsnodes, _node_resources, _parse_qstat_records)
 
 
@@ -113,7 +113,7 @@ class TestCollectInfo:
 
     def test_collect_info_marks_disabled(self):
         backend = QueueInfoPBSPro()
-        with patch('radical.edge.queue_info_pbs._run',
+        with patch('radical.orbit.queue_info_pbs._run',
                    side_effect=[self._qstat_qf(), self._pbsnodes()]):
             res = backend._collect_info()
         queues = res['queues']
@@ -149,7 +149,7 @@ class TestCollectJobs:
             "    Resource_List.nodect = 1\n"
             "    Resource_List.ncpus = 64\n"
             "    Resource_List.walltime = 00:30:00\n")
-        with patch('radical.edge.queue_info_pbs._run', return_value=out):
+        with patch('radical.orbit.queue_info_pbs._run', return_value=out):
             res = backend._collect_jobs('compute', 'alice')
         jobs = res['jobs']
         assert len(jobs) == 1
@@ -183,7 +183,7 @@ def test_collect_allocations_parses_sbank_output():
     backend = QueueInfoPBSPro()
     fake_proc = MagicMock(returncode=0, stdout=sample, stderr='')
     with patch('shutil.which', return_value='/usr/bin/sbank-list-allocations'), \
-         patch('radical.edge.queue_info_pbs.subprocess.run',
+         patch('radical.orbit.queue_info_pbs.subprocess.run',
                return_value=fake_proc):
         result = backend._collect_allocations('alice')
     assert len(result['allocations']) == 1

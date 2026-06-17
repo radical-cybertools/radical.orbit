@@ -2,11 +2,11 @@
 
 Covers the paths that previously had no coverage (and were buggy):
 
-- C2  pilot child-edge disconnect → DONE/FAILED, capacity reclaimed,
+- C2  pilot child-endpoint disconnect → DONE/FAILED, capacity reclaimed,
       tasks re-enqueued; plus the restart race where a replayed-ACTIVE
       pilot must NOT be torn down before its child reconnects.
 - C4  restart correlation: ``_uid_to_task`` rebuilt from the replayed
-      task log; edge-mode ledger replayed (terminal entries filtered).
+      task log; endpoint-mode lendpointr replayed (terminal entries filtered).
 - C5  a late terminal event for a re-enqueued task's stale uid is
       ignored rather than clobbering the task.
 - H2  guard: no test reintroduces the loop-state-fragile
@@ -19,10 +19,10 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
-from radical.edge.plugin_task_dispatcher import PluginTaskDispatcher
-from radical.edge.task_dispatcher_config import PoolConfig, PilotSize
-from radical.edge.task_dispatcher_state import (
-    PilotRecord, TaskRecord, EdgeModeRecord,
+from radical.orbit.plugin_task_dispatcher import PluginTaskDispatcher
+from radical.orbit.task_dispatcher_config import PoolConfig, PilotSize
+from radical.orbit.task_dispatcher_state import (
+    PilotRecord, TaskRecord, EndpointModeRecord,
     PILOT_ACTIVE, PILOT_DONE, PILOT_FAILED,
     TASK_QUEUED, TASK_RUNNING, TASK_DONE,
 )
@@ -35,7 +35,7 @@ from radical.edge.task_dispatcher_state import (
 def _pool_cfg(name: str = 'cpu') -> PoolConfig:
     return PoolConfig(
         name         = name,
-        edge_name    = 'edge0',
+        endpoint_name    = 'endpoint0',
         queue        = 'batch',
         account      = 'proj',
         pilot_sizes  = {'s': PilotSize(nodes=1, cpus_per_node=4,
@@ -49,7 +49,7 @@ def _pool_cfg(name: str = 'cpu') -> PoolConfig:
 
 def _make_plugin(tmp_path: Path, *, with_pool: bool = True):
     app = FastAPI()
-    app.state.edge_name  = 'edge0'
+    app.state.endpoint_name  = 'endpoint0'
     app.state.bridge_url = 'https://localhost:9999'
     plugin = PluginTaskDispatcher(
         app, state_root=tmp_path / 'state', scratch_root=tmp_path / 'scratch')
@@ -58,20 +58,20 @@ def _make_plugin(tmp_path: Path, *, with_pool: bool = True):
     return plugin
 
 
-def _active_pilot(plugin, *, pid='p.1', child='edge0_p.1',
+def _active_pilot(plugin, *, pid='p.1', child='endpoint0_p.1',
                   walltime_deadline=0.0):
     ps = plugin._pool_states['cpu']
     pilot = PilotRecord(
         pid=pid, pool='cpu', size_key='s', rhapsody_backend='concurrent',
         state=PILOT_ACTIVE, submitted_at=100.0, active_at=110.0,
-        capacity=4, in_flight=1, child_edge_name=child,
+        capacity=4, in_flight=1, child_endpoint_name=child,
         walltime_deadline=walltime_deadline)
     ps.pilots[pid] = pilot
     return ps, pilot
 
 
-def _topology(plugin, edges_present):
-    payload = {e: {'plugins': ['rhapsody']} for e in edges_present}
+def _topology(plugin, endpoints_present):
+    payload = {e: {'plugins': ['rhapsody']} for e in endpoints_present}
     asyncio.run(plugin.on_topology_change(payload))
 
 
@@ -90,7 +90,7 @@ class TestPhantomPilotRecovery:
                           pilot_id='p.1')
         ps.tasks['t.1'] = task
 
-        _topology(plugin, ['edge0_p.1'])   # child seen
+        _topology(plugin, ['endpoint0_p.1'])   # child seen
         _topology(plugin, [])              # child gone, walltime passed
 
         assert pilot.state == PILOT_DONE
@@ -103,7 +103,7 @@ class TestPhantomPilotRecovery:
         plugin._loops_started = True
         ps, pilot = _active_pilot(plugin,
                                   walltime_deadline=time.time() + 1000)
-        _topology(plugin, ['edge0_p.1'])
+        _topology(plugin, ['endpoint0_p.1'])
         _topology(plugin, [])
 
         assert pilot.state == PILOT_FAILED
@@ -117,7 +117,7 @@ class TestPhantomPilotRecovery:
         _, pilot = _active_pilot(plugin,
                                  walltime_deadline=time.time() + 1000)
         # Never feed a topology event containing the child → never "seen".
-        _topology(plugin, ['some_other_edge'])
+        _topology(plugin, ['some_other_endpoint'])
         assert pilot.state == PILOT_ACTIVE   # untouched
 
     def test_disconnect_unseen_child_is_noop(self, tmp_path: Path):
@@ -150,26 +150,26 @@ class TestRestartCorrelation:
         assert ps2.tasks['t.x'].state == TASK_RUNNING
         assert plugin2._uid_to_task.get('rh.1') == ('cpu', 't.x')
 
-    def test_edge_mode_ledger_replayed(self, tmp_path: Path):
+    def test_endpoint_mode_lendpointr_replayed(self, tmp_path: Path):
         plugin = _make_plugin(tmp_path, with_pool=False)
-        plugin._edge_mode_log.append(
-            EdgeModeRecord(task_id='t.e', edge='gpuedge',
+        plugin._endpoint_mode_log.append(
+            EndpointModeRecord(task_id='t.e', endpoint='gpuendpoint',
                            state=TASK_RUNNING))
 
         plugin2 = _make_plugin(tmp_path, with_pool=False)
-        assert plugin2._edge_mode_tasks.get('t.e') == 'gpuedge'
+        assert plugin2._endpoint_mode_tasks.get('t.e') == 'gpuendpoint'
 
-    def test_edge_mode_terminal_filtered_on_replay(self, tmp_path: Path):
+    def test_endpoint_mode_terminal_filtered_on_replay(self, tmp_path: Path):
         plugin = _make_plugin(tmp_path, with_pool=False)
-        plugin._edge_mode_log.append(
-            EdgeModeRecord(task_id='t.e', edge='gpuedge',
+        plugin._endpoint_mode_log.append(
+            EndpointModeRecord(task_id='t.e', endpoint='gpuendpoint',
                            state=TASK_RUNNING))
-        plugin._edge_mode_log.append(
-            EdgeModeRecord(task_id='t.e', edge='gpuedge',
+        plugin._endpoint_mode_log.append(
+            EndpointModeRecord(task_id='t.e', endpoint='gpuendpoint',
                            state=TASK_DONE))
 
         plugin2 = _make_plugin(tmp_path, with_pool=False)
-        assert 't.e' not in plugin2._edge_mode_tasks
+        assert 't.e' not in plugin2._endpoint_mode_tasks
 
 
 # ---------------------------------------------------------------------------
@@ -201,25 +201,25 @@ class TestStaleUid:
 
 
 # ---------------------------------------------------------------------------
-# C6 — edge-mode ledger self-prunes via snapshot
+# C6 — endpoint-mode lendpointr self-prunes via snapshot
 # ---------------------------------------------------------------------------
 
-class TestEdgeModeCompaction:
+class TestEndpointModeCompaction:
 
     def test_snapshot_drops_terminal_entries(self, tmp_path: Path):
         plugin = _make_plugin(tmp_path, with_pool=False)
-        log = plugin._edge_mode_log
+        log = plugin._endpoint_mode_log
         # one live, one already-terminal
-        plugin._edge_mode_tasks['t.live'] = 'e1'
-        log.append(EdgeModeRecord(task_id='t.live', edge='e1',
+        plugin._endpoint_mode_tasks['t.live'] = 'e1'
+        log.append(EndpointModeRecord(task_id='t.live', endpoint='e1',
                                   state=TASK_RUNNING))
-        log.append(EdgeModeRecord(task_id='t.gone', edge='e2',
+        log.append(EndpointModeRecord(task_id='t.gone', endpoint='e2',
                                   state=TASK_DONE))
 
         # Snapshot the live set only (what the compaction sweeper does).
-        live = {tid: EdgeModeRecord(task_id=tid, edge=edge,
+        live = {tid: EndpointModeRecord(task_id=tid, endpoint=endpoint,
                                     state=TASK_RUNNING)
-                for tid, edge in plugin._edge_mode_tasks.items()}
+                for tid, endpoint in plugin._endpoint_mode_tasks.items()}
         log.snapshot(live)
 
         replayed = log.replay()

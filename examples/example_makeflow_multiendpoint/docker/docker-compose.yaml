@@ -1,0 +1,96 @@
+x-common-image: &common-image
+  image: ${RADICAL_ORBIT_IMAGE:-radicalcybertools/radical.orbit}:${RADICAL_ORBIT_TAG:-latest}
+
+x-endpoint-service: &endpoint-service
+  <<: *common-image
+  environment:
+    - RADICAL_BRIDGE_URL=https://${RADICAL_BRIDGE_HOSTNAME:-bridge}:8000
+  command: [ "bash", "-c", "orbit-endpoint-wrapper.sh -n $$(hostname) --plugins psij,rhapsody,staging,task_dispatcher" ]
+  volumes:
+    - orbit-volume:/app:ro
+  networks:
+    - orbit-network
+  depends_on:
+    image-builder:
+      condition: service_completed_successfully
+    bridge:
+      condition: service_healthy
+
+services:
+
+  image-builder:
+    <<: *common-image
+    container_name: orbit-image-builder
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        RADICAL_ORBIT_BRANCH: ${RADICAL_ORBIT_BRANCH:-master}
+        GENERATE_BRIDGE_CERT: "true"
+        BRIDGE_IP: "127.0.0.1"
+        BRIDGE_HOSTNAME: ${RADICAL_BRIDGE_HOSTNAME:-bridge}
+    command: [ "echo", "Build complete" ]
+    networks:
+      - orbit-network
+
+  bridge:
+    <<: *common-image
+    container_name: radical-bridge
+    hostname: ${RADICAL_BRIDGE_HOSTNAME:-bridge}
+    command: [ "orbit-bridge.py" ]
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "timeout 1 bash -c '</dev/tcp/localhost/8000'"
+      interval: 5s
+      timeout: 10s
+      retries: 15
+      start_period: 30s
+    ports:
+      - "8000:8000"
+    volumes:
+      - orbit-volume:/app
+    networks:
+      - orbit-network
+    depends_on:
+      image-builder:
+        condition: service_completed_successfully
+
+  endpoint-a:
+    <<: *endpoint-service
+    container_name: orbit-a
+    hostname: endpoint_a
+
+  endpoint-b:
+    <<: *endpoint-service
+    container_name: orbit-b
+    hostname: endpoint_b
+
+  client:
+    <<: *common-image
+    container_name: orbit-client
+    hostname: client
+    environment:
+      - RADICAL_BRIDGE_URL=https://${RADICAL_BRIDGE_HOSTNAME:-bridge}:8000
+    command: [ "tail", "-f", "/dev/null" ]
+    volumes:
+      - orbit-volume:/app:ro
+    networks:
+      - orbit-network
+    depends_on:
+      image-builder:
+        condition: service_completed_successfully
+      bridge:
+        condition: service_healthy
+      endpoint-a:
+        condition: service_started
+      endpoint-b:
+        condition: service_started
+
+volumes:
+  orbit-volume:
+    name: orbit-volume
+
+networks:
+  orbit-network:
+    name: orbit-network
