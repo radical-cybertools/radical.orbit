@@ -232,8 +232,8 @@ radical-edge-service.py [options]
   --url  URL          Bridge URL                 (CLI > env > file)
   --cert CERT         TLS cert path              (CLI > env > file)
   -p PLUGINS          Comma-separated plugins to load
-  --tunnel            Open ssh -L outbound to login host before connect
-  --tunnel-via HOST   Explicit login host for --tunnel (defaults to
+  --tunnel MODE       Tunnel mode: none | forward | reverse
+  --tunnel-via HOST   Login host for --tunnel forward (defaults to
                       $PBS_O_HOST / $SLURM_SUBMIT_HOST)
   --log-level LEVEL   DEBUG | INFO | WARNING | ERROR
 ```
