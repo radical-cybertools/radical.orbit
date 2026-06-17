@@ -49,8 +49,7 @@ A Globus Transfer token is supplied at ``register_session`` time, as **one of**:
 The credential lives in the edge process memory (inside the ``TransferClient``)
 for the lifetime of the session and is **never** written to disk.
 
-Acquire a token with the bundled ``get_globus_token.py`` helper.
-
+Acquire a token via Globus Auth (for example with the Globus CLI or your own helper script), then pass it to ``register_session``.
 .. note::
 
    For Globus Connect Server **mapped collections**, the token must already
