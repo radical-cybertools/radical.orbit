@@ -205,6 +205,13 @@ def run_test() -> int:
 # Pytest entry point ----------------------------------------------------------
 
 def test_notifications_local():
+    import pytest
+    try:
+        subprocess.run(['openssl', 'version'], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pytest.skip('openssl not available')
+
     rc = run_test()
     assert rc == 0, "notification path is broken — see captured output"
 
