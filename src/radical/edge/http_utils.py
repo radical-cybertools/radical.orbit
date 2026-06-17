@@ -24,6 +24,8 @@ class RetryTransport(httpx.HTTPTransport):
         try:
             return super().handle_request(request)
         except (httpx.RemoteProtocolError, httpx.ReadError):
+            if request.method.upper() not in ('GET', 'HEAD', 'OPTIONS'):
+                raise
             return super().handle_request(request)
 
 
