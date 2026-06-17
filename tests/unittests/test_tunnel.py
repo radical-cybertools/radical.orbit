@@ -3,6 +3,9 @@ EdgeService._open_tunnel flow."""
 
 import asyncio
 import io
+import os
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -25,6 +28,26 @@ class _FakeProc:
 
     def poll(self):
         return self._poll
+
+
+class _PipeProc:
+    """Pipe-backed proc stub for reverse-tunnel stderr tests."""
+
+    def __init__(self, poll_result=None):
+        rfd, self._wfd = os.pipe()
+        self.stderr = os.fdopen(rfd, 'rb', buffering=0)
+        self._poll = poll_result
+        self.returncode = poll_result
+
+    def poll(self):
+        return self._poll
+
+    def write_stderr(self, data: bytes):
+        os.write(self._wfd, data)
+
+    def close_stderr(self):
+        os.close(self._wfd)
+        self.stderr.close()
 
 
 @pytest.fixture
@@ -113,6 +136,36 @@ def test_cleanup_tunnel_falls_back_to_kill():
     proc.terminate.side_effect = OSError
     _tunnel.cleanup_tunnel(proc, 'e2')
     proc.kill.assert_called_once()
+
+
+def test_parse_allocated_port_reads_reverse_port():
+    proc = _PipeProc()
+    log_lines = []
+
+    def _writer():
+        time.sleep(0.01)
+        proc.write_stderr(b'Allocated port 54321 for remote forward to x\n')
+
+    writer = threading.Thread(target=_writer)
+    writer.start()
+    try:
+        assert _tunnel._parse_allocated_port(proc, log_lines, 1.0) == 54321
+    finally:
+        proc.close_stderr()
+        writer.join()
+
+
+def test_parse_allocated_port_times_out_without_output():
+    proc = _PipeProc()
+    started = time.monotonic()
+
+    try:
+        with pytest.raises(RuntimeError, match='did not allocate a port within'):
+            _tunnel._parse_allocated_port(proc, [], 0.1)
+    finally:
+        proc.close_stderr()
+
+    assert time.monotonic() - started < 0.5
 
 
 # ---------------------------------------------------------------------------

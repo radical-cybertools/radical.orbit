@@ -26,7 +26,9 @@ read the same path regardless of which side spawned the SSH.
 """
 
 import logging
+import os
 import pathlib
+import select
 import socket
 import subprocess
 import threading
@@ -194,24 +196,59 @@ def _parse_allocated_port(proc, log_lines: list, timeout: float) -> int:
     Raises :class:`RuntimeError` on timeout or premature SSH exit.
     """
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if proc.stderr is None:
-            raise RuntimeError("SSH stderr unavailable; cannot parse allocated port")
-        line = proc.stderr.readline()
-        if not line:
-            if proc.poll() is not None:
-                tail = '\n'.join(log_lines[-20:])
-                raise RuntimeError(
-                    f"SSH reverse tunnel exited (rc={proc.returncode}) "
-                    f"before allocating a port\nSSH output (last 20 lines):"
-                    f"\n{tail}")
-            time.sleep(0.05)
-            continue
-        text = line.decode('utf-8', errors='replace').rstrip()
-        log_lines.append(text)
-        m = _ALLOCATED_PORT_RE.search(text)
-        if m:
-            return int(m.group(1))
+    if proc.stderr is None:
+        raise RuntimeError("SSH stderr unavailable; cannot parse allocated port")
+
+    fd         = proc.stderr.fileno()
+    was_block  = os.get_blocking(fd)
+    buf        = b''
+
+    try:
+        os.set_blocking(fd, False)
+        while time.monotonic() < deadline:
+            remaining = max(0.0, deadline - time.monotonic())
+            ready, _, _ = select.select([fd], [], [], min(0.1, remaining))
+            if not ready:
+                if proc.poll() is not None:
+                    tail = '\n'.join(log_lines[-20:])
+                    raise RuntimeError(
+                        f"SSH reverse tunnel exited (rc={proc.returncode}) "
+                        f"before allocating a port\nSSH output (last 20 lines):"
+                        f"\n{tail}")
+                continue
+
+            try:
+                chunk = os.read(fd, 4096)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                if proc.poll() is not None:
+                    tail = '\n'.join(log_lines[-20:])
+                    raise RuntimeError(
+                        f"SSH reverse tunnel exited (rc={proc.returncode}) "
+                        f"before allocating a port\nSSH output (last 20 lines):"
+                        f"\n{tail}")
+                continue
+
+            buf += chunk
+            while b'\n' in buf:
+                raw, buf = buf.split(b'\n', 1)
+                text = raw.decode('utf-8', errors='replace').rstrip('\r')
+                log_lines.append(text)
+                m = _ALLOCATED_PORT_RE.search(text)
+                if m:
+                    return int(m.group(1))
+
+            text = buf.decode('utf-8', errors='replace').rstrip('\r')
+            m = _ALLOCATED_PORT_RE.search(text)
+            if m:
+                log_lines.append(text)
+                return int(m.group(1))
+    finally:
+        os.set_blocking(fd, was_block)
+
+    if buf:
+        log_lines.append(buf.decode('utf-8', errors='replace').rstrip())
     tail = '\n'.join(log_lines[-20:])
     raise RuntimeError(
         f"SSH reverse tunnel did not allocate a port within {timeout:.0f}s\n"
