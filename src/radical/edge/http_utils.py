@@ -24,6 +24,8 @@ class RetryTransport(httpx.HTTPTransport):
         try:
             return super().handle_request(request)
         except (httpx.RemoteProtocolError, httpx.ReadError):
+            if request.method.upper() not in ('GET', 'HEAD', 'OPTIONS'):
+                raise
             return super().handle_request(request)
 
 
@@ -32,6 +34,8 @@ class RetryAsyncTransport(httpx.AsyncHTTPTransport):
         try:
             return await super().handle_async_request(request)
         except (httpx.RemoteProtocolError, httpx.ReadError):
+            if request.method.upper() not in ('GET', 'HEAD', 'OPTIONS'):
+                raise
             return await super().handle_async_request(request)
 
 

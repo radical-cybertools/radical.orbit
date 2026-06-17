@@ -457,6 +457,7 @@ class EdgeService(PluginHostBase):
         # 'none' → fall through, use bridge URL as-is.
         # ── End tunnel setup ──────────────────────────────────────────────────
 
+        ssl_check_hostname = True
         while not self._stop_event.is_set():
             try:
                 # For the ws connect, we change http(s) to ws(s)
@@ -476,8 +477,8 @@ class EdgeService(PluginHostBase):
                 ssl_ctx = None
                 if ws_url.startswith("wss://"):
                     ssl_ctx = ssl.create_default_context()
-                    ssl_ctx.check_hostname = False
-                    ssl_ctx.verify_mode = ssl.CERT_NONE
+                    ssl_ctx.check_hostname = ssl_check_hostname
+                    ssl_ctx.verify_mode = ssl.CERT_REQUIRED
                     # Cert path was already resolved + validated in __init__.
                     if self._cert and os.path.exists(self._cert):
                         ssl_ctx.load_verify_locations(self._cert)
@@ -609,6 +610,25 @@ class EdgeService(PluginHostBase):
                             _recv_task, _stop_fut,
                             return_exceptions=True)
 
+            except ssl.SSLCertVerificationError as e:
+                verify_msg = getattr(e, 'verify_message', str(e)).lower()
+                if ssl_check_hostname and 'hostname' in verify_msg:
+                    log.warning("[Edge] TLS hostname validation failed for %s: %s. "
+                                "Continuing with hostname validation disabled.",
+                                self._bridge_url, e)
+                    ssl_check_hostname = False
+                    continue
+                if self._stop_event.is_set():
+                    break
+
+                # Add jitter to backoff to prevent thundering herd
+                jitter = backoff * JITTER_FACTOR * random.random()
+                sleep_time = backoff + jitter
+                log.warning("[Edge] Connection lost: %s. Reconnecting in %.1fs...",
+                            e, sleep_time)
+                await asyncio.sleep(sleep_time)
+                backoff = min(backoff * BACKOFF_FACTOR, MAX_BACKOFF)
+
             except (ws_exc.ConnectionClosed, OSError) as e:
                 if self._stop_event.is_set():
                     break  # no reconnect
@@ -716,9 +736,7 @@ class EdgeService(PluginHostBase):
         relay_file = rdir / f'{self._name}.port'
         req_file   = rdir / f'{self._name}.req'
 
-        parsed      = urlparse(self._bridge_url)
-        bridge_host = parsed.hostname or 'localhost'
-        bridge_port = parsed.port or (443 if parsed.scheme == 'https' else 8000)
+        bridge_port = parsed.port or (443 if parsed.scheme in ('https', 'wss') else 8000)
 
         # Drop the request file *before* polling — atomic via tmp + rename
         # so the helper script never reads a half-written payload.
