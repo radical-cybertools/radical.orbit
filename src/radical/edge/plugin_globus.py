@@ -315,7 +315,7 @@ class GlobusSession(PluginSession):
                                      'recursive': bool(recursive)}
         if label is not None: dd_kwargs['label'] = label
 
-        ddata = globus_sdk.DeleteData(**dd_kwargs)
+        ddata = globus_sdk.DeleteData(self._tc, **dd_kwargs)
         for p in paths:
             ddata.add_item(p)
 
