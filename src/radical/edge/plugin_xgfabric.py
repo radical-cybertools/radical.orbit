@@ -29,6 +29,7 @@ import httpx
 
 from fastapi import FastAPI, HTTPException, Request
 
+from .http_utils import make_async_http_client
 from .plugin_session_base import PluginSession
 from .plugin_base import Plugin
 from .client import PluginClient
@@ -178,7 +179,7 @@ class XGFabricSession(PluginSession):
         self._edge_name = edge_name or 'local'
         self._bridge_url = bridge_url
         self._bridge_cert = bridge_cert
-        self._http        = httpx.AsyncClient(verify=self._verify())
+        self._http        = make_async_http_client(verify=self._verify())
         self._connected_edges: Dict[str, Any] = {}  # Cached connected edges
         self._current_config: Optional[WorkflowConfig] = None
         self._current_resource_config: Optional[ResourceConfig] = None
@@ -1291,10 +1292,17 @@ class PluginXGFabric(Plugin):
         """Create session with workdir, edge name, and bridge connection info."""
         edge_name = getattr(self._app.state, 'edge_name', 'local')
 
-        # Get bridge URL from edge service
+        # Get bridge URL from edge service.  Cert path comes from the
+        # shared resolver (CLI > env > file) — we ignore CLI here since
+        # this is the bridge-internal session-creation path.
+        from . import utils
         edge_service = getattr(self._app.state, 'edge_service', None)
-        bridge_url = getattr(edge_service, '_bridge_url', None) if edge_service else None
-        bridge_cert = os.environ.get('RADICAL_BRIDGE_CERT')
+        bridge_url   = getattr(edge_service, '_bridge_url', None) if edge_service else None
+        try:
+            cert_path, _ = utils.resolve_bridge_cert()
+            bridge_cert  = str(cert_path)
+        except (ValueError, FileNotFoundError):
+            bridge_cert  = None
 
         log.info("[XGFabric] _create_session: sid=%s  edge=%s  bridge_url=%s  cached_edges=%s",
                  sid, edge_name, bridge_url, list(self._connected_edges.keys()))

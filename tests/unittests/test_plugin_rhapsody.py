@@ -83,6 +83,19 @@ from radical.edge.plugin_rhapsody import (  # noqa: E402
 )
 
 
+# Stub RhapsodySession.initialize for every test in this module.
+# The background `_init_session` task runs concurrently inside the same
+# TestClient.post that registers the session, so the test's own
+# `_init_ready.set()` always loses the race with `await initialize()`
+# — and initialize() now awaits start_telemetry / awaitable backends
+# that the sync MagicMock cannot satisfy.  These tests assign their own
+# mock `_rh_session` afterwards, so the real initialize is unwanted.
+@pytest.fixture(autouse=True)
+def _stub_session_initialize():
+    with patch.object(RhapsodySession, 'initialize', new_callable=AsyncMock):
+        yield
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -622,11 +635,21 @@ async def test_session_close():
     mock_rh_session = MagicMock()
     mock_rh_session.close = AsyncMock()
     session._rh_session = mock_rh_session
+    session._telemetry = MagicMock()
+    session._telemetry.summary.return_value = {"telemetry": "ok"}
 
-    result = await session.close()
+    expected = json.dumps(session._telemetry.summary.return_value, indent=4)
+
+    with patch('radical.edge.plugin_rhapsody.log') as mock_log, \
+         patch('builtins.print') as mock_print:
+        result = await session.close()
+
     assert result == {}
     assert session._active is False
+    assert session._telemetry is None
     mock_rh_session.close.assert_called_once()
+    mock_log.info.assert_called_once_with(expected)
+    mock_print.assert_called_once_with(expected, flush=True)
 
 
 # ---------------------------------------------------------------------------

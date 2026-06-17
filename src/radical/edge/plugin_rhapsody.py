@@ -60,6 +60,30 @@ def _assert_json_serializable(obj, path=""):
             f"{type(obj).__name__} = {repr(obj)!s:.200}")
 
 
+def _json_safe(v):
+    """Coerce *v* to a JSON-serializable form.
+
+    Backend-specific kwargs (e.g. dragon ``Policy`` objects passed via
+    ``task_backend_specific_kwargs``) are not JSON-encodable; without
+    this, any read of the cached task dict (list_tasks / wait_tasks /
+    notification serialization) raises ``TypeError`` and the response
+    or WS frame is dropped.  Falls back through ``to_dict`` / recursion
+    / ``str``.
+    """
+    try:
+        json.dumps(v)
+        return v
+    except (TypeError, ValueError):
+        if hasattr(v, 'to_dict'):
+            try:                  return _json_safe(v.to_dict())
+            except Exception:     pass
+        if isinstance(v, dict):
+            return {str(k): _json_safe(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple, set)):
+            return [_json_safe(x) for x in v]
+        return str(v)
+
+
 # ---------------------------------------------------------------------------
 # Edge-side session
 # ---------------------------------------------------------------------------
@@ -98,6 +122,7 @@ class RhapsodySession(PluginSession):
         self.backend_names       = backend_names or ['dragon_v3']
         self.allow_pickled_tasks = allow_pickled_tasks
         self._rh_session         = None
+        self._telemetry          = None
         self._tasks: dict[str, dict] = {}
 
         # Async init tracking
@@ -142,6 +167,10 @@ class RhapsodySession(PluginSession):
 
             self._rh_session = rh.Session(backends=backends, uid=self._sid)
 
+            self._telemetry = await self._rh_session.start_telemetry(
+                resource_poll_interval=0.1, checkpoint_path=f"telemetry-output"
+                )
+
             # Register state-change callbacks for intermediate notifications
             self._notified_states: dict[str, str] = {}
             self._notified_lock = threading.Lock()
@@ -161,6 +190,35 @@ class RhapsodySession(PluginSession):
 
             self._init_ready.set()
             log.info("[%s] Session initialization complete", self._sid)
+
+            # Probe: log Dragon's view of node hostnames so we can compare
+            # against what queue_info.nodelist() / amsc.py is using for
+            # Policy(host_name=…).  A mismatch silently turns HOST_NAME
+            # placement into a no-op and tasks pile up on whichever node
+            # Dragon's default policy lands them.
+            #
+            # ``System().nodes`` returns huids (int).  ``Node(huid)``
+            # wraps each one and exposes ``.hostname``.
+            try:
+                from dragon.native.machine import (
+                    System as _DragonSystem, Node as _DragonNode)
+                _dragon_hosts = [str(_DragonNode(h).hostname)
+                                 for h in _DragonSystem().nodes]
+                log.info("[%s] dragon System().nodes hostnames: %s",
+                         self._sid, _dragon_hosts)
+                # Probe accelerator visibility — if Policy(gpu_affinity=…)
+                # is being silently dropped, dragon's _get_gpu_affinity
+                # filters our request against node.accelerators.device_list
+                # (== Node.gpus).  Empty/None/wrong-vocabulary list here
+                # explains why CUDA_VISIBLE_DEVICES never gets set.
+                for _h in _DragonSystem().nodes:
+                    _n = _DragonNode(_h)
+                    log.info("[%s] dragon node %s: gpus=%s vendor=%s env=%s",
+                             self._sid, _n.hostname,
+                             _n.gpus, _n.gpu_vendor, _n.gpu_env_str)
+            except Exception as _e:
+                log.info("[%s] dragon hostname probe skipped: %s",
+                         self._sid, _e)
 
         except Exception as e:
             self._init_error = str(e)
@@ -614,7 +672,7 @@ class RhapsodySession(PluginSession):
                 except (TypeError, ValueError):
                     d['return_value'] = str(rv)
 
-        return d
+        return {k: _json_safe(v) for k, v in d.items()}
 
     _NOTIFICATION_KEYS = {'uid', 'state', 'exit_code',
                           'return_value', '_return_value_encoding',
@@ -703,6 +761,11 @@ class RhapsodySession(PluginSession):
         Shutdown RHAPSODY session and clean up.
         """
         if self._rh_session:
+            if self._telemetry is not None:
+                summary = json.dumps(self._telemetry.summary(), indent=4)
+                log.info(summary)
+                print(summary, flush=True)
+                self._telemetry = None
             await self._rh_session.close()
             self._rh_session = None
         self._tasks = {}
@@ -1288,9 +1351,15 @@ class PluginRhapsody(Plugin):
 
     @classmethod
     def is_enabled(cls, app: FastAPI) -> bool:
-        """Rhapsody loads on compute nodes only (task execution)."""
+        """Rhapsody loads on compute nodes (inside an allocation) and on
+        standalone hosts (no batch system at all).  Both can host Dragon
+        workers; bridges and login nodes deliberately don't load Rhapsody.
+        """
+        if getattr(app.state, 'is_bridge', False):
+            return False
         from .batch_system import detect_batch_system
-        return detect_batch_system().in_allocation()
+        bs = detect_batch_system()
+        return bs.in_allocation() or bs.name == 'none'
 
     def __init__(self, app: FastAPI, instance_name: str = "rhapsody"):
         super().__init__(app, instance_name)

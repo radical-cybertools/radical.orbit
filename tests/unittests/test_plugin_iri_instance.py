@@ -66,6 +66,23 @@ def test_instance_no_plugin_name():
     assert not hasattr(PluginIRIInstance, 'plugin_name')
 
 
+def test_update_token_rotates_plugin_and_session(bridge_app):
+    """``update_token`` refreshes the bearer token on the plugin and on
+    the auto-session's outbound httpx client (Authorization header)."""
+    plugin = PluginIRIInstance(bridge_app, 'iri.nersc',
+                              endpoint='nersc', token='old-token')
+    sess = plugin._sessions[plugin._auto_sid]
+    assert plugin._token == 'old-token'
+    assert sess._token   == 'old-token'
+    assert sess._http.headers['Authorization'] == 'Bearer old-token'
+
+    plugin.update_token('new-token')
+
+    assert plugin._token == 'new-token'
+    assert sess._token   == 'new-token'
+    assert sess._http.headers['Authorization'] == 'Bearer new-token'
+
+
 # ---------------------------------------------------------------------------
 # register_session returns pre-created SID
 # ---------------------------------------------------------------------------

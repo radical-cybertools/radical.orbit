@@ -74,15 +74,16 @@ def test_edge_client_get_plugin(mock_post):
 # BridgeClient — URL validation
 # ---------------------------------------------------------------------------
 
-def test_bridge_client_no_url_raises():
-    import os
-    old = os.environ.pop("RADICAL_BRIDGE_URL", None)
-    try:
-        with pytest.raises(ValueError, match="Bridge URL required"):
-            BridgeClient()
-    finally:
-        if old is not None:
-            os.environ["RADICAL_BRIDGE_URL"] = old
+def test_bridge_client_no_url_raises(tmp_path, monkeypatch):
+    """No CLI arg, no env, no file at ``~/.radical/edge/bridge.url``
+    → ValueError.  Redirect the resolver's file path to a tmp dir so
+    we don't accidentally pick up the dev's own bridge.url."""
+    from radical.edge import utils
+    monkeypatch.delenv("RADICAL_BRIDGE_URL", raising=False)
+    monkeypatch.setattr(utils, 'URL_FILE', tmp_path / 'bridge.url')
+
+    with pytest.raises(ValueError, match="Bridge URL required"):
+        BridgeClient()
 
 
 # ---------------------------------------------------------------------------

@@ -5,6 +5,7 @@ __copyright__ = 'Copyright 2024, RADICAL@Rutgers'
 __license__   = 'MIT'
 
 
+import getpass
 import glob
 import os
 import re
@@ -24,7 +25,6 @@ from starlette.requests import Request
 
 from .plugin_base   import Plugin
 from .client        import PluginClient
-from .batch_system  import detect_batch_system
 
 log = logging.getLogger("radical.edge")
 
@@ -366,12 +366,21 @@ class SysInfoProvider:
         uptime = time.time() - boot_time
         unet = platform.uname()
 
+        # ``getpass.getuser()`` checks the standard env vars (LOGNAME /
+        # USER / LNAME / USERNAME) before falling back to pwd lookup —
+        # right answer in the common case, no exception on rootless
+        # container weirdness where pwd lookup might fail.
+        try:    user = getpass.getuser()
+        except Exception:
+            user = ''
+
         metrics = {
             "system": {
                 "hostname": socket.gethostname(),
-                "uptime": uptime,
-                "kernel": f"{unet.system} {unet.release}",
-                "arch": unet.machine
+                "user":     user,
+                "uptime":   uptime,
+                "kernel":   f"{unet.system} {unet.release}",
+                "arch":     unet.machine,
             }
         }
 
@@ -611,22 +620,26 @@ class PluginSysInfo(Plugin):
     async def host_role_endpoint(self, request: Request) -> dict:
         """Return the role of the host this edge runs on.
 
-        Role is one of ``bridge`` / ``login`` / ``compute``.  When the
-        edge is running inside a batch allocation, ``scheduler`` and
-        ``job_id`` carry the detected scheduler name and the allocation
-        id; otherwise both are ``None`` (login nodes with a scheduler
-        installed but no active job report ``scheduler=None``).
+        Returned fields:
+
+        - ``role``          — ``bridge`` / ``login`` / ``compute`` /
+                              ``standalone``.
+        - ``scheduler``     — the batch system's full name (e.g.
+                              ``'slurm'``, ``'pbs'``, ``'pbs-aurora'``,
+                              ``'none'``); may be a site-specific
+                              subclass identifier.
+        - ``psij_executor`` — the corresponding PsiJ executor name
+                              (``'slurm'``, ``'pbs'``, ``'local'``).
+                              Use this when actually submitting via
+                              PsiJ; ``scheduler`` may be more specific.
+        - ``job_id``        — current allocation id on compute nodes,
+                              ``None`` everywhere else.
+
+        Detection logic lives in :func:`utils.host_role`; this route
+        is just a wire surface for it.
         """
-        bs       = detect_batch_system()
-        in_alloc = bs.in_allocation()
-        if   self.is_bridge: role = 'bridge'
-        elif in_alloc:       role = 'compute'
-        else:                role = 'login'
-        return {
-            'role'     : role,
-            'scheduler': bs.name    if in_alloc else None,
-            'job_id'   : bs.job_id() if in_alloc else None,
-        }
+        from .utils import host_role
+        return host_role(self._app)
 
     async def get_metrics_endpoint(self, request: Request) -> dict:
         """

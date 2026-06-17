@@ -34,6 +34,8 @@ import httpx
 
 from fastapi import FastAPI, HTTPException, Request
 
+from .http_utils import make_async_http_client
+
 from .plugin_session_base import PluginSession
 from .plugin_base          import Plugin
 from .client               import PluginClient
@@ -104,7 +106,7 @@ class IRIInstanceSession(PluginSession):
         self._endpoint     = IRI_ENDPOINTS[endpoint]
         self._token        = token
 
-        self._http = httpx.AsyncClient(
+        self._http = make_async_http_client(
             base_url = self._endpoint['url'],
             headers  = {'Authorization': f'Bearer {self._token}'},
             timeout  = 30.0,
@@ -424,6 +426,22 @@ class PluginIRIInstance(Plugin):
         self.add_route_get ('incidents',                   self.list_incidents)
         self.add_route_get ('projects',                    self.list_projects)
         self.add_route_get ('allocations/{project_id}',    self.list_allocations)
+
+    # -- token rotation -----------------------------------------------------
+
+    def update_token(self, new_token: str) -> None:
+        '''Replace the bearer token used for outbound calls to this endpoint.
+
+        Updates both the plugin's stored token and the live ``httpx`` client
+        on the auto-session, so subsequent IRI calls use the new credential
+        immediately.  Called by ``iri_connect.connect`` when a re-connect
+        request arrives for an already-registered instance.
+        '''
+        self._token = new_token.strip()
+        sess = self._sessions.get(self._auto_sid)
+        if sess:
+            sess._token = self._token
+            sess._http.headers['Authorization'] = f'Bearer {self._token}'
 
     # -- session override ---------------------------------------------------
 

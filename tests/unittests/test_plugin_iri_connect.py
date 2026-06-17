@@ -106,17 +106,31 @@ async def test_connect(bridge_app):
 
 
 @pytest.mark.asyncio
-async def test_connect_duplicate_rejected(bridge_app):
+async def test_connect_reconnect_updates_token(bridge_app):
+    """A second connect for the same endpoint refreshes the bearer token
+    in place (no 409) — clients can rotate stale credentials without
+    disconnecting first."""
     app, host = bridge_app
     plugin = PluginIRIConnect(app)
 
     request = MagicMock()
     request.json = AsyncMock(return_value={
-        'endpoint': 'nersc', 'token': 'tok123'})
-    await plugin.connect(request)
+        'endpoint': 'nersc', 'token': 'old-token'})
+    first = await plugin.connect(request)
+    assert first['status']   == 'connected'
+    assert first['instance'] == 'iri.nersc'
 
-    with pytest.raises(Exception, match='already connected'):
-        await plugin.connect(request)
+    request.json = AsyncMock(return_value={
+        'endpoint': 'nersc', 'token': 'new-token'})
+    second = await plugin.connect(request)
+    assert second['status']   == 'token_updated'
+    assert second['instance'] == 'iri.nersc'
+
+    # Same plugin instance kept; update_token was called with the new
+    # value.  (The semantics of update_token itself live in
+    # test_plugin_iri_instance.py — this test is about the connect route
+    # contract.)
+    host._plugins['iri.nersc'].update_token.assert_called_once_with('new-token')
 
 
 @pytest.mark.asyncio

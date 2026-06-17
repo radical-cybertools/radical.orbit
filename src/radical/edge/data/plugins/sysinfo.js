@@ -35,9 +35,10 @@ export function css() {
       color: var(--muted);
       border: 1px solid var(--border, #ccc);
     }
-    .sysinfo-role-badge.role-bridge  { background: #eef; color: #335; border-color: #ccd; }
-    .sysinfo-role-badge.role-login   { background: #efe; color: #353; border-color: #cdc; }
-    .sysinfo-role-badge.role-compute { background: #fee; color: #533; border-color: #dcc; }
+    .sysinfo-role-badge.role-bridge     { background: #eef; color: #335; border-color: #ccd; }
+    .sysinfo-role-badge.role-login      { background: #efe; color: #353; border-color: #cdc; }
+    .sysinfo-role-badge.role-compute    { background: #fee; color: #533; border-color: #dcc; }
+    .sysinfo-role-badge.role-standalone { background: #f5f0e0; color: #553; border-color: #ddc; }
     .sysinfo-content .metric-box {
       background: var(--bg2);
       padding: 12px;
@@ -108,10 +109,11 @@ async function loadHostRole(page, api) {
   try {
     const r = await api.fetch('host_role');
     const role = r.role || '?';
-    const icon = role === 'bridge'  ? '🌐'
-              : role === 'compute' ? '⚙️'
-              : role === 'login'   ? '🖥'
-              :                       '?';
+    const icon = role === 'bridge'     ? '🌐'
+              : role === 'compute'    ? '⚙️'
+              : role === 'login'      ? '🖥'
+              : role === 'standalone' ? '🧰'
+              :                          '?';
     let label = `${icon} ${role}`;
     if (r.scheduler) {
       label += r.job_id ? ` (${r.scheduler} job ${r.job_id})`
@@ -139,6 +141,7 @@ function renderSysinfo(m) {
       <div class="card-title">🖥️ System</div>
       <div class="grid4">
         <div class="metric-box"><label>Hostname</label><div class="val" style="font-size:.85rem">${sys.hostname || '?'}</div></div>
+        <div class="metric-box"><label>User</label><div class="val" style="font-size:.85rem">${sys.user || '?'}</div></div>
         <div class="metric-box"><label>Kernel</label><div class="val" style="font-size:.85rem">${sys.kernel || '?'}</div></div>
         <div class="metric-box"><label>Arch</label><div class="val" style="font-size:.85rem">${sys.arch || '?'}</div></div>
         <div class="metric-box"><label>Uptime</label><div class="val" style="font-size:.85rem">${formatUptime(sys.uptime)}</div></div>

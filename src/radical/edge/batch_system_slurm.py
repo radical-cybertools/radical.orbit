@@ -111,6 +111,23 @@ class SlurmBatchSystem(BatchSystem):
             pass
         return []
 
+    def nodelist(self) -> list:
+        # Expand SLURM_JOB_NODELIST (a range expression like "nid[001-016]")
+        # via ``scontrol show hostnames`` -- same expansion used by
+        # ``job_nodes(native_id)`` above, but for the *current* allocation.
+        raw = os.environ.get('SLURM_JOB_NODELIST')
+        if not raw:
+            return []
+        try:
+            r = subprocess.run(
+                ['scontrol', 'show', 'hostnames', raw],
+                capture_output=True, text=True, timeout=10)
+            if r.returncode == 0 and r.stdout.strip():
+                return [h.strip() for h in r.stdout.splitlines() if h.strip()]
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return []
+
     def cancel(self, native_id) -> None:
         r = subprocess.run(['scancel', str(native_id)],
                            capture_output=True, text=True, timeout=10)

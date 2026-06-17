@@ -48,15 +48,15 @@ class IRIConnectClient(PluginClient):
         return resp.json()
 
     def connect(self, endpoint: str, token: str) -> 'IRIInstanceClient':
-        '''Connect to an IRI endpoint and return a client for the new instance.
+        '''Connect to an IRI endpoint and return a client for the instance.
 
-        If the endpoint is already connected (409), returns a client for the
-        existing instance instead of raising.
+        Idempotent: if the instance is already up, the bridge refreshes the
+        token in place and returns ``status='token_updated'``.  Either way
+        we return a fresh client bound to the running instance.
         '''
         resp = self._http.post(self._url('connect'),
                                json={'endpoint': endpoint, 'token': token})
-        if resp.status_code != 409:
-            self._raise(resp, f'connect {endpoint!r}')
+        self._raise(resp, f'connect {endpoint!r}')
 
         iname     = f'iri.{endpoint}'
         namespace = f'/{self._edge_id}/{iname}'
@@ -153,11 +153,13 @@ class PluginIRIConnect(Plugin):
         iname = self._instance_key(endpoint)
         host  = self._host()
 
+        # Idempotent reconnect: if the instance is already up, refresh its
+        # bearer token in place rather than refusing.  This lets clients
+        # rotate stale credentials without first having to disconnect.
         if iname in host._plugins:
-            raise HTTPException(
-                status_code=409,
-                detail=f'{iname} already connected. '
-                       f'Disconnect first.')
+            host._plugins[iname].update_token(token.strip())
+            log.info('[iri_connect] Updated token for %s', iname)
+            return {'instance': iname, 'status': 'token_updated'}
 
         await host.register_dynamic_plugin(
             PluginIRIInstance, iname,

@@ -152,9 +152,13 @@ class Plugin(object):
         self._main_loop: Optional[asyncio.AbstractEventLoop] = None
         self._cleanup_task: Optional[asyncio.Task] = None
 
-        # Shared direct-dispatch route table (one list across all plugins)
+        # Shared direct-dispatch route table (one list across all plugins).
+        # We also track the entries this particular plugin instance owns,
+        # so a dynamic-plugin host can strip them on deregister without
+        # having to guess by handler identity or path prefix.
         if not hasattr(self._app.state, 'direct_routes'):
             self._app.state.direct_routes = []
+        self._owned_routes: list = []
 
         # Built-in session management routes
         self.add_route_post('register_session', self.register_session)
@@ -165,21 +169,33 @@ class Plugin(object):
         self.add_route_get('ui_config', self.get_ui_config)
         self._log_routes()
 
+    # Role classification — all four properties delegate to a single
+    # helper so the role / scheduler / executor decision lives in
+    # exactly one place (utils.host_role).
     @property
     def is_bridge(self) -> bool:
         """True when this plugin is hosted on the bridge (not on an edge)."""
-        return getattr(self._app.state, 'is_bridge', False)
+        from .utils import host_role
+        return host_role(self._app)['role'] == 'bridge'
 
     @property
     def is_compute_node(self) -> bool:
         """True when running inside a batch job allocation (compute node)."""
-        from .batch_system import detect_batch_system
-        return detect_batch_system().in_allocation()
+        from .utils import host_role
+        return host_role(self._app)['role'] == 'compute'
 
     @property
     def is_login_node(self) -> bool:
-        """True when running on a login node (not inside a batch job)."""
-        return not self.is_bridge and not self.is_compute_node
+        """True on an HPC login node — a real scheduler is installed but
+        no allocation is active."""
+        from .utils import host_role
+        return host_role(self._app)['role'] == 'login'
+
+    @property
+    def is_standalone(self) -> bool:
+        """True for a non-HPC host (no batch scheduler installed)."""
+        from .utils import host_role
+        return host_role(self._app)['role'] == 'standalone'
 
     @property
     def namespace(self) -> str:
@@ -239,9 +255,9 @@ class Plugin(object):
             else:
                 regex_parts.append(re.escape(part))
         pattern = re.compile('^/' + '/'.join(regex_parts) + '$')
-        self._app.state.direct_routes.append(
-            (method, pattern, tuple(param_names), handler)
-        )
+        entry = (method, pattern, tuple(param_names), handler)
+        self._app.state.direct_routes.append(entry)
+        self._owned_routes.append(entry)
 
     def _create_session(self, sid: str, **kwargs) -> PluginSession:
         """

@@ -80,12 +80,14 @@ def main():
         description="Run an XGFabric workflow end-to-end and stream progress.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument('-u', '--bridge-url',
-                        default=os.environ.get('RADICAL_BRIDGE_URL',
-                        'https://localhost:8000'), help='Bridge URL')
-    parser.add_argument('-c', '--bridge-cert',
-                        default=os.environ.get('RADICAL_BRIDGE_CERT'),
-                        help='Path to bridge CA certificate')
+    # URL/cert default to None so BridgeClient self-resolves via
+    # radical.edge.utils (CLI > env > file).
+    parser.add_argument('-u', '--bridge-url',  default=None,
+                        help='Bridge URL  (CLI > $RADICAL_BRIDGE_URL > '
+                             '~/.radical/edge/bridge.url).')
+    parser.add_argument('-c', '--bridge-cert', default=None,
+                        help='Bridge CA cert path  (CLI > $RADICAL_BRIDGE_CERT '
+                             '> ~/.radical/edge/bridge_cert.pem).')
     parser.add_argument('-e', '--edge',     default='local',
                         help='Edge name where xgfabric plugin is running')
     parser.add_argument('-w', '--workflow', default='__default__',

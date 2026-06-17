@@ -252,6 +252,21 @@ class QueueInfoClient(PluginClient):
         self._raise(resp, 'job_allocation')
         return resp.json().get('allocation')
 
+    def nodelist(self) -> list:
+        """Return the expanded list of hostnames in the edge's allocation.
+
+        No session is required.  Hostnames are returned one per node, in
+        scheduler-reported order.  Empty list when the edge is on a login
+        node, when no batch backend is detected, or when the scheduler
+        doesn't expose the info.
+
+        Returns:
+            list[str]: Allocated compute-node hostnames.
+        """
+        resp = self._http.get(self._url('nodelist'))
+        self._raise(resp, 'nodelist')
+        return list(resp.json().get('nodelist') or [])
+
     def backend(self) -> str:
         """Return the active batch backend name on the edge.
 
@@ -322,6 +337,7 @@ class PluginQueueInfo(Plugin):
 
         # Register QueueInfo-specific routes
         self.add_route_get('job_allocation', self.job_allocation_endpoint)
+        self.add_route_get('nodelist',       self.nodelist_endpoint)
         self.add_route_get('backend',        self.backend_endpoint)
         self.add_route_get('get_info/{sid}', self.get_info)
         self.add_route_get('list_jobs/{sid}/{queue}', self.list_jobs)
@@ -387,6 +403,22 @@ class PluginQueueInfo(Plugin):
             return {'allocation': alloc}
         except RuntimeError as exc:
             raise HTTPException(status_code=500, detail=str(exc))
+
+    async def nodelist_endpoint(self, request: Request) -> dict:
+        """Session-less endpoint: expanded hostnames in *this* edge's allocation.
+
+        Response::
+
+            {"nodelist": []}                                # login node / no scheduler
+            {"nodelist": ["nid001234", "nid001235", ...]}   # inside a job
+
+        Implementation note: nodelist lives on the ``BatchSystem``
+        hierarchy (``detect_batch_system()``), not on ``QueueInfo``
+        (``self._backend``).  Mirrors the ``get_job_allocation`` pattern
+        a few methods up.
+        """
+        nodes = await asyncio.to_thread(detect_batch_system().nodelist)
+        return {'nodelist': nodes}
 
     async def get_info(self, request: Request) -> dict:
         """Return queue/partition information."""

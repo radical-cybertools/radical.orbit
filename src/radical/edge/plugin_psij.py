@@ -40,11 +40,22 @@ log = logging.getLogger("radical.edge")
 # Default poll interval for job status updates (in seconds)
 PSIJ_POLL_INTERVAL = 5.0
 
+# consecutive STATE_UNKNOWN polls tolerated after the job has been seen
+# RUNNING — beyond this we conclude the job left the queue and bail
+UNKNOWN_TOLERANCE = 3
+
 # Persistent directory for job stdout/stderr capture
 _OUTPUT_BASE = pathlib.Path.home() / '.radical' / 'edge' / 'psij' / 'output'
 
 # Maximum age (days) for stale output directories cleaned up on session creation
 _OUTPUT_MAX_AGE_DAYS = 7
+
+# Diagnostic: when set (truthy env var), pass ``keep_files=True`` into the
+# batch-scheduler executor config so PsiJ leaves its generated submit
+# scripts under ``~/.psij/work/<scheduler>/`` for inspection.  Off by
+# default to keep the workdir tidy.
+_KEEP_PSIJ_FILES = os.environ.get('RADICAL_EDGE_PSIJ_KEEP_FILES', '').lower() \
+                   in ('1', 'true', 'yes', 'on')
 
 
 # Terminal states that don't need further polling
@@ -167,9 +178,13 @@ class PSIJSession(PluginSession):
                 spec.attributes.account = attribs.get("account")
                 spec.attributes.reservation_id = attribs.get("reservation_id")
 
-                node_count = attribs.get("node_count")
-                if node_count:
-                    spec.attributes.resource_count = int(node_count)
+            # Resource spec: pass any ``ResourceSpecV1`` field through
+            # verbatim (``node_count``, ``exclusive_node_use``, etc).
+            # An unknown key here raises TypeError -- caller bug, not
+            # something to silently swallow.
+            res = job_spec_dict.get('resources') or {}
+            if res:
+                spec.resources = psij.ResourceSpecV1(**res)
 
             # Merge site defaults for PSIJ custom_attributes with the
             # caller's (caller wins on conflict).  Defaults come from the
@@ -201,7 +216,22 @@ class PSIJSession(PluginSession):
             spec.stdout_path = out_path
             spec.stderr_path = err_path
 
-            ex = psij.JobExecutor.get_instance(executor_name)
+            # ``keep_files=True`` only meaningful for batch-scheduler
+            # executors (slurm/pbs/lsf/cobalt/...).  ``local`` ignores it.
+            ex_config = None
+            if _KEEP_PSIJ_FILES and executor_name in ('slurm', 'pbs', 'lsf',
+                                                       'cobalt', 'flux'):
+                from psij.executors.batch.batch_scheduler_executor \
+                    import BatchSchedulerExecutorConfig
+                ex_config = BatchSchedulerExecutorConfig(keep_files=True)
+                log.info("[psij] RADICAL_EDGE_PSIJ_KEEP_FILES set: "
+                         "executor=%s keep_files=True", executor_name)
+
+            if ex_config is not None:
+                ex = psij.JobExecutor.get_instance(executor_name,
+                                                    config=ex_config)
+            else:
+                ex = psij.JobExecutor.get_instance(executor_name)
 
             # Set poll interval for status updates
             if hasattr(ex, 'poll_interval'):
@@ -520,32 +550,50 @@ class PSIJClient(PluginClient):
 
     def submit_tunneled(self, job_spec: Dict[str, Any],
                         executor: str = 'local',
-                        tunnel: bool = False) -> Dict[str, Any]:
+                        tunnel: str = 'none') -> Dict[str, Any]:
         """Submit a job that launches a child Edge service on a compute node.
 
         The ``job_spec.arguments`` list *must* contain ``-n <edge_name>`` or
         ``--name <edge_name>`` so the child edge can register under the
         correct name.
 
-        When *tunnel* is ``True`` the server automatically appends ``--tunnel``
-        to the job arguments.  The plugin-side watcher then opens a reverse
-        SSH tunnel (login node → compute node) once the job is running and
-        writes the port to ``~/.radical/edge/tunnels/{edge_name}.port``.  The
-        child edge service reads that file at startup and rewrites its bridge
-        URL to connect through the tunnel.
-
         Args:
-            job_spec: PsiJ job specification dict.  ``arguments`` must include
-                      ``-n <edge_name>``.
+            job_spec: PsiJ job specification dict.  ``arguments`` must
+                      include ``-n <edge_name>``.
             executor: PsiJ executor name (default: ``"local"``).
-            tunnel:   Whether to set up a reverse SSH tunnel (default: False).
+            tunnel:   SSH tunnel mode for the child's bridge connection.
+                      One of:
+
+                      * ``'none'``    — child connects directly to the
+                                        bridge.  No SSH spawned anywhere.
+                      * ``'forward'`` — child opens its own outbound
+                                        ``ssh -L`` to the login host
+                                        (compute → login).  Suitable
+                                        where outbound SSH from compute
+                                        is permitted and login → compute
+                                        is blocked (Aurora, Perlmutter).
+                      * ``'reverse'`` — login-side parent opens
+                                        ``ssh -R`` to the compute host
+                                        (login → compute).  Suitable
+                                        where compute → login SSH is
+                                        blocked but login → compute
+                                        works (Odo).
+
+                      Hard-rejects any other value (including ``True`` /
+                      ``False``) — there is no boolean back-compat.
 
         Returns:
             dict with ``job_id``, ``native_id``, and ``edge_name``.
 
         Raises:
+            ValueError:   If *tunnel* is not one of the three string values.
             RuntimeError: If the server returns an error response.
         """
+        if tunnel not in ('none', 'forward', 'reverse'):
+            raise ValueError(
+                f"tunnel must be one of 'none' / 'forward' / 'reverse'; "
+                f"got {tunnel!r}")
+
         self._require_session()
 
         url     = self._url(f"submit_tunneled/{self.sid}")
@@ -650,6 +698,18 @@ class PluginPSIJ(Plugin):
         # watcher tasks keyed by edge_name (plugin-level, survive session cleanup)
         self._watchers: dict = {}
 
+        # Reverse-tunnel SSH processes keyed by edge_name (parent side
+        # only — forward-mode tunnels live in the child process and are
+        # invisible from here).
+        self._tunnel_procs: dict = {}
+
+        # job_id -> error message for jobs we cancelled because their
+        # tunnel setup failed.  Read by ``get_job_status`` to override
+        # the underlying CANCELLED state to FAILED with context.  An
+        # entry is overwritten on next cancel for the same job_id; we
+        # never pop on read (repeated reads return a stable result).
+        self._failure_reasons: dict = {}
+
         # Ensure relay directory exists at startup
         _relay_dir()
 
@@ -677,10 +737,19 @@ class PluginPSIJ(Plugin):
         job_id = request.path_params['job_id']
         so     = int(request.query_params.get('stdout_offset', '0'))
         se     = int(request.query_params.get('stderr_offset', '0'))
-        return await self._forward(sid, PSIJSession.get_job_status,
-                                   job_id=job_id,
-                                   stdout_offset=so,
-                                   stderr_offset=se)
+        status = await self._forward(sid, PSIJSession.get_job_status,
+                                     job_id=job_id,
+                                     stdout_offset=so,
+                                     stderr_offset=se)
+        # If we cancelled this job because its tunnel setup failed,
+        # override the underlying CANCELLED state with FAILED + the
+        # actual reason.  Operator-initiated cancels (no entry in
+        # ``_failure_reasons``) keep their natural CANCELLED state.
+        err = self._failure_reasons.get(job_id)
+        if err:
+            status['state'] = 'FAILED'
+            status['error'] = err
+        return status
 
     async def list_jobs(self, request: Request) -> dict:
         sid = request.path_params['sid']
@@ -701,32 +770,35 @@ class PluginPSIJ(Plugin):
         The job *must* pass ``-n``/``--name <edge_name>`` in its arguments so
         the child edge service can register under the correct name.
 
-        When ``tunnel=true`` the plugin automatically appends ``--tunnel`` to the
-        job's argument list.  The child edge service reads this flag at startup and
-        waits for a relay port file at the hardcoded path
-        ``~/.radical/edge/tunnels/{edge_name}.port`` before connecting to the bridge.
-        The watcher on the parent edge writes that file once the reverse SSH tunnel
-        is established.
+        Tunnel direction is selected by the ``tunnel`` field:
 
-        When ``tunnel=true`` the plugin:
-
-        1. Cleans up any stale relay file from a previous run.
-        2. Injects ``--tunnel`` into the job arguments.
-        3. Spawns an async watcher that waits for the SLURM job to reach RUNNING,
-           then opens a reverse SSH tunnel (login → compute) and writes the
-           allocated port to the relay file.
+        * ``'none'``    — no SSH tunnel; child connects directly to the bridge.
+        * ``'forward'`` — child opens its own outbound ``ssh -L`` back to
+                          this login node (compute → login).  We inject
+                          ``--tunnel forward`` and ``--tunnel-via <login>``
+                          into the child's argv.  The child writes the
+                          rendezvous file itself; the parent watcher
+                          only observes job state.
+        * ``'reverse'`` — *parent* (this plugin) opens ``ssh -R`` to the
+                          compute node once the job reaches RUNNING and
+                          writes the rendezvous file with the remote
+                          port allocated by the compute-side sshd.  We
+                          inject only ``--tunnel reverse`` so the child
+                          waits for the rendezvous file.
 
         Request body JSON fields:
 
         - ``job_spec``  (dict)  — PsiJ job specification.
         - ``executor``  (str)   — PsiJ executor name (default: ``"local"``).
-        - ``tunnel``    (bool)  — Whether to set up a reverse SSH tunnel
-                                  (default: ``false``).
+        - ``tunnel``    (str)   — One of ``'none'``, ``'forward'``, ``'reverse'``
+                                  (default: ``'none'``).  Boolean values
+                                  are *not* accepted.
 
         Returns:
             JSON with ``job_id``, ``native_id``, and ``edge_name``.
 
         Raises:
+            400 if ``tunnel`` is not one of the three string values.
             422 if ``-n``/``--name`` is missing from ``job_spec.arguments``.
             409 if a tunnel watcher for the same edge name is already active.
         """
@@ -735,7 +807,13 @@ class PluginPSIJ(Plugin):
 
         job_spec = data.get('job_spec', {})
         executor = data.get('executor', 'local')
-        tunnel   = bool(data.get('tunnel', False))
+        tunnel   = data.get('tunnel', 'none')
+
+        if tunnel not in ('none', 'forward', 'reverse'):
+            raise HTTPException(
+                status_code=400,
+                detail=f"tunnel must be one of 'none' / 'forward' / 'reverse'; "
+                       f"got {tunnel!r}")
 
         # --- resolve edge name from arguments ---
         args = list(job_spec.get('arguments') or [])
@@ -757,20 +835,20 @@ class PluginPSIJ(Plugin):
                 status_code=409,
                 detail=f"Tunnel watcher already active for edge '{edge_name}'")
 
-        # --- prepare relay file and inject --tunnel flags ---
+        # --- prepare rendezvous + inject child-side flags ---
         relay_file: 'pathlib.Path | None' = None
-        if tunnel:
+        if tunnel != 'none':
             relay_file = _relay_dir() / f'{edge_name}.port'
             relay_file.unlink(missing_ok=True)  # remove stale file from previous run
             pid_file = _relay_dir() / f'{edge_name}.pid'
             pid_file.unlink(missing_ok=True)
+            req_file = _relay_dir() / f'{edge_name}.req'
+            req_file.unlink(missing_ok=True)
 
-            # Inject --tunnel and --tunnel-via so the child edge opens its
-            # own outbound ssh -L back to this login node. Hostname is taken
-            # from the login node running this plugin.
             if '--tunnel' not in args:
-                args.append('--tunnel')
-            if '--tunnel-via' not in args:
+                args.extend(['--tunnel', tunnel])
+            if tunnel == 'forward' and '--tunnel-via' not in args:
+                # Forward mode: child needs to know which login host to ssh to.
                 args.extend(['--tunnel-via', socket.gethostname()])
 
             job_spec = dict(job_spec)
@@ -780,12 +858,15 @@ class PluginPSIJ(Plugin):
                                    job_spec_dict=job_spec,
                                    executor_name=executor)
 
-        if tunnel and relay_file is not None:
+        if tunnel != 'none' and relay_file is not None:
             native_id = resp.get('native_id')
-            log.info("[psij] submit_tunneled: edge=%s job_id=%s native_id=%s -- watcher polling for relay file",
-                     edge_name, resp.get('job_id'), native_id)
+            job_id    = resp.get('job_id')
+            log.info("[psij] submit_tunneled mode=%s: edge=%s job_id=%s "
+                     "native_id=%s -- watcher started",
+                     tunnel, edge_name, job_id, native_id)
             task = asyncio.create_task(
-                self._tunnel_watcher(edge_name, native_id, relay_file))
+                self._tunnel_watcher(edge_name, native_id, job_id,
+                                     relay_file, tunnel))
             self._watchers[edge_name] = task
 
         # Augment response with edge_name for caller convenience
@@ -851,69 +932,329 @@ class PluginPSIJ(Plugin):
     # ─────────────────────────────────────────────────────────────────────────
 
     async def _tunnel_watcher(self, edge_name: str, native_id,
-                              relay_file: 'pathlib.Path') -> None:
-        """Watch a batch job until RUNNING, then wait for the child to
-        publish its tunnel port.
+                              job_id: 'str | None',
+                              relay_file: 'pathlib.Path',
+                              mode: str) -> None:
+        """Watch a tunneled-job's progress; behaviour depends on *mode*.
 
-        In the compute-initiated tunnel model the child edge opens the
-        outbound ssh -L itself once it starts; the login side's only job is
-        to report state via :meth:`tunnel_status`.  This coroutine gives
-        ``tunnel_status`` something to inspect: while it's alive the status
-        is ``pending``; once the port file appears the status flips to
-        ``active``.
+        **forward** (compute → login): the child opens its own ``ssh -L``
+        and writes the rendezvous file.  This watcher only observes the
+        job state.  If the job goes terminal before the file appears,
+        the failure already manifests as the job's natural ``FAILED``
+        state — we do nothing (no parent-side cancel needed).
+
+        **reverse** (login → compute): once the job reaches ``RUNNING``
+        we look up the compute hostname via ``BatchSystem.job_nodes()``
+        and spawn ``ssh -R`` from this side.  On any spawn failure (or
+        the SSH process dying before/after writing the rendezvous file)
+        we record a reason in ``_failure_reasons[job_id]`` and call
+        ``cancel_job`` so the now-useless allocation is released; the
+        client then sees the cancel as ``FAILED`` (with our reason) via
+        :meth:`get_job_status`.
 
         Args:
             edge_name:  Logical name of the child edge service.
-            native_id:  Native job ID string/int (SLURM/PBS/...).
-            relay_file: Shared-filesystem file the child will write.
+            native_id:  Native scheduler job ID (SLURM/PBS/...).
+            job_id:     PsiJ job-id (key in ``_failure_reasons``).
+            relay_file: Shared-filesystem file the child reads
+                        regardless of who writes it.
+            mode:       ``'forward'`` or ``'reverse'``.  ``'none'``
+                        callers don't reach here.
         """
-        from .batch_system import (detect_batch_system, STATE_RUNNING,
-                                   TERMINAL_STATES)
+        from .batch_system import (detect_batch_system, STATE_CANCELLED,
+                                   STATE_UNKNOWN, TERMINAL_STATES)
+        from . import tunnel as _tunnel
         batch = detect_batch_system()
 
-        log.info("[psij] Watcher started for edge '%s' (job %s, backend=%s) "
-                 "-- waiting for relay file %s",
-                 edge_name, native_id, batch.name, relay_file)
+        log.info("[psij] Watcher started mode=%s for edge '%s' "
+                 "(job=%s native=%s, backend=%s) — relay file %s",
+                 mode, edge_name, job_id, native_id, batch.name, relay_file)
 
-        last_state = None
-        for attempt in range(300):          # up to ~10 min (2s × 300)
-            await asyncio.sleep(2)
+        # In reverse mode this watcher *will* spawn an SSH process and
+        # is responsible for tearing it down.
+        ssh_proc = None
 
-            if relay_file.exists():
-                try:
-                    port = int(relay_file.read_text().strip())
-                except (ValueError, OSError):
-                    port = None
-                log.info("[psij] edge '%s' published tunnel port %s — active",
-                         edge_name, port)
-                return
+        # Bridge URL/port for the reverse spawn — same value the child
+        # would resolve, so we can hand it to OpenSSH's -R spec.
+        bridge_host = 'localhost'
+        bridge_port = 8000
+        if mode == 'reverse':
+            from urllib.parse import urlparse
+            bridge_url = getattr(self._app.state, 'bridge_url', '') or ''
+            parsed     = urlparse(bridge_url)
+            bridge_host = parsed.hostname or 'localhost'
+            bridge_port = parsed.port or (443 if parsed.scheme in ('https', 'wss') else 8000)
 
-            state = await asyncio.to_thread(batch.job_state, native_id)
+        last_state     = None
+        seen_known     = False
+        unknown_streak = 0
+        try:
+            for attempt in range(300):       # up to ~10 min (2s × 300)
+                await asyncio.sleep(2)
 
-            if state != last_state or attempt % 30 == 0:
-                log.info("[psij] watcher edge=%s job=%s state=%r (attempt %d/300)",
-                         edge_name, native_id, state or '(unknown)', attempt)
-                last_state = state
+                # Both modes: rendezvous file appearing is the success signal.
+                if relay_file.exists():
+                    try:
+                        port = int(relay_file.read_text().strip())
+                    except (ValueError, OSError):
+                        port = None
+                    log.info("[psij] edge '%s' tunnel active on port %s "
+                             "(mode=%s)", edge_name, port, mode)
+                    if mode == 'reverse':
+                        # Continue polling so we can tear ssh_proc down
+                        # cleanly when the job ends.
+                        await self._await_reverse_teardown(
+                            edge_name, native_id, ssh_proc, batch)
+                    return
 
-            if state in TERMINAL_STATES and state != 'DONE':
-                log.warning("[psij] Job %s ended with state %s — aborting watch",
-                            native_id, state)
-                return
+                # Reverse-mode side-channel: spawn ssh -R as soon as
+                # the job has been allocated a compute host.
+                state = await asyncio.to_thread(batch.job_state, native_id)
 
-            # We no longer spawn the tunnel from here; the child edge does.
-            # Just keep logging until the port file appears (above) or the
-            # job terminates.
-            if state != STATE_RUNNING:
+                # Reverse-mode spawn: gate on the child's .req file
+                # ONLY.  We deliberately do NOT require state ==
+                # RUNNING: SLURM state polling is unreliable on some
+                # clusters (squeue can return UNKNOWN/empty for the
+                # entire lifetime of a short job; observed on ODO
+                # 2026-05-11) and is a stale-at-best proxy for
+                # "child is ready".  The .req file is authoritative
+                # — it can only have been produced by the running
+                # child, on its own compute node, after
+                # socket.gethostname() returned.  State polling
+                # below still aborts the watcher when the job
+                # reaches a TERMINAL state without producing .req.
+                if mode == 'reverse' and ssh_proc is None:
+                    req_file = relay_file.with_suffix('.req')
+                    # NFSv3 caches negative lookups (file-doesn't-exist)
+                    # for tens of seconds.  After the parent's first
+                    # `req_file.exists()` returns False, the cached
+                    # ENOENT keeps returning False even after the
+                    # child writes .req on the shared FS — observed
+                    # on ODO 2026-05-11 17:10: .req appeared at +21s,
+                    # parent kept seeing False for the whole 16s
+                    # window the file was on disk.  A readdir on the
+                    # parent dir invalidates the negative-lookup
+                    # cache by forcing fresh directory attributes.
+                    try:
+                        dir_contents = set(
+                            os.listdir(str(req_file.parent)))
+                    except OSError:
+                        dir_contents = set()
+                    if req_file.name in dir_contents:
+                        try:
+                            import json as _json
+                            compute_host = _json.loads(
+                                req_file.read_text()).get('hostname')
+                        except (ValueError, OSError) as exc:
+                            await self._fail_tunnel(
+                                edge_name, job_id, native_id,
+                                f"reverse SSH: .req file unreadable: {exc}")
+                            return
+                        if not compute_host:
+                            await self._fail_tunnel(
+                                edge_name, job_id, native_id,
+                                "reverse SSH: .req file has no 'hostname' field")
+                            return
+                        log.info("[psij] reverse: child .req says hostname=%s "
+                                 "for job %s, spawning ssh -R to %s:%s",
+                                 compute_host, native_id, bridge_host, bridge_port)
+                        # Retry the spawn for up to ~30s.  Some
+                        # sites' compute-node sshd refuses logins
+                        # from the login node for a short window
+                        # after the job is registered (e.g.
+                        # pam_slurm_adopt rejects until the job's
+                        # cgroup is fully established).  The retry
+                        # is transport-agnostic: any spawn failure
+                        # gets a fresh attempt 1s later.  Bail out
+                        # immediately if the job goes terminal in
+                        # the meantime — no point retrying once the
+                        # allocation is gone.
+                        last_exc = None
+                        for spawn_attempt in range(30):
+                            try:
+                                ssh_proc, port = await asyncio.to_thread(
+                                    _tunnel.spawn_reverse_tunnel,
+                                    compute_host, bridge_host, bridge_port,
+                                    edge_name)
+                                break
+                            except Exception as exc:
+                                last_exc = exc
+                                if (await asyncio.to_thread(
+                                        batch.job_state, native_id)
+                                        in TERMINAL_STATES):
+                                    await self._fail_tunnel(
+                                        edge_name, job_id, native_id,
+                                        f"reverse SSH spawn failed and job "
+                                        f"went terminal: {exc}")
+                                    return
+                                if spawn_attempt == 0:
+                                    log.info("[psij] reverse: first ssh -R "
+                                             "spawn rejected (likely "
+                                             "pam_slurm_adopt race), "
+                                             "retrying: %s", exc)
+                                else:
+                                    log.debug("[psij] reverse: ssh -R spawn "
+                                              "retry %d/30: %s",
+                                              spawn_attempt + 1, exc)
+                                await asyncio.sleep(1)
+                        else:
+                            await self._fail_tunnel(
+                                edge_name, job_id, native_id,
+                                f"reverse SSH spawn failed after 30 "
+                                f"attempts: {last_exc}")
+                            return
+                        self._tunnel_procs[edge_name] = ssh_proc
+
+                if state == STATE_UNKNOWN:
+                    unknown_streak += 1
+                else:
+                    seen_known     = True
+                    unknown_streak = 0
+
+                if state != last_state or attempt % 30 == 0:
+                    log.info("[psij] watcher edge=%s job=%s mode=%s "
+                             "state=%r (attempt %d/300)",
+                             edge_name, native_id, mode,
+                             state or '(unknown)', attempt)
+                    last_state = state
+
+                if state in TERMINAL_STATES:
+                    log.warning("[psij] Job %s ended with state %s — "
+                                "aborting watch (relay file %s never appeared)",
+                                native_id, state, relay_file)
+                    if mode == 'reverse' and ssh_proc is not None:
+                        # We had spawned SSH but the rendezvous file never
+                        # appeared.  Treat as tunnel failure.
+                        await self._fail_tunnel(
+                            edge_name, job_id, native_id,
+                            f"reverse SSH spawned but rendezvous file never "
+                            f"appeared (job {state})", spawn_proc=ssh_proc)
+                    elif mode == 'reverse' and state != STATE_CANCELLED:
+                        # Job hit a terminal state before the child
+                        # could write .req — surface that as a tunnel
+                        # failure so the client gets a clear error.
+                        # CANCELLED is left alone: that's a deliberate
+                        # operator-initiated outcome and shouldn't be
+                        # converted to FAILED via _fail_tunnel.
+                        await self._fail_tunnel(
+                            edge_name, job_id, native_id,
+                            f"child never wrote .req (job ended {state} "
+                            f"before reverse tunnel could be set up)")
+                    return
+
+                if seen_known and unknown_streak >= UNKNOWN_TOLERANCE:
+                    log.warning("[psij] Job %s vanished from queue "
+                                "(state=UNKNOWN x %d) — aborting watch "
+                                "(relay file %s never appeared)",
+                                native_id, unknown_streak, relay_file)
+                    if mode == 'reverse' and ssh_proc is not None:
+                        await self._fail_tunnel(
+                            edge_name, job_id, native_id,
+                            f"reverse SSH spawned but job vanished "
+                            f"(UNKNOWN x {unknown_streak})",
+                            spawn_proc=ssh_proc)
+                    return
+
+            log.warning("[psij] Watcher for edge '%s' timed out waiting for "
+                        "tunnel port file %s", edge_name, relay_file)
+            if mode == 'reverse':
+                await self._fail_tunnel(
+                    edge_name, job_id, native_id,
+                    "tunnel watcher timed out before rendezvous file appeared",
+                    spawn_proc=ssh_proc)
+        finally:
+            if ssh_proc is not None and ssh_proc.poll() is None and \
+                    edge_name not in self._tunnel_procs:
+                # Defensive cleanup if the process leaked past a code path
+                # that didn't tear it down explicitly.
+                _tunnel.cleanup_tunnel(ssh_proc, edge_name)
+
+    async def _await_reverse_teardown(self, edge_name: str, native_id,
+                                       ssh_proc, batch) -> None:
+        """Once a reverse tunnel is active, poll the job state until
+        it reaches a terminal state, then tear down the SSH process."""
+        from .batch_system import TERMINAL_STATES, STATE_UNKNOWN
+        from . import tunnel as _tunnel
+
+        try:
+            while True:
+                await asyncio.sleep(5)
+                state = await asyncio.to_thread(batch.job_state, native_id)
+                if state in TERMINAL_STATES or state == STATE_UNKNOWN:
+                    log.info("[psij] reverse: job %s reached %s — "
+                             "tearing down ssh -R for edge %s",
+                             native_id, state, edge_name)
+                    return
+                if ssh_proc.poll() is not None:
+                    log.warning("[psij] reverse: ssh -R for edge %s exited "
+                                "(rc=%s) while job %s still running",
+                                edge_name, ssh_proc.returncode, native_id)
+                    return
+        finally:
+            _tunnel.cleanup_tunnel(ssh_proc, edge_name)
+            self._tunnel_procs.pop(edge_name, None)
+            (_relay_dir() / f'{edge_name}.req').unlink(missing_ok=True)
+
+    async def _fail_tunnel(self, edge_name: str, job_id: 'str | None',
+                            native_id, reason: str, spawn_proc=None) -> None:
+        """Record a tunnel failure and cancel the now-useless job.
+
+        Recorded reason surfaces via ``get_job_status`` as a synthesised
+        ``state='FAILED'`` plus an ``error`` field — see the override
+        in :meth:`get_job_status`.
+        """
+        from . import tunnel as _tunnel
+        log.error("[psij] tunnel failed for edge '%s' (job %s): %s",
+                  edge_name, job_id, reason)
+        if job_id:
+            self._failure_reasons[job_id] = reason
+        if spawn_proc is not None:
+            _tunnel.cleanup_tunnel(spawn_proc, edge_name)
+            self._tunnel_procs.pop(edge_name, None)
+        # Clean up the child's .req rendezvous file on every failure
+        # path, not just when an ssh proc was spawned.  Otherwise an
+        # UNKNOWN-streak / terminal-state abort that fires before we
+        # ever entered the spawn branch leaves stale .req on disk,
+        # which the next watcher run might pick up after submit-time
+        # cleanup if the user re-submits very quickly.
+        (_relay_dir() / f'{edge_name}.req').unlink(missing_ok=True)
+        if job_id is not None:
+            try:
+                # Use the underlying PSIJSession.cancel_job to release the
+                # allocation.  Fire-and-forget — the watcher has already
+                # failed-marked the job.
+                await self._dispatch_cancel(str(job_id))
+            except Exception as exc:
+                log.warning("[psij] cancel after tunnel failure raised: %s",
+                            exc)
+
+    async def _dispatch_cancel(self, job_id: str) -> None:
+        """Cancel a job by id from inside a watcher.
+
+        We can't call the HTTP route directly (we're not in a request
+        handler), so we walk the live PSIJSession instances looking for
+        the one that submitted *job_id*, and call its ``cancel_job``
+        directly.
+        """
+        for session in list(self._sessions.values()):
+            if not isinstance(session, PSIJSession):
                 continue
-
-        log.warning("[psij] Watcher for edge '%s' timed out waiting for "
-                    "tunnel port file %s", edge_name, relay_file)
+            if job_id in getattr(session, '_jobs', {}):
+                await session.cancel_job(job_id)
+                return
+        log.warning("[psij] _dispatch_cancel: no session owns job %s", job_id)
 
     async def _cleanup_watchers(self) -> None:
-        """Cancel all watcher tasks on plugin shutdown."""
-        for name, task in list(self._watchers.items()):
+        """Cancel all watcher tasks + tear down any open reverse SSH
+        processes on plugin shutdown."""
+        from . import tunnel as _tunnel
+        for _, task in list(self._watchers.items()):
             task.cancel()
         self._watchers.clear()
+        for edge_name, proc in list(self._tunnel_procs.items()):
+            _tunnel.cleanup_tunnel(proc, edge_name)
+            (_relay_dir() / f'{edge_name}.req').unlink(missing_ok=True)
+        self._tunnel_procs.clear()
 
 
 

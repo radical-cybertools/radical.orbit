@@ -27,12 +27,6 @@ import pytest
 from radical.edge.service import _resolve_plugin_names
 
 
-def test_resolve_plugin_names_all():
-    available = ["sysinfo", "psij", "queue_info"]
-    result = _resolve_plugin_names(["all"], available)
-    assert result == available
-
-
 def test_resolve_plugin_names_exact():
     available = ["sysinfo", "psij", "queue_info"]
     result = _resolve_plugin_names(["psij", "sysinfo"], available)
@@ -57,8 +51,8 @@ def test_resolve_plugin_names_unknown_raises():
         _resolve_plugin_names(["rhapsody"], available)
 
 
-def test_resolve_plugin_names_empty_all():
-    assert _resolve_plugin_names(["all"], []) == []
+def test_resolve_plugin_names_empty():
+    assert _resolve_plugin_names([], ["sysinfo"]) == []
 
 
 if __name__ == '__main__':

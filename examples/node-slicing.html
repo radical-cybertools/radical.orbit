@@ -1,0 +1,1031 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>AmSC slicing — horizontal / vertical</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #050518;
+    color: #e0e6f0;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-size: 13px;
+  }
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+  }
+  #stage {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  #cv {
+    display: block;
+    border-radius: 6px;
+    background: #080818;
+  }
+  #controls {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 10px 16px;
+    background: #0e1626;
+    border: 1px solid #283040;
+    border-radius: 6px;
+    box-sizing: border-box;
+    width: 1280px;
+  }
+  .btn {
+    background: #182030;
+    color: #e0e6f0;
+    border: 1px solid #283040;
+    border-radius: 4px;
+    padding: 6px 14px;
+    font-family: inherit;
+    font-size: 13px;
+    cursor: pointer;
+    letter-spacing: 0.04em;
+  }
+  .btn:hover { background: #202840; }
+  .btn.active {
+    background: #1a2a40;
+    border-color: #40c8e8;
+    color: #40c8e8;
+  }
+  /* Pause/play toggles between two strings of different widths;
+     a fixed width keeps the rest of the control row from shifting. */
+  #play { min-width: 96px; text-align: center; }
+  .spacer { flex: 1; }
+  #speed { width: 140px; vertical-align: middle; accent-color: #40c8e8; }
+  .ctl-label {
+    color: #90a0c0;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    font-size: 11px;
+  }
+  #speedval {
+    font-variant-numeric: tabular-nums;
+    color: #e0e6f0;
+    min-width: 44px;
+    display: inline-block;
+    text-align: right;
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="cv" width="1280" height="720"></canvas>
+  <div id="controls">
+    <button class="btn" id="play">&#10074;&#10074; pause</button>
+    <span class="spacer"></span>
+    <span class="ctl-label">speed</span>
+    <input type="range" id="speed" min="0.25" max="4" step="0.05" value="1">
+    <span id="speedval">1.00&times;</span>
+    <span class="spacer"></span>
+    <button class="btn active" id="mode-h">horizontal</button>
+    <button class="btn" id="mode-v">vertical</button>
+  </div>
+</div>
+<script>
+(() => {
+
+  // -------------------------------------------------------------------------
+  //  Stage + palette
+  // -------------------------------------------------------------------------
+  const W = 1280, H = 720;
+  const FONT      = "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
+  const FONT_MONO = "ui-monospace, 'SF Mono', Menlo, Consolas, monospace";
+
+  // Frame / label colours borrowed from the deck's flow-diagram-v5.html so
+  // the panel idiom feels native to the slide:
+  //   - frame_border   = inner-node stroke (deep slate-blue)
+  //   - frame_label    = node title (muted slate, clearly readable)
+  const COLORS = {
+    bg:           '#080818',
+    panel:        '#0d1525',
+    frame_border: '#1e3a5f',
+    frame_label:  '#94a3b8',
+    text:         '#e6ecf6',
+    text_dim:     '#7080a0',
+    text_label:   '#a0b0c8',
+    matey:       '#e8a040',   // amber  -> slide's amber frame family
+    infer:       '#40c8e8',   // cyan   -> slide's cyan frame family
+    gkeyll:      '#5acd83',   // green  -> slide's green frame family
+    matey_dim:   '#4a3418',
+    infer_dim:   '#15384a',
+    gkeyll_dim:  '#1a4028',
+    unused:      '#161e2a',
+    unused_brd:  '#283040',
+  };
+  const KIND_COLOR = { matey: COLORS.matey,    infer: COLORS.infer,    gkeyll: COLORS.gkeyll };
+  const KIND_DIM   = { matey: COLORS.matey_dim, infer: COLORS.infer_dim, gkeyll: COLORS.gkeyll_dim };
+  const KINDS = ['matey', 'infer', 'gkeyll'];
+
+  // -------------------------------------------------------------------------
+  //  Workload shape (simplified from amsc.py)
+  //
+  //  Horizontal: every node, matey=3 GPUs, infer=1 GPU, gkeyll=all CPU.
+  //  Vertical:   weights 1:1:2 over 8 nodes -> matey 2, infer 2, gkeyll 4;
+  //              CPU only (GPUs unused, matches the real spec).
+  // -------------------------------------------------------------------------
+  const N_NODES         = 8;
+  const GPU_PER_NODE    = 4;
+  const CORES_PER_NODE  = 32;
+  const CORE_COLS       = 16;     // 16x2 grid
+  const BUCKET_VISIBLE  = 24;     // 12x2 grid (purely cosmetic — refills instantly)
+  const BUCKET_COLS     = 12;
+
+  const TILE            = 14;     // CPU slot + bucket tile size
+  const GPU             = 30;     // GPU slot size
+
+  // Dispatch rates chosen to comfortably oversaturate the per-mode caps so
+  // most slots stay busy.  tryDispatch() returns false when a kind is full,
+  // so over-supply is harmless — it just means the queue stays "always
+  // ready to fire" as soon as a slot frees.
+  const DISPATCH = { matey: 0.06, infer: 0.06, gkeyll: 0.02 };
+
+  // Duration is keyed by *slot type*, not task kind: a task on a CPU core
+  // runs longer than the same task on a GPU.  Keeps the many CPU cores
+  // visibly utilised; in vertical mode matey/infer naturally slow down
+  // when they land on CPU.
+  const DURATION = {
+    gpu: [2.5,  5.0],
+    cpu: [5.0, 10.0],
+  };
+  const FLIGHT_DURATION = 1.4;     // ~3× the original — easier to follow live
+  const FADE_DURATION   = 0.8;
+  const GLOW_DURATION   = 0.5;     // on-landing slot halo
+  const FILLUP_TARGET   = 2.0;     // target wall-clock seconds to fill cap
+
+  // -------------------------------------------------------------------------
+  //  Layout
+  // -------------------------------------------------------------------------
+  const M             = 20;
+  const TITLE_H       = 46;
+  const BUCKETS_Y     = TITLE_H + 8;
+  const BUCKETS_H     = 168;
+  const NODES_Y       = BUCKETS_Y + BUCKETS_H + 18;
+  const NODES_AREA_H  = H - NODES_Y - M;
+  const NODE_COLS     = 4;
+  const NODE_GAP      = 16;
+  const BUCKET_GAP    = 16;
+  const BUCKET_W      = (W - 2*M - 2*BUCKET_GAP) / 3;
+  const NODE_W        = (W - 2*M - (NODE_COLS - 1)*NODE_GAP) / NODE_COLS;
+  const NODE_H        = (NODES_AREA_H - NODE_GAP) / 2;
+
+  // Right-side gutter inside each bucket panel reserved for the weight
+  // slider(s); the tile grid centers itself in the remaining left area.
+  // Horizontal mode shows two sliders (GPU + CPU); vertical mode collapses
+  // to a single NODES slider centered in the gutter.
+  const SLIDER_AREA_W = 70;
+  const SLIDER_W      = 8;
+  const SLIDER_GAP    = 32;     // center-to-center spacing keeps "0.x" labels apart
+
+  // -------------------------------------------------------------------------
+  //  Deterministic PRNG (mulberry32) — reset on load so recordings reproduce.
+  // -------------------------------------------------------------------------
+  let _seed = 0x42424242;
+  function rand() {
+    _seed |= 0;
+    _seed = (_seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(_seed ^ (_seed >>> 15), 1 | _seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  }
+  function randR(a, b) { return a + (b - a) * rand(); }
+
+  // -------------------------------------------------------------------------
+  //  State
+  // -------------------------------------------------------------------------
+  let mode    = 'horizontal';
+  let playing = true;
+  let speed   = 1.0;
+  let simTime = 0;
+
+  // Per-bucket controls: independent share of the GPU pool and the CPU pool.
+  // Per-pool sums are clamped to <= 1 by the UI.  A weight of 0 means the
+  // bucket doesn't use that pool (== the old "toggle off").  Both > 0 means
+  // tasks dispatch as atomic same-node GPU+CPU pairs.
+  //
+  // Defaults approximate the classic partitions on the 0.1 grid:
+  //   horizontal GPU pool: matey 0.7 + infer 0.3 = 1.0
+  //   horizontal CPU pool: gkeyll 1.0
+  //   vertical node split (8 nodes): matey 3/8 + infer 1/8 + gkeyll 4/8 = 1.0
+  const bucketState = {
+    matey:  { gpuWeight: 0.7, cpuWeight: 0,   nodeWeight: 3/8 },
+    infer:  { gpuWeight: 0.3, cpuWeight: 0,   nodeWeight: 1/8 },
+    gkeyll: { gpuWeight: 0,   cpuWeight: 1.0, nodeWeight: 4/8 },
+  };
+
+  const buckets         = { matey: [], infer: [], gkeyll: [] };
+  const flying          = [];
+  const fading          = [];
+  const dispatchTimer   = { matey: 0, infer: 0, gkeyll: 0 };
+  const dispatchCursor  = { matey: 0, infer: 0, gkeyll: 0 };
+  const inFlight        = { matey: 0, infer: 0, gkeyll: 0 };
+  const nodes           = [];
+  let   _idCounter      = 0;
+  let   _taskCounter    = 0;
+
+  // Vertical-mode node assignment is explicit and stable: each kind owns a
+  // list of node indices.  Decreasing the slider pops the tail (most-recently
+  // acquired); increasing claims the first free node by ascending index.
+  // Matches the default 3/1/4 vertical split.
+  const vertNodes = { matey: [0, 1, 2], infer: [3], gkeyll: [4, 5, 6, 7] };
+
+  // Dispatch is paused until simTime >= wipeUntil — set on mode switch so
+  // the cleared board stays empty briefly before the new partition fills.
+  let wipeUntil = 0;
+  const WIPE_DURATION = 1.2;
+
+  function init() {
+    for (let n = 0; n < N_NODES; n++) {
+      const col = n % NODE_COLS;
+      const row = Math.floor(n / NODE_COLS);
+      const nx  = M + col * (NODE_W + NODE_GAP);
+      const ny  = NODES_Y + row * (NODE_H + NODE_GAP);
+      const nd  = { id: n, x: nx, y: ny, w: NODE_W, h: NODE_H, gpu: [], cpu: [] };
+
+      // Vertically center the GPU + CPU group inside the node panel.
+      const headerH  = 30;
+      const groupH   = GPU + 18 + 2 * TILE + 2;
+      const contentY = ny + headerH + (NODE_H - headerH - groupH) / 2;
+
+      const gpuRowW = GPU_PER_NODE * GPU + (GPU_PER_NODE - 1) * 8;
+      const gpuX0   = nx + (NODE_W - gpuRowW) / 2;
+      const gpuY    = contentY;
+      for (let g = 0; g < GPU_PER_NODE; g++) {
+        nd.gpu.push({
+          type:    'gpu',
+          x:       gpuX0 + g * (GPU + 8),
+          y:       gpuY,
+          w:       GPU,
+          h:       GPU,
+          busy:    false,
+          task:    null,
+          owner:   null,         // derived each frame from bucketState
+          _v_kind: null,         // mode='vertical' node assignment (stable)
+        });
+      }
+
+      const coreRowW = CORE_COLS * TILE + (CORE_COLS - 1) * 2;
+      const cpuX0    = nx + (NODE_W - coreRowW) / 2;
+      const cpuY     = gpuY + GPU + 18;
+      // Vertical mode: a node belongs entirely to one kind — every slot on
+      // it (GPU + CPU) is that kind's.  Patch the GPU slots we already built
+      // so they carry the same v_kind as the CPU slots below.  3:1 matey:infer
+      // mirrors the per-node GPU split used in horizontal mode.
+      const vKind = n < 3 ? 'matey' : n < 4 ? 'infer' : 'gkeyll';
+      for (const g of nd.gpu) g._v_kind = vKind;
+      for (let c = 0; c < CORES_PER_NODE; c++) {
+        const cc = c % CORE_COLS;
+        const cr = Math.floor(c / CORE_COLS);
+        nd.cpu.push({
+          type:    'cpu',
+          x:       cpuX0 + cc * (TILE + 2),
+          y:       cpuY  + cr * (TILE + 2),
+          w:       TILE,
+          h:       TILE,
+          busy:    false,
+          task:    null,
+          owner:   null,
+          _v_kind: vKind,
+        });
+      }
+      nodes.push(nd);
+    }
+    KINDS.forEach(refillBucket);
+  }
+
+  function refillBucket(k) {
+    while (buckets[k].length < BUCKET_VISIBLE) {
+      buckets[k].push({ id: ++_idCounter, kind: k });
+    }
+  }
+
+  function bucketRect(i) {
+    return {
+      x: M + i * (BUCKET_W + BUCKET_GAP),
+      y: BUCKETS_Y,
+      w: BUCKET_W,
+      h: BUCKETS_H,
+    };
+  }
+  function bucketTilePos(i, idx) {
+    const r       = bucketRect(i);
+    const totalW  = BUCKET_COLS * TILE + (BUCKET_COLS - 1) * 4;
+    // Center grid in the left sub-area (excluding the slider gutter).
+    const innerW  = r.w - SLIDER_AREA_W;
+    const x0      = r.x + (innerW - totalW) / 2;
+    const y0      = r.y + 56;
+    const col     = idx % BUCKET_COLS;
+    const row     = Math.floor(idx / BUCKET_COLS);
+    return { x: x0 + col * (TILE + 4), y: y0 + row * (TILE + 4) };
+  }
+
+  // Horizontal: two sliders per bucket (sliderIdx 0=GPU, 1=CPU) laid out
+  // side-by-side in the gutter.  Vertical: one slider centered in the
+  // gutter — sliderIdx is ignored.
+  function bucketSliderRect(bucketIdx, sliderIdx) {
+    const r  = bucketRect(bucketIdx);
+    const sy = r.y + 52;
+    const sh = r.h - 52 - 14;
+    if (mode === 'vertical') {
+      const sx = r.x + r.w - SLIDER_AREA_W / 2 - SLIDER_W / 2;
+      return { x: sx, y: sy, w: SLIDER_W, h: sh };
+    }
+    const totalW = SLIDER_W + SLIDER_GAP;
+    const x0     = r.x + r.w - SLIDER_AREA_W + (SLIDER_AREA_W - totalW - SLIDER_W) / 2;
+    const sx     = x0 + sliderIdx * SLIDER_GAP;
+    return { x: sx, y: sy, w: SLIDER_W, h: sh };
+  }
+
+  function slotOwner(slot) {
+    return slot.owner;
+  }
+
+  // A slot is eligible for kind k iff it's currently owned by k.  Ownership
+  // already encodes the toggle (only toggled-on types get assigned) and the
+  // weight (only floor(weight * pool) slots get claimed).
+  function slotEligible(slot, kind) {
+    return slot.owner === kind;
+  }
+
+  // Recompute slot ownership from bucketState.  Called every frame so the
+  // visual partition reflects the live toggle/slider state.
+  //
+  //   horizontal: each resource pool (GPU = 32 slots, CPU = 256) is split
+  //               among the kinds that toggled it on, in proportion to
+  //               their weights.  Slots are picked in a node-interleaved
+  //               order so each kind's share spreads evenly across nodes
+  //               rather than clumping on the leftmost ones.
+  //
+  //   vertical:   node-to-kind assignment is fixed by _v_kind.  Inside each
+  //               kind's node block, only floor(weight * |pool|) of each
+  //               toggled-on slot type is claimed; the rest stay unassigned.
+  //
+  //   kindCap then is just the count of owned slots (with min across pools
+  //   for atomic pairs).
+  function recomputeOwnership() {
+    for (const nd of nodes) {
+      for (const s of nd.gpu) s.owner = null;
+      for (const s of nd.cpu) s.owner = null;
+    }
+    if (mode === 'horizontal') {
+      distributePool(nodes, 'gpu');
+      distributePool(nodes, 'cpu');
+    } else {
+      // Vertical: ownership is the explicit per-kind node list in vertNodes
+      // (stable across slider edits — reducing a count releases the tail of
+      // that kind's list rather than reshuffling the whole partition).
+      for (const k of KINDS) {
+        for (const idx of vertNodes[k]) {
+          const nd = nodes[idx];
+          for (const s of nd.gpu) s.owner = k;
+          for (const s of nd.cpu) s.owner = k;
+        }
+      }
+    }
+  }
+
+  // Interleave-collect this type's slots across the given nodes and assign
+  // floor(weight * total) of them to each kind with weight > 0 in KINDS
+  // order.  If `onlyKind` is set, only that one kind competes (used for
+  // vertical mode where the slot pool is already restricted to one kind's
+  // nodes).
+  function distributePool(nodeList, type, onlyKind) {
+    const perNode = type === 'gpu' ? GPU_PER_NODE : CORES_PER_NODE;
+    const wKey    = type + 'Weight';
+    const slots   = [];
+    for (let i = 0; i < perNode; i++) {
+      for (const nd of nodeList) slots.push(nd[type][i]);
+    }
+    let cursor = 0;
+    const kinds = onlyKind ? [onlyKind] : KINDS;
+    for (const k of kinds) {
+      const w = bucketState[k][wKey];
+      if (w <= 0) continue;
+      const n = Math.floor(w * slots.length);
+      for (let i = 0; i < n && cursor < slots.length; i++) {
+        slots[cursor++].owner = k;
+      }
+    }
+  }
+
+  // Per-kind cap on concurrent in-flight tasks.  Vertical: independent
+  // single-slot tasks, cap = all owned slots.  Horizontal: a kind engaged
+  // in both pools fires atomic pairs (bottleneck pool wins); a single-pool
+  // kind just counts that pool.
+  function kindCap(k) {
+    let gpuN = 0, cpuN = 0;
+    for (const nd of nodes) {
+      for (const s of nd.gpu) if (s.owner === k) gpuN++;
+      for (const s of nd.cpu) if (s.owner === k) cpuN++;
+    }
+    if (mode === 'vertical')         return gpuN + cpuN;
+    if (gpuN > 0 && cpuN > 0)        return Math.min(gpuN, cpuN);
+    return gpuN + cpuN;
+  }
+
+  // -------------------------------------------------------------------------
+  //  Simulation
+  // -------------------------------------------------------------------------
+  function tryDispatch(kind) {
+    if (inFlight[kind] >= kindCap(kind)) return false;
+
+    // Drive the dispatch mode from actual ownership counts, not from
+    // bucketState directly — keeps tryDispatch and kindCap consistent even
+    // when a weight is too small to claim any slot after flooring.
+    let hasGpu = false, hasCpu = false;
+    for (const nd of nodes) {
+      for (const s of nd.gpu) if (s.owner === kind) { hasGpu = true; break; }
+      for (const s of nd.cpu) if (s.owner === kind) { hasCpu = true; break; }
+      if (hasGpu && hasCpu) break;
+    }
+    if (!hasGpu && !hasCpu) return false;
+
+    // Atomic pair only applies in horizontal when a kind is engaged in both
+    // pools; in vertical the kind owns whole nodes and dispatches single
+    // tasks independently across all of its slots.
+    const atomicPair = mode === 'horizontal' && hasGpu && hasCpu;
+
+    // Atomic pair: needs a free eligible GPU + free eligible CPU on the SAME
+    // node.  Round-robin across nodes for visual variety.
+    if (atomicPair) {
+      let gpuSlot = null, cpuSlot = null;
+      for (let i = 0; i < N_NODES; i++) {
+        const ni = (i + dispatchCursor[kind]) % N_NODES;
+        const nd = nodes[ni];
+        let g = null, c = null;
+        for (const s of nd.gpu) if (!s.busy && slotEligible(s, kind)) { g = s; break; }
+        for (const s of nd.cpu) if (!s.busy && slotEligible(s, kind)) { c = s; break; }
+        if (g && c) { gpuSlot = g; cpuSlot = c; dispatchCursor[kind] = (ni + 1) % N_NODES; break; }
+      }
+      if (!gpuSlot) return false;
+
+      buckets[kind].shift();
+      refillBucket(kind);
+      const taskId = ++_taskCounter;
+      launchFlight(kind, gpuSlot, taskId, true);
+      launchFlight(kind, cpuSlot, taskId, false);
+      // Shared lifetime — use the CPU duration range since the host driver
+      // is the natural pacer; both members land together and end together.
+      const [dlo, dhi] = DURATION.cpu;
+      const endTime    = simTime + FLIGHT_DURATION + randR(dlo, dhi);
+      gpuSlot.task.endTime = endTime;
+      cpuSlot.task.endTime = endTime;
+      inFlight[kind]++;
+      return true;
+    }
+
+    // Single-task dispatch.  Scan both pools per node; ownership filters
+    // out slots the kind doesn't have.  In horizontal-single only one pool
+    // is populated; in vertical both are, and tasks dispatch independently
+    // until every owned slot fills.
+    let chosen = null;
+    for (let i = 0; i < N_NODES; i++) {
+      const ni = (i + dispatchCursor[kind]) % N_NODES;
+      const nd = nodes[ni];
+      for (const s of nd.gpu) if (!s.busy && s.owner === kind) { chosen = s; break; }
+      if (chosen) { dispatchCursor[kind] = (ni + 1) % N_NODES; break; }
+      for (const s of nd.cpu) if (!s.busy && s.owner === kind) { chosen = s; break; }
+      if (chosen) { dispatchCursor[kind] = (ni + 1) % N_NODES; break; }
+    }
+    if (!chosen) return false;
+
+    buckets[kind].shift();
+    refillBucket(kind);
+    const taskId = ++_taskCounter;
+    launchFlight(kind, chosen, taskId, true);
+    inFlight[kind]++;
+    return true;
+  }
+
+  function launchFlight(kind, slot, taskId, primary) {
+    const i     = KINDS.indexOf(kind);
+    const r     = bucketRect(i);
+    const fromX = r.x + r.w / 2 - TILE / 2;
+    const fromY = r.y + r.h - 12;
+    flying.push({
+      kind,
+      fromX, fromY,
+      toX:      slot.x,
+      toY:      slot.y,
+      fromSize: TILE,
+      toSize:   slot.w,
+      t0:       simTime,
+      duration: FLIGHT_DURATION,
+      slot,
+    });
+    slot.busy = true;
+    slot.task = { state: 'flying', kind, taskId, primary };
+  }
+
+  function tickFlying() {
+    for (let i = flying.length - 1; i >= 0; i--) {
+      const f = flying[i];
+      if (simTime >= f.t0 + f.duration) {
+        const t = f.slot.task;
+        // Atomic-pair tasks pre-set endTime at dispatch so both members
+        // share the same lifetime; singles compute it on landing.
+        let endTime = t.endTime;
+        if (endTime == null) {
+          const [dlo, dhi] = DURATION[f.slot.type];
+          endTime = simTime + randR(dlo, dhi);
+        }
+        f.slot.task = {
+          state:     'running',
+          kind:      f.kind,
+          taskId:    t.taskId,
+          primary:   t.primary,
+          startTime: simTime,
+          endTime,
+        };
+        flying.splice(i, 1);
+      }
+    }
+  }
+
+  function tickRunning() {
+    for (const nd of nodes) {
+      for (const s of nd.gpu) maybeComplete(s);
+      for (const s of nd.cpu) maybeComplete(s);
+    }
+  }
+  function maybeComplete(s) {
+    if (s.busy && s.task && s.task.state === 'running' && simTime >= s.task.endTime) {
+      fading.push({
+        x:        s.x,
+        y:        s.y,
+        w:        s.w,
+        h:        s.h,
+        kind:     s.task.kind,
+        t0:       simTime,
+        duration: FADE_DURATION,
+      });
+      // Pairs: only the primary slot decrements; partner shares the taskId
+      // and rides along.  Singles always have primary=true.
+      if (s.task.primary) inFlight[s.task.kind]--;
+      s.busy = false;
+      s.task = null;
+    }
+  }
+
+  function tickFading() {
+    for (let i = fading.length - 1; i >= 0; i--) {
+      if (simTime >= fading[i].t0 + fading[i].duration) fading.splice(i, 1);
+    }
+  }
+
+  function tickDispatch(dt) {
+    // Hold off dispatch while a mode-switch wipe is in flight — gives the
+    // audience a clear visual beat: old board empties, new board fills.
+    if (simTime < wipeUntil) return;
+    for (const k of KINDS) {
+      // During initial fillup, dispatch fast enough to fill the kind's
+      // current cap in ~FILLUP_TARGET seconds — proportional to cap so
+      // every kind reaches saturation at roughly the same wall-clock
+      // time, regardless of how many slots it owns in the current mode.
+      // The min() vs DISPATCH[k] guards against the boost being *slower*
+      // than the configured rate when the cap is tiny (horizontal infer).
+      // After saturation falls back to the configured rate.
+      const cap      = kindCap(k);
+      const busy     = inFlight[k];
+      const filling  = cap > 0 && busy < cap * 0.9;
+      const interval = filling
+        ? Math.min(FILLUP_TARGET / cap, DISPATCH[k])
+        : DISPATCH[k];
+      dispatchTimer[k] += dt;
+      let guard = 40;
+      while (dispatchTimer[k] >= interval && guard-- > 0) {
+        dispatchTimer[k] -= interval;
+        if (!tryDispatch(k)) {
+          dispatchTimer[k] = Math.min(dispatchTimer[k], interval);
+          break;
+        }
+      }
+    }
+  }
+
+  function tick(dt) {
+    simTime += dt;
+    tickFlying();
+    tickRunning();
+    tickFading();
+    tickDispatch(dt);
+  }
+
+  // -------------------------------------------------------------------------
+  //  Render
+  // -------------------------------------------------------------------------
+  const cv  = document.getElementById('cv');
+  const ctx = cv.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  cv.width        = W * dpr;
+  cv.height       = H * dpr;
+  cv.style.width  = W + 'px';
+  cv.style.height = H + 'px';
+  ctx.scale(dpr, dpr);
+
+  function rr(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x,     y + h, r);
+    ctx.arcTo(x,     y + h, x,     y,     r);
+    ctx.arcTo(x,     y,     x + w, y,     r);
+    ctx.closePath();
+  }
+
+  // Letter-spaced ALL CAPS — matches the slide deck's section headers.
+  function drawSpaced(text, x, y, spacing) {
+    let cur = x;
+    for (const ch of text) {
+      ctx.fillText(ch, cur, y);
+      cur += ctx.measureText(ch).width + spacing;
+    }
+  }
+
+  function panel(x, y, w, h, borderColor, label, labelColor) {
+    ctx.fillStyle = COLORS.panel;
+    rr(x, y, w, h, 8);
+    ctx.fill();
+    ctx.strokeStyle = borderColor;
+    ctx.lineWidth   = 1.5;
+    rr(x + 0.5, y + 0.5, w - 1, h - 1, 8);
+    ctx.stroke();
+
+    if (label) {
+      // labelColor defaults to borderColor (used by the kind-coloured bucket
+      // headers).  Nodes pass a separate slate so the border and the label
+      // can live at different brightness levels.
+      ctx.fillStyle    = labelColor || borderColor;
+      ctx.font         = `600 11px ${FONT}`;
+      ctx.textBaseline = 'top';
+      ctx.textAlign    = 'left';
+      drawSpaced(label.toUpperCase(), x + 14, y + 12, 0.8);
+    }
+  }
+
+  function drawTile(x, y, w, h, kind, alpha) {
+    if (alpha !== undefined && alpha !== 1) ctx.globalAlpha = alpha;
+    ctx.fillStyle = KIND_COLOR[kind];
+    rr(x, y, w, h, 2);
+    ctx.fill();
+    if (alpha !== undefined && alpha !== 1) ctx.globalAlpha = 1;
+  }
+
+  function drawTitle() {
+    // Cyan accent dot — matches the bullet in the slide deck's title bar.
+    ctx.fillStyle = COLORS.infer;
+    ctx.beginPath();
+    ctx.arc(M + 4, 26, 4, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle    = COLORS.text;
+    ctx.font         = `600 18px ${FONT}`;
+    ctx.textBaseline = 'middle';
+    ctx.textAlign    = 'left';
+    drawSpaced(`${mode.toUpperCase()} SLICING`, M + 18, 26, 1.0);
+
+    // Monospace so the digit columns don't flicker as simTime ticks.
+    ctx.fillStyle    = COLORS.text_dim;
+    ctx.font         = `400 12px ${FONT_MONO}`;
+    ctx.textAlign    = 'right';
+    ctx.fillText(`t = ${simTime.toFixed(1)} s`, W - M, 26);
+  }
+
+  function drawBuckets() {
+    KINDS.forEach((k, i) => {
+      const r = bucketRect(i);
+      panel(r.x, r.y, r.w, r.h, KIND_COLOR[k], `${k} queue`);
+
+      // Dim queue tiles when the bucket has no owned slots (all weights 0
+      // or others have used up the pool).
+      const stalled   = kindCap(k) === 0;
+      const tileAlpha = stalled ? 0.22 : 1.0;
+      for (let t = 0; t < buckets[k].length; t++) {
+        const p = bucketTilePos(i, t);
+        drawTile(p.x, p.y, TILE, TILE, k, tileAlpha);
+      }
+
+      if (mode === 'horizontal') {
+        drawSlider(i, 0, 'GPU', bucketState[k].gpuWeight, KIND_COLOR[k]);
+        drawSlider(i, 1, 'CPU', bucketState[k].cpuWeight, KIND_COLOR[k]);
+      } else {
+        drawSlider(i, 0, 'NODES', bucketState[k].nodeWeight, KIND_COLOR[k]);
+      }
+    });
+  }
+
+  function drawSlider(bucketIdx, sliderIdx, label, weight, color) {
+    const s = bucketSliderRect(bucketIdx, sliderIdx);
+
+    // Track background.
+    ctx.fillStyle = COLORS.unused;
+    rr(s.x, s.y, s.w, s.h, 4);
+    ctx.fill();
+    ctx.strokeStyle = COLORS.unused_brd;
+    ctx.lineWidth   = 1;
+    rr(s.x + 0.5, s.y + 0.5, s.w - 1, s.h - 1, 4);
+    ctx.stroke();
+
+    // Fill rises from the bottom proportionally to weight.
+    const fillH = Math.max(0, weight * s.h);
+    const fillY = s.y + s.h - fillH;
+    if (fillH > 0.5) {
+      ctx.globalAlpha = 0.45;
+      ctx.fillStyle   = color;
+      rr(s.x, fillY, s.w, fillH, 4);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    // Handle bar straddling the fill top edge — easy to grab visually.
+    ctx.fillStyle = color;
+    rr(s.x - 4, fillY - 1.5, s.w + 8, 3, 1);
+    ctx.fill();
+
+    // Numeric value above the track.  NODES is shown as an integer count;
+    // pool sliders as a 0.x weight.
+    ctx.fillStyle    = COLORS.text_dim;
+    ctx.font         = `400 10px ${FONT_MONO}`;
+    ctx.textBaseline = 'bottom';
+    ctx.textAlign    = 'center';
+    const valueStr = label === 'NODES'
+      ? Math.round(weight * N_NODES).toString()
+      : weight.toFixed(1);
+    ctx.fillText(valueStr, s.x + s.w / 2, s.y - 16);
+
+    // Pool label tucked between value and track — drawSpaced expects
+    // textAlign='left'; pre-measure the spaced width so we can center it.
+    ctx.fillStyle = COLORS.text_dim;
+    ctx.font      = `600 9px ${FONT}`;
+    ctx.textAlign = 'left';
+    let spacedW = -0.5;       // discount the trailing letter-gap
+    for (const ch of label) spacedW += ctx.measureText(ch).width + 0.5;
+    drawSpaced(label, s.x + s.w / 2 - spacedW / 2, s.y - 4, 0.5);
+  }
+
+  function drawNodes() {
+    for (let i = 0; i < nodes.length; i++) {
+      const nd = nodes[i];
+      panel(nd.x, nd.y, nd.w, nd.h, COLORS.frame_border, `node ${i}`, COLORS.frame_label);
+      for (const s of nd.gpu) drawSlot(s);
+      for (const s of nd.cpu) drawSlot(s);
+    }
+    // Fading tasks underneath flying ones so a fresh dispatch sits on top
+    // of a tile leaving the same neighbourhood.
+    for (const fa of fading) drawFading(fa);
+    for (const f  of flying) drawFlying(f);
+  }
+
+  function drawSlot(s) {
+    if (s.busy && s.task && s.task.state === 'running') {
+      const elapsed = simTime - s.task.startTime;
+      const color   = KIND_COLOR[s.task.kind];
+
+      // On-landing halo — soft glow that fades over GLOW_DURATION.
+      // Implemented as a double-fill with shadowBlur so the halo extends
+      // beyond the slot's footprint without growing the slot itself.
+      if (elapsed < GLOW_DURATION) {
+        const g = 1 - elapsed / GLOW_DURATION;
+        ctx.save();
+        ctx.shadowBlur  = 18 * g;
+        ctx.shadowColor = color;
+        ctx.globalAlpha = 0.9;
+        ctx.fillStyle   = color;
+        rr(s.x, s.y, s.w, s.h, 2);
+        ctx.fill();
+        ctx.fill();      // second pass intensifies the halo
+        ctx.restore();
+      }
+
+      // Steady-state pulse — gentler than v1 so the landing glow leads.
+      const pulse = 0.85 + 0.15 * (0.5 + 0.5 * Math.sin(elapsed * 2.5));
+      ctx.globalAlpha = pulse;
+      ctx.fillStyle   = color;
+      rr(s.x, s.y, s.w, s.h, 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      return;
+    }
+    const owner = slotOwner(s);
+    if (owner) {
+      ctx.fillStyle = KIND_DIM[owner];
+      rr(s.x, s.y, s.w, s.h, 2);
+      ctx.fill();
+      ctx.globalAlpha = 0.4;
+      ctx.strokeStyle = KIND_COLOR[owner];
+      ctx.lineWidth   = 1;
+      rr(s.x + 0.5, s.y + 0.5, s.w - 1, s.h - 1, 2);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    } else {
+      ctx.fillStyle = COLORS.unused;
+      rr(s.x, s.y, s.w, s.h, 2);
+      ctx.fill();
+      ctx.strokeStyle = COLORS.unused_brd;
+      ctx.lineWidth   = 0.5;
+      rr(s.x + 0.5, s.y + 0.5, s.w - 1, s.h - 1, 2);
+      ctx.stroke();
+    }
+  }
+
+  function drawFlying(f) {
+    const p = flyingPos(f);
+    drawTile(p.x, p.y, p.size, p.size, f.kind, 0.95);
+  }
+
+  function drawFading(fa) {
+    const t     = Math.min(1, (simTime - fa.t0) / fa.duration);
+    // easeInQuad on the fall — tiles accelerate as they leave, the way
+    // they would under gravity.  Alpha is just linear.
+    const fall  = fa.fall != null ? fa.fall : 60;
+    const y     = fa.y + fall * t * t;
+    const alpha = 1 - t;
+    drawTile(fa.x, y, fa.w, fa.h, fa.kind, alpha);
+  }
+
+  function render() {
+    ctx.fillStyle = COLORS.bg;
+    ctx.fillRect(0, 0, W, H);
+    drawTitle();
+    drawBuckets();
+    drawNodes();
+  }
+
+  // -------------------------------------------------------------------------
+  //  RAF loop + controls
+  // -------------------------------------------------------------------------
+  let last = performance.now();
+  function frame() {
+    const now = performance.now();
+    const dt  = Math.min(0.1, (now - last) / 1000);
+    last      = now;
+    recomputeOwnership();
+    if (playing) tick(dt * speed);
+    render();
+    requestAnimationFrame(frame);
+  }
+
+  const $play = document.getElementById('play');
+  const $sp   = document.getElementById('speed');
+  const $spv  = document.getElementById('speedval');
+  const $mh   = document.getElementById('mode-h');
+  const $mv   = document.getElementById('mode-v');
+
+  $play.onclick = () => {
+    playing = !playing;
+    $play.innerHTML = playing ? '&#10074;&#10074; pause' : '&#9654; play';
+  };
+  $sp.oninput = (e) => {
+    speed = parseFloat(e.target.value);
+    $spv.textContent = speed.toFixed(2) + '×';
+  };
+  function setMode(m) {
+    if (mode === m) return;
+
+    // Wipe the board.  Each running/flying tile is converted into a fading
+    // tile that drops past the bottom edge of the canvas.  Slots reset to
+    // free so the new partition starts from a blank board after the wipe.
+    for (const f of flying) {
+      const p = flyingPos(f);
+      fading.push({
+        x: p.x, y: p.y, w: p.size, h: p.size,
+        kind:     f.kind,
+        t0:       simTime,
+        duration: WIPE_DURATION,
+        fall:     H - p.y - p.size + 40,
+      });
+      if (f.slot) { f.slot.busy = false; f.slot.task = null; }
+    }
+    flying.length = 0;
+
+    for (const nd of nodes) {
+      for (const s of nd.gpu.concat(nd.cpu)) {
+        if (s.busy && s.task && s.task.state === 'running') {
+          fading.push({
+            x: s.x, y: s.y, w: s.w, h: s.h,
+            kind:     s.task.kind,
+            t0:       simTime,
+            duration: WIPE_DURATION,
+            fall:     H - s.y - s.h + 40,
+          });
+          s.busy = false;
+          s.task = null;
+        }
+      }
+    }
+    wipeUntil = simTime + WIPE_DURATION * 0.85;
+    for (const k of KINDS) inFlight[k] = 0;
+
+    mode = m;
+    $mh.classList.toggle('active', m === 'horizontal');
+    $mv.classList.toggle('active', m === 'vertical');
+  }
+
+  function flyingPos(f) {
+    const t     = Math.min(1, (simTime - f.t0) / f.duration);
+    const eased = 1 - Math.pow(1 - t, 3);
+    const x     = f.fromX + (f.toX - f.fromX) * eased;
+    const yLine = f.fromY + (f.toY - f.fromY) * eased;
+    const lift  = -28 * Math.sin(eased * Math.PI);
+    const size  = f.fromSize + (f.toSize - f.fromSize) * eased;
+    return { x, y: yLine + lift, size };
+  }
+  $mh.onclick = () => setMode('horizontal');
+  $mv.onclick = () => setMode('vertical');
+
+  // ----- Canvas mouse handlers: per-bucket GPU + CPU weight sliders -------
+  let dragging = null;        // { kind, pool: 'gpu'|'cpu', rect }
+
+  function canvasXY(e) {
+    const r = cv.getBoundingClientRect();
+    return {
+      x: (e.clientX - r.left) * (W / r.width),
+      y: (e.clientY - r.top)  * (H / r.height),
+    };
+  }
+  function inRect(x, y, r, pad = 0) {
+    return x >= r.x - pad && x <= r.x + r.w + pad &&
+           y >= r.y       && y <= r.y + r.h;
+  }
+  function poolSumOthers(pool, kind) {
+    const wKey = pool + 'Weight';
+    let s = 0;
+    for (const k of KINDS) if (k !== kind) s += bucketState[k][wKey];
+    return s;
+  }
+  function snap01(w) { return Math.round(w * 10) / 10; }
+
+  // Vertical-mode node allocator: adjust the kind's owned-node list toward
+  // `target` (an integer count), clamped to the free-node budget.  Tail-pop
+  // on decrease, claim-first-free on increase — both preserve stability of
+  // the other nodes the kind already holds.
+  function setNodeCount(kind, target) {
+    const list = vertNodes[kind];
+    let usedByOthers = 0;
+    for (const k of KINDS) if (k !== kind) usedByOthers += vertNodes[k].length;
+    const cap = N_NODES - usedByOthers;
+    target = Math.max(0, Math.min(cap, Math.round(target)));
+    while (list.length > target) list.pop();
+    if (list.length < target) {
+      const owned = new Set();
+      for (const k of KINDS) for (const i of vertNodes[k]) owned.add(i);
+      for (let i = 0; i < N_NODES && list.length < target; i++) {
+        if (!owned.has(i)) list.push(i);
+      }
+    }
+    bucketState[kind].nodeWeight = list.length / N_NODES;
+  }
+
+  function setWeightFromY(kind, pool, sr, y) {
+    const raw = 1 - (y - sr.y) / sr.h;
+    if (pool === 'node') {
+      setNodeCount(kind, Math.max(0, Math.min(1, raw)) * N_NODES);
+      return;
+    }
+    // Pool sliders snap to the 0.1 grid; per-pool sum <= 1.  Snap the cap
+    // too so float drift can't push it off the grid.
+    const target = snap01(Math.max(0, Math.min(1, raw)));
+    const cap    = snap01(Math.max(0, 1 - poolSumOthers(pool, kind)));
+    bucketState[kind][pool + 'Weight'] = Math.min(target, cap);
+  }
+
+  cv.addEventListener('mousedown', (e) => {
+    const { x, y } = canvasXY(e);
+    const pools = mode === 'horizontal'
+      ? [{ idx: 0, pool: 'gpu' }, { idx: 1, pool: 'cpu' }]
+      : [{ idx: 0, pool: 'node' }];
+    for (let i = 0; i < KINDS.length; i++) {
+      const k = KINDS[i];
+      for (const sd of pools) {
+        const sr = bucketSliderRect(i, sd.idx);
+        // Generous horizontal padding for an easier grab on the thin track.
+        if (inRect(x, y, sr, 6)) {
+          dragging = { kind: k, pool: sd.pool, rect: sr };
+          setWeightFromY(k, sd.pool, sr, y);
+          return;
+        }
+      }
+    }
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const { y } = canvasXY(e);
+    setWeightFromY(dragging.kind, dragging.pool, dragging.rect, y);
+  });
+  window.addEventListener('mouseup', () => { dragging = null; });
+
+  init();
+  requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>

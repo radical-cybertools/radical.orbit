@@ -97,29 +97,72 @@ class EdgeService(PluginHostBase):
         app (FastAPI): The internal FastAPI application hosting the plugins.
     """
 
-    def __init__(self, bridge_url: Optional[str] = None, name: Optional[str] = None,
-                 plugins: Optional[list] = None, tunnel: bool = False,
-                 tunnel_via: Optional[str] = None):
+    def __init__(self, bridge_url: Optional[str] = None,
+                 cert:       Optional[str]      = None,
+                 name:       Optional[str]      = None,
+                 plugins:    Optional[list]     = None,
+                 tunnel:     str                = 'none',
+                 tunnel_via: Optional[str]      = None,
+                 app:        Optional[FastAPI]  = None):
         """
         Initialize the Edge Service.
 
         Args:
-            bridge_url: WebSocket URL for the Bridge. Defaults to env var
-                        'RADICAL_BRIDGE_URL' or internal default.
-            name: Edge service name for identification. Defaults to hostname.
-            tunnel: When True, open an outbound SSH tunnel to the login host
-                    and route the bridge connection through it. See
-                    :mod:`radical.edge.tunnel`.
-            tunnel_via: Explicit login host to tunnel through. If unset,
-                    falls back to ``PBS_O_HOST`` (PBSPro) or
-                    ``SLURM_SUBMIT_HOST`` (SLURM).
-        """
-        self._bridge_url: str = bridge_url or os.environ.get("RADICAL_BRIDGE_URL", "")
-        self._app: FastAPI = FastAPI(title="Embedded Edge Service")
-        self._app.state.bridge_url = self._bridge_url
+            bridge_url: WebSocket URL for the Bridge.  CLI > env
+                        (``RADICAL_BRIDGE_URL``) > file
+                        (``~/.radical/edge/bridge.url``).
+            cert: Path to the bridge's TLS cert.  Same precedence using
+                  ``RADICAL_BRIDGE_CERT`` and
+                  ``~/.radical/edge/bridge_cert.pem``.
+            name: Edge service name for identification.  Defaults to
+                  hostname.
+            tunnel: SSH tunnel mode for the bridge connection.  One of:
 
-        if not self._bridge_url:
-            raise ValueError("Bridge URL missing as argument or RADICAL_BRIDGE_URL")
+                    * ``'none'``    — connect directly.
+                    * ``'forward'`` — open an outbound ``ssh -L``
+                                      to the login host (compute → login).
+                                      Requires *tunnel_via* (or one of
+                                      the env-var fallbacks).
+                    * ``'reverse'`` — wait for the parent (login-side
+                                      ``plugin_psij`` watcher) to
+                                      open ``ssh -R`` and write the
+                                      rendezvous file.  No SSH spawn
+                                      from this side.
+
+                    Boolean values are *not* accepted.
+            tunnel_via: Explicit login host for ``forward`` mode.  If
+                    unset, falls back to ``PBS_O_HOST`` (PBSPro) or
+                    ``SLURM_SUBMIT_HOST`` (SLURM).  Ignored in
+                    ``reverse`` / ``none`` modes.
+            app: existing ``FastAPI`` instance to register plugin
+                 routes on.  When ``None`` the edge constructs its own.
+        """
+        if tunnel not in ('none', 'forward', 'reverse'):
+            raise ValueError(
+                f"tunnel must be one of 'none' / 'forward' / 'reverse'; "
+                f"got {tunnel!r}")
+        from urllib.parse import urlparse
+        from . import utils
+        # Resolve bridge URL + cert via the shared helper.  No
+        # side-effect on the local URL file: a one-off ``RADICAL_BRIDGE_URL``
+        # to point at a different bridge must not clobber the file
+        # the operator may rely on for the *default* bridge.
+        resolved_url, _ = utils.resolve_bridge_url(cli=bridge_url)
+        self._bridge_url: str = resolved_url
+
+        # Cert is required for TLS schemes (https/wss) and ignored for
+        # plain (http/ws) — mirrors BridgeClient.  Test setups that
+        # don't exercise the TLS handshake use the plain forms.
+        scheme = urlparse(self._bridge_url).scheme
+        if scheme in ('https', 'wss'):
+            resolved_cert, _    = utils.resolve_bridge_cert(cli=cert)
+            self._cert: Optional[str] = str(resolved_cert)
+        else:
+            self._cert = None
+
+        self._app: FastAPI = app if app is not None \
+                                 else FastAPI(title="Embedded Edge Service")
+        self._app.state.bridge_url = self._bridge_url
 
         self._plugins: Dict[str, Plugin] = {}
         self._name: str = name or socket.gethostname()
@@ -127,7 +170,7 @@ class EdgeService(PluginHostBase):
         self._app.state.edge_name = self._name
         self._app.state.edge_service = self
         self._app.state.is_bridge    = False
-        self._tunnel: bool = tunnel
+        self._tunnel: str = tunnel
         self._tunnel_via: Optional[str] = tunnel_via
         self._tunnel_proc = None     # subprocess.Popen of active SSH tunnel
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
@@ -384,7 +427,9 @@ class EdgeService(PluginHostBase):
         Connects to Bridge and starts processing loop.
         """
         PING_INTERVAL  = 20
-        PING_TIMEOUT   = 30
+        PING_TIMEOUT   = 600    # 10 min: tolerate long blocking ops
+                                # (e.g. dragon V3 Batch init across many
+                                # nodes) without dropping the WS to bridge.
         MAX_BACKOFF    = 10
         JITTER_FACTOR  = 0.3  # Add up to 30% jitter to prevent thundering herd
         BACKOFF_FACTOR = 1.2
@@ -393,17 +438,26 @@ class EdgeService(PluginHostBase):
         self._stop_event.clear()
         self._running_task = asyncio.current_task()
 
-        # ── Outbound SSH tunnel (--tunnel flag) ──────────────────────────────
-        # When --tunnel is passed we are running on a compute node and the
-        # bridge is only reachable from the login node. We open an outbound
-        # ssh -L tunnel to the login host ourselves and rewrite the bridge
-        # URL to localhost:<allocated_port>. Compute→login SSH is permitted
-        # on virtually all HPC sites; the reverse direction (login→compute)
-        # is blocked on Aurora and others.
-        if self._tunnel:
-            await self._open_tunnel()
+        # ── Bridge connection: optional SSH tunnel ──────────────────────────
+        # ``self._tunnel`` is one of:
+        #   'none'    — connect directly.
+        #   'forward' — open ssh -L from this (compute) node to the login
+        #               host ourselves; rewrite bridge URL to localhost:<port>.
+        #               Used where compute→login SSH works (Aurora,
+        #               Perlmutter).
+        #   'reverse' — wait for the parent (login-side) plugin_psij watcher
+        #               to open ssh -R and write the rendezvous file with
+        #               the remote port allocated by the compute-side sshd.
+        #               Used where login→compute SSH works but the reverse
+        #               direction is blocked (Odo).
+        if self._tunnel == 'forward':
+            await self._open_tunnel_forward()
+        elif self._tunnel == 'reverse':
+            await self._open_tunnel_reverse()
+        # 'none' → fall through, use bridge URL as-is.
         # ── End tunnel setup ──────────────────────────────────────────────────
 
+        ssl_check_hostname = True
         while not self._stop_event.is_set():
             try:
                 # For the ws connect, we change http(s) to ws(s)
@@ -423,11 +477,11 @@ class EdgeService(PluginHostBase):
                 ssl_ctx = None
                 if ws_url.startswith("wss://"):
                     ssl_ctx = ssl.create_default_context()
-                    ssl_ctx.check_hostname = False
-                    ssl_ctx.verify_mode = ssl.CERT_NONE
-                    certfile = os.environ.get("RADICAL_BRIDGE_CERT")
-                    if certfile and os.path.exists(certfile):
-                        ssl_ctx.load_verify_locations(certfile)
+                    ssl_ctx.check_hostname = ssl_check_hostname
+                    ssl_ctx.verify_mode = ssl.CERT_REQUIRED
+                    # Cert path was already resolved + validated in __init__.
+                    if self._cert and os.path.exists(self._cert):
+                        ssl_ctx.load_verify_locations(self._cert)
 
                 async with websockets.connect(ws_url,
                                               ssl=ssl_ctx,
@@ -556,6 +610,25 @@ class EdgeService(PluginHostBase):
                             _recv_task, _stop_fut,
                             return_exceptions=True)
 
+            except ssl.SSLCertVerificationError as e:
+                verify_msg = getattr(e, 'verify_message', str(e)).lower()
+                if ssl_check_hostname and 'hostname' in verify_msg:
+                    log.warning("[Edge] TLS hostname validation failed for %s: %s. "
+                                "Continuing with hostname validation disabled.",
+                                self._bridge_url, e)
+                    ssl_check_hostname = False
+                    continue
+                if self._stop_event.is_set():
+                    break
+
+                # Add jitter to backoff to prevent thundering herd
+                jitter = backoff * JITTER_FACTOR * random.random()
+                sleep_time = backoff + jitter
+                log.warning("[Edge] Connection lost: %s. Reconnecting in %.1fs...",
+                            e, sleep_time)
+                await asyncio.sleep(sleep_time)
+                backoff = min(backoff * BACKOFF_FACTOR, MAX_BACKOFF)
+
             except (ws_exc.ConnectionClosed, OSError) as e:
                 if self._stop_event.is_set():
                     break  # no reconnect
@@ -588,8 +661,8 @@ class EdgeService(PluginHostBase):
             _tunnel.cleanup_tunnel(self._tunnel_proc, self._name)
             self._tunnel_proc = None
 
-    async def _open_tunnel(self) -> None:
-        """Open an outbound SSH tunnel to the login host (--tunnel mode).
+    async def _open_tunnel_forward(self) -> None:
+        """Forward mode: open an outbound SSH tunnel to the login host.
 
         Derives the login host from ``tunnel_via``, then ``PBS_O_HOST``,
         then ``SLURM_SUBMIT_HOST``.  Spawns the SSH process, parses the
@@ -604,14 +677,14 @@ class EdgeService(PluginHostBase):
                       or os.environ.get('SLURM_SUBMIT_HOST'))
         if not login_host:
             raise RuntimeError(
-                "--tunnel: no login host available. Pass --tunnel-via HOST or "
-                "set PBS_O_HOST / SLURM_SUBMIT_HOST.")
+                "--tunnel forward: no login host available. Pass "
+                "--tunnel-via HOST or set PBS_O_HOST / SLURM_SUBMIT_HOST.")
 
         parsed      = urlparse(self._bridge_url)
         bridge_host = parsed.hostname or 'localhost'
         bridge_port = parsed.port or (443 if parsed.scheme == 'https' else 8000)
 
-        log.info("[Edge] --tunnel: opening ssh -L tunnel via %s to %s:%d",
+        log.info("[Edge] --tunnel forward: opening ssh -L via %s to %s:%d",
                  login_host, bridge_host, bridge_port)
 
         proc, port = await asyncio.to_thread(
@@ -623,6 +696,98 @@ class EdgeService(PluginHostBase):
             parsed._replace(netloc=f'localhost:{port}'))
         log.info("[Edge] Tunnel active on localhost:%d; bridge URL now %s",
                  port, self._bridge_url)
+
+    async def _open_tunnel_reverse(self,
+                                    wait_timeout: float = 15.0) -> None:
+        """Reverse mode: wait for a login-side spawner to open ``ssh -R``
+        and write the rendezvous file.
+
+        We always drop a ``<edge_name>.req`` JSON file first with our
+        ``socket.gethostname()`` (the compute node SLURM placed us on)
+        and the bridge target.  Two flows consume it:
+
+        * **PsiJ-launched** — the parent edge's ``plugin_psij`` watcher
+          reads ``.req`` to discover which compute node to ssh into,
+          spawns ``ssh -R``, writes ``<edge_name>.port``.  Gating the
+          spawn on ``.req`` (rather than on SLURM's RUNNING transition)
+          avoids picking a wrong host on multi-node allocations where
+          the script's node != ``scheduler.job_nodes()[0]``.
+
+        * **IRI-launched** — no parent edge on the login node; a
+          standalone helper (``bin/radical-edge-iri-tunnel-helper.sh``)
+          watches the relay dir for ``.req`` files and does the
+          spawn+write.
+
+        Either way we poll for ``<edge_name>.port`` and rewrite
+        ``self._bridge_url`` to ``localhost:<port>`` once it appears.
+
+        ``wait_timeout`` is the ssh-handshake budget after ``.req`` has
+        been written — short on purpose, because Dragon startup is
+        already past us by this point.  Tunnel setup is much more
+        predictable than the work that got the child to this line.
+        """
+        import json
+        import os
+        import socket
+        from urllib.parse import urlparse, urlunparse
+        from . import tunnel as _tunnel
+
+        parsed      = urlparse(self._bridge_url)
+        bridge_host = parsed.hostname or 'localhost'
+        bridge_port = parsed.port or (443 if parsed.scheme in ('https', 'wss') else 8000)
+
+        rdir       = _tunnel.relay_dir()
+        relay_file = rdir / f'{self._name}.port'
+        req_file   = rdir / f'{self._name}.req'
+
+        # Drop the request file *before* polling — atomic via tmp + rename
+        # so the helper script never reads a half-written payload.
+        req_payload = json.dumps({
+            'edge_name'  : self._name,
+            'hostname'   : socket.gethostname(),
+            'bridge_host': bridge_host,
+            'bridge_port': bridge_port,
+        })
+        tmp = req_file.with_suffix('.req.tmp')
+        tmp.write_text(req_payload)
+        tmp.rename(req_file)
+        log.info("[Edge] --tunnel reverse: wrote request file %s", req_file)
+
+        log.info("[Edge] --tunnel reverse: waiting for parent-side "
+                 "rendezvous file %s (timeout %.0fs)",
+                 relay_file, wait_timeout)
+
+        deadline = asyncio.get_running_loop().time() + wait_timeout
+        while asyncio.get_running_loop().time() < deadline:
+            # NFSv3 negative-lookup cache hides the parent's freshly-
+            # written .port file from our `relay_file.exists()` checks
+            # for tens of seconds.  An os.listdir on the parent dir
+            # triggers a readdir RPC which forces fresh directory
+            # attributes; on Linux NFS clients this invalidates the
+            # cached ENOENT, so we see the parent's write within one
+            # polling iteration (2s) instead of waiting for the
+            # client's acregmin (30-60s) to expire.  Same trick is
+            # applied parent-side for .req — see plugin_psij.py.
+            try:
+                dir_contents = set(os.listdir(str(relay_file.parent)))
+            except OSError:
+                dir_contents = set()
+            if relay_file.name in dir_contents:
+                try:
+                    port = int(relay_file.read_text().strip())
+                except (ValueError, OSError):
+                    port = None
+                if port:
+                    self._bridge_url = urlunparse(
+                        parsed._replace(netloc=f'localhost:{port}'))
+                    log.info("[Edge] Reverse tunnel active on localhost:%d; "
+                             "bridge URL now %s", port, self._bridge_url)
+                    return
+            await asyncio.sleep(2.0)
+
+        raise RuntimeError(
+            f"--tunnel reverse: rendezvous file {relay_file} did not "
+            f"appear within {wait_timeout:.0f}s (parent-side ssh -R failed?)")
 
 
 

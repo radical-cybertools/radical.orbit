@@ -10,6 +10,7 @@ Import this module early in your application to configure logging.
 """
 
 import logging
+import os
 import sys
 import copy
 import contextvars
@@ -89,25 +90,76 @@ class ColoredFormatter(logging.Formatter):
 
 
 def configure_logging(level: int = logging.INFO,
-                      format_string: Optional[str] = None) -> None:
+                      format_string: Optional[str] = None,
+                      log_file: Optional[str] = None) -> None:
     """
     Configure logging for radical.edge.
 
     Args:
         level:         Logging level (default: logging.INFO).
-        format_string: Custom format string (optional).
+        format_string: Custom format string for the stdout handler
+                       (optional; ignored by the file handler which
+                       always uses a plain timestamped format).
+        log_file:      If given, also write logs to this file
+                       (appended on open).  Parent directory is
+                       created if missing.  Stdout output stays
+                       colored; the file is plain text with
+                       timestamps so it survives ``less`` / ``grep``
+                       and Dragon's stdio capture.
     """
     if format_string is None:
         format_string = '%(levelname)s %(message)s'
 
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(ColoredFormatter(fmt=format_string))
+    handlers: list = []
 
-    logging.basicConfig(force=True, level=level, handlers=[handler])
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setFormatter(ColoredFormatter(fmt=format_string))
+    handlers.append(stdout_handler)
 
-    logging.getLogger("radical.edge").setLevel(level)
+    if log_file:
+        log_dir = os.path.dirname(log_file)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        file_handler = logging.FileHandler(log_file, mode='a')
+        file_handler.setFormatter(logging.Formatter(
+            fmt='%(asctime)s %(levelname)-8s %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'))
+        handlers.append(file_handler)
+
+    # Attach handlers to the ``radical.edge`` and ``rhapsody`` loggers
+    # directly with propagate=False so external libraries that call
+    # ``logging.basicConfig(force=True, ...)`` during their own init
+    # — Dragon's launcher and rhapsody V3 backend bringup are the
+    # observed offenders — cannot wipe our file handler.  Without
+    # this, log output past V3 init silently vanishes from the file,
+    # which is exactly what we hit at 16-node scale.
+    #
+    # Idempotent across re-calls: drop any handlers we previously
+    # attached before re-installing.
+    for name in ('radical.edge', 'rhapsody'):
+        protected = logging.getLogger(name)
+        for h in list(protected.handlers):
+            protected.removeHandler(h)
+            try:
+                h.close()
+            except Exception:
+                pass
+        for h in handlers:
+            protected.addHandler(h)
+        protected.setLevel(level)
+        protected.propagate = False
+
+    # Root is still configured so third-party libraries (psij, dragon,
+    # websockets, uvicorn) keep showing up in stdout / file.  This
+    # channel can be wiped by a foreign basicConfig(force=True), but
+    # the radical.edge channel above is now immune.
+    logging.basicConfig(force=True, level=level, handlers=list(handlers))
 
 
-# Auto-configure on import with INFO level
-configure_logging()
+# Auto-configure on import.  Honor ``RADICAL_EDGE_LOG_LEVEL`` so that
+# client scripts (amsc.py, etc.) inherit the level via env without
+# needing a code edit; entry-point scripts call ``configure_logging``
+# again after argparse, so this has no effect on them.
+_env_level = os.environ.get('RADICAL_EDGE_LOG_LEVEL', 'INFO').upper()
+configure_logging(getattr(logging, _env_level, logging.INFO))
 

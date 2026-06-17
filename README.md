@@ -29,20 +29,36 @@ actually used - the bridge host and the client hosts usually don't need those.
 ## Usage (Command Line)
 
 ### 1. Generating Certificates (Dev)
-For the bridge to securely operate on HTTPs/WSS:
+
+Write the cert + key directly into the default config dir
+(`~/.radical/edge/`) — that way the bridge, edges, and clients all
+find them with **no env vars set**.  Replace `95.217.193.116` with
+your bridge's public IP.
+
 ```sh
+mkdir -p ~/.radical/edge
 openssl req -x509 -nodes -days 3650 -newkey rsa:4096 \
-  -keyout bridge_key.pem -out bridge_cert.pem \
-  -subj "/CN=RADICAL" \
-  -addext "subjectAltName = IP:127.0.0.1,DNS:localhost"
+        -keyout ~/.radical/edge/bridge_key.pem \
+        -out    ~/.radical/edge/bridge_cert.pem \
+        -subj   "/CN=95.217.193.116" \
+        -addext "subjectAltName = IP:95.217.193.116,DNS:localhost,IP:127.0.0.1"
+chmod 0600 ~/.radical/edge/bridge_key.pem
 ```
 
-Set the appropriate environment variables:
+`chmod 0600` is mandatory: the bridge refuses to start if the key
+file is more permissive.
+
+To override the defaults (different paths, remote bridge URL, etc.),
+set any of:
+
 ```sh
-export RADICAL_BRIDGE_URL='https://localhost:8000/'
-export RADICAL_BRIDGE_CERT="`pwd`/bridge_cert.pem"
-export RADICAL_BRIDGE_KEY="`pwd`/bridge_key.pem"  # only needed for the bridge
+export RADICAL_BRIDGE_URL='https://my-bridge:8000/'
+export RADICAL_BRIDGE_CERT="/path/to/bridge_cert.pem"
+export RADICAL_BRIDGE_KEY="/path/to/bridge_key.pem"  # only needed for the bridge
 ```
+
+See the **Bridge configuration** section below for the full
+precedence rules (CLI > env > file).
 
 ### 2. Starting the Bridge
 The Bridge server exposes a REST API and a WebSocket endpoint (`/register`):
@@ -168,27 +184,59 @@ The interactive Edge Explorer interface (`src/radical/edge/data/edge_explorer.ht
 
 ## Configuration
 
-### Environment Variables
+### Bridge configuration: URL, cert, key
 
-| Variable               | Description                                              | Default         |
-|------------------------|----------------------------------------------------------|-----------------|
-| `RADICAL_BRIDGE_URL`   | Bridge URL used by edge services and Python clients      | *(required)*    |
-| `RADICAL_BRIDGE_CERT`  | Path to CA certificate for SSL verification              | *(none — HTTP)* |
-| `RADICAL_BRIDGE_KEY`   | Path to private key (bridge startup only, HTTPS mode)    | *(none — HTTP)* |
+The bridge URL, TLS cert, and TLS key are resolved with this
+precedence:
+
+> **CLI flag > environment variable > file under `~/.radical/edge/`**
+
+| Item | Env var               | Default file                      |
+|------|-----------------------|-----------------------------------|
+| URL  | `RADICAL_BRIDGE_URL`  | `~/.radical/edge/bridge.url`      |
+| Cert | `RADICAL_BRIDGE_CERT` | `~/.radical/edge/bridge_cert.pem` |
+| Key  | `RADICAL_BRIDGE_KEY`  | `~/.radical/edge/bridge_key.pem`  |
+
+
+Behaviour notes:
+
+- **URL** (consumer side only): the bridge derives its own advertised
+  URL from `(host, port)` — wildcard binds use the local FQDN
+  (printing both FQDN and outbound-IPv4 forms on stdout); specific
+  binds advertise that literal address.  The bridge writes
+  `bridge.url` only when the file does not already exist, so a stale
+  file the operator placed for a different bridge is never clobbered.
+  Edges / clients raise `ValueError` if no URL resolves.
+- **Cert / key**: never auto-written; the operator places them.
+  Required for `https://` / `wss://` URLs; ignored entirely for
+  `http://` / `ws://`.
+- **Key**: The key is only needed by the bridge.  The bridge refuses
+  to start if `bridge_key.pem` is more permissive than `0o600`.
+
+### Bridge CLI Args
+
+```
+radical-edge-bridge.py [options]
+  --cert CERT    TLS cert path                  (CLI > env > file)
+  --key  KEY     TLS key path; mode 0o600       (CLI > env > file)
+  --host HOST    Bind address (default: 0.0.0.0)
+  --port PORT    Bind port    (default: 8000)
+  -p PLUGINS     Bridge-hosted plugins (default: role default set)
+```
 
 ### Edge Service CLI Args
 
 ```
 radical-edge-service.py [options]
-  --name NAME    Edge name (shown in Explorer and /edge/list)
-  --url  URL     Bridge WebSocket URL (e.g. wss://bridge:8000)
-  -p PLUGINS     Comma-separated list of plugin names to load
-  --cert CERT    CA certificate path for SSL
+  --name NAME         Edge name (shown in Explorer and /edge/list)
+  --url  URL          Bridge URL                 (CLI > env > file)
+  --cert CERT         TLS cert path              (CLI > env > file)
+  -p PLUGINS          Comma-separated plugins to load
+  --tunnel MODE       Tunnel mode: none | forward | reverse
+  --tunnel-via HOST   Login host for --tunnel forward (defaults to
+                      $PBS_O_HOST / $SLURM_SUBMIT_HOST)
+  --log-level LEVEL   DEBUG | INFO | WARNING | ERROR
 ```
-
-### Bridge Startup
-
-The bridge listens on `0.0.0.0:8000` by default. To change host/port, subclass `Bridge` or edit `bin/radical-edge-bridge.py` and pass `host=` / `port=` to `uvicorn.run()`.
 
 ### Log Level
 
@@ -213,4 +261,4 @@ Or in code: `logging.getLogger("radical.edge").setLevel(logging.DEBUG)`.
 : The PsiJ executor may be misconfigured. Check the edge log for PsiJ errors. For SLURM, verify the account and queue names are valid with `sinfo` and `sacctmgr`.
 
 **SSL verification error when connecting**
-: Set `RADICAL_BRIDGE_CERT` to the path of the CA certificate (the `.pem` file generated during setup). Without it, Python clients default to `verify=False` (dev mode only).
+: For `https://` / `wss://` URLs the cert is required — `BridgeClient` and edge services raise `ValueError` if no cert is resolved (CLI > env > file).  Either set `RADICAL_BRIDGE_CERT` to the `.pem` from setup, drop the file at `~/.radical/edge/bridge_cert.pem`, or use a plain `http://` / `ws://` URL (cert resolution is then skipped entirely — dev mode only).
