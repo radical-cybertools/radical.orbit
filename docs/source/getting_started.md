@@ -88,18 +88,18 @@ git clone https://github.com/radical-cybertools/radical.orbit.git
 
 ## 2. Configuration
 
-The bridge endpoint should have environment variables `RADICAL_BRIDGE_CERT` and
-`RADICAL_BRIDGE_KEY` to be set before it starts, while the endpoint service requires 
-to have `RADICAL_BRIDGE_CERT` only.
+The bridge endpoint should have environment variables `RADICAL_ORBIT_BRIDGE_CERT` and
+`RADICAL_ORBIT_BRIDGE_KEY` to be set before it starts, while the endpoint service requires 
+to have `RADICAL_ORBIT_BRIDGE_CERT` only.
 
 ```shell
-export RADICAL_BRIDGE_CERT=`pwd`/bridge_cert.pem
-export RADICAL_BRIDGE_KEY=`pwd`/bridge_key.pem
+export RADICAL_ORBIT_BRIDGE_CERT=`pwd`/bridge_cert.pem
+export RADICAL_ORBIT_BRIDGE_KEY=`pwd`/bridge_key.pem
 ```
 
 Endpoint service and client endpoints should be provided with the bridge url, 
 either as an argument or as the environment variable (e.g., 
-`export RADICAL_BRIDGE_URL='https://localhost:8000'`).
+`export RADICAL_ORBIT_BRIDGE_URL='https://localhost:8000'`).
 
 ## 3. Run demo
 
@@ -114,8 +114,8 @@ Run the bridge endpoint which bridges between the client and the endpoint servic
 
 ```shell
 # corresponding virtual environment (e.g., ve_endpoint) should be active,
-# env variables RADICAL_BRIDGE_CERT, RADICAL_BRIDGE_KEY should be set
-orbit-bridge.py
+# env variables RADICAL_ORBIT_BRIDGE_CERT, RADICAL_ORBIT_BRIDGE_KEY should be set
+radical-orbit-bridge.py
 ```
 
 Example output:
@@ -134,13 +134,13 @@ target HPC resource (on the head node and/or from the batch job).
 
 ```shell
 # corresponding virtual environment (e.g., ve_endpoint) should be active,
-# env variables RADICAL_BRIDGE_CERT, RADICAL_BRIDGE_URL should be set
-orbit-endpoint.py
+# env variables RADICAL_ORBIT_BRIDGE_CERT, RADICAL_ORBIT_BRIDGE_URL should be set
+radical-orbit-endpoint.py
 ```
 
 For launching via batch job schedulers, use the wrapper script which sets up the environment:
 ```shell
-orbit-endpoint-wrapper.sh --url wss://bridge.example.org:8000 --name my-hpc-endpoint
+radical-orbit-endpoint-wrapper.sh --url wss://bridge.example.org:8000 --name my-hpc-endpoint
 ```
 
 Example output:
@@ -166,7 +166,7 @@ Run a test client.
 
 ```shell
 # corresponding virtual environment (e.g., ve_endpoint) should be active,
-# env variable RADICAL_BRIDGE_URL should be set
+# env variable RADICAL_ORBIT_BRIDGE_URL should be set
 #
 # get to the directory with examples (within the Endpoint repo)
 cd radical.orbit/examples
@@ -205,14 +205,14 @@ export RADICAL_ORBIT_TAG=dev
 export RADICAL_ORBIT_BRANCH="devel"
 
 # for the demo we use the hostname for the bridge as `bridge`
-export RADICAL_BRIDGE_HOSTNAME=bridge
+export RADICAL_ORBIT_BRIDGE_HOSTNAME=bridge
 ```
 
 ```shell
 cd radical.orbit/examples/docker
 docker build --build-arg GENERATE_BRIDGE_CERT=true \
              --build-arg BRIDGE_IP=127.0.0.1 \
-             --build-arg BRIDGE_HOSTNAME=${RADICAL_BRIDGE_HOSTNAME} \
+             --build-arg BRIDGE_HOSTNAME=${RADICAL_ORBIT_BRIDGE_HOSTNAME} \
              --build-arg RADICAL_ORBIT_BRANCH=${RADICAL_ORBIT_BRANCH} \
              -t ${RADICAL_ORBIT_IMAGE}:${RADICAL_ORBIT_TAG} .
 ```
@@ -222,7 +222,7 @@ docker build --build-arg GENERATE_BRIDGE_CERT=true \
 docker compose up -d
 
 # get into the client container and run the example
-docker exec -it orbit-client bash
+docker exec -it radical-orbit-client bash
 
 cd /app/radical.orbit/examples
 python3 example_sysinfo.py

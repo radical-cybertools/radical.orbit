@@ -11,7 +11,7 @@ Usage:
 Examples:
     python examples/xgfabric.py --bridge-url https://bridge:8000 --endpoint thinkie
     python examples/xgfabric.py -w myworkflow -r myresource
-    RADICAL_BRIDGE_URL=https://bridge:8000 python examples/xgfabric.py
+    RADICAL_ORBIT_BRIDGE_URL=https://bridge:8000 python examples/xgfabric.py
 """
 
 import argparse
@@ -83,10 +83,10 @@ def main():
     # URL/cert default to None so BridgeClient self-resolves via
     # radical.orbit.utils (CLI > env > file).
     parser.add_argument('-u', '--bridge-url',  default=None,
-                        help='Bridge URL  (CLI > $RADICAL_BRIDGE_URL > '
+                        help='Bridge URL  (CLI > $RADICAL_ORBIT_BRIDGE_URL > '
                              '~/.radical/orbit/bridge.url).')
     parser.add_argument('-c', '--bridge-cert', default=None,
-                        help='Bridge CA cert path  (CLI > $RADICAL_BRIDGE_CERT '
+                        help='Bridge CA cert path  (CLI > $RADICAL_ORBIT_BRIDGE_CERT '
                              '> ~/.radical/orbit/bridge_cert.pem).')
     parser.add_argument('-e', '--endpoint',     default='local',
                         help='Endpoint name where xgfabric plugin is running')

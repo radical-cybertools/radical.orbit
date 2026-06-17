@@ -1,4 +1,4 @@
-"""Smoke tests for bin/orbit-run.
+"""Smoke tests for bin/radical-orbit-run.
 
 Covers the pure-Python helpers (argv splitting, flatten, task_id).
 End-to-end tests against a live bridge/endpoint would belong under
@@ -16,7 +16,7 @@ import pytest
 _loader = SourceFileLoader(
     'run_mod',
     str(Path(__file__).resolve().parents[2]
-        / 'bin' / 'orbit-run')
+        / 'bin' / 'radical-orbit-run')
 )
 _spec = importlib.util.spec_from_loader('run_mod', _loader)
 _run  = importlib.util.module_from_spec(_spec)

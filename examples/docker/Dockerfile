@@ -3,8 +3,8 @@ FROM python:3.10-slim
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONNOUSERSITE=True
 ENV PATH="/opt/ve_endpoint/bin:$PATH"
-ENV RADICAL_BRIDGE_CERT="/app/private/bridge_cert.pem"
-ENV RADICAL_BRIDGE_KEY="/app/private/bridge_key.pem"
+ENV RADICAL_ORBIT_BRIDGE_CERT="/app/private/bridge_cert.pem"
+ENV RADICAL_ORBIT_BRIDGE_KEY="/app/private/bridge_key.pem"
 
 RUN apt-get update -y && \
     apt-get install -y --no-install-recommends \
@@ -32,10 +32,10 @@ ARG GENERATE_BRIDGE_CERT=false
 ARG BRIDGE_IP=127.0.0.1
 ARG BRIDGE_HOSTNAME=localhost
 RUN if [ "$GENERATE_BRIDGE_CERT" = "true" ]; then \
-        mkdir -p $(dirname "$RADICAL_BRIDGE_CERT") && \
+        mkdir -p $(dirname "$RADICAL_ORBIT_BRIDGE_CERT") && \
         openssl req -x509 -nodes -days 3650 -newkey rsa:4096 \
-            -keyout "${RADICAL_BRIDGE_KEY}" \
-            -out "${RADICAL_BRIDGE_CERT}" \
+            -keyout "${RADICAL_ORBIT_BRIDGE_KEY}" \
+            -out "${RADICAL_ORBIT_BRIDGE_CERT}" \
             -subj "/CN=${BRIDGE_IP}" \
             -addext "subjectAltName = IP:${BRIDGE_IP},DNS:${BRIDGE_HOSTNAME},IP:127.0.0.1,DNS:localhost"; \
         echo "Certificate generated for ${BRIDGE_HOSTNAME} and ${BRIDGE_IP}"; \

@@ -79,7 +79,7 @@ def test_bridge_client_no_url_raises(tmp_path, monkeypatch):
     → ValueError.  Redirect the resolver's file path to a tmp dir so
     we don't accidentally pick up the dev's own bridge.url."""
     from radical.orbit import utils
-    monkeypatch.delenv("RADICAL_BRIDGE_URL", raising=False)
+    monkeypatch.delenv("RADICAL_ORBIT_BRIDGE_URL", raising=False)
     monkeypatch.setattr(utils, 'URL_FILE', tmp_path / 'bridge.url')
 
     with pytest.raises(ValueError, match="Bridge URL required"):

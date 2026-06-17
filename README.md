@@ -6,8 +6,8 @@ ORBIT provides a decentralized architectural framework for seamlessly interactin
 ## Architecture
 
 ORBIT consists of three primary layers:
-1. **Bridge (`orbit-bridge`)**: The centralized entry hub. It maintains WebSocket connections to external Endpoint services, manages endpoint discovery, and serves as an HTTP-to-WebSocket reverse proxy forwarding REST API calls to the respective Endpoints.
-2. **Endpoint Service (`orbit-endpoint`)**: Deployed directly on the compute nodes/HPC resources. It connects upstream to the Bridge via WebSocket, loading local Plugins to execute tasks natively within the remote network boundary.
+1. **Bridge (`radical-orbit-bridge`)**: The centralized entry hub. It maintains WebSocket connections to external Endpoint services, manages endpoint discovery, and serves as an HTTP-to-WebSocket reverse proxy forwarding REST API calls to the respective Endpoints.
+2. **Endpoint Service (`radical-orbit-endpoint`)**: Deployed directly on the compute nodes/HPC resources. It connects upstream to the Bridge via WebSocket, loading local Plugins to execute tasks natively within the remote network boundary.
 3. **Clients / Portal (`client.py` & `orbit_explorer.html`)**: Developer and end-user interfaces. The Python Client SDK orchestrates dynamic REST interactions with Plugins, while the Web Portal demonstrates direct native JavaScript browser integration with the Bridge API over HTTP.
 
 ## Deployment
@@ -52,9 +52,9 @@ To override the defaults (different paths, remote bridge URL, etc.),
 set any of:
 
 ```sh
-export RADICAL_BRIDGE_URL='https://my-bridge:8000/'
-export RADICAL_BRIDGE_CERT="/path/to/bridge_cert.pem"
-export RADICAL_BRIDGE_KEY="/path/to/bridge_key.pem"  # only needed for the bridge
+export RADICAL_ORBIT_BRIDGE_URL='https://my-bridge:8000/'
+export RADICAL_ORBIT_BRIDGE_CERT="/path/to/bridge_cert.pem"
+export RADICAL_ORBIT_BRIDGE_KEY="/path/to/bridge_key.pem"  # only needed for the bridge
 ```
 
 See the **Bridge configuration** section below for the full
@@ -63,19 +63,19 @@ precedence rules (CLI > env > file).
 ### 2. Starting the Bridge
 The Bridge server exposes a REST API and a WebSocket endpoint (`/register`):
 ```sh
-./bin/orbit-bridge.py
+./bin/radical-orbit-bridge.py
 ```
 
 ### 3. Starting the Endpoint Service
 Start the endpoint service (ideally on your target HPC node) pointing to the running Bridge:
 ```sh
-./bin/orbit-endpoint.py --name my-endpoint --url wss://localhost:8000
+./bin/radical-orbit-endpoint.py --name my-endpoint --url wss://localhost:8000
 ```
 
 #### Using the Wrapper Script
 For launching endpoint services via batch job schedulers (e.g., SLURM), use the wrapper script which properly sets up the environment:
 ```sh
-./bin/orbit-endpoint-wrapper.sh --url wss://bridge.example.org:8000 --name my-hpc-endpoint
+./bin/radical-orbit-endpoint-wrapper.sh --url wss://bridge.example.org:8000 --name my-hpc-endpoint
 ```
 
 The wrapper script automatically detects and exports the correct `PYTHONPATH` for the installed modules.
@@ -193,9 +193,9 @@ precedence:
 
 | Item | Env var               | Default file                      |
 |------|-----------------------|-----------------------------------|
-| URL  | `RADICAL_BRIDGE_URL`  | `~/.radical/orbit/bridge.url`      |
-| Cert | `RADICAL_BRIDGE_CERT` | `~/.radical/orbit/bridge_cert.pem` |
-| Key  | `RADICAL_BRIDGE_KEY`  | `~/.radical/orbit/bridge_key.pem`  |
+| URL  | `RADICAL_ORBIT_BRIDGE_URL`  | `~/.radical/orbit/bridge.url`      |
+| Cert | `RADICAL_ORBIT_BRIDGE_CERT` | `~/.radical/orbit/bridge_cert.pem` |
+| Key  | `RADICAL_ORBIT_BRIDGE_KEY`  | `~/.radical/orbit/bridge_key.pem`  |
 
 
 Behaviour notes:
@@ -216,7 +216,7 @@ Behaviour notes:
 ### Bridge CLI Args
 
 ```
-orbit-bridge.py [options]
+radical-orbit-bridge.py [options]
   --cert CERT    TLS cert path                  (CLI > env > file)
   --key  KEY     TLS key path; mode 0o600       (CLI > env > file)
   --host HOST    Bind address (default: 0.0.0.0)
@@ -227,7 +227,7 @@ orbit-bridge.py [options]
 ### Endpoint Service CLI Args
 
 ```
-orbit-endpoint.py [options]
+radical-orbit-endpoint.py [options]
   --name NAME         Endpoint name (shown in Explorer and /endpoint/list)
   --url  URL          Bridge URL                 (CLI > env > file)
   --cert CERT         TLS cert path              (CLI > env > file)
@@ -240,10 +240,11 @@ orbit-endpoint.py [options]
 
 ### Log Level
 
-Set the standard Python logging level via environment or launcher:
+Set the logging level via `RADICAL_ORBIT_LOG_LVL` (or the generic
+`RADICAL_LOG_LVL`):
 
 ```sh
-RADICAL_LOG_LVL=DEBUG ./bin/orbit-bridge.py
+RADICAL_ORBIT_LOG_LVL=DEBUG ./bin/radical-orbit-bridge.py
 ```
 
 Or in code: `logging.getLogger("radical.orbit").setLevel(logging.DEBUG)`.
@@ -261,4 +262,4 @@ Or in code: `logging.getLogger("radical.orbit").setLevel(logging.DEBUG)`.
 : The PsiJ executor may be misconfigured. Check the endpoint log for PsiJ errors. For SLURM, verify the account and queue names are valid with `sinfo` and `sacctmgr`.
 
 **SSL verification error when connecting**
-: For `https://` / `wss://` URLs the cert is required — `BridgeClient` and endpoint services raise `ValueError` if no cert is resolved (CLI > env > file).  Either set `RADICAL_BRIDGE_CERT` to the `.pem` from setup, drop the file at `~/.radical/orbit/bridge_cert.pem`, or use a plain `http://` / `ws://` URL (cert resolution is then skipped entirely — dev mode only).
+: For `https://` / `wss://` URLs the cert is required — `BridgeClient` and endpoint services raise `ValueError` if no cert is resolved (CLI > env > file).  Either set `RADICAL_ORBIT_BRIDGE_CERT` to the `.pem` from setup, drop the file at `~/.radical/orbit/bridge_cert.pem`, or use a plain `http://` / `ws://` URL (cert resolution is then skipped entirely — dev mode only).

@@ -648,7 +648,7 @@ class PluginPSIJ(Plugin):
             "layout": "grid2",
             "fields": [
                 {"name": "exec", "type": "text", "label": "Executable",
-                 "default": "orbit-endpoint-wrapper.sh", "css_class": "p-exec",
+                 "default": "radical-orbit-endpoint-wrapper.sh", "css_class": "p-exec",
                  "column": 0},
                 {"name": "args", "type": "text", "label": "Arguments (space-separated)",
                  "placeholder": "auto-filled with --url and --name",

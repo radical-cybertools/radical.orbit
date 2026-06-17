@@ -16,10 +16,10 @@ from radical.orbit.bridge import Bridge
 def main():
     parser = argparse.ArgumentParser(description='ORBIT Bridge')
     parser.add_argument('--cert', default=None,
-                        help='TLS cert path.  CLI > $RADICAL_BRIDGE_CERT > '
+                        help='TLS cert path.  CLI > $RADICAL_ORBIT_BRIDGE_CERT > '
                              '~/.radical/orbit/bridge_cert.pem.')
     parser.add_argument('--key', default=None,
-                        help='TLS key path.  CLI > $RADICAL_BRIDGE_KEY > '
+                        help='TLS key path.  CLI > $RADICAL_ORBIT_BRIDGE_KEY > '
                              '~/.radical/orbit/bridge_key.pem.  Refuses to '
                              'start if the file is more permissive than '
                              '0o600.')
@@ -38,7 +38,8 @@ def main():
                              'supported. Combine, e.g.: "-p default,rose".')
     args = parser.parse_args()
 
-    log_level_name = os.environ.get('RADICAL_ORBIT_LOG_LEVEL', 'INFO').upper()
+    log_level_name = (os.environ.get('RADICAL_ORBIT_LOG_LVL')
+                      or os.environ.get('RADICAL_LOG_LVL') or 'INFO').upper()
     level = getattr(logging, log_level_name, logging.INFO)
     log_file = (os.environ.get('RADICAL_ORBIT_LOG_FILE')
                 or os.path.expanduser('~/.radical/orbit/logs/bridge.log'))

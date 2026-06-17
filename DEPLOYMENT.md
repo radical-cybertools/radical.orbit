@@ -28,15 +28,15 @@ session state lives in the endpoint processes.
 
 ```sh
 # HTTP (development only)
-./bin/orbit-bridge.py
+./bin/radical-orbit-bridge.py
 
 # HTTPS (production)
-export RADICAL_BRIDGE_CERT=/path/to/cert.pem
-export RADICAL_BRIDGE_KEY=/path/to/key.pem
-./bin/orbit-bridge.py
+export RADICAL_ORBIT_BRIDGE_CERT=/path/to/cert.pem
+export RADICAL_ORBIT_BRIDGE_KEY=/path/to/key.pem
+./bin/radical-orbit-bridge.py
 ```
 
-To change host/port, edit the last line of `bin/orbit-bridge.py`:
+To change host/port, edit the last line of `bin/radical-orbit-bridge.py`:
 
 ```python
 uvicorn.run(app, host="0.0.0.0", port=8000, ...)
@@ -53,9 +53,9 @@ After=network.target
 Type=simple
 User=radical
 WorkingDirectory=/opt/orbit
-Environment=RADICAL_BRIDGE_CERT=/opt/orbit/certs/bridge_cert.pem
-Environment=RADICAL_BRIDGE_KEY=/opt/orbit/certs/bridge_key.pem
-ExecStart=/opt/orbit/bin/orbit-bridge.py
+Environment=RADICAL_ORBIT_BRIDGE_CERT=/opt/orbit/certs/bridge_cert.pem
+Environment=RADICAL_ORBIT_BRIDGE_KEY=/opt/orbit/certs/bridge_key.pem
+ExecStart=/opt/orbit/bin/radical-orbit-bridge.py
 Restart=on-failure
 RestartSec=5s
 
@@ -70,7 +70,7 @@ or as long-running daemon processes on login nodes.
 
 ```sh
 # Direct launch (login node daemon)
-./bin/orbit-endpoint.py \
+./bin/radical-orbit-endpoint.py \
   --name my-hpc-endpoint \
   --url  wss://bridge.example.org:8000 \
   -p     sysinfo,psij,queue_info,staging
@@ -88,15 +88,15 @@ sbatch endpoint_job.sh
 #SBATCH --nodes=1
 #SBATCH --time=24:00:00
 
-export RADICAL_BRIDGE_CERT=/path/to/bridge_cert.pem
+export RADICAL_ORBIT_BRIDGE_CERT=/path/to/bridge_cert.pem
 
-./bin/orbit-endpoint-wrapper.sh \
+./bin/radical-orbit-endpoint-wrapper.sh \
   --name "$SLURM_CLUSTER_NAME-endpoint" \
   --url  wss://bridge.example.org:8000 \
   -p     sysinfo,psij,queue_info,staging,rhapsody
 ```
 
-The wrapper script (`orbit-endpoint-wrapper.sh`) sets up `PYTHONPATH` and
+The wrapper script (`radical-orbit-endpoint-wrapper.sh`) sets up `PYTHONPATH` and
 `PATH` for the installed package before starting the endpoint service.
 
 ## Session Persistence
@@ -133,12 +133,12 @@ curl -sk https://bridge:8000/endpoint/list -X POST | jq .
 
 ## Observability
 
-Log level is controlled via the `RADICAL_LOG_LVL` environment variable or
-standard Python logging:
+Log level is controlled via the `RADICAL_ORBIT_LOG_LVL` environment
+variable (falling back to the generic `RADICAL_LOG_LVL`):
 
 ```sh
 # DEBUG logging
-RADICAL_LOG_LVL=DEBUG ./bin/orbit-bridge.py
+RADICAL_ORBIT_LOG_LVL=DEBUG ./bin/radical-orbit-bridge.py
 ```
 
 Key log namespaces:

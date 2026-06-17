@@ -21,8 +21,8 @@ Usage
 
 Prerequisites
 -------------
-- A running bridge (orbit-bridge.py)
-- A running parent endpoint on the login node (orbit-endpoint-wrapper.sh --url <bridge>)
+- A running bridge (radical-orbit-bridge.py)
+- A running parent endpoint on the login node (radical-orbit-endpoint-wrapper.sh --url <bridge>)
 - The parent endpoint must have the 'psij' plugin loaded
 """
 
@@ -101,7 +101,7 @@ def main():
         arguments.append('--tunnel')
 
     job_spec = {
-        'executable': 'orbit-endpoint-wrapper.sh',
+        'executable': 'radical-orbit-endpoint-wrapper.sh',
         'arguments':  arguments,
         'attributes': attributes,
     }

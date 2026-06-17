@@ -826,7 +826,7 @@ class XGFabricSession(PluginSession):
         args += ["-p", ",".join(plugin_filter)]
 
         pilot_spec = {
-            "executable": "orbit-endpoint.sh",
+            "executable": "radical-orbit-endpoint.sh",
             "arguments": args,
             "attributes": {
                 "queue_name": cluster.get('queue', 'regular'),

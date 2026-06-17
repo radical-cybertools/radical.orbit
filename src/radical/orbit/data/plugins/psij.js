@@ -32,7 +32,7 @@ export function template() {
       <div class="card-title">📝 Submit Job</div>
       <div class="grid2">
         <div>
-          <div class="form-group"><label>Executable</label><input class="p-exec" type="text" value="orbit-endpoint-wrapper.sh" /></div>
+          <div class="form-group"><label>Executable</label><input class="p-exec" type="text" value="radical-orbit-endpoint-wrapper.sh" /></div>
           <div class="form-group"><label>Arguments (space-separated)</label><input class="p-args" type="text" value="" placeholder="auto-filled with --url and --name" /></div>
           <div class="form-group"><label>Executor</label>
             <select class="p-executor">
@@ -147,7 +147,7 @@ export function init(page, api) {
 
   // Toggle --tunnel in the arguments field when the checkbox changes.
   // Only modify args when the executable is the endpoint wrapper / service script,
-  // since --tunnel is a orbit-endpoint flag, not a general job argument.
+  // since --tunnel is a radical-orbit-endpoint flag, not a general job argument.
   const ENDPOINT_EXEC_RE = /orbit(?:-wrapper\.sh|-service(?:\.py)?)$/;
   const tunnelChk = page.querySelector('.p-tunnel');
   if (tunnelChk) {

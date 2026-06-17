@@ -25,10 +25,10 @@ focus of this example is the *plumbing*:
 What makes this example interesting
 ───────────────────────────────────
   • **Endpoint auto-selection** — no bridge URL or endpoint name hard-coded.
-    ``rhapsody.get_backend('orbit')`` reads ``RADICAL_BRIDGE_URL`` from
+    ``rhapsody.get_backend('orbit')`` reads ``RADICAL_ORBIT_BRIDGE_URL`` from
     the environment and picks the first connected endpoint that advertises
     a Rhapsody plugin (defaults: ``https://localhost:8000`` is *not*
-    assumed; set ``RADICAL_BRIDGE_URL`` if your bridge runs elsewhere).
+    assumed; set ``RADICAL_ORBIT_BRIDGE_URL`` if your bridge runs elsewhere).
 
   • **Closure discipline** — DragonExecutionBackendV3 cloudpickles every
     function task before launching it.  Live DDict handles, the ACL
@@ -53,13 +53,13 @@ DDict key layout (shared across all Dragon-managed processes)
 Run
 ───
     # In one terminal: start the bridge
-    ./bin/orbit-bridge.py
+    ./bin/radical-orbit-bridge.py
 
     # In another: start an endpoint with the rhapsody plugin loaded
-    ./bin/orbit-endpoint-wrapper.sh
+    ./bin/radical-orbit-endpoint-wrapper.sh
 
     # Then:
-    export RADICAL_BRIDGE_URL=https://localhost:8000   # optional
+    export RADICAL_ORBIT_BRIDGE_URL=https://localhost:8000   # optional
     python examples/example_rose.py
 """
 
@@ -95,7 +95,7 @@ async def make_engine():
     """Build a Rhapsody Endpoint backend and wrap it in an asyncflow engine.
 
     With no arguments, ``get_backend('orbit')`` resolves the bridge URL
-    from ``$RADICAL_BRIDGE_URL`` and auto-selects the first connected
+    from ``$RADICAL_ORBIT_BRIDGE_URL`` and auto-selects the first connected
     endpoint advertising an enabled ``rhapsody`` plugin.  A ``RuntimeError``
     surfaces from ``await backend`` if no candidate is found.
     """

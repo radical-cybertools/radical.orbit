@@ -17,18 +17,18 @@ from radical.orbit.service import EndpointService
 import radical.orbit.logging_config as _lc
 
 
-log = logging.getLogger("radical.orbit")
+log = logging.getLogger("radical.orbit.endpoint")
 
 
 async def main():
     parser = argparse.ArgumentParser(description="ORBIT Service")
     parser.add_argument("--name",      "-n", nargs="?", help="Endpoint name")
     parser.add_argument("--url",       "-u", nargs="?",
-                        help="Bridge URL.  CLI > $RADICAL_BRIDGE_URL > "
+                        help="Bridge URL.  CLI > $RADICAL_ORBIT_BRIDGE_URL > "
                              "~/.radical/orbit/bridge.url.")
     parser.add_argument("--cert",      "-c", nargs="?",
                         help="Bridge TLS cert path.  CLI > "
-                             "$RADICAL_BRIDGE_CERT > "
+                             "$RADICAL_ORBIT_BRIDGE_CERT > "
                              "~/.radical/orbit/bridge_cert.pem.")
     parser.add_argument("--plugins",   "-p", default="default",
                         help="Comma-separated plugins to load (default: "
@@ -38,9 +38,11 @@ async def main():
                              "allowed: 'iri*'.  Prefix matching supported: "
                              "'sys'→sysinfo.  Combine, e.g.: '-p default,rose'.")
     parser.add_argument("--log-level", "-l",
-                        default=os.environ.get("RADICAL_ORBIT_LOG_LEVEL", "INFO"),
+                        default=(os.environ.get("RADICAL_ORBIT_LOG_LVL")
+                                 or os.environ.get("RADICAL_LOG_LVL") or "INFO"),
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-                        help="Log level (default: INFO; env: RADICAL_ORBIT_LOG_LEVEL)")
+                        help="Log level (default: INFO; env: "
+                             "RADICAL_ORBIT_LOG_LVL / RADICAL_LOG_LVL)")
     parser.add_argument("--tunnel", default='none',
                         choices=['none', 'forward', 'reverse'],
                         help="SSH tunnel mode for the bridge connection. "

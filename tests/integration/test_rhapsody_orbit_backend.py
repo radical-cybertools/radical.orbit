@@ -2,7 +2,7 @@
 Integration tests for OrbitExecutionBackend → Bridge → Endpoint → Rhapsody plugin.
 
 These tests require:
-  - A running bridge (RADICAL_BRIDGE_URL set or default localhost:8000)
+  - A running bridge (RADICAL_ORBIT_BRIDGE_URL set or default localhost:8000)
   - A connected endpoint with the rhapsody plugin loaded (concurrent backend)
 
 Run with:
@@ -29,7 +29,7 @@ except ImportError:
 
 
 def _get_bridge_url():
-    return os.environ.get('RADICAL_BRIDGE_URL', 'http://localhost:8000')
+    return os.environ.get('RADICAL_ORBIT_BRIDGE_URL', 'http://localhost:8000')
 
 
 def _get_endpoint_name():

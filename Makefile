@@ -214,7 +214,6 @@ prep_pypi:
 	@echo "      * create a new virtualenv via 'virtualenv test_ve'"
 	@echo "      * use that virtualenv via 'source test_ve/bin/activate'"
 	@echo "      * install your package from pypi, via 'pip install --upgrade radical.orbit'"
-	@echo "      * ensure basic functionality, eg. via 'radical-radical.orbit-version'"
 	@read reply
 	@echo "  * Pypi setup is now done."
 	@read reply

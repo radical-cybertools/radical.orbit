@@ -4,12 +4,12 @@ x-common-image: &common-image
 x-endpoint-service: &endpoint-service
   <<: *common-image
   environment:
-    - RADICAL_BRIDGE_URL=https://${RADICAL_BRIDGE_HOSTNAME:-bridge}:8000
-  command: [ "bash", "-c", "orbit-endpoint-wrapper.sh -n $$(hostname) --plugins psij,rhapsody,staging,task_dispatcher" ]
+    - RADICAL_ORBIT_BRIDGE_URL=https://${RADICAL_ORBIT_BRIDGE_HOSTNAME:-bridge}:8000
+  command: [ "bash", "-c", "radical-orbit-endpoint-wrapper.sh -n $$(hostname) --plugins psij,rhapsody,staging,task_dispatcher" ]
   volumes:
-    - orbit-volume:/app:ro
+    - radical-orbit-volume:/app:ro
   networks:
-    - orbit-network
+    - radical-orbit-network
   depends_on:
     image-builder:
       condition: service_completed_successfully
@@ -20,7 +20,7 @@ services:
 
   image-builder:
     <<: *common-image
-    container_name: orbit-image-builder
+    container_name: radical-orbit-image-builder
     build:
       context: ..
       dockerfile: docker/Dockerfile
@@ -28,16 +28,16 @@ services:
         RADICAL_ORBIT_BRANCH: ${RADICAL_ORBIT_BRANCH:-master}
         GENERATE_BRIDGE_CERT: "true"
         BRIDGE_IP: "127.0.0.1"
-        BRIDGE_HOSTNAME: ${RADICAL_BRIDGE_HOSTNAME:-bridge}
+        BRIDGE_HOSTNAME: ${RADICAL_ORBIT_BRIDGE_HOSTNAME:-bridge}
     command: [ "echo", "Build complete" ]
     networks:
-      - orbit-network
+      - radical-orbit-network
 
   bridge:
     <<: *common-image
-    container_name: radical-bridge
-    hostname: ${RADICAL_BRIDGE_HOSTNAME:-bridge}
-    command: [ "orbit-bridge.py" ]
+    container_name: radical-orbit-bridge
+    hostname: ${RADICAL_ORBIT_BRIDGE_HOSTNAME:-bridge}
+    command: [ "radical-orbit-bridge.py" ]
     healthcheck:
       test:
         - CMD-SHELL
@@ -49,34 +49,34 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - orbit-volume:/app
+      - radical-orbit-volume:/app
     networks:
-      - orbit-network
+      - radical-orbit-network
     depends_on:
       image-builder:
         condition: service_completed_successfully
 
   endpoint-a:
     <<: *endpoint-service
-    container_name: orbit-a
+    container_name: radical-orbit-endpoint-a
     hostname: endpoint_a
 
   endpoint-b:
     <<: *endpoint-service
-    container_name: orbit-b
+    container_name: radical-orbit-endpoint-b
     hostname: endpoint_b
 
   client:
     <<: *common-image
-    container_name: orbit-client
+    container_name: radical-orbit-client
     hostname: client
     environment:
-      - RADICAL_BRIDGE_URL=https://${RADICAL_BRIDGE_HOSTNAME:-bridge}:8000
+      - RADICAL_ORBIT_BRIDGE_URL=https://${RADICAL_ORBIT_BRIDGE_HOSTNAME:-bridge}:8000
     command: [ "tail", "-f", "/dev/null" ]
     volumes:
-      - orbit-volume:/app:ro
+      - radical-orbit-volume:/app:ro
     networks:
-      - orbit-network
+      - radical-orbit-network
     depends_on:
       image-builder:
         condition: service_completed_successfully
@@ -88,9 +88,9 @@ services:
         condition: service_started
 
 volumes:
-  orbit-volume:
-    name: orbit-volume
+  radical-orbit-volume:
+    name: radical-orbit-volume
 
 networks:
-  orbit-network:
-    name: orbit-network
+  radical-orbit-network:
+    name: radical-orbit-network

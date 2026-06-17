@@ -29,17 +29,17 @@ RUN micromamba install -y -n $ENV_NAME -f /tmp/environment.yml && \
 ARG MAMBA_DOCKERFILE_ACTIVATE=1
 ENV PATH="/opt/conda/bin:${PATH}"
 
-ENV RADICAL_BRIDGE_CERT="/app/private/bridge_cert.pem"
-ENV RADICAL_BRIDGE_KEY="/app/private/bridge_key.pem"
+ENV RADICAL_ORBIT_BRIDGE_CERT="/app/private/bridge_cert.pem"
+ENV RADICAL_ORBIT_BRIDGE_KEY="/app/private/bridge_key.pem"
 
 ARG GENERATE_BRIDGE_CERT=false
 ARG BRIDGE_IP=127.0.0.1
 ARG BRIDGE_HOSTNAME=localhost
 RUN if [ "$GENERATE_BRIDGE_CERT" = "true" ]; then \
-        mkdir -p $(dirname "$RADICAL_BRIDGE_CERT") && \
+        mkdir -p $(dirname "$RADICAL_ORBIT_BRIDGE_CERT") && \
         openssl req -x509 -nodes -days 3650 -newkey rsa:4096 \
-            -keyout "${RADICAL_BRIDGE_KEY}" \
-            -out "${RADICAL_BRIDGE_CERT}" \
+            -keyout "${RADICAL_ORBIT_BRIDGE_KEY}" \
+            -out "${RADICAL_ORBIT_BRIDGE_CERT}" \
             -subj "/CN=${BRIDGE_IP}" \
             -addext "subjectAltName = IP:${BRIDGE_IP},DNS:${BRIDGE_HOSTNAME},IP:127.0.0.1,DNS:localhost"; \
         echo "Certificate generated for ${BRIDGE_HOSTNAME} and ${BRIDGE_IP}"; \

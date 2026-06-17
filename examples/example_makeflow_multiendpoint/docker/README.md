@@ -43,10 +43,10 @@ export RADICAL_ORBIT_BRANCH=feature/task-dispatcher
    Execute the Makeflow workflow from the client container. Since the workflow file is copied into the image, you can run it directly:
 
    ```bash
-   docker exec -it orbit-client orbit-makeflow workflow.makeflow
+   docker exec -it radical-orbit-client radical-orbit-makeflow workflow.makeflow
    ```
 
-   The `orbit-makeflow` script will:
+   The `radical-orbit-makeflow` script will:
    - Preprocess the workflow.
    - Dispatch tasks to the appropriate endpoint nodes (`endpoint_a` or `endpoint_b`).
    - Manage cross-endpoint file transfers through the client.
@@ -55,7 +55,7 @@ export RADICAL_ORBIT_BRANCH=feature/task-dispatcher
    After the workflow completes, check for the generated `summary.txt`:
 
    ```bash
-   docker exec orbit-client cat summary.txt
+   docker exec radical-orbit-client cat summary.txt
    ```
 
 ## Cleanup

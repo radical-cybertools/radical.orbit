@@ -27,7 +27,7 @@ command itself.
 ## Prerequisites
 
 1. A radical.orbit **bridge** running somewhere reachable
-   (`RADICAL_BRIDGE_URL` set).
+   (`RADICAL_ORBIT_BRIDGE_URL` set).
 2. Two radical.orbit **endpoints** connected to that bridge:
    - one named `endpoint_a` with the `task_dispatcher`, `rhapsody`, `staging`,
      and `psij` plugins loaded
@@ -47,31 +47,31 @@ scp pools.json endpoint_a_host:~/.radical/orbit/task_dispatcher/pools.json
 scp pools.json endpoint_b_host:~/.radical/orbit/task_dispatcher/pools.json
 
 # Start the bridge on the client host
-orbit-bridge.py &
+radical-orbit-bridge.py &
 
 # Start endpoint_a on its login node
-RADICAL_BRIDGE_URL=... orbit-endpoint-wrapper.sh -n endpoint_a \
+RADICAL_ORBIT_BRIDGE_URL=... radical-orbit-endpoint-wrapper.sh -n endpoint_a \
     --plugins task_dispatcher,rhapsody,staging,psij &
 
 # Start endpoint_b on its login node
-RADICAL_BRIDGE_URL=... orbit-endpoint-wrapper.sh -n endpoint_b \
+RADICAL_ORBIT_BRIDGE_URL=... radical-orbit-endpoint-wrapper.sh -n endpoint_b \
     --plugins task_dispatcher,rhapsody,staging,psij &
 
 # On the client host, run the workflow
 cd examples/example_makeflow_multiendpoint
-orbit-makeflow workflow.makeflow
+radical-orbit-makeflow workflow.makeflow
 ```
 
-The `orbit-makeflow` convenience script preprocesses
+The `radical-orbit-makeflow` convenience script preprocesses
 `workflow.makeflow` into a temporary file with every rule's command
-wrapped by `orbit-run`, then invokes `makeflow` on it.
+wrapped by `radical-orbit-run`, then invokes `makeflow` on it.
 
 After the run completes, `summary.txt` appears in the current
 directory.
 
 ## What's happening under the hood
 
-For each rule, Makeflow spawns one `orbit-run` subprocess.  The
+For each rule, Makeflow spawns one `radical-orbit-run` subprocess.  The
 wrapper:
 
 1. Uploads declared inputs (`--in`) via `task_dispatcher.stage_in` to

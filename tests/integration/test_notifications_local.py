@@ -32,8 +32,8 @@ from pathlib import Path
 
 
 REPO_ROOT  = Path(__file__).resolve().parents[2]
-BIN_BRIDGE = REPO_ROOT / 'bin' / 'orbit-bridge.py'
-BIN_ENDPOINT   = REPO_ROOT / 'bin' / 'orbit-endpoint.py'
+BIN_BRIDGE = REPO_ROOT / 'bin' / 'radical-orbit-bridge.py'
+BIN_ENDPOINT   = REPO_ROOT / 'bin' / 'radical-orbit-endpoint.py'
 
 ENDPOINT_NAME       = 'test-endpoint-local'
 NOTIF_TIMEOUT_S = 30.0   # generous: covers slow PsiJ local startup
@@ -100,9 +100,9 @@ def run_test() -> int:
     # different bridge / cert from a previous unrelated session.
     env = {k: v for k, v in os.environ.items() if not k.startswith('RADICAL_')}
     env.update(
-        RADICAL_BRIDGE_URL=bridge_url,
-        RADICAL_BRIDGE_CERT=cert_path,
-        RADICAL_ORBIT_LOG_LEVEL='DEBUG',
+        RADICAL_ORBIT_BRIDGE_URL=bridge_url,
+        RADICAL_ORBIT_BRIDGE_CERT=cert_path,
+        RADICAL_ORBIT_LOG_LVL='DEBUG',
     )
 
     bridge_proc = subprocess.Popen(

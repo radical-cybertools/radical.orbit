@@ -13,10 +13,10 @@ services:
       args:
         GENERATE_BRIDGE_CERT: "true"
         BRIDGE_IP: "127.0.0.1"
-        BRIDGE_HOSTNAME: ${RADICAL_BRIDGE_HOSTNAME:-bridge}
-    container_name: radical-bridge
-    hostname: ${RADICAL_BRIDGE_HOSTNAME:-bridge}
-    command: [ "orbit-bridge.py" ]
+        BRIDGE_HOSTNAME: ${RADICAL_ORBIT_BRIDGE_HOSTNAME:-bridge}
+    container_name: radical-orbit-bridge
+    hostname: ${RADICAL_ORBIT_BRIDGE_HOSTNAME:-bridge}
+    command: [ "radical-orbit-bridge.py" ]
     healthcheck:
       test:
         - CMD-SHELL
@@ -29,24 +29,24 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - orbit-volume:/app
+      - radical-orbit-volume:/app
     networks:
-      - orbit-network
+      - radical-orbit-network
 
   endpoint:
     <<: *common-build
     build:
       args:
         GENERATE_BRIDGE_CERT: "false"
-    container_name: orbit
+    container_name: radical-orbit-endpoint
     hostname: endpoint
     environment:
-      - RADICAL_BRIDGE_URL=https://${RADICAL_BRIDGE_HOSTNAME:-bridge}:8000
-    command: [ "orbit-endpoint.py" ]
+      - RADICAL_ORBIT_BRIDGE_URL=https://${RADICAL_ORBIT_BRIDGE_HOSTNAME:-bridge}:8000
+    command: [ "radical-orbit-endpoint.py" ]
     volumes:
-      - orbit-volume:/app:ro
+      - radical-orbit-volume:/app:ro
     networks:
-      - orbit-network
+      - radical-orbit-network
     depends_on:
       bridge:
         condition: service_healthy
@@ -56,15 +56,15 @@ services:
     build:
       args:
         GENERATE_BRIDGE_CERT: "false"
-    container_name: orbit-client
+    container_name: radical-orbit-client
     hostname: client
     environment:
-      - RADICAL_BRIDGE_URL=https://${RADICAL_BRIDGE_HOSTNAME:-bridge}:8000
+      - RADICAL_ORBIT_BRIDGE_URL=https://${RADICAL_ORBIT_BRIDGE_HOSTNAME:-bridge}:8000
     command: [ "tail", "-f", "/dev/null" ]
     volumes:
-      - orbit-volume:/app:ro
+      - radical-orbit-volume:/app:ro
     networks:
-      - orbit-network
+      - radical-orbit-network
     depends_on:
       bridge:
         condition: service_healthy
@@ -72,9 +72,9 @@ services:
         condition: service_started
 
 volumes:
-  orbit-volume:
-    name: orbit-volume
+  radical-orbit-volume:
+    name: radical-orbit-volume
 
 networks:
-  orbit-network:
-    name: orbit-network
+  radical-orbit-network:
+    name: radical-orbit-network

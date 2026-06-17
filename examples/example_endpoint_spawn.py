@@ -180,7 +180,7 @@ def main():
     child_name = f"{parent_eid}.{os.getpid()}"
     plugins    = ','.join(parent.list_plugins().keys())
     job_spec = {
-        "executable": "orbit-endpoint.py",
+        "executable": "radical-orbit-endpoint.py",
         "arguments": ["--url", bc._url, "--name", child_name, "-p", plugins],
         "attributes": {
             "queue_name":    queue,

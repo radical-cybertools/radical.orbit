@@ -369,7 +369,7 @@ MACHINE_DEFAULTS = {
 #
 #  Per-target ``amsc_dir`` (target-side) is a path component (relative
 #  to the target's ``$HOME``) under which the install script laid down
-#  ``ve/bin/orbit-endpoint-wrapper.sh``.  Defaults to ``.amsc``; override
+#  ``ve/bin/radical-orbit-endpoint-wrapper.sh``.  Defaults to ``.amsc``; override
 #  per target via the ``amsc_dir`` field in IRI_DEFAULTS / MACHINE_DEFAULTS.
 #
 #  Bridge cert is no longer plumbed by this script — child endpoints
@@ -500,7 +500,7 @@ def _make_progress(n_matey, n_infer, n_gkeyll):
 #    1. Read the bearer token from ~/.amsc/token_<endpoint>.
 #    2. iri_connect.connect(...) — creates a dynamic iri.<endpoint> plugin
 #       on the bridge and returns an IRIInstanceClient bound to it.
-#    3. Submit a job whose executable is orbit-endpoint-wrapper.sh.  The job
+#    3. Submit a job whose executable is radical-orbit-endpoint-wrapper.sh.  The job
 #       will WS-connect back to the bridge; if --tunnel is set, the child
 #       opens an outbound SSH tunnel to ``login_host`` first.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -513,7 +513,7 @@ def _validate_iri_cfg(endpoint, cfg):
         raise RuntimeError(f'IRI {endpoint}: home_dir on target is required '
                            f'(used to resolve <home>/'
                            f'{cfg.get("amsc_dir") or ".amsc"}'
-                           f'/ve/bin/orbit-endpoint-wrapper.sh)')
+                           f'/ve/bin/radical-orbit-endpoint-wrapper.sh)')
 
 
 def read_token(endpoint):
@@ -543,7 +543,7 @@ def launch_iri(bc, endpoint, cfg, bridge_url):
     endpoint_name = f'{endpoint}.{COUNTERS[endpoint]}'
     COUNTERS[endpoint] += 1
 
-    # Build the orbit-endpoint.py CLI.  See bin/orbit-endpoint.py.
+    # Build the radical-orbit-endpoint.py CLI.  See bin/radical-orbit-endpoint.py.
     args = ['--name', endpoint_name, '--url', bridge_url]
     if cfg['tunnel']:
         args += ['--tunnel', '--tunnel-via', cfg['login_host']]
@@ -571,13 +571,13 @@ def launch_iri(bc, endpoint, cfg, bridge_url):
     # bash as a path component and never expands.
     home    = cfg['home_dir'].rstrip('/')
     amsc    = (cfg.get('amsc_dir') or '.amsc').strip('/')
-    wrapper = f'{home}/{amsc}/ve/bin/orbit-endpoint-wrapper.sh'
+    wrapper = f'{home}/{amsc}/ve/bin/radical-orbit-endpoint-wrapper.sh'
 
     # Cert resolution is delegated to the child endpoint: it falls back to
-    # ``~/.radical/orbit/bridge_cert.pem`` (or $RADICAL_BRIDGE_CERT if
+    # ``~/.radical/orbit/bridge_cert.pem`` (or $RADICAL_ORBIT_BRIDGE_CERT if
     # set on the target side).  We only inject the bridge URL — that
     # changes per bridge run and the file fallback would be stale.
-    env = {'RADICAL_BRIDGE_URL': bridge_url}
+    env = {'RADICAL_ORBIT_BRIDGE_URL': bridge_url}
     env.update(cfg['environment'])
     # Site-specific shell snippet — module loads, env exports, etc.
     # The wrapper ``eval``s this *before* exec-ing dragon / python.
@@ -630,7 +630,7 @@ def launch_psij(bc, endpoint_name, cfg, bridge_url):
     # care about, so the login-endpoint's home is also the compute job's.
     home    = endpoint.get_plugin('sysinfo').homedir().rstrip('/')
     amsc    = (cfg.get('amsc_dir') or '.amsc').strip('/')
-    wrapper = f'{home}/{amsc}/ve/bin/orbit-endpoint-wrapper.sh'
+    wrapper = f'{home}/{amsc}/ve/bin/radical-orbit-endpoint-wrapper.sh'
 
     # Unique name for the child endpoint.
     COUNTERS[endpoint_name] += 1
@@ -656,9 +656,9 @@ def launch_psij(bc, endpoint_name, cfg, bridge_url):
         custom_attrs[f'{cfg["executor"]}.qos'] = cfg['qos']
     # Cert is left to the child endpoint to resolve from
     # ``~/.radical/orbit/bridge_cert.pem`` on the target (or via
-    # $RADICAL_BRIDGE_CERT if explicitly set there).  Only the bridge
+    # $RADICAL_ORBIT_BRIDGE_CERT if explicitly set there).  Only the bridge
     # URL — which changes per bridge run — is injected here.
-    env = {'RADICAL_BRIDGE_URL': bridge_url}
+    env = {'RADICAL_ORBIT_BRIDGE_URL': bridge_url}
     # Site-specific shell snippet — module loads, env exports, etc.
     # The wrapper ``eval``s this *before* exec-ing dragon / python.
     if cfg.get('setup'):

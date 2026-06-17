@@ -173,10 +173,10 @@ class BridgeClient:
         Initialize the Bridge Client.
 
         Args:
-            url: The bridge URL.  CLI > env (``RADICAL_BRIDGE_URL``) >
+            url: The bridge URL.  CLI > env (``RADICAL_ORBIT_BRIDGE_URL``) >
                  file (``~/.radical/orbit/bridge.url``).
             cert: Path to CA cert.  Same precedence using
-                  ``RADICAL_BRIDGE_CERT`` and
+                  ``RADICAL_ORBIT_BRIDGE_CERT`` and
                   ``~/.radical/orbit/bridge_cert.pem``.  Required when
                   the URL scheme is ``https``; ignored for ``http``.
         """

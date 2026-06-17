@@ -1,6 +1,6 @@
 """Tests for the :class:`radical.orbit.bridge.Bridge` class.
 
-The bridge logic moved from ``bin/orbit-bridge.py`` (module-level
+The bridge logic moved from ``bin/radical-orbit-bridge.py`` (module-level
 globals) to a class with instance attributes — these tests construct a
 ``Bridge`` and poke its ``.pending`` / ``.endpoints`` directly.
 """

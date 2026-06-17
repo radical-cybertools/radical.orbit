@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""orbit-makeflow-prep — preprocess a .makeflow for the task dispatcher.
+"""radical-orbit-makeflow-prep — preprocess a .makeflow for the task dispatcher.
 
 Reads a user-authored Makeflow file and rewrites every rule's command
-to route through ``orbit-run``.  Directives ``ENDPOINT``, ``POOL``,
+to route through ``radical-orbit-run``.  Directives ``ENDPOINT``, ``POOL``,
 and ``PRIORITY`` are scoped like Makeflow's existing ``CATEGORY``:
 an assignment applies to all subsequent rules until overridden.
 
 Usage:
-    orbit-makeflow-prep INPUT.makeflow \\
+    radical-orbit-makeflow-prep INPUT.makeflow \\
         [--output OUTPUT.makeflow] \\
         [--default-endpoint NAME] [--default-pool NAME] \\
         [--default-priority N]
@@ -24,7 +24,7 @@ Input example (before prep):
 Output (after prep):
 
     out.dat: in.dat
-        orbit-run --endpoint=perlmutter --pool=cpu_small \\
+        radical-orbit-run --endpoint=perlmutter --pool=cpu_small \\
                          --priority=10 --run-id=<sha1> \\
                          --in in.dat --out out.dat \\
                          -- ./compute in.dat out.dat
@@ -322,7 +322,7 @@ def _emit_rule(rule: Rule, run_id: str,
     Makeflow's ``LOCAL`` keyword (``LOCAL <cmd>`` on the first command
     line) marks the rule as "always run on the submitter, never via
     a worker".  We honour it by NOT wrapping the command in
-    orbit-run; the LOCAL prefix is preserved so makeflow
+    radical-orbit-run; the LOCAL prefix is preserved so makeflow
     executes the rule on the submitter itself.
     '''
     stripped, is_local = _strip_local(rule.commands)
@@ -350,14 +350,14 @@ def _strip_local(commands: list[str]) -> tuple[list[str], bool]:
 
 def _build_wrapper_cmd(rule: Rule, run_id: str, original: str,
                         vars: dict[str, str]) -> str:
-    '''Produce the ``orbit-run ... -- sh -c '<cmd>'`` line.
+    '''Produce the ``radical-orbit-run ... -- sh -c '<cmd>'`` line.
 
     The original command is wrapped in ``sh -c`` so shell grammar
     (pipes, redirections, compound commands) is contained as a single
     argument to the wrapper rather than splitting at the outer shell
     that Makeflow uses to invoke the rule.
     '''
-    parts = ['orbit-run']
+    parts = ['radical-orbit-run']
     # Exactly one of endpoint/pool is set (validated above).
     if rule.endpoint is not None:
         parts.append(f'--endpoint={_q(rule.endpoint)}')
@@ -368,7 +368,7 @@ def _build_wrapper_cmd(rule: Rule, run_id: str, original: str,
     if rule.pools:
         parts.append(f'--pools={_q(rule.pools)}')
     # Endpoint mode doesn't (yet) support input/output staging, so skip
-    # the --in/--out flags entirely — orbit-run would reject
+    # the --in/--out flags entirely — radical-orbit-run would reject
     # them at argparse time otherwise.
     if rule.endpoint is None:
         for f in rule.inputs:
@@ -429,7 +429,7 @@ class PrepError(ValueError):
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        prog='orbit-makeflow-prep',
+        prog='radical-orbit-makeflow-prep',
         description='Rewrite a .makeflow for the task dispatcher.')
     ap.add_argument('input', type=Path,
                     help='input .makeflow file')
@@ -452,7 +452,7 @@ def main(argv: list[str] | None = None) -> int:
                     type=int, default=0)
     ap.add_argument('--pools',            dest='pools_file',
                     help='Path to a pools.json declaring the workflow\'s '
-                         'pools.  Forwarded to orbit-run on every '
+                         'pools.  Forwarded to radical-orbit-run on every '
                          'generated rule (--pools=<path>).  Without this, '
                          'rules use the dispatcher\'s built-in "default" '
                          'pool — which usually isn\'t what you want.  '
@@ -464,7 +464,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     if not args.input.is_file():
-        print(f'orbit-makeflow-prep: input not found: {args.input}',
+        print(f'radical-orbit-makeflow-prep: input not found: {args.input}',
               file=sys.stderr)
         return 2
 
@@ -486,7 +486,7 @@ def main(argv: list[str] | None = None) -> int:
         lines = args.input.read_text().splitlines(keepends=True)
         out_lines = prep_stream(lines, run_id, opts)
     except PrepError as e:
-        print(f'orbit-makeflow-prep: {e}', file=sys.stderr)
+        print(f'radical-orbit-makeflow-prep: {e}', file=sys.stderr)
         return 3
 
     output = args.output or args.input.with_suffix(

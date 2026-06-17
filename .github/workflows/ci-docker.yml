@@ -17,7 +17,7 @@ jobs:
       RADICAL_ORBIT_IMAGE: radicalcybertools/radical.orbit
       RADICAL_ORBIT_TAG: dev
       RADICAL_ORBIT_BRANCH: ${{ github.base_ref || 'devel' }}
-      RADICAL_BRIDGE_HOSTNAME: bridge
+      RADICAL_ORBIT_BRIDGE_HOSTNAME: bridge
 
     defaults:
       run:
@@ -39,7 +39,7 @@ jobs:
           tags: ${{ env.RADICAL_ORBIT_IMAGE }}:${{ env.RADICAL_ORBIT_TAG }}
           build-args: |
             GENERATE_BRIDGE_CERT=true
-            BRIDGE_HOSTNAME=${{ env.RADICAL_BRIDGE_HOSTNAME }}
+            BRIDGE_HOSTNAME=${{ env.RADICAL_ORBIT_BRIDGE_HOSTNAME }}
             RADICAL_ORBIT_BRANCH=${{ env.RADICAL_ORBIT_BRANCH }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -55,7 +55,7 @@ jobs:
 
       - name: Run example (sysinfo)
         run: |
-          docker exec orbit-client bash -c \
+          docker exec radical-orbit-client bash -c \
             "cd /app/radical.orbit/examples && \
              python3 example_sysinfo.py"
 

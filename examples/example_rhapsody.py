@@ -7,7 +7,7 @@ Submits a batch of compute tasks through the ORBIT bridge,
 waits for completion, and prints the results and session statistics.
 
 Prerequisites:
-  - A ORBIT bridge is running (RADICAL_BRIDGE_URL set).
+  - A ORBIT bridge is running (RADICAL_ORBIT_BRIDGE_URL set).
   - An endpoint service is connected with the Rhapsody plugin loaded.
   - The ``rhapsody`` package is installed on the endpoint node.
 """

@@ -22,11 +22,11 @@ Requires two terminals (optionally three for testing):
 
 ```sh
 # Terminal 1 – Bridge (reverse proxy, public-facing)
-./bin/orbit-bridge.py
+./bin/radical-orbit-bridge.py
 
 # Terminal 2 – Endpoint service (HPC side, connects to bridge via WebSocket)
-./bin/orbit-endpoint-wrapper.sh  # preferred: sets up PATH and PYTHONPATH
-# or: ./bin/orbit-endpoint.py
+./bin/radical-orbit-endpoint-wrapper.sh  # preferred: sets up PATH and PYTHONPATH
+# or: ./bin/radical-orbit-endpoint.py
 
 # Terminal 3 – Test client (optional)
 python examples/example_sysinfo.py   # System info
@@ -62,9 +62,9 @@ The flake8 config ignores many whitespace/formatting rules to match the project'
 
 ### Three-tier request flow
 
-1. **Bridge** (`bin/orbit-bridge.py`) – FastAPI server acting as reverse proxy. Clients send HTTP requests; the bridge forwards them to the appropriate endpoint over a persistent WebSocket, then returns the response. Correlates requests via UUID. Provides SSE endpoint (`/events`) for real-time notifications.
+1. **Bridge** (`bin/radical-orbit-bridge.py`) – FastAPI server acting as reverse proxy. Clients send HTTP requests; the bridge forwards them to the appropriate endpoint over a persistent WebSocket, then returns the response. Correlates requests via UUID. Provides SSE endpoint (`/events`) for real-time notifications.
 
-2. **Endpoint** (`bin/orbit-endpoint.py`, wrapper: `bin/orbit-endpoint-wrapper.sh`) – FastAPI service on HPC nodes. Initiates an outbound WebSocket connection to the bridge (firewall-friendly). Receives forwarded requests from the bridge, dispatches them to locally-mounted plugin routes via HTTP loopback, and returns results.
+2. **Endpoint** (`bin/radical-orbit-endpoint.py`, wrapper: `bin/radical-orbit-endpoint-wrapper.sh`) – FastAPI service on HPC nodes. Initiates an outbound WebSocket connection to the bridge (firewall-friendly). Receives forwarded requests from the bridge, dispatches them to locally-mounted plugin routes via HTTP loopback, and returns results.
 
 3. **Plugins** – extend the endpoint with domain-specific functionality. Each plugin gets a unique namespace (`/{plugin_name}/{uuid}/`) to avoid route collisions.
 
@@ -85,7 +85,7 @@ Key endpoints:
 
 **Available plugins:**
 - **sysinfo** (`plugin_sysinfo.py`) – System info (hostname, OS, CPU, memory, disk, network, GPUs). Detects shared filesystems (Lustre, GPFS, NFS, DVS, etc.). Background prefetch on startup. Client API: `SysInfoClient.homedir()` (session-less, returns endpoint home dir), `get_metrics()` (requires session).
-- **psij** (`plugin_psij.py`) – HPC job submission via PsiJ (supports local, SLURM, PBS, LSF). Background job state polling. Default executable: `orbit-endpoint-wrapper.sh`. Stores job metadata at submit time. Client API: `submit_job(job_spec, executor)`, `get_job_status(job_id, stdout_offset, stderr_offset)` (streams stdout/stderr with byte offsets), `list_jobs()`, `cancel_job(job_id)`, `submit_tunneled(job_spec, executor, tunnel='none'|'forward'|'reverse')` (spawns child endpoint via batch job; see tunnel section below), `tunnel_status(endpoint_name)` (session-less, returns `{status, port, pid}`). Notification topic: `job_status` → `{job_id, state, exit_code, stdout, stderr}`.
+- **psij** (`plugin_psij.py`) – HPC job submission via PsiJ (supports local, SLURM, PBS, LSF). Background job state polling. Default executable: `radical-orbit-endpoint-wrapper.sh`. Stores job metadata at submit time. Client API: `submit_job(job_spec, executor)`, `get_job_status(job_id, stdout_offset, stderr_offset)` (streams stdout/stderr with byte offsets), `list_jobs()`, `cancel_job(job_id)`, `submit_tunneled(job_spec, executor, tunnel='none'|'forward'|'reverse')` (spawns child endpoint via batch job; see tunnel section below), `tunnel_status(endpoint_name)` (session-less, returns `{status, port, pid}`). Notification topic: `job_status` → `{job_id, state, exit_code, stdout, stderr}`.
 - **Tunnel implementation** — three runtime modes selected per-target via the `tunnel` field on `submit_tunneled` (and on the IRI/PsiJ entries in `examples/{amsc,matey}.py`):
   - `'none'` — child connects directly to the bridge.  No SSH spawn.
   - `'forward'` (compute→login) — `submit_tunneled` injects `--tunnel forward` and `--tunnel-via <login_hostname>` into the child's argv.  The child opens `ssh -L <port>:<bridge_host>:<bridge_port> <login_host> -N` itself, writes `~/.radical/orbit/tunnels/<endpoint_name>.port` on the shared filesystem, then rewrites its bridge URL to `https://localhost:<port>`.  Used on Aurora / Perlmutter (compute→login SSH allowed; reverse direction blocked).  Failure surfaces naturally as the job's `FAILED` state — no parent-side cancel needed.

@@ -156,10 +156,12 @@ def configure_logging(level: int = logging.INFO,
     logging.basicConfig(force=True, level=level, handlers=list(handlers))
 
 
-# Auto-configure on import.  Honor ``RADICAL_ORBIT_LOG_LEVEL`` so that
-# client scripts (amsc.py, etc.) inherit the level via env without
-# needing a code edit; entry-point scripts call ``configure_logging``
-# again after argparse, so this has no effect on them.
-_env_level = os.environ.get('RADICAL_ORBIT_LOG_LEVEL', 'INFO').upper()
+# Auto-configure on import.  Honor ``RADICAL_ORBIT_LOG_LVL`` (falling
+# back to the generic ``RADICAL_LOG_LVL``) so that client scripts
+# (amsc.py, etc.) inherit the level via env without needing a code
+# edit; entry-point scripts call ``configure_logging`` again after
+# argparse, so this has no effect on them.
+_env_level = (os.environ.get('RADICAL_ORBIT_LOG_LVL')
+              or os.environ.get('RADICAL_LOG_LVL') or 'INFO').upper()
 configure_logging(getattr(logging, _env_level, logging.INFO))
 

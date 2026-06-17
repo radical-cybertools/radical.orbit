@@ -12,7 +12,7 @@ per-task arguments (heterogeneous) to compare template-compressed vs
 regular batched submit paths.
 
 Prerequisites:
-  - A ORBIT bridge is running (RADICAL_BRIDGE_URL set).
+  - A ORBIT bridge is running (RADICAL_ORBIT_BRIDGE_URL set).
   - An endpoint service is connected with the Rhapsody plugin loaded.
   - The ``rhapsody`` package is installed on both client and endpoint.
 

@@ -20,10 +20,10 @@ from typing  import Any, Dict, List, Optional, Tuple
 #  Bridge connection config (consumer side: endpoint / client / cert+key reads).
 #
 #  Env vars:
-#    RADICAL_BRIDGE_URL  — bridge URL for endpoints / clients to connect to
-#    RADICAL_BRIDGE_CERT — TLS cert path (bridge serves with it; endpoints /
+#    RADICAL_ORBIT_BRIDGE_URL  — bridge URL for endpoints / clients to connect to
+#    RADICAL_ORBIT_BRIDGE_CERT — TLS cert path (bridge serves with it; endpoints /
 #                          clients verify against it)
-#    RADICAL_BRIDGE_KEY  — TLS key path (bridge only)
+#    RADICAL_ORBIT_BRIDGE_KEY  — TLS key path (bridge only)
 #
 #  Fallback files (placed by the operator; never auto-written from env):
 #    ~/.radical/orbit/bridge.url
@@ -43,9 +43,9 @@ URL_FILE     = DEFAULT_DIR / 'bridge.url'
 CERT_FILE    = DEFAULT_DIR / 'bridge_cert.pem'
 KEY_FILE     = DEFAULT_DIR / 'bridge_key.pem'
 
-ENV_URL      = 'RADICAL_BRIDGE_URL'
-ENV_CERT     = 'RADICAL_BRIDGE_CERT'
-ENV_KEY      = 'RADICAL_BRIDGE_KEY'
+ENV_URL      = 'RADICAL_ORBIT_BRIDGE_URL'
+ENV_CERT     = 'RADICAL_ORBIT_BRIDGE_CERT'
+ENV_KEY      = 'RADICAL_ORBIT_BRIDGE_KEY'
 
 
 def _read_url_file(path: Optional[Path] = None) -> Optional[str]:
@@ -148,7 +148,7 @@ def public_url_forms(host: str, port: int, *,
 def resolve_bridge_url(cli: Optional[str] = None) -> Tuple[str, str]:
     """Resolve the bridge URL for a *consumer* (endpoint / client).
 
-    Precedence: CLI arg > ``$RADICAL_BRIDGE_URL`` > ``~/.radical/orbit/bridge.url``.
+    Precedence: CLI arg > ``$RADICAL_ORBIT_BRIDGE_URL`` > ``~/.radical/orbit/bridge.url``.
 
     Returns ``(url, source)`` with source one of
     ``'cli'`` / ``'env'`` / ``'file'``.  Raises ``ValueError`` if no
@@ -192,7 +192,7 @@ def resolve_bridge_cert(cli: Optional[str] = None) -> Tuple[Path, str]:
     with the resolved cert path; that does the server-side pairing
     via ``load_cert_chain``.
 
-    Precedence: CLI arg > ``$RADICAL_BRIDGE_CERT`` >
+    Precedence: CLI arg > ``$RADICAL_ORBIT_BRIDGE_CERT`` >
     ``~/.radical/orbit/bridge_cert.pem``.
 
     Returns ``(path, source)``.  Raises ``ValueError`` if no source

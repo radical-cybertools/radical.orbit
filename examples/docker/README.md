@@ -23,7 +23,7 @@ export RADICAL_ORBIT_TAG=dev
 # for the demo we use the current `devel` branch
 export RADICAL_ORBIT_BRANCH=devel
 # for the demo we use the hostname for the bridge as `bridge`
-export RADICAL_BRIDGE_HOSTNAME=bridge
+export RADICAL_ORBIT_BRIDGE_HOSTNAME=bridge
 ```
 
 ### 2. Build the image
@@ -38,7 +38,7 @@ endpoint.
 cd examples/docker
 docker build --build-arg GENERATE_BRIDGE_CERT=true \
              --build-arg BRIDGE_IP=127.0.0.1 \
-             --build-arg BRIDGE_HOSTNAME=${RADICAL_BRIDGE_HOSTNAME} \
+             --build-arg BRIDGE_HOSTNAME=${RADICAL_ORBIT_BRIDGE_HOSTNAME} \
              --build-arg RADICAL_ORBIT_BRANCH=${RADICAL_ORBIT_BRANCH} \
              -t ${RADICAL_ORBIT_IMAGE}:${RADICAL_ORBIT_TAG} .
 ```
@@ -50,7 +50,7 @@ docker build --build-arg GENERATE_BRIDGE_CERT=true \
 docker compose up -d
 
 # get into the client container and run the example
-docker exec -it orbit-client bash
+docker exec -it radical-orbit-client bash
 
 cd /app/radical.orbit/examples
 python3 example_sysinfo.py

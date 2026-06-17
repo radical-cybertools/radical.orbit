@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""orbit-run — submit one task to the bridge task dispatcher and
+"""radical-orbit-run — submit one task to the bridge task dispatcher and
 block until it reaches a terminal state.
 
-Invoked per Makeflow rule by ``orbit-makeflow-prep``-rewritten
+Invoked per Makeflow rule by ``radical-orbit-makeflow-prep``-rewritten
 commands, but usable standalone.  Everything after the ``--`` separator
 is the command to run on the remote endpoint.
 
 Usage:
-    orbit-run (--pool NAME | --endpoint NAME) --run-id ID \\
+    radical-orbit-run (--pool NAME | --endpoint NAME) --run-id ID \\
         [--priority N] [--in FILE]... [--out FILE]... \\
         [--pools pools.json] -- COMMAND [ARG...]
 
@@ -66,19 +66,19 @@ def _split_argv(argv: list[str]) -> tuple[list[str], list[str]]:
     try:
         sep = argv.index('--')
     except ValueError:
-        print('orbit-run: missing -- separator before the command',
+        print('radical-orbit-run: missing -- separator before the command',
               file=sys.stderr)
         sys.exit(2)
     opts = argv[1:sep]
     cmd  = argv[sep + 1:]
     if not cmd:
-        print('orbit-run: no command after --', file=sys.stderr)
+        print('radical-orbit-run: no command after --', file=sys.stderr)
         sys.exit(2)
     return opts, cmd
 
 
 def _parse_opts(opts: list[str]) -> argparse.Namespace:
-    ap = argparse.ArgumentParser(prog='orbit-run',
+    ap = argparse.ArgumentParser(prog='radical-orbit-run',
                                   add_help=False)
     # --endpoint XOR --pool: a task targets either a pool (dispatcher
     # manages pilots) or an endpoint directly (transparent proxy to that
@@ -108,7 +108,7 @@ def _parse_opts(opts: list[str]) -> argparse.Namespace:
     args.outputs = _flatten(args.outputs)
     # Endpoint mode does not support file staging yet.
     if args.endpoint and (args.inputs or args.outputs):
-        print('orbit-run: --in/--out are not supported with --endpoint; '
+        print('radical-orbit-run: --in/--out are not supported with --endpoint; '
               'use --pool for staging-enabled tasks',
               file=sys.stderr)
         sys.exit(2)
@@ -224,7 +224,7 @@ class Wrapper:
             # Sentinel upload — named so it's obvious in the scratch dir.
             reply = td.stage_in(
                 self.args.pool, self.task_id,
-                '.orbit-run.scratch-init', b'',
+                '.radical-orbit-run.scratch-init', b'',
                 overwrite=True)
             cwd = reply['cwd']
         else:
@@ -233,7 +233,7 @@ class Wrapper:
                     with open(path, 'rb') as fh:
                         content = fh.read()
                 except OSError as e:
-                    print(f'orbit-run: cannot read input {path}: {e}',
+                    print(f'radical-orbit-run: cannot read input {path}: {e}',
                           file=sys.stderr)
                     sys.exit(3)
                 filename = os.path.basename(path)
@@ -256,7 +256,7 @@ class Wrapper:
             try:
                 content = td.stage_out(self.task_id, name)
             except Exception as e:
-                print(f'orbit-run: stage_out failed for {name}: {e}',
+                print(f'radical-orbit-run: stage_out failed for {name}: {e}',
                       file=sys.stderr)
                 continue
             dest = Path(local_path)
@@ -282,7 +282,7 @@ class Wrapper:
             return self._final_state
 
         # Fallback: poll
-        print('orbit-run: SSE not connected; falling back to polling',
+        print('radical-orbit-run: SSE not connected; falling back to polling',
               file=sys.stderr)
         td = self._td_client
         assert td is not None
@@ -290,7 +290,7 @@ class Wrapper:
             try:
                 t = td.get_task(self.task_id)  # type: ignore[attr-defined]
             except Exception as e:
-                print(f'orbit-run: get_task failed: {e}',
+                print(f'radical-orbit-run: get_task failed: {e}',
                       file=sys.stderr)
                 time.sleep(_POLL_INTERVAL_SEC)
                 continue
@@ -301,13 +301,13 @@ class Wrapper:
     def _install_signal_handler(self) -> None:
         '''On SIGTERM/SIGINT, cancel the task and exit.'''
         def _on_signal(signum, _frame):
-            print(f'orbit-run: caught signal {signum}; '
+            print(f'radical-orbit-run: caught signal {signum}; '
                   f'cancelling task {self.task_id}', file=sys.stderr)
             try:
                 if self._td_client is not None:
                     self._td_client.cancel_task(self.task_id)  # type: ignore[attr-defined]
             except Exception as e:
-                print(f'orbit-run: cancel_task failed: {e}',
+                print(f'radical-orbit-run: cancel_task failed: {e}',
                       file=sys.stderr)
             sys.exit(130 if signum == signal.SIGINT else 143)
 
@@ -351,7 +351,7 @@ class Wrapper:
                             for p in self.args.outputs],
             )
         except Exception as e:
-            print(f'orbit-run: submit failed: {e}', file=sys.stderr)
+            print(f'radical-orbit-run: submit failed: {e}', file=sys.stderr)
             return 4
 
         final = self._wait_for_terminal()
@@ -369,13 +369,14 @@ class Wrapper:
 
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
-        level=os.environ.get('RADICAL_ORBIT_LOG_LEVEL', 'WARNING'),
-        format='%(asctime)s orbit-run %(levelname)s %(message)s',
+        level=(os.environ.get('RADICAL_ORBIT_LOG_LVL')
+               or os.environ.get('RADICAL_LOG_LVL') or 'WARNING'),
+        format='%(asctime)s radical-orbit-run %(levelname)s %(message)s',
         stream=sys.stderr)
 
     if argv is None:
         argv = sys.argv
-    # --help before argument parsing so "orbit-run --help" works.
+    # --help before argument parsing so "radical-orbit-run --help" works.
     if any(a in ('-h', '--help') for a in argv[1:]):
         print(__doc__)
         return 0

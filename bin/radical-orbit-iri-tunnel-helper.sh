@@ -22,7 +22,7 @@
 #       The child polls for this file, then connects to localhost:<port>.
 #
 # Usage:
-#   ./bin/orbit-iri-tunnel-helper.sh
+#   ./bin/radical-orbit-iri-tunnel-helper.sh
 #
 # Quick & dirty: polls every second, processes each .req exactly once,
 # kills its SSH when the SSH dies (e.g. compute node disappears at job

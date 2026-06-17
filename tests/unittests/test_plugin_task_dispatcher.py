@@ -314,7 +314,7 @@ class TestBridgeHostLoadsDispatcher:
         from radical.orbit.bridge_plugin_host import BridgePluginHost
         # Steer the dispatcher's default state/scratch roots at tmp_path
         # so the host's auto-built plugin doesn't pollute $HOME.
-        monkeypatch.setenv('RADICAL_BRIDGE_URL', 'https://localhost:9999')
+        monkeypatch.setenv('RADICAL_ORBIT_BRIDGE_URL', 'https://localhost:9999')
         monkeypatch.setattr(
             'radical.orbit.plugin_task_dispatcher._DEFAULT_STATE_ROOT',
             tmp_path / 'state')

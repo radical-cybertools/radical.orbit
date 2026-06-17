@@ -5,9 +5,9 @@
 # in the same venv, the service is launched via ``dragon`` so plugins that
 # require the Dragon runtime (Rhapsody) initialise correctly.
 #
-# Log level is controlled by RADICAL_ORBIT_LOG_LEVEL (default: INFO).
+# Log level is controlled by RADICAL_ORBIT_LOG_LVL (default: INFO).
 # Set to DEBUG before submitting to get verbose output in the job log:
-#   export RADICAL_ORBIT_LOG_LEVEL=DEBUG
+#   export RADICAL_ORBIT_LOG_LVL=DEBUG
 
 export PATH="@BINDIR@:${PATH}"
 export PYTHONPATH="@SITEPKGS@:${PYTHONPATH:-}"
@@ -53,8 +53,8 @@ fi
 
 if [ "$USE_DRAGON" = "yes" ]; then
     echo "[orbit] starting with dragon ($DRAGON_PATH)" >&2
-    exec "$DRAGON_PATH" $ARGS "@BINDIR@/orbit-endpoint.py" "$@"
+    exec "$DRAGON_PATH" $ARGS "@BINDIR@/radical-orbit-endpoint.py" "$@"
 else
     echo "[orbit] starting with python ($PYTHON_PATH) — $REASON" >&2
-    exec "$PYTHON_PATH" "@BINDIR@/orbit-endpoint.py" "$@"
+    exec "$PYTHON_PATH" "@BINDIR@/radical-orbit-endpoint.py" "$@"
 fi

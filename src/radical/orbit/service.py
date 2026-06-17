@@ -32,7 +32,7 @@ from radical.orbit.models import (
 )
 from radical.orbit.ui_schema import ui_config_to_dict
 
-log = logging.getLogger("radical.orbit")
+log = logging.getLogger("radical.orbit.endpoint")
 
 
 # ---------------------------------------------------------------------------
@@ -109,10 +109,10 @@ class EndpointService(PluginHostBase):
 
         Args:
             bridge_url: WebSocket URL for the Bridge.  CLI > env
-                        (``RADICAL_BRIDGE_URL``) > file
+                        (``RADICAL_ORBIT_BRIDGE_URL``) > file
                         (``~/.radical/orbit/bridge.url``).
             cert: Path to the bridge's TLS cert.  Same precedence using
-                  ``RADICAL_BRIDGE_CERT`` and
+                  ``RADICAL_ORBIT_BRIDGE_CERT`` and
                   ``~/.radical/orbit/bridge_cert.pem``.
             name: Endpoint service name for identification.  Defaults to
                   hostname.
@@ -144,7 +144,7 @@ class EndpointService(PluginHostBase):
         from urllib.parse import urlparse
         from . import utils
         # Resolve bridge URL + cert via the shared helper.  No
-        # side-effect on the local URL file: a one-off ``RADICAL_BRIDGE_URL``
+        # side-effect on the local URL file: a one-off ``RADICAL_ORBIT_BRIDGE_URL``
         # to point at a different bridge must not clobber the file
         # the operator may rely on for the *default* bridge.
         resolved_url, _ = utils.resolve_bridge_url(cli=bridge_url)
@@ -714,7 +714,7 @@ class EndpointService(PluginHostBase):
           the script's node != ``scheduler.job_nodes()[0]``.
 
         * **IRI-launched** — no parent endpoint on the login node; a
-          standalone helper (``bin/orbit-iri-tunnel-helper.sh``)
+          standalone helper (``bin/radical-orbit-iri-tunnel-helper.sh``)
           watches the relay dir for ``.req`` files and does the
           spawn+write.
 

@@ -1,7 +1,7 @@
 """ORBIT Bridge — class-based.
 
 This module hosts the :class:`Bridge` class.  The thin
-``bin/orbit-bridge.py`` script just argparse-parses CLI options
+``bin/radical-orbit-bridge.py`` script just argparse-parses CLI options
 and instantiates ``Bridge(...).run()``.
 
 Bridge config (URL/cert/key) is resolved via
@@ -66,9 +66,9 @@ class Bridge:
                ``None``, the bridge constructs its own with the lifespan
                handler attached.
       cert:    CLI override for the TLS cert path.  Falls back to
-               ``$RADICAL_BRIDGE_CERT`` → ``~/.radical/orbit/bridge_cert.pem``.
+               ``$RADICAL_ORBIT_BRIDGE_CERT`` → ``~/.radical/orbit/bridge_cert.pem``.
       key:     CLI override for the TLS key path.  Falls back to
-               ``$RADICAL_BRIDGE_KEY`` → ``~/.radical/orbit/bridge_key.pem``.
+               ``$RADICAL_ORBIT_BRIDGE_KEY`` → ``~/.radical/orbit/bridge_key.pem``.
                Refuses to start if the key file is more permissive than
                ``0o600``.
       host:    bind address (default ``0.0.0.0``).

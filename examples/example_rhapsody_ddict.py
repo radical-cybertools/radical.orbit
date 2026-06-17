@@ -11,7 +11,7 @@ serialized descriptor.  Task 2 (consumer) attaches to the same DDict
 via that descriptor, reads the data, and destroys the DDict.
 
 Prerequisites:
-  - A ORBIT bridge is running (RADICAL_BRIDGE_URL set).
+  - A ORBIT bridge is running (RADICAL_ORBIT_BRIDGE_URL set).
   - An endpoint service is connected with the Rhapsody plugin loaded.
   - Dragon runtime is active on the endpoint node.
 

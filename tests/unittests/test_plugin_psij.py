@@ -153,7 +153,7 @@ async def test_submit_tunneled_missing_name(mock_psij):
 
     payload = {
         "job_spec": {
-            "executable": "orbit-endpoint-wrapper.sh",
+            "executable": "radical-orbit-endpoint-wrapper.sh",
             "arguments": ["--url", "http://bridge:8000"]
         },
         "executor": "local"
@@ -179,7 +179,7 @@ async def test_submit_tunneled_no_tunnel(mock_psij):
 
     payload = {
         "job_spec": {
-            "executable": "orbit-endpoint-wrapper.sh",
+            "executable": "radical-orbit-endpoint-wrapper.sh",
             "arguments": ["--url", "http://bridge:8000", "-n", "test-endpoint"]
         },
         "executor": "local",
@@ -216,7 +216,7 @@ async def test_submit_tunneled_with_tunnel(mock_psij):
 
         payload = {
             "job_spec": {
-                "executable": "orbit-endpoint-wrapper.sh",
+                "executable": "radical-orbit-endpoint-wrapper.sh",
                 "arguments": ["--url", "http://bridge:8000", "-n", "tunnel-endpoint"],
             },
             "executor": "slurm",
@@ -255,7 +255,7 @@ async def test_submit_tunneled_duplicate_watcher(mock_psij):
 
     payload = {
         "job_spec": {
-            "executable": "orbit-endpoint-wrapper.sh",
+            "executable": "radical-orbit-endpoint-wrapper.sh",
             "arguments": ["--url", "http://bridge:8000", "-n", "dup-endpoint"]
         },
         "executor": "local"

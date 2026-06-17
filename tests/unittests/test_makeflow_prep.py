@@ -1,4 +1,4 @@
-"""Unit tests for bin/orbit-makeflow-prep.
+"""Unit tests for bin/radical-orbit-makeflow-prep.
 
 Exercises the preprocessor's parser, directive scoping, rewrite
 semantics, and error reporting.  The script has no ``.py`` extension
@@ -16,7 +16,7 @@ import pytest
 _loader = SourceFileLoader(
     'prep_mod',
     str(Path(__file__).resolve().parents[2]
-        / 'bin' / 'orbit-makeflow-prep')
+        / 'bin' / 'radical-orbit-makeflow-prep')
 )
 _spec = importlib.util.spec_from_loader('prep_mod', _loader)
 _prep = importlib.util.module_from_spec(_spec)
@@ -46,7 +46,7 @@ class TestBasicRewrite:
             '\n'
             'out.dat: in.dat\n'
             '\t./compute in.dat out.dat\n')
-        assert 'orbit-run' in out
+        assert 'radical-orbit-run' in out
         assert '--endpoint=e1' in out
         assert '--pool=' not in out
         assert '--run-id=runid0' in out
@@ -62,7 +62,7 @@ class TestBasicRewrite:
             '\n'
             'out.dat: in.dat\n'
             '\t./compute in.dat out.dat\n')
-        assert 'orbit-run' in out
+        assert 'radical-orbit-run' in out
         assert '--pool=p1' in out
         assert '--endpoint=' not in out
         assert '--in in.dat' in out
@@ -99,7 +99,7 @@ class TestScoping:
             'a: i1\n\tc1\n'
             'POOL = "p2"\n'
             'b: i2\n\tc2\n')
-        lines = [l for l in out.split('\n') if 'orbit-run' in l]
+        lines = [l for l in out.split('\n') if 'radical-orbit-run' in l]
         assert len(lines) == 2
         assert '--pool=p1' in lines[0]
         assert '--pool=p2' in lines[1]
@@ -159,7 +159,7 @@ class TestEndpointPoolMutex:
             'a: i1\n\tc1\n'
             'POOL = "p1"\n'
             'b: i2\n\tc2\n')
-        lines = [l for l in out.split('\n') if 'orbit-run' in l]
+        lines = [l for l in out.split('\n') if 'radical-orbit-run' in l]
         assert len(lines) == 2
         assert '--endpoint=e1' in lines[0]
         assert '--pool=' not in lines[0]
@@ -189,7 +189,7 @@ class TestPoolsFile:
             'a: i\n\tc1\n'
             'b: a\n\tc2\n',
             pools_file='/wf/pools.json')
-        lines = [l for l in out.splitlines() if 'orbit-run' in l]
+        lines = [l for l in out.splitlines() if 'radical-orbit-run' in l]
         assert len(lines) == 2
         for line in lines:
             assert '--pools=/wf/pools.json' in line
@@ -299,7 +299,7 @@ class TestMultiCommand:
         # the preprocessor doesn't produce a syntactically broken line.
         # Compile-check via shlex.split:
         import shlex as _shlex
-        line = [l for l in out.split('\n') if 'orbit-run' in l][0]
+        line = [l for l in out.split('\n') if 'radical-orbit-run' in l][0]
         tokens = _shlex.split(line)
         sep    = tokens.index('--')
         # After '-- sh -c', the final token should equal the original.
@@ -315,21 +315,21 @@ class TestLocalKeyword:
 
     def test_local_rule_not_wrapped(self):
         '''A rule whose command starts with ``LOCAL `` is left to
-        Makeflow (LOCAL preserved, no orbit-run wrapper).
+        Makeflow (LOCAL preserved, no radical-orbit-run wrapper).
         '''
         out = _run(
             'ENDPOINT = "e"\n'
             'o: i\n'
             '\tLOCAL ./gen.sh > o\n')
         # The LOCAL keyword is preserved and the command is NOT
-        # wrapped in orbit-run.
+        # wrapped in radical-orbit-run.
         assert 'LOCAL ./gen.sh > o' in out
-        assert 'orbit-run' not in out
+        assert 'radical-orbit-run' not in out
 
     def test_non_local_rule_still_wrapped(self):
         out = _run('ENDPOINT = "e"\n'
                    'o: i\n\t./gen.sh\n')
-        assert 'orbit-run' in out
+        assert 'radical-orbit-run' in out
         assert 'LOCAL' not in out
 
 
@@ -352,7 +352,7 @@ class TestMakeflowVarRewrite:
             'ENDPOINT = "e"\n'
             'o: i\n'
             '\tcp $(SRC)/file $(DST)/file\n')
-        line = [l for l in out.splitlines() if 'orbit-run' in l][0]
+        line = [l for l in out.splitlines() if 'radical-orbit-run' in l][0]
         assert '$(SRC)' not in line
         assert '$(DST)' not in line
         assert '/in/file'  in line
@@ -366,7 +366,7 @@ class TestMakeflowVarRewrite:
             'ENDPOINT = "e"\n'
             'o: i\n'
             '\tcp $(NOSUCH)/x.txt /tmp/\n')
-        line = [l for l in out.splitlines() if 'orbit-run' in l][0]
+        line = [l for l in out.splitlines() if 'radical-orbit-run' in l][0]
         assert '$(NOSUCH)' in line
 
     def test_local_rule_not_expanded(self):

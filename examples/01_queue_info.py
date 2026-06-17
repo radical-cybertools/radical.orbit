@@ -15,8 +15,8 @@ Usage:
   ./examples/01_queue_info.py --name=frontier --slurm_conf=/etc/slurm/frontier.conf
 
 Prerequisites:
-  - Bridge running   (bin/orbit-bridge.py)
-  - Endpoint running     (bin/orbit-endpoint.py)
+  - Bridge running   (bin/radical-orbit-bridge.py)
+  - Endpoint running     (bin/radical-orbit-endpoint.py)
   - SLURM commands available on the endpoint node (sinfo, squeue, sacctmgr)
 """
 

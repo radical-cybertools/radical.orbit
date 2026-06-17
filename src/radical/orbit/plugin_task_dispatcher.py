@@ -647,7 +647,7 @@ class PluginTaskDispatcher(Plugin):
         '''
         try:
             bridge_url  = getattr(self._app.state, 'bridge_url', None)
-            bridge_cert = os.environ.get('RADICAL_BRIDGE_CERT')
+            bridge_cert = os.environ.get('RADICAL_ORBIT_BRIDGE_CERT')
             if not bridge_url:
                 log.warning('[%s] bridge_url missing; SSE disabled',
                             self.instance_name)
@@ -1383,19 +1383,19 @@ class PluginTaskDispatcher(Plugin):
         The dispatcher signals "this is a pilot child endpoint" via
         ``RADICAL_ORBIT_POOL`` / ``RADICAL_ORBIT_RHAPSODY_BACKEND`` /
         ``RADICAL_ORBIT_SCRATCH_BASE``.  Bridge/cert names use the same
-        ``RADICAL_BRIDGE_*`` vars that any plain endpoint service reads, so
-        the generic ``orbit-endpoint-wrapper.sh`` works without renames.
+        ``RADICAL_ORBIT_BRIDGE_*`` vars that any plain endpoint service reads, so
+        the generic ``radical-orbit-endpoint-wrapper.sh`` works without renames.
         '''
         bridge_url = getattr(self._app.state, 'bridge_url', '') or ''
         env: dict[str, str] = {
-            'RADICAL_BRIDGE_URL'           : str(bridge_url),
+            'RADICAL_ORBIT_BRIDGE_URL'           : str(bridge_url),
             'RADICAL_ORBIT_POOL'            : pool_state.config.name,
             'RADICAL_ORBIT_RHAPSODY_BACKEND': record.rhapsody_backend,
             'RADICAL_ORBIT_SCRATCH_BASE'    : str(pool_state.scratch_base),
         }
-        cert = os.environ.get('RADICAL_BRIDGE_CERT')
+        cert = os.environ.get('RADICAL_ORBIT_BRIDGE_CERT')
         if cert:
-            env['RADICAL_BRIDGE_CERT'] = cert
+            env['RADICAL_ORBIT_BRIDGE_CERT'] = cert
         return env
 
     def _build_job_spec(self, pool_state: PoolState,
@@ -1418,7 +1418,7 @@ class PluginTaskDispatcher(Plugin):
             attributes['project'] = pool_state.config.account
 
         return {
-            'executable' : 'orbit-endpoint-wrapper.sh',
+            'executable' : 'radical-orbit-endpoint-wrapper.sh',
             'arguments'  : ['-n', child_endpoint, '--plugins', 'default'],
             'environment': env,
             'resources'  : resources,

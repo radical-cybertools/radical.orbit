@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""orbit-makeflow — one-shot prep + makeflow.
+"""radical-orbit-makeflow — one-shot prep + makeflow.
 
-Convenience wrapper around ``orbit-makeflow-prep`` and the
+Convenience wrapper around ``radical-orbit-makeflow-prep`` and the
 ``makeflow`` binary.  Preprocesses the input in a temporary directory,
 then invokes ``makeflow`` with any passthrough flags.
 
 Usage:
-    orbit-makeflow INPUT.makeflow [-- makeflow-args...]
-    orbit-makeflow --default-endpoint=e --default-pool=p INPUT.makeflow
+    radical-orbit-makeflow INPUT.makeflow [-- makeflow-args...]
+    radical-orbit-makeflow --default-endpoint=e --default-pool=p INPUT.makeflow
 
 Examples:
-    orbit-makeflow workflow.makeflow
-    orbit-makeflow workflow.makeflow -- -T local -j 4
+    radical-orbit-makeflow workflow.makeflow
+    radical-orbit-makeflow workflow.makeflow -- -T local -j 4
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ def main(argv: list[str] | None = None) -> int:
     prep_args, makeflow_args = _split_argv(argv)
 
     ap = argparse.ArgumentParser(
-        prog='orbit-makeflow',
+        prog='radical-orbit-makeflow',
         description='Preprocess and run a .makeflow via the task dispatcher.')
     ap.add_argument('input', type=Path,
                     help='input .makeflow file')
@@ -57,17 +57,17 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(prep_args)
 
     if not args.input.is_file():
-        print(f'orbit-makeflow: input not found: {args.input}',
+        print(f'radical-orbit-makeflow: input not found: {args.input}',
               file=sys.stderr)
         return 2
 
     makeflow_bin = shutil.which('makeflow')
     if makeflow_bin is None:
-        print('orbit-makeflow: makeflow binary not found in PATH',
+        print('radical-orbit-makeflow: makeflow binary not found in PATH',
               file=sys.stderr)
         return 2
 
-    with tempfile.TemporaryDirectory(prefix='orbit-makeflow-') as td:
+    with tempfile.TemporaryDirectory(prefix='radical-orbit-makeflow-') as td:
         prepped = Path(td) / (args.input.name + '.prepped')
 
         prep_cmd = [_find_prep(), str(args.input), '-o', str(prepped)]
@@ -96,20 +96,20 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _find_prep() -> str:
-    '''Locate ``orbit-makeflow-prep``.
+    '''Locate ``radical-orbit-makeflow-prep``.
 
     Normally it lives next to us on ``PATH`` after install.  Fall back
     to the adjacent file for in-tree invocations.
     '''
-    found = shutil.which('orbit-makeflow-prep')
+    found = shutil.which('radical-orbit-makeflow-prep')
     if found:
         return found
     candidate = Path(__file__).resolve().with_name(
-        'orbit-makeflow-prep')
+        'radical-orbit-makeflow-prep')
     if candidate.is_file():
         return str(candidate)
     raise FileNotFoundError(
-        'orbit-makeflow-prep not found; install the package or '
+        'radical-orbit-makeflow-prep not found; install the package or '
         'ensure it is on PATH')
 
 
