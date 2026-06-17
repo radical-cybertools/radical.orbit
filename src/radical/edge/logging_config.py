@@ -140,6 +140,10 @@ def configure_logging(level: int = logging.INFO,
         protected = logging.getLogger(name)
         for h in list(protected.handlers):
             protected.removeHandler(h)
+            try:
+                h.close()
+            except Exception:
+                pass
         for h in handlers:
             protected.addHandler(h)
         protected.setLevel(level)
