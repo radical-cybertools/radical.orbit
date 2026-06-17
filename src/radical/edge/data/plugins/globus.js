@@ -370,7 +370,7 @@ async function cancelTask(page, api, tid) {
   if (!st || !st.sid) return;
   try {
     await api.fetch(`cancel/${st.sid}/${tid}`, { method: 'POST' });
-    st.tasks[tid].status = 'FAILED';
+    st.tasks[tid].status = 'CANCELED';
     renderTasks(page, api);
     api.flash('Globus transfer cancelled');
   } catch (e) {
