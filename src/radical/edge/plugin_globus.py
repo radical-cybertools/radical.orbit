@@ -66,7 +66,7 @@ log = logging.getLogger('radical.edge')
 GLOBUS_POLL_INTERVAL = 10.0
 
 # Terminal Globus task statuses (no further polling needed).
-GLOBUS_TERMINAL = {'SUCCEEDED', 'FAILED'}
+GLOBUS_TERMINAL = {'SUCCEEDED', 'FAILED', 'CANCELED', 'CANCELLED'}
 
 # Local-collection config file (lowest-priority auto-detection source).
 GLOBUS_CONFIG_FILE = '~/.radical/edge/globus.json'
