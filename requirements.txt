@@ -13,4 +13,5 @@ rich
 
 psij-python
 rhapsody-py
+globus-sdk
 

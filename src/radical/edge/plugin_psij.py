@@ -983,7 +983,7 @@ class PluginPSIJ(Plugin):
             bridge_url = getattr(self._app.state, 'bridge_url', '') or ''
             parsed     = urlparse(bridge_url)
             bridge_host = parsed.hostname or 'localhost'
-            bridge_port = parsed.port or (443 if parsed.scheme == 'https' else 8000)
+            bridge_port = parsed.port or (443 if parsed.scheme in ('https', 'wss') else 8000)
 
         last_state     = None
         seen_known     = False
@@ -1163,11 +1163,9 @@ class PluginPSIJ(Plugin):
                     "tunnel watcher timed out before rendezvous file appeared",
                     spawn_proc=ssh_proc)
         finally:
-            if ssh_proc is not None and ssh_proc.poll() is None and \
-                    edge_name not in self._tunnel_procs:
-                # Defensive cleanup if the process leaked past a code path
-                # that didn't tear it down explicitly.
+            if ssh_proc is not None and ssh_proc.poll() is None:
                 _tunnel.cleanup_tunnel(ssh_proc, edge_name)
+                self._tunnel_procs.pop(edge_name, None)
 
     async def _await_reverse_teardown(self, edge_name: str, native_id,
                                        ssh_proc, batch) -> None:

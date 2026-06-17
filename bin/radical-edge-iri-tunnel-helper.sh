@@ -116,14 +116,18 @@ handle_request() {
 # fresh request for the same edge name doesn't see a stale port.
 reap_dead() {
     local edge_name pid
+    local to_remove=()
     for edge_name in "${!SSH_PIDS[@]}"; do
         pid="${SSH_PIDS[$edge_name]}"
         if ! kill -0 "$pid" 2>/dev/null; then
             log "ssh for edge=$edge_name (pid=$pid) is gone; cleaning up"
             rm -f "$RELAY_DIR/${edge_name}.port" \
                   "$RELAY_DIR/${edge_name}.req"
-            unset 'SSH_PIDS[$edge_name]'
+            to_remove+=("$edge_name")
         fi
+    done
+    for edge_name in "${to_remove[@]}"; do
+        unset "SSH_PIDS[$edge_name]"
     done
 }
 

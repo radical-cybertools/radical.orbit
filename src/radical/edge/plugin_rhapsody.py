@@ -767,7 +767,9 @@ class RhapsodySession(PluginSession):
         """
         if self._rh_session:
             if self._telemetry is not None:
-                print(json.dumps(self._telemetry.summary(), indent=4), flush=True)
+                summary = json.dumps(self._telemetry.summary(), indent=4)
+                log.info(summary)
+                print(summary, flush=True)
                 self._telemetry = None
             await self._rh_session.close()
             self._rh_session = None

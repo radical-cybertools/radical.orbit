@@ -99,9 +99,11 @@ def run_test() -> int:
     # Sanitize env: strip inherited RADICAL_* vars that might point at a
     # different bridge / cert from a previous unrelated session.
     env = {k: v for k, v in os.environ.items() if not k.startswith('RADICAL_')}
-    env.update(RADICAL_BRIDGE_URL =bridge_url,
-               RADICAL_BRIDGE_CERT=cert_path,
-               RADICAL_EDGE_LOG_LEVEL='DEBUG')
+    env.update(
+        RADICAL_BRIDGE_URL=bridge_url,
+        RADICAL_BRIDGE_CERT=cert_path,
+        RADICAL_EDGE_LOG_LEVEL='DEBUG',
+    )
 
     bridge_proc = subprocess.Popen(
         [sys.executable, str(BIN_BRIDGE),
@@ -203,6 +205,13 @@ def run_test() -> int:
 # Pytest entry point ----------------------------------------------------------
 
 def test_notifications_local():
+    import pytest
+    try:
+        subprocess.run(['openssl', 'version'], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pytest.skip('openssl not available')
+
     rc = run_test()
     assert rc == 0, "notification path is broken — see captured output"
 

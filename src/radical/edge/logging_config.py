@@ -101,7 +101,7 @@ def configure_logging(level: int = logging.INFO,
                        (optional; ignored by the file handler which
                        always uses a plain timestamped format).
         log_file:      If given, also write logs to this file
-                       (truncated on open).  Parent directory is
+                       (appended on open).  Parent directory is
                        created if missing.  Stdout output stays
                        colored; the file is plain text with
                        timestamps so it survives ``less`` / ``grep``
@@ -140,6 +140,10 @@ def configure_logging(level: int = logging.INFO,
         protected = logging.getLogger(name)
         for h in list(protected.handlers):
             protected.removeHandler(h)
+            try:
+                h.close()
+            except Exception:
+                pass
         for h in handlers:
             protected.addHandler(h)
         protected.setLevel(level)
