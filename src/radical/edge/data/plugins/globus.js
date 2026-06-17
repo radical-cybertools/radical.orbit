@@ -38,7 +38,7 @@ export function template() {
       <div class="card-title">🔑 Authentication</div>
       <p style="color:var(--muted); font-size:0.85rem; margin-top:0;">
         Supply a Globus Transfer <b>access token</b>, or a <b>refresh token + client ID</b>
-        (auto-renews for long transfers).  Acquire one with <code>get_globus_token.py</code>.
+        (auto-renews for long transfers). Acquire one via Globus Auth (for example with the Globus CLI).
       </p>
       <div class="form-group">
         <label>Access token</label>
