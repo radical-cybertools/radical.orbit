@@ -390,7 +390,7 @@ function renderTasks(page, api) {
   }
   let html = '<table><thead><tr><th>Task</th><th>Label</th><th>Status</th><th></th></tr></thead><tbody>';
   for (const [tid, t] of tasks) {
-    const term = t.status === 'SUCCEEDED' || t.status === 'FAILED';
+    const term = t.status === 'SUCCEEDED' || t.status === 'FAILED' || t.status === 'CANCELED' || t.status === 'CANCELLED';
     html += `<tr>
       <td><code style="font-size:0.78rem;">${escHtml(tid)}</code></td>
       <td>${escHtml(t.label || '')}</td>
