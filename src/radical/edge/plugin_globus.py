@@ -232,7 +232,7 @@ class GlobusSession(PluginSession):
         if label      is not None: td_kwargs['label']      = label
         if sync_level is not None: td_kwargs['sync_level'] = sync_level
 
-        tdata = globus_sdk.TransferData(**td_kwargs)
+        tdata = globus_sdk.TransferData(self._tc, **td_kwargs)
         for it in items:
             s = it.get('source')
             d = it.get('destination')
