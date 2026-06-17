@@ -732,11 +732,13 @@ class EdgeService(PluginHostBase):
         from urllib.parse import urlparse, urlunparse
         from . import tunnel as _tunnel
 
+        parsed      = urlparse(self._bridge_url)
+        bridge_host = parsed.hostname or 'localhost'
+        bridge_port = parsed.port or (443 if parsed.scheme in ('https', 'wss') else 8000)
+
         rdir       = _tunnel.relay_dir()
         relay_file = rdir / f'{self._name}.port'
         req_file   = rdir / f'{self._name}.req'
-
-        bridge_port = parsed.port or (443 if parsed.scheme in ('https', 'wss') else 8000)
 
         # Drop the request file *before* polling — atomic via tmp + rename
         # so the helper script never reads a half-written payload.
