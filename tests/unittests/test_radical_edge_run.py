@@ -19,13 +19,13 @@ _loader = SourceFileLoader(
         / 'bin' / 'radical-edge-run')
 )
 _spec = importlib.util.spec_from_loader('run_mod', _loader)
-_RUN  = importlib.util.module_from_spec(_spec)
-sys.modules['run_mod'] = _RUN
-_loader.exec_module(_RUN)
+_run  = importlib.util.module_from_spec(_spec)
+sys.modules['run_mod'] = _run
+_loader.exec_module(_run)
 
-compute_task_id = _RUN.compute_task_id
-_split_argv     = _RUN._split_argv
-_flatten        = _RUN._flatten
+compute_task_id = _run.compute_task_id
+_split_argv     = _run._split_argv
+_flatten        = _run._flatten
 
 
 # ---------------------------------------------------------------------------

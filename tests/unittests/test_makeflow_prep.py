@@ -19,13 +19,13 @@ _loader = SourceFileLoader(
         / 'bin' / 'radical-edge-makeflow-prep')
 )
 _spec = importlib.util.spec_from_loader('prep_mod', _loader)
-_PREP = importlib.util.module_from_spec(_spec)
-sys.modules['prep_mod'] = _PREP
-_loader.exec_module(_PREP)
+_prep = importlib.util.module_from_spec(_spec)
+sys.modules['prep_mod'] = _prep
+_loader.exec_module(_prep)
 
-PrepOptions = _PREP.PrepOptions
-PrepError   = _PREP.PrepError
-prep_stream = _PREP.prep_stream
+PrepOptions = _prep.PrepOptions
+PrepError   = _prep.PrepError
+prep_stream = _prep.prep_stream
 
 
 def _run(text: str, **opts_kwargs) -> str:
@@ -392,16 +392,16 @@ class TestRunId:
     def test_run_id_deterministic(self, tmp_path: Path):
         p = tmp_path / 'wf.makeflow'
         p.write_text('POOL = "p"\n')
-        r1 = _PREP.compute_run_id(p)
-        r2 = _PREP.compute_run_id(p)
+        r1 = _prep.compute_run_id(p)
+        r2 = _prep.compute_run_id(p)
         assert r1 == r2
 
     def test_run_id_changes_on_mtime(self, tmp_path: Path):
         import os, time
         p = tmp_path / 'wf.makeflow'
         p.write_text('POOL = "p"\n')
-        r1 = _PREP.compute_run_id(p)
+        r1 = _prep.compute_run_id(p)
         time.sleep(0.01)
         os.utime(p, None)   # bumps mtime
-        r2 = _PREP.compute_run_id(p)
+        r2 = _prep.compute_run_id(p)
         assert r1 != r2
