@@ -983,7 +983,7 @@ class PluginPSIJ(Plugin):
             bridge_url = getattr(self._app.state, 'bridge_url', '') or ''
             parsed     = urlparse(bridge_url)
             bridge_host = parsed.hostname or 'localhost'
-            bridge_port = parsed.port or (443 if parsed.scheme == 'https' else 8000)
+            bridge_port = parsed.port or (443 if parsed.scheme in ('https', 'wss') else 8000)
 
         last_state     = None
         seen_known     = False
