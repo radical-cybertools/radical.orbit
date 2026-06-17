@@ -419,6 +419,30 @@ class EndpointService(PluginHostBase):
             except Exception as e:
                 log.warning("[Endpoint] Failed to send notification: %s", e)
 
+    @staticmethod
+    def _classify_cert_error(verify_message: str, cert_pinned: bool,
+                             check_hostname: bool) -> str:
+        """Decide how to react to a TLS certificate verification failure.
+
+        Returns ``'relax'`` (disable name validation and retry) or
+        ``'abort'`` (fail hard).
+
+        A hostname / IP-address mismatch is benign *only* when an explicit
+        certificate has been pinned (``--cert``): ``CERT_REQUIRED`` then
+        already guarantees the peer presents exactly that certificate, so the
+        name check is redundant and relaxing it — with a loud warning — is a
+        reasonable development convenience.  Without a pinned cert we trust the
+        system store, where disabling the name check is a real downgrade; that
+        case, and every other cert failure (expired, untrusted issuer,
+        self-signed-not-pinned, …), aborts — reconnecting cannot recover from
+        a bad certificate.
+        """
+        msg = (verify_message or '').lower()
+        name_mismatch = 'hostname' in msg or 'ip address' in msg
+        if check_hostname and cert_pinned and name_mismatch:
+            return 'relax'
+        return 'abort'
+
     async def run(self) -> None:
         """
         Main async entry point.
@@ -609,23 +633,26 @@ class EndpointService(PluginHostBase):
                             return_exceptions=True)
 
             except ssl.SSLCertVerificationError as e:
-                verify_msg = getattr(e, 'verify_message', str(e)).lower()
-                if ssl_check_hostname and 'hostname' in verify_msg:
-                    log.warning("[Endpoint] TLS hostname validation failed for %s: %s. "
-                                "Continuing with hostname validation disabled.",
+                verify_msg  = getattr(e, 'verify_message', str(e))
+                cert_pinned = bool(self._cert and os.path.exists(self._cert))
+                if self._classify_cert_error(
+                        verify_msg, cert_pinned, ssl_check_hostname) == 'relax':
+                    log.warning("[Endpoint] TLS name/IP validation failed for "
+                                "%s: %s. Pinned cert present — continuing with "
+                                "name validation DISABLED (development mode).",
                                 self._bridge_url, e)
                     ssl_check_hostname = False
                     continue
                 if self._stop_event.is_set():
                     break
 
-                # Add jitter to backoff to prevent thundering herd
-                jitter = backoff * JITTER_FACTOR * random.random()
-                sleep_time = backoff + jitter
-                log.warning("[Endpoint] Connection lost: %s. Reconnecting in %.1fs...",
-                            e, sleep_time)
-                await asyncio.sleep(sleep_time)
-                backoff = min(backoff * BACKOFF_FACTOR, MAX_BACKOFF)
+                # A bad / untrusted certificate is permanent — reconnecting
+                # cannot recover from it, so abort with a clear error instead
+                # of looping.  This propagates out of run() to the entrypoint,
+                # which logs and exits non-zero.
+                log.error("[Endpoint] TLS certificate verification failed for "
+                          "%s: %s. Aborting.", self._bridge_url, e)
+                raise
 
             except (ws_exc.ConnectionClosed, OSError) as e:
                 if self._stop_event.is_set():

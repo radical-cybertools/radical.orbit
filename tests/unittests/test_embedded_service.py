@@ -91,7 +91,8 @@ def test_embedded_service_sync_background():
 
 @pytest.mark.asyncio
 async def test_embedded_service_tls_hostname_fallback(monkeypatch, tmp_path, caplog):
-    """Hostname verification failure logs a warning and retries without it."""
+    """Name/IP verification failure with a *pinned* cert logs a warning and
+    retries with name validation disabled (development convenience)."""
 
     cert = tmp_path / 'bridge_cert.pem'
     cert.write_text('dummy cert')
@@ -164,6 +165,6 @@ async def test_embedded_service_tls_hostname_fallback(monkeypatch, tmp_path, cap
     assert ssl_contexts[1].check_hostname is False
     assert ssl_contexts[1].verify_mode == ssl.CERT_REQUIRED
     assert ssl_contexts[1].loaded == [str(cert)]
-    assert "TLS hostname validation failed" in caplog.text
-    assert "Continuing with hostname validation disabled" in caplog.text
+    assert "TLS name/IP validation failed" in caplog.text
+    assert "name validation DISABLED" in caplog.text
 
