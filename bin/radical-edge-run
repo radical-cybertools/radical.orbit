@@ -1,7 +1,38 @@
 #!/usr/bin/env python3
+"""radical-edge-run — submit one task to the bridge task dispatcher and
+block until it reaches a terminal state.
+
+Invoked per Makeflow rule by ``radical-edge-makeflow-prep``-rewritten
+commands, but usable standalone.  Everything after the ``--`` separator
+is the command to run on the remote edge.
+
+Usage:
+    radical-edge-run (--pool NAME | --edge NAME) --run-id ID \\
+        [--priority N] [--in FILE]... [--out FILE]... \\
+        [--pools pools.json] -- COMMAND [ARG...]
+
+Targeting (exactly one required):
+    --pool NAME   route through a dispatcher-managed pilot pool
+                  (supports --in/--out file staging)
+    --edge NAME   run directly on that edge's rhapsody (transparent
+                  proxy; no pool, no file staging)
+
+Options:
+    --run-id ID   stable id for this workflow invocation; combined with
+                  the command + inputs/outputs to derive the task id
+    --priority N  dispatch priority (higher first); default 0
+    --in  FILE    stage this input file into the task's scratch dir
+                  (repeatable; --pool only)
+    --out FILE    stage this output file back after success
+                  (repeatable; --pool only)
+    --pools FILE  pools.json declaring the workflow's pools; forwarded
+                  to the dispatcher on register_session
+
+Exit code mirrors the task's exit code (0 on DONE without one, 1 on
+FAILED/CANCELED without one).
+"""
 
 import argparse
-import base64
 import hashlib
 import logging
 import os

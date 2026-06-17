@@ -27,10 +27,12 @@ import asyncio
 import base64
 import logging
 import os
+import shutil
 import threading
 import time
 import uuid
 
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -44,9 +46,9 @@ from .task_dispatcher_config            import (
     default_pool_config, parse_pools,
 )
 from .task_dispatcher_state             import (
-    PilotRecord, TaskRecord, StateLog,
+    PilotRecord, TaskRecord, EdgeModeRecord, StateLog,
     PILOT_PENDING, PILOT_STARTING, PILOT_ACTIVE,
-    PILOT_FAILED, PILOT_TERMINAL_STATES, PILOT_LIVE_STATES,
+    PILOT_DONE, PILOT_FAILED, PILOT_LIVE_STATES,
     TASK_QUEUED, TASK_RUNNING, TASK_DONE, TASK_FAILED, TASK_CANCELED,
     TASK_TERMINAL_STATES,
 )
@@ -71,7 +73,16 @@ _DEFAULT_SCRATCH_ROOT = Path('~/.radical/edge/task_dispatcher/scratch'
 # deleted by the background sweeper (memory/project_bridge_dispatcher.md
 # Phase 5).
 _STATE_PRUNE_DAYS    = 30
-_SWEEP_INTERVAL_SEC  = 86400.0   # 1 day
+_PRUNE_INTERVAL_SEC  = 86400.0   # stale-dir pruning: once a day
+
+# Log compaction (C6): snapshot a pool's append-only logs when they
+# accrue _COMPACT_MAX_APPENDS records since the last snapshot, OR when
+# any uncompacted records have lingered _COMPACT_MAX_AGE_SEC.  Checked
+# every _COMPACT_INTERVAL_SEC so the age trigger can be tighter than the
+# daily stale-dir prune.
+_COMPACT_INTERVAL_SEC = 300.0    # check for due compactions every 5 min
+_COMPACT_MAX_APPENDS  = 1000     # size trigger
+_COMPACT_MAX_AGE_SEC  = 3600.0   # age trigger: don't let a tail linger >1h
 
 # Tick frequency for strategy.on_tick loops
 _TICK_INTERVAL_SEC = 5.0
@@ -137,7 +148,7 @@ class PoolState:
         # Build StrategyContext once and reuse
         self.ctx = StrategyContext(
             config,
-            now_fn               = time.monotonic,
+            now_fn               = time.time,
             pending_queue_fn     = self._pending_queue_snapshot,
             pilots_fn            = self._pilots_snapshot,
             arrivals_window_fn   = self._arrivals_window,
@@ -168,7 +179,7 @@ class PoolState:
 
     def _arrivals_window(self, seconds: float) -> list[float]:
         '''Arrival timestamps within *seconds* of now.'''
-        cutoff = time.monotonic() - seconds
+        cutoff = time.time() - seconds
         return [ts for ts in self.arrivals if ts >= cutoff]
 
     # -- strategy action hooks (called from strategy code) ----------------
@@ -192,8 +203,8 @@ class PoolState:
             size_key         = size_key,
             rhapsody_backend = size.rhapsody_backend,
             state            = PILOT_PENDING,
-            submitted_at     = time.monotonic(),
-            walltime_deadline= time.monotonic() + size.walltime_sec,
+            submitted_at     = time.time(),
+            walltime_deadline= time.time() + size.walltime_sec,
         )
         self.pilots[pid] = record
         self.pilot_log.append(record)
@@ -241,6 +252,28 @@ class PoolState:
         d = self.scratch_base / task_id
         d.mkdir(parents=True, exist_ok=True)
         return d
+
+    def compact_logs(self) -> None:
+        '''Snapshot pilot/task logs that are due for compaction (C6).
+
+        Called from the plugin's compaction sweeper on the event-loop
+        thread, so it is serialised with appends — the snapshot captures
+        the current in-memory map and truncates the log atomically with
+        respect to writers.
+        '''
+        if self.pilot_log.needs_compaction(
+                max_appends=_COMPACT_MAX_APPENDS,
+                max_age_sec=_COMPACT_MAX_AGE_SEC):
+            self.pilot_log.snapshot(self.pilots)
+        if self.task_log.needs_compaction(
+                max_appends=_COMPACT_MAX_APPENDS,
+                max_age_sec=_COMPACT_MAX_AGE_SEC):
+            self.task_log.snapshot(self.tasks)
+
+    def close(self) -> None:
+        '''Release the logs' persistent file handles.'''
+        self.pilot_log.close()
+        self.task_log.close()
 
 
 # ---------------------------------------------------------------------------
@@ -419,15 +452,30 @@ class PluginTaskDispatcher(Plugin):
         # of an edge-mode task submission.
         self._connected_edges: dict[str, set[str]] = {}
 
+        # Child edges we've actually observed connected during this
+        # process's lifetime.  A live pilot is only demoted on
+        # disconnect if we previously saw its child here — otherwise a
+        # replayed-ACTIVE pilot whose child hasn't reconnected yet (just
+        # after a bridge restart) would be wrongly torn down before the
+        # child gets a chance to reappear.  See on_topology_change (C2).
+        self._seen_child_edges: set[str] = set()
+
         # Edge-mode task tracking: task_id → target_edge_name.  Edge
         # mode bypasses pool state — the dispatcher is a transparent
         # proxy to the target edge's rhapsody.  This dict lets get/
         # cancel routes know which edge to forward to.  Entries are
         # cleared when the task reaches a terminal state (via the SSE
-        # callback).  Not persisted: bridge restart loses edge-mode
-        # in-flight tracking (consistent with the deferred restart-
-        # recovery decision).
-        self._edge_mode_tasks: dict[str, str] = {}
+        # callback).  Backed by a small on-disk ledger (C4) so an
+        # in-flight edge-mode task survives a bridge restart; terminal
+        # records are filtered out on replay so only live entries seed
+        # the dict.
+        self._edge_mode_log = StateLog(
+            self._state_root / 'edge_mode.log', EdgeModeRecord, 'task_id')
+        self._edge_mode_tasks: dict[str, str] = {
+            rec.task_id: rec.edge
+            for rec in self._edge_mode_log.replay().values()
+            if not rec.is_terminal()
+        }
 
         # BridgeClient lazily created when we need to reach other edges
         # or subscribe to SSE.  Lifetime managed by _ensure_started.
@@ -505,6 +553,15 @@ class PluginTaskDispatcher(Plugin):
                         else self._scratch_root / cfg.name)
         ps = PoolState(cfg, state_dir, scratch_base, self)
         self._pool_states[cfg.name] = ps
+
+        # Restart recovery (C4): the uid→task map is in-memory only, but
+        # fully derivable from the replayed task log.  Repopulate it so a
+        # terminal SSE event for a task that was RUNNING before the
+        # restart can still be correlated and advanced.
+        for rec in ps.tasks.values():
+            if rec.state == TASK_RUNNING and rec.rhapsody_uid:
+                self._uid_to_task[rec.rhapsody_uid] = (cfg.name, rec.task_id)
+
         log.info('[%s] materialised pool %r → edge %r '
                  '(strategy=%s, sizes=%s)',
                  self.instance_name, cfg.name, cfg.edge_name,
@@ -572,6 +629,8 @@ class PluginTaskDispatcher(Plugin):
             self._handshake_sweeper()))
         self._loops_tasks.append(loop.create_task(
             self._state_sweeper()))
+        self._loops_tasks.append(loop.create_task(
+            self._compaction_sweeper()))
 
         # Spin up the bridge client + SSE subscription in a worker thread
         # — BridgeClient uses blocking httpx under the hood.
@@ -631,7 +690,7 @@ class PluginTaskDispatcher(Plugin):
         while True:
             try:
                 await asyncio.sleep(_TICK_INTERVAL_SEC)
-                now = time.monotonic()
+                now = time.time()
                 for pool_state in self._pool_states.values():
                     for pilot in list(pool_state.pilots.values()):
                         if pilot.state not in (PILOT_PENDING, PILOT_STARTING):
@@ -675,9 +734,37 @@ class PluginTaskDispatcher(Plugin):
                 log.exception('[%s] state sweeper error: %s',
                               self.instance_name, e)
             try:
-                await asyncio.sleep(_SWEEP_INTERVAL_SEC)
+                await asyncio.sleep(_PRUNE_INTERVAL_SEC)
             except asyncio.CancelledError:
                 return
+
+    async def _compaction_sweeper(self) -> None:
+        '''Periodically snapshot append-only logs that are due (C6).
+
+        Runs on the event loop, so per-log compaction is serialised with
+        appends.  Each pool's logs are compacted on a size-or-age policy
+        (see :meth:`PoolState.compact_logs`); the edge-mode ledger is
+        compacted the same way so its terminal tombstones don't pile up.
+        '''
+        while True:
+            try:
+                await asyncio.sleep(_COMPACT_INTERVAL_SEC)
+                for pool_state in self._pool_states.values():
+                    pool_state.compact_logs()
+                if self._edge_mode_log.needs_compaction(
+                        max_appends=_COMPACT_MAX_APPENDS,
+                        max_age_sec=_COMPACT_MAX_AGE_SEC):
+                    live = {
+                        tid: EdgeModeRecord(task_id=tid, edge=edge,
+                                            state=TASK_RUNNING)
+                        for tid, edge in self._edge_mode_tasks.items()
+                    }
+                    self._edge_mode_log.snapshot(live)
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                log.exception('[%s] compaction sweeper error: %s',
+                              self.instance_name, e)
 
     def _prune_stale_state_dirs(self) -> None:
         '''Synchronous worker for :meth:`_state_sweeper`.
@@ -695,7 +782,6 @@ class PluginTaskDispatcher(Plugin):
         candidates for pruning by virtue of not being in the active
         set — that's the intended garbage-collection.
         '''
-        import shutil
         if not self._state_root.exists():
             return
         cutoff = time.time() - _STATE_PRUNE_DAYS * 86400
@@ -778,13 +864,8 @@ class PluginTaskDispatcher(Plugin):
             # No pools declared; auto-materialise the default once.
             self._materialise_pool(default_pool_config())
 
-        # Hand off to the base sid-allocation logic.
-        sid = f'session.{uuid.uuid4().hex[:8]}'
-        self._sessions[sid] = self._create_session(sid)
-        self._session_last_access[sid] = time.time()
-        self._ensure_cleanup_task()
-        log.info('[%s] Registered session %s', self.instance_name, sid)
-        return {'sid': sid}
+        # Hand off to the base sid-allocation / cleanup logic.
+        return await super().register_session(request)
 
     async def _route_pools(self, request: Request) -> dict:
         '''List all configured pools.  Session-less.'''
@@ -863,13 +944,13 @@ class PluginTaskDispatcher(Plugin):
                 log.info('[%s] task %s DONE cached; returning '
                          'without re-execution', self.instance_name, task_id)
                 return self._task_dict(existing)
-            if existing.state == TASK_RUNNING or existing.state == TASK_QUEUED:
+            if existing.state in (TASK_RUNNING, TASK_QUEUED):
                 log.info('[%s] task %s already %s; attaching',
                          self.instance_name, task_id, existing.state)
                 return self._task_dict(existing)
             # FAILED / CANCELED → re-execute: fall through and overwrite
 
-        now = time.monotonic()
+        now = time.time()
         record = TaskRecord(
             task_id      = task_id,
             pool         = pool_name,
@@ -952,8 +1033,12 @@ class PluginTaskDispatcher(Plugin):
                        f'{target_edge}: {e}') from e
 
         self._edge_mode_tasks[task_id] = target_edge
-        # Map rhapsody uid (== task_id here) to the edge for terminal
-        # cleanup via the SSE callback.
+        # Persist the in-flight ledger entry (C4) so a bridge restart can
+        # re-correlate this task; rhapsody uid (== task_id here) is what
+        # the SSE callback keys on for terminal cleanup.
+        self._edge_mode_log.append(
+            EdgeModeRecord(task_id=task_id, edge=target_edge,
+                           state=TASK_RUNNING))
         return {
             'task_id': task_id,
             'edge'   : target_edge,
@@ -1115,18 +1200,26 @@ class PluginTaskDispatcher(Plugin):
                             detail=f'unknown task: {task_id}')
 
     async def on_topology_change(self, edges: dict) -> None:
-        '''Bridge topology hook: detect pilot child-edges as they register.
+        '''Bridge topology hook: bind pilots as their child edges come and go.
 
         Replaces the explicit handshake POST.  The dispatcher pre-binds
-        ``record.child_edge_name`` at submit time; when a matching edge
-        name appears in the bridge's topology, the pilot becomes ACTIVE.
-        Capacity is taken from the pool's pilot-size config (good enough
-        for the static-allocation case; runtime capacity discovery would
-        re-introduce a handshake).
+        ``record.child_edge_name`` at submit time; this hook then tracks
+        that edge's presence in the bridge topology:
 
-        Also caches each connected edge's plugin set so other code
-        paths (auto-resolution of ``PoolConfig.edge_name`` when None;
-        validation of edge-mode task submissions) have live topology.
+        - **appears** → a PENDING/STARTING pilot becomes ACTIVE, with
+          capacity taken from the pool's pilot-size config (good enough
+          for static allocation; runtime capacity discovery would
+          re-introduce a handshake).
+        - **disappears** (after having been seen) → a live pilot is
+          finalised: DONE if its walltime has elapsed (clean batch-job
+          end), else FAILED (premature loss).  Either way its capacity
+          is reclaimed and any unfinished tasks are re-enqueued — without
+          this the pilot would linger ACTIVE forever (a "phantom",
+          inflating the live count and the apparent free capacity).
+
+        Also caches each connected edge's plugin set so other code paths
+        (auto-resolution of ``PoolConfig.edge_name`` when None;
+        validation of edge-mode submissions) have live topology.
         '''
         # Build {edge_name: set(plugin_names)}.  Topology payload's
         # 'plugins' field is sometimes a list, sometimes a dict
@@ -1140,54 +1233,72 @@ class PluginTaskDispatcher(Plugin):
         self._connected_edges = new
         if not self._loops_started:
             return
+
         for ps in self._pool_states.values():
             for pilot in list(ps.pilots.values()):
-                if pilot.state != PILOT_PENDING and \
-                        pilot.state != PILOT_STARTING:
+                ce = pilot.child_edge_name
+                if not ce:
                     continue
-                if not pilot.child_edge_name:
-                    continue
-                if pilot.child_edge_name not in new:
-                    continue
+                present = ce in new
 
-                size = ps.config.pilot_sizes.get(pilot.size_key)
-                capacity = (size.nodes * size.cpus_per_node) if size else 0
-                if capacity <= 0:
-                    log.warning('[%s] cannot bind pilot %s: pool size '
-                                '%r has zero capacity',
-                                self.instance_name, pilot.pid,
-                                pilot.size_key)
-                    continue
+                if present and pilot.state in PILOT_LIVE_STATES:
+                    # Remember we've seen this child so a later
+                    # disconnect is recognised as a genuine teardown.
+                    self._seen_child_edges.add(ce)
 
-                old_state = pilot.state
-                pilot.capacity  = capacity
-                pilot.state     = PILOT_ACTIVE
-                pilot.active_at = time.monotonic()
-                ps.pilot_log.append(pilot)
+                if present and pilot.state in (PILOT_PENDING, PILOT_STARTING):
+                    self._activate_pilot(ps, pilot)
+                elif (not present and ce in self._seen_child_edges
+                        and pilot.state in PILOT_LIVE_STATES):
+                    self._seen_child_edges.discard(ce)
+                    if time.time() >= pilot.walltime_deadline:
+                        self._mark_pilot_done(
+                            ps, pilot, 'walltime reached')
+                    else:
+                        self._mark_pilot_failed(
+                            ps, pilot,
+                            'child edge disconnected before walltime')
+                    self._drain_pending(ps)
 
-                if pilot.active_at and pilot.submitted_at:
-                    lag_observed = pilot.active_at - pilot.submitted_at
-                    ps.record_pilot_lag(lag_observed)
-                    log.info('[%s] pilot %s registered as %s; lag=%.1fs',
-                             self.instance_name, pilot.pid,
-                             pilot.child_edge_name, lag_observed)
+    def _activate_pilot(self, ps: PoolState, pilot: PilotRecord) -> None:
+        '''Transition a PENDING/STARTING pilot to ACTIVE on child handshake.'''
+        size = ps.config.pilot_sizes.get(pilot.size_key)
+        capacity = (size.nodes * size.cpus_per_node) if size else 0
+        if capacity <= 0:
+            log.warning('[%s] cannot bind pilot %s: pool size '
+                        '%r has zero capacity',
+                        self.instance_name, pilot.pid, pilot.size_key)
+            return
 
-                self._dispatch_notify('pilot_status', {
-                    'pilot_id'  : pilot.pid,
-                    'pool'      : ps.config.name,
-                    'state'     : pilot.state,
-                    'child_edge': pilot.child_edge_name,
-                    'capacity'  : capacity,
-                })
+        old_state = pilot.state
+        pilot.capacity  = capacity
+        pilot.state     = PILOT_ACTIVE
+        pilot.active_at = time.time()
+        ps.pilot_log.append(pilot)
 
-                try:
-                    ps.strategy.on_pilot_state(
-                        ps.ctx, pilot, old_state, PILOT_ACTIVE)
-                except Exception as e:
-                    log.exception('[%s] on_pilot_state raised: %s',
-                                  self.instance_name, e)
+        if pilot.active_at and pilot.submitted_at:
+            lag_observed = pilot.active_at - pilot.submitted_at
+            ps.record_pilot_lag(lag_observed)
+            log.info('[%s] pilot %s registered as %s; lag=%.1fs',
+                     self.instance_name, pilot.pid,
+                     pilot.child_edge_name, lag_observed)
 
-                self._drain_pending(ps)
+        self._dispatch_notify('pilot_status', {
+            'pilot_id'  : pilot.pid,
+            'pool'      : ps.config.name,
+            'state'     : pilot.state,
+            'child_edge': pilot.child_edge_name,
+            'capacity'  : capacity,
+        })
+
+        try:
+            ps.strategy.on_pilot_state(
+                ps.ctx, pilot, old_state, PILOT_ACTIVE)
+        except Exception as e:
+            log.exception('[%s] on_pilot_state raised: %s',
+                          self.instance_name, e)
+
+        self._drain_pending(ps)
 
     # -- pilot submission path -----------------------------------------
 
@@ -1417,22 +1528,48 @@ class PluginTaskDispatcher(Plugin):
     def _mark_pilot_failed(self, pool_state: PoolState,
                            record: PilotRecord, reason: str) -> None:
         '''Mark a pilot FAILED, re-enqueue assigned tasks, notify strategy.'''
-        old_state = record.state
-        record.state = PILOT_FAILED
-        pool_state.pilot_log.append(record)
         log.warning('[%s] pilot %s → FAILED (%s)',
                     self.instance_name, record.pid, reason)
+        self._finalize_pilot(pool_state, record, PILOT_FAILED, reason)
+
+    def _mark_pilot_done(self, pool_state: PoolState,
+                         record: PilotRecord, reason: str) -> None:
+        '''Mark a pilot DONE (clean end, e.g. walltime expiry).
+
+        Any task still assigned and non-terminal is re-enqueued — a job
+        that reached walltime mid-task should be retried on another
+        pilot, not silently dropped.
+        '''
+        log.info('[%s] pilot %s → DONE (%s)',
+                 self.instance_name, record.pid, reason)
+        self._finalize_pilot(pool_state, record, PILOT_DONE, reason)
+
+    def _finalize_pilot(self, pool_state: PoolState, record: PilotRecord,
+                        new_state: str, reason: str) -> None:
+        '''Drive a pilot to a terminal state and reclaim its tasks.
+
+        Shared by the FAILED and DONE paths: persists the transition,
+        notifies clients, re-enqueues any non-terminal tasks that were
+        assigned to this pilot (clearing their stale rhapsody-uid
+        mapping so a late terminal event from the dead pilot can't
+        clobber the re-queued task), and signals the strategy.
+        '''
+        old_state = record.state
+        record.state = new_state
+        pool_state.pilot_log.append(record)
         self._dispatch_notify('pilot_status', {
             'pilot_id': record.pid,
             'pool'    : pool_state.config.name,
-            'state'   : PILOT_FAILED,
+            'state'   : new_state,
             'reason'  : reason,
         })
 
-        # Re-enqueue running tasks assigned to this pilot
         for t in list(pool_state.tasks.values()):
             if t.pilot_id == record.pid and \
                     t.state not in TASK_TERMINAL_STATES:
+                if t.rhapsody_uid:
+                    self._uid_to_task.pop(t.rhapsody_uid, None)
+                    t.rhapsody_uid = None
                 t.state    = TASK_QUEUED
                 t.pilot_id = None
                 pool_state.task_log.append(t)
@@ -1440,7 +1577,7 @@ class PluginTaskDispatcher(Plugin):
 
         try:
             pool_state.strategy.on_pilot_state(
-                pool_state.ctx, record, old_state, PILOT_FAILED)
+                pool_state.ctx, record, old_state, new_state)
         except Exception as e:
             log.exception('[%s] on_pilot_state raised: %s',
                           self.instance_name, e)
@@ -1483,7 +1620,7 @@ class PluginTaskDispatcher(Plugin):
         '''
         task.state      = TASK_RUNNING
         task.pilot_id   = pilot.pid
-        task.started_at = time.monotonic()
+        task.started_at = time.time()
         pilot.in_flight     += 1
         pilot.started_tasks += 1
         pool_state.task_log.append(task)
@@ -1581,6 +1718,11 @@ class PluginTaskDispatcher(Plugin):
         # filter on plugin='task_dispatcher' still see the event.
         if uid in self._edge_mode_tasks:
             edge_name = self._edge_mode_tasks.pop(uid)
+            # Write the terminal ledger record so replay no longer
+            # resurrects this entry after a restart (C4).
+            self._edge_mode_log.append(
+                EdgeModeRecord(task_id=uid, edge=edge_name,
+                               state=target_state))
             self._dispatch_notify('task_status', {
                 'task_id'  : uid,
                 'edge'     : edge_name,
@@ -1604,7 +1746,7 @@ class PluginTaskDispatcher(Plugin):
         task.state       = target_state
         task.exit_code   = data.get('exit_code')
         task.error       = data.get('error')
-        task.finished_at = time.monotonic()
+        task.finished_at = time.time()
         pool_state.task_log.append(task)
 
         pilot = pool_state.pilots.get(task.pilot_id or '')
@@ -1628,7 +1770,7 @@ class PluginTaskDispatcher(Plugin):
                           task: TaskRecord, reason: str) -> None:
         task.state       = TASK_FAILED
         task.error       = reason
-        task.finished_at = time.monotonic()
+        task.finished_at = time.time()
         pool_state.task_log.append(task)
         pilot = pool_state.pilots.get(task.pilot_id or '')
         if pilot is not None:
@@ -1643,7 +1785,7 @@ class PluginTaskDispatcher(Plugin):
             return self._task_dict(task)
         if task.state == TASK_QUEUED:
             task.state       = TASK_CANCELED
-            task.finished_at = time.monotonic()
+            task.finished_at = time.time()
             pool_state.task_log.append(task)
             self._dispatch_notify('task_status', self._task_dict(task))
             return self._task_dict(task)
@@ -1661,7 +1803,7 @@ class PluginTaskDispatcher(Plugin):
                     log.warning('[%s] rhapsody cancel_task failed: %s',
                                 self.instance_name, e)
         task.state       = TASK_CANCELED
-        task.finished_at = time.monotonic()
+        task.finished_at = time.time()
         if pilot is not None:
             pilot.in_flight = max(0, pilot.in_flight - 1)
             pool_state.pilot_log.append(pilot)
@@ -1690,11 +1832,9 @@ class PluginTaskDispatcher(Plugin):
                                 detail=f'unknown session: {sid}')
 
     def _task_dict(self, task: TaskRecord) -> dict:
-        from dataclasses import asdict
         return asdict(task)
 
     def _pilot_dict(self, pilot: PilotRecord) -> dict:
-        from dataclasses import asdict
         return asdict(pilot)
 
     def _summarize_pool(self, ps: PoolState, verbose: bool = False) -> dict:

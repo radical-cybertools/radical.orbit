@@ -185,7 +185,7 @@ def test_unregister_unknown_session():
 
     with pytest.raises(HTTPException) as exc_info:
         # Use the internal handler directly for cleaner 404 detection
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             plugin.unregister_session(
                 MagicMock(spec=Request, path_params={"sid": "bogus"})
             )

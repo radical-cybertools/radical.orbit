@@ -223,3 +223,63 @@ class TestSnapshot:
         log.append(PilotRecord(pid='p', pool='x', size_key='s',
                                rhapsody_backend='c'))
         assert log.replay()['p'].pool == 'x'
+
+    def test_append_resumes_at_eof_after_truncate(self, tmp_path: Path):
+        """The held O_APPEND handle keeps working across a snapshot."""
+        log = StateLog(tmp_path / 'pilot.log', PilotRecord, 'pid')
+        for i in range(3):
+            log.append(PilotRecord(pid=f'p.{i}', pool='x', size_key='s',
+                                   rhapsody_backend='c'))
+        log.snapshot(log.replay())          # truncates through the handle
+        # Appends after truncation must land at the new (zero) EOF, not
+        # leave a sparse gap; replay should see snapshot + new record.
+        log.append(PilotRecord(pid='p.new', pool='x', size_key='s',
+                               rhapsody_backend='c'))
+        state = log.replay()
+        assert set(state.keys()) == {'p.0', 'p.1', 'p.2', 'p.new'}
+
+
+# ---------------------------------------------------------------------------
+# Compaction triggers + handle lifecycle
+# ---------------------------------------------------------------------------
+
+class TestCompactionPolicy:
+
+    def _log(self, tmp_path: Path) -> StateLog:
+        return StateLog(tmp_path / 'pilot.log', PilotRecord, 'pid')
+
+    def _rec(self, i: int) -> PilotRecord:
+        return PilotRecord(pid=f'p.{i}', pool='x', size_key='s',
+                           rhapsody_backend='c')
+
+    def test_no_compaction_when_idle(self, tmp_path: Path):
+        log = self._log(tmp_path)
+        assert log.needs_compaction(max_appends=1, max_age_sec=0.0) is False
+
+    def test_size_trigger(self, tmp_path: Path):
+        log = self._log(tmp_path)
+        for i in range(5):
+            log.append(self._rec(i))
+        assert log.needs_compaction(max_appends=5, max_age_sec=1e9) is True
+        assert log.needs_compaction(max_appends=6, max_age_sec=1e9) is False
+
+    def test_age_trigger(self, tmp_path: Path):
+        log = self._log(tmp_path)
+        log.append(self._rec(0))
+        # Below the size threshold, but past the age window → due.
+        future = log._last_snapshot_ts + 100.0
+        assert log.needs_compaction(max_appends=1000, max_age_sec=10.0,
+                                    now=future) is True
+
+    def test_counters_reset_after_snapshot(self, tmp_path: Path):
+        log = self._log(tmp_path)
+        for i in range(3):
+            log.append(self._rec(i))
+        log.snapshot(log.replay())
+        assert log.needs_compaction(max_appends=1, max_age_sec=1e9) is False
+
+    def test_close_is_idempotent(self, tmp_path: Path):
+        log = self._log(tmp_path)
+        log.append(self._rec(0))
+        log.close()
+        log.close()   # must not raise

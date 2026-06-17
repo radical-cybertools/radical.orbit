@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -126,6 +127,25 @@ class TaskRecord:
         return self.state in TASK_TERMINAL_STATES
 
 
+@dataclass
+class EdgeModeRecord:
+    '''Ledger entry for one edge-mode task (transparent rhapsody proxy).
+
+    Edge-mode tasks bypass pool state, so they need their own tiny
+    persisted ledger to survive a bridge restart (C4): an in-flight
+    entry lets get/cancel routes re-resolve the target edge after
+    replay.  A terminal record is appended on completion and filtered
+    out on replay, so the ledger self-prunes via the usual
+    last-write-wins compaction.
+    '''
+    task_id: str
+    edge   : str
+    state  : str = TASK_RUNNING
+
+    def is_terminal(self) -> bool:
+        return self.state in TASK_TERMINAL_STATES
+
+
 # ---------------------------------------------------------------------------
 # Append-only JSONL log
 # ---------------------------------------------------------------------------
@@ -159,9 +179,21 @@ class StateLog:
         self._id_attr      = id_attr
         self._snapshot_path = self._path.with_suffix('.snapshot.json')
 
-        # Touch the log file so ``open(..., 'a')`` on first append is a
-        # pure append rather than create.  Simplifies tests.
-        self._path.touch(exist_ok=True)
+        # One persistent append handle, held open for the life of the
+        # log.  Opening in ``'a'`` creates the file and sets ``O_APPEND``,
+        # so every write atomically targets EOF — which lets
+        # :meth:`snapshot` truncate through this same handle (writes then
+        # resume cleanly at the new, zero EOF) without reopening, and
+        # avoids an open/close syscall pair on every :meth:`append`.
+        # Single-owner discipline: append + snapshot run on one thread
+        # (the plugin's event loop), so no locking is needed here.
+        self._fh = self._path.open('a')
+
+        # Compaction bookkeeping consumed by the plugin's state sweeper
+        # via :meth:`needs_compaction`: how many appends have accrued
+        # since the last snapshot, and when that snapshot happened.
+        self._appends_since_snapshot = 0
+        self._last_snapshot_ts       = time.time()
 
     @property
     def path(self) -> Path:
@@ -172,11 +204,17 @@ class StateLog:
         return self._snapshot_path
 
     def append(self, record: Any) -> None:
-        '''Append a record to the log.  Flushes after each write.'''
+        '''Append a record to the log.  Flushes after each write.
+
+        Writes through the persistent ``O_APPEND`` handle and ``flush``es
+        (to the OS page cache) — same durability as before: survives a
+        process crash, not a power loss.  The log stays the source of
+        truth between snapshots.
+        '''
         line = json.dumps(asdict(record), default=str)
-        with self._path.open('a') as f:
-            f.write(line + '\n')
-            f.flush()
+        self._fh.write(line + '\n')
+        self._fh.flush()
+        self._appends_since_snapshot += 1
 
     def replay(self) -> dict[str, Any]:
         '''Reduce snapshot + log to ``{id: record}``.
@@ -236,9 +274,44 @@ class StateLog:
                 pass
             raise
 
-        # Truncate the log now that its contents are captured in the snapshot.
-        # open('w') both creates (if missing) and truncates.
-        with self._path.open('w'):
+        # Truncate the log now that its contents are captured in the
+        # snapshot, through the persistent handle.  With ``O_APPEND`` the
+        # next ``append`` write still lands at EOF (now zero), so no
+        # reopen is needed and no sparse hole is created.
+        self._fh.flush()
+        self._fh.seek(0)
+        self._fh.truncate()
+        self._appends_since_snapshot = 0
+        self._last_snapshot_ts       = time.time()
+
+    def needs_compaction(self, *, max_appends: int, max_age_sec: float,
+                         now: float | None = None) -> bool:
+        '''Whether this log is due for a snapshot.
+
+        Compaction triggers when there are uncompacted appends AND
+        either:
+        - their count has reached *max_appends* (size trigger), or
+        - the oldest uncompacted append has lingered past *max_age_sec*
+          (age trigger) — so a low-traffic log whose tail never reaches
+          the size threshold still gets compacted instead of growing
+          slowly forever.
+
+        Returns ``False`` when nothing has been appended since the last
+        snapshot, so an idle log is never rewritten.
+        '''
+        if self._appends_since_snapshot <= 0:
+            return False
+        if self._appends_since_snapshot >= max_appends:
+            return True
+        now = now if now is not None else time.time()
+        return (now - self._last_snapshot_ts) >= max_age_sec
+
+    def close(self) -> None:
+        '''Flush and close the persistent append handle.  Idempotent.'''
+        try:
+            self._fh.flush()
+            self._fh.close()
+        except Exception:
             pass
 
     def _iter_lines(self) -> Iterator[str]:

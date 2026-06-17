@@ -92,7 +92,13 @@ class StrategyContext:
         return self._logger
 
     def now(self) -> float:
-        '''Monotonic timestamp (seconds).'''
+        '''Wall-clock timestamp (seconds since epoch).
+
+        Wall-clock (not monotonic) so it is comparable with the
+        persisted timestamps on :class:`PilotRecord`/:class:`TaskRecord`
+        (e.g. ``pilot.active_at``), which must survive dispatcher
+        restarts.
+        '''
         return self._now_fn()
 
     def pending_queue(self) -> list['TaskRecord']:

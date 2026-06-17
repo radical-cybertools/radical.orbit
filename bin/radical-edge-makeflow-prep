@@ -41,7 +41,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import os
 import re
 import shlex
 import sys
@@ -207,8 +206,7 @@ def prep_stream(lines: list[str], run_id: str,
                 outputs = outputs, inputs = inputs,
                 commands = commands, header_line = rule_header,
                 edge = scope_edge, pool = scope_pool,
-                priority = scope_priority if scope_priority != 0 else
-                           scope_priority,
+                priority = scope_priority,
                 pools = scope_pools)
 
             if not commands:
