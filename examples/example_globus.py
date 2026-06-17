@@ -11,8 +11,8 @@ Requirements
 ------------
 * A running bridge with at least one connected edge that loads the
   ``globus`` plugin (needs ``globus-sdk`` installed on the edge).
-* A Globus Transfer token.  Acquire one with ``get_globus_token.py`` and
-  export it, e.g.::
+* A Globus Transfer token.  Acquire one via Globus Auth (for example with the
+  Globus CLI), and export it, e.g.::
 
       export GLOBUS_ACCESS_TOKEN="$(...)"        # access token, or
       export GLOBUS_REFRESH_TOKEN=... GLOBUS_CLIENT_ID=...
