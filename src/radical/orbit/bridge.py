@@ -100,7 +100,7 @@ class Bridge:
         self._url: str  = self._url_forms[0]
 
         # ── Instance state (was module-level in the old script) ──────
-        self.endpoints:               Dict[str, WebSocket] = {}
+        self.endpoint_ws:               Dict[str, WebSocket] = {}
         self.pending:             Dict[str, tuple]     = {}
         self.pending_lock:        asyncio.Lock         = asyncio.Lock()
         self.endpoints:           Dict[str, Any]       = {
@@ -260,12 +260,12 @@ class Bridge:
             try:    await q.put(None)
             except Exception as e:
                 log.debug("[Bridge] SSE queue put failed during shutdown: %s", e)
-        for endpoint_name, ws in list(self.endpoints.items()):
+        for endpoint_name, ws in list(self.endpoint_ws.items()):
             try:    await ws.close(code=1001, reason="Server shutting down")
             except Exception as e:
                 log.debug("[Bridge] WebSocket close failed for %s: %s",
                           endpoint_name, e)
-        self.endpoints.clear()
+        self.endpoint_ws.clear()
         log.info("[Bridge] Shutdown complete")
 
     # ── helpers (was module-level) ───────────────────────────────────
@@ -281,7 +281,7 @@ class Bridge:
         endpoint_list = {name: {"plugins": list(info.get("plugins", {}).keys())}
                      for name, info in self.endpoints.get("endpoints", {}).items()}
         msg = json.dumps({"type": "topology", "endpoints": endpoint_list})
-        for endpoint_name, ws in list(self.endpoints.items()):
+        for endpoint_name, ws in list(self.endpoint_ws.items()):
             try:
                 if ws.client_state == WebSocketState.CONNECTED:
                     await ws.send_text(msg)
@@ -297,7 +297,7 @@ class Bridge:
 
     async def _send_to_endpoint(self, endpoint_name: str, message,
                             binary: bool = False):
-        ws = self.endpoints.get(endpoint_name)
+        ws = self.endpoint_ws.get(endpoint_name)
         if not ws or ws.client_state != WebSocketState.CONNECTED:
             raise HTTPException(
                 status_code=503,
@@ -449,7 +449,7 @@ class Bridge:
                                 "type": "error",
                                 "message": f"Endpoint name '{frame_endpoint_name}' is reserved"}))
                             return
-                        if frame_endpoint_name in self_.endpoints:
+                        if frame_endpoint_name in self_.endpoint_ws:
                             log.warning("[Bridge] Endpoint '%s' already connected.",
                                         frame_endpoint_name)
                             await ws.send_text(json.dumps({
@@ -458,7 +458,7 @@ class Bridge:
                             return
 
                         endpoint_name = frame_endpoint_name
-                        self_.endpoints[endpoint_name] = ws
+                        self_.endpoint_ws[endpoint_name] = ws
                         log.info("[Bridge] Endpoint '%s' connected", endpoint_name)
                         self_.endpoints["endpoints"][endpoint_name] = {
                             "endpoint": data.get("endpoint", {}),
@@ -525,8 +525,8 @@ class Bridge:
                     ping_task.cancel()
 
                 if endpoint_name:
-                    if self_.endpoints.get(endpoint_name) == ws:
-                        del self_.endpoints[endpoint_name]
+                    if self_.endpoint_ws.get(endpoint_name) == ws:
+                        del self_.endpoint_ws[endpoint_name]
                         if endpoint_name in self_.endpoints["endpoints"]:
                             log.info("[Bridge] Unregistering endpoint: %s", endpoint_name)
                             del self_.endpoints["endpoints"][endpoint_name]
@@ -591,7 +591,7 @@ class Bridge:
             endpoint_list_resp = []
             for endpoint_name, endpoint_data in self_.endpoints.get("endpoints", {}).items():
                 plugins = list(endpoint_data.get("plugins", {}).keys())
-                connected = (endpoint_name in self_.endpoints
+                connected = (endpoint_name in self_.endpoint_ws
                              or endpoint_name == BRIDGE_ENDPOINT_NAME)
                 endpoint_list_resp.append({
                     "name":          endpoint_name,
@@ -608,11 +608,11 @@ class Bridge:
                 raise HTTPException(
                     status_code=400,
                     detail="Cannot disconnect bridge-hosted plugins")
-            if endpoint_name not in self_.endpoints:
+            if endpoint_name not in self_.endpoint_ws:
                 raise HTTPException(
                     status_code=404,
                     detail=f"Endpoint '{endpoint_name}' not connected")
-            ws = self_.endpoints[endpoint_name]
+            ws = self_.endpoint_ws[endpoint_name]
             try:
                 await ws.send_text(json.dumps({"type": "shutdown",
                                                "reason": "Disconnected by user"}))
@@ -788,7 +788,7 @@ class Bridge:
                                     if request.url.query else ''),
                 )
 
-            if endpoint_name not in self_.endpoints:
+            if endpoint_name not in self_.endpoint_ws:
                 raise HTTPException(
                     status_code=404,
                     detail=f"Endpoint '{endpoint_name}' unknown")

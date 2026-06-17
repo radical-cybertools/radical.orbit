@@ -17,7 +17,7 @@ class RegisterMessage(BaseModel):
     """Endpoint registration message sent when connecting to the bridge."""
     type: Literal["register"] = "register"
     endpoint_name: str = Field(..., description="Name of the endpoint service")
-    endpoint: Dict[str, Any] = Field(default_factory=dict, description="Endpoint endpoint metadata")
+    endpoint: Dict[str, Any] = Field(default_factory=dict, description="Endpoint metadata")
     plugins: Dict[str, Dict[str, Any]] = Field(default_factory=dict, description="Plugin metadata keyed by plugin name")
 
 
