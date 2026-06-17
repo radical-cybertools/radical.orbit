@@ -5,21 +5,27 @@ End-to-end tests against a live bridge/edge would belong under
 tests/integration/ and are deferred.
 """
 
+import sys
+import importlib.util
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 import pytest
 
 
-_RUN = SourceFileLoader(
+_loader = SourceFileLoader(
     'run_mod',
     str(Path(__file__).resolve().parents[2]
         / 'bin' / 'radical-edge-run')
-).load_module()
+)
+_spec = importlib.util.spec_from_loader('run_mod', _loader)
+_run  = importlib.util.module_from_spec(_spec)
+sys.modules['run_mod'] = _run
+_loader.exec_module(_run)
 
-compute_task_id = _RUN.compute_task_id
-_split_argv     = _RUN._split_argv
-_flatten        = _RUN._flatten
+compute_task_id = _run.compute_task_id
+_split_argv     = _run._split_argv
+_flatten        = _run._flatten
 
 
 # ---------------------------------------------------------------------------

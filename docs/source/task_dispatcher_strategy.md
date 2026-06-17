@@ -93,7 +93,7 @@ class DispatchStrategy(ABC):
 ```python
 ctx.pool                         # PoolConfig
 ctx.logger                       # logging.Logger
-ctx.now()                        # monotonic seconds
+ctx.now()                        # wall-clock seconds since epoch
 
 ctx.pending_queue()              # [TaskRecord] priority-ordered
 ctx.pilots()                     # [PilotRecord] non-terminal
