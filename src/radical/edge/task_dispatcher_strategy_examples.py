@@ -142,7 +142,8 @@ class AggressiveScaleToBacklogStrategy(DispatchStrategy):
         # pilot is booting?  Use current arrival rate over the last
         # window as a rough forecast.
         arrivals = ctx.arrivals_window(self._arrivals_window)
-        arrival_rate = len(arrivals) / self._arrivals_window
+        arrival_rate = (len(arrivals) / self._arrivals_window
+                        if self._arrivals_window > 0 else 0.0)
         lag_hist = ctx.pilot_lag_history()
         avg_lag  = (sum(lag_hist) / len(lag_hist)) if lag_hist else 60.0
         projected_arrivals = arrival_rate * avg_lag

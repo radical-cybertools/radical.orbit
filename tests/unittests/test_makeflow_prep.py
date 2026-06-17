@@ -2,20 +2,26 @@
 
 Exercises the preprocessor's parser, directive scoping, rewrite
 semantics, and error reporting.  The script has no ``.py`` extension
-so we load it via ``SourceFileLoader``.
+so we load it via ``importlib`` / ``SourceFileLoader``.
 """
 
+import sys
+import importlib.util
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 import pytest
 
 
-_PREP = SourceFileLoader(
+_loader = SourceFileLoader(
     'prep_mod',
     str(Path(__file__).resolve().parents[2]
         / 'bin' / 'radical-edge-makeflow-prep')
-).load_module()
+)
+_spec = importlib.util.spec_from_loader('prep_mod', _loader)
+_PREP = importlib.util.module_from_spec(_spec)
+sys.modules['prep_mod'] = _PREP
+_loader.exec_module(_PREP)
 
 PrepOptions = _PREP.PrepOptions
 PrepError   = _PREP.PrepError

@@ -45,10 +45,10 @@ log = logging.getLogger('radical.edge')
 class StrategyContext:
     '''Read-only state accessors plus narrow action hooks for a strategy.
 
-    The dispatcher constructs one context per strategy invocation; the
-    context is not meant to be held across calls.  Accessor methods
-    return snapshots; action methods schedule dispatcher-side work (they
-    do not block on the underlying batch system or bridge).
+    The dispatcher constructs one context per pool and reuses it across
+    strategy invocations.  Accessor methods return snapshots; action methods
+    schedule dispatcher-side work (they do not block on the underlying batch
+    system or bridge).
 
     The strategy must not import psij, rhapsody, httpx, or BridgeClient.
     All side effects are expressed through this object.
