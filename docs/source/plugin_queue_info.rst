@@ -165,7 +165,7 @@ Example
 
 .. code-block:: bash
 
-   ./examples/01_queue_info.py --queue compute --user alice
+   ./examples/example_queue_info.py
 
 
 Extending to other batch systems

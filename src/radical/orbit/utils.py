@@ -172,12 +172,16 @@ def resolve_bridge_url(cli: Optional[str] = None) -> Tuple[str, str]:
 def _resolve_path_value(cli: Optional[str], env_var: str,
                         file_path: Path
                         ) -> Tuple[Optional[Path], str]:
-    """CLI > env > file precedence for a filesystem path."""
+    """CLI > env > file precedence for a filesystem path.
+
+    ``~`` is expanded: the shell does not expand it after ``--cert=`` /
+    ``--key=`` or inside env vars, so the tool must.
+    """
     if cli:
-        return Path(cli), 'cli'
+        return Path(cli).expanduser(), 'cli'
     env_val = os.environ.get(env_var, '').strip()
     if env_val:
-        return Path(env_val), 'env'
+        return Path(env_val).expanduser(), 'env'
     if file_path.exists():
         return file_path, 'file'
     return None, ''

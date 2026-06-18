@@ -7,8 +7,8 @@ import time
 from radical.orbit import BridgeClient
 
 
-def my_notification_cb(topic: str, data: dict):
-    print(f"\n[Notification] {topic}: {data}\n")
+def my_notification_cb(endpoint: str, plugin: str, topic: str, data: dict):
+    print(f"\n[Notification] {endpoint}/{plugin} {topic}: {data}\n")
 
 
 def get_config(config_path: str = None) -> dict:

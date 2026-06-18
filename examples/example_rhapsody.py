@@ -18,8 +18,8 @@ import time
 from radical.orbit import BridgeClient
 
 
-def my_notification_cb(topic: str, data: dict):
-    print(f"\n[Notification Receive] topic={topic} data={data}\n")
+def my_notification_cb(endpoint: str, plugin: str, topic: str, data: dict):
+    print(f"[Notification]   {endpoint}/{plugin} topic={topic} data={data}")
 
 
 def main():
@@ -32,7 +32,7 @@ def main():
         print("No endpoints found.")
         return
 
-    eid = eids[0]
+    eid = eids[1]
     print(f"Using endpoint: {eid}")
 
     ec = bc.get_endpoint_client(eid)
@@ -61,14 +61,14 @@ def main():
     # To submit to a specific Rhapsody backend (e.g., dragon, flux), you can
     # pass the `backend` argument. E.g.:
     # submitted = rh.submit_tasks(tasks, backend="dragon_v3")
-    print(f"\nSubmitting {len(tasks)} tasks ...")
+    print(f"Submitting {len(tasks)} tasks ...")
     submitted = rh.submit_tasks(tasks)
 
     uids = [t['uid'] for t in submitted]
     print(f"  Task UIDs: {uids}")
 
     # ---- wait for completion ----
-    print("\nWaiting for tasks to complete ...")
+    print("Waiting for tasks to complete ...")
     t0 = time.time()
     completed = rh.wait_tasks(uids)
     elapsed = time.time() - t0
@@ -77,7 +77,7 @@ def main():
     # ---- print results ----
     print("\n" + "=" * 60)
     print(" Results")
-    print("=" * 60)
+    print("=" * 60 + "\n")
     for task in completed:
         uid   = task.get('uid', '?')
         state = task.get('state', '?')
@@ -85,7 +85,7 @@ def main():
         err   = (task.get('stderr') or '').strip()
         rc    = task.get('exit_code')
 
-        print(f"\n  [{uid}]  state={state}  exit_code={rc}")
+        print(f"  [{uid}]   state={state}  exit_code={rc}")
         if out:
             print(f"    stdout: {out}")
         if err:
