@@ -796,6 +796,9 @@ class RhapsodyClient(PluginClient):
         # Waiters: list of (set_of_uids, threading.Event) for wait_tasks
         self._waiters: list[tuple[set, threading.Event]] = []
         self._waiters_lock = threading.Lock()
+        # UIDs submitted via this client — lets wait_tasks() reject UIDs that
+        # were never submitted instead of blocking on them forever.
+        self._submitted: set[str] = set()
 
     def _on_task_done(self, endpoint, plugin, topic, data):
         """Persistent SSE callback: accumulate terminal task states.
@@ -1028,6 +1031,10 @@ class RhapsodyClient(PluginClient):
             if 'uid' not in td:
                 td['uid'] = f"task.{uuid.uuid4().hex[:8]}"
 
+        # Remember what we submitted so wait_tasks() can validate UIDs.
+        with self._completed_lock:
+            self._submitted.update(str(td['uid']) for td in task_dicts)
+
         # --- try template compression for homogeneous batches ---
         # If all tasks share the same fields (except uid), send a
         # template + list of UIDs instead of N full copies.
@@ -1170,6 +1177,41 @@ class RhapsodyClient(PluginClient):
             list[dict]: Completed task dicts.
         """
         self._require_session()
+
+        # ------------------------------------------------------------------
+        # Normalize input and fail fast.  Accept task UIDs (str) or task
+        # objects/dicts (extract their 'uid'); reject anything else with a
+        # TypeError, and reject UIDs never submitted via this session with a
+        # ValueError.  Either way is better than blocking forever on a value
+        # the wait can never satisfy.
+        # ------------------------------------------------------------------
+        norm: list[str] = []
+        for item in uids:
+            if isinstance(item, str):
+                norm.append(item)
+                continue
+            uid = getattr(item, 'uid', None)
+            if uid is None:
+                try:
+                    uid = item['uid']
+                except (TypeError, KeyError, IndexError):
+                    uid = None
+            if uid is None:
+                raise TypeError(
+                    "wait_tasks: each item must be a task UID (str) or a "
+                    "task object/dict with a 'uid'; got "
+                    f"{type(item).__name__}")
+            norm.append(str(uid))
+        uids = norm
+
+        with self._completed_lock:
+            unknown = [u for u in uids
+                       if u not in self._submitted
+                       and u not in self._completed]
+        if unknown:
+            raise ValueError(
+                "wait_tasks: unknown task UID(s) not submitted via this "
+                f"session: {unknown}")
 
         # ------------------------------------------------------------------
         # Check if SSE notifications are available

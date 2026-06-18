@@ -694,6 +694,7 @@ def test_rhapsody_client_submit_tasks():
 
 def test_rhapsody_client_wait_tasks():
     client = _make_rhapsody_client([{"uid": "t.001", "state": "DONE"}])
+    client._submitted.add("t.001")
     result = client.wait_tasks(["t.001"])
     assert isinstance(result, list)
     mock_call = client._http.post.call_args
@@ -703,9 +704,33 @@ def test_rhapsody_client_wait_tasks():
 
 def test_rhapsody_client_wait_tasks_with_timeout():
     client = _make_rhapsody_client([])
+    client._submitted.add("t.001")
     client.wait_tasks(["t.001"], timeout=30.0)
     mock_call = client._http.post.call_args
     assert mock_call[1]["json"].get("timeout") == 30.0
+
+
+def test_rhapsody_client_wait_tasks_accepts_task_objects():
+    """wait_tasks() accepts task objects/dicts, not just UID strings."""
+    client = _make_rhapsody_client([{"uid": "t.001", "state": "DONE"}])
+    client._submitted.add("t.001")
+    result = client.wait_tasks([{"uid": "t.001"}])     # task dict, not str
+    assert isinstance(result, list)
+    assert client._http.post.call_args[1]["json"]["uids"] == ["t.001"]
+
+
+def test_rhapsody_client_wait_tasks_unknown_uid_raises():
+    """Waiting on a UID never submitted fails fast instead of hanging."""
+    client = _make_rhapsody_client([])
+    with pytest.raises(ValueError, match="unknown task UID"):
+        client.wait_tasks(["t.never"])
+
+
+def test_rhapsody_client_wait_tasks_bad_type_raises():
+    """A non-UID, non-task argument raises TypeError instead of hanging."""
+    client = _make_rhapsody_client([])
+    with pytest.raises(TypeError, match="task UID"):
+        client.wait_tasks([12345])
 
 
 def test_rhapsody_client_cancel_task():
