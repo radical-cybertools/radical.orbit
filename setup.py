@@ -16,7 +16,7 @@ import sysconfig
 import subprocess as sp
 
 from glob       import glob
-from setuptools import setup, Command, find_namespace_packages
+from setuptools import setup, find_namespace_packages
 
 from distutils.command.build_scripts import build_scripts as _build_scripts
 
@@ -114,15 +114,6 @@ def get_version(_mod_root):
 
 # get version info — this will create _version.py in the package dir
 version, version_path = get_version(mod_root)
-
-
-class RunTwine(Command):
-    user_options = []
-    def initialize_options(self): pass
-    def finalize_options(self):   pass
-    def run(self):
-        _, _, _ret = sh_callout('python3 setup.py sdist upload -r pypi')
-        raise SystemExit(_ret)
 
 
 class BuildScripts(_build_scripts):
@@ -225,8 +216,7 @@ setup_args = {
     'install_requires'   : requirements,
     'zip_safe'           : False,
     'data_files'         : data,
-    'cmdclass'           : {'upload'        : RunTwine,
-                            'build_scripts' : BuildScripts},
+    'cmdclass'           : {'build_scripts' : BuildScripts},
     'entry_points'       : {
         # Pluggable task-dispatcher strategies.  In-tree strategies are
         # also discoverable via the built-in registry in
