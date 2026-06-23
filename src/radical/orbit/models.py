@@ -19,6 +19,7 @@ class RegisterMessage(BaseModel):
     endpoint_name: str = Field(..., description="Name of the endpoint service")
     endpoint: Dict[str, Any] = Field(default_factory=dict, description="Endpoint metadata")
     plugins: Dict[str, Dict[str, Any]] = Field(default_factory=dict, description="Plugin metadata keyed by plugin name")
+    token: Optional[str] = Field(None, description="Shared bridge auth token")
 
 
 class ResponseMessage(BaseModel):

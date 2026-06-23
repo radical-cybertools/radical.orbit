@@ -42,6 +42,21 @@ For HTTPS, generate a self-signed cert first:
 openssl req -x509 -newkey rsa:4096 -nodes -keyout key.pem -out cert.pem -days 365 -subj "/CN=localhost"
 ```
 
+### Ingress auth token
+
+The bridge gates its HTTP ingress and the endpoint `/register` handshake with a
+**shared bearer token**. On first start it generates one and writes it to
+`~/.radical/orbit/bridge.token` (0600), printing it on stdout. Resolution
+(client/endpoint side): `--token` > `$RADICAL_ORBIT_BRIDGE_TOKEN` >
+`~/.radical/orbit/bridge.token` — so same-host clients/endpoints pick it up with
+no config; for a remote bridge, copy the token or set the env var. The Explorer
+prompts for it and then rides an HttpOnly cookie minted by `POST /auth`. Disable
+the gate for local dev with `--no-auth` (or `RADICAL_ORBIT_BRIDGE_NO_AUTH=1`).
+Helpers live in `utils.py` (`resolve_bridge_token`, `ensure_bridge_token`,
+`auth_disabled`, `tokens_match`); the gate is the `Bridge._auth_dispatch`
+middleware. This is the interim credential that the planned broker rework
+generalizes into a per-participant identity (mTLS).
+
 ## Testing
 
 ```sh

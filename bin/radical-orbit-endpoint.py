@@ -30,6 +30,10 @@ async def main():
                         help="Bridge TLS cert path.  CLI > "
                              "$RADICAL_ORBIT_BRIDGE_CERT > "
                              "~/.radical/orbit/bridge_cert.pem.")
+    parser.add_argument("--token",     "-t", nargs="?",
+                        help="Shared bridge auth token.  CLI > "
+                             "$RADICAL_ORBIT_BRIDGE_TOKEN > "
+                             "~/.radical/orbit/bridge.token.")
     parser.add_argument("--plugins",   "-p", default="default",
                         help="Comma-separated plugins to load (default: "
                              "the role-specific default set).  Special "
@@ -76,7 +80,8 @@ async def main():
                           name       =args.name,
                           plugins    =plugins,
                           tunnel     =args.tunnel,
-                          tunnel_via =args.tunnel_via)
+                          tunnel_via =args.tunnel_via,
+                          token      =args.token)
 
     loop = asyncio.get_running_loop()
 

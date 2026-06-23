@@ -56,12 +56,16 @@ def make_bridge(self_signed, tmp_path, monkeypatch):
     """
     from radical.orbit import utils
     monkeypatch.setattr(utils, 'URL_FILE', tmp_path / 'bridge.url')
+    monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'bridge.token')
 
     cert, key = self_signed
 
     def _build(**kwargs):
         from radical.orbit import Bridge
-        defaults = dict(cert=str(cert), key=str(key))
+        # Default these bridge tests to auth-off; dedicated auth coverage
+        # lives in test_bridge_auth.py.  Callers override with
+        # ``no_auth=False`` + ``token=...``.
+        defaults = dict(cert=str(cert), key=str(key), no_auth=True)
         defaults.update(kwargs)
         return Bridge(**defaults)
 

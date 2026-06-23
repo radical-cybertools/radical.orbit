@@ -54,16 +54,41 @@ set any of:
 ```sh
 export RADICAL_ORBIT_BRIDGE_URL='https://my-bridge:8000/'
 export RADICAL_ORBIT_BRIDGE_CERT="/path/to/bridge_cert.pem"
-export RADICAL_ORBIT_BRIDGE_KEY="/path/to/bridge_key.pem"  # only needed for the bridge
+export RADICAL_ORBIT_BRIDGE_KEY="/path/to/bridge_key.pem"    # only needed for the bridge
+export RADICAL_ORBIT_BRIDGE_TOKEN="<shared ingress token>"  # see "Ingress authentication" below
 ```
 
 See the **Bridge configuration** section below for the full
 precedence rules (CLI > env > file).
 
+### 1b. Ingress authentication (token)
+
+The bridge requires a **shared bearer token** on its HTTP ingress and on the
+endpoint `/register` handshake — without it, anyone who can reach the bridge
+could drive plugins (submit jobs, stage files). On first start the bridge
+**generates a token** and writes it to `~/.radical/orbit/bridge.token` (mode
+`0600`), printing it on stdout. Same-host endpoints and clients pick that file
+up automatically; for a remote bridge, copy the token (like the cert) and set:
+
+```sh
+export RADICAL_ORBIT_BRIDGE_TOKEN='<the token>'
+```
+
+Precedence is CLI (`--token`) > `$RADICAL_ORBIT_BRIDGE_TOKEN` >
+`~/.radical/orbit/bridge.token`. The Python client/SDK and the endpoint resolve
+it automatically; the **Explorer** prompts for it once and rides an HttpOnly
+cookie thereafter.
+
+For pure local development you can disable the gate (loud warning):
+
+```sh
+./bin/radical-orbit-bridge.py --no-auth   # or RADICAL_ORBIT_BRIDGE_NO_AUTH=1
+```
+
 ### 2. Starting the Bridge
 The Bridge server exposes a REST API and a WebSocket endpoint (`/register`):
 ```sh
-./bin/radical-orbit-bridge.py
+./bin/radical-orbit-bridge.py        # prints the auth token + URL on startup
 ```
 
 ### 3. Starting the Endpoint Service
@@ -89,8 +114,13 @@ The wrapper script automatically detects and exports the correct `PYTHONPATH` fo
 
 The Bridge serves as an HTTP proxy with the following management endpoints:
 
+All routes except the UI shell (`GET /`) and the static plugin assets
+(`/plugins/*`) require the bridge token — sent as `Authorization: Bearer <token>`
+or, for the browser, the cookie minted by `POST /auth`.
+
 ### Management Endpoints
-- `GET /` - Fetches the interactive ORBIT Explorer UI.
+- `GET /` - Fetches the interactive ORBIT Explorer UI. (ungated)
+- `POST /auth` - Validates the bearer token and sets the HttpOnly auth cookie (used by the Explorer / SSE).
 - `POST /endpoint/list` - Returns a JSON structure describing all currently connected Endpoints and their loaded Plugins namespaces.
 - `POST /endpoint/disconnect/{endpoint_name}` - Disconnect a specific endpoint service from the bridge.
 - `POST /bridge/terminate` - Terminate the bridge process (endpoints remain running).
