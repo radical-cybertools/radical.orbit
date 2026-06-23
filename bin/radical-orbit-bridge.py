@@ -36,6 +36,15 @@ def main():
                              'registered plugin), "" (none).  Wildcards '
                              'allowed: "iri*". Prefix matching '
                              'supported. Combine, e.g.: "-p default,rose".')
+    parser.add_argument('--token', default=None,
+                        help='Shared ingress auth token.  CLI > '
+                             '$RADICAL_ORBIT_BRIDGE_TOKEN > '
+                             '~/.radical/orbit/bridge.token.  If none is set, '
+                             'one is generated and written to that file '
+                             '(mode 0600) at startup.')
+    parser.add_argument('--no-auth', action='store_true',
+                        help='Disable ingress authentication (local dev only). '
+                             'Also via $RADICAL_ORBIT_BRIDGE_NO_AUTH=1.')
     args = parser.parse_args()
 
     log_level_name = (os.environ.get('RADICAL_ORBIT_LOG_LVL')

@@ -28,6 +28,7 @@ from fastapi               import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi               import Request, Response, HTTPException
 from fastapi.responses     import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses   import StreamingResponse
 from starlette.websockets  import WebSocketState
 
@@ -83,12 +84,25 @@ class Bridge:
                  key:     Optional[str]     = None,
                  host:    str = '0.0.0.0',
                  port:    int = 8000,
-                 plugins: str = 'default'):
+                 plugins: str = 'default',
+                 token:   Optional[str]     = None,
+                 no_auth: bool              = False):
         # ── Resolve TLS config (cert/key) ────────────────────────────
         cert_path, _ = utils.resolve_bridge_cert(cli=cert)
         key_path,  _ = utils.resolve_bridge_key (cli=key, cert=cert_path)
         self._cert: str = str(cert_path)
         self._key : str = str(key_path)
+
+        # ── Resolve ingress auth token ───────────────────────────────
+        # A shared bearer token gates the HTTP ingress and the endpoint
+        # /register handshake.  ``--no-auth`` (or $RADICAL_ORBIT_BRIDGE_NO_AUTH)
+        # disables the gate for local dev.  When enabled and no token is
+        # configured, one is generated and written to ~/.radical/orbit/bridge.token.
+        self._auth_enabled: bool          = not utils.auth_disabled(no_auth)
+        self._token:        Optional[str] = None
+        self._token_source: str           = 'disabled'
+        if self._auth_enabled:
+            self._token, self._token_source = utils.ensure_bridge_token(cli=token)
 
         # ── Derive advertised URL from (host, port) ──────────────────
         # The bridge produces its URL — it never reads ``bridge.url``.
@@ -163,6 +177,18 @@ class Bridge:
         # the operator can copy whichever is reachable from clients.
         for form in self._url_forms:
             print(f'[Bridge] URL: {form}', flush=True)
+
+        # Surface the ingress auth state.  The token is also in the 0600 file,
+        # so same-host clients pick it up automatically; cross-host operators
+        # copy it like they copy the cert/URL.
+        if self._auth_enabled:
+            print(f'[Bridge] auth token ({self._token_source}): {self._token}',
+                  flush=True)
+            print(f'[Bridge] token file: {utils.TOKEN_FILE}', flush=True)
+        else:
+            log.warning("[Bridge] ingress authentication DISABLED (--no-auth)")
+            print('[Bridge] WARNING: ingress authentication DISABLED '
+                  '(--no-auth)', flush=True)
 
         # Write the URL file only when it does not already exist —
         # never clobber a file the operator may have placed there
@@ -307,15 +333,25 @@ class Bridge:
 
     @staticmethod
     def _strip_headers(request: Request) -> dict:
+        # Also drop the bridge credential (authorization / cookie) so the
+        # shared token is never forwarded on to endpoint plugins.
         to_strip = {"connection", "keep-alive", "proxy-authenticate",
                     "proxy-authorization", "te", "trailers",
-                    "transfer-encoding", "upgrade"}
+                    "transfer-encoding", "upgrade",
+                    "authorization", "cookie"}
         return {k: v for k, v in request.headers.items()
                 if k.lower() not in to_strip}
 
     # ── middleware + exception handlers ──────────────────────────────
 
     def _setup_middleware(self):
+        # Ingress auth gate.  Added BEFORE CORS so CORS ends up outermost
+        # (Starlette applies the most-recently-added middleware first), which
+        # means a 401 still carries CORS headers and the browser can read it.
+        if self._auth_enabled:
+            self._app.add_middleware(BaseHTTPMiddleware,
+                                     dispatch=self._auth_dispatch)
+
         # LUCID needs credentials; browsers reject credentials + wildcard
         # origin, so we list allowed origins explicitly.
         origins = [
@@ -332,6 +368,37 @@ class Bridge:
             allow_methods=["*"],
             allow_headers=["*"],
         )
+
+    @staticmethod
+    def _request_token(request: Request) -> Optional[str]:
+        """Extract the bearer token from a request: ``Authorization: Bearer``
+        header first, else the ``orbit_bridge_token`` cookie (the browser/SSE
+        path set by ``POST /auth``)."""
+        auth = request.headers.get('authorization', '')
+        if auth.lower().startswith('bearer '):
+            return auth[7:].strip()
+        return request.cookies.get(utils.AUTH_COOKIE)
+
+    async def _auth_dispatch(self, request: Request, call_next):
+        """Require the shared token on every capability-bearing route.
+
+        Exempt: CORS preflight (``OPTIONS``), the UI shell (``/``), and the
+        static plugin JS (``/plugins/...``) — these carry no capability and
+        must load so the Explorer can prompt for the token.  ``POST /auth``
+        is *not* exempt: it is reached only with a valid bearer header and
+        then mints the cookie.
+        """
+        path = request.url.path
+        if request.method == 'OPTIONS' \
+                or path == '/' \
+                or path.startswith('/plugins/'):
+            return await call_next(request)
+        if not utils.tokens_match(self._request_token(request), self._token):
+            return JSONResponse(
+                status_code=401,
+                content={"error": True, "status_code": 401,
+                         "detail": "missing or invalid bridge token"})
+        return await call_next(request)
 
     def _setup_exception_handlers(self):
         app = self._app
@@ -442,6 +509,15 @@ class Bridge:
                         if not frame_endpoint_name:
                             log.warning("[Bridge] Registration missing endpoint_name")
                             continue
+                        if self_._auth_enabled and not utils.tokens_match(
+                                data.get("token"), self_._token):
+                            log.warning("[Bridge] Registration with missing/"
+                                        "invalid token from '%s'",
+                                        frame_endpoint_name)
+                            await ws.send_text(json.dumps({
+                                "type": "error",
+                                "message": "missing or invalid bridge token"}))
+                            return
                         if frame_endpoint_name == BRIDGE_ENDPOINT_NAME:
                             log.warning("[Bridge] Endpoint name '%s' is reserved",
                                         frame_endpoint_name)
@@ -579,6 +655,21 @@ class Bridge:
 
             return StreamingResponse(event_generator(),
                                      media_type="text/event-stream")
+
+        # ── /auth (mint the browser/SSE cookie) ──────────────────────
+        # Reaching this handler means the auth middleware already validated a
+        # bearer header (or an existing cookie).  We then set an HttpOnly,
+        # Secure, SameSite=Strict cookie so the browser's EventSource — which
+        # cannot send headers — authenticates on the same connection.  This
+        # route is a no-op (still 200) when auth is disabled.
+        @app.post("/auth", tags=["Auth"])
+        async def auth(request: Request):
+            resp = JSONResponse({"ok": True})
+            if self_._auth_enabled and self_._token:
+                resp.set_cookie(key=utils.AUTH_COOKIE, value=self_._token,
+                                httponly=True, secure=True,
+                                samesite="strict", path="/")
+            return resp
 
         # ── topology / endpoint management ───────────────────────────────
 

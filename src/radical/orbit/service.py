@@ -101,6 +101,7 @@ class EndpointService(PluginHostBase):
                  plugins:    Optional[list]     = None,
                  tunnel:     str                = 'none',
                  tunnel_via: Optional[str]      = None,
+                 token:      Optional[str]      = None,
                  app:        Optional[FastAPI]  = None):
         """
         Initialize the Endpoint Service.
@@ -157,6 +158,10 @@ class EndpointService(PluginHostBase):
             self._cert: Optional[str] = str(resolved_cert)
         else:
             self._cert = None
+
+        # Shared ingress auth token, sent in the register frame.  None is fine
+        # when the bridge runs with auth disabled.
+        self._token: Optional[str] = utils.resolve_bridge_token(cli=token)[0]
 
         self._app: FastAPI = app if app is not None \
                                  else FastAPI(title="Embedded Endpoint Service")
@@ -546,6 +551,7 @@ class EndpointService(PluginHostBase):
                             endpoint_name=self._name,
                             endpoint={"type": "radical.orbit"},
                             plugins=plugins_data,
+                            token=self._token,
                         )
                         await ws.send(reg.model_dump_json())
 

@@ -1757,6 +1757,41 @@
 
     const API_TIMEOUT_MS = 30000; // 30 second request timeout
 
+    // Shared bridge auth token.  Kept in localStorage only to (re)authenticate;
+    // the live credential the browser sends is the HttpOnly cookie minted by
+    // POST /auth, which JS cannot read.
+    let BRIDGE_TOKEN = localStorage.getItem('orbit_bridge_token') || '';
+
+    async function ensureAuth(forcePrompt = false) {
+      // Obtain/refresh the HttpOnly auth cookie via POST /auth using the shared
+      // bearer token.  If the bridge runs with --no-auth, /auth returns 200 and
+      // sets no cookie, so a blank token works.  Returns false only if the user
+      // cancels the prompt.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (forcePrompt || !BRIDGE_TOKEN) {
+          const t = window.prompt(
+            'Bridge auth token (leave blank if the bridge runs with --no-auth):',
+            BRIDGE_TOKEN || '');
+          if (t === null) return false;             // user cancelled
+          BRIDGE_TOKEN = t.trim();
+          localStorage.setItem('orbit_bridge_token', BRIDGE_TOKEN);
+        }
+        const headers = {};
+        if (BRIDGE_TOKEN) headers['Authorization'] = 'Bearer ' + BRIDGE_TOKEN;
+        let res;
+        try {
+          res = await fetch(BRIDGE.replace(/\/$/, '') + '/auth',
+                            { method: 'POST', credentials: 'include', headers });
+        } catch (e) {
+          return true;   // network error — let the connect flow surface it
+        }
+        if (res.ok) return true;
+        if (res.status === 401) { forcePrompt = true; continue; }
+        return true;     // other status — don't block; caller handles
+      }
+      return false;
+    }
+
     async function apiFetch(path, opts = {}) {
       const url = BRIDGE.replace(/\/$/, '') + path;
       const controller = new AbortController();
@@ -1765,12 +1800,19 @@
       try {
         const res = await fetch(url, {
           ...opts,
+          credentials: 'include',
           signal: controller.signal,
           headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) }
         });
         clearTimeout(timeoutId);
 
         if (!res.ok) {
+          // Auth lapsed/missing: re-prompt for the token, refresh the cookie,
+          // and retry once.
+          if (res.status === 401 && !opts._retried) {
+            const ok = await ensureAuth(true);
+            if (ok) return await apiFetch(path, { ...opts, _retried: true });
+          }
           const t = await res.text();
           const errMsg = `HTTP ${res.status}: ${t}`;
 
@@ -1875,6 +1917,10 @@
       } catch (e) {
         // assume relative or invalid, continue fetching
       }
+
+      // Authenticate (mint the HttpOnly cookie) before any capability call.
+      const authed = await ensureAuth();
+      if (!authed) { flash('Authentication cancelled', false); return; }
 
       document.getElementById('connectBtn').disabled = true;
       setConnectionStatus('reconnecting', 'Connecting...');
@@ -1998,7 +2044,9 @@
     function setupEventSource() {
       if (eventSource) eventSource.close();
 
-      eventSource = new EventSource(BRIDGE + '/events');
+      // withCredentials so the HttpOnly auth cookie rides the SSE connection
+      // (EventSource cannot set headers).
+      eventSource = new EventSource(BRIDGE + '/events', { withCredentials: true });
 
       eventSource.onopen = function() {
         setConnectionStatus('connected');
