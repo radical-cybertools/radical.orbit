@@ -265,3 +265,13 @@ def test_strip_headers_drops_cookie_header_when_only_auth():
     out = {k.lower(): v for k, v in Bridge._strip_headers(req).items()}
 
     assert "cookie" not in out
+
+
+def test_strip_headers_handles_trailing_semicolon():
+    """A trailing ``;`` (empty segment) must not yield an empty Cookie header."""
+    from radical.orbit import Bridge, utils
+
+    req = _request_with_headers({"cookie": f"{utils.AUTH_COOKIE}=secret;"})
+    out = {k.lower(): v for k, v in Bridge._strip_headers(req).items()}
+
+    assert "cookie" not in out

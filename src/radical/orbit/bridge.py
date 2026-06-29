@@ -17,6 +17,7 @@ import itertools
 import json
 import logging
 import os
+import posixpath
 import re
 import signal
 from contextlib import asynccontextmanager
@@ -353,7 +354,8 @@ class Bridge:
                 # Strip only the bridge auth cookie; preserve any others that
                 # endpoint plugins may rely on.
                 kept = [c.strip() for c in v.split(";")
-                        if not c.strip().startswith(f"{utils.AUTH_COOKIE}=")]
+                        if c.strip()
+                        and not c.strip().startswith(f"{utils.AUTH_COOKIE}=")]
                 if kept:
                     headers[k] = "; ".join(kept)
             else:
@@ -406,7 +408,11 @@ class Bridge:
         is *not* exempt: it is reached only with a valid bearer header and
         then mints the cookie.
         """
-        path = request.url.path
+        # Normalize before matching exemptions so a traversal-style path
+        # (e.g. ``/plugins/../endpoint/list``) can't slip a gated route past
+        # the gate.  Routing still uses the raw scope path, so normalizing here
+        # can only ever *under*-exempt — never expose a gated handler.
+        path = posixpath.normpath(request.url.path)
         if request.method == 'OPTIONS' \
                 or path == '/' \
                 or path.startswith('/plugins/'):

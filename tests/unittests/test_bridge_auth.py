@@ -121,3 +121,34 @@ def test_no_auth_bypass(make_bridge):
                       'endpoint': {}})
         msg = ws.receive_json()
         assert msg['type'] == 'topology'
+
+
+# Exercise the middleware directly: httpx (TestClient) collapses ``..`` in the
+# URL before sending, so a traversal path can only be fed to the gate by hand.
+
+def _scope_request(path):
+    from starlette.requests import Request
+    return Request({'type': 'http', 'method': 'GET', 'path': path,
+                    'headers': []})
+
+
+@pytest.mark.asyncio
+async def test_auth_dispatch_normalizes_traversal(make_bridge):
+    """A traversal path that resolves out of an exempt prefix
+    (``/plugins/../endpoint/list``) must be normalized and gated, not exempted."""
+    from starlette.responses import JSONResponse
+
+    bridge = make_bridge()                  # auth on, token='s3cret', no header
+
+    async def _passed(_req):
+        return JSONResponse({'ok': True})   # stands in for an exempted pass-through
+
+    # Traversal out of /plugins → normalized to /endpoint/list → must be gated.
+    resp = await bridge._auth_dispatch(
+        _scope_request('/plugins/../endpoint/list'), _passed)
+    assert resp.status_code == 401
+
+    # A genuine /plugins/ asset stays exempt (passes through without a token).
+    resp = await bridge._auth_dispatch(
+        _scope_request('/plugins/orbit.js'), _passed)
+    assert resp.status_code == 200
