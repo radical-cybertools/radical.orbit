@@ -1760,7 +1760,11 @@
     // Shared bridge auth token.  Kept in localStorage only to (re)authenticate;
     // the live credential the browser sends is the HttpOnly cookie minted by
     // POST /auth, which JS cannot read.
-    let BRIDGE_TOKEN = localStorage.getItem('orbit_bridge_token') || '';
+    let BRIDGE_TOKEN = localStorage.getItem('orbit_bridge_token');
+    // Distinguish "never set" (null) from "set to empty" (e.g. --no-auth) so we
+    // don't re-prompt on every connect once the user has chosen a blank token.
+    let hasTokenSet = BRIDGE_TOKEN !== null;
+    if (BRIDGE_TOKEN === null) BRIDGE_TOKEN = '';
 
     async function ensureAuth(forcePrompt = false) {
       // Obtain/refresh the HttpOnly auth cookie via POST /auth using the shared
@@ -1768,13 +1772,14 @@
       // sets no cookie, so a blank token works.  Returns false only if the user
       // cancels the prompt.
       for (let attempt = 0; attempt < 3; attempt++) {
-        if (forcePrompt || !BRIDGE_TOKEN) {
+        if (forcePrompt || !hasTokenSet) {
           const t = window.prompt(
             'Bridge auth token (leave blank if the bridge runs with --no-auth):',
             BRIDGE_TOKEN || '');
           if (t === null) return false;             // user cancelled
           BRIDGE_TOKEN = t.trim();
           localStorage.setItem('orbit_bridge_token', BRIDGE_TOKEN);
+          hasTokenSet = true;
         }
         const headers = {};
         if (BRIDGE_TOKEN) headers['Authorization'] = 'Bearer ' + BRIDGE_TOKEN;

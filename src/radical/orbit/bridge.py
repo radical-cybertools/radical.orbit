@@ -667,7 +667,8 @@ class Bridge:
             resp = JSONResponse({"ok": True})
             if self_._auth_enabled and self_._token:
                 resp.set_cookie(key=utils.AUTH_COOKIE, value=self_._token,
-                                httponly=True, secure=True,
+                                httponly=True,
+                                secure=request.url.scheme == "https",
                                 samesite="strict", path="/")
             return resp
 

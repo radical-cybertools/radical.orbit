@@ -60,7 +60,9 @@ def main():
            key=args.key,
            host=args.host,
            port=args.port,
-           plugins=args.plugins).run()
+           plugins=args.plugins,
+           token=args.token,
+           no_auth=args.no_auth).run()
 
 
 if __name__ == "__main__":
