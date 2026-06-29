@@ -284,7 +284,10 @@ def _read_token_file(path: Optional[Path] = None) -> Optional[str]:
         path = TOKEN_FILE
     try:
         text = path.read_text().strip()
-    except FileNotFoundError:
+    except OSError:
+        # Absent, or present-but-unreadable (e.g. PermissionError).  A missing
+        # or unreadable token is non-fatal on the consumer side, so treat any
+        # OS-level access failure as "no token".
         return None
     return text or None
 

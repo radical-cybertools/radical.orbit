@@ -337,10 +337,11 @@ class BridgeClient:
 
     def _listen_sse(self) -> None:
         log.debug("[client] SSE listener starting: url=%s/events", self._url)
-        sse_headers = {'Authorization': f'Bearer {self._token}'} \
-                          if self._token else {}
+        # Reuse the pooled client: it carries base_url, TLS verification, and
+        # the _inject_req_id request hook (Authorization + X-Request-ID), so we
+        # don't duplicate connection/auth setup here.
         try:
-            with httpx.stream("GET", f"{self._url}/events", headers=sse_headers, verify=self._cert if self._cert else False, timeout=None) as response:
+            with self._http.stream("GET", "/events", timeout=None) as response:
                 log.debug("[client] SSE stream connected: status=%s", response.status_code)
                 self._listener_connected.set()
                 for line in response.iter_lines():

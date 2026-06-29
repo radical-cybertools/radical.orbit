@@ -30,7 +30,7 @@ async def main():
                         help="Bridge TLS cert path.  CLI > "
                              "$RADICAL_ORBIT_BRIDGE_CERT > "
                              "~/.radical/orbit/bridge_cert.pem.")
-    parser.add_argument("--token",     "-t", nargs="?",
+    parser.add_argument("--token",     "-t",
                         help="Shared bridge auth token.  CLI > "
                              "$RADICAL_ORBIT_BRIDGE_TOKEN > "
                              "~/.radical/orbit/bridge.token.")
