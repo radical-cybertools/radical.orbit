@@ -224,3 +224,44 @@ def test_disconnect_removes_endpoint_from_both_maps(make_bridge):
     assert _wait_until(lambda: "thinkie" not in bridge.endpoints["endpoints"])
     assert "thinkie" not in bridge.endpoint_ws
     json.dumps(bridge.endpoints)
+
+
+# ---------------------------------------------------------------------------
+# _strip_headers — bridge credential must not leak to endpoint plugins
+# ---------------------------------------------------------------------------
+
+def _request_with_headers(headers: dict):
+    """Build a minimal Starlette ``Request`` carrying *headers*."""
+    from starlette.requests import Request
+    raw = [(k.lower().encode(), v.encode()) for k, v in headers.items()]
+    return Request({"type": "http", "method": "GET", "path": "/",
+                    "headers": raw})
+
+
+def test_strip_headers_drops_auth_keeps_other_cookies():
+    """The auth header and the bridge auth cookie are stripped; unrelated
+    cookies and other headers are forwarded untouched."""
+    from radical.orbit import Bridge, utils
+
+    req = _request_with_headers({
+        "authorization": "Bearer secret",
+        "cookie": f"{utils.AUTH_COOKIE}=secret; session=abc; theme=dark",
+        "content-type": "application/json",
+    })
+    out = {k.lower(): v for k, v in Bridge._strip_headers(req).items()}
+
+    assert "authorization" not in out
+    assert out["content-type"] == "application/json"
+    assert utils.AUTH_COOKIE not in out["cookie"]
+    assert "session=abc" in out["cookie"]
+    assert "theme=dark"  in out["cookie"]
+
+
+def test_strip_headers_drops_cookie_header_when_only_auth():
+    """When the auth cookie is the sole cookie, the whole Cookie header goes."""
+    from radical.orbit import Bridge, utils
+
+    req = _request_with_headers({"cookie": f"{utils.AUTH_COOKIE}=secret"})
+    out = {k.lower(): v for k, v in Bridge._strip_headers(req).items()}
+
+    assert "cookie" not in out

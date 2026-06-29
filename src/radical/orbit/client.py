@@ -343,6 +343,9 @@ class BridgeClient:
         try:
             with self._http.stream("GET", "/events", timeout=None) as response:
                 log.debug("[client] SSE stream connected: status=%s", response.status_code)
+                # Don't signal "connected" on an error status (e.g. 401/500) —
+                # raise so the listener exits instead of falsely reporting success.
+                response.raise_for_status()
                 self._listener_connected.set()
                 for line in response.iter_lines():
                     if self._listener_stop.is_set():

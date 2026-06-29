@@ -1766,7 +1766,18 @@
     let hasTokenSet = BRIDGE_TOKEN !== null;
     if (BRIDGE_TOKEN === null) BRIDGE_TOKEN = '';
 
-    async function ensureAuth(forcePrompt = false) {
+    // Single-flight guard: concurrent 401s would otherwise each open their own
+    // window.prompt.  Coalesce overlapping calls onto one in-flight auth attempt.
+    let activeAuthPromise = null;
+
+    function ensureAuth(forcePrompt = false) {
+      if (activeAuthPromise) return activeAuthPromise;
+      activeAuthPromise = _ensureAuth(forcePrompt)
+                            .finally(() => { activeAuthPromise = null; });
+      return activeAuthPromise;
+    }
+
+    async function _ensureAuth(forcePrompt = false) {
       // Obtain/refresh the HttpOnly auth cookie via POST /auth using the shared
       // bearer token.  If the bridge runs with --no-auth, /auth returns 200 and
       // sets no cookie, so a blank token works.  Returns false only if the user

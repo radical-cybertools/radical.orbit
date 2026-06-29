@@ -182,9 +182,14 @@ class Bridge:
         # so same-host clients pick it up automatically; cross-host operators
         # copy it like they copy the cert/URL.
         if self._auth_enabled:
-            print(f'[Bridge] auth token ({self._token_source}): {self._token}',
-                  flush=True)
-            print(f'[Bridge] token file: {utils.TOKEN_FILE}', flush=True)
+            # Never echo the token on every start — stdout lands in bridge.log /
+            # container logs, which are far less protected than the 0600 file
+            # (CWE-532).  Print the secret only when we just generated it (so a
+            # first-run operator can grab it); otherwise point at the file.
+            if self._token_source == 'generated':
+                print(f'[Bridge] generated auth token: {self._token}', flush=True)
+            print(f'[Bridge] auth token source: {self._token_source}; '
+                  f'file: {utils.TOKEN_FILE}', flush=True)
         else:
             log.warning("[Bridge] ingress authentication DISABLED (--no-auth)")
             print('[Bridge] WARNING: ingress authentication DISABLED '
@@ -333,14 +338,27 @@ class Bridge:
 
     @staticmethod
     def _strip_headers(request: Request) -> dict:
-        # Also drop the bridge credential (authorization / cookie) so the
-        # shared token is never forwarded on to endpoint plugins.
+        # Also drop the bridge credential (authorization header) so the shared
+        # token is never forwarded on to endpoint plugins.
         to_strip = {"connection", "keep-alive", "proxy-authenticate",
                     "proxy-authorization", "te", "trailers",
                     "transfer-encoding", "upgrade",
-                    "authorization", "cookie"}
-        return {k: v for k, v in request.headers.items()
-                if k.lower() not in to_strip}
+                    "authorization"}
+        headers = {}
+        for k, v in request.headers.items():
+            k_lower = k.lower()
+            if k_lower in to_strip:
+                continue
+            if k_lower == "cookie":
+                # Strip only the bridge auth cookie; preserve any others that
+                # endpoint plugins may rely on.
+                kept = [c.strip() for c in v.split(";")
+                        if not c.strip().startswith(f"{utils.AUTH_COOKIE}=")]
+                if kept:
+                    headers[k] = "; ".join(kept)
+            else:
+                headers[k] = v
+        return headers
 
     # ── middleware + exception handlers ──────────────────────────────
 

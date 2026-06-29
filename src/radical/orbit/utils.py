@@ -279,15 +279,18 @@ def resolve_bridge_key(cli: Optional[str] = None, *,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _read_token_file(path: Optional[Path] = None) -> Optional[str]:
-    """Read the token file, stripped.  ``None`` if absent/empty."""
+    """Read the token file, stripped.  ``None`` if absent/empty.
+
+    Only ``FileNotFoundError`` is swallowed (consistent with ``_read_url_file``):
+    a present-but-unreadable file (e.g. ``PermissionError``) is a real
+    misconfiguration that should surface loudly rather than be masked as
+    "no token" — which would otherwise trigger a regenerate-then-crash-on-write.
+    """
     if path is None:
         path = TOKEN_FILE
     try:
         text = path.read_text().strip()
-    except OSError:
-        # Absent, or present-but-unreadable (e.g. PermissionError).  A missing
-        # or unreadable token is non-fatal on the consumer side, so treat any
-        # OS-level access failure as "no token".
+    except FileNotFoundError:
         return None
     return text or None
 
