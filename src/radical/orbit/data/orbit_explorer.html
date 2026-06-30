@@ -1757,6 +1757,57 @@
 
     const API_TIMEOUT_MS = 30000; // 30 second request timeout
 
+    // Shared bridge auth token.  Kept in localStorage only to (re)authenticate;
+    // the live credential the browser sends is the HttpOnly cookie minted by
+    // POST /auth, which JS cannot read.
+    let BRIDGE_TOKEN = localStorage.getItem('orbit_bridge_token');
+    // Distinguish "never set" (null) from "set to empty" (e.g. --no-auth) so we
+    // don't re-prompt on every connect once the user has chosen a blank token.
+    let hasTokenSet = BRIDGE_TOKEN !== null;
+    if (BRIDGE_TOKEN === null) BRIDGE_TOKEN = '';
+
+    // Single-flight guard: concurrent 401s would otherwise each open their own
+    // window.prompt.  Coalesce overlapping calls onto one in-flight auth attempt.
+    let activeAuthPromise = null;
+
+    function ensureAuth(forcePrompt = false) {
+      if (activeAuthPromise) return activeAuthPromise;
+      activeAuthPromise = _ensureAuth(forcePrompt)
+                            .finally(() => { activeAuthPromise = null; });
+      return activeAuthPromise;
+    }
+
+    async function _ensureAuth(forcePrompt = false) {
+      // Obtain/refresh the HttpOnly auth cookie via POST /auth using the shared
+      // bearer token.  If the bridge runs with --no-auth, /auth returns 200 and
+      // sets no cookie, so a blank token works.  Returns false only if the user
+      // cancels the prompt.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (forcePrompt || !hasTokenSet) {
+          const t = window.prompt(
+            'Bridge auth token (leave blank if the bridge runs with --no-auth):',
+            BRIDGE_TOKEN || '');
+          if (t === null) return false;             // user cancelled
+          BRIDGE_TOKEN = t.trim();
+          localStorage.setItem('orbit_bridge_token', BRIDGE_TOKEN);
+          hasTokenSet = true;
+        }
+        const headers = {};
+        if (BRIDGE_TOKEN) headers['Authorization'] = 'Bearer ' + BRIDGE_TOKEN;
+        let res;
+        try {
+          res = await fetch(BRIDGE.replace(/\/$/, '') + '/auth',
+                            { method: 'POST', credentials: 'include', headers });
+        } catch (e) {
+          return true;   // network error — let the connect flow surface it
+        }
+        if (res.ok) return true;
+        if (res.status === 401) { forcePrompt = true; continue; }
+        return true;     // other status — don't block; caller handles
+      }
+      return false;
+    }
+
     async function apiFetch(path, opts = {}) {
       const url = BRIDGE.replace(/\/$/, '') + path;
       const controller = new AbortController();
@@ -1765,12 +1816,21 @@
       try {
         const res = await fetch(url, {
           ...opts,
+          credentials: 'include',
           signal: controller.signal,
           headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) }
         });
         clearTimeout(timeoutId);
 
         if (!res.ok) {
+          // Auth lapsed/missing: try a *silent* re-auth first (the cookie may
+          // have expired while the stored token is still valid).  ensureAuth
+          // only prompts if that POST /auth itself 401s, so we don't bother the
+          // user when the token in localStorage still works.
+          if (res.status === 401 && !opts._retried) {
+            const ok = await ensureAuth(false);
+            if (ok) return await apiFetch(path, { ...opts, _retried: true });
+          }
           const t = await res.text();
           const errMsg = `HTTP ${res.status}: ${t}`;
 
@@ -1875,6 +1935,10 @@
       } catch (e) {
         // assume relative or invalid, continue fetching
       }
+
+      // Authenticate (mint the HttpOnly cookie) before any capability call.
+      const authed = await ensureAuth();
+      if (!authed) { flash('Authentication cancelled', false); return; }
 
       document.getElementById('connectBtn').disabled = true;
       setConnectionStatus('reconnecting', 'Connecting...');
@@ -1998,7 +2062,9 @@
     function setupEventSource() {
       if (eventSource) eventSource.close();
 
-      eventSource = new EventSource(BRIDGE + '/events');
+      // withCredentials so the HttpOnly auth cookie rides the SSE connection
+      // (EventSource cannot set headers).
+      eventSource = new EventSource(BRIDGE + '/events', { withCredentials: true });
 
       eventSource.onopen = function() {
         setConnectionStatus('connected');

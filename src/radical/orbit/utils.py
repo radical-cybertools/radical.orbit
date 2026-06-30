@@ -5,7 +5,9 @@ Anything with state, threads, side effects, or non-trivial domain logic
 belongs in its own module.
 """
 
+import hmac
 import os
+import secrets
 import socket
 import ssl
 import stat
@@ -42,10 +44,18 @@ DEFAULT_DIR  = Path.home() / '.radical' / 'orbit'
 URL_FILE     = DEFAULT_DIR / 'bridge.url'
 CERT_FILE    = DEFAULT_DIR / 'bridge_cert.pem'
 KEY_FILE     = DEFAULT_DIR / 'bridge_key.pem'
+TOKEN_FILE   = DEFAULT_DIR / 'bridge.token'
 
 ENV_URL      = 'RADICAL_ORBIT_BRIDGE_URL'
 ENV_CERT     = 'RADICAL_ORBIT_BRIDGE_CERT'
 ENV_KEY      = 'RADICAL_ORBIT_BRIDGE_KEY'
+ENV_TOKEN    = 'RADICAL_ORBIT_BRIDGE_TOKEN'
+ENV_NO_AUTH  = 'RADICAL_ORBIT_BRIDGE_NO_AUTH'
+
+# Cookie the browser/SSE path carries (set by the bridge's POST /auth).  The
+# token never lives in a query string, only this HttpOnly cookie or a
+# request header.
+AUTH_COOKIE  = 'orbit_bridge_token'
 
 
 def _read_url_file(path: Optional[Path] = None) -> Optional[str]:
@@ -249,6 +259,114 @@ def resolve_bridge_key(cli: Optional[str] = None, *,
         ctx.load_cert_chain(str(cert), str(path))
 
     return path, source
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Bridge ingress auth token.
+#
+#  A shared bearer token gates the bridge's HTTP ingress and the endpoint
+#  ``/register`` handshake.  It is the deployment-scoped credential (same trust
+#  model as the cert): clients/endpoints present it, the bridge verifies it.
+#
+#    Env var:  RADICAL_ORBIT_BRIDGE_TOKEN
+#    File:     ~/.radical/orbit/bridge.token   (mode 0600)
+#    Disable:  RADICAL_ORBIT_BRIDGE_NO_AUTH=1  (escape hatch for local dev)
+#
+#  Consumer precedence (endpoint / client): CLI > env > file.  A missing token
+#  is *not* an error on the consumer side — the bridge may run with auth off.
+#  The bridge itself uses ``ensure_bridge_token``, which generates and writes a
+#  token when none is configured.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _read_token_file(path: Optional[Path] = None) -> Optional[str]:
+    """Read the token file, stripped.  ``None`` if absent/empty.
+
+    Only ``FileNotFoundError`` is swallowed (consistent with ``_read_url_file``):
+    a present-but-unreadable file (e.g. ``PermissionError``) is a real
+    misconfiguration that should surface loudly rather than be masked as
+    "no token" — which would otherwise trigger a regenerate-then-crash-on-write.
+    """
+    if path is None:
+        path = TOKEN_FILE
+    try:
+        text = path.read_text().strip()
+    except FileNotFoundError:
+        return None
+    return text or None
+
+
+def write_bridge_token_file(token: str, path: Optional[Path] = None) -> None:
+    """Write *token* to *path* atomically, mode 0600 (private — like the key)."""
+    if path is None:
+        path = TOKEN_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix='.bridge.token.', dir=str(path.parent))
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(token.rstrip() + '\n')
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception:
+        try:    os.unlink(tmp)
+        except FileNotFoundError: pass
+        raise
+
+
+def resolve_bridge_token(cli: Optional[str] = None) -> Tuple[Optional[str], str]:
+    """Resolve the bridge token for a *consumer* (endpoint / client).
+
+    Precedence: CLI arg > ``$RADICAL_ORBIT_BRIDGE_TOKEN`` >
+    ``~/.radical/orbit/bridge.token``.  Returns ``(token, source)`` with source
+    one of ``'cli'`` / ``'env'`` / ``'file'``, or ``(None, '')`` when none is
+    configured (a missing token is not fatal — the bridge may have auth off).
+    """
+    if cli:
+        return cli.strip(), 'cli'
+    env_tok = os.environ.get(ENV_TOKEN, '').strip()
+    if env_tok:
+        return env_tok, 'env'
+    file_tok = _read_token_file()
+    if file_tok:
+        return file_tok, 'file'
+    return None, ''
+
+
+def auth_disabled(cli_no_auth: bool = False) -> bool:
+    """Whether bridge ingress auth is disabled (the ``--no-auth`` escape hatch).
+
+    True when *cli_no_auth* is set or ``$RADICAL_ORBIT_BRIDGE_NO_AUTH`` is a
+    truthy value (``1`` / ``true`` / ``yes``).
+    """
+    if cli_no_auth:
+        return True
+    return os.environ.get(ENV_NO_AUTH, '').strip().lower() in ('1', 'true', 'yes')
+
+
+def ensure_bridge_token(cli: Optional[str] = None) -> Tuple[str, str]:
+    """Resolve the bridge token for the *bridge* itself, generating if absent.
+
+    Precedence: CLI > env > file; if none resolves, generate a fresh
+    URL-safe token, write it to ``~/.radical/orbit/bridge.token`` (mode 0600),
+    and return it.  Returns ``(token, source)`` with source one of
+    ``'cli'`` / ``'env'`` / ``'file'`` / ``'generated'``.
+    """
+    token, source = resolve_bridge_token(cli)
+    if token:
+        return token, source
+    token = secrets.token_urlsafe(32)
+    write_bridge_token_file(token)
+    return token, 'generated'
+
+
+def tokens_match(provided: Any, expected: Any) -> bool:
+    """Constant-time token comparison; ``False`` if either side is empty or
+    not a string (e.g. a non-string token in a JSON ``/register`` payload,
+    which would otherwise raise ``TypeError`` in ``hmac.compare_digest``)."""
+    if not isinstance(provided, str) or not isinstance(expected, str):
+        return False
+    if not provided or not expected:
+        return False
+    return hmac.compare_digest(provided, expected)
 
 
 def host_role(app: Any) -> Dict[str, Any]:

@@ -167,7 +167,8 @@ class BridgeClient:
         client.register_topology_callback(on_topology)
     """
 
-    def __init__(self, url: Optional[str] = None, cert: Optional[str] = None):
+    def __init__(self, url: Optional[str] = None, cert: Optional[str] = None,
+                 token: Optional[str] = None):
         """
         Initialize the Bridge Client.
 
@@ -178,6 +179,11 @@ class BridgeClient:
                   ``RADICAL_ORBIT_BRIDGE_CERT`` and
                   ``~/.radical/orbit/bridge_cert.pem``.  Required when
                   the URL scheme is ``https``; ignored for ``http``.
+            token: Shared bridge auth token.  CLI > env
+                  (``RADICAL_ORBIT_BRIDGE_TOKEN``) > file
+                  (``~/.radical/orbit/bridge.token``).  Sent as
+                  ``Authorization: Bearer``.  ``None`` is fine when the
+                  bridge runs with auth disabled.
         """
         from urllib.parse import urlparse
         from . import utils
@@ -192,12 +198,17 @@ class BridgeClient:
         else:
             self._cert = None
 
+        # Ingress auth token (header on every request, incl. the SSE stream).
+        self._token: Optional[str] = utils.resolve_bridge_token(cli=token)[0]
+
         self._prof = rprof.Profiler('client', ns='radical.orbit')
         self._req_counter = itertools.count()
 
         def _inject_req_id(request):
             req_id = 'req.%06d' % next(self._req_counter)
             request.headers['X-Request-ID'] = req_id
+            if self._token:
+                request.headers['Authorization'] = f'Bearer {self._token}'
             # stash for the response hook
             request.extensions['req_id'] = req_id
             self._prof.prof('client_send', uid=req_id, msg=str(request.url))
@@ -326,9 +337,15 @@ class BridgeClient:
 
     def _listen_sse(self) -> None:
         log.debug("[client] SSE listener starting: url=%s/events", self._url)
+        # Reuse the pooled client: it carries base_url, TLS verification, and
+        # the _inject_req_id request hook (Authorization + X-Request-ID), so we
+        # don't duplicate connection/auth setup here.
         try:
-            with httpx.stream("GET", f"{self._url}/events", verify=self._cert if self._cert else False, timeout=None) as response:
+            with self._http.stream("GET", "/events", timeout=None) as response:
                 log.debug("[client] SSE stream connected: status=%s", response.status_code)
+                # Don't signal "connected" on an error status (e.g. 401/500) —
+                # raise so the listener exits instead of falsely reporting success.
+                response.raise_for_status()
                 self._listener_connected.set()
                 for line in response.iter_lines():
                     if self._listener_stop.is_set():

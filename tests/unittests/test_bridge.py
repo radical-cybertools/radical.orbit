@@ -56,12 +56,16 @@ def make_bridge(self_signed, tmp_path, monkeypatch):
     """
     from radical.orbit import utils
     monkeypatch.setattr(utils, 'URL_FILE', tmp_path / 'bridge.url')
+    monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'bridge.token')
 
     cert, key = self_signed
 
     def _build(**kwargs):
         from radical.orbit import Bridge
-        defaults = dict(cert=str(cert), key=str(key))
+        # Default these bridge tests to auth-off; dedicated auth coverage
+        # lives in test_bridge_auth.py.  Callers override with
+        # ``no_auth=False`` + ``token=...``.
+        defaults = dict(cert=str(cert), key=str(key), no_auth=True)
         defaults.update(kwargs)
         return Bridge(**defaults)
 
@@ -220,3 +224,54 @@ def test_disconnect_removes_endpoint_from_both_maps(make_bridge):
     assert _wait_until(lambda: "thinkie" not in bridge.endpoints["endpoints"])
     assert "thinkie" not in bridge.endpoint_ws
     json.dumps(bridge.endpoints)
+
+
+# ---------------------------------------------------------------------------
+# _strip_headers — bridge credential must not leak to endpoint plugins
+# ---------------------------------------------------------------------------
+
+def _request_with_headers(headers: dict):
+    """Build a minimal Starlette ``Request`` carrying *headers*."""
+    from starlette.requests import Request
+    raw = [(k.lower().encode(), v.encode()) for k, v in headers.items()]
+    return Request({"type": "http", "method": "GET", "path": "/",
+                    "headers": raw})
+
+
+def test_strip_headers_drops_auth_keeps_other_cookies():
+    """The auth header and the bridge auth cookie are stripped; unrelated
+    cookies and other headers are forwarded untouched."""
+    from radical.orbit import Bridge, utils
+
+    req = _request_with_headers({
+        "authorization": "Bearer secret",
+        "cookie": f"{utils.AUTH_COOKIE}=secret; session=abc; theme=dark",
+        "content-type": "application/json",
+    })
+    out = {k.lower(): v for k, v in Bridge._strip_headers(req).items()}
+
+    assert "authorization" not in out
+    assert out["content-type"] == "application/json"
+    assert utils.AUTH_COOKIE not in out["cookie"]
+    assert "session=abc" in out["cookie"]
+    assert "theme=dark"  in out["cookie"]
+
+
+def test_strip_headers_drops_cookie_header_when_only_auth():
+    """When the auth cookie is the sole cookie, the whole Cookie header goes."""
+    from radical.orbit import Bridge, utils
+
+    req = _request_with_headers({"cookie": f"{utils.AUTH_COOKIE}=secret"})
+    out = {k.lower(): v for k, v in Bridge._strip_headers(req).items()}
+
+    assert "cookie" not in out
+
+
+def test_strip_headers_handles_trailing_semicolon():
+    """A trailing ``;`` (empty segment) must not yield an empty Cookie header."""
+    from radical.orbit import Bridge, utils
+
+    req = _request_with_headers({"cookie": f"{utils.AUTH_COOKIE}=secret;"})
+    out = {k.lower(): v for k, v in Bridge._strip_headers(req).items()}
+
+    assert "cookie" not in out
