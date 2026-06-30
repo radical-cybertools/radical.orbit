@@ -63,3 +63,8 @@ def test_tokens_match():
     assert utils.tokens_match(None,  'abc') is False
     assert utils.tokens_match('abc', None)  is False
     assert utils.tokens_match('',    '')    is False
+    # Non-string input (e.g. an int/bool token in a JSON /register payload)
+    # must return False, not raise TypeError in hmac.compare_digest.
+    assert utils.tokens_match(123,   'abc') is False
+    assert utils.tokens_match('abc', 123)   is False
+    assert utils.tokens_match(True,  'abc') is False

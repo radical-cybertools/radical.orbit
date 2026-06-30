@@ -358,8 +358,12 @@ def ensure_bridge_token(cli: Optional[str] = None) -> Tuple[str, str]:
     return token, 'generated'
 
 
-def tokens_match(provided: Optional[str], expected: Optional[str]) -> bool:
-    """Constant-time token comparison; ``False`` if either side is empty."""
+def tokens_match(provided: Any, expected: Any) -> bool:
+    """Constant-time token comparison; ``False`` if either side is empty or
+    not a string (e.g. a non-string token in a JSON ``/register`` payload,
+    which would otherwise raise ``TypeError`` in ``hmac.compare_digest``)."""
+    if not isinstance(provided, str) or not isinstance(expected, str):
+        return False
     if not provided or not expected:
         return False
     return hmac.compare_digest(provided, expected)
