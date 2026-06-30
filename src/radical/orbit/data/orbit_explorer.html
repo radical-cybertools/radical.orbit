@@ -1823,10 +1823,12 @@
         clearTimeout(timeoutId);
 
         if (!res.ok) {
-          // Auth lapsed/missing: re-prompt for the token, refresh the cookie,
-          // and retry once.
+          // Auth lapsed/missing: try a *silent* re-auth first (the cookie may
+          // have expired while the stored token is still valid).  ensureAuth
+          // only prompts if that POST /auth itself 401s, so we don't bother the
+          // user when the token in localStorage still works.
           if (res.status === 401 && !opts._retried) {
-            const ok = await ensureAuth(true);
+            const ok = await ensureAuth(false);
             if (ok) return await apiFetch(path, { ...opts, _retried: true });
           }
           const t = await res.text();

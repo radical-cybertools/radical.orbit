@@ -183,14 +183,18 @@ class Bridge:
         # so same-host clients pick it up automatically; cross-host operators
         # copy it like they copy the cert/URL.
         if self._auth_enabled:
-            # Never echo the token on every start — stdout lands in bridge.log /
-            # container logs, which are far less protected than the 0600 file
-            # (CWE-532).  Print the secret only when we just generated it (so a
-            # first-run operator can grab it); otherwise point at the file.
-            if self._token_source == 'generated':
-                print(f'[Bridge] generated auth token: {self._token}', flush=True)
-            print(f'[Bridge] auth token source: {self._token_source}; '
-                  f'file: {utils.TOKEN_FILE}', flush=True)
+            # Never echo the token to stdout — it is captured by container logs,
+            # the systemd journal, or a redirected bridge.log, all far less
+            # protected than the 0600 token file (CWE-532).  Report only where
+            # it came from; the operator reads the secret from the file itself.
+            if self._token_source in ('generated', 'file'):
+                verb = ('generated and written to' if self._token_source
+                        == 'generated' else 'loaded from')
+                print(f'[Bridge] auth token {verb}: {utils.TOKEN_FILE}',
+                      flush=True)
+            else:
+                print(f'[Bridge] auth token source: {self._token_source}',
+                      flush=True)
         else:
             log.warning("[Bridge] ingress authentication DISABLED (--no-auth)")
             print('[Bridge] WARNING: ingress authentication DISABLED '

@@ -46,7 +46,9 @@ openssl req -x509 -newkey rsa:4096 -nodes -keyout key.pem -out cert.pem -days 36
 
 The bridge gates its HTTP ingress and the endpoint `/register` handshake with a
 **shared bearer token**. On first start it generates one and writes it to
-`~/.radical/orbit/bridge.token` (0600), printing it on stdout. Resolution
+`~/.radical/orbit/bridge.token` (0600); the token value is **never** printed to
+stdout (only its source/path), so it can't leak into captured logs (CWE-532) —
+read it from the file. Resolution
 (client/endpoint side): `--token` > `$RADICAL_ORBIT_BRIDGE_TOKEN` >
 `~/.radical/orbit/bridge.token` — so same-host clients/endpoints pick it up with
 no config; for a remote bridge, copy the token or set the env var. The Explorer
