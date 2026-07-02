@@ -603,14 +603,29 @@ class PluginClient:
         origin = '/'.join(filter(None, [self._endpoint_id, self._plugin_name]))
         _raise(resp, f"[{origin}] {context}" if context else f"[{origin}]")
 
-    def register_session(self, **kwargs: Any) -> None:
+    def register_session(self, sid: Optional[str] = None,
+                         lifetime: Optional[str] = None,
+                         ttl: Optional[float] = None, **kwargs: Any) -> None:
         """
-        Register a session with the plugin.
+        Register (or reconnect to) a session with the plugin.
+
+        Args:
+            sid:      Client-supplied session ID for create-or-reconnect
+                      (``None`` mints a fresh one).
+            lifetime: Session lifetime policy — ``'ephemeral'`` (default),
+                      ``'ttl'``, or ``'persistent'``.
+            ttl:      Seconds until expiry; required (and only valid) when
+                      ``lifetime='ttl'``.
 
         Subclasses may override to accept plugin-specific keyword
         arguments (e.g. ``backends``).
         """
-        resp = self._http.post(self._url("register_session"))
+        payload = {}
+        if sid      is not None: payload['sid']      = sid
+        if lifetime is not None: payload['lifetime'] = lifetime
+        if ttl      is not None: payload['ttl']      = ttl
+        resp = self._http.post(self._url("register_session"),
+                               json=payload or None)
         self._raise(resp)
         self._sid = resp.json()['sid']
 

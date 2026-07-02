@@ -306,6 +306,196 @@ async def test_plugin_session_cleanup():
     assert "new_session" in plugin._sessions
 
 
+# ---------------------------------------------------------------------------
+# Session policy: create-or-reconnect, lifetime validation, expiry, default
+# ---------------------------------------------------------------------------
+
+def _body_request(payload):
+    '''Build a minimal Request-like mock whose .json() returns `payload`.'''
+    async def _json():
+        return payload
+    request = Mock(spec=Request)
+    request.json = _json
+    return request
+
+
+@pytest.mark.asyncio
+async def test_session_create_or_reconnect():
+    '''A client-supplied sid that exists reconnects (same sid, last_access
+    bumped); a fresh sid creates under exactly that id.'''
+    app = FastAPI()
+    plugin = Plugin(app, "test_plugin")
+    plugin.session_class = PluginSession
+
+    # Explicit-sid create
+    data = await plugin.register_session(_body_request({"sid": "s1"}))
+    assert data['sid'] == "s1"
+    assert "s1" in plugin._sessions
+    obj = plugin._sessions["s1"]
+
+    # Reconnect: same sid returned, last_access bumped, session not rebuilt
+    plugin._session_last_access["s1"] = 0.0
+    data = await plugin.register_session(_body_request({"sid": "s1"}))
+    assert data['sid'] == "s1"
+    assert plugin._sessions["s1"] is obj              # not rebuilt
+    assert plugin._session_last_access["s1"] > 0.0    # bumped
+
+
+@pytest.mark.asyncio
+async def test_session_mint_when_sid_omitted():
+    '''sid=None mints a fresh session id.'''
+    app = FastAPI()
+    plugin = Plugin(app, "test_plugin")
+    plugin.session_class = PluginSession
+
+    data = await plugin.register_session(_body_request({}))
+    assert data['sid'].startswith("session.")
+    assert data['sid'] in plugin._sessions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [
+    {"lifetime": "ttl"},                       # ttl lifetime, no ttl
+    {"lifetime": "ttl", "ttl": 0},             # ttl not > 0
+    {"lifetime": "ttl", "ttl": -5},            # ttl not > 0
+    {"lifetime": "persistent", "ttl": 10},     # ttl with non-ttl lifetime
+    {"lifetime": "ephemeral", "ttl": 10},      # ttl with non-ttl lifetime
+    {"lifetime": "forever"},                   # unknown lifetime
+])
+async def test_session_incoherent_policy_409(payload):
+    '''Incoherent lifetime/ttl pairs and unknown lifetimes map to HTTP 409.'''
+    app = FastAPI()
+    plugin = Plugin(app, "test_plugin")
+    plugin.session_class = PluginSession
+
+    with pytest.raises(HTTPException) as exc_info:
+        await plugin.register_session(_body_request(payload))
+    assert exc_info.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_session_reconnect_policy_conflict_409():
+    '''Reconnecting to a sid with a different lifetime/ttl is a 409.'''
+    app = FastAPI()
+    plugin = Plugin(app, "test_plugin")
+    plugin.session_class = PluginSession
+
+    await plugin.register_session(
+        _body_request({"sid": "s1", "lifetime": "ttl", "ttl": 10}))
+
+    # Different lifetime
+    with pytest.raises(HTTPException) as exc_info:
+        await plugin.register_session(
+            _body_request({"sid": "s1", "lifetime": "persistent"}))
+    assert exc_info.value.status_code == 409
+
+    # Different ttl
+    with pytest.raises(HTTPException) as exc_info:
+        await plugin.register_session(
+            _body_request({"sid": "s1", "lifetime": "ttl", "ttl": 20}))
+    assert exc_info.value.status_code == 409
+
+    # Same policy reconnects cleanly
+    data = await plugin.register_session(
+        _body_request({"sid": "s1", "lifetime": "ttl", "ttl": 10}))
+    assert data['sid'] == "s1"
+
+
+@pytest.mark.asyncio
+async def test_session_ttl_expiry_via_cleanup():
+    '''A 'ttl' session expires once now-last_access > ttl (time-driven).'''
+    app = FastAPI()
+    plugin = Plugin(app, "test_plugin")
+    plugin.session_class = PluginSession
+    plugin.session_ttl = 0  # ensure ephemeral idle-timeout does not interfere
+
+    await plugin.register_session(
+        _body_request({"sid": "s1", "lifetime": "ttl", "ttl": 0.5}))
+    assert "s1" in plugin._sessions
+
+    # Not yet expired
+    assert await plugin._cleanup_expired_sessions() == 0
+    assert "s1" in plugin._sessions
+
+    # Backdate last_access past the ttl and clean up (no real sleep)
+    plugin._session_last_access["s1"] = time.time() - 5
+    cleaned = await plugin._cleanup_expired_sessions()
+    assert cleaned == 1
+    assert "s1" not in plugin._sessions
+    assert "s1" not in plugin._session_policy
+
+
+@pytest.mark.asyncio
+async def test_session_persistent_never_expires():
+    '''A 'persistent' session is never reclaimed by the cleanup pass.'''
+    app = FastAPI()
+    plugin = Plugin(app, "test_plugin")
+    plugin.session_class = PluginSession
+    plugin.session_ttl = 1
+
+    await plugin.register_session(
+        _body_request({"sid": "s1", "lifetime": "persistent"}))
+
+    # Backdate far past any idle/ttl horizon — persistent stays put
+    plugin._session_last_access["s1"] = time.time() - 10_000
+    assert await plugin._cleanup_expired_sessions() == 0
+    assert "s1" in plugin._sessions
+
+
+@pytest.mark.asyncio
+async def test_session_default_auto_create_under_concurrency():
+    '''Two concurrent first requests for 'default' create exactly one session.'''
+    import asyncio
+
+    app = FastAPI()
+    plugin = Plugin(app, "test_plugin")
+    plugin.session_class = PluginSession
+
+    results = await asyncio.gather(
+        plugin.register_session(_body_request({"sid": "default"})),
+        plugin.register_session(_body_request({"sid": "default"})),
+    )
+    assert all(r['sid'] == "default" for r in results)
+    assert list(plugin._sessions.keys()) == ["default"]
+
+
+@pytest.mark.asyncio
+async def test_session_default_forced_persistent():
+    '''The reserved 'default' session is always persistent.'''
+    app = FastAPI()
+    plugin = Plugin(app, "test_plugin")
+    plugin.session_class = PluginSession
+
+    # Bare register (lifetime defaults to 'ephemeral') resolves to persistent
+    data = await plugin.register_session(_body_request({"sid": "default"}))
+    assert data['sid'] == "default"
+    assert plugin._session_policy["default"]['lifetime'] == "persistent"
+
+    # An explicitly conflicting lifetime for 'default' is a 409
+    with pytest.raises(HTTPException) as exc_info:
+        await plugin.register_session(
+            _body_request({"sid": "default", "lifetime": "ephemeral"}))
+    assert exc_info.value.status_code == 409
+
+    # Explicit 'persistent' is accepted (reconnect)
+    data = await plugin.register_session(
+        _body_request({"sid": "default", "lifetime": "persistent"}))
+    assert data['sid'] == "default"
+
+
+@pytest.mark.asyncio
+async def test_session_default_auto_create_via_forward():
+    '''An unregistered '_forward' to 'default' auto-creates it (persistent).'''
+    app = FastAPI()
+    plugin = Plugin(app, "test_plugin")
+    plugin.session_class = PluginSession
+
+    assert "default" not in plugin._sessions
+    await plugin._forward("default", PluginSession.close)
+    assert "default" in plugin._sessions
+    assert plugin._session_policy["default"]['lifetime'] == "persistent"
+
+
 def test_plugin_session_ttl_default():
     '''
     Test that session_ttl has a sensible default.

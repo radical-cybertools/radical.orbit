@@ -18,7 +18,7 @@ import uuid
 from fastapi import FastAPI, HTTPException, Request
 
 from .plugin_session_base import PluginSession
-from .plugin_base import Plugin
+from .plugin_base import Plugin, DEFAULT_SID
 from .client import PluginClient
 
 log = logging.getLogger("radical.orbit")
@@ -1418,7 +1418,9 @@ class PluginRhapsody(Plugin):
     async def register_session(self, request: Request) -> dict:
         """Register a new Rhapsody session.
 
-        Accepts an optional JSON body with ``{"backends": ["name", ...]}``.
+        Accepts an optional JSON body with ``{"backends": ["name", ...]}``
+        plus the base session-policy fields ``sid`` / ``lifetime`` / ``ttl``
+        (see :meth:`Plugin.register_session`).
 
         Session initialization happens asynchronously in the background.
         The SID is returned immediately.  The client should wait for a
@@ -1429,6 +1431,10 @@ class PluginRhapsody(Plugin):
             data = await request.json()
         except Exception:
             data = {}
+        if not isinstance(data, dict):
+            data = {}
+
+        sid, lifetime, ttl = self._normalize_session_policy(data)
 
         backend_names       = data.get('backends')
         # Endpoint-startup default: when the client doesn't specify a
@@ -1446,9 +1452,30 @@ class PluginRhapsody(Plugin):
         notify_batch_size   = data.get('notify_batch_size',
                                        NOTIFY_BATCH_SIZE)
 
-        # Build session directly to avoid race on shared plugin state
         self._ensure_cleanup_task()
-        sid     = f"session.{uuid.uuid4().hex[:8]}"
+
+        # Reserved persistent 'default' — created on demand (see the
+        # `_ensure_default_session` override), reporting its real status.
+        if sid == DEFAULT_SID:
+            session = await self._ensure_default_session()
+            self._session_last_access[sid] = time.time()
+            return {"sid": sid, "status": self._session_status(session)}
+
+        if sid is None:
+            sid = f"session.{uuid.uuid4().hex[:8]}"
+
+        # Reconnect to an existing session — do not rebuild it.  Report the
+        # session's real status: its init may have long completed, and the
+        # reconnecting client would otherwise wait for a `session_status`
+        # notification that was emitted before it attached.
+        if sid in self._sessions:
+            self._check_policy_conflict(sid, lifetime, ttl)
+            self._session_last_access[sid] = time.time()
+            log.info("[%s] Reconnected session %s", self.instance_name, sid)
+            status = self._session_status(self._sessions[sid])
+            return {"sid": sid, "status": status}
+
+        # Build session directly to avoid race on shared plugin state
         session = self.session_class(
             sid,
             backend_names=backend_names,
@@ -1456,8 +1483,7 @@ class PluginRhapsody(Plugin):
             notify_batch_size=int(notify_batch_size),
         )
         session._plugin = self
-        self._sessions[sid]            = session
-        self._session_last_access[sid] = time.time()
+        self._record_session(sid, session, lifetime, ttl)
         log.info("[%s] Registered session %s", self.instance_name, sid)
 
         # Kick off initialization in the background so the HTTP response
@@ -1465,6 +1491,49 @@ class PluginRhapsody(Plugin):
         asyncio.create_task(self._init_session(sid, session))
 
         return {"sid": sid, "status": "initializing"}
+
+    @staticmethod
+    def _session_status(session) -> str:
+        """Report a session's real initialization state.
+
+        ``initializing`` while the background init is still running,
+        ``failed`` once init errored, ``ready`` otherwise.
+        """
+        if not session._init_ready.is_set():
+            return "initializing"
+        if session._init_error:
+            return "failed"
+        return "ready"
+
+    async def _ensure_default_session(self):
+        """Return the persistent ``default`` session, creating it on demand.
+
+        Rhapsody sessions need their background initialization kicked, so
+        the base on-demand path does not suffice: the session is built
+        through rhapsody's direct-build path (endpoint-startup backend
+        defaults — no client body is available here) and its init task is
+        started, exactly like a fresh create.  Creation is guarded by the
+        base default lock so two concurrent first requests cannot
+        double-create it.
+        """
+        session = self._sessions.get(DEFAULT_SID)
+        if session is not None:
+            return session
+        async with self._default_lock:
+            session = self._sessions.get(DEFAULT_SID)
+            if session is None:
+                backend_names = None
+                env_backend   = os.environ.get('RADICAL_ORBIT_RHAPSODY_BACKEND')
+                if env_backend:
+                    backend_names = [env_backend]
+                session = self.session_class(
+                    DEFAULT_SID, backend_names=backend_names)
+                session._plugin = self
+                self._record_session(DEFAULT_SID, session, 'persistent', None)
+                log.info("[%s] Created persistent 'default' session",
+                         self.instance_name)
+                asyncio.create_task(self._init_session(DEFAULT_SID, session))
+            return session
 
     async def _init_session(self, sid: str, session) -> None:
         """Background task: initialize a session and notify via SSE."""

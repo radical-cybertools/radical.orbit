@@ -13,6 +13,10 @@ from .ui_schema import UIConfig, ui_config_to_dict
 
 log = logging.getLogger("radical.orbit")
 
+# Reserved session ID.  The 'default' session is persistent and per plugin
+# instance — a `rhapsody` default and a `psij` default are distinct sessions.
+DEFAULT_SID = 'default'
+
 
 class Plugin(object):
     """
@@ -148,6 +152,14 @@ class Plugin(object):
 
         self._sessions: Dict[str, PluginSession] = {}
         self._session_last_access: Dict[str, float] = {}  # Track last access time
+        # Per-session lifetime record: sid -> {lifetime, ttl, owner}.  The
+        # mutable last_access field of the record lives in the hot
+        # `_session_last_access` map above.  Sessions with no record fall back
+        # to the ephemeral idle-timeout stub (see `_session_expired`).
+        self._session_policy: Dict[str, Dict[str, Any]] = {}
+        # Guards on-demand creation of the reserved 'default' session so two
+        # concurrent first requests cannot double-create it.
+        self._default_lock = asyncio.Lock()
         self._main_loop: Optional[asyncio.AbstractEventLoop] = None
         self._cleanup_task: Optional[asyncio.Task] = None
 
@@ -303,19 +315,189 @@ class Plugin(object):
                           self.instance_name)
 
     async def register_session(self, request: Request) -> dict:
-        """Register a new session and return its unique session ID."""
+        """Register (or reconnect to) a session and return its session ID.
+
+        Session policy
+        --------------
+        The request body (JSON, all fields optional) selects a lifetime
+        policy and, for reconnect, a client-supplied session ID::
+
+            {"sid": <str>, "lifetime": "ephemeral"|"ttl"|"persistent",
+             "ttl": <seconds>}
+
+        - ``sid`` omitted                    -> a fresh session ID is minted.
+        - ``sid`` names an existing session  -> *reconnect*: its last-access
+          time is bumped and the same ``sid`` is returned (409 if the supplied
+          lifetime/ttl differs from the one it was created with).
+        - ``sid`` names no session           -> a session is created under
+          exactly that ID.
+
+        Each session records ``{lifetime, ttl, last_access, owner}`` (``owner``
+        is reserved for owner-checked reattach and is ``None`` for now):
+
+        - ``ephemeral`` (default): liveness-driven expiry is a documented stub
+          — until it lands, an ephemeral session retains the plugin idle-timeout
+          behavior (``session_ttl``) so idle sessions are not leaked.
+        - ``ttl``: expires once ``now - last_access`` exceeds ``ttl`` seconds
+          (time-driven, enforced by the cleanup pass); requires ``ttl > 0``.
+        - ``persistent``: never expires; its resources are reclaimed only by
+          explicit operator action (e.g. ``unregister_session`` / ``cancel_all``)
+          — there is no liveness reclaim.
+
+        The session registry is per plugin *instance*, so the reserved
+        ``default`` session (always ``persistent``, auto-created on demand) is
+        per-plugin: a ``rhapsody`` default and a ``psij`` default are distinct
+        sessions.
+
+        Raises:
+            HTTPException 409: an incoherent lifetime/ttl pair, an unknown
+                lifetime value, or a reconnect whose policy conflicts with the
+                existing session.
+        """
         self._ensure_cleanup_task()
-        sid = f"session.{uuid.uuid4().hex[:8]}"
-        self._sessions[sid] = self._create_session(sid)
-        self._session_last_access[sid] = time.time()
-        log.info("[%s] Registered session %s", self.instance_name, sid)
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+
+        sid, lifetime, ttl = self._normalize_session_policy(data)
+        sid = await self._open_session(sid, lifetime, ttl)
         return {"sid": sid}
+
+    def _normalize_session_policy(self, data: Dict[str, Any]) -> tuple:
+        """Validate the session-policy fields of a register_session body.
+
+        Returns the normalized ``(sid, lifetime, ttl)`` triple; ``sid`` may be
+        ``None`` (the caller mints one).  The reserved ``default`` session is
+        special-cased *before* lifetime validation, so a bare
+        ``register_session(sid='default')`` — where ``lifetime`` still carries
+        its ``'ephemeral'`` default — resolves to the persistent default rather
+        than being rejected; only an *explicitly* non-persistent policy for
+        ``default`` is incoherent.
+
+        Raises:
+            HTTPException 409: incoherent lifetime/ttl pair or unknown lifetime.
+        """
+        sid      = data.get('sid')
+        lifetime = data.get('lifetime', 'ephemeral')
+        ttl      = data.get('ttl')
+
+        if sid == DEFAULT_SID:
+            if 'lifetime' in data and data['lifetime'] != 'persistent':
+                raise HTTPException(
+                    status_code=409,
+                    detail="reserved session 'default' is always persistent")
+            if ttl is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="reserved session 'default' takes no ttl")
+            return sid, 'persistent', None
+
+        if lifetime not in ('ephemeral', 'ttl', 'persistent'):
+            raise HTTPException(
+                status_code=409,
+                detail=f"unknown session lifetime: {lifetime!r}")
+
+        if lifetime == 'ttl':
+            if not isinstance(ttl, (int, float)) or isinstance(ttl, bool) \
+                    or ttl <= 0:
+                raise HTTPException(
+                    status_code=409,
+                    detail="lifetime='ttl' requires a positive ttl")
+            ttl = float(ttl)
+        elif ttl is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"ttl is incoherent with lifetime={lifetime!r}")
+
+        return sid, lifetime, ttl
+
+    async def _open_session(self, sid: Optional[str], lifetime: str,
+                            ttl: Optional[float]) -> str:
+        """Create-or-reconnect a session under the given policy.
+
+        ``sid=None`` mints a fresh ID; an existing ``sid`` reconnects (after a
+        policy-conflict check); the reserved ``default`` is created on demand
+        under a lock.  Returns the resolved session ID.
+        """
+        if sid == DEFAULT_SID:
+            await self._ensure_default_session()
+            self._session_last_access[sid] = time.time()
+            return sid
+
+        if sid is None:
+            sid = f"session.{uuid.uuid4().hex[:8]}"
+            while sid in self._sessions:
+                sid = f"session.{uuid.uuid4().hex[:8]}"
+
+        if sid in self._sessions:
+            self._check_policy_conflict(sid, lifetime, ttl)
+            self._session_last_access[sid] = time.time()
+            log.info("[%s] Reconnected session %s", self.instance_name, sid)
+            return sid
+
+        self._record_session(sid, self._create_session(sid), lifetime, ttl)
+        log.info("[%s] Registered session %s", self.instance_name, sid)
+        return sid
+
+    def _record_session(self, sid: str, session: PluginSession,
+                        lifetime: str, ttl: Optional[float]) -> None:
+        """Store a session together with its lifetime record.
+
+        The record is ``{lifetime, ttl, owner}`` (``owner`` reserved for
+        owner-checked reattach, ``None`` for now); the mutable ``last_access``
+        field lives in ``self._session_last_access``.
+        """
+        self._sessions[sid]            = session
+        self._session_policy[sid]      = {'lifetime': lifetime,
+                                          'ttl':      ttl,
+                                          'owner':    None}
+        self._session_last_access[sid] = time.time()
+
+    def _check_policy_conflict(self, sid: str, lifetime: str,
+                               ttl: Optional[float]) -> None:
+        """Reject a reconnect whose policy differs from the live session's.
+
+        Sessions created outside the policy model (no recorded policy — e.g. a
+        plugin that builds sessions directly) accept any reconnect; there is
+        nothing to conflict with.
+        """
+        record = self._session_policy.get(sid)
+        if record is None:
+            return
+        if record['lifetime'] != lifetime or record['ttl'] != ttl:
+            raise HTTPException(
+                status_code=409,
+                detail=f"session {sid} exists with a different lifetime policy")
+
+    async def _ensure_default_session(self) -> PluginSession:
+        """Return the reserved ``default`` session, creating it on demand.
+
+        ``default`` is persistent and per plugin instance.  Creation is guarded
+        by a lock so two concurrent first requests cannot double-create it.
+        Persistent-default-owned resources have no liveness reclaim — they are
+        released only by explicit operator action (e.g. ``cancel_all``).
+        """
+        session = self._sessions.get(DEFAULT_SID)
+        if session is not None:
+            return session
+        async with self._default_lock:
+            session = self._sessions.get(DEFAULT_SID)
+            if session is None:
+                session = self._create_session(DEFAULT_SID)
+                self._record_session(DEFAULT_SID, session, 'persistent', None)
+                log.info("[%s] Created persistent 'default' session",
+                         self.instance_name)
+            return session
 
     async def unregister_session(self, request: Request) -> dict:
         """Unregister a session by its session ID and close it."""
         sid = request.path_params['sid']
         inst = self._sessions.pop(sid, None)
         self._session_last_access.pop(sid, None)
+        self._session_policy.pop(sid, None)
 
         if not inst:
             raise HTTPException(status_code=404, detail=f"unknown session id: {sid}")
@@ -421,13 +603,14 @@ class Plugin(object):
                 has already been cleaned up before this is raised.
             HTTPException 500: Unexpected error inside the session method.
         """
-        if self.session_ttl > 0:
-            # Detect expiry of THIS session before the background cleanup removes it
-            last        = self._session_last_access.get(sid)
-            sid_expired = (last is not None and (time.time() - last) > self.session_ttl)
-            if sid_expired:
-                await self._cleanup_expired_sessions()
-                raise HTTPException(status_code=410, detail=f"session expired: {sid}")
+        # On-demand creation of the reserved persistent 'default' session.
+        if sid == DEFAULT_SID and sid not in self._sessions:
+            await self._ensure_default_session()
+
+        # Detect expiry of THIS session before the background cleanup removes it
+        if self._session_expired(sid, time.time()):
+            await self._cleanup_expired_sessions()
+            raise HTTPException(status_code=410, detail=f"session expired: {sid}")
 
         session = self._sessions.get(sid)
         if not session:
@@ -449,25 +632,52 @@ class Plugin(object):
                 detail=f"[{self.instance_name}/{sid}] {func.__name__}: {e}"
             ) from e
 
+    def _session_expired(self, sid: str, now: float) -> bool:
+        """Return True if the session has passed its lifetime policy.
+
+        - ``persistent`` never expires.
+        - ``ttl`` expires once ``now - last_access`` exceeds its ``ttl``.
+        - ``ephemeral`` (and any session with no recorded policy) falls back to
+          the plugin idle timeout (``session_ttl``) — the documented stub that
+          stands in for liveness-driven expiry until it lands.
+        """
+        last = self._session_last_access.get(sid)
+        if last is None:
+            return False
+
+        record   = self._session_policy.get(sid)
+        lifetime = record['lifetime'] if record else 'ephemeral'
+
+        if lifetime == 'persistent':
+            return False
+
+        if lifetime == 'ttl':
+            ttl = record['ttl']
+            return ttl is not None and (now - last) > ttl
+
+        # 'ephemeral' stub — idle timeout until liveness-driven expiry lands.
+        return self.session_ttl > 0 and (now - last) > self.session_ttl
+
     async def _cleanup_expired_sessions(self) -> int:
         """
-        Clean up sessions that have exceeded their TTL.
+        Close and drop every session past its lifetime policy.
+
+        ``ttl`` sessions expire on time; ``ephemeral`` sessions on idle
+        timeout; ``persistent`` sessions are never touched here.
 
         Returns:
             Number of sessions cleaned up.
         """
-        if self.session_ttl <= 0:
-            return 0
-
         now = time.time()
         expired_sids = [
-            sid for sid, last_access in self._session_last_access.items()
-            if (now - last_access) > self.session_ttl
+            sid for sid in list(self._session_last_access.keys())
+            if self._session_expired(sid, now)
         ]
 
         for sid in expired_sids:
             session = self._sessions.pop(sid, None)
             self._session_last_access.pop(sid, None)
+            self._session_policy.pop(sid, None)
             if session:
                 try:
                     await session.close()
@@ -492,8 +702,7 @@ class Plugin(object):
         """Background task: expire stale sessions every 5 seconds."""
         while True:
             await asyncio.sleep(5)
-            if self.session_ttl > 0:
-                await self._cleanup_expired_sessions()
+            await self._cleanup_expired_sessions()
 
     def _log_routes(self) -> None:
         """Log all registered routes for debugging."""
