@@ -111,6 +111,23 @@ class _EchoPlugin(Plugin):
         return {'blocked': True}
 
 
+class _LivenessPlugin(Plugin):
+    '''Records the (name, liveness) pairs its on_topology_change observes and
+    still drives the base reclaim-drain behavior (calls super()).'''
+    plugin_name   = 'liveness_rt'
+    session_class = PluginSession
+    version       = '0.0.1'
+
+    def __init__(self, app):
+        super().__init__(app, 'liveness_rt')
+        self.observed = []
+
+    async def on_topology_change(self, participants):
+        for name, info in participants.items():
+            self.observed.append((name, (info or {}).get('liveness')))
+        await super().on_topology_change(participants)
+
+
 # ---------------------------------------------------------------------------
 # Broker-under-uvicorn harness + runtime factory
 # ---------------------------------------------------------------------------
@@ -400,6 +417,77 @@ def test_topology_callback_connect_and_disconnect(harness):
 
     a.stop()
     assert _wait(lambda: snaps and 'epA' not in snaps[-1], timeout=5.0)
+
+
+# ---------------------------------------------------------------------------
+# owner channel: broker-stamped src wins over a forged x-orbit-src header
+# ---------------------------------------------------------------------------
+
+def test_owner_channel_broker_stamped_not_spoofable(harness):
+    make_broker, make_runtime = harness
+    srv = make_broker()
+
+    a = make_runtime(srv.url, name='epA', plugins=['echo_rt'])
+    b = make_runtime(srv.url, name='epB')
+    assert _wait_topology(b, 'epA', 'echo_rt', timeout=5.0)
+
+    # B forges x-orbit-src; the serving runtime overwrites it with the
+    # broker-stamped identity 'epB' before the plugin records the owner.
+    resp = b.call('epA', 'POST', '/echo_rt/register_session',
+                  headers={'x-orbit-src': 'attacker'}, body=b'{}')
+    assert resp.status_code == 200
+    sid = resp.json()['sid']
+
+    plugin = a._plugins['echo_rt']
+    assert _wait(lambda: sid in plugin._session_policy, timeout=2.0)
+    assert plugin._session_policy[sid]['owner'] == 'epB'    # not 'attacker'
+
+
+# ---------------------------------------------------------------------------
+# runtime wires on_topology_change to served plugins incl. synthesized 'lost';
+# an owner-bound ephemeral session is reclaimed after the drain
+# ---------------------------------------------------------------------------
+
+def test_served_plugin_observes_lost_and_reclaims(harness):
+    make_broker, make_runtime = harness
+    # Aggressive broker keepalive + tiny grace so a hard-dropped consumer
+    # reaches suspect then lost within the test window.
+    srv = make_broker(ws_ping_interval=0.2, ws_ping_timeout=0.5, grace=0.5)
+
+    a = make_runtime(srv.url, name='epA', plugins=['liveness_rt'],
+                     ping_interval=0.2, ping_timeout=0.5)
+    b = make_runtime(srv.url, name='epB',
+                     ping_interval=0.2, ping_timeout=0.5)
+    assert _wait_topology(b, 'epA', 'liveness_rt', timeout=5.0)
+
+    plugin = a._plugins['liveness_rt']
+    plugin.reclaim_drain = 0.2
+
+    # B registers an owner-bound ephemeral session on epA's plugin.
+    resp = b.call('epA', 'POST', '/liveness_rt/register_session', body=b'{}')
+    sid = resp.json()['sid']
+    assert _wait(lambda: sid in plugin._sessions, timeout=2.0)
+    assert plugin._session_policy[sid]['owner'] == 'epB'
+    assert _wait(lambda: ('epB', 'present') in plugin.observed, timeout=5.0)
+
+    # Hard-drop B: abort the WS transport (TCP RST, no close frame) so the
+    # broker sees a NON-clean drop -> suspect -> (grace) -> lost.  Mark B
+    # stopping first so its transport loop does not reconnect.
+    b._stopping = True
+
+    def _abort():
+        try:    b._ws.transport.abort()
+        except Exception:
+            pass
+    b._transport_loop.call_soon_threadsafe(_abort)
+
+    # epA's plugin observes suspect, then the runtime-synthesized 'lost'
+    # (the wire carries no tombstone — the participant simply vanishes).
+    assert _wait(lambda: ('epB', 'suspect') in plugin.observed, timeout=5.0)
+    assert _wait(lambda: ('epB', 'lost')    in plugin.observed, timeout=5.0)
+
+    # The owner-bound ephemeral session is reclaimed after the drain.
+    assert _wait(lambda: sid not in plugin._sessions, timeout=5.0)
 
 
 # ---------------------------------------------------------------------------

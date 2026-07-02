@@ -643,7 +643,16 @@ class EndpointRuntime(PluginHostBase):
                                  }).encode())
         content_type = (req.headers or {}).get('content-type',
                                                'application/json')
-        shim = RequestShim(path_params, query, req.body, content_type)
+        # Trusted owner channel.  ``req.src`` is broker-stamped (the broker
+        # overwrote the envelope src from the registered identity on every
+        # forwarded request), so it — not any client-supplied copy — is the
+        # authoritative participant identity.  Inject it as ``x-orbit-src``,
+        # dropping any inbound header of that name (never trust the client's
+        # copy); plugin_base reads it as the session owner.
+        headers = {k: v for k, v in (req.headers or {}).items()
+                   if k.lower() != 'x-orbit-src'}
+        headers['x-orbit-src'] = req.src
+        shim = RequestShim(path_params, query, req.body, content_type, headers)
         try:
             result = await handler(shim)
         except HTTPException as e:
@@ -800,13 +809,51 @@ class EndpointRuntime(PluginHostBase):
             self._cb.submit(cb, endpoint, plugin, topic, data)
 
     def _on_topology(self, msg: protocol.Topology) -> None:
-        self._topology = {name: info.model_dump()
-                          for name, info in msg.participants.items()}
+        new_topo = {name: info.model_dump()
+                    for name, info in msg.participants.items()}
+        prev = self._topology
+        self._topology = new_topo
         with self._cb_lock:
             cbs = list(self._topology_callbacks)
-        snapshot = dict(self._topology)
+        snapshot = dict(new_topo)
         for cb in cbs:
             self._cb.submit(cb, snapshot)
+        # Served plugins react to the rich topology (owner-liveness → session
+        # reclaim-drain in plugin_base).  Consumers have no served plugins.
+        if self._plugins:
+            self._dispatch_topology_to_plugins(prev, new_topo)
+
+    def _dispatch_topology_to_plugins(self,
+                                      prev: Dict[str, Dict[str, Any]],
+                                      curr: Dict[str, Dict[str, Any]]) -> None:
+        """Deliver the rich topology to served plugins, synthesizing a
+        ``lost`` entry for a participant that has vanished after being seen.
+
+        The wire carries no tombstone: the broker broadcasts ``suspect`` on a
+        socket drop and, once the grace elapses, simply drops the participant
+        from the topology.  A participant absent from *curr* that was
+        ``present``/``suspect`` in *prev* is therefore the post-grace
+        ``lost`` — synthesized here (as a copy carrying ``liveness='lost'``)
+        so served plugins observe the loss exactly once."""
+        participants = dict(curr)
+        for name, info in prev.items():
+            if name in curr:
+                continue
+            if (info or {}).get('liveness') in ('present', 'suspect'):
+                lost = dict(info)
+                lost['liveness'] = 'lost'
+                participants[name] = lost
+        for plugin in list(self._plugins.values()):
+            self._work_loop.create_task(
+                self._invoke_topology(plugin, participants))
+
+    async def _invoke_topology(self, plugin, participants: Dict[str, Any]
+                               ) -> None:
+        try:
+            await plugin.on_topology_change(participants)
+        except Exception as e:                             # pragma: no cover
+            log.error("[Runtime] %s.on_topology_change failed: %s",
+                      plugin.instance_name, e)
 
     def _on_control(self, msg: protocol.Control) -> None:
         if msg.op in ('shutdown', 'terminate'):
