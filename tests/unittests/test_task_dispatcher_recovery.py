@@ -1,16 +1,13 @@
-"""Recovery / lifecycle tests for plugin_task_dispatcher.
+"""Recovery / lifecycle tests for plugin_task_dispatcher (broker-hosted).
 
-Covers the paths that previously had no coverage (and were buggy):
-
-- C2  pilot child-endpoint disconnect → DONE/FAILED, capacity reclaimed,
-      tasks re-enqueued; plus the restart race where a replayed-ACTIVE
-      pilot must NOT be torn down before its child reconnects.
-- C4  restart correlation: ``_uid_to_task`` rebuilt from the replayed
-      task log; endpoint-mode lendpointr replayed (terminal entries filtered).
-- C5  a late terminal event for a re-enqueued task's stale uid is
-      ignored rather than clobbering the task.
-- H2  guard: no test reintroduces the loop-state-fragile
-      ``get_event_loop().run_until_complete`` antipattern.
+- C2  pilot child-endpoint liveness → DONE/FAILED on ``lost``, capacity
+      reclaimed, tasks re-enqueued; suspect blip does not tear down; a child
+      never seen ``present`` (post-restart) is never demoted.
+- C4  restart correlation: pools + ``_uid_to_task`` rebuilt from the sid-scoped
+      durable store; endpoint-mode ledger replayed (terminal entries filtered).
+- C5  a late terminal event for a re-enqueued task's stale uid is ignored.
+- C6  endpoint-mode ledger self-prunes via snapshot.
+- H2  guard against the loop-state-fragile ``run_until_complete`` antipattern.
 """
 
 import asyncio
@@ -28,11 +25,10 @@ from radical.orbit.task_dispatcher_state import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+_SID = 'sessA'
 
-def _pool_cfg(name: str = 'cpu') -> PoolConfig:
+
+def _pool_cfg(name='cpu'):
     return PoolConfig(
         name         = name,
         endpoint_name    = 'endpoint0',
@@ -47,85 +43,87 @@ def _pool_cfg(name: str = 'cpu') -> PoolConfig:
     )
 
 
-def _make_plugin(tmp_path: Path, *, with_pool: bool = True):
+def _make_plugin(tmp_path: Path, *, with_pool=True):
     app = FastAPI()
     app.state.endpoint_name  = 'endpoint0'
-    app.state.bridge_url = 'https://localhost:9999'
+    app.state.bridge_url     = 'https://localhost:9999'
+    app.state.broker_caller  = None
+    app.state.broker_tap     = None
     plugin = PluginTaskDispatcher(
         app, state_root=tmp_path / 'state', scratch_root=tmp_path / 'scratch')
     if with_pool:
-        plugin._materialise_pool(_pool_cfg())
+        plugin._materialise_pool(_SID, _pool_cfg())
     return plugin
+
+
+def _pool(plugin, name='cpu'):
+    return plugin._pool_states[_SID][name]
 
 
 def _active_pilot(plugin, *, pid='p.1', child='endpoint0_p.1',
                   walltime_deadline=0.0):
-    ps = plugin._pool_states['cpu']
+    ps = _pool(plugin)
     pilot = PilotRecord(
-        pid=pid, pool='cpu', size_key='s', rhapsody_backend='concurrent',
-        state=PILOT_ACTIVE, submitted_at=100.0, active_at=110.0,
-        capacity=4, in_flight=1, child_endpoint_name=child,
-        walltime_deadline=walltime_deadline)
+        pid=pid, pool='cpu', owning_sid=_SID, size_key='s',
+        rhapsody_backend='concurrent', state=PILOT_ACTIVE,
+        submitted_at=100.0, active_at=110.0, capacity=4, in_flight=1,
+        child_endpoint_name=child, walltime_deadline=walltime_deadline)
     ps.pilots[pid] = pilot
     return ps, pilot
 
 
-def _topology(plugin, endpoints_present):
-    payload = {e: {'plugins': ['rhapsody']} for e in endpoints_present}
-    asyncio.run(plugin.on_topology_change(payload))
+def _topo(plugin, name, liveness):
+    asyncio.run(plugin.on_topology_change(
+        {name: {'role': 'endpoint',
+                'plugins': {'rhapsody': {'namespace': '/rhapsody'}},
+                'liveness': liveness}}))
 
 
 # ---------------------------------------------------------------------------
-# C2 — phantom-pilot recovery on disconnect
+# C2 — pilot child liveness
 # ---------------------------------------------------------------------------
 
 class TestPhantomPilotRecovery:
 
-    def test_disconnect_after_walltime_marks_done(self, tmp_path: Path):
+    def test_lost_after_walltime_marks_done(self, tmp_path):
         plugin = _make_plugin(tmp_path)
         plugin._loops_started = True
         ps, pilot = _active_pilot(plugin, walltime_deadline=time.time() - 1)
-        task = TaskRecord(task_id='t.1', pool='cpu', cmd=['/bin/echo'],
-                          cwd=str(tmp_path), state=TASK_RUNNING,
-                          pilot_id='p.1')
-        ps.tasks['t.1'] = task
-
-        _topology(plugin, ['endpoint0_p.1'])   # child seen
-        _topology(plugin, [])              # child gone, walltime passed
-
+        ps.tasks['t.1'] = TaskRecord(task_id='t.1', pool='cpu', owning_sid=_SID,
+                                     cmd=['/bin/echo'], cwd=str(tmp_path),
+                                     state=TASK_RUNNING, pilot_id='p.1')
+        _topo(plugin, 'endpoint0_p.1', 'present')
+        _topo(plugin, 'endpoint0_p.1', 'lost')
         assert pilot.state == PILOT_DONE
-        assert ps.tasks['t.1'].state == TASK_QUEUED   # re-enqueued
+        assert ps.tasks['t.1'].state == TASK_QUEUED
         assert ps.tasks['t.1'].pilot_id is None
-        assert ps._pilots_snapshot() == []            # capacity reclaimed
+        assert ps._pilots_snapshot() == []
 
-    def test_disconnect_before_walltime_marks_failed(self, tmp_path: Path):
+    def test_lost_before_walltime_marks_failed(self, tmp_path):
         plugin = _make_plugin(tmp_path)
         plugin._loops_started = True
-        ps, pilot = _active_pilot(plugin,
-                                  walltime_deadline=time.time() + 1000)
-        _topology(plugin, ['endpoint0_p.1'])
-        _topology(plugin, [])
-
+        ps, pilot = _active_pilot(plugin, walltime_deadline=time.time() + 1000)
+        _topo(plugin, 'endpoint0_p.1', 'present')
+        _topo(plugin, 'endpoint0_p.1', 'lost')
         assert pilot.state == PILOT_FAILED
         assert ps._pilots_snapshot() == []
 
-    def test_replayed_active_not_demoted_before_child_seen(self, tmp_path):
-        """Restart race: an ACTIVE pilot whose child hasn't reconnected
-        yet must survive a topology event that doesn't list it."""
+    def test_suspect_blip_does_not_demote(self, tmp_path):
         plugin = _make_plugin(tmp_path)
         plugin._loops_started = True
-        _, pilot = _active_pilot(plugin,
-                                 walltime_deadline=time.time() + 1000)
-        # Never feed a topology event containing the child → never "seen".
-        _topology(plugin, ['some_other_endpoint'])
-        assert pilot.state == PILOT_ACTIVE   # untouched
+        _, pilot = _active_pilot(plugin, walltime_deadline=time.time() + 1000)
+        _topo(plugin, 'endpoint0_p.1', 'present')
+        _topo(plugin, 'endpoint0_p.1', 'suspect')
+        assert pilot.state == PILOT_ACTIVE
+        assert pilot.accepting_new_tasks is False
 
-    def test_disconnect_unseen_child_is_noop(self, tmp_path: Path):
+    def test_unseen_child_never_demoted(self, tmp_path):
+        """Restart race: an ACTIVE pilot whose child never appears 'present'
+        (never synthesized 'lost') survives — no `_seen` heuristic needed."""
         plugin = _make_plugin(tmp_path)
         plugin._loops_started = True
-        _, pilot = _active_pilot(plugin,
-                                 walltime_deadline=time.time() + 1000)
-        _topology(plugin, [])   # child never seen → no demotion
+        _, pilot = _active_pilot(plugin, walltime_deadline=time.time() + 1000)
+        _topo(plugin, 'some_other_endpoint', 'present')
         assert pilot.state == PILOT_ACTIVE
 
 
@@ -135,39 +133,37 @@ class TestPhantomPilotRecovery:
 
 class TestRestartCorrelation:
 
-    def test_uid_to_task_rebuilt_on_materialise(self, tmp_path: Path):
+    def test_pool_and_uid_map_rebuilt(self, tmp_path):
         plugin = _make_plugin(tmp_path)
-        ps = plugin._pool_states['cpu']
-        rec = TaskRecord(task_id='t.x', pool='cpu', cmd=['/bin/echo'],
-                         cwd=str(tmp_path), state=TASK_RUNNING,
-                         pilot_id='p.1', rhapsody_uid='rh.1')
+        ps = _pool(plugin)
+        rec = TaskRecord(task_id='t.x', pool='cpu', owning_sid=_SID,
+                         cmd=['/bin/echo'], cwd=str(tmp_path),
+                         state=TASK_RUNNING, pilot_id='p.1', rhapsody_uid='rh.1')
         ps.tasks['t.x'] = rec
         ps.task_log.append(rec)
 
-        # Simulate a bridge restart: a fresh plugin over the same state.
-        plugin2 = _make_plugin(tmp_path)
-        ps2 = plugin2._pool_states['cpu']
+        plugin2 = _make_plugin(tmp_path, with_pool=False)   # fresh; replay only
+        assert _SID in plugin2._pool_states
+        ps2 = _pool(plugin2)
         assert ps2.tasks['t.x'].state == TASK_RUNNING
-        assert plugin2._uid_to_task.get('rh.1') == ('cpu', 't.x')
+        assert plugin2._uid_to_task.get('rh.1') == (_SID, 'cpu', 't.x')
 
-    def test_endpoint_mode_lendpointr_replayed(self, tmp_path: Path):
+    def test_endpoint_mode_ledger_replayed(self, tmp_path):
         plugin = _make_plugin(tmp_path, with_pool=False)
         plugin._endpoint_mode_log.append(
             EndpointModeRecord(task_id='t.e', endpoint='gpuendpoint',
-                           state=TASK_RUNNING))
-
+                               state=TASK_RUNNING))
         plugin2 = _make_plugin(tmp_path, with_pool=False)
         assert plugin2._endpoint_mode_tasks.get('t.e') == 'gpuendpoint'
 
-    def test_endpoint_mode_terminal_filtered_on_replay(self, tmp_path: Path):
+    def test_endpoint_mode_terminal_filtered(self, tmp_path):
         plugin = _make_plugin(tmp_path, with_pool=False)
         plugin._endpoint_mode_log.append(
             EndpointModeRecord(task_id='t.e', endpoint='gpuendpoint',
-                           state=TASK_RUNNING))
+                               state=TASK_RUNNING))
         plugin._endpoint_mode_log.append(
             EndpointModeRecord(task_id='t.e', endpoint='gpuendpoint',
-                           state=TASK_DONE))
-
+                               state=TASK_DONE))
         plugin2 = _make_plugin(tmp_path, with_pool=False)
         assert 't.e' not in plugin2._endpoint_mode_tasks
 
@@ -180,50 +176,44 @@ class TestStaleUid:
 
     def test_late_terminal_for_reenqueued_task_ignored(self, tmp_path):
         plugin = _make_plugin(tmp_path)
-        ps = plugin._pool_states['cpu']
-        pilot = PilotRecord(pid='p.1', pool='cpu', size_key='s',
-                            rhapsody_backend='concurrent',
-                            state=PILOT_ACTIVE, capacity=2, in_flight=1)
+        ps = _pool(plugin)
+        pilot = PilotRecord(pid='p.1', pool='cpu', owning_sid=_SID, size_key='s',
+                            rhapsody_backend='concurrent', state=PILOT_ACTIVE,
+                            capacity=2, in_flight=1)
         ps.pilots['p.1'] = pilot
-        task = TaskRecord(task_id='t.r', pool='cpu', cmd=['/bin/echo'],
-                          cwd=str(tmp_path), state=TASK_RUNNING,
-                          pilot_id='p.1', rhapsody_uid='rh.old')
+        task = TaskRecord(task_id='t.r', pool='cpu', owning_sid=_SID,
+                          cmd=['/bin/echo'], cwd=str(tmp_path),
+                          state=TASK_RUNNING, pilot_id='p.1', rhapsody_uid='rh.old')
         ps.tasks['t.r'] = task
-        plugin._uid_to_task['rh.old'] = ('cpu', 't.r')
+        plugin._uid_to_task['rh.old'] = (_SID, 'cpu', 't.r')
 
         plugin._mark_pilot_failed(ps, pilot, 'lost')
         assert task.state == TASK_QUEUED
-        assert 'rh.old' not in plugin._uid_to_task   # mapping cleared
+        assert 'rh.old' not in plugin._uid_to_task
 
-        # A late terminal event for the dead pilot's old uid arrives.
         plugin._handle_task_terminal('rh.old', TASK_DONE, {})
-        assert task.state == TASK_QUEUED   # not clobbered
+        assert task.state == TASK_QUEUED    # not clobbered
 
 
 # ---------------------------------------------------------------------------
-# C6 — endpoint-mode lendpointr self-prunes via snapshot
+# C6 — endpoint-mode ledger self-prunes via snapshot
 # ---------------------------------------------------------------------------
 
 class TestEndpointModeCompaction:
 
-    def test_snapshot_drops_terminal_entries(self, tmp_path: Path):
+    def test_snapshot_drops_terminal_entries(self, tmp_path):
         plugin = _make_plugin(tmp_path, with_pool=False)
         log = plugin._endpoint_mode_log
-        # one live, one already-terminal
         plugin._endpoint_mode_tasks['t.live'] = 'e1'
         log.append(EndpointModeRecord(task_id='t.live', endpoint='e1',
-                                  state=TASK_RUNNING))
+                                      state=TASK_RUNNING))
         log.append(EndpointModeRecord(task_id='t.gone', endpoint='e2',
-                                  state=TASK_DONE))
-
-        # Snapshot the live set only (what the compaction sweeper does).
-        live = {tid: EndpointModeRecord(task_id=tid, endpoint=endpoint,
-                                    state=TASK_RUNNING)
-                for tid, endpoint in plugin._endpoint_mode_tasks.items()}
+                                      state=TASK_DONE))
+        live = {tid: EndpointModeRecord(task_id=tid, endpoint=ep,
+                                        state=TASK_RUNNING)
+                for tid, ep in plugin._endpoint_mode_tasks.items()}
         log.snapshot(live)
-
-        replayed = log.replay()
-        assert set(replayed.keys()) == {'t.live'}
+        assert set(log.replay().keys()) == {'t.live'}
 
 
 # ---------------------------------------------------------------------------
@@ -231,16 +221,8 @@ class TestEndpointModeCompaction:
 # ---------------------------------------------------------------------------
 
 def test_no_get_event_loop_run_until_complete_in_tests():
-    """``get_event_loop().run_until_complete`` breaks once any earlier
-    test calls ``asyncio.run`` (which nulls the loop on 3.11+).  Keep the
-    suite order-independent by forbidding the pattern outright."""
     here = Path(__file__).parent
-    pattern = 'get_event_loop().run_' + 'until_complete'  # avoid self-match
-    offenders = []
-    for path in here.glob('test_*.py'):
-        if path.name == Path(__file__).name:
-            continue
-        if pattern in path.read_text():
-            offenders.append(path.name)
-    assert not offenders, \
-        f"use asyncio.run instead of get_event_loop(): {offenders}"
+    pattern = 'get_event_loop().run_' + 'until_complete'
+    offenders = [p.name for p in here.glob('test_*.py')
+                 if p.name != Path(__file__).name and pattern in p.read_text()]
+    assert not offenders, f"use asyncio.run instead: {offenders}"

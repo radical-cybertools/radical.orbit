@@ -226,6 +226,13 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
         # ``_broadcast_topology``.
         self._topology_listeners: List[Callable[[], None]] = []
 
+        # Last rich topology delivered to the hosted-plugin host, so a
+        # participant that vanishes (post-grace ``lost``) can be re-synthesized
+        # with ``liveness='lost'`` for hosted plugins (the wire carries no
+        # tombstone; the broker simply drops a lost participant).  Touched only
+        # on the routing loop.
+        self._host_topology_prev: Dict[str, Dict[str, Any]] = {}
+
         # Correlation: one broker-side pending table (src='broker') plus a
         # lightweight inflight forwarding table for grace-bounded fast-fail.
         self.pending:  Dict[str, asyncio.Future]        = {}   # corr_id -> future
@@ -397,7 +404,8 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
             try:
                 host = BridgePluginHost(
                     names, self._host_broadcast, BROKER_NAME,
-                    on_topology_changed=None, bridge_url=self._url)
+                    on_topology_changed=None, bridge_url=self._url,
+                    broker_caller=self.caller, broker_tap=self.tap)
                 fut.set_result(host)
             except Exception as e:                         # pragma: no cover
                 fut.set_exception(e)
@@ -702,44 +710,58 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
 
     async def _dispatch_to_host(self, src_name: str, raw: dict) -> None:
         """Route a ``dst='broker'`` request into the host and reply."""
-        status  = 502
-        headers : Dict[str, str] = {}
-        body    : bytes          = b''
-        if self._host is None:
-            body = json.dumps({"error": True, "detail": "no broker host"}).encode()
-            status = 503
-        else:
-            try:
-                query = ''
-                path  = raw.get('path', '/')
-                if '?' in path:
-                    path, query = path.split('?', 1)
-                cfut = asyncio.run_coroutine_threadsafe(
-                    self._host.handle_request(
-                        method       = raw.get('method', 'GET'),
-                        path         = path,
-                        headers      = raw.get('headers', {}),
-                        body_bytes   = self._as_bytes(raw.get('body', b'')),
-                        query_string = query),
-                    self._host_loop)
-                resp    = await asyncio.wrap_future(cfut)
-                status  = resp.status_code
-                headers = dict(resp.headers)
-                body    = bytes(resp.body)
-            except HTTPException as e:
-                status = e.status_code
-                body   = json.dumps({"error": True, "detail": e.detail}).encode()
-            except Exception as e:
-                log.exception("[Broker] host dispatch failed: %s", e)
-                status = 500
-                body   = json.dumps({"error": True, "detail": str(e)}).encode()
-
-        out = protocol.Response(src=BROKER_NAME, dst=src_name, status=status,
-                                headers={k: v for k, v in headers.items()},
-                                body=body, corr_id=raw.get('corr_id'))
+        resp = await self.call_host(
+            raw.get('method', 'GET'), raw.get('path', '/'),
+            headers=raw.get('headers', {}), body=raw.get('body', b''))
+        out = protocol.Response(
+            src=BROKER_NAME, dst=src_name, status=int(resp['status']),
+            headers={k: v for k, v in (resp['headers'] or {}).items()},
+            body=resp['body'], corr_id=raw.get('corr_id'))
         target = self.registry.get(src_name)
         if target is not None:
             await self._send(target, protocol.pack_message(out, cap=self._frame_cap))
+
+    async def call_host(self, method: str, path: str, *,
+                        headers: Optional[Dict[str, str]] = None,
+                        body: Any = b'') -> Dict[str, Any]:
+        """Invoke a broker-hosted plugin route across the thread boundary.
+
+        Gateway seam (pre-flip item 1): the HTTP catch-all proxies a
+        ``dst=='broker'`` request here instead of 404-ing on the routing-loop
+        registry.  Returns a ``{status, headers, body}`` dict (body is bytes),
+        the same passthrough shape :meth:`_dispatch_to_host` wraps into a wire
+        ``response``."""
+        if self._host is None:
+            return {'status': 503, 'headers': {},
+                    'body': json.dumps({"error": True,
+                                        "detail": "no broker host"}).encode()}
+        query = ''
+        if '?' in path:
+            path, query = path.split('?', 1)
+        try:
+            cfut = asyncio.run_coroutine_threadsafe(
+                self._host.handle_request(
+                    method       = method,
+                    path         = path,
+                    headers      = headers or {},
+                    body_bytes   = self._as_bytes(body),
+                    query_string = query),
+                self._host_loop)
+            resp = await asyncio.wrap_future(cfut)
+            return {'status':  resp.status_code,
+                    'headers': dict(resp.headers),
+                    'body':    bytes(resp.body)}
+        except HTTPException as e:
+            return {'status': e.status_code,
+                    'headers': {'content-type': 'application/json'},
+                    'body': json.dumps({"error": True,
+                                        "detail": e.detail}).encode()}
+        except Exception as e:
+            log.exception("[Broker] host dispatch failed: %s", e)
+            return {'status': 500,
+                    'headers': {'content-type': 'application/json'},
+                    'body': json.dumps({"error": True,
+                                        "detail": str(e)}).encode()}
 
     def _host_broadcast(self, topic: str, data: dict):
         """``broadcast_fn`` handed to :class:`BridgePluginHost`.
@@ -936,11 +958,41 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
         packed = self._build_topology_msg()
         for name, ws in list(self.registry.items()):
             await self._send(ws, packed)
+        # Deliver the rich topology to the hosted-plugin host (task_dispatcher
+        # consumes it for pilot-child liveness + owner-session reclaim-drain).
+        self._deliver_topology_to_host()
         # Notify in-process topology listeners (the gateway's SSE fan-out).
         for cb in list(self._topology_listeners):
             try:    cb()
             except Exception as e:
                 log.error("[Broker] topology listener failed: %r", e, exc_info=e)
+
+    def _deliver_topology_to_host(self) -> None:
+        """Hand the rich topology to hosted plugins on the host loop.
+
+        Synthesizes a ``liveness='lost'`` entry for a participant that was
+        ``present``/``suspect`` in the previous delivery but is now gone (the
+        post-grace ``lost`` the wire never carries), mirroring the runtime's
+        served-plugin delivery.  A fresh broker starts with an empty ``prev``,
+        so a not-yet-reconnected child is never synthesized ``lost`` (it was
+        never ``present`` in this broker's view)."""
+        if self._host is None or self._host_loop is None:
+            return
+        curr = self.topology_snapshot()
+        participants = dict(curr)
+        for name, info in self._host_topology_prev.items():
+            if name in curr:
+                continue
+            if (info or {}).get('liveness') in ('present', 'suspect'):
+                lost = dict(info)
+                lost['liveness'] = 'lost'
+                participants[name] = lost
+        self._host_topology_prev = curr
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._host.on_topology_change(participants), self._host_loop)
+        except Exception as e:
+            log.debug("[Broker] host topology delivery failed: %s", e)
 
     # ── low-level helpers ─────────────────────────────────────────────
 

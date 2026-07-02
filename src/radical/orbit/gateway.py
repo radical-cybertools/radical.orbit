@@ -507,6 +507,21 @@ class Gateway:
             body    = await request.body()
             headers = self_._strip_headers(request)
 
+            # dst == the broker's own hosted-plugin participant: route into the
+            # plugin host (the same host-loop crossing ``_dispatch_to_host``
+            # uses) instead of the routing-loop registry, which 404s for
+            # ``dst=='broker'`` (pre-flip item 1: HTTP reach to hosted plugins).
+            if endpoint_name == BROKER_NAME:
+                resp = await self_._broker.call_host(
+                    request.method, forward_path, headers=headers, body=body)
+                status  = int(resp.get('status', 502))
+                rheaders = resp.get('headers') or {}
+                rbody   = resp.get('body') or b''
+                if isinstance(rbody, str):
+                    rbody = rbody.encode()
+                return Response(content=rbody, status_code=status,
+                                headers=dict(rheaders))
+
             try:
                 resp = await self_._broker.caller.call(
                     endpoint_name, request.method, forward_path,
