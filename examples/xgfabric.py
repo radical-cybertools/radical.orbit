@@ -2,7 +2,7 @@
 """
 XGFabric Workflow Client
 
-Connects to the bridge, starts an XGFabric workflow on the specified endpoint,
+Connects to the broker, starts an XGFabric workflow on the specified endpoint,
 and watches execution to completion via SSE notifications.
 
 Usage:
@@ -21,7 +21,7 @@ import sys
 import threading
 import time
 
-from radical.orbit import BridgeClient
+from radical.orbit import EndpointRuntime
 
 logging.basicConfig(level=logging.DEBUG, format='%(levelname)s %(name)s %(message)s')
 
@@ -80,7 +80,7 @@ def main():
         description="Run an XGFabric workflow end-to-end and stream progress.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    # URL/cert default to None so BridgeClient self-resolves via
+    # URL/cert default to None so EndpointRuntime self-resolves via
     # radical.orbit.utils (CLI > env > file).
     parser.add_argument('-u', '--bridge-url',  default=None,
                         help='Bridge URL  (CLI > $RADICAL_ORBIT_BRIDGE_URL > '
@@ -98,9 +98,9 @@ def main():
 
     print(args)
 
-    bc  = BridgeClient(url=args.bridge_url, cert=args.bridge_cert)
-    ec  = bc.get_endpoint_client(args.endpoint)
-    xgf = ec.get_plugin('xgfabric')
+    rt  = EndpointRuntime(broker_url=args.bridge_url, cert=args.bridge_cert)
+    rt.start(wait=True)
+    xgf = rt.get_plugin(args.endpoint, 'xgfabric')
 
 
     done      = threading.Event()
@@ -130,12 +130,12 @@ def main():
 
     try:
         # Show initial cluster/config state before starting
-        print(f"Connecting to bridge: {args.bridge_url}")
+        print(f"Connecting to broker: {args.bridge_url}")
         print(f"Endpoint: {args.endpoint}  Workflow: {args.workflow}  Resource: {args.resource}")
         _print_status(xgf.get_status())
 
         # Register for topology and workflow notifications
-        bc.register_topology_callback(on_topology)
+        rt.register_topology_callback(on_topology)
         xgf.register_notification_callback(on_status, topic='workflow_status')
 
         # Start the workflow
@@ -175,7 +175,7 @@ def main():
 
     finally:
         xgf.close()
-        bc.close()
+        rt.stop()
 
 
 if __name__ == '__main__':

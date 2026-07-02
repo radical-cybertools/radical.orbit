@@ -114,6 +114,7 @@ def run_test() -> int:
     _drain(bridge_proc.stdout, 'bridge')
 
     endpoint_proc = None
+    client = None
     try:
         _wait_for_port('localhost', port, timeout=10.0)
 
@@ -127,15 +128,15 @@ def run_test() -> int:
         _drain(endpoint_proc.stdout, 'endpoint')
 
         # Late imports so logging picks up the env above.
-        from radical.orbit.client import BridgeClient
+        from radical.orbit import EndpointRuntime
 
-        client = BridgeClient(url=bridge_url, cert=cert_path)
-        # Make SSE listener errors visible (otherwise they're DEBUG-only).
+        client = EndpointRuntime(broker_url=bridge_url, cert=cert_path)
+        client.start(wait=True)
         logging.getLogger('radical.orbit').setLevel(logging.DEBUG)
-        logging.getLogger('radical.orbit.client').setLevel(logging.DEBUG)
+        logging.getLogger('radical.orbit.runtime').setLevel(logging.DEBUG)
 
         # Wait for the endpoint to register over WS.  Use the topology
-        # callback the BridgeClient already exposes.
+        # callback the runtime consumer already exposes.
         endpoint_seen = threading.Event()
         def on_topology(endpoints):
             if ENDPOINT_NAME in endpoints:
@@ -143,22 +144,21 @@ def run_test() -> int:
         client.register_topology_callback(on_topology)
 
         if not endpoint_seen.wait(timeout=15.0):
-            # fall back to polling list_endpoints in case the topology
-            # event was missed (e.g. SSE listener not yet warm).
+            # fall back to polling the topology in case the change
+            # event was missed.
             for _ in range(50):
                 try:
-                    if ENDPOINT_NAME in client.list_endpoints():
+                    if ENDPOINT_NAME in client.topology():
                         endpoint_seen.set()
                         break
                 except Exception:
                     pass
                 time.sleep(0.1)
         if not endpoint_seen.is_set():
-            print("FAIL: endpoint did not register on bridge", file=sys.stderr)
+            print("FAIL: endpoint did not register on broker", file=sys.stderr)
             return 1
 
-        endpoint = client.get_endpoint_client(ENDPOINT_NAME)
-        psij = endpoint.get_plugin('psij')
+        psij = client.get_plugin(ENDPOINT_NAME, 'psij')
 
         notifications = []
         terminal_seen = threading.Event()
@@ -192,6 +192,11 @@ def run_test() -> int:
         return 0
 
     finally:
+        try:
+            if client is not None:
+                client.stop()
+        except Exception:
+            pass
         for proc, name in ((endpoint_proc, 'endpoint'), (bridge_proc, 'bridge')):
             if proc and proc.poll() is None:
                 proc.terminate()

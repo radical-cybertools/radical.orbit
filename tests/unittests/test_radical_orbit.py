@@ -20,11 +20,11 @@ def test_radical_orbit():
 
 
 # ---------------------------------------------------------------------------
-# _resolve_plugin_names (pure function in service.py)
+# _resolve_plugin_names (pure function in plugin_host_base.py)
 # ---------------------------------------------------------------------------
 
 import pytest
-from radical.orbit.service import _resolve_plugin_names
+from radical.orbit.plugin_host_base import _resolve_plugin_names
 
 
 def test_resolve_plugin_names_exact():

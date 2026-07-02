@@ -3,7 +3,7 @@
 IRI Plugin Example
 ==================
 
-Submit a one-shot test job to an HPC resource via the bridge's IRI plugin.
+Submit a one-shot test job to an HPC resource via the broker's IRI plugin.
 
 Usage::
 
@@ -14,8 +14,8 @@ Defaults are filled from ``ENDPOINT_CONFIG`` below.  Environment variables
 workdir values.
 
 The token file holds only the Bearer token string (no ``Bearer`` prefix).
-The token is read locally, sent to the bridge once at ``connect`` time,
-and held in bridge process memory only — never written to bridge disk.
+The token is read locally, sent to the broker once at ``connect`` time,
+and held in broker process memory only — never written to broker disk.
 
 Per-endpoint defaults: edit ENDPOINT_CONFIG below to match your account
 and (where required) workdir before first use.
@@ -25,7 +25,7 @@ import os
 import sys
 import time
 
-from radical.orbit.client import BridgeClient
+from radical.orbit import EndpointRuntime
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -164,10 +164,10 @@ def main():
         sys.exit(f'no resource_id for endpoint {cfg["endpoint"]!r} '
                  f'and none on the CLI — set ENDPOINT_CONFIG or pass argv[3]')
 
-    print(f'Connecting to bridge (endpoint: {cfg["endpoint"]})…')
-    bc     = BridgeClient()
-    bridge = bc.get_endpoint_client('bridge')
-    cx     = bridge.get_plugin('iri_connect')
+    print(f'Connecting to broker (endpoint: {cfg["endpoint"]})…')
+    rt     = EndpointRuntime()
+    rt.start(wait=True)
+    cx     = rt.get_plugin('broker', 'iri_connect')
 
     print('Available endpoints:')
     for key, ep in cx.list_endpoints().items():
@@ -201,7 +201,7 @@ def main():
         try_list_projects(iri, cfg['endpoint'])
     finally:
         cx.disconnect(cfg['endpoint'])
-        bc.close()
+        rt.stop()
         print('\nDone.')
 
 

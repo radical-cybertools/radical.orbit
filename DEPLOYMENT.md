@@ -23,8 +23,10 @@ No inbound ports need to be opened on the HPC firewall.
 
 ## Bridge Setup
 
-The bridge is a single FastAPI/uvicorn process. It holds no job state — all
-session state lives in the endpoint processes.
+The bridge is a single FastAPI/uvicorn process running the active broker: a
+WebSocket `/register` hub that routes between participants, with the gateway
+compat tier (HTTP REST, SSE, Explorer) attached on the same port by default. It
+holds no job state — all session state lives in the endpoint processes.
 
 ```sh
 # HTTP (development only)
@@ -34,13 +36,12 @@ session state lives in the endpoint processes.
 export RADICAL_ORBIT_BRIDGE_CERT=/path/to/cert.pem
 export RADICAL_ORBIT_BRIDGE_KEY=/path/to/key.pem
 ./bin/radical-orbit-bridge.py
+
+# Headless broker (WebSocket ingress only, no HTTP/SSE/Explorer)
+./bin/radical-orbit-bridge.py --no-gateway
 ```
 
-To change host/port, edit the last line of `bin/radical-orbit-bridge.py`:
-
-```python
-uvicorn.run(app, host="0.0.0.0", port=8000, ...)
-```
+Set the bind address/port with `--host` / `--port` (defaults `0.0.0.0:8000`).
 
 ### systemd Unit File (Bridge)
 

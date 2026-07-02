@@ -21,10 +21,10 @@ pip install .
 Requires two terminals (optionally three for testing):
 
 ```sh
-# Terminal 1 – Bridge (reverse proxy, public-facing)
-./bin/radical-orbit-bridge.py
+# Terminal 1 – Bridge (the active broker + gateway, public-facing)
+./bin/radical-orbit-bridge.py            # add --no-gateway for a headless broker
 
-# Terminal 2 – Endpoint service (HPC side, connects to bridge via WebSocket)
+# Terminal 2 – Endpoint (HPC side, dials the broker over an outbound WebSocket)
 ./bin/radical-orbit-endpoint-wrapper.sh  # preferred: sets up PATH and PYTHONPATH
 # or: ./bin/radical-orbit-endpoint.py
 
@@ -35,7 +35,12 @@ python examples/example_rhapsody.py  # Rhapsody tasks
 python examples/example_endpoint.py      # Submit a child endpoint service as a batch job
 ```
 
-The bridge includes a web-based **Explorer UI** at the root URL (e.g., `http://localhost:8000/`).
+The `radical-orbit-bridge.py` filename runs the **active broker** — a WebSocket
+`/register` hub that routes between participants — with the **gateway** compat
+tier (HTTP REST, SSE `/events`, and the Explorer UI at the root URL, e.g.
+`http://localhost:8000/`) attached on the same port by default; `--no-gateway`
+disables it. The endpoint runs the participant runtime, which dials the broker
+over one outbound WebSocket and may serve and/or consume plugins.
 
 For HTTPS, generate a self-signed cert first:
 ```sh

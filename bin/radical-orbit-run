@@ -170,15 +170,18 @@ class Wrapper:
 
     def _get_td(self):
         '''Lazy import + connect.  Done inside run() so argv errors
-        fail before we bring up a full BridgeClient.
+        fail before we bring up a full runtime.
 
-        The dispatcher is bridge-hosted, so we always target the
-        ``'bridge'`` endpoint for plugin lookup; ``--endpoint`` (if given) is
-        a per-task routing hint forwarded in the submit body.
+        The dispatcher is broker-hosted, so we always target the
+        ``'broker'`` participant for plugin lookup; ``--endpoint`` (if given)
+        is a per-task routing hint forwarded in the submit body.  This is a
+        zero-plugin :class:`EndpointRuntime` consumer: it dials the broker over
+        one outbound WebSocket and reaches the hosted dispatcher through the
+        consumer facade.
         '''
-        from radical.orbit import BridgeClient  # type: ignore[import-untyped]
-        self._bc = BridgeClient()
-        endpoint_c   = self._bc.get_endpoint_client('bridge')
+        from radical.orbit import EndpointRuntime  # type: ignore[import-untyped]
+        self._bc = EndpointRuntime()
+        self._bc.start(wait=True)
 
         # Forward --pools to register_session if provided.  The body
         # must match the pools.json schema (top-level "pools" list).
@@ -191,20 +194,21 @@ class Wrapper:
             pools = body.get('pools', body) if isinstance(body, dict) else body
             kwargs['pools'] = pools
 
-        self._td_client = endpoint_c.get_plugin('task_dispatcher', **kwargs)
+        self._td_client = self._bc.get_plugin('broker', 'task_dispatcher',
+                                              **kwargs)
         return self._td_client
 
     def _close(self) -> None:
         if self._bc is not None:
             try:
-                self._bc.close()
+                self._bc.stop()
             except Exception:
                 pass
 
     def _on_task_status(self, endpoint: str, plugin: str,
                          topic: str, data: dict) -> None:
-        '''SSE callback — fire terminal event when our task_id hits a
-        terminal state.  Runs in the BridgeClient listener thread.'''
+        '''Event callback — fire terminal event when our task_id hits a
+        terminal state.  Runs on the runtime's callback-dispatcher thread.'''
         del endpoint, plugin, topic  # filtered at registration time
         if data.get('task_id') != self.task_id:
             return
@@ -271,8 +275,8 @@ class Wrapper:
         final task dict.
         '''
         if self._bc is None:
-            raise RuntimeError('bridge client not initialised')
-        connected = self._bc.wait_for_listener(timeout=_SSE_CONNECT_TIMEOUT)
+            raise RuntimeError('runtime not initialised')
+        connected = self._bc.wait_registered(timeout=_SSE_CONNECT_TIMEOUT)
 
         if connected:
             # Wait indefinitely for SSE — Makeflow will SIGTERM us if
@@ -319,12 +323,12 @@ class Wrapper:
 
         td = self._get_td()
 
-        # Register a persistent SSE callback BEFORE submitting so no
+        # Register a persistent event callback BEFORE submitting so no
         # notification can slip through between submit and subscribe.
-        # The dispatcher is always on the 'bridge' endpoint.
+        # The dispatcher is always on the broker-hosted 'broker' participant.
         if self._bc is not None:
             self._bc.register_callback(
-                endpoint_id='bridge',
+                endpoint_id='broker',
                 plugin_name='task_dispatcher',
                 topic='task_status',
                 callback=self._on_task_status)

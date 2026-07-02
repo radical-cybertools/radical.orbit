@@ -8,21 +8,21 @@ Demonstrates listing a remote directory, uploading a file, and downloading it.
 import os
 import tempfile
 
-from radical.orbit import BridgeClient
+from radical.orbit import EndpointRuntime
 
 
 def main():
 
-    bc   = BridgeClient()
-    eids = bc.list_endpoints()
+    rt   = EndpointRuntime()
+    rt.start(wait=True)
+    eids = [n for n in rt.topology() if n != 'broker']
 
     if not eids:
         print("No endpoints connected - start an endpoint service first")
-        bc.close()
+        rt.stop()
         return
 
-    ec      = bc.get_endpoint_client(eids[0])
-    staging = ec.get_plugin('staging')
+    staging = rt.get_plugin(eids[0], 'staging')
 
     # Create a local test file
     with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as f:
@@ -50,7 +50,7 @@ def main():
                 os.unlink(p)
 
     staging.close()
-    bc.close()
+    rt.stop()
     print("Done.")
 
 

@@ -167,6 +167,14 @@ class Gateway:
         self._untap         = None
         self._untopo        = None
 
+        # Dynamic ``ui_module`` JS cache for broker-hosted plugins whose UI is
+        # registered at runtime (the ``iri.<endpoint>`` instances) — the packaged
+        # ``data/plugins/*.js`` covers the static plugins.  Written and read on
+        # the routing loop (``serve_plugin``, refreshed on a miss from
+        # ``Broker.get_ui_modules()``); no lock needed.  Mirrors the bridge's
+        # ``_plugin_ui_module_js`` (the bridge cached the same host modules).
+        self._plugin_ui_module_js: Dict[str, str] = {}
+
         self._setup_middleware()
         self._register_routes()
         self._subscribe_events()
@@ -282,7 +290,11 @@ class Gateway:
 
         Emits the legacy topology envelope with the same ``{bridge, endpoints}``
         payload the discovery route returns (the exact shape the bridge sent).
+        The dynamic ``ui_module`` cache is refreshed lazily on a ``serve_plugin``
+        miss (a bounded cross-thread fetch off the hot path) rather than here, so
+        a topology change never blocks the routing loop on host-loop state.
         """
+        self._routing_loop = asyncio.get_running_loop()
         if not self._sse_clients:
             return
         self._push_all(self._sse_frame('topology', self._discovery_snapshot()))
@@ -483,11 +495,23 @@ class Gateway:
             if not re.match(r'^[a-z_][a-z0-9_.]*\.js$', filename):
                 raise HTTPException(status_code=404,
                                     detail="Invalid plugin filename")
+            # Packaged static JS wins.
             plugin_path = self_._resource_path('plugins/%s' % filename)
             if plugin_path:
                 return FileResponse(plugin_path,
                                     media_type="application/javascript",
                                     headers=self_._no_cache())
+            # Fall back to a broker-hosted plugin's dynamically-registered UI
+            # module (e.g. ``iri.nersc.js``).  Refresh on a miss so a UI
+            # registered since the last topology change is still found.
+            plugin_name = filename[:-3]
+            js = self_._plugin_ui_module_js.get(plugin_name)
+            if js is None:
+                self_._plugin_ui_module_js.update(self_._broker.get_ui_modules())
+                js = self_._plugin_ui_module_js.get(plugin_name)
+            if js is not None:
+                return Response(js, media_type="application/javascript",
+                                headers=self_._no_cache())
             raise HTTPException(status_code=404,
                                 detail=f"Plugin '{filename}' not found")
 

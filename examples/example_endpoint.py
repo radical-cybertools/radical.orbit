@@ -4,7 +4,7 @@ example_endpoint.py — Submit a child Endpoint service as a batch job.
 
 This example demonstrates how to use the psij ``submit_tunneled`` API to launch a
 new ORBIT service on a compute node, optionally setting up a reverse
-SSH tunnel so the compute node can reach the bridge through the login node.
+SSH tunnel so the compute node can reach the broker through the login node.
 
 Usage
 -----
@@ -17,12 +17,12 @@ Usage
         --nodes  1                           # number of nodes
         --tunnel                             # set up reverse SSH tunnel (required on
                                              # systems where compute nodes cannot reach
-                                             # the bridge directly)
+                                             # the broker directly)
 
 Prerequisites
 -------------
-- A running bridge (radical-orbit-bridge.py)
-- A running parent endpoint on the login node (radical-orbit-endpoint-wrapper.sh --url <bridge>)
+- A running broker (radical-orbit-bridge.py)
+- A running parent endpoint on the login node (radical-orbit-endpoint-wrapper.sh --url <broker>)
 - The parent endpoint must have the 'psij' plugin loaded
 """
 
@@ -30,14 +30,14 @@ import argparse
 import sys
 import time
 
-from radical.orbit import BridgeClient
+from radical.orbit import EndpointRuntime
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Submit a child Endpoint service as a batch job via PsiJ.")
     parser.add_argument('--url',     required=True,
-                        help="Bridge URL, e.g. http://login09.host:8000")
+                        help="Broker URL, e.g. http://login09.host:8000")
     parser.add_argument('--endpoint',    required=True,
                         help="Parent endpoint name (must have psij plugin)")
     parser.add_argument('--name',    required=True,
@@ -60,18 +60,18 @@ def main():
                              "(default: same as parent)")
     args = parser.parse_args()
 
-    # ── Connect to bridge ────────────────────────────────────────────────────
-    print(f"Connecting to bridge at {args.url} …")
-    client = BridgeClient(url=args.url)
+    # ── Connect to broker ────────────────────────────────────────────────────
+    print(f"Connecting to broker at {args.url} …")
+    rt = EndpointRuntime(broker_url=args.url)
+    rt.start(wait=True)
 
-    endpoints = client.list_endpoints()
+    endpoints = rt.topology()
     if args.endpoint not in endpoints:
         print(f"ERROR: endpoint '{args.endpoint}' not connected. Available: {list(endpoints)}")
-        client.close()
+        rt.stop()
         sys.exit(1)
 
-    endpoint = client.get_endpoint_client(args.endpoint)
-    psij = endpoint.get_plugin('psij')
+    psij = rt.get_plugin(args.endpoint, 'psij')
 
     # ── Determine plugins to forward to child endpoint ───────────────────────────
     if args.plugins:
@@ -125,8 +125,8 @@ def main():
     print(f"  endpoint_name : {endpoint_name}")
 
     if not args.tunnel:
-        print("\nNo tunnel requested.  Waiting for child endpoint to connect to bridge …")
-        _wait_for_endpoint(client, endpoint_name, timeout=300)
+        print("\nNo tunnel requested.  Waiting for child endpoint to connect to broker …")
+        _wait_for_endpoint(rt, endpoint_name, timeout=300)
         return
 
     # ── Poll tunnel status ───────────────────────────────────────────────────
@@ -145,7 +145,7 @@ def main():
             break
         elif st == 'failed':
             print("  ERROR: tunnel watcher failed.")
-            client.close()
+            rt.stop()
             sys.exit(1)
         elif st == 'done':
             print("  Watcher finished (tunnel completed).")
@@ -154,30 +154,30 @@ def main():
             print(f"  [{attempt * 5:>4}s] status={st}")
     else:
         print("  Timed out waiting for tunnel.")
-        client.close()
+        rt.stop()
         sys.exit(1)
 
     # ── Wait for the child endpoint to appear ────────────────────────────────────
-    print(f"\nWaiting for child endpoint '{endpoint_name}' to register with the bridge …")
-    _wait_for_endpoint(client, endpoint_name, timeout=120)
+    print(f"\nWaiting for child endpoint '{endpoint_name}' to register with the broker …")
+    _wait_for_endpoint(rt, endpoint_name, timeout=120)
 
-    client.close()
+    rt.stop()
 
 
-def _wait_for_endpoint(client: BridgeClient, endpoint_name: str, timeout: int = 300) -> None:
-    """Poll until *endpoint_name* appears in the bridge's endpoint list."""
+def _wait_for_endpoint(rt: EndpointRuntime, endpoint_name: str, timeout: int = 300) -> None:
+    """Poll until *endpoint_name* appears in the broker's topology."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        endpoints = client.list_endpoints()
+        endpoints = rt.topology()
         if endpoint_name in endpoints:
-            plugins = endpoints[endpoint_name].get('plugins', [])
-            print(f"  Child endpoint '{endpoint_name}' connected!  plugins: {plugins}")
+            plugins = endpoints[endpoint_name].get('plugins', {})
+            print(f"  Child endpoint '{endpoint_name}' connected!  plugins: {list(plugins)}")
             return
         time.sleep(5)
         print("  … still waiting …")
 
     print(f"  Timed out after {timeout}s — '{endpoint_name}' did not connect.")
-    client.close()
+    rt.stop()
     sys.exit(1)
 
 

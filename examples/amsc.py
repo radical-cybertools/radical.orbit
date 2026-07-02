@@ -69,7 +69,7 @@ from collections import defaultdict
 from pathlib import Path
 
 # ORBIT client + Rhapsody bits
-from radical.orbit.client import BridgeClient
+from radical.orbit import EndpointRuntime
 
 import rhapsody
 
@@ -245,7 +245,7 @@ IRI_DEFAULTS = {
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Per-machine defaults.  Keyed by endpoint name (as reported by
-#  ``bc.list_endpoints()``).  Used by ``psij:<name>`` (queue / account /
+#  ``bc.topology()``).  Used by ``psij:<name>`` (queue / account /
 #  walltime / tunnel for submitting a child endpoint) and by ``compute:<name>``
 #  (only the ``app`` block + ``gpus_per_node`` / ``cores_per_node`` are
 #  read in that path).  Values are taken verbatim — no prompts.
@@ -535,7 +535,7 @@ def launch_iri(bc, endpoint, cfg, bridge_url):
     Returns ``(iri_client, job_id, endpoint_name)`` so we can cancel later.
     """
     # Connect (idempotent — 409 returns the existing instance's client).
-    cx    = bc.get_endpoint_client('bridge').get_plugin('iri_connect')
+    cx    = bc.get_plugin('broker', 'iri_connect')
     token = read_token(endpoint)
     iri   = cx.connect(endpoint=endpoint, token=token)
 
@@ -622,13 +622,12 @@ def launch_iri(bc, endpoint, cfg, bridge_url):
 # ─────────────────────────────────────────────────────────────────────────────
 def launch_psij(bc, endpoint_name, cfg, bridge_url):
     """Submit a child endpoint via the parent endpoint's PsiJ plugin."""
-    endpoint = bc.get_endpoint_client(endpoint_name)
-    psij = endpoint.get_plugin('psij')
+    psij = bc.get_plugin(endpoint_name, 'psij')
 
     # Resolve $HOME on the target via the login-endpoint's sysinfo plugin.
     # Login and compute share $HOME via NFS/Lustre on every site we
     # care about, so the login-endpoint's home is also the compute job's.
-    home    = endpoint.get_plugin('sysinfo').homedir().rstrip('/')
+    home    = bc.get_plugin(endpoint_name, 'sysinfo').homedir().rstrip('/')
     amsc    = (cfg.get('amsc_dir') or '.amsc').strip('/')
     wrapper = f'{home}/{amsc}/ve/bin/radical-orbit-endpoint-wrapper.sh'
 
@@ -699,25 +698,34 @@ def launch_psij(bc, endpoint_name, cfg, bridge_url):
 # ─────────────────────────────────────────────────────────────────────────────
 #  Wait for the first endpoint to register.
 #
-#  We poll the bridge's endpoint list every few seconds and return the first
+#  We poll the broker's topology every few seconds and return the first
 #  expected name we see.  Polling is dumb but readable; for a demo this is
 #  better than wiring up an SSE callback bridge to asyncio.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _heartbeat_dot():
-    """Print a single dot to stdout; passed to ``bc.wait_for_endpoint`` so
-    a long queue wait shows visible progress without spamming the
-    screen."""
+    """Print a single dot to stdout; called from the poll loop so a long
+    queue wait shows visible progress without spamming the screen."""
     sys.stdout.write('.')
     sys.stdout.flush()
 
 
 def _wait_for_endpoint(bc, name):
-    """``bc.wait_for_endpoint`` wrapper that adds the demo's heartbeat-dot
-    progress UI and guarantees a trailing newline on either path."""
+    """Poll ``bc.topology()`` until *name* registers, adding the demo's
+    heartbeat-dot progress UI and guaranteeing a trailing newline on
+    either path."""
+    start   = time.time()
+    last_hb = start
     try:
-        return bc.wait_for_endpoint([name], timeout=ENDPOINT_WAIT_SECONDS,
-                                on_heartbeat=_heartbeat_dot)
+        while time.time() - start < ENDPOINT_WAIT_SECONDS:
+            if name in bc.topology():
+                return name
+            time.sleep(3.0)
+            if time.time() - last_hb >= 10.0:
+                _heartbeat_dot()
+                last_hb = time.time()
+        raise TimeoutError(f'endpoint {name!r} did not appear within '
+                           f'{ENDPOINT_WAIT_SECONDS}s')
     finally:
         sys.stdout.write('\n')
         sys.stdout.flush()
@@ -1200,7 +1208,7 @@ def teardown(bc, created):
     # 3. Disconnect IRI endpoints
     iri_eps = {c['endpoint'] for c in created if c['kind'] == 'iri'}
     if iri_eps:
-        cx = bc.get_endpoint_client('bridge').get_plugin('iri_connect')
+        cx = bc.get_plugin('broker', 'iri_connect')
         for ep in iri_eps:
             try:
                 cx.disconnect(ep)
@@ -1242,7 +1250,7 @@ def _parse_target_arg(arg):
 def _resolve_executor(bc, endpoint_name):
     """Ask the endpoint's sysinfo plugin what PsiJ executor it expects."""
     try:
-        info = bc.get_endpoint_client(endpoint_name).get_plugin('sysinfo').host_role()
+        info = bc.get_plugin(endpoint_name, 'sysinfo').host_role()
         return info.get('psij_executor', 'local')
     except Exception:
         return 'local'
@@ -1269,8 +1277,7 @@ def _step_run(bc, bridge_url, endpoint_name, cfg):
     nodelist so dragon's HOST_NAME placement still has a target to bind.
     """
     try:
-        nodelist = bc.get_endpoint_client(endpoint_name) \
-                     .get_plugin('queue_info').nodelist()
+        nodelist = bc.get_plugin(endpoint_name, 'queue_info').nodelist()
     except Exception:
         nodelist = []
     if not nodelist:
@@ -1323,9 +1330,9 @@ def _main_target(bc, bridge_url, kind, name,
       - ``iri``     : submit via the named IRI endpoint
       - ``compute`` : re-use the named endpoint directly (no submission)
     """
-    step(1, 'connect bridge', bridge_url)
+    step(1, 'connect broker', bridge_url)
 
-    live_endpoints = set(bc.list_endpoints())
+    live_endpoints = {n for n in bc.topology() if n != 'broker'}
     created    = []
 
     if kind == 'psij':
@@ -1334,7 +1341,7 @@ def _main_target(bc, bridge_url, kind, name,
                   f"Start the parent endpoint first.")
         if name not in MACHINE_DEFAULTS:
             abort(f"no MACHINE_DEFAULTS entry for {name!r}")
-        if 'psij' not in bc.get_endpoint_client(name).list_plugins():
+        if 'psij' not in bc.topology().get(name, {}).get('plugins', {}):
             abort(f"endpoint {name!r} has no psij plugin")
 
         executor = _resolve_executor(bc, name)
@@ -1405,7 +1412,7 @@ def _main_target(bc, bridge_url, kind, name,
     elif kind == 'compute':
         if name not in live_endpoints:
             abort(f"no endpoint {name!r} connected to bridge")
-        if 'rhapsody' not in bc.get_endpoint_client(name).list_plugins():
+        if 'rhapsody' not in bc.topology().get(name, {}).get('plugins', {}):
             abort(f"endpoint {name!r} has no rhapsody plugin")
         if name not in MACHINE_DEFAULTS:
             abort(f"no MACHINE_DEFAULTS entry for {name!r} (need 'app' block)")
@@ -1453,15 +1460,16 @@ def main():
 
     kind, name = _parse_target_arg(target_arg)
 
-    # BridgeClient self-resolves URL + cert via radical.orbit.utils
+    # EndpointRuntime self-resolves URL + cert via radical.orbit.utils
     # (CLI > env > file).
-    bc         = BridgeClient()
-    bridge_url = bc.url
+    bc         = EndpointRuntime()
+    bc.start(wait=True)
+    bridge_url = bc.broker_url
     try:
         _main_target(bc, bridge_url, kind, name,
                      slicing_mode=slicing_mode, n_nodes=n_nodes)
     finally:
-        bc.close()
+        bc.stop()
         print()
 
 

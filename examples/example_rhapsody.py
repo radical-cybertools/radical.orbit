@@ -3,11 +3,11 @@
 Example: Rhapsody Plugin via ORBIT
 =========================================
 
-Submits a batch of compute tasks through the ORBIT bridge,
+Submits a batch of compute tasks through the ORBIT broker,
 waits for completion, and prints the results and session statistics.
 
 Prerequisites:
-  - A ORBIT bridge is running (RADICAL_ORBIT_BRIDGE_URL set).
+  - A ORBIT broker is running (RADICAL_ORBIT_BRIDGE_URL set).
   - An endpoint service is connected with the Rhapsody plugin loaded.
   - The ``rhapsody`` package is installed on the endpoint node.
 """
@@ -15,7 +15,7 @@ Prerequisites:
 import json
 import time
 
-from radical.orbit import BridgeClient
+from radical.orbit import EndpointRuntime
 
 
 def my_notification_cb(endpoint: str, plugin: str, topic: str, data: dict):
@@ -24,9 +24,10 @@ def my_notification_cb(endpoint: str, plugin: str, topic: str, data: dict):
 
 def main():
 
-    # ---- connect to the bridge ----
-    bc  = BridgeClient()
-    eids = bc.list_endpoints()
+    # ---- connect to the broker ----
+    rt  = EndpointRuntime()
+    rt.start(wait=True)
+    eids = [n for n in rt.topology() if n != 'broker']
 
     if not eids:
         print("No endpoints found.")
@@ -35,10 +36,9 @@ def main():
     eid = eids[1]
     print(f"Using endpoint: {eid}")
 
-    ec = bc.get_endpoint_client(eid)
-    rh = ec.get_plugin('rhapsody')
+    rh = rt.get_plugin(eid, 'rhapsody')
 
-    # Register for asynchronous bridge notifications
+    # Register for asynchronous broker notifications
     rh.register_notification_callback(my_notification_cb)
 
     # ---- define tasks ----
@@ -99,7 +99,7 @@ def main():
 
     # ---- cleanup ----
     rh.close()
-    bc.close()
+    rt.stop()
     print("\nDone.")
 
 

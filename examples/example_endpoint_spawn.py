@@ -5,15 +5,15 @@ then tear down.
 
 Supports both direct (no tunnel) and reverse-SSH-tunnel modes.  In tunnel
 mode the child endpoint runs on a compute node with no direct network access to
-the bridge; a reverse SSH tunnel is established automatically by the parent
-endpoint so the child can reach the bridge through localhost.
+the broker; a reverse SSH tunnel is established automatically by the parent
+endpoint so the child can reach the broker through localhost.
 """
 
 import threading
 import time
 import os
 
-from radical.orbit import BridgeClient
+from radical.orbit import EndpointRuntime
 
 # Register ROSE plugin class (lives in separate package)
 try:
@@ -22,9 +22,9 @@ except ImportError:
     pass
 
 
-def select_endpoint(bc):
+def select_endpoint(rt):
     """List endpoints and let user pick one."""
-    endpoints = bc.list_endpoints()
+    endpoints = [n for n in rt.topology() if n != 'broker']
     if not endpoints:
         raise RuntimeError("No endpoints available")
     for i, eid in enumerate(endpoints):
@@ -33,9 +33,9 @@ def select_endpoint(bc):
     return endpoints[int(choice)]
 
 
-def get_job_params(ec):
+def get_job_params(rt, eid):
     """Prompt user for job parameters, showing available queues and accounts."""
-    qi       = ec.get_plugin('queue_info')
+    qi       = rt.get_plugin(eid, 'queue_info')
     queues   = list(qi.get_info().get('queues', {}).keys())
     accounts = list(set(
         a['account']
@@ -79,19 +79,19 @@ def wait_for_tunnel(psij, endpoint_name, timeout=120):
     raise TimeoutError(f"Tunnel for '{endpoint_name}' did not become active within {timeout}s")
 
 
-def wait_for_endpoint(bc, endpoint_name, timeout=300):
-    """Wait for a new endpoint to register at the bridge."""
+def wait_for_endpoint(rt, endpoint_name, timeout=300):
+    """Wait for a new endpoint to register at the broker."""
     print(f"Waiting for endpoint '{endpoint_name}' to register...")
     start = time.time()
     while time.time() - start < timeout:
-        if endpoint_name in bc.list_endpoints():
+        if endpoint_name in rt.topology():
             print(f"Endpoint '{endpoint_name}' is online!")
-            return bc.get_endpoint_client(endpoint_name)
+            return endpoint_name
         time.sleep(2)
     raise TimeoutError(f"Endpoint '{endpoint_name}' did not appear within {timeout}s")
 
 
-def _get_workflow_file(child):
+def _get_workflow_file(rt, child_name):
     """Prompt for a ROSE workflow YAML, verifying or uploading as needed.
 
     Returns the remote path on the endpoint, or empty string to skip.
@@ -109,8 +109,9 @@ def _get_workflow_file(child):
             return ''
 
         # Lazy-init staging plugin
-        if not staging and 'staging' in child.list_plugins():
-            staging = child.get_plugin('staging')
+        child_plugins = rt.topology().get(child_name, {}).get('plugins', {})
+        if not staging and 'staging' in child_plugins:
+            staging = rt.get_plugin(child_name, 'staging')
 
         if choice == '1':
             path = input("Remote path on the endpoint: ").strip()
@@ -151,7 +152,7 @@ def _get_workflow_file(child):
 
             # Upload to ~/workflows/<filename> on the endpoint
             basename    = os.path.basename(local_path)
-            sysinfo     = child.get_plugin('sysinfo')
+            sysinfo     = rt.get_plugin(child_name, 'sysinfo')
             remote_dir  = sysinfo.homedir() + '/workflows'
             remote_path = f"{remote_dir}/{basename}"
 
@@ -165,23 +166,24 @@ def _get_workflow_file(child):
 
 
 def main():
-    bc = BridgeClient()
+    rt = EndpointRuntime()
+    rt.start(wait=True)
 
     # Step 1: Select parent endpoint
-    parent_eid = select_endpoint(bc)
+    parent_eid = select_endpoint(rt)
     print(f"\nUsing parent endpoint: {parent_eid}")
-    parent = bc.get_endpoint_client(parent_eid)
 
     # Step 2: Get job parameters and tunnel preference
-    queue, account, nodes, duration, executor = get_job_params(parent)
+    queue, account, nodes, duration, executor = get_job_params(rt, parent_eid)
     use_tunnel = ask_tunnel()
 
     # Step 3: Build job spec and submit
     child_name = f"{parent_eid}.{os.getpid()}"
-    plugins    = ','.join(parent.list_plugins().keys())
+    parent_plugins = rt.topology().get(parent_eid, {}).get('plugins', {})
+    plugins    = ','.join(parent_plugins.keys())
     job_spec = {
         "executable": "radical-orbit-endpoint.py",
-        "arguments": ["--url", bc._url, "--name", child_name, "-p", plugins],
+        "arguments": ["--url", rt.broker_url, "--name", child_name, "-p", plugins],
         "attributes": {
             "queue_name":    queue,
             "account":       account,
@@ -190,7 +192,7 @@ def main():
         },
     }
 
-    psij = parent.get_plugin('psij')
+    psij = rt.get_plugin(parent_eid, 'psij')
     print(f"\nSubmitting sub-endpoint job to {executor}...")
 
     if use_tunnel:
@@ -205,14 +207,14 @@ def main():
     if use_tunnel:
         wait_for_tunnel(psij, child_name)
 
-    # Step 5: Wait for the child endpoint to register at the bridge
-    child = wait_for_endpoint(bc, child_name)
+    # Step 5: Wait for the child endpoint to register at the broker
+    child_name = wait_for_endpoint(rt, child_name)
 
     # Print allocation info from the child endpoint
-    child_plugins = child.list_plugins()
+    child_plugins = rt.topology().get(child_name, {}).get('plugins', {})
     if 'queue_info' in child_plugins:
         try:
-            qi    = child.get_plugin('queue_info')
+            qi    = rt.get_plugin(child_name, 'queue_info')
             alloc = qi.job_allocation()
             if alloc:
                 n   = alloc.get('n_nodes', '?')
@@ -223,7 +225,7 @@ def main():
             pass
     if 'sysinfo' in child_plugins:
         try:
-            si      = child.get_plugin('sysinfo')
+            si      = rt.get_plugin(child_name, 'sysinfo')
             metrics = si.get_metrics()
             host    = metrics.get('hostname', '?')
             osname  = metrics.get('os', '?')
@@ -252,7 +254,7 @@ def main():
     else:
         try:
             print("\nSubmitting Rhapsody tasks on sub-endpoint...")
-            rh = child.get_plugin('rhapsody')
+            rh = rt.get_plugin(child_name, 'rhapsody')
 
             tasks = [
                 {"executable": "/bin/echo",    "arguments": ["Hello from task 1"]},
@@ -282,11 +284,11 @@ def main():
         print("\nROSE plugin not available on child endpoint — skipping workflow.")
     else:
         try:
-            workflow_file = _get_workflow_file(child)
+            workflow_file = _get_workflow_file(rt, child_name)
             if not workflow_file:
                 print("Skipping ROSE workflow.")
             else:
-                rose_ep = child.get_plugin('rose')
+                rose_ep = rt.get_plugin(child_name, 'rose')
 
                 # Track state changes via notification callback
                 done_event  = threading.Event()
@@ -357,7 +359,7 @@ def main():
     psij.cancel_job(job_id)
     print(f"Job {job_id} canceled.")
 
-    bc.close()
+    rt.stop()
     print("Done.")
 
 

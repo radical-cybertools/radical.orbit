@@ -1,5 +1,5 @@
 """Unit tests for the SSH tunnel helper and the compute-side
-EndpointService._open_tunnel flow."""
+EndpointRuntime._open_tunnel_forward flow."""
 
 import asyncio
 import io
@@ -169,20 +169,18 @@ def test_parse_allocated_port_times_out_without_output():
 
 
 # ---------------------------------------------------------------------------
-# EndpointService._open_tunnel
+# EndpointRuntime._open_tunnel_forward
 # ---------------------------------------------------------------------------
 
 def _make_endpoint_service(bridge_url='http://bridge:8000', tunnel_via=None):
-    """Build an EndpointService without going through the plugin loader.
+    """Build a zero-plugin EndpointRuntime (pure consumer — no plugin loader).
 
     Default URL uses ``http://`` (not ``https://``) so the cert
     resolution path is skipped — these tests don't exercise TLS.
     """
-    from radical.orbit.service import EndpointService
-    with patch('radical.orbit.service.EndpointService._load_plugins_from_filter'):
-        svc = EndpointService(bridge_url=bridge_url, name='endpoint1',
-                          tunnel='forward', tunnel_via=tunnel_via)
-    return svc
+    from radical.orbit.runtime import EndpointRuntime
+    return EndpointRuntime(broker_url=bridge_url, name='endpoint1',
+                           tunnel='forward', tunnel_via=tunnel_via)
 
 
 def test_open_tunnel_uses_explicit_via(tmp_path, monkeypatch,
@@ -197,7 +195,7 @@ def test_open_tunnel_uses_explicit_via(tmp_path, monkeypatch,
     with patch('subprocess.Popen', return_value=proc):
         asyncio.run(svc._open_tunnel_forward())
 
-    assert f'localhost:{port}' in svc._bridge_url
+    assert f'localhost:{port}' in svc._broker_url
     assert svc._tunnel_proc is proc
 
 
@@ -214,7 +212,7 @@ def test_open_tunnel_falls_back_to_pbs_o_host(tmp_path, monkeypatch,
         asyncio.run(svc._open_tunnel_forward())
     argv = popen.call_args[0][0]
     assert argv[-1] == 'aurora-uan-0010'
-    assert f'localhost:{port}' in svc._bridge_url
+    assert f'localhost:{port}' in svc._broker_url
 
 
 def test_open_tunnel_falls_back_to_slurm_submit_host(tmp_path, monkeypatch,
