@@ -31,49 +31,12 @@ from radical.orbit.models import (
 )
 from radical.orbit.ui_schema import ui_config_to_dict
 
+# ``RequestShim`` + ``match_route`` live in ``dispatch.py`` now (shared by the
+# WS endpoint and the broker-hosted plugin host).  Re-export ``RequestShim``
+# here so external imports (``bridge_plugin_host``, tests) keep working.
+from radical.orbit.dispatch import RequestShim, match_route  # noqa: F401
+
 log = logging.getLogger("radical.orbit.endpoint")
-
-
-# ---------------------------------------------------------------------------
-# RequestShim — lightweight stand-in for starlette.requests.Request
-# ---------------------------------------------------------------------------
-
-class RequestShim:
-    """Lightweight adapter for starlette ``Request``.
-
-    Provides the three interfaces that every plugin handler uses:
-    ``path_params``, ``query_params``, and ``await .json()`` / ``await .body()``.
-    Encoding-agnostic: stores raw bytes, decodes lazily based on content_type.
-    """
-
-    def __init__(self, path_params : dict,
-                       query_params: dict,
-                       body_bytes  : bytes,
-                       content_type: str = 'application/json'):
-        self.path_params  = path_params
-        self.query_params = query_params
-        self.content_type = content_type
-        self._body        = body_bytes
-        self._decoded     = None
-
-    async def body(self) -> bytes:
-        """Raw body bytes (matches ``Request.body()``)."""
-        return self._body
-
-    async def json(self) -> dict:
-        """Parse body into a Python dict (matches ``Request.json()``).
-
-        Content-type-aware: JSON or msgpack based on Content-Type header.
-        """
-        if self._decoded is not None:
-            return self._decoded
-
-        ct = self.content_type or 'application/json'
-        if 'msgpack' in ct:
-            self._decoded = msgpack.unpackb(self._body, raw=False)
-        else:
-            self._decoded = json.loads(self._body) if self._body else {}
-        return self._decoded
 
 
 # Re-export for backward compatibility (bridge_plugin_host.py, tests, etc.)
@@ -201,14 +164,11 @@ class EndpointService(PluginHostBase):
     def _match_route(self, method: str, path: str):
         """Match *method* + *path* against the direct-dispatch route table.
 
-        Returns ``(handler, path_params)`` or ``(None, None)``.
+        Thin wrapper over :func:`radical.orbit.dispatch.match_route` bound to
+        this endpoint's live route table.  Returns ``(handler, path_params)``
+        or ``(None, None)``.
         """
-        for rt_method, pattern, param_names, handler in self._direct_routes:
-            if rt_method == method:
-                m = pattern.match(path)
-                if m:
-                    return handler, dict(zip(param_names, m.groups()))
-        return None, None
+        return match_route(self._direct_routes, method, path)
 
     @staticmethod
     def _error_response(req_id: str, exc: Exception) -> ResponseMessage:
