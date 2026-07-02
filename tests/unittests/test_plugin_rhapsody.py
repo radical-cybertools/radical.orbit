@@ -950,7 +950,7 @@ async def test_cancel_all_skips_terminal():
 # don't expose `Session.start_telemetry`.
 # ---------------------------------------------------------------------------
 #
-# Bug surfaced during the local e2e smoke (memory/project_bridge_dispatcher.md):
+# Bug surfaced during the local e2e smoke (memory/project_broker_dispatcher.md):
 # the rhapsody plugin called `self._rh_session.start_telemetry(...)`
 # unconditionally; older rhapsody installs raise AttributeError.  Fix
 # guards the call with `getattr(session, 'start_telemetry', None)`.

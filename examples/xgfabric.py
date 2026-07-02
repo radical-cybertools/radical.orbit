@@ -9,9 +9,9 @@ Usage:
     python examples/xgfabric.py [options]
 
 Examples:
-    python examples/xgfabric.py --bridge-url https://bridge:8000 --endpoint thinkie
+    python examples/xgfabric.py --broker-url https://broker:8000 --endpoint thinkie
     python examples/xgfabric.py -w myworkflow -r myresource
-    RADICAL_ORBIT_BRIDGE_URL=https://bridge:8000 python examples/xgfabric.py
+    RADICAL_ORBIT_BROKER_URL=https://broker:8000 python examples/xgfabric.py
 """
 
 import argparse
@@ -82,12 +82,12 @@ def main():
     )
     # URL/cert default to None so EndpointRuntime self-resolves via
     # radical.orbit.utils (CLI > env > file).
-    parser.add_argument('-u', '--bridge-url',  default=None,
-                        help='Bridge URL  (CLI > $RADICAL_ORBIT_BRIDGE_URL > '
-                             '~/.radical/orbit/bridge.url).')
-    parser.add_argument('-c', '--bridge-cert', default=None,
-                        help='Bridge CA cert path  (CLI > $RADICAL_ORBIT_BRIDGE_CERT '
-                             '> ~/.radical/orbit/bridge_cert.pem).')
+    parser.add_argument('-u', '--broker-url',  default=None,
+                        help='Broker URL  (CLI > $RADICAL_ORBIT_BROKER_URL > '
+                             '~/.radical/orbit/broker.url).')
+    parser.add_argument('-c', '--broker-cert', default=None,
+                        help='Broker CA cert path  (CLI > $RADICAL_ORBIT_BROKER_CERT '
+                             '> ~/.radical/orbit/broker_cert.pem).')
     parser.add_argument('-e', '--endpoint',     default='local',
                         help='Endpoint name where xgfabric plugin is running')
     parser.add_argument('-w', '--workflow', default='__default__',
@@ -98,7 +98,7 @@ def main():
 
     print(args)
 
-    rt  = EndpointRuntime(broker_url=args.bridge_url, cert=args.bridge_cert)
+    rt  = EndpointRuntime(broker_url=args.broker_url, cert=args.broker_cert)
     rt.start(wait=True)
     xgf = rt.get_plugin(args.endpoint, 'xgfabric')
 
@@ -130,7 +130,7 @@ def main():
 
     try:
         # Show initial cluster/config state before starting
-        print(f"Connecting to broker: {args.bridge_url}")
+        print(f"Connecting to broker: {args.broker_url}")
         print(f"Endpoint: {args.endpoint}  Workflow: {args.workflow}  Resource: {args.resource}")
         _print_status(xgf.get_status())
 

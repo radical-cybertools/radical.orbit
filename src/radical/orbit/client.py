@@ -63,11 +63,11 @@ class PluginClient:
     overrides these to ride the runtime's callback registry over the WebSocket.
     """
 
-    def __init__(self, http_client, base_url: str, bridge_client=None,
+    def __init__(self, http_client, base_url: str, broker_client=None,
                  endpoint_id: str = None, plugin_name: str = None):
         self._http = http_client
         self._base_url = base_url.rstrip('/')
-        self._bc = bridge_client
+        self._bc = broker_client
         self._endpoint_id = endpoint_id
         self._plugin_name = plugin_name
         self._sid: Optional[str] = None

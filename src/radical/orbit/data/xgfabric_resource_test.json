@@ -1,6 +1,6 @@
 {
   "name"            : "test",
-  "bridge_url"      : "https://localhost:8000",
+  "broker_url"      : "https://localhost:8000",
   "cluster_configs" : {
     "anvil"    : {
       "queue"   : "wholenode",

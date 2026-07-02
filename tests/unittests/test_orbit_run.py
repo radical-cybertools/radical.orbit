@@ -1,7 +1,7 @@
 """Smoke tests for bin/radical-orbit-run.
 
 Covers the pure-Python helpers (argv splitting, flatten, task_id).
-End-to-end tests against a live bridge/endpoint would belong under
+End-to-end tests against a live broker/endpoint would belong under
 tests/integration/ and are deferred.
 """
 

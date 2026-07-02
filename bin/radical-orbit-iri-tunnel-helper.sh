@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # IRI tunnel helper — login-node companion for IRI-launched child endpoints
-# that need a reverse tunnel back to the bridge.
+# that need a reverse tunnel back to the broker.
 #
 # Background.  The PsiJ launch path runs a parent endpoint on the login node;
 # its plugin_psij watcher discovers the compute hostname and spawns
@@ -14,7 +14,7 @@
 # Protocol (filesystem-mediated):
 #
 #   ~/.radical/orbit/tunnels/<endpoint_name>.req    -- written by the child
-#       JSON: {endpoint_name, hostname, bridge_host, bridge_port}
+#       JSON: {endpoint_name, hostname, broker_host, broker_port}
 #       (atomic via .req.tmp + rename)
 #
 #   ~/.radical/orbit/tunnels/<endpoint_name>.port   -- written by THIS script
@@ -46,7 +46,7 @@ log() {
 handle_request() {
     local req_file="$1"
     local endpoint_name="$2"
-    local payload hostname bridge_host bridge_port
+    local payload hostname broker_host broker_port
     local stderr_log ssh_pid port port_file tmp
 
     payload=$(cat "$req_file" 2>/dev/null) || {
@@ -58,12 +58,12 @@ handle_request() {
         log "malformed payload in $req_file"
         return 1
     }
-    bridge_host=$(printf '%s' "$payload" | python3 -c \
-        'import json,sys;print(json.load(sys.stdin)["bridge_host"])')
-    bridge_port=$(printf '%s' "$payload" | python3 -c \
-        'import json,sys;print(json.load(sys.stdin)["bridge_port"])')
+    broker_host=$(printf '%s' "$payload" | python3 -c \
+        'import json,sys;print(json.load(sys.stdin)["broker_host"])')
+    broker_port=$(printf '%s' "$payload" | python3 -c \
+        'import json,sys;print(json.load(sys.stdin)["broker_port"])')
 
-    log "request: endpoint=$endpoint_name compute=$hostname bridge=$bridge_host:$bridge_port"
+    log "request: endpoint=$endpoint_name compute=$hostname broker=$broker_host:$broker_port"
 
     stderr_log=$(mktemp -t iri-tunnel-helper-XXXXXX.log)
     ssh -N \
@@ -74,7 +74,7 @@ handle_request() {
         -o ServerAliveCountMax=3 \
         -o ExitOnForwardFailure=yes \
         -v \
-        -R "0:${bridge_host}:${bridge_port}" \
+        -R "0:${broker_host}:${broker_port}" \
         "$hostname" \
         2>"$stderr_log" &
     ssh_pid=$!

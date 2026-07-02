@@ -1,7 +1,7 @@
 # ORBIT — Docker Example
 
 This directory contains a `Dockerfile` and `docker-compose.yaml` to run all
-ORBIT endpoints (bridge, endpoint service, and client) inside separate
+ORBIT endpoints (broker, endpoint service, and client) inside separate
 Docker containers.
 
 > [!NOTE]
@@ -22,13 +22,13 @@ export RADICAL_ORBIT_IMAGE=radicalcybertools/radical.orbit
 export RADICAL_ORBIT_TAG=dev
 # for the demo we use the current `devel` branch
 export RADICAL_ORBIT_BRANCH=devel
-# for the demo we use the hostname for the bridge as `bridge`
-export RADICAL_ORBIT_BRIDGE_HOSTNAME=bridge
+# for the demo we use the hostname for the broker as `broker`
+export RADICAL_ORBIT_BROKER_HOSTNAME=broker
 ```
 
 ### 2. Build the image
 
-The build step also generates a self-signed TLS certificate used by the bridge
+The build step also generates a self-signed TLS certificate used by the broker
 endpoint.
 
 > [!WARNING]
@@ -36,9 +36,9 @@ endpoint.
 
 ```shell
 cd examples/docker
-docker build --build-arg GENERATE_BRIDGE_CERT=true \
-             --build-arg BRIDGE_IP=127.0.0.1 \
-             --build-arg BRIDGE_HOSTNAME=${RADICAL_ORBIT_BRIDGE_HOSTNAME} \
+docker build --build-arg GENERATE_BROKER_CERT=true \
+             --build-arg BROKER_IP=127.0.0.1 \
+             --build-arg BROKER_HOSTNAME=${RADICAL_ORBIT_BROKER_HOSTNAME} \
              --build-arg RADICAL_ORBIT_BRANCH=${RADICAL_ORBIT_BRANCH} \
              -t ${RADICAL_ORBIT_IMAGE}:${RADICAL_ORBIT_TAG} .
 ```
@@ -46,7 +46,7 @@ docker build --build-arg GENERATE_BRIDGE_CERT=true \
 ### 3. Start containers and run the example
 
 ```shell
-# start the bridge, endpoint, and client containers in the background
+# start the broker, endpoint, and client containers in the background
 docker compose up -d
 
 # get into the client container and run the example
@@ -58,7 +58,7 @@ python3 example_sysinfo.py
 
 ### 4. Browse the API
 
-The bridge service exposes port `8000` to the host, so once the containers are
+The broker service exposes port `8000` to the host, so once the containers are
 running you can open the API documentation directly in a web browser:
 
 | URL | Description |
@@ -72,19 +72,19 @@ running you can open the API documentation directly in a web browser:
 
 > [!TIP]
 > When registering a new endpoint service through the portal (e.g., via the
-> `/register` endpoint), use the **internal Docker hostname** as the Bridge URL:
+> `/register` endpoint), use the **internal Docker hostname** as the Broker URL:
 > ```
-> https://bridge:8000
+> https://broker:8000
 > ```
-> where `bridge` is the value of `BRIDGE_HOSTNAME` argument used during the docker
-> build (default: `bridge`). Using `localhost` here would resolve on the host
+> where `broker` is the value of `BROKER_HOSTNAME` argument used during the docker
+> build (default: `broker`). Using `localhost` here would resolve on the host
 > machine, not inside the Docker network.
 
 ### 5. Useful commands
 
 ```shell
-# follow logs from bridge and endpoint containers
-docker compose logs -f bridge -f endpoint
+# follow logs from broker and endpoint containers
+docker compose logs -f broker -f endpoint
 
 # stop and remove all containers
 docker compose down

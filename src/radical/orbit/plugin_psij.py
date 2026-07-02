@@ -8,7 +8,7 @@ PSIJSession   Endpoint-side session: holds one PsiJ ``Executor`` per submit call
               stdout/stderr incrementally.
 
 PSIJClient    Application-side thin HTTP wrapper: delegates to the endpoint service
-              over the bridge (``submit_job``, ``get_job_status``, ``list_jobs``,
+              over the broker (``submit_job``, ``get_job_status``, ``list_jobs``,
               ``cancel_job``, ``submit_tunneled``, ``tunnel_status``).
 
 PluginPSIJ    Registers the plugin with the endpoint, adds URL routes, and wires
@@ -561,11 +561,11 @@ class PSIJClient(PluginClient):
             job_spec: PsiJ job specification dict.  ``arguments`` must
                       include ``-n <endpoint_name>``.
             executor: PsiJ executor name (default: ``"local"``).
-            tunnel:   SSH tunnel mode for the child's bridge connection.
+            tunnel:   SSH tunnel mode for the child's broker connection.
                       One of:
 
                       * ``'none'``    — child connects directly to the
-                                        bridge.  No SSH spawned anywhere.
+                                        broker.  No SSH spawned anywhere.
                       * ``'forward'`` — child opens its own outbound
                                         ``ssh -L`` to the login host
                                         (compute → login).  Suitable
@@ -689,8 +689,8 @@ class PluginPSIJ(Plugin):
 
     @classmethod
     def is_enabled(cls, app: FastAPI) -> bool:
-        """PsiJ loads on endpoint nodes (login or compute) — not on the bridge."""
-        return not getattr(app.state, 'is_bridge', False)
+        """PsiJ loads on endpoint nodes (login or compute) — not on the broker."""
+        return not getattr(app.state, 'is_broker', False)
 
     def __init__(self, app: FastAPI, instance_name: str = "psij"):
         super().__init__(app, instance_name)
@@ -772,7 +772,7 @@ class PluginPSIJ(Plugin):
 
         Tunnel direction is selected by the ``tunnel`` field:
 
-        * ``'none'``    — no SSH tunnel; child connects directly to the bridge.
+        * ``'none'``    — no SSH tunnel; child connects directly to the broker.
         * ``'forward'`` — child opens its own outbound ``ssh -L`` back to
                           this login node (compute → login).  We inject
                           ``--tunnel forward`` and ``--tunnel-via <login>``
@@ -974,16 +974,16 @@ class PluginPSIJ(Plugin):
         # is responsible for tearing it down.
         ssh_proc = None
 
-        # Bridge URL/port for the reverse spawn — same value the child
+        # Broker URL/port for the reverse spawn — same value the child
         # would resolve, so we can hand it to OpenSSH's -R spec.
-        bridge_host = 'localhost'
-        bridge_port = 8000
+        broker_host = 'localhost'
+        broker_port = 8000
         if mode == 'reverse':
             from urllib.parse import urlparse
-            bridge_url = getattr(self._app.state, 'bridge_url', '') or ''
-            parsed     = urlparse(bridge_url)
-            bridge_host = parsed.hostname or 'localhost'
-            bridge_port = parsed.port or (443 if parsed.scheme in ('https', 'wss') else 8000)
+            broker_url = getattr(self._app.state, 'broker_url', '') or ''
+            parsed     = urlparse(broker_url)
+            broker_host = parsed.hostname or 'localhost'
+            broker_port = parsed.port or (443 if parsed.scheme in ('https', 'wss') else 8000)
 
         last_state     = None
         seen_known     = False
@@ -1057,7 +1057,7 @@ class PluginPSIJ(Plugin):
                             return
                         log.info("[psij] reverse: child .req says hostname=%s "
                                  "for job %s, spawning ssh -R to %s:%s",
-                                 compute_host, native_id, bridge_host, bridge_port)
+                                 compute_host, native_id, broker_host, broker_port)
                         # Retry the spawn for up to ~30s.  Some
                         # sites' compute-node sshd refuses logins
                         # from the login node for a short window
@@ -1074,7 +1074,7 @@ class PluginPSIJ(Plugin):
                             try:
                                 ssh_proc, port = await asyncio.to_thread(
                                     _tunnel.spawn_reverse_tunnel,
-                                    compute_host, bridge_host, bridge_port,
+                                    compute_host, broker_host, broker_port,
                                     endpoint_name)
                                 break
                             except Exception as exc:

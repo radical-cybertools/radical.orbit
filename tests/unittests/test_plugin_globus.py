@@ -26,17 +26,17 @@ from radical.orbit.plugin_globus import (
 @pytest.fixture
 def endpoint_app():
     app = FastAPI()
-    app.state.is_bridge    = False
+    app.state.is_broker    = False
     app.state.endpoint_service = MagicMock()
     app.state.endpoint_name    = 'endpoint1'
-    app.state.bridge_url   = ''
+    app.state.broker_url   = ''
     return app
 
 
 @pytest.fixture
-def bridge_app():
+def broker_app():
     app = FastAPI()
-    app.state.is_bridge    = True
+    app.state.is_broker    = True
     app.state.endpoint_service = MagicMock()
     return app
 
@@ -58,8 +58,8 @@ def test_is_enabled_endpoint(endpoint_app):
     assert PluginGlobus.is_enabled(endpoint_app) is True
 
 
-def test_is_enabled_bridge(bridge_app):
-    assert PluginGlobus.is_enabled(bridge_app) is False
+def test_is_enabled_broker(broker_app):
+    assert PluginGlobus.is_enabled(broker_app) is False
 
 
 def test_is_disabled_without_sdk(endpoint_app):

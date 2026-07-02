@@ -4,14 +4,14 @@ Example: DDict Data Exchange Between Tasks
 ===========================================
 
 Demonstrates two Dragon tasks exchanging data via a shared DDict
-(distributed dictionary) through the ORBIT bridge.
+(distributed dictionary) through the ORBIT broker.
 
 Task 1 (producer) creates a DDict, writes data, and returns the
 serialized descriptor.  Task 2 (consumer) attaches to the same DDict
 via that descriptor, reads the data, and destroys the DDict.
 
 Prerequisites:
-  - A ORBIT bridge is running (RADICAL_ORBIT_BRIDGE_URL set).
+  - A ORBIT broker is running (RADICAL_ORBIT_BROKER_URL set).
   - An endpoint service is connected with the Rhapsody plugin loaded.
   - Dragon runtime is active on the endpoint node.
 
@@ -53,12 +53,12 @@ async def consumer(dd_serial):
 async def main():
 
     # Endpoint auto-discovery: ``get_backend('orbit')`` with no args resolves
-    # the bridge URL via radical.orbit.utils and selects the first
+    # the broker URL via radical.orbit.utils and selects the first
     # connected endpoint advertising the rhapsody plugin.  ``await backend``
     # raises RuntimeError if no candidate is found.
     backend = rhapsody.get_backend('orbit')
     backend = await backend
-    print(f"Bridge: {backend._bridge_url}")
+    print(f"Broker: {backend._broker_url}")
     print(f"Endpoint:   {backend._endpoint_name}")
 
     session = rhapsody.Session(backends=[backend])

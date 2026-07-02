@@ -2,7 +2,7 @@
 """
 Generate RP-style plots from radical.prof Endpoint profile data.
 
-Reads client.prof, bridge.prof, endpoint.prof from a directory, combines
+Reads client.prof, broker.prof, endpoint.prof from a directory, combines
 them into a single timeline, and produces 8 plots:
 
   Infrastructure (req.* UIDs):
@@ -71,7 +71,7 @@ plt.rcParams.update(_STYLE)
 def load_profiles(prof_dir):
     """Find and load .prof files, return combined timeline."""
 
-    patterns = ['client.prof', 'client.task.prof', 'bridge.prof', 'endpoint.prof']
+    patterns = ['client.prof', 'client.task.prof', 'broker.prof', 'endpoint.prof']
     prof_files = []
     for pat in patterns:
         prof_files.extend(glob.glob(os.path.join(prof_dir, pat)))
@@ -173,26 +173,26 @@ def _step_data(events, global_t0):
 # Key events in request lifecycle
 INFRA_EVENT_LIST = [
     ('client_send',       'client send'),
-    ('bridge_recv',       'bridge recv'),
-    ('bridge_ws_sent',    'bridge WS sent'),
+    ('broker_recv',       'broker recv'),
+    ('broker_ws_sent',    'broker WS sent'),
     ('endpoint_recv',         'endpoint recv'),
     ('endpoint_handler',      'endpoint handler'),
     ('endpoint_handler_done', 'endpoint handler done'),
     ('endpoint_ws_sent',      'endpoint WS sent'),
-    ('bridge_reply',      'bridge reply'),
+    ('broker_reply',      'broker reply'),
     ('client_recv',       'client recv'),
 ]
 
 # Phases for duration / concurrency
 INFRA_PHASES = [
-    ('client_send',       'bridge_recv',       'client -> bridge'),
-    ('bridge_recv',       'bridge_ws_sent',    'bridge inbound'),
-    ('bridge_ws_sent',    'endpoint_recv',         'bridge -> endpoint WS'),
+    ('client_send',       'broker_recv',       'client -> broker'),
+    ('broker_recv',       'broker_ws_sent',    'broker inbound'),
+    ('broker_ws_sent',    'endpoint_recv',         'broker -> endpoint WS'),
     ('endpoint_recv',         'endpoint_handler',      'endpoint routing'),
     ('endpoint_handler',      'endpoint_handler_done', 'endpoint handler'),
     ('endpoint_handler_done', 'endpoint_ws_sent',      'endpoint outbound'),
-    ('endpoint_ws_sent',      'bridge_reply',      'bridge outbound'),
-    ('bridge_reply',      'client_recv',       'bridge -> client'),
+    ('endpoint_ws_sent',      'broker_reply',      'broker outbound'),
+    ('broker_reply',      'client_recv',       'broker -> client'),
 ]
 
 
@@ -202,7 +202,7 @@ def plot_infra_state(requests, prof_dir):
     data = []
     for rid in requests:
         events = requests[rid]['_events']
-        t0 = events.get('client_send', events.get('bridge_recv',
+        t0 = events.get('client_send', events.get('broker_recv',
              events.get('endpoint_recv')))
         if t0 is None:
             continue
@@ -324,13 +324,13 @@ def plot_infra_rate(requests, prof_dir):
     """Request completion rate over time."""
 
     metrics = {
-        'bridge recv':   'bridge_recv',
+        'broker recv':   'broker_recv',
         'handler start': 'endpoint_handler',
         'handler done':  'endpoint_handler_done',
         'client recv':   'client_recv',
     }
     metric_colors = {
-        'bridge recv':   '#4e79a7',
+        'broker recv':   '#4e79a7',
         'handler start': '#f28e2b',
         'handler done':  '#59a14f',
         'client recv':   '#e15759',

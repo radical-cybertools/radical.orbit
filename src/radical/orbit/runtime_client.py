@@ -15,7 +15,7 @@ WebSocket **unchanged**:
 * :class:`RuntimePluginClient` — the seam mixed under a concrete helper class
   by ``EndpointRuntime.get_plugin``: it overrides *only* the transport-touching
   surface (the ``_http`` object + notification registration over the runtime's
-  callback registry instead of a ``BridgeClient`` + SSE).
+  callback registry instead of HTTP + SSE).
 """
 
 import json as _json
@@ -102,8 +102,8 @@ class RuntimePluginClient(PluginClient):
     ``EndpointRuntime.get_plugin``; this base overrides only the
     transport-touching surface: the ``self._http`` object is a
     :class:`_RuntimeHTTP` adapter (installed at construction), and notification
-    registration rides the runtime's callback registry instead of a
-    ``BridgeClient`` + SSE.
+    registration rides the runtime's callback registry instead of
+    HTTP + SSE.
     """
 
     _runtime = None

@@ -21,7 +21,7 @@ Usage
 
 Prerequisites
 -------------
-- A running broker (radical-orbit-bridge.py)
+- A running broker (radical-orbit-broker.py)
 - A running parent endpoint on the login node (radical-orbit-endpoint-wrapper.sh --url <broker>)
 - The parent endpoint must have the 'psij' plugin loaded
 """

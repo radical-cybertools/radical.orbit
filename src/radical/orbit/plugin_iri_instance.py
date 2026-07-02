@@ -9,7 +9,7 @@ combines resource info and job submission on one page.
 Token lifecycle
 ---------------
 The token is passed at construction time by ``iri_connect`` and lives in
-bridge process memory (inside the httpx client) for the lifetime of the
+broker process memory (inside the httpx client) for the lifetime of the
 plugin instance.  It is **never** written to disk.
 
 Design notes

@@ -82,8 +82,8 @@ class EndpointRuntime(PluginHostBase):
     """A participant: serve and/or consume over one outbound WS to the broker.
 
     Args:
-        broker_url:  Broker URL.  CLI > env (``RADICAL_ORBIT_BRIDGE_URL``) >
-                     file — resolved via :func:`utils.resolve_bridge_url`.
+        broker_url:  Broker URL.  CLI > env (``RADICAL_ORBIT_BROKER_URL``) >
+                     file — resolved via :func:`utils.resolve_broker_url`.
         cert:        Broker TLS cert (only for ``https``/``wss``).
         name:        Stable participant name.  ``None`` → ``consumer.<uuid8>``
                      (auto-named consumers cannot recover sessions on restart).
@@ -130,15 +130,15 @@ class EndpointRuntime(PluginHostBase):
                 f"got {tunnel!r}")
 
         # ── URL / TLS / token resolution (service.py shapes) ──────────
-        resolved_url, _ = utils.resolve_bridge_url(cli=broker_url)
+        resolved_url, _ = utils.resolve_broker_url(cli=broker_url)
         self._broker_url: str = resolved_url
         scheme = urlparse(self._broker_url).scheme
         if scheme in ('https', 'wss'):
-            resolved_cert, _ = utils.resolve_bridge_cert(cli=cert)
+            resolved_cert, _ = utils.resolve_broker_cert(cli=cert)
             self._cert: Optional[str] = str(resolved_cert)
         else:
             self._cert = None
-        self._token: Optional[str] = utils.resolve_bridge_token(cli=token)[0]
+        self._token: Optional[str] = utils.resolve_broker_token(cli=token)[0]
 
         # ── Identity / role ───────────────────────────────────────────
         self._name: str = name or ('consumer.%s' % uuid.uuid4().hex[:8])
@@ -154,10 +154,10 @@ class EndpointRuntime(PluginHostBase):
         self._app: FastAPI = app if app is not None \
                                  else FastAPI(title="ORBIT Endpoint Runtime")
         self._plugins: Dict[str, Plugin] = {}
-        self._app.state.bridge_url       = self._broker_url
+        self._app.state.broker_url       = self._broker_url
         self._app.state.endpoint_name    = self._name
         self._app.state.endpoint_service = self
-        self._app.state.is_bridge        = False
+        self._app.state.is_broker        = False
         if not hasattr(self._app.state, 'direct_routes'):
             self._app.state.direct_routes = []
         self._direct_routes: list = self._app.state.direct_routes
@@ -734,7 +734,7 @@ class EndpointRuntime(PluginHostBase):
         combined = type('Runtime%s' % client_cls.__name__,
                         (client_cls, RuntimePluginClient), {})
         client = combined(_RuntimeHTTP(self, endpoint_name), namespace,
-                          bridge_client=None, endpoint_id=endpoint_name,
+                          broker_client=None, endpoint_id=endpoint_name,
                           plugin_name=plugin_name)
         client._runtime = self
         client.register_session(**session_kwargs)
@@ -748,8 +748,7 @@ class EndpointRuntime(PluginHostBase):
                           callback: Callable = None) -> None:
         """Register an event callback and auto-``subscribe`` for its pattern.
 
-        Same tuple semantics as ``BridgeClient.register_callback``: ``None`` is
-        a wildcard; filtering happens at the edge.
+        Tuple semantics: ``None`` is a wildcard; filtering happens at the edge.
         """
         if callback is None:
             raise ValueError("callback is required")
@@ -929,8 +928,8 @@ class EndpointRuntime(PluginHostBase):
         req_payload = _json.dumps({
             'endpoint_name': self._name,
             'hostname':      socket.gethostname(),
-            'bridge_host':   broker_host,
-            'bridge_port':   broker_port,
+            'broker_host':   broker_host,
+            'broker_port':   broker_port,
         })
         tmp = req_file.with_suffix('.req.tmp')
         tmp.write_text(req_payload)

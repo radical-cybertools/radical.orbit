@@ -5,10 +5,12 @@ ORBIT provides a decentralized architectural framework for seamlessly interactin
 
 ## Architecture
 
-ORBIT consists of three primary layers:
-1. **Bridge (`radical-orbit-bridge`)**: The centralized entry hub. It maintains WebSocket connections to external Endpoint services, manages endpoint discovery, and serves as an HTTP-to-WebSocket reverse proxy forwarding REST API calls to the respective Endpoints.
-2. **Endpoint Service (`radical-orbit-endpoint`)**: Deployed directly on the compute nodes/HPC resources. It connects upstream to the Bridge via WebSocket, loading local Plugins to execute tasks natively within the remote network boundary.
-3. **Clients / Portal (`client.py` & `orbit_explorer.html`)**: Developer and end-user interfaces. The Python Client SDK orchestrates dynamic REST interactions with Plugins, while the Web Portal demonstrates direct native JavaScript browser integration with the Bridge API over HTTP.
+ORBIT is a **star**: one active hub and many participants.
+1. **Broker (`radical-orbit-broker`)**: The active hub. It routes messages between participants by `src`/`dst`, correlates request/response both ways, tracks topology and liveness, and is itself a participant that can host plugins (e.g. the task dispatcher). It also runs the `gateway` module (on by default), which serves the HTTP/SSE/Explorer compatibility surface for non-participant callers.
+2. **Endpoint (`radical-orbit-endpoint`)**: A participant, typically on an HPC login or compute node. It dials the broker over a single outbound WebSocket (firewall-friendly) and may **serve** plugins, **consume** other participants' plugins, or both. A dedicated transport thread owns the socket and its keepalive so liveness reflects process/host/network health rather than plugin behaviour.
+3. **Clients / Portal (`client.py` & `orbit_explorer.html`)**: Developer and end-user interfaces. The Python SDK is itself a participant (a zero-plugin consumer over the same runtime); the Web Portal is a non-participant that speaks HTTP/SSE to the broker's gateway.
+
+Control flows through the star; bulk data moves out of band (Globus, shared filesystem, SSH tunnels).
 
 ## Deployment
 
@@ -23,7 +25,7 @@ However, some plugins require dependencies, otherwise they won't load:
 In fact, the ROSE plugin is only installed with ROSE - so that's also an example
 how 3rd party module can install `radical.orbit` plugins.  Note that plugin
 dependencies are only needed on those machines on which the endpoint plugins are
-actually used - the bridge host and the client hosts usually don't need those.
+actually used - the broker host and the client hosts usually don't need those.
 
 
 ## Usage (Command Line)
@@ -31,71 +33,71 @@ actually used - the bridge host and the client hosts usually don't need those.
 ### 1. Generating Certificates (Dev)
 
 Write the cert + key directly into the default config dir
-(`~/.radical/orbit/`) — that way the bridge, endpoints, and clients all
+(`~/.radical/orbit/`) — that way the broker, endpoints, and clients all
 find them with **no env vars set**.  Replace `95.217.193.116` with
-your bridge's public IP.
+your broker's public IP.
 
 ```sh
 mkdir -p ~/.radical/orbit
 openssl req -x509 -nodes -days 3650 -newkey rsa:4096 \
-        -keyout ~/.radical/orbit/bridge_key.pem \
-        -out    ~/.radical/orbit/bridge_cert.pem \
+        -keyout ~/.radical/orbit/broker_key.pem \
+        -out    ~/.radical/orbit/broker_cert.pem \
         -subj   "/CN=95.217.193.116" \
         -addext "subjectAltName = IP:95.217.193.116,DNS:localhost,IP:127.0.0.1"
-chmod 0600 ~/.radical/orbit/bridge_key.pem
+chmod 0600 ~/.radical/orbit/broker_key.pem
 ```
 
-`chmod 0600` is mandatory: the bridge refuses to start if the key
+`chmod 0600` is mandatory: the broker refuses to start if the key
 file is more permissive.
 
-To override the defaults (different paths, remote bridge URL, etc.),
+To override the defaults (different paths, remote broker URL, etc.),
 set any of:
 
 ```sh
-export RADICAL_ORBIT_BRIDGE_URL='https://my-bridge:8000/'
-export RADICAL_ORBIT_BRIDGE_CERT="/path/to/bridge_cert.pem"
-export RADICAL_ORBIT_BRIDGE_KEY="/path/to/bridge_key.pem"    # only needed for the bridge
-export RADICAL_ORBIT_BRIDGE_TOKEN="<shared ingress token>"  # see "Ingress authentication" below
+export RADICAL_ORBIT_BROKER_URL='https://my-broker:8000/'
+export RADICAL_ORBIT_BROKER_CERT="/path/to/broker_cert.pem"
+export RADICAL_ORBIT_BROKER_KEY="/path/to/broker_key.pem"    # only needed for the broker
+export RADICAL_ORBIT_BROKER_TOKEN="<shared ingress token>"  # see "Ingress authentication" below
 ```
 
-See the **Bridge configuration** section below for the full
+See the **Broker configuration** section below for the full
 precedence rules (CLI > env > file).
 
 ### 1b. Ingress authentication (token)
 
-The bridge requires a **shared bearer token** on its HTTP ingress and on the
-endpoint `/register` handshake — without it, anyone who can reach the bridge
-could drive plugins (submit jobs, stage files). On first start the bridge
-**generates a token** and writes it to `~/.radical/orbit/bridge.token` (mode
+The broker requires a **shared bearer token** on its HTTP ingress and on the
+endpoint `/register` handshake — without it, anyone who can reach the broker
+could drive plugins (submit jobs, stage files). On first start the broker
+**generates a token** and writes it to `~/.radical/orbit/broker.token` (mode
 `0600`), printing it on stdout. Same-host endpoints and clients pick that file
-up automatically; for a remote bridge, copy the token (like the cert) and set:
+up automatically; for a remote broker, copy the token (like the cert) and set:
 
 ```sh
-export RADICAL_ORBIT_BRIDGE_TOKEN='<the token>'
+export RADICAL_ORBIT_BROKER_TOKEN='<the token>'
 ```
 
-Precedence is CLI (`--token`) > `$RADICAL_ORBIT_BRIDGE_TOKEN` >
-`~/.radical/orbit/bridge.token`. The Python client/SDK and the endpoint resolve
+Precedence is CLI (`--token`) > `$RADICAL_ORBIT_BROKER_TOKEN` >
+`~/.radical/orbit/broker.token`. The Python client/SDK and the endpoint resolve
 it automatically; the **Explorer** prompts for it once and rides an HttpOnly
 cookie thereafter.
 
 For pure local development you can disable the gate (loud warning):
 
 ```sh
-./bin/radical-orbit-bridge.py --no-auth   # or RADICAL_ORBIT_BRIDGE_NO_AUTH=1
+./bin/radical-orbit-broker.py --no-auth   # or RADICAL_ORBIT_BROKER_NO_AUTH=1
 ```
 
-### 2. Starting the Bridge
-The Bridge process runs the active broker: a WebSocket `/register` hub that
+### 2. Starting the Broker
+The Broker process runs the active broker: a WebSocket `/register` hub that
 routes between participants, plus the on-by-default gateway compat tier (HTTP
 REST API, SSE `/events`, and the Explorer). Pass `--no-gateway` for a headless
 broker (WebSocket ingress only).
 ```sh
-./bin/radical-orbit-bridge.py        # prints the auth token source + URL on startup
+./bin/radical-orbit-broker.py        # prints the auth token source + URL on startup
 ```
 
 ### 3. Starting the Endpoint Service
-Start the endpoint service (ideally on your target HPC node) pointing to the running Bridge:
+Start the endpoint service (ideally on your target HPC node) pointing to the running Broker:
 ```sh
 ./bin/radical-orbit-endpoint.py --name my-endpoint --url wss://localhost:8000
 ```
@@ -103,7 +105,7 @@ Start the endpoint service (ideally on your target HPC node) pointing to the run
 #### Using the Wrapper Script
 For launching endpoint services via batch job schedulers (e.g., SLURM), use the wrapper script which properly sets up the environment:
 ```sh
-./bin/radical-orbit-endpoint-wrapper.sh --url wss://bridge.example.org:8000 --name my-hpc-endpoint
+./bin/radical-orbit-endpoint-wrapper.sh --url wss://broker.example.org:8000 --name my-hpc-endpoint
 ```
 
 The wrapper script automatically detects and exports the correct `PYTHONPATH` for the installed modules.
@@ -115,22 +117,22 @@ The wrapper script automatically detects and exports the correct `PYTHONPATH` fo
 
 ## REST API
 
-The Bridge serves as an HTTP proxy with the following management endpoints:
+The broker's `gateway` module serves the HTTP compatibility surface, with the following management endpoints:
 
 All routes except the UI shell (`GET /`) and the static plugin assets
-(`/plugins/*`) require the bridge token — sent as `Authorization: Bearer <token>`
+(`/plugins/*`) require the broker token — sent as `Authorization: Bearer <token>`
 or, for the browser, the cookie minted by `POST /auth`.
 
 ### Management Endpoints
 - `GET /` - Fetches the interactive ORBIT Explorer UI. (ungated)
 - `POST /auth` - Validates the bearer token and sets the HttpOnly auth cookie (used by the Explorer / SSE).
 - `POST /endpoint/list` - Returns a JSON structure describing all currently connected Endpoints and their loaded Plugins namespaces.
-- `POST /endpoint/disconnect/{endpoint_name}` - Disconnect a specific endpoint service from the bridge.
-- `POST /bridge/terminate` - Terminate the bridge process (endpoints remain running).
+- `POST /endpoint/disconnect/{endpoint_name}` - Disconnect a specific endpoint service from the broker.
+- `POST /broker/terminate` - Terminate the broker process (endpoints remain running).
 - `GET /events` - Server-Sent Events (SSE) endpoint for real-time notifications.
 
 ### Proxy Routes
-- `/*` - All other routes are parsed by the Bridge to extract the targeted `{endpoint_name}` and `{namespace}` path. Requests are tunneled via WebSocket directly to that Endpoint's registered internal FastAPI app.
+- `/*` - All other routes are parsed by the gateway to extract the targeted `{endpoint_name}` and `{namespace}` path; the request is mapped onto `(dst, path)` and routed over the broker's WebSocket to that Endpoint's served plugins.
 
 ## Plugin Structure
 
@@ -206,50 +208,50 @@ PSI/J job submission plugin:
 
 ## Portal Integration
 
-The interactive ORBIT Explorer interface (`src/radical/orbit/data/orbit_explorer.html`) provides a comprehensive browser-based client for interacting with the Bridge HTTP interface.
+The interactive ORBIT Explorer interface (`src/radical/orbit/data/orbit_explorer.html`) provides a comprehensive browser-based client for interacting with the Broker HTTP interface.
 
-- Served dynamically via `GET /` on the Bridge.
+- Served dynamically via `GET /` on the Broker.
 - Discovers the endpoint hierarchy leveraging the `POST /endpoint/list` API.
 - Implements purely client-side routing to interact with REST bindings of different endpoint plugins (e.g., querying `queue_info`, or submitting jobs dynamically via `psij` or `rhapsody` plugins).
 - Supports real-time updates via Server-Sent Events (SSE) from the `/events` endpoint.
 - Allows launching new endpoint services on HPC resources via PSI/J job submission.
-- Provides bridge and endpoint termination controls.
+- Provides broker and endpoint termination controls.
 
 ## Configuration
 
-### Bridge configuration: URL, cert, key
+### Broker configuration: URL, cert, key
 
-The bridge URL, TLS cert, and TLS key are resolved with this
+The broker URL, TLS cert, and TLS key are resolved with this
 precedence:
 
 > **CLI flag > environment variable > file under `~/.radical/orbit/`**
 
 | Item | Env var               | Default file                      |
 |------|-----------------------|-----------------------------------|
-| URL  | `RADICAL_ORBIT_BRIDGE_URL`  | `~/.radical/orbit/bridge.url`      |
-| Cert | `RADICAL_ORBIT_BRIDGE_CERT` | `~/.radical/orbit/bridge_cert.pem` |
-| Key  | `RADICAL_ORBIT_BRIDGE_KEY`  | `~/.radical/orbit/bridge_key.pem`  |
+| URL  | `RADICAL_ORBIT_BROKER_URL`  | `~/.radical/orbit/broker.url`      |
+| Cert | `RADICAL_ORBIT_BROKER_CERT` | `~/.radical/orbit/broker_cert.pem` |
+| Key  | `RADICAL_ORBIT_BROKER_KEY`  | `~/.radical/orbit/broker_key.pem`  |
 
 
 Behaviour notes:
 
-- **URL** (consumer side only): the bridge derives its own advertised
+- **URL** (consumer side only): the broker derives its own advertised
   URL from `(host, port)` — wildcard binds use the local FQDN
   (printing both FQDN and outbound-IPv4 forms on stdout); specific
-  binds advertise that literal address.  The bridge writes
-  `bridge.url` only when the file does not already exist, so a stale
-  file the operator placed for a different bridge is never clobbered.
+  binds advertise that literal address.  The broker writes
+  `broker.url` only when the file does not already exist, so a stale
+  file the operator placed for a different broker is never clobbered.
   Endpoints / clients raise `ValueError` if no URL resolves.
 - **Cert / key**: never auto-written; the operator places them.
   Required for `https://` / `wss://` URLs; ignored entirely for
   `http://` / `ws://`.
-- **Key**: The key is only needed by the bridge.  The bridge refuses
-  to start if `bridge_key.pem` is more permissive than `0o600`.
+- **Key**: The key is only needed by the broker.  The broker refuses
+  to start if `broker_key.pem` is more permissive than `0o600`.
 
-### Bridge CLI Args
+### Broker CLI Args
 
 ```
-radical-orbit-bridge.py [options]
+radical-orbit-broker.py [options]
   --cert CERT    TLS cert path                  (CLI > env > file)
   --key  KEY     TLS key path; mode 0o600       (CLI > env > file)
   --host HOST    Bind address (default: 0.0.0.0)
@@ -266,7 +268,7 @@ radical-orbit-bridge.py [options]
 ```
 radical-orbit-endpoint.py [options]
   --name NAME         Endpoint name (shown in Explorer and /endpoint/list)
-  --url  URL          Bridge URL                 (CLI > env > file)
+  --url  URL          Broker URL                 (CLI > env > file)
   --cert CERT         TLS cert path              (CLI > env > file)
   -p PLUGINS          Comma-separated plugins to load
   --tunnel MODE       Tunnel mode: none | forward | reverse
@@ -281,7 +283,7 @@ Set the logging level via `RADICAL_ORBIT_LOG_LVL` (or the generic
 `RADICAL_LOG_LVL`):
 
 ```sh
-RADICAL_ORBIT_LOG_LVL=DEBUG ./bin/radical-orbit-bridge.py
+RADICAL_ORBIT_LOG_LVL=DEBUG ./bin/radical-orbit-broker.py
 ```
 
 Or in code: `logging.getLogger("radical.orbit").setLevel(logging.DEBUG)`.
@@ -299,4 +301,4 @@ Or in code: `logging.getLogger("radical.orbit").setLevel(logging.DEBUG)`.
 : The PsiJ executor may be misconfigured. Check the endpoint log for PsiJ errors. For SLURM, verify the account and queue names are valid with `sinfo` and `sacctmgr`.
 
 **SSL verification error when connecting**
-: For `https://` / `wss://` URLs the cert is required — the `EndpointRuntime` (consumers and endpoints) raises `ValueError` if no cert is resolved (CLI > env > file).  Either set `RADICAL_ORBIT_BRIDGE_CERT` to the `.pem` from setup, drop the file at `~/.radical/orbit/bridge_cert.pem`, or use a plain `http://` / `ws://` URL (cert resolution is then skipped entirely — dev mode only).
+: For `https://` / `wss://` URLs the cert is required — the `EndpointRuntime` (consumers and endpoints) raises `ValueError` if no cert is resolved (CLI > env > file).  Either set `RADICAL_ORBIT_BROKER_CERT` to the `.pem` from setup, drop the file at `~/.radical/orbit/broker_cert.pem`, or use a plain `http://` / `ws://` URL (cert resolution is then skipped entirely — dev mode only).

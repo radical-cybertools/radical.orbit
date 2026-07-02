@@ -168,10 +168,10 @@ class _RunningBroker:
 def harness(self_signed, tmp_path, monkeypatch):
     """Factory yielding (make_broker, make_runtime); tears everything down."""
     from radical.orbit import utils
-    monkeypatch.setattr(utils, 'URL_FILE',   tmp_path / 'bridge.url')
-    monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'bridge.token')
-    monkeypatch.delenv('RADICAL_ORBIT_BRIDGE_TOKEN', raising=False)
-    monkeypatch.delenv('RADICAL_ORBIT_BRIDGE_URL',   raising=False)
+    monkeypatch.setattr(utils, 'URL_FILE',   tmp_path / 'broker.url')
+    monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'broker.token')
+    monkeypatch.delenv('RADICAL_ORBIT_BROKER_TOKEN', raising=False)
+    monkeypatch.delenv('RADICAL_ORBIT_BROKER_URL',   raising=False)
     cert, key = self_signed
 
     servers = []
@@ -558,9 +558,9 @@ def test_callback_dispatcher_drop_oldest_counter():
 def test_dispatch_move_reexport():
     from radical.orbit import dispatch
     from radical.orbit import runtime as _runtime
-    from radical.orbit import bridge_plugin_host
+    from radical.orbit import broker_plugin_host
     assert _runtime.RequestShim is dispatch.RequestShim
-    assert bridge_plugin_host.RequestShim is dispatch.RequestShim
+    assert broker_plugin_host.RequestShim is dispatch.RequestShim
     assert callable(dispatch.match_route)
     # A route table the shared matcher understands.
     import re

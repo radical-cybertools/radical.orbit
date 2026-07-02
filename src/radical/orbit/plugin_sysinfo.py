@@ -543,7 +543,7 @@ class SysInfoClient(PluginClient):
     def host_role(self) -> dict:
         """Return ``{'role', 'scheduler', 'job_id'}`` for the endpoint host.
 
-        ``role`` is one of ``'bridge'``, ``'login'`` or ``'compute'``.
+        ``role`` is one of ``'broker'``, ``'login'`` or ``'compute'``.
         ``scheduler`` is ``'slurm' | 'pbs' | 'lsf' | None`` and ``job_id``
         is the allocation id (``None`` outside an allocation).
 
@@ -622,7 +622,7 @@ class PluginSysInfo(Plugin):
 
         Returned fields:
 
-        - ``role``          — ``bridge`` / ``login`` / ``compute`` /
+        - ``role``          — ``broker`` / ``login`` / ``compute`` /
                               ``standalone``.
         - ``scheduler``     — the batch system's full name (e.g.
                               ``'slurm'``, ``'pbs'``, ``'pbs-aurora'``,

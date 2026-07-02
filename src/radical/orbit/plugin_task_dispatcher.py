@@ -80,7 +80,7 @@ _DEFAULT_SCRATCH_ROOT = Path('~/.radical/orbit/task_dispatcher/scratch'
 
 # State-directory pruning: directories whose mtime is older than this
 # threshold AND whose pool is no longer in self._pool_states get
-# deleted by the background sweeper (memory/project_bridge_dispatcher.md
+# deleted by the background sweeper (memory/project_broker_dispatcher.md
 # Phase 5).
 _STATE_PRUNE_DAYS    = 30
 _PRUNE_INTERVAL_SEC  = 86400.0   # stale-dir pruning: once a day
@@ -485,7 +485,7 @@ class TaskDispatcherClient(PluginClient):
         '''Upload one file into a task's scratch dir.  Returns ``{cwd, size}``.
 
         NOTE: v1 uses a single base64-in-JSON body per file — radical.orbit's
-        bridge forwards JSON over WebSocket, so multipart is not available.
+        broker forwards JSON over WebSocket, so multipart is not available.
         Bulk-transfer optimization (tar-stream / dedicated binary staging
         plugin) is deferred; see design doc §6.4.
         '''
@@ -532,16 +532,16 @@ class PluginTaskDispatcher(Plugin):
 
     @classmethod
     def is_enabled(cls, app: FastAPI) -> bool:
-        '''Bridge hosts only.
+        '''Broker hosts only.
 
-        The dispatcher is a bridge-side plugin: it owns the global
+        The dispatcher is a broker-side plugin: it owns the global
         pool/pilot/task state, observes topology events directly, and
         proxies psij calls out to login-node endpoints that submit batch
         jobs.  Running it on an endpoint would put it in the wrong half of
-        the architecture — see ``memory/project_bridge_dispatcher.md``.
+        the architecture — see ``memory/project_broker_dispatcher.md``.
         '''
         from .utils import host_role
-        return host_role(app)['role'] == 'bridge'
+        return host_role(app)['role'] == 'broker'
 
     def __init__(self, app: FastAPI,
                  instance_name: str = 'task_dispatcher',
@@ -553,9 +553,9 @@ class PluginTaskDispatcher(Plugin):
         self._scratch_root = Path(scratch_root or _DEFAULT_SCRATCH_ROOT)
 
         # Broker seam (the dispatcher is broker-hosted only): the in-process
-        # caller handle and the raw event tap, injected by BridgePluginHost.
-        # Under the old ``bridge.py`` construction these are absent (None) and
-        # the dispatcher refuses any endpoint call cleanly (see _call).
+        # caller handle and the raw event tap, injected by BrokerPluginHost.
+        # When these are absent (None) the dispatcher refuses any endpoint call
+        # cleanly (see _call).
         self._broker_caller = getattr(app.state, 'broker_caller', None)
         self._broker_tap    = getattr(app.state, 'broker_tap', None)
         self._untap         = None
@@ -749,7 +749,7 @@ class PluginTaskDispatcher(Plugin):
         '''Auto-pick an endpoint_name when a pool was declared without one.
 
         Policy: lexically first connected endpoint that isn't us (the
-        bridge endpoint).  Returns ``None`` if no eligible endpoint is
+        broker endpoint).  Returns ``None`` if no eligible endpoint is
         available; the caller decides whether to defer or fail.
         '''
         self_endpoint = getattr(self._app.state, 'endpoint_name', None)
@@ -783,7 +783,7 @@ class PluginTaskDispatcher(Plugin):
             self._compaction_sweeper()))
 
         # Subscribe to the broker's raw event tap for child-pilot task events
-        # (the old stack read these off the bridge SSE stream).  The tap fires
+        # (the old stack read these off the broker SSE stream).  The tap fires
         # on the plugin-host loop — the dispatcher's own loop — so terminal
         # handling runs inline with no cross-thread marshalling.
         if self._broker_tap is not None and self._untap is None:
@@ -799,8 +799,8 @@ class PluginTaskDispatcher(Plugin):
         The dispatcher is broker-hosted: every endpoint call rides the
         in-process ``BrokerCaller`` (``call_threadsafe`` schedules onto the
         routing loop; ``asyncio.wrap_future`` awaits it on the host loop
-        without blocking).  Refuses cleanly when no caller is wired (the old
-        ``bridge.py`` host, where the dispatcher is not meant to run).
+        without blocking).  Refuses cleanly when no caller is wired (a host
+        where the dispatcher is not meant to run).
         '''
         caller = self._broker_caller
         if caller is None:
@@ -1640,20 +1640,20 @@ class PluginTaskDispatcher(Plugin):
 
         The dispatcher signals "this is a pilot child endpoint" via
         ``RADICAL_ORBIT_POOL`` / ``RADICAL_ORBIT_RHAPSODY_BACKEND`` /
-        ``RADICAL_ORBIT_SCRATCH_BASE``.  Bridge/cert names use the same
-        ``RADICAL_ORBIT_BRIDGE_*`` vars that any plain endpoint service reads, so
+        ``RADICAL_ORBIT_SCRATCH_BASE``.  Broker/cert names use the same
+        ``RADICAL_ORBIT_BROKER_*`` vars that any plain endpoint service reads, so
         the generic ``radical-orbit-endpoint-wrapper.sh`` works without renames.
         '''
-        bridge_url = getattr(self._app.state, 'bridge_url', '') or ''
+        broker_url = getattr(self._app.state, 'broker_url', '') or ''
         env: dict[str, str] = {
-            'RADICAL_ORBIT_BRIDGE_URL'           : str(bridge_url),
+            'RADICAL_ORBIT_BROKER_URL'           : str(broker_url),
             'RADICAL_ORBIT_POOL'            : pool_state.config.name,
             'RADICAL_ORBIT_RHAPSODY_BACKEND': record.rhapsody_backend,
             'RADICAL_ORBIT_SCRATCH_BASE'    : str(pool_state.scratch_base),
         }
-        cert = os.environ.get('RADICAL_ORBIT_BRIDGE_CERT')
+        cert = os.environ.get('RADICAL_ORBIT_BROKER_CERT')
         if cert:
-            env['RADICAL_ORBIT_BRIDGE_CERT'] = cert
+            env['RADICAL_ORBIT_BROKER_CERT'] = cert
         return env
 
     def _build_job_spec(self, pool_state: PoolState,

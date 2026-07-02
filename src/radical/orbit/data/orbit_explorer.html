@@ -1025,7 +1025,7 @@
       <h1>Radical <span>Endpoint</span> Explorer</h1>
     </div>
     <div class="connect-bar">
-      <input id="bridgeUrl" type="text" placeholder="http://your-bridge-host:8000" value="" spellcheck="false" />
+      <input id="brokerUrl" type="text" placeholder="http://your-broker-host:8000" value="" spellcheck="false" />
       <div id="connectionStatus" class="connection-status disconnected">
         <div id="statusDot" class="status-dot" title="Not connected"></div>
         <span id="statusText">Disconnected</span>
@@ -1039,11 +1039,11 @@
     <!-- ── SIDEBAR ──────────────────────────────────────────── -->
     <aside id="sidebar">
       <ul class="tree" id="treeRoot">
-        <li class="tree-item" id="nav-bridge" style="display:none; display:flex; align-items:center; justify-content:space-between;">
-          <span onclick="showPage('bridge')" style="display:flex; align-items:center; gap:8px; flex:1; cursor:pointer;">
-            <span class="icon">🌉</span> <span id="bridgeLabel">Bridge</span>
+        <li class="tree-item" id="nav-broker" style="display:none; display:flex; align-items:center; justify-content:space-between;">
+          <span onclick="showPage('broker')" style="display:flex; align-items:center; gap:8px; flex:1; cursor:pointer;">
+            <span class="icon">🌉</span> <span id="brokerLabel">Broker</span>
           </span>
-          <button class="task-cancel-btn" onclick="terminateBridge(event)" title="Terminate bridge">❌</button>
+          <button class="task-cancel-btn" onclick="terminateBroker(event)" title="Terminate broker">❌</button>
         </li>
       </ul>
       <div id="endpointTree"></div>
@@ -1058,23 +1058,23 @@
         <div class="welcome-hero">
           <div class="hero-icon">⚡</div>
           <h2>Radical <span>ORBIT Explorer</span></h2>
-          <p>Enter your Bridge URL above and click <strong>Connect</strong> to discover endpoints and interact with their
+          <p>Enter your Broker URL above and click <strong>Connect</strong> to discover endpoints and interact with their
             plugins.</p>
 
           <div class="ssl-banner">
-            <strong>⚡ Connecting to the bridge</strong>
+            <strong>⚡ Connecting to the broker</strong>
             <ol>
               <li>
-                <strong>Plain HTTP bridge</strong> (no <code>RADICAL_ORBIT_BRIDGE_CERT</code> /
-                <code>RADICAL_ORBIT_BRIDGE_KEY</code> set):
-                use <code>http://...</code>. The browser error <em>ERR_SSL_PROTOCOL_ERROR</em> and the bridge log
+                <strong>Plain HTTP broker</strong> (no <code>RADICAL_ORBIT_BROKER_CERT</code> /
+                <code>RADICAL_ORBIT_BROKER_KEY</code> set):
+                use <code>http://...</code>. The browser error <em>ERR_SSL_PROTOCOL_ERROR</em> and the broker log
                 message
                 <em>"invalid HTTP request received"</em> both mean you are using <code>https://</code> against a
                 plain‑HTTP server.
               </li>
               <li>
-                <strong>HTTPS bridge</strong> (SSL cert/key configured): use <code>https://...</code>.
-                If the cert is self-signed, click <strong>Connect</strong> to navigate directly to the bridge and accept
+                <strong>HTTPS broker</strong> (SSL cert/key configured): use <code>https://...</code>.
+                If the cert is self-signed, click <strong>Connect</strong> to navigate directly to the broker and accept
                 the browser warning.
               </li>
             </ol>
@@ -1082,24 +1082,24 @@
         </div>
       </div>
 
-      <!-- Bridge info page -->
-      <div class="page" id="page-bridge">
+      <!-- Broker info page -->
+      <div class="page" id="page-broker">
         <div class="page-header">
           <div class="page-icon">🌉</div>
-          <h2 id="bridgePageTitle">Bridge</h2>
+          <h2 id="brokerPageTitle">Broker</h2>
           <a href="/docs" target="_blank" class="btn btn-secondary btn-sm" style="margin-left:auto">REST API</a>
           <button class="btn btn-secondary btn-sm" onclick="loadHierarchy()">↺ Refresh</button>
-          <button class="btn btn-danger btn-sm" onclick="terminateBridge(event)">Terminate</button>
+          <button class="btn btn-danger btn-sm" onclick="terminateBroker(event)">Terminate</button>
         </div>
-        <div id="bridgeInfoContent">
+        <div id="brokerInfoContent">
           <div class="empty">
             <div class="empty-icon">🔌</div>
-            <p>Not connected. Enter a Bridge URL and click Connect.</p>
+            <p>Not connected. Enter a Broker URL and click Connect.</p>
           </div>
         </div>
 
         <!-- Endpoint Submission Form (remote PsiJ - not yet implemented) -->
-        <div class="card" id="bridgeEndpointSubmit" style="display:none; margin-top:20px;">
+        <div class="card" id="brokerEndpointSubmit" style="display:none; margin-top:20px;">
           <div class="card-title">🚀 Submit Remote Endpoint</div>
           <p style="color:var(--muted); font-size:0.85rem; margin-bottom:12px;">
             Submit a new endpoint service to a remote HPC resource via PsiJ.
@@ -1107,21 +1107,21 @@
           <div class="grid2">
             <div>
               <div class="form-group"><label>Endpoint Name</label>
-                <input class="bridge-endpoint-name" type="text" placeholder="my-endpoint" /></div>
+                <input class="broker-endpoint-name" type="text" placeholder="my-endpoint" /></div>
               <div class="form-group"><label>Resource (SSH target)</label>
-                <input class="bridge-target" type="text" placeholder="user@login.cluster.edu" /></div>
+                <input class="broker-target" type="text" placeholder="user@login.cluster.edu" /></div>
               <div class="form-group"><label>IRI Service Endpoint</label>
-                <input class="bridge-executor" type="text" placeholder="ssh://user@host or local://localhost" /></div>
+                <input class="broker-executor" type="text" placeholder="ssh://user@host or local://localhost" /></div>
             </div>
             <div>
               <div class="form-group"><label>Queue / Partition</label>
-                <input class="bridge-queue" type="text" placeholder="debug" /></div>
+                <input class="broker-queue" type="text" placeholder="debug" /></div>
               <div class="form-group"><label>Account / Project</label>
-                <input class="bridge-account" type="text" placeholder="optional" /></div>
+                <input class="broker-account" type="text" placeholder="optional" /></div>
               <div class="form-group"><label>Duration (seconds)</label>
-                <input class="bridge-duration" type="text" placeholder="3600" /></div>
+                <input class="broker-duration" type="text" placeholder="3600" /></div>
               <div class="form-group"><label>Node Count</label>
-                <input class="bridge-nodes" type="number" value="1" min="1" /></div>
+                <input class="broker-nodes" type="number" value="1" min="1" /></div>
             </div>
           </div>
           <button class="btn btn-success" onclick="submitRemoteEndpoint()" style="margin-top:12px;">
@@ -1130,9 +1130,9 @@
         </div>
 
         <!-- Submitted Endpoint Jobs Monitor -->
-        <div class="card" id="bridgeEndpointJobs" style="display:none; margin-top:16px;">
+        <div class="card" id="brokerEndpointJobs" style="display:none; margin-top:16px;">
           <div class="card-title">📊 Submitted Endpoint Jobs</div>
-          <div class="bridge-jobs-output" style="font-family:'JetBrains Mono',monospace; font-size:0.85rem;">
+          <div class="broker-jobs-output" style="font-family:'JetBrains Mono',monospace; font-size:0.85rem;">
             <div style="color:var(--muted); font-style:italic;">No endpoint jobs submitted yet.</div>
           </div>
         </div>
@@ -1164,7 +1164,7 @@
     // ─────────────────────────────────────────────────────────────
     //  State
     // ─────────────────────────────────────────────────────────────
-    let BRIDGE = '';
+    let BROKER = '';
     let eventSource = null;
     let sessions = {};   // key: "endpointName/pluginName" -> sid
     let endpointData = {};   // endpointName -> plugin info from /endpoint/list
@@ -1265,7 +1265,7 @@
       return {
         endpointName,
         pluginName,
-        bridgeUrl: BRIDGE,
+        brokerUrl: BROKER,
 
         // Session management
         async getSession(plugin = pluginName, regBody = {}) {
@@ -1757,14 +1757,14 @@
 
     const API_TIMEOUT_MS = 30000; // 30 second request timeout
 
-    // Shared bridge auth token.  Kept in localStorage only to (re)authenticate;
+    // Shared broker auth token.  Kept in localStorage only to (re)authenticate;
     // the live credential the browser sends is the HttpOnly cookie minted by
     // POST /auth, which JS cannot read.
-    let BRIDGE_TOKEN = localStorage.getItem('orbit_bridge_token');
+    let BROKER_TOKEN = localStorage.getItem('orbit_broker_token');
     // Distinguish "never set" (null) from "set to empty" (e.g. --no-auth) so we
     // don't re-prompt on every connect once the user has chosen a blank token.
-    let hasTokenSet = BRIDGE_TOKEN !== null;
-    if (BRIDGE_TOKEN === null) BRIDGE_TOKEN = '';
+    let hasTokenSet = BROKER_TOKEN !== null;
+    if (BROKER_TOKEN === null) BROKER_TOKEN = '';
 
     // Single-flight guard: concurrent 401s would otherwise each open their own
     // window.prompt.  Coalesce overlapping calls onto one in-flight auth attempt.
@@ -1779,24 +1779,24 @@
 
     async function _ensureAuth(forcePrompt = false) {
       // Obtain/refresh the HttpOnly auth cookie via POST /auth using the shared
-      // bearer token.  If the bridge runs with --no-auth, /auth returns 200 and
+      // bearer token.  If the broker runs with --no-auth, /auth returns 200 and
       // sets no cookie, so a blank token works.  Returns false only if the user
       // cancels the prompt.
       for (let attempt = 0; attempt < 3; attempt++) {
         if (forcePrompt || !hasTokenSet) {
           const t = window.prompt(
-            'Bridge auth token (leave blank if the bridge runs with --no-auth):',
-            BRIDGE_TOKEN || '');
+            'Broker auth token (leave blank if the broker runs with --no-auth):',
+            BROKER_TOKEN || '');
           if (t === null) return false;             // user cancelled
-          BRIDGE_TOKEN = t.trim();
-          localStorage.setItem('orbit_bridge_token', BRIDGE_TOKEN);
+          BROKER_TOKEN = t.trim();
+          localStorage.setItem('orbit_broker_token', BROKER_TOKEN);
           hasTokenSet = true;
         }
         const headers = {};
-        if (BRIDGE_TOKEN) headers['Authorization'] = 'Bearer ' + BRIDGE_TOKEN;
+        if (BROKER_TOKEN) headers['Authorization'] = 'Bearer ' + BROKER_TOKEN;
         let res;
         try {
-          res = await fetch(BRIDGE.replace(/\/$/, '') + '/auth',
+          res = await fetch(BROKER.replace(/\/$/, '') + '/auth',
                             { method: 'POST', credentials: 'include', headers });
         } catch (e) {
           return true;   // network error — let the connect flow surface it
@@ -1809,7 +1809,7 @@
     }
 
     async function apiFetch(path, opts = {}) {
-      const url = BRIDGE.replace(/\/$/, '') + path;
+      const url = BROKER.replace(/\/$/, '') + path;
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
 
@@ -1922,14 +1922,14 @@
     }
 
     async function doConnect() {
-      const rawUrl = document.getElementById('bridgeUrl').value.trim();
-      if (!rawUrl) { flash('Please enter a Bridge URL', false); return; }
-      BRIDGE = rawUrl.replace(/\/$/, '');
+      const rawUrl = document.getElementById('brokerUrl').value.trim();
+      if (!rawUrl) { flash('Please enter a Broker URL', false); return; }
+      BROKER = rawUrl.replace(/\/$/, '');
 
       try {
-        const targetUrl = new URL(BRIDGE);
+        const targetUrl = new URL(BROKER);
         if (targetUrl.origin !== 'null' && targetUrl.origin !== window.location.origin) {
-          window.location.href = BRIDGE;
+          window.location.href = BROKER;
           return;
         }
       } catch (e) {
@@ -1947,7 +1947,7 @@
       try {
         await loadHierarchy();
         setConnectionStatus('connected');
-        flash('Connected to bridge');
+        flash('Connected to broker');
 
         // Update UI for connected state
         isConnected = true;
@@ -1956,15 +1956,15 @@
         document.getElementById('connectBtn').classList.add('btn-danger');
 
         // Update sidebar and page title
-        document.getElementById('bridgeLabel').textContent = 'Bridge';
-        document.getElementById('bridgePageTitle').textContent = 'Bridge';
-        document.getElementById('nav-bridge').style.display = 'flex';
+        document.getElementById('brokerLabel').textContent = 'Broker';
+        document.getElementById('brokerPageTitle').textContent = 'Broker';
+        document.getElementById('nav-broker').style.display = 'flex';
 
         // Show endpoint submission form and jobs monitor
-        document.getElementById('bridgeEndpointSubmit').style.display = '';
-        document.getElementById('bridgeEndpointJobs').style.display = '';
+        document.getElementById('brokerEndpointSubmit').style.display = '';
+        document.getElementById('brokerEndpointJobs').style.display = '';
 
-        showPage('bridge');
+        showPage('broker');
 
         // Open SSE event stream for push notifications
         setupEventSource();
@@ -1980,12 +1980,12 @@
           msg.includes('ERR_SSL');
 
         if (isNetErr) {
-          if (BRIDGE.startsWith('https://')) {
-            hint = 'ERR_SSL_PROTOCOL_ERROR means the bridge is running on plain HTTP — ' +
+          if (BROKER.startsWith('https://')) {
+            hint = 'ERR_SSL_PROTOCOL_ERROR means the broker is running on plain HTTP — ' +
               'try changing https:// to http:// in the URL. ' +
-              'If the bridge really does use HTTPS, ensure you have accepted the self-signed cert.';
+              'If the broker really does use HTTPS, ensure you have accepted the self-signed cert.';
           } else {
-            hint = 'Could not reach the bridge. Is it running? Check the host/port.';
+            hint = 'Could not reach the broker. Is it running? Check the host/port.';
           }
         }
 
@@ -1994,7 +1994,7 @@
           : '';
 
         flash('Connection failed: ' + msg, false);
-        document.getElementById('bridgeInfoContent').innerHTML =
+        document.getElementById('brokerInfoContent').innerHTML =
           `<div class="card">
              <p style="color:var(--danger)">Error: ${msg}</p>
              ${warnP}
@@ -2013,13 +2013,13 @@
 
       // Reset state
       isConnected = false;
-      BRIDGE = '';
+      BROKER = '';
       endpointData = {};
       sessions = {};
       queueDataCache     = {};
       jobAllocationCache = {};
       window.lastEndpoints = {};
-      window.lastBridge = {};
+      window.lastBroker = {};
 
       // Clear task registry
       for (const key in taskRegistry) delete taskRegistry[key];
@@ -2035,18 +2035,18 @@
       document.getElementById('connectBtn').textContent = 'Connect';
       document.getElementById('connectBtn').classList.remove('btn-danger');
       document.getElementById('connectBtn').classList.add('btn-primary');
-      document.getElementById('nav-bridge').style.display = 'none';
-      document.getElementById('bridgeEndpointSubmit').style.display = 'none';
-      document.getElementById('bridgeEndpointJobs').style.display = 'none';
+      document.getElementById('nav-broker').style.display = 'none';
+      document.getElementById('brokerEndpointSubmit').style.display = 'none';
+      document.getElementById('brokerEndpointJobs').style.display = 'none';
       document.getElementById('endpointTree').innerHTML = '';
-      document.getElementById('bridgeInfoContent').innerHTML = `
+      document.getElementById('brokerInfoContent').innerHTML = `
         <div class="empty">
           <div class="empty-icon">🔌</div>
-          <p>Not connected. Enter a Bridge URL and click Connect.</p>
+          <p>Not connected. Enter a Broker URL and click Connect.</p>
         </div>`;
 
       setConnectionStatus('disconnected');
-      flash('Disconnected from bridge');
+      flash('Disconnected from broker');
       showPage('welcome');
     }
 
@@ -2064,7 +2064,7 @@
 
       // withCredentials so the HttpOnly auth cookie rides the SSE connection
       // (EventSource cannot set headers).
-      eventSource = new EventSource(BRIDGE + '/events', { withCredentials: true });
+      eventSource = new EventSource(BROKER + '/events', { withCredentials: true });
 
       eventSource.onopen = function() {
         setConnectionStatus('connected');
@@ -2093,7 +2093,7 @@
               endpointData[en] = ed;
             }
             window.lastEndpoints = endpoints;
-            window.lastBridge = (msg.data && msg.data.bridge) || {};
+            window.lastBroker = (msg.data && msg.data.broker) || {};
 
             // Track existing endpoint IDs and open states before rebuild
             const existingEndpointIds = new Set();
@@ -2106,7 +2106,7 @@
             });
 
             buildSidebar(endpoints);
-            renderHierarchy(endpoints, window.lastBridge);
+            renderHierarchy(endpoints, window.lastBroker);
 
             // Restore open states (new endpoints stay collapsed by default)
             document.querySelectorAll('details').forEach(el => {
@@ -2137,10 +2137,10 @@
         endpointData[en] = ed;
       }
       window.lastEndpoints = endpoints;
-      window.lastBridge = data.bridge || {};
+      window.lastBroker = data.broker || {};
 
       buildSidebar(endpoints);
-      renderHierarchy(endpoints, data.bridge || {});
+      renderHierarchy(endpoints, data.broker || {});
 
       // Restore open states (endpoints stay collapsed by default)
       document.querySelectorAll('details').forEach(el => {
@@ -2158,7 +2158,7 @@
       return '<span class="badge badge-orange" style="font-size:.65rem;padding:1px 5px;vertical-align:middle;margin-left:4px;">⏳</span>';
     }
 
-    const BRIDGE_ENDPOINT_NAME = 'bridge';
+    const BROKER_ENDPOINT_NAME = 'broker';
 
     function buildSidebar(endpoints) {
       const el = document.getElementById('endpointTree');
@@ -2166,7 +2166,7 @@
       // ── helpers ──────────────────────────────────────────────
 
       // Build children map based on dot-separated endpoint names
-      const endpointNames = Object.keys(endpoints).filter(n => n !== BRIDGE_ENDPOINT_NAME);
+      const endpointNames = Object.keys(endpoints).filter(n => n !== BROKER_ENDPOINT_NAME);
       const children = {}; // parentName -> [childNames]
       const topLevel = [];
 
@@ -2232,7 +2232,7 @@
         let html = `<details id="sidebar-endpoint-${ename}">
           <summary style="display:list-item; list-style-position:inside; padding:6px 16px; padding-left:${16 + indent}px; user-select:none; outline:none; font-weight:bold; cursor:pointer; font-size:0.85rem; color:var(--accent2); transition:background .15s;" onmouseover="this.style.background='var(--bg3)'" onmouseout="this.style.background='transparent'">
             <span style="display:inline-flex; align-items:center; justify-content:space-between; width:calc(100% - 16px);">
-              <span onclick="showPage('bridge'); event.stopPropagation();" style="display:inline-flex; align-items:center; gap:8px;">
+              <span onclick="showPage('broker'); event.stopPropagation();" style="display:inline-flex; align-items:center; gap:8px;">
                 <span class="icon">💻</span> ${ename}
               </span>
               <button class="task-cancel-btn" onclick="disconnectEndpoint(event, '${ename}')" title="Disconnect endpoint">❌</button>
@@ -2267,55 +2267,55 @@
       // ── Preserve open/closed state before re-render ─────────
       const detailsState = new Map();
       el.querySelectorAll('details[id]').forEach(d => detailsState.set(d.id, d.open));
-      const navBridge = document.getElementById('nav-bridge');
-      if (navBridge && navBridge.tagName === 'DETAILS') {
-        detailsState.set('nav-bridge', navBridge.open);
+      const navBroker = document.getElementById('nav-broker');
+      if (navBroker && navBroker.tagName === 'DETAILS') {
+        detailsState.set('nav-broker', navBroker.open);
       }
 
-      // ── Build Bridge node (plugins + endpoints as children) ─────
-      const bridgeOpen = detailsState.has('nav-bridge') ? detailsState.get('nav-bridge') : true;
-      let bridgeHtml = `<details id="nav-bridge" style="display:block;" ${bridgeOpen ? 'open' : ''}>
+      // ── Build Broker node (plugins + endpoints as children) ─────
+      const brokerOpen = detailsState.has('nav-broker') ? detailsState.get('nav-broker') : true;
+      let brokerHtml = `<details id="nav-broker" style="display:block;" ${brokerOpen ? 'open' : ''}>
         <summary style="display:list-item; list-style-position:inside; padding:6px 16px; user-select:none; outline:none; font-weight:bold; cursor:pointer; font-size:0.85rem; color:var(--accent2); transition:background .15s;" onmouseover="this.style.background='var(--bg3)'" onmouseout="this.style.background='transparent'">
           <span style="display:inline-flex; align-items:center; justify-content:space-between; width:calc(100% - 16px);">
-            <span onclick="showPage('bridge'); event.stopPropagation();" style="display:inline-flex; align-items:center; gap:8px;">
-              <span class="icon">🌉</span> <span id="bridgeLabel">Bridge</span>
+            <span onclick="showPage('broker'); event.stopPropagation();" style="display:inline-flex; align-items:center; gap:8px;">
+              <span class="icon">🌉</span> <span id="brokerLabel">Broker</span>
             </span>
-            <button class="task-cancel-btn" onclick="terminateBridge(event)" title="Terminate bridge">❌</button>
+            <button class="task-cancel-btn" onclick="terminateBroker(event)" title="Terminate broker">❌</button>
           </span>
         </summary>
         <ul class="tree" style="margin-top:2px; padding-left:8px; border-left:1px dashed var(--border); margin-left:16px;">`;
 
-      // Bridge plugins (in a collapsible folder, same style as endpoint plugins)
-      const bridgeEndpoint = endpoints[BRIDGE_ENDPOINT_NAME];
-      if (bridgeEndpoint) {
-        const bp = bridgeEndpoint.plugins || {};
+      // Broker plugins (in a collapsible folder, same style as endpoint plugins)
+      const brokerEndpoint = endpoints[BROKER_ENDPOINT_NAME];
+      if (brokerEndpoint) {
+        const bp = brokerEndpoint.plugins || {};
         const bpNames = Object.keys(bp).filter(p => bp[p].enabled !== false);
         if (bpNames.length > 0) {
-          bridgeHtml += `<li style="list-style:none; margin-left:-8px;"><details id="sidebar-plugins-${BRIDGE_ENDPOINT_NAME}">
+          brokerHtml += `<li style="list-style:none; margin-left:-8px;"><details id="sidebar-plugins-${BROKER_ENDPOINT_NAME}">
             <summary style="display:list-item; list-style-position:inside; padding:6px 16px; user-select:none; outline:none; font-weight:bold; cursor:pointer; font-size:0.85rem; color:var(--muted); transition:background .15s;" onmouseover="this.style.background='var(--bg3)'" onmouseout="this.style.background='transparent'">
               <span style="display:inline-flex; align-items:center; gap:8px;">
                 <span class="icon">🔌</span> plugins (${bpNames.length})
               </span>
             </summary>
             <ul class="tree" style="margin-top:2px; padding-left:8px; border-left:1px dashed var(--border); margin-left:8px;">`;
-          bridgeHtml += renderPluginList(BRIDGE_ENDPOINT_NAME, bp, bpNames);
-          bridgeHtml += `</ul></details></li>`;
+          brokerHtml += renderPluginList(BROKER_ENDPOINT_NAME, bp, bpNames);
+          brokerHtml += `</ul></details></li>`;
         }
       }
 
-      // Endpoint services (nested under Bridge)
+      // Endpoint services (nested under Broker)
       for (const ename of topLevel) {
-        bridgeHtml += `<li style="list-style:none; margin-left:-8px;">`;
-        bridgeHtml += renderEndpointSidebar(ename, 0);
-        bridgeHtml += `</li>`;
+        brokerHtml += `<li style="list-style:none; margin-left:-8px;">`;
+        brokerHtml += renderEndpointSidebar(ename, 0);
+        brokerHtml += `</li>`;
       }
 
-      bridgeHtml += `</ul></details>`;
+      brokerHtml += `</ul></details>`;
 
-      // Replace the nav-bridge element in treeRoot
-      if (navBridge) navBridge.outerHTML = bridgeHtml;
+      // Replace the nav-broker element in treeRoot
+      if (navBroker) navBroker.outerHTML = brokerHtml;
 
-      // Clear endpointTree (endpoints now live inside Bridge)
+      // Clear endpointTree (endpoints now live inside Broker)
       el.innerHTML = '';
 
       // Restore open/closed state
@@ -2347,29 +2347,29 @@
       return { sysinfo: '🖥️', queue_info: '📋', psij: '🚀', rhapsody: '🎼', lucid: '🧠', xgfabric: '🕸️' }[p] || '🔌';
     }
 
-    function renderHierarchy(endpoints, bridge) {
-      // Bridge info card with URL
+    function renderHierarchy(endpoints, broker) {
+      // Broker info card with URL
       let html = `<div class="card" style="margin-bottom:16px;">
-        <div class="card-title" style="margin-bottom:4px;">Bridge URL</div>
+        <div class="card-title" style="margin-bottom:4px;">Broker URL</div>
         <div style="display:flex; align-items:center; gap:8px;">
-          <code style="font-size:0.9rem; color:var(--accent); word-break:break-all;">${escHtml(BRIDGE)}</code>
-          <button onclick="copyToClipboard('${escHtml(BRIDGE)}')" title="Copy URL" style="background:none; border:none; cursor:pointer; padding:2px; font-size:1rem;">📋</button>
+          <code style="font-size:0.9rem; color:var(--accent); word-break:break-all;">${escHtml(BROKER)}</code>
+          <button onclick="copyToClipboard('${escHtml(BROKER)}')" title="Copy URL" style="background:none; border:none; cursor:pointer; padding:2px; font-size:1rem;">📋</button>
         </div>
       </div>`;
 
-      // Bridge plugins card (if any)
-      const bridgeEndpoint = endpoints[BRIDGE_ENDPOINT_NAME];
-      if (bridgeEndpoint) {
-        const allBP = bridgeEndpoint.plugins || {};
+      // Broker plugins card (if any)
+      const brokerEndpoint = endpoints[BROKER_ENDPOINT_NAME];
+      if (brokerEndpoint) {
+        const allBP = brokerEndpoint.plugins || {};
         const bpNames = Object.keys(allBP).filter(p => allBP[p].enabled !== false);
         if (bpNames.length > 0) {
           html += `<div class="card" style="margin-bottom:16px;">
-            <div class="card-title" style="margin-bottom:8px;">Bridge Plugins</div>
+            <div class="card-title" style="margin-bottom:8px;">Broker Plugins</div>
             <div style="display:flex; flex-wrap:wrap; gap:8px;">`;
           for (const pname of bpNames) {
-            const icon = pluginIcon(pname, BRIDGE_ENDPOINT_NAME);
+            const icon = pluginIcon(pname, BROKER_ENDPOINT_NAME);
             html += `<span class="badge" style="cursor:pointer; padding:4px 10px; font-size:0.85rem;"
-                           onclick="showPluginPage('${BRIDGE_ENDPOINT_NAME}','${pname}')">
+                           onclick="showPluginPage('${BROKER_ENDPOINT_NAME}','${pname}')">
                        ${icon} ${pname}
                      </span>`;
           }
@@ -2383,10 +2383,10 @@
           <div class="card-title" style="margin-bottom:0;">Connected Endpoints</div>
         </div>`;
 
-      const endpointNames = Object.keys(endpoints).filter(n => n !== BRIDGE_ENDPOINT_NAME).sort();
+      const endpointNames = Object.keys(endpoints).filter(n => n !== BROKER_ENDPOINT_NAME).sort();
       if (endpointNames.length === 0) {
         html += `<div style="color:var(--muted); font-style:italic; padding:12px 0;">
-          No endpoints connected to this bridge.
+          No endpoints connected to this broker.
         </div>`;
       } else {
         html += `<table style="width:100%; border-collapse:collapse; font-size:0.9rem;">
@@ -2429,7 +2429,7 @@
       }
 
       html += `</div>`;
-      document.getElementById('bridgeInfoContent').innerHTML = html;
+      document.getElementById('brokerInfoContent').innerHTML = html;
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -2628,22 +2628,22 @@
     function updateEndpointLaunchArgs(page, endpointName, selector) {
       const argsInput = page.querySelector(selector);
       if (argsInput) {
-        const url = BRIDGE.replace(/\/$/, '');
+        const url = BROKER.replace(/\/$/, '');
         const childName = getNextEndpointChildName(endpointName);
         argsInput.value = `--url ${url} --name ${childName}`;
       }
     }
 
     // ─────────────────────────────────────────────────────────────
-    //  Bridge management
+    //  Broker management
     // ─────────────────────────────────────────────────────────────
 
-    async function terminateBridge(event) {
+    async function terminateBroker(event) {
       event.stopPropagation();
 
       try {
-        await apiFetch('/bridge/terminate', { method: 'POST' });
-        flash('Bridge is terminating...');
+        await apiFetch('/broker/terminate', { method: 'POST' });
+        flash('Broker is terminating...');
         setTimeout(() => doDisconnect(), 1000);
       } catch (e) {
         flash('Terminate failed: ' + e.message, false);
@@ -2651,14 +2651,14 @@
     }
 
     async function submitRemoteEndpoint() {
-      const card   = document.getElementById('bridgeEndpointSubmit');
-      const name   = card.querySelector('.bridge-endpoint-name').value.trim();
-      const target = card.querySelector('.bridge-target').value.trim();
-      const exec   = card.querySelector('.bridge-executor').value;
-      const queue  = card.querySelector('.bridge-queue').value.trim();
-      const acct   = card.querySelector('.bridge-account').value.trim();
-      const dur    = card.querySelector('.bridge-duration').value.trim() || '3600';
-      const nodes  = card.querySelector('.bridge-nodes').value || '1';
+      const card   = document.getElementById('brokerEndpointSubmit');
+      const name   = card.querySelector('.broker-endpoint-name').value.trim();
+      const target = card.querySelector('.broker-target').value.trim();
+      const exec   = card.querySelector('.broker-executor').value;
+      const queue  = card.querySelector('.broker-queue').value.trim();
+      const acct   = card.querySelector('.broker-account').value.trim();
+      const dur    = card.querySelector('.broker-duration').value.trim() || '3600';
+      const nodes  = card.querySelector('.broker-nodes').value || '1';
 
       if (!name)   { flash('Endpoint name is required', false); return; }
       if (!target) { flash('Resource SSH target is required', false); return; }
@@ -2691,7 +2691,7 @@
     }
 
     async function refreshEndpointJobs() {
-      const output = document.querySelector('#bridgeEndpointJobs .bridge-jobs-output');
+      const output = document.querySelector('#brokerEndpointJobs .broker-jobs-output');
       try {
         const data = await apiFetch('/endpoint/jobs');
         if (!data || !data.jobs || data.jobs.length === 0) {
@@ -2769,7 +2769,7 @@
     // ─────────────────────────────────────────────────────────────
     //  Init
     // ─────────────────────────────────────────────────────────────
-    document.getElementById('bridgeUrl').addEventListener('keydown', e => {
+    document.getElementById('brokerUrl').addEventListener('keydown', e => {
       if (e.key === 'Enter') doConnect();
     });
 
@@ -2837,9 +2837,9 @@
       }
     });
 
-    // Auto-fill form and auto-connect if served from bridge (HTTP/HTTPS).
+    // Auto-fill form and auto-connect if served from broker (HTTP/HTTPS).
     if (window.location.protocol.startsWith('http')) {
-      document.getElementById('bridgeUrl').value = window.location.origin;
+      document.getElementById('brokerUrl').value = window.location.origin;
       doConnect();
     }
   </script>

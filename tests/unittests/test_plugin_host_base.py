@@ -76,9 +76,9 @@ class TestResolvePluginNames:
 
 class TestExpandSpecialTokens:
 
-    def _app(self, *, is_bridge=False):
+    def _app(self, *, is_broker=False):
         app = FastAPI()
-        app.state.is_bridge = is_bridge
+        app.state.is_broker = is_broker
         return app
 
     def test_all_expands_to_full_registry(self):
@@ -86,9 +86,9 @@ class TestExpandSpecialTokens:
         out = _expand_special_tokens(['all'], app, ['psij', 'sysinfo'])
         assert out == ['psij', 'sysinfo']
 
-    def test_default_for_bridge(self, monkeypatch):
-        app = self._app(is_bridge=True)
-        # bridge default is ['iri*', 'staging', 'sysinfo']
+    def test_default_for_broker(self, monkeypatch):
+        app = self._app(is_broker=True)
+        # broker default is ['iri*', 'staging', 'sysinfo']
         out = _expand_special_tokens(['default'], app,
                                      ['iri_connect', 'staging', 'sysinfo', 'psij'])
         assert out == ['iri_connect', 'staging', 'sysinfo']
@@ -126,7 +126,7 @@ class TestExpandSpecialTokens:
 
     def test_default_role_table_complete(self):
         """Sanity: every advertised role has a default set."""
-        for role in ('bridge', 'login', 'compute', 'standalone'):
+        for role in ('broker', 'login', 'compute', 'standalone'):
             assert role in DEFAULT_PLUGINS_BY_ROLE
 
 
@@ -150,7 +150,7 @@ class _TestHost(PluginHostBase):
         self._app               = app
         self._plugins           = {}
         self._announce_called   = 0
-        self._app.state.is_bridge = False
+        self._app.state.is_broker = False
 
     async def _announce_topology(self):
         self._announce_called += 1

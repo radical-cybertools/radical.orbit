@@ -206,11 +206,11 @@ from radical.orbit.plugin_xgfabric import (
 
 
 def test_dict_to_resource_config_basic():
-    d = {"name": "test", "bridge_url": "https://host:9000"}
+    d = {"name": "test", "broker_url": "https://host:9000"}
     cfg = dict_to_resource_config(d)
     assert isinstance(cfg, ResourceConfig)
     assert cfg.name == "test"
-    assert cfg.bridge_url == "https://host:9000"
+    assert cfg.broker_url == "https://host:9000"
 
 
 def test_dict_to_resource_config_unknown_fields_ignored():
@@ -223,7 +223,7 @@ def test_dict_to_resource_config_unknown_fields_ignored():
 def test_dict_to_resource_config_defaults():
     cfg = dict_to_resource_config({})
     assert cfg.name == "default"
-    assert cfg.bridge_cert is None
+    assert cfg.broker_cert is None
 
 
 def test_dict_to_config_basic():

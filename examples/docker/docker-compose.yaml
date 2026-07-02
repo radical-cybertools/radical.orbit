@@ -7,16 +7,16 @@ x-common-build: &common-build
       RADICAL_ORBIT_BRANCH: ${RADICAL_ORBIT_BRANCH:-master}
 
 services:
-  bridge:
+  broker:
     <<: *common-build
     build:
       args:
-        GENERATE_BRIDGE_CERT: "true"
-        BRIDGE_IP: "127.0.0.1"
-        BRIDGE_HOSTNAME: ${RADICAL_ORBIT_BRIDGE_HOSTNAME:-bridge}
-    container_name: radical-orbit-bridge
-    hostname: ${RADICAL_ORBIT_BRIDGE_HOSTNAME:-bridge}
-    command: [ "radical-orbit-bridge.py" ]
+        GENERATE_BROKER_CERT: "true"
+        BROKER_IP: "127.0.0.1"
+        BROKER_HOSTNAME: ${RADICAL_ORBIT_BROKER_HOSTNAME:-broker}
+    container_name: radical-orbit-broker
+    hostname: ${RADICAL_ORBIT_BROKER_HOSTNAME:-broker}
+    command: [ "radical-orbit-broker.py" ]
     healthcheck:
       test:
         - CMD-SHELL
@@ -37,36 +37,36 @@ services:
     <<: *common-build
     build:
       args:
-        GENERATE_BRIDGE_CERT: "false"
+        GENERATE_BROKER_CERT: "false"
     container_name: radical-orbit-endpoint
     hostname: endpoint
     environment:
-      - RADICAL_ORBIT_BRIDGE_URL=https://${RADICAL_ORBIT_BRIDGE_HOSTNAME:-bridge}:8000
+      - RADICAL_ORBIT_BROKER_URL=https://${RADICAL_ORBIT_BROKER_HOSTNAME:-broker}:8000
     command: [ "radical-orbit-endpoint.py" ]
     volumes:
       - radical-orbit-volume:/app:ro
     networks:
       - radical-orbit-network
     depends_on:
-      bridge:
+      broker:
         condition: service_healthy
 
   client:
     <<: *common-build
     build:
       args:
-        GENERATE_BRIDGE_CERT: "false"
+        GENERATE_BROKER_CERT: "false"
     container_name: radical-orbit-client
     hostname: client
     environment:
-      - RADICAL_ORBIT_BRIDGE_URL=https://${RADICAL_ORBIT_BRIDGE_HOSTNAME:-bridge}:8000
+      - RADICAL_ORBIT_BROKER_URL=https://${RADICAL_ORBIT_BROKER_HOSTNAME:-broker}:8000
     command: [ "tail", "-f", "/dev/null" ]
     volumes:
       - radical-orbit-volume:/app:ro
     networks:
       - radical-orbit-network
     depends_on:
-      bridge:
+      broker:
         condition: service_healthy
       endpoint:
         condition: service_started

@@ -87,7 +87,7 @@ async def test_endpoint():
 
 
 # ---------------------------------------------------------------------------
-# host_role endpoint — exercises bridge / login / compute classification.
+# host_role endpoint — exercises broker / login / compute classification.
 #
 # Detection routes through batch_system.detect_batch_system(), which probes
 # the local PATH for ``squeue`` (SLURM) and ``qstat`` (PBS).  We patch
@@ -127,7 +127,7 @@ def _host_role(app: FastAPI) -> dict:
 
 
 def test_host_role_standalone(monkeypatch):
-    """No scheduler installed and not a bridge -> standalone (non-HPC host)."""
+    """No scheduler installed and not a broker -> standalone (non-HPC host)."""
     for v in ('SLURM_JOB_ID', 'PBS_JOBID'):
         monkeypatch.delenv(v, raising=False)
     with patch('shutil.which', return_value=None):
@@ -147,13 +147,13 @@ def test_host_role_login_slurm_no_alloc(monkeypatch):
                     'psij_executor': 'slurm', 'job_id': None}
 
 
-def test_host_role_bridge():
-    """When app.state.is_bridge is True, role is 'bridge'."""
+def test_host_role_broker():
+    """When app.state.is_broker is True, role is 'broker'."""
     app = FastAPI()
-    app.state.is_bridge = True
+    app.state.is_broker = True
     with patch('shutil.which', return_value=None):
         role = _host_role(app)
-    assert role['role'] == 'bridge'
+    assert role['role'] == 'broker'
 
 
 def test_host_role_compute_slurm(monkeypatch):

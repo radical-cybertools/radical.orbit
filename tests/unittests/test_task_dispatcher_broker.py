@@ -105,9 +105,9 @@ class _RunningBroker:
 @pytest.fixture
 def harness(self_signed, tmp_path, monkeypatch):
     from radical.orbit import utils
-    monkeypatch.setattr(utils, 'URL_FILE',   tmp_path / 'bridge.url')
-    monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'bridge.token')
-    monkeypatch.delenv('RADICAL_ORBIT_BRIDGE_TOKEN', raising=False)
+    monkeypatch.setattr(utils, 'URL_FILE',   tmp_path / 'broker.url')
+    monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'broker.token')
+    monkeypatch.delenv('RADICAL_ORBIT_BROKER_TOKEN', raising=False)
     # Keep the dispatcher's durable store off $HOME.
     monkeypatch.setattr(
         'radical.orbit.plugin_task_dispatcher._DEFAULT_STATE_ROOT',

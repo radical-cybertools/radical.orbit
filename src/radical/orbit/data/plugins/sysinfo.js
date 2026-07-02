@@ -35,7 +35,7 @@ export function css() {
       color: var(--muted);
       border: 1px solid var(--border, #ccc);
     }
-    .sysinfo-role-badge.role-bridge     { background: #eef; color: #335; border-color: #ccd; }
+    .sysinfo-role-badge.role-broker     { background: #eef; color: #335; border-color: #ccd; }
     .sysinfo-role-badge.role-login      { background: #efe; color: #353; border-color: #cdc; }
     .sysinfo-role-badge.role-compute    { background: #fee; color: #533; border-color: #dcc; }
     .sysinfo-role-badge.role-standalone { background: #f5f0e0; color: #553; border-color: #ddc; }
@@ -109,7 +109,7 @@ async function loadHostRole(page, api) {
   try {
     const r = await api.fetch('host_role');
     const role = r.role || '?';
-    const icon = role === 'bridge'     ? '🌐'
+    const icon = role === 'broker'     ? '🌐'
               : role === 'compute'    ? '⚙️'
               : role === 'login'      ? '🖥'
               : role === 'standalone' ? '🧰'

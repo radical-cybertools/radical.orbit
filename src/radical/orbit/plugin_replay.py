@@ -351,7 +351,7 @@ class PluginReplay(Plugin):
         disabled when the tap is absent (e.g. a host with no ``broker_tap``).
         '''
         from .utils import host_role
-        if host_role(app)['role'] != 'bridge':
+        if host_role(app)['role'] != 'broker':
             return False
         return getattr(app.state, 'broker_tap', None) is not None
 

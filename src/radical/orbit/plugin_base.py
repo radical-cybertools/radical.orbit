@@ -66,7 +66,7 @@ class Plugin(object):
     Notifications
     -------------
     Plugins can send real-time notifications to clients via Server-Sent Events (SSE).
-    The notification flow is: Session -> Plugin -> EndpointService -> Bridge -> SSE clients.
+    The notification flow is: Session -> Plugin -> EndpointService -> Broker -> SSE clients.
 
     **Sending notifications from a session:**
 
@@ -98,7 +98,7 @@ class Plugin(object):
         import sseclient
         import requests
 
-        response = requests.get('http://bridge:8000/events', stream=True)
+        response = requests.get('http://broker:8000/events', stream=True)
         client = sseclient.SSEClient(response)
         for event in client.events():
             msg = json.loads(event.data)
@@ -210,10 +210,10 @@ class Plugin(object):
     # helper so the role / scheduler / executor decision lives in
     # exactly one place (utils.host_role).
     @property
-    def is_bridge(self) -> bool:
-        """True when this plugin is hosted on the bridge (not on an endpoint)."""
+    def is_broker(self) -> bool:
+        """True when this plugin is hosted on the broker (not on an endpoint)."""
         from .utils import host_role
-        return host_role(self._app)['role'] == 'bridge'
+        return host_role(self._app)['role'] == 'broker'
 
     @property
     def is_compute_node(self) -> bool:
@@ -638,14 +638,14 @@ class Plugin(object):
 
         Checked *before* instantiation so no routes are registered when the
         plugin is not applicable.  Override in subclasses to gate on host type
-        (bridge vs endpoint) or runtime conditions (e.g. scheduler presence).
+        (broker vs endpoint) or runtime conditions (e.g. scheduler presence).
         Default: always load.
         """
         return True
 
     async def send_notification(self, topic: str, data: dict):
         """
-        Broadcast a UI event over the bridge SSE channels.
+        Broadcast a UI event over the broker SSE channels.
         Depends on `app.state.endpoint_service` having been injected by EndpointService.
         """
         endpoint_svc = getattr(self._app.state, "endpoint_service", None)

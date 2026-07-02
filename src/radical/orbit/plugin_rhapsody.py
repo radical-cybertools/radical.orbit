@@ -855,7 +855,7 @@ class RhapsodyClient(PluginClient):
         blocks until a ``session_status`` SSE notification confirms
         that the session is ready (or until *init_timeout* seconds).
 
-        Falls back to polling when no ``BridgeClient`` is available.
+        Falls back to polling when no event subscription is available.
 
         Args:
             backends: List of backend names (e.g. ``['dragon_v3']``).
@@ -1174,7 +1174,7 @@ class RhapsodyClient(PluginClient):
         ``self._completed``.  This method checks the accumulator and
         blocks only until every requested UID appears there.
 
-        Falls back to periodic polling when no ``BridgeClient`` is
+        Falls back to periodic polling when no event subscription is
         available (e.g. direct construction in tests).
 
         Args:
@@ -1408,7 +1408,7 @@ class PluginRhapsody(Plugin):
     def is_enabled(cls, app: FastAPI) -> bool:
         """Rhapsody loads on compute nodes (inside an allocation) and on
         standalone hosts (no batch system at all).  Both can host Dragon
-        workers; bridges and login nodes deliberately don't load Rhapsody.
+        workers; brokers and login nodes deliberately don't load Rhapsody.
         """
         from .utils import host_role
         return host_role(app)['role'] in ('compute', 'standalone')

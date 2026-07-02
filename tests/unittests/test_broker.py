@@ -63,8 +63,8 @@ def make_broker(self_signed, tmp_path, monkeypatch):
     they own the loop; TestClient tests let the app lifespan do it.
     """
     from radical.orbit import utils
-    monkeypatch.setattr(utils, 'URL_FILE',   tmp_path / 'bridge.url')
-    monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'bridge.token')
+    monkeypatch.setattr(utils, 'URL_FILE',   tmp_path / 'broker.url')
+    monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'broker.token')
 
     cert, key = self_signed
 

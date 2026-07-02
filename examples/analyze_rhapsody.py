@@ -2,7 +2,7 @@
 """
 Analyze Rhapsody plugin profiling from radical.prof files.
 
-Reads client.prof, bridge.prof, endpoint.prof from a directory, extracts
+Reads client.prof, broker.prof, endpoint.prof from a directory, extracts
 Rhapsody-specific profiling events, and reports per-phase latency
 statistics with dedicated plots.
 
@@ -48,7 +48,7 @@ TASK_PHASES = [
 
 def _load_profiles(prof_dir):
     """Find and load .prof files, return combined timeline."""
-    patterns = ['client.prof', 'client.task.prof', 'bridge.prof', 'endpoint.prof']
+    patterns = ['client.prof', 'client.task.prof', 'broker.prof', 'endpoint.prof']
     prof_files = []
     for pat in patterns:
         found = glob.glob(os.path.join(prof_dir, pat))

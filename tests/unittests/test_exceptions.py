@@ -7,7 +7,7 @@ from radical.orbit.exceptions import (
     EndpointError,
     SessionError, SessionNotFoundError, SessionClosedError, SessionExpiredError,
     PluginError, PluginNotFoundError, PluginInitializationError,
-    ResourceNotFoundError, ConnectionError, BridgeConnectionError,
+    ResourceNotFoundError, ConnectionError, BrokerConnectionError,
     EndpointDisconnectedError, ValidationError, TimeoutError,
     exception_to_http_status
 )
@@ -88,16 +88,16 @@ class TestResourceErrors:
 class TestConnectionErrors:
     """Tests for connection-related errors."""
 
-    def test_bridge_connection_error_basic(self):
-        """Test BridgeConnectionError without reason."""
-        exc = BridgeConnectionError("http://localhost:8000")
+    def test_broker_connection_error_basic(self):
+        """Test BrokerConnectionError without reason."""
+        exc = BrokerConnectionError("http://localhost:8000")
         assert exc.url == "http://localhost:8000"
         assert exc.reason is None
-        assert exc.code == "BRIDGE_CONNECTION_FAILED"
+        assert exc.code == "BROKER_CONNECTION_FAILED"
 
-    def test_bridge_connection_error_with_reason(self):
-        """Test BridgeConnectionError with reason."""
-        exc = BridgeConnectionError("http://localhost:8000", "Connection refused")
+    def test_broker_connection_error_with_reason(self):
+        """Test BrokerConnectionError with reason."""
+        exc = BrokerConnectionError("http://localhost:8000", "Connection refused")
         assert exc.reason == "Connection refused"
         assert "Connection refused" in str(exc)
 
@@ -174,9 +174,9 @@ class TestExceptionToHttpStatus:
         exc = TimeoutError("op", 10.0)
         assert exception_to_http_status(exc) == 504
 
-    def test_bridge_connection_maps_to_503(self):
-        """Test BridgeConnectionError maps to 503."""
-        exc = BridgeConnectionError("url")
+    def test_broker_connection_maps_to_503(self):
+        """Test BrokerConnectionError maps to 503."""
+        exc = BrokerConnectionError("url")
         assert exception_to_http_status(exc) == 503
 
     def test_endpoint_disconnected_maps_to_503(self):

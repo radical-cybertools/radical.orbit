@@ -12,11 +12,11 @@ from radical.orbit.plugin_host_base import PluginHostBase
 from radical.orbit.dispatch         import RequestShim, match_route
 from radical.orbit.ui_schema        import ui_config_to_dict
 
-log = logging.getLogger("radical.orbit.bridge")
+log = logging.getLogger("radical.orbit.broker")
 
 
-class BridgePluginHost(PluginHostBase):
-    """Lightweight plugin host for running plugins directly on the bridge.
+class BrokerPluginHost(PluginHostBase):
+    """Lightweight plugin host for running plugins directly on the broker.
 
     Satisfies the ``Plugin`` contract (``app.state.endpoint_service`` with a
     ``send_notification`` method) without the WebSocket / reconnection
@@ -25,9 +25,9 @@ class BridgePluginHost(PluginHostBase):
 
     def __init__(self, plugin_names        : List[str],
                        broadcast_fn        : Callable,
-                       endpoint_name           : str      = 'bridge',
+                       endpoint_name           : str      = 'broker',
                        on_topology_changed : Optional[Callable] = None,
-                       bridge_url          : str      = '',
+                       broker_url          : str      = '',
                        broker_caller       : Any      = None,
                        broker_tap          : Optional[Callable] = None):
 
@@ -37,17 +37,16 @@ class BridgePluginHost(PluginHostBase):
         self._plugins             : Dict[str, Plugin] = {}
 
         # Internal FastAPI app — plugins register routes here.
-        # bridge_url is the bridge's own loopback-reachable URL so that
-        # bridge-hosted plugins (e.g. task_dispatcher) can construct a
-        # BridgeClient pointing at this same bridge for cross-endpoint calls.
-        self._app = FastAPI(title='Bridge Plugin Host')
+        # broker_url is the broker's own loopback-reachable URL, exposed to
+        # broker-hosted plugins (e.g. task_dispatcher) that need it.
+        self._app = FastAPI(title='Broker Plugin Host')
         self._app.state.endpoint_service = self
         self._app.state.endpoint_name    = endpoint_name
-        self._app.state.bridge_url   = bridge_url
-        self._app.state.is_bridge    = True
+        self._app.state.broker_url   = broker_url
+        self._app.state.is_broker    = True
         # Broker seam for broker-hosted plugins (task_dispatcher): the in-process
-        # caller handle and the raw event tap.  Absent (None) under the old
-        # ``bridge.py`` construction — a broker-only plugin must refuse cleanly.
+        # caller handle and the raw event tap.  When absent (None) a broker-only
+        # plugin must refuse cleanly.
         self._app.state.broker_caller = broker_caller
         self._app.state.broker_tap    = broker_tap
 
@@ -70,8 +69,8 @@ class BridgePluginHost(PluginHostBase):
         """Broadcast topology update to all SSE clients.
 
         Uses the ``on_topology_changed`` callback if provided (allows the
-        bridge script to update its global state and broadcast the full
-        topology).  Falls back to a direct SSE broadcast of the bridge's
+        broker script to update its global state and broadcast the full
+        topology).  Falls back to a direct SSE broadcast of the broker's
         own topology info.
         """
         try:
@@ -81,7 +80,7 @@ class BridgePluginHost(PluginHostBase):
                 await self._broadcast_fn('topology',
                                          self.get_topology_info())
         except Exception as exc:
-            log.warning('[BridgePluginHost] Topology broadcast failed: %s', exc)
+            log.warning('[BrokerPluginHost] Topology broadcast failed: %s', exc)
 
     # ------------------------------------------------------------------
     # notification shim  (called by Plugin.send_notification)
@@ -97,7 +96,7 @@ class BridgePluginHost(PluginHostBase):
                 'data'  : data,
             })
         except Exception as e:
-            log.warning('[BridgePluginHost] Notification send failed: %s', e)
+            log.warning('[BrokerPluginHost] Notification send failed: %s', e)
 
     # ------------------------------------------------------------------
     # route dispatch
@@ -128,7 +127,7 @@ class BridgePluginHost(PluginHostBase):
         except HTTPException:
             raise
         except Exception as e:
-            log.exception('[BridgePluginHost] Handler error: %s %s', method, path)
+            log.exception('[BrokerPluginHost] Handler error: %s %s', method, path)
             raise HTTPException(status_code=500, detail=str(e)) from e
 
         if hasattr(result, 'status_code'):
@@ -141,7 +140,7 @@ class BridgePluginHost(PluginHostBase):
 
     def get_topology_info(self) -> dict:
         return {
-            'endpoint': {'type': 'radical.orbit.bridge'},
+            'endpoint': {'type': 'radical.orbit.broker'},
             'plugins' : {
                 pname: {
                     'type'     : pname,
@@ -160,7 +159,7 @@ class BridgePluginHost(PluginHostBase):
             try:
                 await plugin.on_topology_change(endpoints)
             except Exception as e:
-                log.warning('[BridgePluginHost] %s topology handler failed: %s',
+                log.warning('[BrokerPluginHost] %s topology handler failed: %s',
                             pname, e)
 
     # ------------------------------------------------------------------
@@ -177,7 +176,7 @@ class BridgePluginHost(PluginHostBase):
                     with open(ui_path, encoding='utf-8') as fh:
                         modules[pname] = fh.read()
                 except Exception:
-                    log.warning('[BridgePluginHost] Could not read ui_module '
+                    log.warning('[BrokerPluginHost] Could not read ui_module '
                                 'for %s: %s', pname, ui_path)
         return modules
 

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """End-to-end notification reproducer that runs entirely on localhost.
 
-Spawns a bridge + a single endpoint as subprocesses, submits one tiny job
+Spawns a broker + a single endpoint as subprocesses, submits one tiny job
 through the ``psij`` plugin (``local`` executor), and asserts that a
-terminal ``job_status`` notification reaches the BridgeClient via SSE
+terminal ``job_status`` notification reaches the BrokerClient via SSE
 within a small timeout.
 
 The point is to exercise the full Plugin -> EndpointService.send_notification
--> WS -> Bridge._broadcast_event -> SSE -> BridgeClient._listen_sse
+-> WS -> Broker._broadcast_event -> SSE -> BrokerClient._listen_sse
 -> registered-callback path on a single machine, with no Dragon, no
 SLURM, no tunnel — so a regression in that path can be reproduced and
 bisected in seconds rather than minutes.
@@ -32,7 +32,7 @@ from pathlib import Path
 
 
 REPO_ROOT  = Path(__file__).resolve().parents[2]
-BIN_BRIDGE = REPO_ROOT / 'bin' / 'radical-orbit-bridge.py'
+BIN_BROKER = REPO_ROOT / 'bin' / 'radical-orbit-broker.py'
 BIN_ENDPOINT   = REPO_ROOT / 'bin' / 'radical-orbit-endpoint.py'
 
 ENDPOINT_NAME       = 'test-endpoint-local'
@@ -76,7 +76,7 @@ def _drain(stream, prefix: str) -> threading.Thread:
 
 def _make_self_signed(certdir: Path) -> tuple:
     """Generate a one-shot self-signed cert+key for the test.  openssl is
-    a hard requirement on every host that runs the bridge anyway, so
+    a hard requirement on every host that runs the broker anyway, so
     this doesn't add a new dep."""
     cert = certdir / 'cert.pem'
     key  = certdir / 'key.pem'
@@ -95,23 +95,23 @@ def run_test() -> int:
     cert_path, key_path = str(cert), str(key)
 
     port = _free_port()
-    bridge_url = f'https://localhost:{port}'
+    broker_url = f'https://localhost:{port}'
     # Sanitize env: strip inherited RADICAL_* vars that might point at a
-    # different bridge / cert from a previous unrelated session.
+    # different broker / cert from a previous unrelated session.
     env = {k: v for k, v in os.environ.items() if not k.startswith('RADICAL_')}
     env.update(
-        RADICAL_ORBIT_BRIDGE_URL=bridge_url,
-        RADICAL_ORBIT_BRIDGE_CERT=cert_path,
+        RADICAL_ORBIT_BROKER_URL=broker_url,
+        RADICAL_ORBIT_BROKER_CERT=cert_path,
         RADICAL_ORBIT_LOG_LVL='DEBUG',
     )
 
-    bridge_proc = subprocess.Popen(
-        [sys.executable, str(BIN_BRIDGE),
+    broker_proc = subprocess.Popen(
+        [sys.executable, str(BIN_BROKER),
          '--host', 'localhost', '--port', str(port),
          '--cert', cert_path, '--key', key_path,
-         '--plugins', ''],   # bridge needs no plugins for this test
+         '--plugins', ''],   # broker needs no plugins for this test
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    _drain(bridge_proc.stdout, 'bridge')
+    _drain(broker_proc.stdout, 'broker')
 
     endpoint_proc = None
     client = None
@@ -121,7 +121,7 @@ def run_test() -> int:
         endpoint_proc = subprocess.Popen(
             [sys.executable, str(BIN_ENDPOINT),
              '--name', ENDPOINT_NAME,
-             '--url', bridge_url,
+             '--url', broker_url,
              '--plugins', 'psij',
              '--log-level', 'DEBUG'],
             env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -130,7 +130,7 @@ def run_test() -> int:
         # Late imports so logging picks up the env above.
         from radical.orbit import EndpointRuntime
 
-        client = EndpointRuntime(broker_url=bridge_url, cert=cert_path)
+        client = EndpointRuntime(broker_url=broker_url, cert=cert_path)
         client.start(wait=True)
         logging.getLogger('radical.orbit').setLevel(logging.DEBUG)
         logging.getLogger('radical.orbit.runtime').setLevel(logging.DEBUG)
@@ -197,7 +197,7 @@ def run_test() -> int:
                 client.stop()
         except Exception:
             pass
-        for proc, name in ((endpoint_proc, 'endpoint'), (bridge_proc, 'bridge')):
+        for proc, name in ((endpoint_proc, 'endpoint'), (broker_proc, 'broker')):
             if proc and proc.poll() is None:
                 proc.terminate()
                 try:

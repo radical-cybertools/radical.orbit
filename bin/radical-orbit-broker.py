@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Thin entry point for the ORBIT Bridge.
+"""Thin entry point for the ORBIT Broker.
 
 All logic lives in :class:`radical.orbit.broker.Broker` — the active hub of the
-participant star (routing loop + own-thread plugin host).  This script keeps its
-bridge-era filename and CLI surface; only the implementation behind it flips.
-The HTTP/SSE/Explorer compat tier is the broker's ``gateway`` module, on by
-default (``--no-gateway`` for a headless broker).
+participant star (routing loop + own-thread plugin host).  The HTTP/SSE/Explorer
+compat tier is the broker's ``gateway`` module, on by default (``--no-gateway``
+for a headless broker).
 """
 
 import argparse
@@ -17,13 +16,13 @@ from radical.orbit.broker import Broker
 
 
 def main():
-    parser = argparse.ArgumentParser(description='ORBIT Bridge')
+    parser = argparse.ArgumentParser(description='ORBIT Broker')
     parser.add_argument('--cert', default=None,
-                        help='TLS cert path.  CLI > $RADICAL_ORBIT_BRIDGE_CERT > '
-                             '~/.radical/orbit/bridge_cert.pem.')
+                        help='TLS cert path.  CLI > $RADICAL_ORBIT_BROKER_CERT > '
+                             '~/.radical/orbit/broker_cert.pem.')
     parser.add_argument('--key', default=None,
-                        help='TLS key path.  CLI > $RADICAL_ORBIT_BRIDGE_KEY > '
-                             '~/.radical/orbit/bridge_key.pem.  Refuses to '
+                        help='TLS key path.  CLI > $RADICAL_ORBIT_BROKER_KEY > '
+                             '~/.radical/orbit/broker_key.pem.  Refuses to '
                              'start if the file is more permissive than '
                              '0o600.')
     parser.add_argument('--host', default='0.0.0.0',
@@ -41,13 +40,13 @@ def main():
                              'supported. Combine, e.g.: "-p default,rose".')
     parser.add_argument('--token', default=None,
                         help='Shared ingress auth token.  CLI > '
-                             '$RADICAL_ORBIT_BRIDGE_TOKEN > '
-                             '~/.radical/orbit/bridge.token.  If none is set, '
+                             '$RADICAL_ORBIT_BROKER_TOKEN > '
+                             '~/.radical/orbit/broker.token.  If none is set, '
                              'one is generated and written to that file '
                              '(mode 0600) at startup.')
     parser.add_argument('--no-auth', action='store_true',
                         help='Disable ingress authentication (local dev only). '
-                             'Also via $RADICAL_ORBIT_BRIDGE_NO_AUTH=1.')
+                             'Also via $RADICAL_ORBIT_BROKER_NO_AUTH=1.')
     parser.add_argument('--no-gateway', action='store_true',
                         help='Run a headless broker: only the token-gated '
                              'WebSocket /register ingress, no HTTP/SSE/Explorer '
@@ -58,7 +57,7 @@ def main():
                       or os.environ.get('RADICAL_LOG_LVL') or 'INFO').upper()
     level = getattr(logging, log_level_name, logging.INFO)
     log_file = (os.environ.get('RADICAL_ORBIT_LOG_FILE')
-                or os.path.expanduser('~/.radical/orbit/logs/bridge.log'))
+                or os.path.expanduser('~/.radical/orbit/logs/broker.log'))
     _lc.configure_logging(level, log_file=log_file)
     logging.getLogger('radical.orbit').info(
         "Log level: %s; log file: %s", log_level_name, log_file)

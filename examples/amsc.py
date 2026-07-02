@@ -10,7 +10,7 @@ Architecture
         │  HTTPS / WebSocket
         ▼
    ╔══════════╗      ┌── pre-existing endpoint   (HPC compute node, ready to run)
-   ║  Bridge  ║─────►├── pre-existing endpoint   (HPC login node, runs PsiJ)
+   ║  Broker  ║─────►├── pre-existing endpoint   (HPC login node, runs PsiJ)
    ╚══════════╝      ├── new endpoint ★          (spawned via IRI)
                      └── new endpoint ★          (spawned via PsiJ ↦ submit_tunneled)
 
@@ -53,9 +53,9 @@ IRI bearer tokens are read locally and live at::
     ~/.amsc/token_nersc
     ~/.amsc/token_olcf
 
-The script reads them from disk and sends them to the bridge once at
-``iri_connect.connect()`` time.  The bridge holds them in process memory
-only — they are never written to disk on the bridge side.
+The script reads them from disk and sends them to the broker once at
+``iri_connect.connect()`` time.  The broker holds them in process memory
+only — they are never written to disk on the broker side.
 """
 
 import asyncio
@@ -372,9 +372,9 @@ MACHINE_DEFAULTS = {
 #  ``ve/bin/radical-orbit-endpoint-wrapper.sh``.  Defaults to ``.amsc``; override
 #  per target via the ``amsc_dir`` field in IRI_DEFAULTS / MACHINE_DEFAULTS.
 #
-#  Bridge cert is no longer plumbed by this script — child endpoints
+#  Broker cert is no longer plumbed by this script — child endpoints
 #  resolve it via radical.orbit's CLI > env > file precedence (default
-#  file path: ``~/.radical/orbit/bridge_cert.pem`` on each target).
+#  file path: ``~/.radical/orbit/broker_cert.pem`` on each target).
 #
 #  Why not pass ``~/.amsc/...`` and let bash expand it?  PsiJ's
 #  ``single_launch.sh`` quotes the executable arg, so the literal ``~``
@@ -499,9 +499,9 @@ def _make_progress(n_matey, n_infer, n_gkeyll):
 #  Steps:
 #    1. Read the bearer token from ~/.amsc/token_<endpoint>.
 #    2. iri_connect.connect(...) — creates a dynamic iri.<endpoint> plugin
-#       on the bridge and returns an IRIInstanceClient bound to it.
+#       on the broker and returns an IRIInstanceClient bound to it.
 #    3. Submit a job whose executable is radical-orbit-endpoint-wrapper.sh.  The job
-#       will WS-connect back to the bridge; if --tunnel is set, the child
+#       will WS-connect back to the broker; if --tunnel is set, the child
 #       opens an outbound SSH tunnel to ``login_host`` first.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -529,7 +529,7 @@ def read_token(endpoint):
     return token
 
 
-def launch_iri(bc, endpoint, cfg, bridge_url):
+def launch_iri(bc, endpoint, cfg, broker_url):
     """Connect to the IRI endpoint and submit a job that starts an endpoint.
 
     Returns ``(iri_client, job_id, endpoint_name)`` so we can cancel later.
@@ -544,7 +544,7 @@ def launch_iri(bc, endpoint, cfg, bridge_url):
     COUNTERS[endpoint] += 1
 
     # Build the radical-orbit-endpoint.py CLI.  See bin/radical-orbit-endpoint.py.
-    args = ['--name', endpoint_name, '--url', bridge_url]
+    args = ['--name', endpoint_name, '--url', broker_url]
     if cfg['tunnel']:
         args += ['--tunnel', '--tunnel-via', cfg['login_host']]
 
@@ -574,10 +574,10 @@ def launch_iri(bc, endpoint, cfg, bridge_url):
     wrapper = f'{home}/{amsc}/ve/bin/radical-orbit-endpoint-wrapper.sh'
 
     # Cert resolution is delegated to the child endpoint: it falls back to
-    # ``~/.radical/orbit/bridge_cert.pem`` (or $RADICAL_ORBIT_BRIDGE_CERT if
-    # set on the target side).  We only inject the bridge URL — that
-    # changes per bridge run and the file fallback would be stale.
-    env = {'RADICAL_ORBIT_BRIDGE_URL': bridge_url}
+    # ``~/.radical/orbit/broker_cert.pem`` (or $RADICAL_ORBIT_BROKER_CERT if
+    # set on the target side).  We only inject the broker URL — that
+    # changes per broker run and the file fallback would be stale.
+    env = {'RADICAL_ORBIT_BROKER_URL': broker_url}
     env.update(cfg['environment'])
     # Site-specific shell snippet — module loads, env exports, etc.
     # The wrapper ``eval``s this *before* exec-ing dragon / python.
@@ -620,7 +620,7 @@ def launch_iri(bc, endpoint, cfg, bridge_url):
 #  spliced in.  ``submit_tunneled`` adds --tunnel / --tunnel-via to the
 #  child argv automatically per ``cfg['tunnel']``.
 # ─────────────────────────────────────────────────────────────────────────────
-def launch_psij(bc, endpoint_name, cfg, bridge_url):
+def launch_psij(bc, endpoint_name, cfg, broker_url):
     """Submit a child endpoint via the parent endpoint's PsiJ plugin."""
     psij = bc.get_plugin(endpoint_name, 'psij')
 
@@ -645,7 +645,7 @@ def launch_psij(bc, endpoint_name, cfg, bridge_url):
     # specific flags ride in ``custom_attributes`` keyed by
     # ``<executor>.<flag>`` (e.g. ``slurm.constraint`` -> ``--constraint=…``,
     # ``pbs.l`` -> ``-l …``).  Site defaults from BatchSystem are merged in
-    # bridge-side; this dict carries only what the caller explicitly set.
+    # broker-side; this dict carries only what the caller explicitly set.
     custom_attrs = {}
     if cfg.get('constraint'):
         custom_attrs[f'{cfg["executor"]}.constraint'] = cfg['constraint']
@@ -654,10 +654,10 @@ def launch_psij(bc, endpoint_name, cfg, bridge_url):
     if cfg.get('qos'):
         custom_attrs[f'{cfg["executor"]}.qos'] = cfg['qos']
     # Cert is left to the child endpoint to resolve from
-    # ``~/.radical/orbit/bridge_cert.pem`` on the target (or via
-    # $RADICAL_ORBIT_BRIDGE_CERT if explicitly set there).  Only the bridge
-    # URL — which changes per bridge run — is injected here.
-    env = {'RADICAL_ORBIT_BRIDGE_URL': bridge_url}
+    # ``~/.radical/orbit/broker_cert.pem`` on the target (or via
+    # $RADICAL_ORBIT_BROKER_CERT if explicitly set there).  Only the broker
+    # URL — which changes per broker run — is injected here.
+    env = {'RADICAL_ORBIT_BROKER_URL': broker_url}
     # Site-specific shell snippet — module loads, env exports, etc.
     # The wrapper ``eval``s this *before* exec-ing dragon / python.
     if cfg.get('setup'):
@@ -667,7 +667,7 @@ def launch_psij(bc, endpoint_name, cfg, bridge_url):
         'executable'        : wrapper,
         # ``--name`` is required by submit_tunneled; ``--tunnel`` and
         # ``--tunnel-via`` are appended for us when tunnel=True.
-        'arguments'         : ['--name', child_name, '--url', bridge_url],
+        'arguments'         : ['--name', child_name, '--url', broker_url],
         'attributes'        : attrs,
         'custom_attributes' : custom_attrs,
         # ``exclusive_node_use=True`` forces SLURM to allocate whole
@@ -700,7 +700,7 @@ def launch_psij(bc, endpoint_name, cfg, bridge_url):
 #
 #  We poll the broker's topology every few seconds and return the first
 #  expected name we see.  Polling is dumb but readable; for a demo this is
-#  better than wiring up an SSE callback bridge to asyncio.
+#  better than wiring up an SSE callback broker to asyncio.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _heartbeat_dot():
@@ -975,7 +975,7 @@ def _render_slicing(slicing_mode, slices, gpus_per_node, cores_per_node,
         _console.print(Padding(panel, (0, 0, 0, 2)))
 
 
-async def submit_rhapsody_workload(bridge_url, endpoint_name, cfg, nodelist):
+async def submit_rhapsody_workload(broker_url, endpoint_name, cfg, nodelist):
     """Submit the active task kinds (per ``KINDS``) via the named endpoint.
 
     All active kinds share one Session and run concurrently, each behind
@@ -1109,7 +1109,7 @@ async def submit_rhapsody_workload(bridge_url, endpoint_name, cfg, nodelist):
                     list(tasks_by_kind.keys()))
 
     backend = await rhapsody.get_backend(
-        'orbit', bridge_url=bridge_url, endpoint_name=endpoint_name)
+        'orbit', broker_url=broker_url, endpoint_name=endpoint_name)
 
     counts = {name: {'submitted': 0, 'done': 0, 'failed': 0}
               for name in tasks_by_kind}
@@ -1267,7 +1267,7 @@ def _step_configure(cfg):
          f'queue={cfg.get("queue_name", "?")}{qos_str}')
 
 
-def _step_run(bc, bridge_url, endpoint_name, cfg):
+def _step_run(bc, broker_url, endpoint_name, cfg):
     """Steps 6 + the actual workload run.
 
     Resolves the nodelist via the endpoint's queue_info plugin, prints the
@@ -1295,7 +1295,7 @@ def _step_run(bc, bridge_url, endpoint_name, cfg):
          f'gkeyll {N_GKEYLL_TASKS} (cap {slices["gkeyll"]["cap"]})')
     try:
         asyncio.run(submit_rhapsody_workload(
-            bridge_url, endpoint_name, cfg, nodelist))
+            broker_url, endpoint_name, cfg, nodelist))
     except Exception as exc:
         abort(f'workload failed: {exc}')
 
@@ -1319,7 +1319,7 @@ def _apply_cli_overrides(cfg, mode, n_nodes):
         cfg['slicing'] = VERTICAL_SLICING
 
 
-def _main_target(bc, bridge_url, kind, name,
+def _main_target(bc, broker_url, kind, name,
                  slicing_mode=None, n_nodes=None):
     """Run the workload against ``<kind>:<name>``.
 
@@ -1330,14 +1330,14 @@ def _main_target(bc, bridge_url, kind, name,
       - ``iri``     : submit via the named IRI endpoint
       - ``compute`` : re-use the named endpoint directly (no submission)
     """
-    step(1, 'connect broker', bridge_url)
+    step(1, 'connect broker', broker_url)
 
     live_endpoints = {n for n in bc.topology() if n != 'broker'}
     created    = []
 
     if kind == 'psij':
         if name not in live_endpoints:
-            abort(f"no endpoint {name!r} connected to bridge.  "
+            abort(f"no endpoint {name!r} connected to broker.  "
                   f"Start the parent endpoint first.")
         if name not in MACHINE_DEFAULTS:
             abort(f"no MACHINE_DEFAULTS entry for {name!r}")
@@ -1354,7 +1354,7 @@ def _main_target(bc, bridge_url, kind, name,
 
         try:
             try:
-                rec = launch_psij(bc, name, cfg, bridge_url)
+                rec = launch_psij(bc, name, cfg, broker_url)
             except Exception as exc:
                 abort(f'launch_psij failed: {exc}')
             created.append(rec)
@@ -1369,7 +1369,7 @@ def _main_target(bc, bridge_url, kind, name,
                 abort(f'wait_for_endpoint failed: {exc}')
             step(5, 'await child endpoint', f'up after {int(time.time() - t0)}s')
 
-            _step_run(bc, bridge_url, first, rec.get('cfg') or cfg)
+            _step_run(bc, broker_url, first, rec.get('cfg') or cfg)
         finally:
             step(7, 'teardown', f'cancelling {len(created)} psij job(s)')
             teardown(bc, created)
@@ -1389,7 +1389,7 @@ def _main_target(bc, bridge_url, kind, name,
 
         try:
             try:
-                rec = launch_iri(bc, name, cfg, bridge_url)
+                rec = launch_iri(bc, name, cfg, broker_url)
             except Exception as exc:
                 abort(f'launch_iri failed: {exc}')
             created.append(rec)
@@ -1404,14 +1404,14 @@ def _main_target(bc, bridge_url, kind, name,
                 abort(f'wait_for_endpoint failed: {exc}')
             step(5, 'await child endpoint', f'up after {int(time.time() - t0)}s')
 
-            _step_run(bc, bridge_url, first, rec.get('cfg') or cfg)
+            _step_run(bc, broker_url, first, rec.get('cfg') or cfg)
         finally:
             step(7, 'teardown', f'cancelling {len(created)} iri job(s)')
             teardown(bc, created)
 
     elif kind == 'compute':
         if name not in live_endpoints:
-            abort(f"no endpoint {name!r} connected to bridge")
+            abort(f"no endpoint {name!r} connected to broker")
         if 'rhapsody' not in bc.topology().get(name, {}).get('plugins', {}):
             abort(f"endpoint {name!r} has no rhapsody plugin")
         if name not in MACHINE_DEFAULTS:
@@ -1424,7 +1424,7 @@ def _main_target(bc, bridge_url, kind, name,
 
         step(4, 'submit child endpoint', 'reusing existing endpoint')
         step(5, 'await child endpoint',  'already up')
-        _step_run(bc, bridge_url, name, cfg)
+        _step_run(bc, broker_url, name, cfg)
         step(7, 'teardown',          'nothing to cancel')
 
 
@@ -1464,9 +1464,9 @@ def main():
     # (CLI > env > file).
     bc         = EndpointRuntime()
     bc.start(wait=True)
-    bridge_url = bc.broker_url
+    broker_url = bc.broker_url
     try:
-        _main_target(bc, bridge_url, kind, name,
+        _main_target(bc, broker_url, kind, name,
                      slicing_mode=slicing_mode, n_nodes=n_nodes)
     finally:
         bc.stop()

@@ -29,7 +29,7 @@
 
 ### Document Current State (24h)
 - Architecture doc (system design, data flow, security model, deployment topology)
-- API docs (Bridge endpoints, Endpoint endpoints, WebSocket protocol, plugin interface)
+- API docs (Broker endpoints, Endpoint endpoints, WebSocket protocol, plugin interface)
 - Code docs (inline docstrings, README, configuration reference)
 
 ### Stabilize & Test Current State (48h)

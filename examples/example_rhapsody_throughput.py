@@ -4,15 +4,15 @@ Example: Rhapsody Task Throughput Benchmark
 ===========================================
 
 Measures task throughput for different batch sizes using the Rhapsody
-Session/Task API with the Endpoint execution backend.  All bridge
-interactions are handled by the backend — no direct BridgeClient usage.
+Session/Task API with the Endpoint execution backend.  All broker
+interactions are handled by the backend — no direct BrokerClient usage.
 
 Runs two passes: one with identical (homogeneous) tasks and one with
 per-task arguments (heterogeneous) to compare template-compressed vs
 regular batched submit paths.
 
 Prerequisites:
-  - A ORBIT bridge is running (RADICAL_ORBIT_BRIDGE_URL set).
+  - A ORBIT broker is running (RADICAL_ORBIT_BROKER_URL set).
   - An endpoint service is connected with the Rhapsody plugin loaded.
   - The ``rhapsody`` package is installed on both client and endpoint.
 
@@ -133,14 +133,14 @@ async def main():
 
     # ---- set up Rhapsody session with Endpoint backend ---
     # Endpoint auto-discovery: ``get_backend('orbit')`` with no
-    # ``bridge_url`` / ``endpoint_name`` resolves the bridge URL via
+    # ``broker_url`` / ``endpoint_name`` resolves the broker URL via
     # radical.orbit.utils and selects the first connected endpoint
     # advertising the rhapsody plugin.  ``await backend`` raises
     # RuntimeError if no candidate is found.
     backend = rhapsody.get_backend('orbit', backends=['noop'])
     backend = await backend       # async init (registers remote session)
 
-    out(f"Bridge:  {backend._bridge_url}")
+    out(f"Broker:  {backend._broker_url}")
     out(f"Endpoint:    {backend._endpoint_name}")
     out(f"Batches: {batch_sizes}")
 

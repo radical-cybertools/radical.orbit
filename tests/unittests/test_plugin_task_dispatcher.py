@@ -76,7 +76,7 @@ def _make_plugin(tmp_path: Path, *, instance: str = 'task_dispatcher',
     """Instantiate a plugin bound to tmp_path; return (app, plugin)."""
     app = FastAPI()
     app.state.endpoint_name   = 'endpoint0'
-    app.state.bridge_url      = 'https://localhost:9999'
+    app.state.broker_url      = 'https://localhost:9999'
     app.state.broker_caller   = broker_caller
     app.state.broker_tap      = None
     plugin = PluginTaskDispatcher(
@@ -113,12 +113,12 @@ def _pool(plugin, sid, name='cpu') -> PoolState:
 
 class TestInit:
 
-    def test_is_enabled_on_bridge(self):
+    def test_is_enabled_on_broker(self):
         with patch('radical.orbit.utils.host_role') as m:
-            m.return_value = {'role': 'bridge'}
+            m.return_value = {'role': 'broker'}
             assert PluginTaskDispatcher.is_enabled(FastAPI()) is True
 
-    def test_is_enabled_false_off_bridge(self):
+    def test_is_enabled_false_off_broker(self):
         with patch('radical.orbit.utils.host_role') as m:
             for role in ('login', 'compute', 'standalone'):
                 m.return_value = {'role': role}
