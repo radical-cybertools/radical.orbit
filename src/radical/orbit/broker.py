@@ -179,7 +179,8 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
                  event_queue:       int   = 1024,
                  frame_cap:         int   = protocol.FRAME_CAP,
                  clock:             Callable[[], float] = time.monotonic,
-                 watchdog_interval: float = 1.0):
+                 watchdog_interval: float = 1.0,
+                 gateway:           bool  = True):
 
         # ── TLS config ───────────────────────────────────────────────
         cert_path, _ = utils.resolve_bridge_cert(cli=cert)
@@ -210,6 +211,7 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
         self._clock             = clock
         self._watchdog_interval = watchdog_interval
         self._plugins_spec: str = plugins or ''
+        self._gateway_enabled   = gateway
 
         # ── Routing state (all touched only on the routing loop) ──────
         self.registry:       Dict[str, Any]         = {}   # name -> transport ws
@@ -217,6 +219,12 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
         self._liveness:      Dict[str, str]         = {}   # name -> present/...
         self._resume_keys:   Dict[str, str]         = {}   # name -> resume_key
         self._grace_timers:  Dict[str, Any]         = {}   # name -> TimerHandle
+
+        # Topology-change listeners (the one minimal seam the M5 gateway needs
+        # beyond tap/pending/caller: topology changes do not flow through the
+        # raw event tap).  Fired synchronously on the routing loop from
+        # ``_broadcast_topology``.
+        self._topology_listeners: List[Callable[[], None]] = []
 
         # Correlation: one broker-side pending table (src='broker') plus a
         # lightweight inflight forwarding table for grace-bounded fast-fail.
@@ -258,6 +266,16 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
         self._setup_middleware()
         self._register_routes()
 
+        # ── Gateway module ──────────────────────────────────────────
+        # On by default: build/attach the compat-tier HTTP/SSE/UI ingress onto
+        # this same app (single port, single uvicorn server).  ``gateway=False``
+        # is a headless broker (only the token-gated WS ``/register``).  Imported
+        # lazily so a broker import never hard-depends on the gateway module.
+        self._gateway = None
+        if self._gateway_enabled:
+            from .gateway import Gateway
+            self._gateway = Gateway(self)
+
     # ── public API / gateway seam ─────────────────────────────────────
 
     @property
@@ -289,6 +307,23 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
         callable.
         """
         return self._events.tap(callback)
+
+    def add_topology_listener(self, callback: Callable[[], None]
+                              ) -> Callable[[], None]:
+        """Register an in-process topology-change listener (gateway seam).
+
+        Called (with no arguments) on the **routing loop** whenever the topology
+        is (re)broadcast — a participant connecting, disconnecting, going
+        ``suspect``/``lost``, or a hosted-plugin change.  The listener reads
+        :meth:`topology_snapshot` itself.  Returns an unsubscribe callable.
+        """
+        self._topology_listeners.append(callback)
+
+        def _remove() -> None:
+            try:    self._topology_listeners.remove(callback)
+            except ValueError:
+                pass
+        return _remove
 
     def topology_snapshot(self) -> Dict[str, Dict[str, Any]]:
         """The current rich topology dict (gateway seam).
@@ -427,7 +462,11 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
     # ── middleware (token gate only — no CORS, that is the gateway's) ──
 
     def _setup_middleware(self) -> None:
-        if self._auth_enabled:
+        # When the gateway is attached it installs the fuller HTTP auth gate
+        # (with the Explorer's ``/`` + ``/plugins/*`` exemptions); the core's
+        # OPTIONS-only gate is only needed for a headless broker.  The WS
+        # ``/register`` gate is separate (inside the handler) regardless.
+        if self._auth_enabled and not self._gateway_enabled:
             self._app.add_middleware(BaseHTTPMiddleware,
                                      dispatch=self._auth_dispatch)
 
@@ -897,6 +936,11 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
         packed = self._build_topology_msg()
         for name, ws in list(self.registry.items()):
             await self._send(ws, packed)
+        # Notify in-process topology listeners (the gateway's SSE fan-out).
+        for cb in list(self._topology_listeners):
+            try:    cb()
+            except Exception as e:
+                log.error("[Broker] topology listener failed: %r", e, exc_info=e)
 
     # ── low-level helpers ─────────────────────────────────────────────
 
