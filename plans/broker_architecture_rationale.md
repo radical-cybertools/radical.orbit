@@ -585,7 +585,7 @@ value before the reframe, and keeps every merge reviewable.
   heartbeat-timeout floor (§3.7); and the **throughput gate** — the
   rhapsody-shaped submission + notification-storm benchmark on an emulated
   100 ms link, ≥ the current-stack baseline (§4). The whole campaign runs in a
-  **2-node Perlmutter allocation** (broker spike on the login node, Dragon on
+  **2-node HPC allocation** (broker spike on the login node, Dragon on
   compute; userspace delay proxy for the link — no root, so no `tc netem`),
   with one recorded caveat: 2-node GIL-hold numbers are a lower bound, so the
   heartbeat floor carries a margin and is re-validated at target scale before

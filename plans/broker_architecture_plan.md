@@ -262,12 +262,12 @@ atomic; merging needn't be.)
   `rh.Session(...)` be constructed off the main thread at all? (b) measure the
   **max GIL hold** during Dragon init and during large-frame
   `msgpack.unpackb`/cloudpickle loads — the pong-timeout floor sits above it.
-- **Environment (decided): the whole M0 campaign runs in a 2-node Perlmutter
+- **Environment (decided): the whole M0 campaign runs in a 2-node HPC
   allocation** — broker spike on the login node, endpoint + Dragon gates on
   compute (the forward-tunnel mode covers compute→login if arbitrary-port TCP
   is restricted, and gets exercised for free). Link emulation is the
   **userspace delay proxy** (~50 ms each way + token-bucket bandwidth cap) —
-  no root on Perlmutter, so no `tc netem`. Caveat recorded with the results:
+  no root on HPC, so no `tc netem`. Caveat recorded with the results:
   GIL-hold numbers at 2 nodes are a **lower bound** (`Batch(num_nodes=…)` cost
   grows with allocation size) — the heartbeat floor carries a safety margin
   and is re-validated at target scale before any aggressive profile ships.
