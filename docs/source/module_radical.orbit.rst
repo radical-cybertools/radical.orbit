@@ -49,7 +49,7 @@ Liveness is transport-level only (WebSocket keepalive); there is no app-level
 heartbeat kind.  A frame-size cap bounds each frame.
 
 Session lifecycle
-================
+=================
 
 A consumer opens a session on a plugin with ``register_session`` (create or
 reconnect), which selects a lifetime policy (``ephemeral`` / ``ttl`` /

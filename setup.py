@@ -169,6 +169,15 @@ class BuildScripts(_build_scripts):
 with open('%s/requirements.txt' % root, encoding='utf-8') as freq:
     requirements = freq.readlines()
 
+# docs/requirements.txt is also consumed by ReadTheDocs directly; mirror it
+# here so `pip install .[docs]` / `.[dev]` stay in sync with it.
+with open('%s/docs/requirements.txt' % root, encoding='utf-8') as fdoc:
+    doc_requirements = fdoc.readlines()
+
+test_requirements = ['pytest', 'pytest-asyncio']
+lint_requirements = ['flake8', 'pylint']
+dev_requirements  = test_requirements + lint_requirements + doc_requirements
+
 
 setup_args = {
     'name'               : name,
@@ -214,6 +223,12 @@ setup_args = {
                             'radical.orbit': ['data/*.html', 'data/*.json',
                                              'data/plugins/*.js']},
     'install_requires'   : requirements,
+    'extras_require'     : {
+        'test'               : test_requirements,
+        'lint'               : lint_requirements,
+        'docs'               : doc_requirements,
+        'dev'                : dev_requirements,
+    },
     'zip_safe'           : False,
     'data_files'         : data,
     'cmdclass'           : {'build_scripts' : BuildScripts},

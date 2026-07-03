@@ -328,7 +328,7 @@ timer; a ``present`` owner cancels it (a transient ``suspect`` never reclaims).
 Overriders that want that behavior call ``super()``.
 
 Plugin Shutdown
-==============
+===============
 
 Override ``shutdown`` for orderly teardown on host shutdown.  The base
 implementation cancels the background session-cleanup task and any pending
@@ -364,7 +364,7 @@ them with ``self._plugin._dispatch_notify(topic, data)`` — it is thread-safe a
 schedules the send on the main loop automatically.
 
 Testing Your Plugin
-==================
+====================
 
 Because ``add_route_post`` / ``add_route_get`` also register ASGI routes, a
 plugin can be exercised over HTTP with Starlette's ``TestClient``:

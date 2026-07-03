@@ -115,7 +115,7 @@ returns)::
     }}
 
 Plugin Base Routes
-=================
+==================
 
 Every plugin automatically registers these routes under its namespace
 (``/<endpoint_name>/<plugin_name>/`` through the proxy):

@@ -41,10 +41,12 @@ class Plugin(object):
     Subclasses that define a `plugin_name` class attribute will be
     automatically registered in the global plugin registry.
 
-    Subclasses must define:
+    Subclasses must define::
+
         session_class: The session class to instantiate (must inherit from PluginSession)
 
-    Subclasses may define:
+    Subclasses may define::
+
         client_class: The local helper class for the application-side client.
         version: The version string for the plugin.
         session_ttl: Session timeout in seconds (default: 3600 = 1 hour, 0 = no timeout)
@@ -66,10 +68,12 @@ class Plugin(object):
 
     Notifications
     -------------
-    Plugins can send real-time notifications to clients via Server-Sent Events (SSE).
-    The notification flow is: Session -> Plugin -> EndpointService -> Broker -> SSE clients.
+    Plugins send real-time notifications to consumers as ``event`` frames, and to
+    HTTP clients over Server-Sent Events via the gateway.  The flow is: Session
+    -> Plugin -> participant runtime -> Broker -> subscribed consumers (and the
+    gateway's SSE fan-out).
 
-    **Sending notifications from a session:**
+    Sending notifications from a session::
 
         # In your PluginSession subclass method:
         if self._plugin:
@@ -78,12 +82,12 @@ class Plugin(object):
     The `_plugin` reference is automatically injected into sessions by the plugin.
     `_dispatch_notify` works from both sync and async contexts, including background threads.
 
-    **Sending notifications from a plugin:**
+    Sending notifications from a plugin::
 
         # In your Plugin subclass method:
         await self.send_notification("my_topic", {"key": "value"})
 
-    **Subscribing to notifications (browser/JavaScript):**
+    Subscribing to notifications (browser/JavaScript)::
 
         const eventSource = new EventSource('/events');
         eventSource.onmessage = (event) => {
@@ -94,7 +98,7 @@ class Plugin(object):
             }
         };
 
-    **Subscribing to notifications (Python client):**
+    Subscribing to notifications (Python client)::
 
         import sseclient
         import requests
@@ -111,7 +115,7 @@ class Plugin(object):
     The serving runtime delivers the rich topology (``name -> {role, plugins,
     liveness}``) to served plugins on every change.  The base
     ``on_topology_change`` drives owner-bound ephemeral-session reclaim; a
-    plugin can override it to also react to connect/disconnect/liveness:
+    plugin can override it to also react to connect/disconnect/liveness::
 
         async def on_topology_change(self, participants: dict):
             '''Called on a topology / liveness change.

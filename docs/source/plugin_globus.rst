@@ -115,12 +115,10 @@ Methods:
    ``{"source", "destination", "recursive"}`` dicts.  Returns
    ``{task_id, submission_id, status}``.
 
-``get_task(task_id)`` / ``task_wait(task_id, timeout=60, polling_interval=10)`` /
-``cancel_task(task_id)`` / ``list_tasks(limit=100)``
+``get_task(task_id)`` / ``task_wait(task_id, timeout=60, polling_interval=10)`` / ``cancel_task(task_id)`` / ``list_tasks(limit=100)``
    Task monitoring and control.
 
-``ls(collection, path=None)`` / ``mkdir(collection, path)`` /
-``rename(collection, oldpath, newpath)`` / ``delete(collection, paths, recursive=False, label=None)``
+``ls(collection, path=None)`` / ``mkdir(collection, path)`` / ``rename(collection, oldpath, newpath)`` / ``delete(collection, paths, recursive=False, label=None)``
    Filesystem operations on a collection (``delete`` submits a Globus delete
    task).
 

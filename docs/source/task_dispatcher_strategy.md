@@ -19,7 +19,7 @@ plumbing changes.
 
 In ``pools.json``:
 
-```json
+```text
 {
   "pools": [{
     "name": "cpu",

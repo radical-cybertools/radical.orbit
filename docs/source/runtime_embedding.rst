@@ -162,6 +162,7 @@ API Reference
              topology, name, resume_key, broker_url, wait_registered
    :undoc-members:
    :show-inheritance:
+   :no-index:
 
 Developing external plugins
 ===========================

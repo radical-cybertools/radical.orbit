@@ -42,11 +42,15 @@ plugins shipped with the framework.
 
 **Get involved or contact us:**
 
-+-------+---------------------+------------------------------------------------------------------+
-| |Git| | **GitHub project:** | https://github.com/radical-cybertools/radical.orbit/     |
-+-------+---------------------+------------------------------------------------------------------+
-| |Goo| | **Mailing List:**   | https://groups.google.com/forum/#!forum/radical.orbit-devel      |
-+-------+---------------------+------------------------------------------------------------------+
+.. list-table::
+   :widths: 5 20 75
+
+   * - |Git|
+     - **GitHub project:**
+     - https://github.com/radical-cybertools/radical.orbit/
+   * - |Goo|
+     - **Mailing List:**
+     - https://groups.google.com/forum/#!forum/radical.orbit-devel
 
 .. |Git| image:: images/github.jpg
 .. |Goo| image:: images/google.png

@@ -239,10 +239,10 @@ class QueueInfoClient(PluginClient):
         the **endpoint** process, not the client.
 
         Returns:
-            None: Endpoint is running on a login node.
-            dict: Allocation summary with keys ``job_id``, ``partition``,
-                ``n_nodes``, ``nodelist``, ``cpus_per_node``,
-                ``gpus_per_node``, ``account``, ``job_name``, ``runtime``.
+            The allocation summary (keys ``job_id``, ``partition``, ``n_nodes``,
+            ``nodelist``, ``cpus_per_node``, ``gpus_per_node``, ``account``,
+            ``job_name``, ``runtime``), or ``None`` when the endpoint runs on a
+            login node (outside any batch allocation).
 
         Raises:
             RuntimeError: Endpoint is inside an allocation but the scheduler did
