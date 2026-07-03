@@ -117,7 +117,7 @@ def broker_client(tmp_path, monkeypatch):
     if not _have_openssl():
         pytest.skip("openssl not available")
     from radical.orbit import utils
-    from radical.orbit.broker import Broker
+    from radical.orbit.broker import Broker, BrokerTuning
 
     monkeypatch.setattr(utils, 'URL_FILE',   tmp_path / 'broker.url')
     monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'broker.token')
@@ -131,7 +131,7 @@ def broker_client(tmp_path, monkeypatch):
         check=True, capture_output=True)
 
     broker = Broker(cert=str(cert), key=str(key), no_auth=True,
-                    grace=0.05, ping_timeout=0.05, watchdog_interval=0.02)
+                    tuning=BrokerTuning(grace=0.05, ping_timeout=0.05))
     return broker
 
 

@@ -14,6 +14,7 @@ no real broker or WebSocket is needed.
 
 import asyncio
 import base64
+import time
 from pathlib import Path
 from unittest.mock import patch, AsyncMock, MagicMock
 
@@ -263,7 +264,6 @@ class TestSessionTeardown:
 
     def test_ephemeral_owner_lost_drains_and_cancels(self, tmp_path):
         _, plugin = _make_plugin(tmp_path)
-        plugin.reclaim_drain = 0.05        # tiny drain timer
 
         async def scenario():
             plugin._ensure_started()
@@ -274,11 +274,13 @@ class TestSessionTeardown:
             ps.pilots['p.1'] = PilotRecord(
                 pid='p.1', pool='cpu', owning_sid=sid, size_key='s',
                 rhapsody_backend='concurrent', state=PILOT_ACTIVE)
-            # owner declared lost → arms the reclaim-drain
+            # owner declared lost → stamps the reclaim-drain deadline; the
+            # 5 s sweep reclaims once it passes.  Backdate + sweep now.
             await plugin.on_topology_change(
                 {'clientA': {'role': 'endpoint', 'plugins': {},
                              'liveness': 'lost'}})
-            await asyncio.sleep(0.25)       # let the drain fire
+            plugin._records[sid].drain_deadline = time.time() - 1
+            await plugin._cleanup_expired_sessions()
             return sid, ps
 
         sid, ps = asyncio.run(scenario())

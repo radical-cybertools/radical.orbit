@@ -178,8 +178,12 @@ def harness(self_signed, tmp_path, monkeypatch):
     runtimes = []
 
     def make_broker(ws_ping_interval=20.0, ws_ping_timeout=20.0, **kw):
-        from radical.orbit.broker import Broker
-        defaults = dict(cert=str(cert), key=str(key), no_auth=True, grace=2.0)
+        from radical.orbit.broker import Broker, BrokerTuning
+        tuning = BrokerTuning(grace=2.0)
+        for _k in list(kw):
+            if hasattr(tuning, _k):
+                setattr(tuning, _k, kw.pop(_k))
+        defaults = dict(cert=str(cert), key=str(key), no_auth=True, tuning=tuning)
         defaults.update(kw)
         broker = Broker(**defaults)
         srv = _RunningBroker(broker, ws_ping_interval, ws_ping_timeout).start()
@@ -445,8 +449,8 @@ def test_owner_channel_broker_stamped_not_spoofable(harness):
     sid = resp.json()['sid']
 
     plugin = a._plugins['echo_rt']
-    assert _wait(lambda: sid in plugin._session_policy, timeout=2.0)
-    assert plugin._session_policy[sid]['owner'] == 'epB'    # not 'attacker'
+    assert _wait(lambda: sid in plugin._records, timeout=2.0)
+    assert plugin._records[sid].owner == 'epB'    # not 'attacker'
 
 
 # ---------------------------------------------------------------------------
@@ -473,7 +477,7 @@ def test_served_plugin_observes_lost_and_reclaims(harness):
     resp = b.call('epA', 'POST', '/liveness_rt/register_session', body=b'{}')
     sid = resp.json()['sid']
     assert _wait(lambda: sid in plugin._sessions, timeout=2.0)
-    assert plugin._session_policy[sid]['owner'] == 'epB'
+    assert plugin._records[sid].owner == 'epB'
     assert _wait(lambda: ('epB', 'present') in plugin.observed, timeout=5.0)
 
     # Hard-drop B: abort the WS transport (TCP RST, no close frame) so the

@@ -4,42 +4,34 @@ Wire protocol for broker <-> endpoint (participant) communication.
 One symmetric, **versioned** envelope; ``kind`` discriminates the payload.
 Wire encoding is msgpack, always (``use_bin_type=True``, ``raw=False``) — one
 packer, one parser, ``body`` is native bytes (no base64, no JSON/text path).
-Validation is pydantic v2: ``m0_results.md`` measured slotted dataclasses
-against pydantic v2 and found no performance edge (~2.5x baseline both), so
-pydantic wins on clarity and consistency with the rest of the codebase. The
-broker's pure-forwarding role is the documented exception — it never builds
-a model, see ``peek_routing`` below.
+Validation is pydantic v2.  The broker's pure-forwarding role is the
+documented exception: on the forwarding path it never builds a model, it
+routes on a plain ``msgpack.unpackb`` dict.
 
 There is **no ``ping``/``pong`` kind** in the envelope: liveness is
 WS-protocol-level only (transport keepalive on both sides), never app-level.
 
-``channel`` is reserved for the deferred blocking-served-call / in-band-
-isolation cases: the field exists on every envelope, is always ``None``
-today, and carries no behaviour yet.
-
 ``seq`` (``event`` only) is broker-assigned and frozen with the envelope:
 monotone per session for session-scoped events, monotone per the global
-session-less stream otherwise. Consumers detect drops as ``seq`` gaps; the
-optional replay plugin (later milestone) uses ``ts``/``seq`` to splice
-replay into live delivery with no wire change.
+session-less stream otherwise. Consumers detect drops as ``seq`` gaps.
 
-``corr_id`` is only meaningful on ``request``/``response`` and is namespaced
-by the requester's ``src`` (see ``mint_corr_id``) so every pending-call table
-has a single, unambiguous owner per entry.
+``corr_id`` is only meaningful on ``request``/``response``; it is prefixed
+with the requester's ``src`` (see ``mint_corr_id``) purely for log
+readability.
 
 Frame-size cap: ``FRAME_CAP`` bounds the packed frame by the design
 inequality ``frame_cap <= heartbeat_timeout * min_bandwidth / 2`` (e.g. a 3 s
 pong timeout and a 3 MB/s link floor a ~4 MB cap). The same cap doubles as a
-bound on GIL-hold time: M0 measured a 4 MB ``msgpack.unpackb`` pinning the
-GIL ~66 ms with no release, so capping the frame size also caps how long a
-single inbound frame can stall any thread — including the transport thread
-that answers keepalive pings.
+bound on GIL-hold time: a large ``msgpack.unpackb`` pins the GIL with no
+release, so capping the frame size also caps how long a single inbound frame
+can stall any thread — including the transport thread that answers keepalive
+pings.
 
-Version mismatches are rejected outright at ``parse_message`` time.
-Version *negotiation* (letting old and new peers agree on a shared
-protocol version) is not implemented here — it rides ``register`` /
-``register_ack`` ``capabilities`` in a later milestone; today a mismatch is
-simply a hard error.
+Version mismatches are rejected outright at ``parse_message`` time; version
+negotiation is not implemented — today a mismatch is a hard error.  The
+envelope is versioned, so a future field (e.g. reinstating a per-envelope
+``channel`` or per-message ``is_binary`` flag) is a version bump, not an
+in-place addition.
 """
 
 import uuid
@@ -80,12 +72,10 @@ def mint_id() -> str:
 
 
 def mint_corr_id(src: str) -> str:
-    """Mint a correlation id namespaced by *src*.
+    """Mint a correlation id, prefixed with *src* for log readability.
 
-    corr_ids are namespaced by the requesting ``src`` so that every pending-
-    call table (one per broker-side ``src`` bucket, one per endpoint) has a
-    single, unambiguous owner per entry -- timeout/cleanup never has to guess
-    which side's table an id belongs to.
+    The prefix is cosmetic: uniqueness comes from the ``uuid4`` suffix, and the
+    broker tracks call ownership explicitly in its in-flight table.
     """
     return f"{src}:{uuid.uuid4()}"
 
@@ -142,7 +132,6 @@ class _Envelope(BaseModel):
     version: int           = PROTOCOL_VERSION
     id:      str           = Field(default_factory=mint_id)
     corr_id: Optional[str] = None
-    channel: Optional[str] = None   # reserved; always None today
     src:     str
     dst:     Optional[str] = None
 
@@ -159,7 +148,6 @@ class Request(_Envelope):
     path:      str
     headers:   Dict[str, str] = Field(default_factory=dict)
     body:      bytes          = b''
-    is_binary: bool            = False
 
 
 class Response(_Envelope):
@@ -169,7 +157,6 @@ class Response(_Envelope):
     status:    int
     headers:   Dict[str, str] = Field(default_factory=dict)
     body:      bytes          = b''
-    is_binary: bool            = False
 
 
 class Event(_Envelope):
@@ -184,9 +171,9 @@ class Event(_Envelope):
     plugin:  str
     topic:   str
     session: Optional[str] = None
-    ts:      float
-    seq:     int
-    data:    Dict[str, Any] = Field(default_factory=dict)
+    ts:      Optional[float] = None   # broker-assigned on ingest; sender leaves unset
+    seq:     Optional[int]   = None   # broker-assigned on ingest; sender leaves unset
+    data:    Dict[str, Any]  = Field(default_factory=dict)
 
 
 class Register(_Envelope):
@@ -196,7 +183,6 @@ class Register(_Envelope):
     identity:     Identity
     role:         str
     plugins:      List[Dict[str, Any]] = Field(default_factory=list)
-    capabilities: Dict[str, Any]       = Field(default_factory=dict)
 
 
 class RegisterAck(_Envelope):
@@ -209,7 +195,6 @@ class RegisterAck(_Envelope):
     kind:         Literal['register_ack'] = 'register_ack'
     ok:           bool
     reason:       Optional[str] = None
-    capabilities: Dict[str, Any] = Field(default_factory=dict)
     resume_key:   str
 
 
@@ -310,8 +295,7 @@ def parse_message(data: bytes, cap: int = FRAME_CAP) -> Message:
     if version != PROTOCOL_VERSION:
         raise ProtocolError(
             f"protocol version mismatch: frame is v{version!r}, this "
-            f"process speaks v{PROTOCOL_VERSION} (version negotiation "
-            "rides register/register_ack capabilities, not yet implemented)")
+            f"process speaks v{PROTOCOL_VERSION}")
 
     kind = raw.get('kind')
     cls  = _KIND_TO_MODEL.get(kind)
@@ -324,50 +308,24 @@ def parse_message(data: bytes, cap: int = FRAME_CAP) -> Message:
         raise ProtocolError(f"invalid {kind!r} message: {e}") from e
 
 
-def peek_routing(data: bytes):
-    """Extract routing fields from a msgpack frame **without** validation.
-
-    This is the broker's pure-forwarding fast path: it routes by
-    ``kind``/``src``/``dst``/``corr_id`` and never inspects or mutates
-    bodies, so it has no reason to pay pydantic validation cost or to build
-    a model at all -- a plain msgpack unpack is enough (and, unlike
-    ``parse_message``, tolerates an otherwise-invalid frame as long as the
-    routing fields are present).
-
-    Returns ``(kind, src, dst, corr_id)``.
-    """
-    try:
-        raw = msgpack.unpackb(data, raw=False)
-    except Exception as e:
-        raise ProtocolError(f"malformed msgpack frame: {e}") from e
-
-    if not isinstance(raw, dict):
-        raise ProtocolError(
-            f"malformed frame: expected a mapping, got {type(raw).__name__}")
-
-    return raw.get('kind'), raw.get('src'), raw.get('dst'), raw.get('corr_id')
-
-
 # ---------------------------------------------------------------------------
 # Convenience constructors
 # ---------------------------------------------------------------------------
 
 def make_request(src: str, dst: str, method: str, path: str, *,
-                  headers:   Optional[Dict[str, str]] = None,
-                  body:      bytes                    = b'',
-                  is_binary: bool                      = False,
-                  corr_id:   Optional[str]              = None) -> Request:
-    """Build a ``request`` envelope; mints a namespaced ``corr_id`` by default."""
+                  headers: Optional[Dict[str, str]] = None,
+                  body:    bytes                    = b'',
+                  corr_id: Optional[str]            = None) -> Request:
+    """Build a ``request`` envelope; mints a ``corr_id`` by default."""
     return Request(
         src=src, dst=dst, method=method, path=path,
-        headers=headers or {}, body=body, is_binary=is_binary,
+        headers=headers or {}, body=body,
         corr_id=corr_id or mint_corr_id(src))
 
 
 def make_response(request: Request, status: int, *,
-                   headers:   Optional[Dict[str, str]] = None,
-                   body:      bytes                    = b'',
-                   is_binary: bool                      = False) -> Response:
+                   headers: Optional[Dict[str, str]] = None,
+                   body:    bytes                    = b'') -> Response:
     """Build the ``response`` envelope for *request*.
 
     ``src``/``dst`` are the request's swapped; ``corr_id`` is copied so the
@@ -375,5 +333,5 @@ def make_response(request: Request, status: int, *,
     """
     return Response(
         src=request.dst, dst=request.src, status=status,
-        headers=headers or {}, body=body, is_binary=is_binary,
+        headers=headers or {}, body=body,
         corr_id=request.corr_id)

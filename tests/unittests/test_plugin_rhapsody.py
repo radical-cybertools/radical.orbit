@@ -177,8 +177,9 @@ def test_register_session_policy_passthrough():
                        json={"sid": "s1", "lifetime": "ttl", "ttl": 30})
     assert resp.status_code == 200
     assert resp.json()['sid'] == "s1"
-    assert plugin._session_policy["s1"] == {'lifetime': 'ttl',
-                                            'ttl': 30.0, 'owner': None}
+    assert (plugin._records["s1"].lifetime,
+            plugin._records["s1"].ttl,
+            plugin._records["s1"].owner) == ('ttl', 30.0, None)
     plugin._sessions["s1"]._init_ready.set()
 
     # Reconnect with the same policy — no rebuild, same sid
@@ -235,7 +236,7 @@ async def test_register_default_session():
 
     assert resp['sid']    == DEFAULT_SID
     assert resp['status'] == 'initializing'
-    assert plugin._session_policy[DEFAULT_SID]['lifetime'] == 'persistent'
+    assert plugin._records[DEFAULT_SID].lifetime == 'persistent'
     init_mock.assert_called_once_with(
         DEFAULT_SID, plugin._sessions[DEFAULT_SID])
 
@@ -267,7 +268,7 @@ async def test_default_session_via_forward():
 
     assert exc_info.value.status_code == 409
     assert DEFAULT_SID in plugin._sessions
-    assert plugin._session_policy[DEFAULT_SID]['lifetime'] == 'persistent'
+    assert plugin._records[DEFAULT_SID].lifetime == 'persistent'
     init_mock.assert_called_once_with(
         DEFAULT_SID, plugin._sessions[DEFAULT_SID])
 

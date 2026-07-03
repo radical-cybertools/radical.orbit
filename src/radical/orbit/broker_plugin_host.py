@@ -23,18 +23,16 @@ class BrokerPluginHost(PluginHostBase):
     machinery of a full ``EndpointService``.
     """
 
-    def __init__(self, plugin_names        : List[str],
-                       broadcast_fn        : Callable,
-                       endpoint_name           : str      = 'broker',
-                       on_topology_changed : Optional[Callable] = None,
-                       broker_url          : str      = '',
-                       broker_caller       : Any      = None,
-                       broker_tap          : Optional[Callable] = None):
+    def __init__(self, plugin_names  : List[str],
+                       broadcast_fn  : Callable,
+                       endpoint_name : str      = 'broker',
+                       broker_url    : str      = '',
+                       broker_caller : Any      = None,
+                       broker_tap    : Optional[Callable] = None):
 
-        self._name                : str      = endpoint_name
-        self._broadcast_fn        : Callable = broadcast_fn
-        self._on_topology_changed : Optional[Callable] = on_topology_changed
-        self._plugins             : Dict[str, Plugin] = {}
+        self._name         : str      = endpoint_name
+        self._broadcast_fn : Callable = broadcast_fn
+        self._plugins      : Dict[str, Plugin] = {}
 
         # Internal FastAPI app — plugins register routes here.
         # broker_url is the broker's own loopback-reachable URL, exposed to
@@ -66,19 +64,15 @@ class BrokerPluginHost(PluginHostBase):
     # ------------------------------------------------------------------
 
     async def _announce_topology(self) -> None:
-        """Broadcast topology update to all SSE clients.
+        """Broadcast a topology update (a hosted-plugin change).
 
-        Uses the ``on_topology_changed`` callback if provided (allows the
-        broker script to update its global state and broadcast the full
-        topology).  Falls back to a direct SSE broadcast of the broker's
-        own topology info.
+        Hands off to ``broadcast_fn('topology', ...)``, which rebroadcasts the
+        full participant snapshot on the broker's routing loop — so a
+        dynamically registered plugin (the ``iri.<endpoint>`` flow) reaches the
+        wire and the gateway's SSE fan-out.
         """
         try:
-            if self._on_topology_changed:
-                await self._on_topology_changed()
-            else:
-                await self._broadcast_fn('topology',
-                                         self.get_topology_info())
+            await self._broadcast_fn('topology', self.get_topology_info())
         except Exception as exc:
             log.warning('[BrokerPluginHost] Topology broadcast failed: %s', exc)
 

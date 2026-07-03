@@ -6,11 +6,12 @@ per-endpoint subscription interest sets, the broker-assigned ``seq``/``ts``
 stamping, the per-subscriber bounded (drop-oldest) delivery queues with their
 dedicated sender tasks, and the unfiltered raw tap.
 
-Design guarantees carried from the plan:
+Guarantees:
 
 * A slow subscriber can never backpressure the routing loop or other
   subscribers — enqueue is non-blocking; overflow drops the *oldest* frame and
-  bumps a per-subscriber counter so the consumer sees the loss as a ``seq`` gap.
+  bumps a per-subscriber counter so the consumer sees the loss as a ``seq`` gap
+  (see :class:`radical.orbit.queues.BoundedDropOldestQueue`).
 * ``seq`` is broker-assigned and frozen with the envelope: monotone per session
   for session-scoped events, monotone per the global stream otherwise.
 * The raw tap sees *every* event (stateless, unfiltered) and runs on the
@@ -21,32 +22,16 @@ import asyncio
 import logging
 import time
 
-from collections import deque
-from typing      import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import msgpack
 
 from . import protocol
 
+from .queues import BoundedDropOldestQueue
+
 
 log = logging.getLogger("radical.orbit.broker")
-
-
-class _OutQueue:
-    """A per-endpoint bounded, drop-oldest event delivery queue."""
-
-    __slots__ = ('buf', 'dropped', 'wake')
-
-    def __init__(self, maxlen: int):
-        self.buf     : deque         = deque(maxlen=maxlen)
-        self.dropped : int           = 0
-        self.wake    : asyncio.Event = asyncio.Event()
-
-    def push(self, data: bytes) -> None:
-        if len(self.buf) == self.buf.maxlen:
-            self.dropped += 1                  # deque drops the oldest on append
-        self.buf.append(data)
-        self.wake.set()
 
 
 class EventRouter:
@@ -70,8 +55,11 @@ class EventRouter:
         self._host_loop   = host_loop_getter
 
         self._subscriptions: Dict[str, List[protocol.SubscribePattern]] = {}
-        self._out:           Dict[str, _OutQueue]    = {}
+        self._out:           Dict[str, BoundedDropOldestQueue] = {}
         self._senders:       Dict[str, asyncio.Task] = {}
+        # One monotone seq counter per session-id ever seen.  Intentionally
+        # never pruned: sessions are re-registrable, and a stale counter keeps a
+        # re-registered session from re-using seq numbers a consumer already saw.
         self._session_seq:   Dict[str, int]          = {}
         self._global_seq:    int                     = 0
         self._taps:          list                    = []
@@ -80,7 +68,7 @@ class EventRouter:
 
     def add_endpoint(self, name: str) -> None:
         self._subscriptions.setdefault(name, [])
-        self._out[name] = _OutQueue(self._event_queue)
+        self._out[name] = BoundedDropOldestQueue(self._event_queue)
         self.restart_sender(name)
 
     def remove_endpoint(self, name: str) -> None:
@@ -103,19 +91,15 @@ class EventRouter:
         oq = self._out.get(name)
         if oq is None:
             return
-        while True:
-            await oq.wake.wait()
-            oq.wake.clear()
-            while oq.buf:
-                data = oq.buf.popleft()
-                ws   = self._registry.get(name)
-                if ws is None:
-                    return
-                try:
-                    await ws.send_bytes(data)
-                except Exception as e:
-                    log.debug("[Broker] event send to %s failed: %s", name, e)
-                    return
+        async for data in oq.drain():
+            ws = self._registry.get(name)
+            if ws is None:
+                return
+            try:
+                await ws.send_bytes(data)
+            except Exception as e:
+                log.debug("[Broker] event send to %s failed: %s", name, e)
+                return
 
     def dropped(self, name: str) -> int:
         oq = self._out.get(name)
@@ -191,8 +175,7 @@ class EventRouter:
         else:
             raw['seq'] = self._global_seq
             self._global_seq += 1
-        if not raw.get('ts'):
-            raw['ts'] = time.time()
+        raw['ts'] = time.time()   # broker is the ts authority; overwrite always
 
         self._prof.prof('broker_event_in', uid=str(raw['seq']),
                         msg='%s/%s' % (raw.get('plugin'), raw.get('topic')))

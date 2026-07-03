@@ -141,8 +141,12 @@ def harness(self_signed, tmp_path, monkeypatch):
     runtimes = []
 
     def make_broker(**kw):
-        from radical.orbit.broker import Broker
-        defaults = dict(cert=str(cert), key=str(key), no_auth=True, grace=2.0)
+        from radical.orbit.broker import Broker, BrokerTuning
+        tuning = BrokerTuning(grace=2.0)
+        for _k in list(kw):
+            if hasattr(tuning, _k):
+                setattr(tuning, _k, kw.pop(_k))
+        defaults = dict(cert=str(cert), key=str(key), no_auth=True, tuning=tuning)
         defaults.update(kw)
         broker = Broker(**defaults)
         srv = _RunningBroker(broker).start()

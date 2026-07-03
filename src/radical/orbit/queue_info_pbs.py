@@ -9,10 +9,10 @@ import logging
 import os
 import re
 import shutil
-import subprocess
 import time
 
 from .queue_info import QueueInfo
+from .batch_system import run_cmd, run_cmd_strict
 from .batch_system_pbs import _parse_qstat_f, _parse_pbs_walltime, _parse_exec_host
 
 log = logging.getLogger("radical.orbit")
@@ -181,17 +181,6 @@ def _user_can_submit(attrs: dict, user: str,
     return True
 
 
-def _run(cmd, timeout=60):
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout, check=True)
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(
-            f"Command {cmd} failed (rc={e.returncode}): "
-            f"{e.stderr.strip()}") from e
-    return r.stdout
-
-
 def _parse_qstat_records(stdout):
     """Split a multi-job ``qstat -f`` output into per-job dicts.
 
@@ -284,7 +273,7 @@ class QueueInfoPBSPro(QueueInfo):
 
         Raises the underlying exception if qstat cannot be run.
         """
-        stdout = _run(['qstat', '-Qf'])
+        stdout = run_cmd_strict(['qstat', '-Qf'], timeout=60)
         queues = {}
         cur = None
         cur_lines = []
@@ -311,7 +300,7 @@ class QueueInfoPBSPro(QueueInfo):
 
         # --- node info ---
         try:
-            nstdout = _run(['pbsnodes', '-a'])
+            nstdout = run_cmd_strict(['pbsnodes', '-a'], timeout=60)
             nodes = _parse_pbsnodes(nstdout)
         except Exception:
             nodes = []
@@ -387,7 +376,7 @@ class QueueInfoPBSPro(QueueInfo):
         if user:
             cmd.extend(['-u', user])
         try:
-            stdout = _run(cmd)
+            stdout = run_cmd_strict(cmd, timeout=60)
         except Exception:
             return {'jobs': []}
         records = _parse_qstat_records(stdout)
@@ -402,7 +391,7 @@ class QueueInfoPBSPro(QueueInfo):
         if user:
             cmd.extend(['-u', user])
         try:
-            stdout = _run(cmd)
+            stdout = run_cmd_strict(cmd, timeout=60)
         except Exception:
             return {'jobs': []}
         records = _parse_qstat_records(stdout)
@@ -444,19 +433,13 @@ class QueueInfoPBSPro(QueueInfo):
         if not exe:
             return {'allocations': []}
 
-        try:
-            r = subprocess.run([exe], capture_output=True, text=True,
-                               timeout=30, env=_sbank_clean_env())
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            log.debug("sbank-list-allocations failed: %s", exc)
-            return {'allocations': []}
-        if r.returncode != 0:
-            log.debug("sbank-list-allocations rc=%d stderr=%s",
-                      r.returncode, r.stderr.strip())
+        stdout = run_cmd([exe], timeout=30, env=_sbank_clean_env())
+        if stdout is None:
+            log.debug("sbank-list-allocations failed or returned non-zero exit")
             return {'allocations': []}
 
         try:
-            allocs = _parse_sbank_list_allocations(r.stdout)
+            allocs = _parse_sbank_list_allocations(stdout)
         except Exception as exc:
             log.debug("Failed to parse sbank output: %s", exc)
             return {'allocations': []}

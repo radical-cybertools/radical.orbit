@@ -6,9 +6,14 @@ no requirement exists)**. **E is explicitly deferred** for discussion.
 
 ## Decisions (defaults taken while the user was away — overridable)
 
-- **C3 (dispatcher WAL → atomic-JSON store) is HELD** until after the E discussion:
-  E1 (dispatcher-as-participant) may delete the broker-resident store entirely, so
-  rebuilding it now risks pure rework. Everything else in C proceeds.
+- **C3 (dispatcher WAL → atomic-JSON store) is IN SCOPE** (user decision, overriding
+  the earlier hold): rewrite `task_dispatcher_state.py`'s store as one `state.json`
+  per pool, rewritten atomically (`tempfile` + `os.replace` — the routine already
+  exists in `snapshot()`), debounced to ~1/sec if per-mutation is too chatty; recovery
+  = `json.load`. Delete the append-JSONL log, the size/age compaction policy, the
+  compaction sweeper, the `O_APPEND`-truncate trick, and the two compaction constants.
+  Greenfield (no on-disk data to migrate). If E1 later moves the dispatcher off the
+  broker, this store travels with it.
 - **D-strategy: delete the framework, inline one policy.** Remove the strategy ABC,
   the triple loader (builtin dict / entry points / dotted path), the `setup.py`
   entry-point group, the example strategy, and the arrival/lag telemetry; keep the
@@ -137,9 +142,9 @@ no requirement exists)**. **E is explicitly deferred** for discussion.
 - PSIJ (Opus): `plugin_psij.py`, `tunnel.py` — A4, C8, C9, B4-twins, D-imports/
   poll/route-consistency, B3-poller, B1.
 - DISPATCHER (Opus): `plugin_task_dispatcher.py`, `task_dispatcher_config.py`,
-  `task_dispatcher_strategy*.py`, `task_dispatcher_state.py` (telemetry only — **not**
-  the store), `plugin_replay.py`, `setup.py` — A1, A8, D-strategy, 5→1 loops, B2,
-  C7, replay→shared queue, B1. **C3 held.**
+  `task_dispatcher_strategy*.py`, `task_dispatcher_state.py` (**C3 store rewrite** +
+  telemetry removal), `plugin_replay.py`, `setup.py` — A1, A8, D-strategy, 5→1 loops,
+  B2, C3, C7, replay→shared queue, B1.
 - EDGE (Sonnet): `plugin_xgfabric.py`, `plugin_globus.py`, `plugin_iri_connect.py`,
   `plugin_iri_instance.py`, `plugin_lucid.py`, `plugin_sysinfo.py` — A9, B2-xg,
   B3-poller (globus/iri), D-sysinfo, minor nits, B1.
