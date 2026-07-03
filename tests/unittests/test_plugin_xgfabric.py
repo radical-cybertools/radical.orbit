@@ -342,3 +342,109 @@ def test_xgfabric_client_stop_workflow():
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# item 21/22: by-construction runtime adapters + endpoint-only classification
+# ---------------------------------------------------------------------------
+
+class _RecordingPlugin:
+    """A stub plugin client that records submit_job calls."""
+
+    def __init__(self, endpoint, name):
+        self.endpoint  = endpoint
+        self.name      = name
+        self.submitted = []
+
+    def submit_job(self, spec, executor):
+        self.submitted.append((spec, executor))
+        return {'job_id': 'job.1'}
+
+
+class _StubRuntime:
+    """Minimal EndpointRuntime stand-in: a topology dict + recording get_plugin."""
+
+    def __init__(self, topo, served=None):
+        self._topo           = topo
+        self._plugins        = served or {}      # this endpoint's served set
+        self.calls           = []
+        self.plugins_created = {}
+
+    def topology(self):
+        return dict(self._topo)
+
+    def get_plugin(self, endpoint_name, plugin_name, **kw):
+        self.calls.append((endpoint_name, plugin_name, kw))
+        key = (endpoint_name, plugin_name)
+        plug = self.plugins_created.get(key)
+        if plug is None:
+            plug = _RecordingPlugin(endpoint_name, plugin_name)
+            self.plugins_created[key] = plug
+        return plug
+
+
+def test_runtime_adapters_list_and_plugin_view():
+    from radical.orbit.plugin_xgfabric import (_RuntimeBrokerAdapter,
+                                               _RuntimeEndpointAdapter)
+    topo = {'broker': {'role': 'broker'},
+            'epA':    {'role': 'endpoint', 'plugins': {'psij': {}}}}
+    rt = _StubRuntime(topo)
+
+    bc = _RuntimeBrokerAdapter(rt)
+    assert set(bc.list_endpoints()) == {'broker', 'epA'}
+
+    ec = bc.get_endpoint_client('epA')
+    assert isinstance(ec, _RuntimeEndpointAdapter)
+
+    plug = ec.get_plugin('psij', foo='bar')
+    assert (plug.endpoint, plug.name) == ('epA', 'psij')
+    assert rt.calls == [('epA', 'psij', {'foo': 'bar'})]
+    bc.close()                                       # no-op, must not raise
+
+
+@pytest.mark.asyncio
+async def test_submit_pilot_builds_calls_over_adapter_seam(tmp_path):
+    from radical.orbit.plugin_xgfabric import _RuntimeBrokerAdapter
+    topo = {'epA': {'role': 'endpoint', 'plugins': {'psij': {}}}}
+    rt   = _StubRuntime(topo, served={'sysinfo': object(), 'psij': object()})
+
+    session = XGFabricSession('s1', workdir=str(tmp_path), runtime=rt)
+    session._bc = _RuntimeBrokerAdapter(rt)
+
+    cluster = {'endpoint_name': 'epA', 'queue': 'debug', 'account': 'ACC',
+               'duration': 1200, 'nodes': 2, 'executor': 'slurm'}
+    job_id = await session._submit_pilot(cluster, 'https://broker:8000')
+    assert job_id == 'job.1'
+
+    # get_plugin('psij') was reached via the broker/endpoint adapter seam.
+    assert ('epA', 'psij', {}) in rt.calls
+    plug = rt.plugins_created[('epA', 'psij')]
+    spec, executor = plug.submitted[0]
+    assert executor == 'slurm'                       # cluster-provided, no probe
+    attrs = spec['attributes']
+    assert attrs['queue_name'] == 'debug'
+    assert attrs['account']    == 'ACC'
+    assert attrs['duration']   == '1200'
+    assert attrs['node_count'] == 2
+    args = spec['arguments']
+    assert args[:2] == ['--url', 'https://broker:8000']
+    assert '--name' in args and 'epA.1' in args
+    pi = args.index('-p')
+    assert set(args[pi + 1].split(',')) == {'sysinfo', 'psij'}
+
+
+@pytest.mark.asyncio
+async def test_on_topology_change_classifies_only_endpoints():
+    app    = FastAPI()
+    plugin = PluginXGFabric(app)
+
+    topo = {
+        'broker':       {'role': 'broker',   'plugins': {'task_dispatcher': {}}},
+        'consumer.abc': {'role': 'consumer', 'plugins': {}},
+        'epA':          {'role': 'endpoint', 'plugins': {'queue_info': {}}},
+        'epB':          {'role': 'endpoint', 'plugins': {'sysinfo': {}}},
+    }
+    await plugin.on_topology_change(topo)
+
+    # Only role='endpoint' participants are retained for classification.
+    assert set(plugin._connected_endpoints) == {'epA', 'epB'}

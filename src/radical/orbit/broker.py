@@ -250,7 +250,7 @@ class Broker:
         self._loop:      Optional[asyncio.AbstractEventLoop] = None
         self._host_loop: Optional[asyncio.AbstractEventLoop] = None
         self._host_thread: Optional[threading.Thread]        = None
-        self._host:      Optional[BrokerPluginHost]          = None
+        self._plugin_host: Optional[BrokerPluginHost]        = None
         self._watchdog_task: Optional[asyncio.Task]          = None
         self._started:   bool = False
 
@@ -352,7 +352,7 @@ class Broker:
         so it is fetched **across the host-loop boundary** — the routing loop
         never touches host state.  Empty when the host is not up.
         """
-        host = self._host
+        host = self._plugin_host
         loop = self._host_loop
         if host is None or loop is None:
             return {}
@@ -396,7 +396,26 @@ class Broker:
             except Exception as e:
                 log.debug("[Broker] close of %s failed: %s", name, e)
         self.registry.clear()
+        self._shutdown_host_plugins()
         self._stop_host_thread()
+
+    def _shutdown_host_plugins(self) -> None:
+        """Ask the hosted plugins to stop their background work cleanly.
+
+        Runs the host's plugin-shutdown path *on the host loop* (cancelling each
+        plugin's cleanup / reclaim-drain tasks and closing sessions) and waits a
+        bounded window, so a subsequent ``_stop_host_thread`` does not tear the
+        loop down with plugin tasks still pending (the "Task was destroyed but
+        it is pending" warnings)."""
+        host = self._plugin_host
+        loop = self._host_loop
+        if host is None or loop is None:
+            return
+        try:
+            cfut = asyncio.run_coroutine_threadsafe(host.shutdown(), loop)
+            cfut.result(timeout=5.0)
+        except Exception as e:
+            log.debug("[Broker] host plugin shutdown failed: %s", e)
 
     def _start_host_thread(self) -> None:
         """Bring up the hosted-plugin host on its own loop/thread.
@@ -437,7 +456,7 @@ class Broker:
                 fut.set_exception(e)
 
         self._host_loop.call_soon_threadsafe(_build)
-        self._host = fut.result(timeout=30.0)
+        self._plugin_host = fut.result(timeout=30.0)
         if names:
             log.info("[Broker] hosted plugins: %s", names)
 
@@ -766,7 +785,7 @@ class Broker:
         registry.  Returns a ``{status, headers, body}`` dict (body is bytes),
         the same passthrough shape :meth:`_dispatch_to_host` wraps into a wire
         ``response``."""
-        if self._host is None:
+        if self._plugin_host is None:
             return {'status': 503, 'headers': {},
                     'body': json.dumps({"error": True,
                                         "detail": "no broker host"}).encode()}
@@ -775,7 +794,7 @@ class Broker:
             path, query = path.split('?', 1)
         try:
             cfut = asyncio.run_coroutine_threadsafe(
-                self._host.handle_request(
+                self._plugin_host.handle_request(
                     method       = method,
                     path         = path,
                     headers      = headers or {},
@@ -978,8 +997,9 @@ class Broker:
                 liveness=self._liveness.get(name, 'present'))
         # The broker is itself a participant (its hosted-plugin host).
         broker_plugins: Dict[str, Dict[str, Any]] = {}
-        if self._host is not None:
-            broker_plugins = self._host.get_topology_info().get('plugins', {})
+        if self._plugin_host is not None:
+            broker_plugins = \
+                self._plugin_host.get_topology_info().get('plugins', {})
         parts[BROKER_NAME] = protocol.ParticipantInfo(
             role='broker', plugins=broker_plugins, liveness='present')
         return parts
@@ -1011,7 +1031,7 @@ class Broker:
         served-plugin delivery.  A fresh broker starts with an empty ``prev``,
         so a not-yet-reconnected child is never synthesized ``lost`` (it was
         never ``present`` in this broker's view)."""
-        if self._host is None or self._host_loop is None:
+        if self._plugin_host is None or self._host_loop is None:
             return
         curr = self.topology_snapshot()
         participants = dict(curr)
@@ -1025,7 +1045,8 @@ class Broker:
         self._host_topology_prev = curr
         try:
             asyncio.run_coroutine_threadsafe(
-                self._host.on_topology_change(participants), self._host_loop)
+                self._plugin_host.on_topology_change(participants),
+                self._host_loop)
         except Exception as e:
             log.debug("[Broker] host topology delivery failed: %s", e)
 

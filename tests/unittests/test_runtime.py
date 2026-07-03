@@ -408,7 +408,7 @@ def test_topology_callback_connect_and_disconnect(harness):
 
     def _topo(participants):
         with lock:
-            snaps.append(set(participants.keys()))
+            snaps.append(dict(participants))
 
     b.register_topology_callback(_topo)
 
@@ -416,7 +416,13 @@ def test_topology_callback_connect_and_disconnect(harness):
     assert _wait(lambda: any('epA' in s for s in snaps), timeout=5.0)
 
     a.stop()
-    assert _wait(lambda: snaps and 'epA' not in snaps[-1], timeout=5.0)
+    # Unified 'lost' synthesis: the departing participant appears once with
+    # liveness='lost' (the same one-shot signal served plugins get), then is
+    # gone from the stored snapshot.
+    assert _wait(
+        lambda: snaps and snaps[-1].get('epA', {}).get('liveness') == 'lost',
+        timeout=5.0)
+    assert 'epA' not in b.topology()
 
 
 # ---------------------------------------------------------------------------
@@ -567,3 +573,159 @@ def test_dispatch_move_reexport():
     routes = [('GET', re.compile(r'^/p/ping$'), (), 'H')]
     handler, params = dispatch.match_route(routes, 'GET', '/p/ping')
     assert handler == 'H' and params == {}
+
+
+# ---------------------------------------------------------------------------
+# item 15: consumer topology callback observes the synthesized one-shot 'lost'
+# ---------------------------------------------------------------------------
+
+def test_consumer_topology_callback_observes_synthesized_lost(harness):
+    make_broker, make_runtime = harness
+    # Aggressive keepalive + tiny grace so a hard-dropped endpoint reaches
+    # suspect then lost within the test window.
+    srv = make_broker(ws_ping_interval=0.2, ws_ping_timeout=0.5, grace=0.5)
+
+    obs = make_runtime(srv.url, name='obs',
+                       ping_interval=0.2, ping_timeout=0.5)
+    seen = []
+    lock = threading.Lock()
+
+    def _topo(participants):
+        with lock:
+            info = participants.get('epX')
+            if info is not None:
+                seen.append(info.get('liveness'))
+
+    obs.register_topology_callback(_topo)
+
+    epx = make_runtime(srv.url, name='epX', plugins=['echo_rt'],
+                       ping_interval=0.2, ping_timeout=0.5)
+    assert _wait(lambda: 'present' in seen, timeout=5.0)
+
+    # Hard-drop epX (TCP RST, no close frame): suspect -> (grace) -> lost.
+    epx._stopping = True
+
+    def _abort():
+        try:    epx._ws.transport.abort()
+        except Exception:
+            pass
+    epx._transport_loop.call_soon_threadsafe(_abort)
+
+    # The consumer callback sees the same present -> suspect -> (synthesized)
+    # lost progression the served plugins get.
+    assert _wait(lambda: 'suspect' in seen, timeout=5.0)
+    assert _wait(lambda: 'lost'    in seen, timeout=5.0)
+    # The stored snapshot never retains the synthesized 'lost' entry.
+    assert 'epX' not in obs.topology()
+
+
+# ---------------------------------------------------------------------------
+# item 16: start(wait=True) also waits for the first topology frame
+# ---------------------------------------------------------------------------
+
+def test_start_wait_populates_topology_without_race(harness):
+    make_broker, make_runtime = harness
+    srv = make_broker()
+
+    # Pre-register an endpoint, then bring up a fresh consumer.  After
+    # start(wait=True) returns, topology() must already reflect the broker's
+    # registration-time snapshot — no sleeps, no _wait.
+    make_runtime(srv.url, name='epA', plugins=['echo_rt'])
+    b = make_runtime(srv.url, name='epB')
+
+    topo = b.topology()
+    assert 'broker' in topo
+    assert 'epA'    in topo
+    assert 'echo_rt' in (topo['epA'].get('plugins') or {})
+
+
+# ---------------------------------------------------------------------------
+# item 17: send_notification is a plain sync call (usable from any thread)
+# ---------------------------------------------------------------------------
+
+def test_send_notification_sync_from_plain_thread(harness):
+    make_broker, make_runtime = harness
+    srv = make_broker()
+
+    a = make_runtime(srv.url, name='epA', plugins=['echo_rt'])
+    b = make_runtime(srv.url, name='epB')
+    assert _wait_topology(b, 'epA', 'echo_rt', timeout=5.0)
+
+    seen = []
+    lock = threading.Lock()
+
+    def _cb(endpoint, plugin, topic, data):
+        with lock:
+            seen.append((endpoint, plugin, topic, data))
+
+    b.register_callback(endpoint_id='epA', plugin_name='echo_rt',
+                        topic='thread_demo', callback=_cb)
+    time.sleep(0.2)                                 # let the subscribe land
+
+    # Call the sync API from a plain thread (no event loop) — no await.
+    result = []
+
+    def _fire():
+        result.append(a.send_notification(
+            'echo_rt', 'thread_demo', {'via': 'thread'}))
+    t = threading.Thread(target=_fire, daemon=True)
+    t.start()
+    t.join(timeout=5.0)
+    assert result == [None]                         # plain sync return
+
+    assert _wait(lambda: len(seen) >= 1, timeout=5.0)
+    endpoint, plugin, topic, data = seen[0]
+    assert (endpoint, plugin, topic) == ('epA', 'echo_rt', 'thread_demo')
+    assert data == {'via': 'thread'}
+
+
+# ---------------------------------------------------------------------------
+# item 4: with_meta delivers broker-stamped seq matching what replay retains
+# ---------------------------------------------------------------------------
+
+def test_with_meta_seq_matches_replay_and_default_unchanged(harness):
+    make_broker, make_runtime = harness
+    srv = make_broker(plugins='replay')             # broker-hosted retention
+
+    a = make_runtime(srv.url, name='epA', plugins=['echo_rt'])
+    b = make_runtime(srv.url, name='epB')
+    assert _wait_topology(b, 'epA', 'echo_rt', timeout=5.0)
+
+    lock   = threading.Lock()
+    metas  = []                                     # with_meta 5-arg callback
+    plain  = []                                     # default 4-arg callback
+
+    def _meta_cb(endpoint, plugin, topic, data, meta):
+        with lock:
+            metas.append(meta['seq'])
+
+    def _plain_cb(endpoint, plugin, topic, data):
+        with lock:
+            plain.append((endpoint, plugin, topic, data))
+
+    b.register_callback(endpoint_id='epA', plugin_name='echo_rt',
+                        topic='demo', callback=_meta_cb, with_meta=True)
+    b.register_callback(endpoint_id='epA', plugin_name='echo_rt',
+                        topic='demo', callback=_plain_cb)
+    time.sleep(0.3)
+
+    n = 3
+    for _ in range(n):
+        b.call('epA', 'GET', '/echo_rt/notify')     # fires one 'demo' event
+
+    assert _wait(lambda: len(metas) >= n, timeout=5.0)
+    assert _wait(lambda: len(plain) >= n, timeout=5.0)
+
+    # with_meta seqs are broker-stamped, strictly monotone, and unique.
+    assert metas == sorted(metas)
+    assert len(set(metas)) == len(metas)
+    # Default callback is byte-identical: 4-arg, correct payload.
+    assert plain[0][:3] == ('epA', 'echo_rt', 'demo')
+    assert plain[0][3] == {'hello': 'world'}
+
+    # The same authoritative seqs are what the broker-hosted replay plugin
+    # retained for these events.
+    replay = b.get_plugin('broker', 'replay')
+    resp = replay.fetch('c1')
+    retained = {e['seq'] for e in resp['events']}
+    assert set(metas).issubset(retained)

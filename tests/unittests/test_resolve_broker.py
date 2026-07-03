@@ -248,6 +248,15 @@ def test_cert_missing_everywhere_raises(isolated_dir):
         utils.resolve_broker_cert()
 
 
+def test_cert_missing_error_names_both_checked_paths(isolated_dir):
+    """The TLS-cert error names BOTH the broker file and the legacy fallback."""
+    with pytest.raises(ValueError) as ei:
+        utils.resolve_broker_cert()
+    msg = str(ei.value)
+    assert str(utils.CERT_FILE)        in msg
+    assert str(utils.CERT_FILE_LEGACY) in msg
+
+
 def test_cert_path_set_but_file_missing(isolated_dir, monkeypatch):
     """Env-pointed cert that doesn't exist → FileNotFoundError."""
     monkeypatch.setenv(utils.ENV_CERT, '/nonexistent/cert.pem')
@@ -283,6 +292,15 @@ def test_key_with_cert_validates_pair(isolated_dir, self_signed, monkeypatch):
     monkeypatch.setenv(utils.ENV_KEY, str(key))
     path, _ = utils.resolve_broker_key(cert=cert)
     assert path == key
+
+
+def test_key_missing_error_names_both_checked_paths(isolated_dir):
+    """The TLS-key error names BOTH the broker file and the legacy fallback."""
+    with pytest.raises(ValueError) as ei:
+        utils.resolve_broker_key()
+    msg = str(ei.value)
+    assert str(utils.KEY_FILE)        in msg
+    assert str(utils.KEY_FILE_LEGACY) in msg
 
 
 def test_key_refuses_world_readable(isolated_dir, self_signed, monkeypatch):

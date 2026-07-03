@@ -45,6 +45,17 @@ log = logging.getLogger("radical.orbit")
 # surface the workflow code already speaks.
 # -----------------------------------------------------------------------------
 
+def _endpoint_participants(topology: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only role ``'endpoint'`` participants for cluster classification.
+
+    The runtime hands xgfabric the full rich topology (the broker and any
+    ``consumer.*`` participants included); only endpoints are candidates for the
+    immediate/allocate cluster split, so non-endpoint roles are filtered out
+    explicitly where the topology enters the plugin."""
+    return {name: info for name, info in (topology or {}).items()
+            if (info or {}).get('role') == 'endpoint'}
+
+
 class _RuntimeEndpointAdapter:
     """``get_plugin``-shaped view of one remote endpoint."""
 
@@ -431,7 +442,7 @@ class XGFabricSession(PluginSession):
             return [], []
 
         try:
-            topo = self._runtime.topology()
+            topo = _endpoint_participants(self._runtime.topology())
             endpoints_info = {name: {'plugins': list((info.get('plugins') or {}).keys())}
                           for name, info in topo.items()}
             log.info("[XGFabric] _get_connected_endpoints: broker reported %d endpoints: %s",
@@ -1372,6 +1383,9 @@ class PluginXGFabric(Plugin):
 
     async def on_topology_change(self, endpoints: dict):
         """Handle topology updates from the broker."""
+        # Classify only real endpoints — drop the broker + consumer participants
+        # the runtime now includes in the rich topology.
+        endpoints = _endpoint_participants(endpoints)
         prev  = set(self._connected_endpoints or {})
         curr  = set(endpoints)
         self._connected_endpoints = endpoints

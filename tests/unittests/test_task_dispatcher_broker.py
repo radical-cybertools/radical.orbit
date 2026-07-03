@@ -154,7 +154,7 @@ def harness(self_signed, tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def _dispatcher(srv):
-    return srv.broker._host._plugins['task_dispatcher']
+    return srv.broker._plugin_host._plugins['task_dispatcher']
 
 
 def test_dispatcher_wired_with_caller_and_tap(harness):

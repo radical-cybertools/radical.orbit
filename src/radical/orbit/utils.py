@@ -256,7 +256,7 @@ def resolve_broker_cert(cli: Optional[str] = None) -> Tuple[Path, str]:
                                        file_legacy=CERT_FILE_LEGACY)
     if path is None:
         raise ValueError(f"TLS cert required (no CLI arg, ${ENV_CERT} unset, "
-                         f"no file at {CERT_FILE})")
+                         f"no file at {CERT_FILE} or {CERT_FILE_LEGACY})")
     if not path.exists():
         raise FileNotFoundError(f"TLS cert not found: {path}")
     ctx = ssl.create_default_context()
@@ -283,7 +283,7 @@ def resolve_broker_key(cli: Optional[str] = None, *,
     if path is None:
         raise ValueError(
             f"TLS key required for role='broker' (no CLI arg, "
-            f"${ENV_KEY} unset, no file at {KEY_FILE})")
+            f"${ENV_KEY} unset, no file at {KEY_FILE} or {KEY_FILE_LEGACY})")
     if not path.exists():
         raise FileNotFoundError(f"TLS key not found: {path}")
 

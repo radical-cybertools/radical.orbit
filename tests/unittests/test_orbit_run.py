@@ -104,3 +104,69 @@ class TestTaskId:
         t1 = compute_task_id(['c'], ['x'], [], 'r')
         t2 = compute_task_id(['c'], [], ['x'], 'r')
         assert t1 != t2
+
+
+# ---------------------------------------------------------------------------
+# argparse surface (item 21)
+# ---------------------------------------------------------------------------
+
+class TestParseOpts:
+
+    def test_pool_target(self):
+        args = _run._parse_opts(['--pool', 'p', '--run-id', 'r'])
+        assert args.pool == 'p'
+        assert args.endpoint is None
+        assert args.run_id == 'r'
+        assert args.priority == 0
+
+    def test_endpoint_target(self):
+        args = _run._parse_opts(['--endpoint', 'e', '--run-id', 'r'])
+        assert args.endpoint == 'e'
+        assert args.pool is None
+
+    def test_target_required(self):
+        # Neither --pool nor --endpoint → argparse errors (SystemExit).
+        with pytest.raises(SystemExit):
+            _run._parse_opts(['--run-id', 'r'])
+
+    def test_endpoint_rejects_staging(self):
+        # --in/--out are pool-only; combining with --endpoint exits.
+        with pytest.raises(SystemExit):
+            _run._parse_opts(['--endpoint', 'e', '--run-id', 'r', '--in', 'x'])
+
+
+# ---------------------------------------------------------------------------
+# main flow targets the broker-hosted task_dispatcher (item 21)
+# ---------------------------------------------------------------------------
+
+class TestGetTaskDispatcher:
+
+    def test_get_td_builds_zero_plugin_consumer_targeting_broker(self,
+                                                                 monkeypatch):
+        calls = {}
+
+        class FakeRuntime:
+            def __init__(self, *a, **k):
+                calls['ctor'] = (a, k)
+
+            def start(self, wait=True):
+                calls['started'] = wait
+
+            def get_plugin(self, endpoint, plugin, **kw):
+                calls['get_plugin'] = (endpoint, plugin, kw)
+                return object()
+
+        import radical.orbit
+        monkeypatch.setattr(radical.orbit, 'EndpointRuntime', FakeRuntime,
+                            raising=False)
+
+        args = _run._parse_opts(['--pool', 'p', '--run-id', 'r'])
+        wrapper = _run.Wrapper(args, ['echo', 'hi'])
+        td = wrapper._get_td()
+
+        # A zero-plugin consumer runtime, started with wait=True, that reaches
+        # the hosted dispatcher on the 'broker' participant.
+        assert calls['ctor'] == ((), {})             # no served plugins
+        assert calls['started'] is True
+        assert calls['get_plugin'] == ('broker', 'task_dispatcher', {})
+        assert td is not None

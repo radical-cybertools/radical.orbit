@@ -1,6 +1,7 @@
 import re
 import uuid
 import asyncio
+import inspect
 import logging
 import time
 
@@ -650,7 +651,13 @@ class Plugin(object):
         """
         endpoint_svc = getattr(self._app.state, "endpoint_service", None)
         if endpoint_svc is not None and hasattr(endpoint_svc, "send_notification"):
-            await endpoint_svc.send_notification(self.instance_name, topic, data)
+            # The endpoint runtime's send_notification is sync (it only hands the
+            # event off to its transport loop); the broker plugin host's is
+            # async.  Await only when the call returned an awaitable.
+            result = endpoint_svc.send_notification(
+                self.instance_name, topic, data)
+            if inspect.isawaitable(result):
+                await result
         else:
             log.warning("[%s] Cannot send notification: endpoint_service unlinked", self.instance_name)
 
@@ -867,6 +874,40 @@ class Plugin(object):
         while True:
             await asyncio.sleep(5)
             await self._cleanup_expired_sessions()
+
+    async def shutdown(self) -> None:
+        """Orderly plugin teardown (host-shutdown path).
+
+        Cancels the background session-cleanup task and any pending
+        reclaim-drain timers — awaiting each so its cancellation is processed
+        before the loop is torn down (no "Task was destroyed but it is pending"
+        warnings) — then closes every open session.  Subclasses that spawn
+        additional background tasks override this and call ``super().shutdown()``.
+        """
+        pending = []
+        if self._cleanup_task is not None and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+            pending.append(self._cleanup_task)
+        for owner in list(self._drain_timers):
+            timer = self._drain_timers.pop(owner, None)
+            if timer is not None and not timer.done():
+                timer.cancel()
+                pending.append(timer)
+        for task in pending:
+            try:    await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        for sid in list(self._sessions):
+            session = self._sessions.pop(sid, None)
+            self._session_last_access.pop(sid, None)
+            self._session_policy.pop(sid, None)
+            if session is not None:
+                try:    await session.close()
+                except Exception as e:
+                    log.warning("[%s] Error closing session %s on shutdown: %s",
+                                self.instance_name, sid, e)
 
     def _log_routes(self) -> None:
         """Log all registered routes for debugging."""
