@@ -37,10 +37,10 @@ each targeting a different SLURM cluster:
 .. code-block:: bash
 
    # load for cluster A
-   curl -X POST "https://bridge:8000/endpoint/load_plugin/radical.queue_info?name=cluster_a&slurm_conf=/etc/slurm/cluster_a.conf"
+   curl -X POST "https://broker:8000/endpoint/load_plugin/radical.queue_info?name=cluster_a&slurm_conf=/etc/slurm/cluster_a.conf"
 
    # load for cluster B
-   curl -X POST "https://bridge:8000/endpoint/load_plugin/radical.queue_info?name=cluster_b&slurm_conf=/etc/slurm/cluster_b.conf"
+   curl -X POST "https://broker:8000/endpoint/load_plugin/radical.queue_info?name=cluster_b&slurm_conf=/etc/slurm/cluster_b.conf"
 
 Each instance gets its own namespace, client pool, and cache.
 

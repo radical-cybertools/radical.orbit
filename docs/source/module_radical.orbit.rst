@@ -5,56 +5,59 @@ Module Documentation
 Overview
 ========
 
-The ``radical.orbit`` module provides a plugin-based REST API framework for
-managing distributed computing resources and workflows. It is built on FastAPI
-and provides a standardized way to create plugins that manage multiple client
-sessions.
+The ``radical.orbit`` module provides a broker-based, plugin-oriented framework
+for reaching HPC resources and workflows.  It is a **star**: one active broker
+hub routes between endpoint participants, each dialing the hub over a single
+outbound WebSocket.  Participants serve plugins, consume other participants'
+plugins, or both; a broker-hosted gateway module serves an HTTP/SSE/Explorer
+compatibility surface for non-participant callers.
 
 Core Components
 ===============
 
-The module consists of several key components:
+1. **Broker** (:mod:`radical.orbit.broker`) — the active hub: a lean routing
+   loop plus an own-thread host for broker-hosted plugins.
+2. **Endpoint runtime** (:mod:`radical.orbit.runtime`) — the single node
+   abstraction; :class:`~radical.orbit.EndpointRuntime` (exported as
+   ``Endpoint``) serves and/or consumes plugins over one outbound WebSocket.
+3. **Gateway** (:mod:`radical.orbit.gateway`) — the broker's compat-tier
+   HTTP/SSE/UI ingress.
+4. **Protocol** (:mod:`radical.orbit.protocol`) — the symmetric, versioned,
+   msgpack-only wire envelope shared by broker and participants.
+5. **Plugin system** (:mod:`radical.orbit.plugin_base`,
+   :mod:`radical.orbit.plugin_session_base`, :mod:`radical.orbit.client`) — base
+   classes for plugins, per-client sessions, and consumer-side helpers.
 
-1. **Plugin System**: Base classes for creating plugins with client management
-2. **Endpoint Service**: Embedded service runner for hosting plugins
-3. **Plugins**: Pre-built plugins for various services (Lucid, XGFabric, QueueInfo)
-4. **Queue Info**: Backend for querying batch system information
+Wire protocol
+=============
 
-Architecture
-============
+Broker and participants exchange **one symmetric, versioned envelope**, encoded
+msgpack-only (``body`` is native bytes).  Common fields are
+``version, id, corr_id?, channel?, kind, src, dst?``; ``kind`` discriminates the
+payload:
 
-Plugin Hierarchy
-----------------
+- ``request`` / ``response`` — correlated RPC, routable in either direction by
+  ``dst``.
+- ``event`` — push notification (``plugin, topic, session?, ts, seq, data``);
+  the broker stamps an authoritative ``seq``/``ts`` on ingest.
+- ``register`` / ``register_ack`` — the identity + resume-key handshake.
+- ``subscribe`` / ``unsubscribe`` — live-event interest patterns.
+- ``topology`` — a rich participant/plugin/liveness snapshot.
+- ``control`` — ``shutdown`` / ``error`` / ``terminate`` / ``disconnect``.
 
-The plugin system uses a three-tier architecture:
+Liveness is transport-level only (WebSocket keepalive); there is no app-level
+heartbeat kind.  A frame-size cap bounds each frame.
 
-.. code-block:: text
+Session lifecycle
+================
 
-    Plugin (base class)
-      └── ClientManagedPlugin (manages multiple clients)
-            ├── PluginLucid (Radical Pilot integration)
-            ├── PluginXGFabric (XGFabric integration)
-            └── PluginQueueInfo (Batch system queries)
-
-Each plugin manages multiple client sessions, where each client has:
-
-- Unique client ID
-- Independent session state
-- Isolated resources (or shared backend, depending on plugin)
-
-Client Lifecycle
-----------------
-
-1. **Registration**: Client calls ``POST /{plugin}/{uid}/register_client``
-2. **Operations**: Client performs plugin-specific operations
-3. **Unregistration**: Client calls ``POST /{plugin}/{uid}/unregister_client/{cid}``
-
-All plugins automatically provide:
-
-- Client registration/unregistration
-- Echo service for testing
-- Error handling and logging
-- Thread-safe ID generation
+A consumer opens a session on a plugin with ``register_session`` (create or
+reconnect), which selects a lifetime policy (``ephemeral`` / ``ttl`` /
+``persistent``) and records the trusted owner identity; it releases it with
+``unregister_session``.  Reattach is owner-checked; TTL and idle policies expire
+sessions on time; owner-bound ephemeral sessions are reclaimed a grace period
+after their owner is declared ``lost``.  See :doc:`plugin_development` for the
+full model.
 
 Module API
 ==========
@@ -67,10 +70,34 @@ Main Module
    :undoc-members:
    :show-inheritance:
 
-Endpoint Service
-------------
+Endpoint Runtime
+----------------
 
-.. automodule:: radical.orbit.service
+.. automodule:: radical.orbit.runtime
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+Broker
+------
+
+.. automodule:: radical.orbit.broker
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+Gateway
+-------
+
+.. automodule:: radical.orbit.gateway
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+Protocol
+--------
+
+.. automodule:: radical.orbit.protocol
    :members:
    :undoc-members:
    :show-inheritance:
@@ -82,4 +109,3 @@ Logging Configuration
    :members:
    :undoc-members:
    :show-inheritance:
-

@@ -36,8 +36,9 @@ todo_include_todos=True
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
 
-# The suffix of source filenames.
-source_suffix = '.rst'
+# The suffix of source filenames.  Markdown is handled by myst_parser (see the
+# extensions list) so the star-model guides can be authored in either format.
+source_suffix = ['.rst', '.md']
 
 # The encoding of source files.
 #source_encoding = 'utf-8-sig'

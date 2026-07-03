@@ -5,62 +5,64 @@ Plugin Development Guide
 Overview
 ========
 
-The ORBIT plugin system lets you extend endpoint nodes with
-domain-specific functionality.  Each plugin gets its own URL namespace,
-session management, and notification support out of the box.
+The ORBIT plugin system lets you extend a participant — an endpoint runtime or
+the broker itself — with domain-specific functionality.  Each plugin gets its
+own endpoint-relative namespace, session management, and notification support
+out of the box.
 
-Architecture
-============
+Where plugins run
+=================
+
+A plugin is **transport-agnostic**.  Its route handlers are plain ``async``
+callables; the host decides how requests reach them:
+
+*   **Served on an endpoint runtime.**  The runtime dispatches broker-routed
+    ``request`` frames to the plugin on its work loop and packs the return value
+    into a ``response`` frame — no local HTTP port is ever opened.
+
+*   **Hosted on the broker.**  The broker constructs the plugin on its own
+    plugin-host loop/thread (via ``BrokerPluginHost``).  A broker-hosted plugin
+    is handed extra seam objects on ``app.state``: ``broker_caller`` (a
+    :class:`~radical.orbit.broker.BrokerCaller` for calling *other* participants
+    from inside the plugin) and ``broker_tap`` (the raw event stream, used by the
+    ``replay`` plugin).  ``app.state.is_broker`` is ``True`` there.
+
+The same handler runs unchanged either way because ``add_route_post`` /
+``add_route_get`` perform **dual registration**: they add a compiled
+direct-dispatch entry to ``app.state.direct_routes`` (matched on the runtime /
+host work loop) **and** an ASGI route on the FastAPI app (used by the gateway's
+HTTP proxy and by ``TestClient`` in unit tests).
+
+Use :meth:`~radical.orbit.plugin_base.Plugin.is_enabled` to gate where a plugin
+loads — for example, ``globus`` disables itself on the broker, and ``replay``
+loads only on the broker and only when the event tap is present.
 
 Base Classes
-------------
+============
 
 The plugin system provides three base classes:
 
-1. **Plugin** (``plugin_base.py``) — Server-side plugin registered on the endpoint.
+1. **Plugin** (``plugin_base.py``) — the served/hosted plugin.
 
    - Manages sessions, routes, and notifications
-   - Auto-registers via ``plugin_name`` class attribute
+   - Auto-registers via the ``plugin_name`` class attribute
    - Provides ``add_route_post()`` / ``add_route_get()`` helpers
    - Forwards requests to sessions via ``_forward()``
 
-2. **PluginSession** (``plugin_session_base.py``) — Per-client session state.
+2. **PluginSession** (``plugin_session_base.py``) — per-client session state.
 
-   - Created when a client calls ``register_session``
+   - Created when a caller invokes ``register_session``
    - Holds domain-specific state (jobs, tasks, connections)
-   - Sends notifications via ``self._notify(topic, data)``
+   - Sends notifications via ``self._plugin._dispatch_notify(topic, data)``
 
-3. **PluginClient** (``client.py``) — Application-side client helper.
+3. **PluginClient** (``client.py``) — application-side helper.
 
-   - Wraps HTTP calls to the bridge/endpoint REST API
+   - Speaks a small ``httpx``-shaped transport surface, so it is
+     transport-agnostic: the endpoint runtime rides it over the WebSocket by
+     swapping in a transport shim (``RuntimePluginClient``); ``TestClient`` tests
+     ride it over HTTP
    - Manages session registration and lifecycle
-   - Optional: only needed for Python client usage
-
-Inheritance Hierarchy
----------------------
-
-.. code-block:: text
-
-    Plugin (server-side)
-      ├── PluginSysinfo
-      ├── PluginPSIJ
-      ├── PluginRhapsody
-      ├── PluginQueueInfo
-      ├── PluginLucid
-      └── PluginXGFabric
-
-    PluginSession (server-side)
-      ├── SysinfoSession
-      ├── PSIJSession
-      ├── RhapsodySession
-      ├── QueueInfoSession
-      └── ...
-
-    PluginClient (client-side)
-      ├── PSIJClient
-      ├── RhapsodyClient
-      ├── QueueInfoClient
-      └── ...
+   - Optional: only needed for Python consumer access
 
 Creating a New Plugin
 =====================
@@ -87,9 +89,9 @@ Create a session class that inherits from ``PluginSession``:
             result = f"processed: {param}"
             self._data[param] = result
 
-            # Send real-time notification to clients
-            if self._notify:
-                self._notify("work_status", {
+            # Send a real-time notification to subscribed consumers
+            if self._plugin:
+                self._plugin._dispatch_notify("work_status", {
                     "param": param,
                     "status": "done"
                 })
@@ -104,8 +106,9 @@ Create a session class that inherits from ``PluginSession``:
 **Key Points:**
 
 - Call ``super().__init__(sid)`` to initialize base functionality
-- Use ``self._check_active()`` to validate session is open
-- Use ``self._notify(topic, data)`` for real-time notifications
+- Use ``self._check_active()`` to validate the session is open
+- Emit notifications with ``self._plugin._dispatch_notify(topic, data)``
+  (thread-safe; works from sync/async contexts and background threads)
 - Call ``await super().close()`` in your close method
 
 Step 2: Define Your Plugin Class
@@ -122,7 +125,7 @@ Create a plugin class that inherits from ``Plugin``:
     class PluginMyService(Plugin):
         """MyService plugin for ORBIT."""
 
-        plugin_name   = "myservice"     # URL namespace and registry key
+        plugin_name   = "myservice"     # namespace + registry key
         session_class = MySession       # Required!
         version       = '0.1.0'
 
@@ -133,7 +136,7 @@ Create a plugin class that inherits from ``Plugin``:
             self.add_route_post('do_work/{sid}', self.do_work)
 
         async def do_work(self, request: Request) -> JSONResponse:
-            """Route handler — forwards to session method."""
+            """Route handler — forwards to a session method."""
             sid  = request.path_params['sid']
             data = await request.json()
             return await self._forward(sid, MySession.do_work,
@@ -141,51 +144,55 @@ Create a plugin class that inherits from ``Plugin``:
 
 **Key Points:**
 
-- Set ``plugin_name`` for auto-registration and URL namespace
+- Set ``plugin_name`` for auto-registration and the namespace
+- Give ``instance_name`` a default so the host can construct the plugin as
+  ``PluginMyService(app=...)``
 - Set ``session_class`` to your session class
 - Use ``self.add_route_post()`` / ``self.add_route_get()`` for routes
-- Use ``self._forward(sid, method, **kwargs)`` to dispatch to sessions
-- ``_forward`` handles session lookup, error wrapping, and JSON response
+- Use ``self._forward(sid, method, **kwargs)`` to dispatch to sessions;
+  ``_forward`` handles session lookup, expiry, error wrapping, and the response
 
 Auto-Registered Routes
 -----------------------
 
-Every plugin automatically gets these routes:
+Every plugin automatically gets these routes under its namespace:
 
-- ``POST /{plugin_name}/register_session`` — Create a new session
-- ``POST /{plugin_name}/unregister_session/{sid}`` — Close a session
-- ``GET  /{plugin_name}/version`` — Plugin version
-- ``GET  /{plugin_name}/list_sessions`` — List active sessions
-- ``GET  /{plugin_name}/health`` — Health check
-- ``GET  /{plugin_name}/ui_config`` — UI configuration for the Explorer
+- ``POST /{instance}/register_session`` — Create or reconnect to a session
+- ``POST /{instance}/unregister_session/{sid}`` — Close a session
+- ``GET  /{instance}/version`` — Plugin version
+- ``GET  /{instance}/list_sessions`` — List active sessions
+- ``GET  /{instance}/health`` — Health check
+- ``GET  /{instance}/ui_config`` — UI configuration for the Explorer
 
 Step 3: Define Your Client Class (Optional)
 --------------------------------------------
 
-For Python client access, create a client class:
+For Python consumer access, create a client class:
 
 .. code-block:: python
 
     from radical.orbit.client import PluginClient
 
     class MyServiceClient(PluginClient):
-        """Client-side interface for MyService plugin."""
+        """Consumer-side helper for the MyService plugin."""
 
         def do_work(self, param: str) -> dict:
-            """Call do_work on the endpoint."""
-            if not self.sid:
-                raise RuntimeError("No active session")
-
-            url  = self._url(f"do_work/{self.sid}")
-            resp = self._http.post(url, json={"param": param})
+            """Call do_work on the target participant."""
+            self._require_session()
+            resp = self._request("POST", self._url(f"do_work/{self.sid}"),
+                                  json={"param": param})
             self._raise(resp, f"do_work({param!r})")
             return resp.json()
+
+Register the helper on the plugin (``client_class = MyServiceClient``) so that
+:meth:`~radical.orbit.EndpointRuntime.get_plugin` returns it.
 
 **Key Points:**
 
 - ``self.sid`` is set after ``register_session()``
-- ``self._url(path)`` builds the full URL with namespace
-- ``self._http`` is the HTTP client (``httpx.Client``)
+- ``self._url(path)`` builds the namespaced path
+- ``self._request(method, url, **kwargs)`` is the single transport seam; the
+  runtime transparently routes it over the WebSocket
 - ``self._raise(resp)`` raises on non-2xx status codes
 
 Advanced Patterns
@@ -205,64 +212,192 @@ Override ``_create_session()`` for custom initialization:
             """Pass extra config to sessions."""
             return self.session_class(sid, config=self._config)
 
-Custom Session Registration
-----------------------------
+Sessions
+========
 
-Override ``register_session()`` for custom registration logic:
+Lifetime policies
+-----------------
 
-.. code-block:: python
+``register_session`` accepts a JSON body (all fields optional) selecting a
+lifetime policy and, for reconnect, a client-supplied session id::
 
-    async def register_session(self, request: Request) -> JSONResponse:
-        """Register with custom parameters."""
-        import uuid as _uuid
+    {"sid": <str>, "lifetime": "ephemeral"|"ttl"|"persistent", "ttl": <seconds>}
 
-        data     = await request.json()
-        backends = data.get('backends', ['default'])
-        sid      = f"session.{_uuid.uuid4().hex[:8]}"
+- ``sid`` omitted → a fresh session id is minted.
+- ``sid`` names an existing session → *reconnect* (its last-access is bumped),
+  subject to the owner and policy checks below.
+- ``sid`` names no session → a session is created under exactly that id.
 
-        session = self._create_session(sid, backends=backends)
-        if hasattr(session, 'initialize'):
-            await session.initialize()
-        self._sessions[sid] = session
+The three lifetimes:
 
-        return JSONResponse({"sid": sid})
+- ``ephemeral`` (default) — an owner-bound ephemeral session is reclaimed a
+  reclaim-drain grace after its owner is declared ``lost`` (see
+  `Topology and liveness`_); an owner-less one falls back to the plugin idle
+  timeout (``session_ttl``, default 1 hour) so it is not leaked.
+- ``ttl`` — expires once ``now - last_access`` exceeds ``ttl`` seconds (requires
+  a positive ``ttl``); never touched by owner loss.
+- ``persistent`` — never expires; reclaimed only by explicit operator action.
 
-Notifications
+The reserved ``default`` session id is always persistent, shared, and per plugin
+*instance* (a ``rhapsody`` default and a ``psij`` default are distinct); it is
+created on demand and records owner ``None``.
+
+Owner binding
 -------------
 
-Sessions send notifications via ``self._notify(topic, data)``.
-Notifications flow: Session → Plugin → Endpoint → Bridge → SSE clients.
+The serving runtime injects the broker-stamped participant identity as the
+trusted ``x-orbit-src`` request header (overwriting any client-supplied copy).
+``register_session`` records it as the session ``owner``.  Reattach is
+**owner-checked**: reconnecting to a session whose recorded owner is not ``None``
+and differs from the caller is rejected with **HTTP 403** — recovery goes
+through re-registering the same participant name.  Requests arriving through the
+broker gateway carry no participant identity, so their sessions are owner-less
+(``None``) and stay capability-style within the token trust domain.
+
+Status codes: **403** on a cross-owner reattach, **409** on an incoherent or
+conflicting lifetime/ttl, **410** on a session that has passed its TTL, **404**
+on an unknown session id.
+
+Session teardown
+----------------
+
+When ``close()`` is called on a ``PluginSession``:
+
+- The session releases all resources (threads, backend connections, file
+  handles) and cancels any background polling/watchers
+- The base ``super().close()`` marks the session inactive
+
+Notifications
+=============
+
+Plugins push real-time notifications that become broker ``event`` frames.
+The flow is: **Session → Plugin → participant runtime → Broker → subscribed
+consumers** (and, for HTTP clients, the gateway's SSE ``/events`` fan-out).  The
+broker stamps each event with an authoritative ``seq``/``ts`` on ingest.
+
+From a session:
 
 .. code-block:: python
 
-    # In your session method:
-    if self._notify:
-        self._notify("job_status", {
+    # In your PluginSession subclass method:
+    if self._plugin:
+        self._plugin._dispatch_notify("job_status", {
             "job_id": "abc123",
             "state":  "RUNNING"
         })
 
-Clients receive notifications via SSE at ``/events`` on the bridge.
-See the main CLAUDE.md for subscription examples (JavaScript, Python).
+From a plugin (async context):
 
-Topology Updates
-----------------
+.. code-block:: python
 
-Override ``on_topology_change`` to react when endpoints connect or disconnect:
+    await self.send_notification("my_topic", {"key": "value"})
+
+Consumers subscribe by registering callbacks on the runtime
+(``rt.register_callback(...)``, optionally ``with_meta=True`` to receive the
+broker ``seq``/``ts``); browsers subscribe over SSE at ``/events``.  See the
+project ``CLAUDE.md`` for subscription examples in Python and JavaScript.
+
+Topology and liveness
+=====================
+
+The serving runtime (and the broker's host) deliver the **rich topology** on
+every change.  Override ``on_topology_change`` to react to
+connect / disconnect / liveness transitions:
 
 .. code-block:: python
 
     class PluginMyService(Plugin):
-        async def on_topology_change(self, endpoints: dict):
-            for endpoint_name, info in endpoints.items():
-                plugins = info.get('plugins', [])
-                print(f"Endpoint {endpoint_name}: {plugins}")
+        async def on_topology_change(self, participants: dict):
+            for name, info in participants.items():
+                print(f"{name}: {info.get('liveness')}")
+            await super().on_topology_change(participants)  # keep reclaim-drain
+
+``participants`` maps each participant name to its rich info::
+
+    {"endpoint1": {"role":     "endpoint",
+                   "plugins":  {"sysinfo": {...}, "psij": {...}},
+                   "liveness": "present"}}
+
+``liveness`` is one of ``present`` / ``suspect`` / ``lost``.  The wire carries no
+tombstone — the broker broadcasts ``suspect`` on a socket drop and simply drops
+the participant once its grace elapses — so the host **synthesizes** a
+``liveness='lost'`` entry for a participant that vanishes after being seen, and
+delivers it exactly once.  The base ``on_topology_change`` uses this to drive
+owner-bound ephemeral-session reclaim: a ``lost`` owner arms its reclaim-drain
+timer; a ``present`` owner cancels it (a transient ``suspect`` never reclaims).
+Overriders that want that behavior call ``super()``.
+
+Plugin Shutdown
+==============
+
+Override ``shutdown`` for orderly teardown on host shutdown.  The base
+implementation cancels the background session-cleanup task and any pending
+reclaim-drain timers (awaiting each so no task is destroyed while pending) and
+then closes every open session.  A plugin that spawns extra background tasks
+cancels them first, then calls ``super().shutdown()``:
+
+.. code-block:: python
+
+    class PluginMyService(Plugin):
+        async def shutdown(self) -> None:
+            if self._poller is not None and not self._poller.done():
+                self._poller.cancel()
+                try:    await self._poller
+                except asyncio.CancelledError:
+                    pass
+            await super().shutdown()
+
+Async / Sync Guidelines
+=======================
+
+All plugin route handlers **must** be ``async def``.  Blocking operations (file
+I/O, subprocess calls, network requests) must be offloaded to a thread pool with
+``asyncio.to_thread`` so a handler never stalls the work loop::
+
+    async def my_handler(self, param: str) -> dict:
+        result = await asyncio.to_thread(subprocess.check_output, ['cmd', param])
+        return {'output': result.decode()}
+
+Callbacks from external libraries (PsiJ status callbacks, Rhapsody backend
+callbacks) run on background threads, not the loop.  Emit notifications from
+them with ``self._plugin._dispatch_notify(topic, data)`` — it is thread-safe and
+schedules the send on the main loop automatically.
+
+Testing Your Plugin
+==================
+
+Because ``add_route_post`` / ``add_route_get`` also register ASGI routes, a
+plugin can be exercised over HTTP with Starlette's ``TestClient``:
+
+.. code-block:: python
+
+    import pytest
+    from fastapi import FastAPI
+    from starlette.testclient import TestClient
+
+    def test_my_plugin():
+        app    = FastAPI()
+        plugin = PluginMyService(app)
+        client = TestClient(app)
+
+        # Register a session
+        resp = client.post(f"{plugin.namespace}/register_session")
+        assert resp.status_code == 200
+        sid = resp.json()['sid']
+
+        # Call the plugin endpoint
+        resp = client.post(
+            f"{plugin.namespace}/do_work/{sid}",
+            json={"param": "test"}
+        )
+        assert resp.status_code == 200
+        assert resp.json()['result'] == "processed: test"
 
 UI Configuration
 ================
 
-Plugins can provide a ``ui_config`` dict that the Explorer UI uses to
-render forms, monitors, and notification subscriptions automatically:
+Plugins can provide a ``ui_config`` dict that the Explorer UI uses to render
+forms, monitors, and notification subscriptions automatically:
 
 .. code-block:: python
 
@@ -293,9 +428,8 @@ render forms, monitors, and notification subscriptions automatically:
             }
         }
 
-Alternatively, plugins can provide a custom JS module by setting
-``ui_module`` to the path of a ``.js`` file.  See the next section for
-the complete JS Module API reference.
+Alternatively, plugins can provide a custom JS module by setting ``ui_module`` to
+the path of a ``.js`` file.  See the next section for the JS Module API.
 
 JS Plugin Module API
 ====================
@@ -353,7 +487,7 @@ The ``api`` object is passed to ``init()``, ``onShow()``, and
 **HTTP**
 
 ``api.fetch(path, options)``
-    Fetch relative to the current plugin namespace on the bridge.
+    Fetch relative to the current plugin namespace on the broker.
     Returns parsed JSON. Throws on HTTP errors.
 
 ``api.fetchRaw(path, options)``
@@ -393,8 +527,8 @@ The ``api`` object is passed to ``init()``, ``onShow()``, and
 ``api.pluginName``
     The plugin module name.
 
-``api.bridgeUrl``
-    Full URL of the bridge (e.g. ``"https://bridge:8000"``).
+``api.brokerUrl``
+    Full URL of the broker (e.g. ``"https://broker:8000"``).
 
 ``api.getPluginNames()``
     Returns an array of all plugin names registered on this endpoint.
@@ -450,70 +584,6 @@ adding the row:
 
 See ``psij.js`` and ``rhapsody.js`` for complete examples of this pattern.
 
-Session Lifecycle
-=================
-
-Sessions are created on the first ``api.getSession()`` call and persist until:
-
-- The browser tab is closed or navigated away
-- The endpoint disconnects (all sessions are lost; the endpoint has no persistence)
-- The session TTL expires (default 1 hour of inactivity)
-- The client calls ``unregister_session/{sid}``
-
-When ``close()`` is called on a ``PluginSession``:
-
-- The session should release all resources (threads, backend connections, file handles)
-- Any background polling or watchers must be cancelled
-- The base ``super().close()`` sets the session status to inactive
-
-Sessions are **not persisted** across endpoint restarts. Clients must re-register
-after an endpoint reconnects.
-
-Async / Sync Guidelines
-=======================
-
-All plugin route handlers **must** be ``async def``.  Blocking operations
-(file I/O, subprocess calls, network requests) must be offloaded to a thread
-pool using ``asyncio.to_thread``::
-
-    async def my_handler(self, param: str) -> dict:
-        # Blocking call — run in thread to avoid blocking the event loop
-        result = await asyncio.to_thread(subprocess.check_output, ['cmd', param])
-        return {'output': result.decode()}
-
-Callbacks from external libraries (e.g. PsiJ status callbacks, Rhapsody
-backend callbacks) run in background threads, not the event loop.  Use
-``self._notify(topic, data)`` from those callbacks — it is thread-safe and
-schedules the SSE send on the main event loop automatically.
-
-Testing Your Plugin
-===================
-
-.. code-block:: python
-
-    import pytest
-    from fastapi import FastAPI
-    from starlette.testclient import TestClient
-
-    @pytest.mark.asyncio
-    async def test_my_plugin():
-        app    = FastAPI()
-        plugin = PluginMyService(app)
-        client = TestClient(app)
-
-        # Register session
-        resp = client.post(f"{plugin.namespace}/register_session")
-        assert resp.status_code == 200
-        sid = resp.json()['sid']
-
-        # Call plugin endpoint
-        resp = client.post(
-            f"{plugin.namespace}/do_work/{sid}",
-            json={"param": "test"}
-        )
-        assert resp.status_code == 200
-        assert resp.json()['result'] == "processed: test"
-
 Summary
 =======
 
@@ -521,10 +591,10 @@ To create a new plugin:
 
 1. Create a session class inheriting from ``PluginSession``
 2. Create a plugin class inheriting from ``Plugin``
-3. Set ``plugin_name`` and ``session_class``
+3. Set ``plugin_name`` and ``session_class`` (and a default ``instance_name``)
 4. Add routes in ``__init__`` using ``add_route_post`` / ``add_route_get``
-5. Optionally create a ``PluginClient`` subclass for Python clients
-6. Optionally provide ``ui_config`` for the Explorer UI
+5. Optionally create a ``PluginClient`` subclass and set ``client_class``
+6. Optionally provide ``ui_config`` (or ``ui_module``) for the Explorer UI
 
 See the existing plugins (``plugin_sysinfo.py``, ``plugin_psij.py``,
 ``plugin_rhapsody.py``) for real-world examples.
