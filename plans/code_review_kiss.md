@@ -6,10 +6,12 @@ readability mandate — with the implementation plans and our design discussions
 explicitly withheld, so nothing is accepted on cited-but-unavailable authority.
 
 **Full per-cluster findings** (with `file:line`, "simpler alternative", and
-essential/accidental judgement for every item) live in
-`scratchpad/review/{1_wire_broker,2_runtime_gateway,3_plugin_framework,4_dispatcher,5_hpc_plugins,6_integration_plugins}.md`.
-This file is the ranked, de-duplicated synthesis for our discussion. **No code has
-been changed.** 87 findings total (~18 high, ~44 medium, ~25 low).
+essential/accidental judgement for every item) live alongside this file in
+`plans/code_review_kiss/{1_wire_broker,2_runtime_gateway,3_plugin_framework,4_dispatcher,5_hpc_plugins,6_integration_plugins}.md`;
+`plans/code_review_kiss/0_brief.md` is the exact brief the reviewers were given
+(and the only non-code input they had). This file is the ranked, de-duplicated
+synthesis for our discussion. **No code has been changed.** 87 findings total
+(~18 high, ~44 medium, ~25 low).
 
 ## Overall verdict
 
