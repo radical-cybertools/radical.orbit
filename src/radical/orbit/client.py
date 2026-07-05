@@ -5,9 +5,10 @@ This module provides the base :class:`PluginClient` helper that every plugin's
 ``client_class`` subclasses (``SysInfoClient``, ``PSIJClient``, …).  It speaks a
 small ``httpx``-shaped transport surface (``self._http.get/post`` +
 :meth:`PluginClient._request`) so a helper is transport-agnostic: the endpoint
-runtime rides it over a WebSocket by swapping in a transport shim
-(:class:`radical.orbit.runtime_client.RuntimePluginClient`), and plugin-level
-``TestClient`` tests ride it over HTTP.
+runtime rides it over a WebSocket by injecting a
+:class:`radical.orbit.runtime_client._RuntimeHTTP` transport (and passing the
+runtime as ``broker_client`` so notifications register against the runtime's
+callback registry), and plugin-level ``TestClient`` tests ride it over HTTP.
 
 Notification Callbacks
 ----------------------
@@ -82,8 +83,9 @@ class PluginClient:
         psij.register_notification_callback(on_job_status, topic="job_status")
 
     The base implementation registers over an injected notification client
-    (``self._bc``); :class:`~radical.orbit.runtime_client.RuntimePluginClient`
-    overrides these to ride the runtime's callback registry over the WebSocket.
+    (``self._bc``); the endpoint runtime passes itself as ``self._bc`` (via
+    ``get_plugin(..., broker_client=runtime)``), so these calls ride the
+    runtime's callback registry over the WebSocket with no subclass.
     """
 
     def __init__(self, http_client, base_url: str, broker_client=None,
@@ -196,8 +198,23 @@ class PluginClient:
         Subclasses may override to accept plugin-specific keyword
         arguments (e.g. ``backends``).
         """
-        return _run_sync(self.aregister_session(
-            sid=sid, lifetime=lifetime, ttl=ttl, **kwargs))
+        resp = self._request("POST", self._url("register_session"),
+                             json=self._session_payload(sid, lifetime, ttl))
+        self._raise(resp)
+        self._sid = resp.json()['sid']
+
+    @staticmethod
+    def _session_payload(sid: Optional[str], lifetime: Optional[str],
+                         ttl: Optional[float]):
+        """Build the ``register_session`` request body (``None`` when empty).
+
+        The one place that shapes the session payload — shared by the sync
+        :meth:`register_session` and the async :meth:`aregister_session`."""
+        payload = {}
+        if sid      is not None: payload['sid']      = sid
+        if lifetime is not None: payload['lifetime'] = lifetime
+        if ttl      is not None: payload['ttl']      = ttl
+        return payload or None
 
     async def aregister_session(self, sid: Optional[str] = None,
                                 lifetime: Optional[str] = None,
@@ -205,15 +222,13 @@ class PluginClient:
                                 **kwargs: Any) -> None:
         """Async core for :meth:`register_session` (see it for arguments).
 
-        Shares one wire implementation between the user-thread sync wrapper and
-        the broker-hosted dispatcher (which awaits it on the host loop).
+        The broker-hosted dispatcher awaits this on the host loop (its
+        ``self._async_http`` routes the call over the routing loop); the
+        user-thread path uses the sync :meth:`register_session` instead.
         """
-        payload = {}
-        if sid      is not None: payload['sid']      = sid
-        if lifetime is not None: payload['lifetime'] = lifetime
-        if ttl      is not None: payload['ttl']      = ttl
         resp = await self._arequest("POST", self._url("register_session"),
-                                    json=payload or None)
+                                    json=self._session_payload(sid, lifetime,
+                                                               ttl))
         self._raise(resp)
         self._sid = resp.json()['sid']
 

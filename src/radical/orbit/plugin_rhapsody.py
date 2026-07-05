@@ -38,7 +38,6 @@ ROUTE_CANCEL      = 'cancel/{sid}/{uid}'
 ROUTE_CANCEL_ALL  = 'cancel_all/{sid}'
 
 TERMINAL_STATES     = {'DONE', 'FAILED', 'CANCELED', 'COMPLETED'}
-WATCH_CONCURRENCY   = 64
 WS_PAYLOAD_LIMIT    = 8 * 1024 * 1024  # target max per batch (conservative)
 NOTIFY_BATCH_SIZE   = 1024             # max tasks per bulk notification
 NOTIFY_BATCH_WINDOW = 0.25             # seconds to accumulate before flush
@@ -52,26 +51,6 @@ except ImportError:
 import cloudpickle as _cp
 import msgpack
 from . import _prof as rprof
-
-
-def _assert_json_serializable(obj, path=""):
-    """Recursively verify that *obj* is JSON-serializable.
-
-    Raises ``TypeError`` with the exact key path on the first
-    non-serializable value encountered.
-    """
-    if isinstance(obj, dict):
-        for key, val in obj.items():
-            _assert_json_serializable(val, f"{path}.{key}" if path else key)
-    elif isinstance(obj, (list, tuple)):
-        for i, val in enumerate(obj):
-            _assert_json_serializable(val, f"{path}[{i}]")
-    elif isinstance(obj, (str, int, float, bool, type(None))):
-        return
-    else:
-        raise TypeError(
-            f"non-serializable value at '{path}': "
-            f"{type(obj).__name__} = {repr(obj)!s:.200}")
 
 
 def _json_safe(v):
@@ -111,9 +90,7 @@ class RhapsodySession(PluginSession):
     """
 
     def __init__(self, sid: str, backend_names: list[str] | None = None,
-                 allow_pickled_tasks: bool = True,
-                 notify_batch_window: float = NOTIFY_BATCH_WINDOW,
-                 notify_batch_size: int = NOTIFY_BATCH_SIZE):
+                 allow_pickled_tasks: bool = True):
         """
         Initialize a RhapsodySession.
 
@@ -123,10 +100,6 @@ class RhapsodySession(PluginSession):
                 Backends to configure.  Defaults to ``['dragon_v3']``.
             allow_pickled_tasks (bool):
                 Allow cloudpickle-encoded function tasks.  Defaults to ``True``.
-            notify_batch_window (float):
-                Seconds to accumulate notifications before flushing.
-            notify_batch_size (int):
-                Max notifications per flush — triggers immediate send.
         """
         super().__init__(sid)
 
@@ -143,31 +116,20 @@ class RhapsodySession(PluginSession):
         self._init_ready = threading.Event()
         self._init_error: str | None = None
 
-        # Limit concurrent task watchers
-        self._watch_sem: asyncio.Semaphore | None = None
-
-        # Notification batcher: accumulate completions and flush in bulk
-        self._notify_buf: list[dict]  = []
-        self._notify_lock             = threading.Lock()
-        self._notify_batch_window     = notify_batch_window
-        self._notify_batch_size       = notify_batch_size
+        # Notification batcher: accumulate completions and flush in bulk.
+        # Coalescing window/size are the module constants; a single pending
+        # flush task drains the buffer (see _queue_notification).
+        self._notify_buf: list[dict] = []
+        self._notify_lock            = threading.Lock()
+        self._flush_scheduled        = False
 
         # Cache for deserialized cloudpickle payloads — avoids decoding the
-        # same encoded string N times for template-expanded homogeneous batches.
+        # same encoded string N times when a batch repeats identical blobs.
         self._pickle_cache: dict[str, object] = {}
 
-        # Profiler — resolved lazily via the injected _plugin reference
+        # Profiler — injected by PluginRhapsody._create_session (shared with
+        # the endpoint runtime); ``None`` for sessions built directly in tests.
         self._prof: rprof.Profiler | None = None
-
-    @property
-    def prof(self) -> rprof.Profiler:
-        if self._prof is None:
-            svc = getattr(getattr(self._plugin, '_app', None),
-                          'state', None)
-            svc = getattr(svc, 'endpoint_service', None) if svc else None
-            self._prof = getattr(svc, '_prof', None) or \
-                         rprof.Profiler('rhapsody', ns='radical.orbit')
-        return self._prof
 
     async def initialize(self) -> None:
         """Asynchronously initialize the session and its backends."""
@@ -181,11 +143,7 @@ class RhapsodySession(PluginSession):
 
             # Offload the blocking ``rh.Session`` construction to a worker
             # thread (the established ``_prepare_batch`` offload pattern) so it
-            # never runs on the work loop.  This is work-loop hygiene, not
-            # liveness-critical: M0 measures Dragon init holding the GIL for
-            # only ~2.8 ms (runtime bring-up releases the GIL), so with
-            # transport isolation the keepalive never depends on this offload —
-            # it just keeps the work loop responsive to other requests.
+            # keeps the work loop responsive to other requests during init.
             self._rh_session = await asyncio.to_thread(
                 rh.Session, backends=backends, uid=self._sid)
 
@@ -212,40 +170,8 @@ class RhapsodySession(PluginSession):
 
                     b.register_callback(_on_state)
 
-            # Create semaphore now that we're in an event loop
-            self._watch_sem = asyncio.Semaphore(WATCH_CONCURRENCY)
-
             self._init_ready.set()
             log.info("[%s] Session initialization complete", self._sid)
-
-            # Probe: log Dragon's view of node hostnames so we can compare
-            # against what queue_info.nodelist() / amsc.py is using for
-            # Policy(host_name=…).  A mismatch silently turns HOST_NAME
-            # placement into a no-op and tasks pile up on whichever node
-            # Dragon's default policy lands them.
-            #
-            # ``System().nodes`` returns huids (int).  ``Node(huid)``
-            # wraps each one and exposes ``.hostname``.
-            try:
-                from dragon.native.machine import (
-                    System as _DragonSystem, Node as _DragonNode)
-                _dragon_hosts = [str(_DragonNode(h).hostname)
-                                 for h in _DragonSystem().nodes]
-                log.info("[%s] dragon System().nodes hostnames: %s",
-                         self._sid, _dragon_hosts)
-                # Probe accelerator visibility — if Policy(gpu_affinity=…)
-                # is being silently dropped, dragon's _get_gpu_affinity
-                # filters our request against node.accelerators.device_list
-                # (== Node.gpus).  Empty/None/wrong-vocabulary list here
-                # explains why CUDA_VISIBLE_DEVICES never gets set.
-                for _h in _DragonSystem().nodes:
-                    _n = _DragonNode(_h)
-                    log.info("[%s] dragon node %s: gpus=%s vendor=%s env=%s",
-                             self._sid, _n.hostname,
-                             _n.gpus, _n.gpu_vendor, _n.gpu_env_str)
-            except Exception as _e:
-                log.info("[%s] dragon hostname probe skipped: %s",
-                         self._sid, _e)
 
         except Exception as e:
             self._init_error = str(e)
@@ -269,15 +195,15 @@ class RhapsodySession(PluginSession):
                 return
             self._notified_states[uid_str] = state_str
 
-        # Only fire for non-terminal states; terminal is handled by _watch_task
+        # Only fire for non-terminal states; terminal states are handled by
+        # _watch_batch (which carries the full completion payload).
         if state_str.upper() in TERMINAL_STATES:
             return
 
-        if self._plugin:
-            self._plugin._dispatch_notify("task_status", {
-                "uid":   uid_str,
-                "state": state_str,
-            })
+        self.notify("task_status", {
+            "uid":   uid_str,
+            "state": state_str,
+        })
 
     def _check_initialized(self) -> None:
         """Check that the session is active and fully initialized.
@@ -341,23 +267,16 @@ class RhapsodySession(PluginSession):
 
         return td
 
-    def _prepare_batch(self, task_dicts: list[dict],
-                       pre_expanded: bool = False) -> list:
-        """Deserialize and create task objects (runs in worker thread).
+    def _prepare_batch(self, task_dicts: list[dict]) -> list:
+        """Deserialize and create task objects (runs in a worker thread).
 
         CPU-bound work (cloudpickle, from_dict) is offloaded here so the
-        event loop stays responsive for WebSocket keepalive.
-
-        When *pre_expanded* is True the batch came from template expansion:
-        all dicts already share field values by reference and the first
-        dict's cloudpickle fields seed the pickle cache so subsequent
-        dicts hit the cache.
+        work loop stays responsive for WebSocket keepalive.
         """
         deserialized = [self._deserialize_task(td) for td in task_dicts]
         return [rh.BaseTask.from_dict(td) for td in deserialized]
 
-    async def submit_tasks(self, task_dicts: list[dict],
-                           pre_expanded: bool = False) -> list[dict]:
+    async def submit_tasks(self, task_dicts: list[dict]) -> list[dict]:
         """
         Submit a list of tasks.
 
@@ -365,111 +284,63 @@ class RhapsodySession(PluginSession):
         ``BaseTask.from_dict()``.  Function fields encoded as cloudpickle
         blobs or import-path strings are deserialized first.
 
-        Uses a pipeline: deserialization of chunk N+1 runs concurrently
-        with backend submission of chunk N, so the two dominant costs
-        overlap.
+        Large submissions are processed one chunk at a time: the CPU-bound
+        deserialization is offloaded to a worker thread, then the chunk is
+        handed to the backend.  Both the ``to_thread`` offload and the
+        ``await`` on the backend keep the work loop responsive.
 
         Returns:
             list[dict]: Minimal ack dicts ``{uid, state}``.
         """
         self._check_initialized()
 
-        prof    = self.prof
         batch_n = len(task_dicts)
         bid     = task_dicts[0].get('uid', '?') if task_dicts else '?'
-        prof.prof('rh_submit', uid=bid, msg=str(batch_n))
+        if self._prof:
+            self._prof.prof('rh_submit', uid=bid, msg=str(batch_n))
 
-        _CHUNK  = 4096
-        results = []
+        _CHUNK    = 4096
+        results   = []
         all_tasks = []   # collect for batch watcher
 
-        # -- pipelined deser / submit ----------------------------------------
-        # Kick off deserialization of the first chunk while we have nothing
-        # else to do; then overlap deser(N+1) with submit(N).
-
-        chunks = [task_dicts[i:i + _CHUNK]
-                  for i in range(0, len(task_dicts), _CHUNK)]
-
-        prev_submit_fut = None   # future for the previous submit
-        prev_tasks      = None   # tasks from the previous chunk
-
-        for ci, chunk_dicts in enumerate(chunks):
-
-            # Offload CPU-bound deserialization to a worker thread
-            prof.prof('rh_deser', uid=bid, msg=str(len(chunk_dicts)))
-            deser_fut = asyncio.ensure_future(asyncio.to_thread(
-                self._prepare_batch, chunk_dicts, pre_expanded))
-
-            # While deser runs, await the *previous* chunk's submit
-            if prev_submit_fut is not None:
-                await prev_submit_fut
-                prof.prof('rh_backend_submit_done', uid=bid)
-
-                # Register the previously submitted tasks
-                prof.prof('rh_register', uid=bid)
-                for t in prev_tasks:
-                    uid_str = str(t.uid)
-                    self._tasks[uid_str] = t
-                    results.append({"uid": uid_str,
-                                    "state": str(t.get("state"))})
-                all_tasks.extend(prev_tasks)
-                prof.prof('rh_register_done', uid=bid)
-
-            tasks = await deser_fut
-            prof.prof('rh_deser_done', uid=bid)
-
-            # Fire off the backend submit (will be awaited next iteration
-            # or after the loop)
-            prof.prof('rh_backend_submit', uid=bid)
-            prev_submit_fut = asyncio.ensure_future(
-                self._rh_session.submit_tasks(tasks))
-            prev_tasks = tasks
-
-            # Yield so the event loop can process WS pings
-            await asyncio.sleep(0)
-
-        # Await the final chunk's submit
-        if prev_submit_fut is not None:
-            await prev_submit_fut
-            prof.prof('rh_backend_submit_done', uid=bid)
-
-            prof.prof('rh_register', uid=bid)
-            for t in prev_tasks:
+        for i in range(0, len(task_dicts), _CHUNK):
+            chunk = task_dicts[i:i + _CHUNK]
+            tasks = await asyncio.to_thread(self._prepare_batch, chunk)
+            await self._rh_session.submit_tasks(tasks)
+            for t in tasks:
                 uid_str = str(t.uid)
                 self._tasks[uid_str] = t
                 results.append({"uid": uid_str,
                                 "state": str(t.get("state"))})
-            all_tasks.extend(prev_tasks)
-            prof.prof('rh_register_done', uid=bid)
+            all_tasks.extend(tasks)
 
         # Start a single batch watcher instead of per-task watchers
         if self._plugin and all_tasks:
             asyncio.ensure_future(self._watch_batch(all_tasks))
 
-        prof.prof('rh_submit_done', uid=bid, msg=str(batch_n))
+        if self._prof:
+            self._prof.prof('rh_submit_done', uid=bid, msg=str(batch_n))
         return results
 
     def _queue_notification(self, payload: dict) -> None:
         """Add a task notification to the batch buffer and ensure a
         flush is scheduled.
 
-        Thread-safe — called from watcher coroutines.
+        Thread-safe — called from watcher coroutines.  A full buffer flushes
+        immediately; otherwise a single delayed flush is scheduled (and only
+        one is ever pending at a time).
         """
-        uid = payload.get('uid', '?')
-        self.prof.prof('notify_queue', uid=uid)
-
         with self._notify_lock:
             self._notify_buf.append(payload)
-            buf_len = len(self._notify_buf)
+            full     = len(self._notify_buf) >= NOTIFY_BATCH_SIZE
+            schedule = not full and not self._flush_scheduled
+            if schedule:
+                self._flush_scheduled = True
 
-        if buf_len >= self._notify_batch_size:
-            # Buffer full — flush immediately (sync, from event loop)
+        if full:
             self._flush_notifications()
-        else:
-            # Schedule a delayed flush so tail items aren't stranded.
-            # Always schedule — it's cheap and a no-op if buffer is
-            # empty when it fires.
-            self._schedule_flush(delay=self._notify_batch_window)
+        elif schedule:
+            self._schedule_flush(delay=NOTIFY_BATCH_WINDOW)
 
     def _schedule_flush(self, delay: float = 0) -> None:
         """Schedule a notification flush on the event loop."""
@@ -493,81 +364,36 @@ class RhapsodySession(PluginSession):
     def _flush_notifications(self) -> None:
         """Flush the notification buffer as a bulk message."""
         with self._notify_lock:
+            self._flush_scheduled = False
             if not self._notify_buf:
                 return
             batch = list(self._notify_buf)
             self._notify_buf.clear()
 
-        if not self._plugin:
-            return
-
-        prof = self.prof
-        for item in batch:
-            prof.prof('notify_flush', uid=item.get('uid', '?'))
-
         if len(batch) == 1:
-            self._plugin._dispatch_notify("task_status", batch[0])
+            self.notify("task_status", batch[0])
         else:
-            self._plugin._dispatch_notify("task_status_batch",
-                                          {"tasks": batch})
+            self.notify("task_status_batch", {"tasks": batch})
 
-    async def _watch_task(self, task):
-        """Background watcher for a single task: notify as soon as it completes.
+    def _task_future(self, uid_str: str, task) -> "asyncio.Future":
+        """Return the rhapsody wait-future for a single task.
 
-        Concurrency is bounded by ``self._watch_sem`` so that thousands of
-        simultaneous watchers do not overwhelm the event loop.
+        Reaches into rhapsody's private ``_state_manager`` — the sole
+        coupling to an undocumented backend internal, isolated here so the
+        dependency is a single greppable line that a dependency upgrade can
+        find.
         """
-        uid = self._get_attr(task, 'uid')
-        uid_str = str(uid) if uid else '?'
-
-        # Acquire semaphore — queues here if too many watchers are active
-        sem = self._watch_sem or asyncio.Semaphore(WATCH_CONCURRENCY)
-        prof = self.prof
-        async with sem:
-            log.debug("[%s] Watcher started for task %s", self._sid, uid_str)
-            prof.prof('rh_task_exec', uid=uid_str)
-            try:
-                if not self._rh_session:
-                    log.warning("[%s] Session closed before task %s completed",
-                                self._sid, uid_str)
-                    self._queue_notification({
-                        "uid": uid_str, "state": "FAILED",
-                        "error": "Session closed"})
-                    prof.prof('rh_task_done', uid=uid_str, state='FAILED')
-                    return
-
-                await self._rh_session.wait_tasks([task])
-
-                state = self._get_attr(task, 'state')
-                log.debug("[%s] Task %s completed with state: %s",
-                          self._sid, uid_str, state)
-
-                prof.prof('rh_task_done', uid=uid_str,
-                          state=str(state))
-
-                d = self._notification_payload(task)
-                self._queue_notification(d)
-
-            except Exception as e:
-                prof.prof('rh_task_done', uid=uid_str, state='FAILED')
-                log.warning("[%s] Rhapsody watch error for task %s: %s",
-                            self._sid, uid_str, e)
-                self._queue_notification({
-                    "uid": uid_str, "state": "FAILED",
-                    "error": str(e)})
+        return self._rh_session._state_manager.get_wait_future(uid_str, task)
 
     async def _watch_batch(self, tasks):
         """Watch a batch of tasks, notifying as each completes.
 
         Uses ``asyncio.wait(FIRST_COMPLETED)`` to drain completions
         incrementally.  Notifications are queued per-task as soon as
-        each finishes — the existing notification buffer
-        (``_queue_notification``) batches them opportunistically so
-        fast-completing tasks are grouped into single SSE messages
-        while slow tasks don't block others.
+        each finishes — the notification buffer (``_queue_notification``)
+        batches them opportunistically so fast-completing tasks are grouped
+        into single SSE messages while slow tasks don't block others.
         """
-        prof = self.prof
-
         # Build uid map and per-task futures
         fut_to_uid: dict[asyncio.Future, str] = {}
         uid_to_task: dict[str, object]         = {}
@@ -576,21 +402,16 @@ class RhapsodySession(PluginSession):
             uid     = self._get_attr(t, 'uid')
             uid_str = str(uid) if uid else '?'
             uid_to_task[uid_str] = t
-            prof.prof('rh_task_exec', uid=uid_str)
 
         if not self._rh_session:
             for uid_str in uid_to_task:
-                prof.prof('rh_task_done', uid=uid_str, state='FAILED')
                 self._queue_notification({
                     "uid": uid_str, "state": "FAILED",
                     "error": "Session closed"})
             return
 
-        # Obtain per-task futures from the session's state manager
-        sm = self._rh_session._state_manager
         for uid_str, t in uid_to_task.items():
-            fut = sm.get_wait_future(uid_str, t)
-            fut_to_uid[fut] = uid_str
+            fut_to_uid[self._task_future(uid_str, t)] = uid_str
 
         # Drain completions incrementally
         pending = set(fut_to_uid.keys())
@@ -609,8 +430,6 @@ class RhapsodySession(PluginSession):
                 t       = uid_to_task[uid_str]
                 state     = self._get_attr(t, 'state')
                 state_str = str(state) if state else 'UNKNOWN'
-
-                prof.prof('rh_task_done', uid=uid_str, state=state_str)
 
                 if state_str.upper() in TERMINAL_STATES:
                     d = self._notification_payload(t)
@@ -810,14 +629,12 @@ class RhapsodyClient(PluginClient):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Session-wide accumulator for terminal task notifications.
-        # Populated by a persistent SSE callback registered after
-        # session init, so no notification is ever lost.
+        # Session-wide accumulator for terminal task notifications, guarded
+        # by a single Condition.  Populated by a persistent SSE callback
+        # registered after session init, so no notification is ever lost;
+        # waiters block on the same Condition and wake on each completion.
+        self._cond = threading.Condition()
         self._completed: dict[str, dict] = {}
-        self._completed_lock = threading.Lock()
-        # Waiters: list of (set_of_uids, threading.Event) for wait_tasks
-        self._waiters: list[tuple[set, threading.Event]] = []
-        self._waiters_lock = threading.Lock()
         # UIDs submitted via this client — lets wait_tasks() reject UIDs that
         # were never submitted instead of blocking on them forever.
         self._submitted: set[str] = set()
@@ -833,8 +650,8 @@ class RhapsodyClient(PluginClient):
         else:
             tasks = [data]
 
-        newly_done: list[str] = []
-        with self._completed_lock:
+        with self._cond:
+            changed = False
             for t in tasks:
                 # Decode base64-encoded return values
                 if t.get('_return_value_encoding') == 'base64':
@@ -845,23 +662,13 @@ class RhapsodyClient(PluginClient):
                 state = str(t.get('state', '')).upper()
                 if uid and state in TERMINAL_STATES:
                     self._completed[uid] = t
-                    newly_done.append(uid)
+                    changed = True
 
-            # Wake waiters under completed_lock so no waiter can
-            # register between adding to _completed and checking
-            # pending sets.  Lock order: completed → waiters.
-            if newly_done:
-                with self._waiters_lock:
-                    for pending, event in self._waiters:
-                        for uid in newly_done:
-                            pending.discard(uid)
-                        if not pending:
-                            event.set()
+            if changed:
+                self._cond.notify_all()
 
     def register_session(self, backends: list[str] | None = None,
-                         init_timeout: float = 120,
-                         notify_batch_window: float | None = None,
-                         notify_batch_size: int | None = None):
+                         init_timeout: float = 120):
         """
         Register a session, optionally specifying backend names.
 
@@ -875,9 +682,6 @@ class RhapsodyClient(PluginClient):
             backends: List of backend names (e.g. ``['dragon_v3']``).
                       Defaults to ``['dragon_v3']`` on the server side.
             init_timeout: Seconds to wait for session init (default 120).
-            notify_batch_window: Seconds to accumulate notifications
-                      before flushing (endpoint-side).
-            notify_batch_size: Max notifications per flush (endpoint-side).
         """
         has_sse = (self._bc is not None and
                    self._endpoint_id is not None and
@@ -905,10 +709,6 @@ class RhapsodyClient(PluginClient):
         payload = {}
         if backends:
             payload['backends'] = backends
-        if notify_batch_window is not None:
-            payload['notify_batch_window'] = notify_batch_window
-        if notify_batch_size is not None:
-            payload['notify_batch_size'] = notify_batch_size
         resp = self._http.post(self._url('register_session'), json=payload)
         self._raise(resp)
 
@@ -917,7 +717,7 @@ class RhapsodyClient(PluginClient):
         status    = data.get('status')
 
         # Reset the session-wide task completion accumulator
-        with self._completed_lock:
+        with self._cond:
             self._completed.clear()
 
         if status == 'ready':
@@ -971,80 +771,6 @@ class RhapsodyClient(PluginClient):
             time.sleep(1.0)
         raise RuntimeError(
             f"Session init timed out after {timeout}s (poll)")
-
-    async def _apoll_session_ready(self, timeout: float = 120) -> None:
-        """Async twin of :meth:`_poll_session_ready` (broker-hosted dispatcher).
-
-        Rhapsody inits its session off-thread and answers 409 until ready;
-        poll ``list_tasks`` over the async transport until non-409 or timeout.
-        Mirrors the sync poll's semantics (swallow transient errors, raise on
-        timeout).
-        """
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                resp = await self._arequest(
-                    "GET", self._url(ROUTE_LIST_TASKS.format(sid=self.sid)))
-                if resp.status_code != 409:
-                    return
-            except Exception:
-                pass
-            await asyncio.sleep(1.0)
-        raise RuntimeError(
-            f"Session init timed out after {timeout}s (poll)")
-
-    async def aregister_session(self, backends: list[str] | None = None,
-                                init_timeout: float = 120) -> None:
-        """Async session registration for the broker-hosted dispatcher.
-
-        The dispatcher has no SSE channel, so this mirrors the sync
-        :meth:`register_session` no-SSE branch: POST ``register_session`` with
-        the requested backends, then poll until the session leaves the
-        initializing (409) state.
-        """
-        payload: dict = {}
-        if backends:
-            payload['backends'] = backends
-        resp = await self._arequest(
-            "POST", self._url("register_session"), json=payload)
-        self._raise(resp)
-        data      = resp.json()
-        self._sid = data['sid']
-        if data.get('status') != 'ready':
-            await self._apoll_session_ready(init_timeout)
-
-    async def asubmit_tasks(self, task_dicts: list[dict]) -> list[dict]:
-        """Single-batch async submit for the broker-hosted dispatcher.
-
-        Mirrors the sync :meth:`submit_tasks` single-batch wire shape (one
-        msgpack ``{"tasks": [...]}`` body) without the user-thread
-        template-compression / pipelining path — the dispatcher submits one
-        task at a time.
-        """
-        self._require_session()
-        url  = self._url(ROUTE_SUBMIT.format(sid=self.sid))
-        body = msgpack.packb({"tasks": task_dicts}, use_bin_type=True)
-        resp = await self._arequest(
-            "POST", url, content=body,
-            headers={"content-type": "application/msgpack"})
-        self._raise(resp, f"submit {len(task_dicts)} task(s)")
-        return resp.json()
-
-    async def aget_task(self, uid: str) -> dict:
-        """Async core mirroring :meth:`get_task` (broker-hosted dispatcher)."""
-        self._require_session()
-        resp = await self._arequest(
-            "GET", self._url(ROUTE_TASK.format(sid=self.sid, uid=uid)))
-        self._raise(resp)
-        return resp.json()
-
-    async def acancel_task(self, uid: str) -> dict:
-        """Async core mirroring :meth:`cancel_task` (broker-hosted dispatcher)."""
-        self._require_session()
-        resp = await self._arequest(
-            "POST", self._url(ROUTE_CANCEL.format(sid=self.sid, uid=uid)))
-        self._raise(resp)
-        return resp.json()
 
     @staticmethod
     def _serialize_task(td: dict) -> None:
@@ -1100,10 +826,9 @@ class RhapsodyClient(PluginClient):
         """
         Submit tasks to the endpoint.
 
-        Large batches are automatically split so each payload stays
-        within the WebSocket frame limit.  Batches are submitted
-        concurrently via a thread pool so that network round-trips
-        overlap (pipelining).
+        Large submissions are split so each payload stays within the
+        WebSocket frame limit (:data:`WS_PAYLOAD_LIMIT`); the batches are
+        submitted sequentially.
 
         UIDs are assigned client-side (if absent) so the caller can
         start waiting for SSE notifications immediately.
@@ -1114,8 +839,6 @@ class RhapsodyClient(PluginClient):
         Returns:
             list[dict]: Submitted task info (uid, state).
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
         self._require_session()
 
         # --- serialize callables and clean up internal fields ---
@@ -1128,29 +851,11 @@ class RhapsodyClient(PluginClient):
                 td['uid'] = f"task.{uuid.uuid4().hex[:8]}"
 
         # Remember what we submitted so wait_tasks() can validate UIDs.
-        with self._completed_lock:
+        with self._cond:
             self._submitted.update(str(td['uid']) for td in task_dicts)
 
-        # --- try template compression for homogeneous batches ---
-        # If all tasks share the same fields (except uid), send a
-        # template + list of UIDs instead of N full copies.
+        # --- split into frame-size-bounded batches ---
         url = self._url(ROUTE_SUBMIT.format(sid=self.sid))
-        if len(task_dicts) > 1:
-            ref      = task_dicts[0]
-            ref_keys = set(ref) - {'uid'}
-            homogeneous = all(
-                set(td) - {'uid'} == ref_keys and
-                all(td[k] is ref[k] or td[k] == ref[k] for k in ref_keys)
-                for td in task_dicts[1:])
-        else:
-            homogeneous = False
-
-        if homogeneous and len(task_dicts) > 1:
-            first = {k: v for k, v in ref.items() if k != 'uid'}
-            return self._submit_template(
-                url, first, [td['uid'] for td in task_dicts])
-
-        # --- split into size-aware batches (byte limit only) ---
         batches: list[list[dict]] = []
         batch: list[dict]         = []
         batch_bytes                = 0
@@ -1166,90 +871,15 @@ class RhapsodyClient(PluginClient):
         if batch:
             batches.append(batch)
 
-        # --- submit batches concurrently (pipelining) ---
-        errors: list[str] = []
-
-        def _submit_batch(b):
+        # --- submit batches sequentially ---
+        results: list[dict] = []
+        for b in batches:
             resp = self._http.post(
                 url,
                 data=msgpack.packb({"tasks": b}, use_bin_type=True),
                 headers={"Content-Type": "application/msgpack"})
             self._raise(resp, f"submit {len(b)} task(s)")
-            return resp.json()
-
-        if len(batches) == 1:
-            return _submit_batch(batches[0])
-
-        results = []
-        batch_results: dict[int, list] = {}
-        with ThreadPoolExecutor(max_workers=len(batches)) as pool:
-            futures = {pool.submit(_submit_batch, b): i
-                       for i, b in enumerate(batches)}
-            for fut in as_completed(futures):
-                idx = futures[fut]
-                try:
-                    batch_results[idx] = fut.result()
-                except Exception as e:
-                    errors.append(str(e))
-
-        if errors:
-            detail = '; '.join(errors[:3])
-            raise RuntimeError(
-                f"submit failed for {len(errors)} batch(es): {detail}")
-
-        for i in sorted(batch_results):
-            results.extend(batch_results[i])
-        return results
-
-    def _submit_template(self, url: str, template: dict,
-                         uids: list[str]) -> list[dict]:
-        """Submit homogeneous tasks via template compression.
-
-        Sends one template + list of UIDs instead of N full task dicts.
-        Falls back to regular submit in WS_PAYLOAD_LIMIT-sized chunks.
-        """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        # Cap chunks by both byte size and count so the server
-        # doesn't block the event loop processing too many at once.
-        max_by_bytes = max(
-            1, (WS_PAYLOAD_LIMIT - len(str(template))) // 20)
-        uids_per_chunk = min(max_by_bytes, 8192)
-        chunks = [uids[i:i + uids_per_chunk]
-                  for i in range(0, len(uids), uids_per_chunk)]
-
-        def _submit_chunk(uid_chunk):
-            payload = {"template": template, "uids": uid_chunk}
-            resp = self._http.post(
-                url,
-                data=msgpack.packb(payload, use_bin_type=True),
-                headers={"Content-Type": "application/msgpack"})
-            self._raise(resp, f"submit template {len(uid_chunk)} task(s)")
-            return resp.json()
-
-        if len(chunks) == 1:
-            return _submit_chunk(chunks[0])
-
-        results = []
-        batch_results: dict[int, list] = {}
-        errors: list[str] = []
-        with ThreadPoolExecutor(max_workers=len(chunks)) as pool:
-            futures = {pool.submit(_submit_chunk, c): i
-                       for i, c in enumerate(chunks)}
-            for fut in as_completed(futures):
-                idx = futures[fut]
-                try:
-                    batch_results[idx] = fut.result()
-                except Exception as e:
-                    errors.append(str(e))
-
-        if errors:
-            detail = '; '.join(errors[:3])
-            raise RuntimeError(
-                f"submit failed for {len(errors)} chunk(s): {detail}")
-
-        for i in sorted(batch_results):
-            results.extend(batch_results[i])
+            results.extend(resp.json())
         return results
 
     def wait_tasks(self, uids: list[str],
@@ -1300,7 +930,7 @@ class RhapsodyClient(PluginClient):
             norm.append(str(uid))
         uids = norm
 
-        with self._completed_lock:
+        with self._cond:
             unknown = [u for u in uids
                        if u not in self._submitted
                        and u not in self._completed]
@@ -1322,33 +952,19 @@ class RhapsodyClient(PluginClient):
         # ------------------------------------------------------------------
         # SSE-based wait (preferred path)
         # ------------------------------------------------------------------
+        # The persistent `_on_task_done` callback fills `_completed` and
+        # notifies the Condition on every completion; block on it until every
+        # requested UID has landed (or the deadline passes).
+        deadline = (time.time() + timeout) if timeout is not None else None
+        with self._cond:
+            while not all(uid in self._completed for uid in uids):
+                remaining = None
+                if deadline is not None:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        break
+                self._cond.wait(remaining)
 
-        # Build pending set and register waiter atomically so no
-        # completions slip through between the check and the
-        # registration.  Lock order matches _on_task_done:
-        # completed_lock → waiters_lock.
-        done = threading.Event()
-        with self._completed_lock:
-            if all(uid in self._completed for uid in uids):
-                return [self._completed[uid] for uid in uids]
-
-            pending = set(uid for uid in uids
-                          if uid not in self._completed)
-
-            with self._waiters_lock:
-                waiter = (pending, done)
-                self._waiters.append(waiter)
-
-        try:
-            done.wait(timeout=timeout)
-        finally:
-            with self._waiters_lock:
-                try:
-                    self._waiters.remove(waiter)
-                except ValueError:
-                    pass
-
-        with self._completed_lock:
             return [self._completed.get(uid, {"uid": uid,
                                               "state": "UNKNOWN"})
                     for uid in uids]
@@ -1530,23 +1146,9 @@ class PluginRhapsody(Plugin):
         if not isinstance(data, dict):
             data = {}
 
+        owner              = self._request_owner(request)
         sid, lifetime, ttl = self._normalize_session_policy(data)
-
-        backend_names       = data.get('backends')
-        # Endpoint-startup default: when the client doesn't specify a
-        # backend, honour $RADICAL_ORBIT_RHAPSODY_BACKEND so the endpoint
-        # operator can pick the right backend at service launch time
-        # (e.g. 'concurrent' on a laptop without Dragon).  Falls back
-        # to the session class's own default ('dragon_v3') if neither
-        # is set.
-        if not backend_names:
-            env_backend = os.environ.get('RADICAL_ORBIT_RHAPSODY_BACKEND')
-            if env_backend:
-                backend_names = [env_backend]
-        notify_batch_window = data.get('notify_batch_window',
-                                       NOTIFY_BATCH_WINDOW)
-        notify_batch_size   = data.get('notify_batch_size',
-                                       NOTIFY_BATCH_SIZE)
+        backend_names      = self._backend_names(data.get('backends'))
 
         self._ensure_cleanup_task()
 
@@ -1554,39 +1156,62 @@ class PluginRhapsody(Plugin):
         # `_ensure_default_session` override), reporting its real status.
         if sid == DEFAULT_SID:
             session = await self._ensure_default_session()
-            self._session_last_access[sid] = time.time()
+            self._touch(sid)
             return {"sid": sid, "status": self._session_status(session)}
 
         if sid is None:
             sid = f"session.{uuid.uuid4().hex[:8]}"
 
-        # Reconnect to an existing session — do not rebuild it.  Report the
-        # session's real status: its init may have long completed, and the
-        # reconnecting client would otherwise wait for a `session_status`
-        # notification that was emitted before it attached.
+        # Reconnect to an existing session — do not rebuild it.  Owner check
+        # first (bug A5: a session created with an owner must not be hijacked
+        # by another participant).  Report the session's real status: its init
+        # may have long completed, and the reconnecting client would otherwise
+        # wait for a `session_status` notification emitted before it attached.
         if sid in self._sessions:
+            self._check_owner(sid, owner)
             self._check_policy_conflict(sid, lifetime, ttl)
-            self._session_last_access[sid] = time.time()
+            self._touch(sid)
             log.info("[%s] Reconnected session %s", self.instance_name, sid)
-            status = self._session_status(self._sessions[sid])
-            return {"sid": sid, "status": status}
+            return {"sid": sid,
+                    "status": self._session_status(self._sessions[sid])}
 
-        # Build session directly to avoid race on shared plugin state
-        session = self.session_class(
-            sid,
-            backend_names=backend_names,
-            notify_batch_window=float(notify_batch_window),
-            notify_batch_size=int(notify_batch_size),
-        )
-        session._plugin = self
-        self._record_session(sid, session, lifetime, ttl)
+        # Build (with the injected profiler) and record, then kick the
+        # background init so the HTTP response — and the WebSocket slot — is
+        # released immediately, before Dragon is up.
+        session = self._create_session(sid, backend_names=backend_names)
+        self._record_session(sid, session, lifetime, ttl, owner)
         log.info("[%s] Registered session %s", self.instance_name, sid)
-
-        # Kick off initialization in the background so the HTTP response
-        # (and therefore the WebSocket slot) is released immediately.
         asyncio.create_task(self._init_session(sid, session))
 
         return {"sid": sid, "status": "initializing"}
+
+    @staticmethod
+    def _backend_names(backends: list[str] | None) -> list[str] | None:
+        """Resolve the backend list for a new session.
+
+        When the client names no backend, honour
+        ``$RADICAL_ORBIT_RHAPSODY_BACKEND`` so the endpoint operator can pick
+        the right backend at service launch (e.g. ``concurrent`` on a laptop
+        without Dragon).  Returns ``None`` when neither is set so the session
+        falls back to its own default (``dragon_v3``).
+        """
+        if backends:
+            return backends
+        env_backend = os.environ.get('RADICAL_ORBIT_RHAPSODY_BACKEND')
+        return [env_backend] if env_backend else None
+
+    def _create_session(self, sid: str, **kwargs) -> RhapsodySession:
+        """Build a session and inject the endpoint's shared profiler.
+
+        Extends the base factory (which injects ``_plugin``) so every
+        rhapsody session profiles against the one endpoint-runtime profiler
+        instead of digging it out of app state on first use.
+        """
+        session = super()._create_session(sid, **kwargs)
+        svc = getattr(self._app.state, 'endpoint_service', None)
+        session._prof = getattr(svc, '_prof', None) or \
+                        rprof.Profiler('rhapsody', ns='radical.orbit')
+        return session
 
     @staticmethod
     def _session_status(session) -> str:
@@ -1618,13 +1243,8 @@ class PluginRhapsody(Plugin):
         async with self._default_lock:
             session = self._sessions.get(DEFAULT_SID)
             if session is None:
-                backend_names = None
-                env_backend   = os.environ.get('RADICAL_ORBIT_RHAPSODY_BACKEND')
-                if env_backend:
-                    backend_names = [env_backend]
-                session = self.session_class(
-                    DEFAULT_SID, backend_names=backend_names)
-                session._plugin = self
+                session = self._create_session(
+                    DEFAULT_SID, backend_names=self._backend_names(None))
                 self._record_session(DEFAULT_SID, session, 'persistent', None)
                 log.info("[%s] Created persistent 'default' session",
                          self.instance_name)
@@ -1657,31 +1277,11 @@ class PluginRhapsody(Plugin):
     # -- route handlers -----------------------------------------------------
 
     async def submit_tasks(self, request: Request) -> dict:
-        sid  = request.path_params['sid']
-
-        prof = getattr(getattr(self._app.state, 'endpoint_service', None),
-                       '_prof', None)
-
-        if prof: prof.prof('rh_parse_body', msg=sid)
-        data = await request.json()
-        if prof: prof.prof('rh_parse_body_done', msg=sid)
-
-        # Support template compression: {"template": {...}, "uids": [...]}
-        template = data.get('template')
-        if template is not None:
-            uids = data.get('uids', [])
-            if prof: prof.prof('rh_template_expand',
-                               msg='%d tasks' % len(uids))
-            task_dicts = [dict(template, uid=uid) for uid in uids]
-            if prof: prof.prof('rh_template_expand_done')
-            pre_expanded = True
-        else:
-            task_dicts = data.get('tasks', [])
-            pre_expanded = False
-
+        sid        = request.path_params['sid']
+        data       = await request.json()
+        task_dicts = data.get('tasks', [])
         return await self._forward(sid, RhapsodySession.submit_tasks,
-                                   task_dicts=task_dicts,
-                                   pre_expanded=pre_expanded)
+                                   task_dicts=task_dicts)
 
     async def wait_tasks(self, request: Request) -> dict:
         sid = request.path_params['sid']

@@ -444,8 +444,9 @@ def test_sse_topology_on_connect_and_disconnect(harness):
 
 
 def test_sse_queue_drop_oldest_counter():
-    from radical.orbit.gateway import _SSEQueue
-    q = _SSEQueue(2)
+    # The gateway now uses the shared bounded, drop-oldest queue.
+    from radical.orbit.queues import BoundedDropOldestQueue
+    q = BoundedDropOldestQueue(2)
     for i in range(5):
         q.push('f%d' % i)
     assert q.dropped == 3                                 # 5 pushed, 2 retained

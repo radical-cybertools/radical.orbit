@@ -24,6 +24,15 @@ from .iri_endpoints       import IRI_ENDPOINTS
 log = logging.getLogger('radical.orbit')
 
 
+def _instance_key(endpoint: str) -> str:
+    '''Build the ``iri.<endpoint>`` dynamic-instance name from a bare endpoint
+    key.  Idempotent — an already-prefixed name is returned unchanged, so
+    callers can pass either ``'nersc'`` or ``'iri.nersc'``.  The single place
+    both the client and the plugin build this string.
+    '''
+    return endpoint if endpoint.startswith('iri.') else f'iri.{endpoint}'
+
+
 class IRIConnectClient(PluginClient):
     '''Client-side helper for the ``iri_connect`` broker plugin.
 
@@ -42,7 +51,7 @@ class IRIConnectClient(PluginClient):
         return resp.json()
 
     def disconnect(self, endpoint: str) -> Dict[str, Any]:
-        name = endpoint if endpoint.startswith('iri.') else f'iri.{endpoint}'
+        name = _instance_key(endpoint)
         resp = self._http.post(self._url(f'disconnect/{name}'))
         self._raise(resp, f'disconnect {name!r}')
         return resp.json()
@@ -58,7 +67,7 @@ class IRIConnectClient(PluginClient):
                                json={'endpoint': endpoint, 'token': token})
         self._raise(resp, f'connect {endpoint!r}')
 
-        iname     = f'iri.{endpoint}'
+        iname     = _instance_key(endpoint)
         namespace = f'/{self._endpoint_id}/{iname}'
         client    = IRIInstanceClient(
             self._http, namespace,
@@ -107,8 +116,20 @@ class PluginIRIConnect(Plugin):
                                 detail='No plugin host available')
         return host
 
-    def _instance_key(self, endpoint: str) -> str:
-        return f'iri.{endpoint}'
+    @staticmethod
+    def _instance(host, name: str):
+        '''Look up one dynamically-registered plugin instance by name.
+
+        The single place this plugin reaches into the host's instance table
+        (``host._plugins``); every route below goes through here or
+        :meth:`_instances` instead of reading the private dict itself.
+        '''
+        return host._plugins.get(name)
+
+    @staticmethod
+    def _instances(host) -> Dict[str, Any]:
+        '''The host's live plugin-instance table (dynamic + static).'''
+        return host._plugins
 
     # -- routes -------------------------------------------------------------
 
@@ -117,12 +138,12 @@ class PluginIRIConnect(Plugin):
         host    = self._host()
         result  = {}
         for key, ep in IRI_ENDPOINTS.items():
-            iname = self._instance_key(key)
+            iname = _instance_key(key)
             result[key] = {
                 'label'    : ep['label'],
                 'url'      : ep['url'],
                 'auth'     : ep.get('auth', ''),
-                'connected': iname in host._plugins,
+                'connected': self._instance(host, iname) is not None,
             }
         return result
 
@@ -150,14 +171,15 @@ class PluginIRIConnect(Plugin):
             raise HTTPException(status_code=400,
                                 detail='token must not be empty')
 
-        iname = self._instance_key(endpoint)
-        host  = self._host()
+        iname    = _instance_key(endpoint)
+        host     = self._host()
+        instance = self._instance(host, iname)
 
         # Idempotent reconnect: if the instance is already up, refresh its
         # bearer token in place rather than refusing.  This lets clients
         # rotate stale credentials without first having to disconnect.
-        if iname in host._plugins:
-            host._plugins[iname].update_token(token.strip())
+        if instance is not None:
+            instance.update_token(token.strip())
             log.info('[iri_connect] Updated token for %s', iname)
             return {'instance': iname, 'status': 'token_updated'}
 
@@ -170,14 +192,10 @@ class PluginIRIConnect(Plugin):
 
     async def disconnect(self, request: Request) -> dict:
         '''Disconnect an IRI endpoint instance.'''
-        name = request.path_params['name']
+        name = _instance_key(request.path_params['name'])
         host = self._host()
 
-        # Allow both 'iri.nersc' and just 'nersc'
-        if not name.startswith('iri.'):
-            name = f'iri.{name}'
-
-        if name not in host._plugins:
+        if self._instance(host, name) is None:
             raise HTTPException(status_code=404,
                                 detail=f'{name} not connected')
 
@@ -189,7 +207,7 @@ class PluginIRIConnect(Plugin):
         '''Return list of active iri.* instances.'''
         host = self._host()
         instances: Dict[str, dict] = {}
-        for pname, plugin in host._plugins.items():
+        for pname, plugin in self._instances(host).items():
             if pname.startswith('iri.'):
                 instances[pname] = {
                     'endpoint': getattr(plugin, '_endpoint_key', ''),

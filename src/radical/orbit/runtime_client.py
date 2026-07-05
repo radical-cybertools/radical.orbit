@@ -8,23 +8,24 @@ WebSocket **unchanged**:
 
 * :class:`RuntimeResponse` — an ``httpx.Response``-shaped result satisfying
   ``PluginClient._raise`` and the helpers (``status_code``/``json()``/
-  ``content``/``text``/``is_error``) *and* the plain ``status``/``headers``/
-  ``body`` consumer-API contract.
+  ``content``/``text``/``is_error``).
 * :class:`_RuntimeHTTP` — a minimal ``httpx.Client``-shaped adapter bound to
-  ``(runtime, dst)`` installed as the helper's ``self._http``.
-* :class:`RuntimePluginClient` — the seam mixed under a concrete helper class
-  by ``EndpointRuntime.get_plugin``: it overrides *only* the transport-touching
-  surface (the ``_http`` object + notification registration over the runtime's
-  callback registry instead of HTTP + SSE).
+  ``(runtime, dst)`` installed as the helper's ``self._http``.  Its verbs are
+  sync (user-thread callers); each rides ``EndpointRuntime.call``.
+
+``EndpointRuntime.get_plugin`` constructs a helper directly with a
+:class:`_RuntimeHTTP` transport and ``broker_client=`` the runtime itself, so the
+base ``PluginClient.register_notification_callback`` forwards notification
+(un)registration straight to the runtime's callback registry — no seam subclass.
 """
 
 import asyncio
 import json as _json
 
-from typing       import Any, Callable, Dict, Optional
+from typing       import Any, Dict, Optional, Tuple
 from urllib.parse import urlencode
 
-from .client import PluginClient
+from .client import PluginClient  # noqa: F401  (re-export convenience)
 
 
 def _pack_request(method: str, url: str, *, json=None, content=None, data=None,
@@ -54,18 +55,30 @@ def _pack_request(method: str, url: str, *, json=None, content=None, data=None,
     return path, bytes(body), hdrs
 
 
+def unpack_response_dict(resp: Dict[str, Any]) -> Tuple[int, Dict[str, str],
+                                                        bytes]:
+    """Normalize a broker/caller ``response`` dict to ``(status, headers, body)``.
+
+    The body is coerced to ``bytes``.  One helper for the three places that
+    unpacked this shape by hand (the gateway HTTP proxy and :class:`CallerHTTP`).
+    """
+    status = int(resp.get('status', 502))
+    body   = resp.get('body') or b''
+    if isinstance(body, str):
+        body = body.encode()
+    return status, resp.get('headers') or {}, body
+
+
 class RuntimeResponse:
-    """Response object returned by :meth:`EndpointRuntime.call` and handed to
-    the plugin helpers.  Satisfies both the consumer-API surface
-    (``status``/``headers``/``body``) and the httpx-ish surface the helpers +
-    ``PluginClient._raise`` rely on."""
+    """An ``httpx.Response``-shaped result returned by
+    :meth:`EndpointRuntime.call` and handed to the plugin helpers — satisfying
+    the httpx surface (``status_code``/``headers``/``content``/``text``/
+    ``json()``/``is_error``) that the helpers and ``PluginClient._raise`` use."""
 
     def __init__(self, status: int, headers: Dict[str, str], body: bytes):
-        self.status      = status
         self.status_code = status
         self.headers     = headers or {}
-        self.body        = body or b''
-        self.content     = self.body
+        self.content     = body or b''
 
     @property
     def text(self) -> str:
@@ -114,36 +127,6 @@ class _RuntimeHTTP:
                                   body=body, headers=hdrs)
 
 
-class RuntimePluginClient(PluginClient):
-    """Transport seam for the plugin ``client_class`` helpers over a runtime.
-
-    A concrete helper class is mixed on top of this by
-    ``EndpointRuntime.get_plugin``; this base overrides only the
-    transport-touching surface: the ``self._http`` object is a
-    :class:`_RuntimeHTTP` adapter (installed at construction), and notification
-    registration rides the runtime's callback registry instead of
-    HTTP + SSE.
-    """
-
-    _runtime = None
-
-    def register_notification_callback(self, callback: Callable,
-                                       topic: Optional[str] = None) -> None:
-        if self._runtime is None:
-            raise RuntimeError("no runtime bound to this plugin client")
-        self._runtime.register_callback(
-            endpoint_id=self._endpoint_id, plugin_name=self._plugin_name,
-            topic=topic, callback=callback)
-
-    def unregister_notification_callback(self, callback: Callable,
-                                         topic: Optional[str] = None) -> None:
-        if self._runtime is None:
-            raise RuntimeError("no runtime bound to this plugin client")
-        self._runtime.unregister_callback(
-            endpoint_id=self._endpoint_id, plugin_name=self._plugin_name,
-            topic=topic, callback=callback)
-
-
 class CallerHTTP:
     """Async transport shim over a broker in-process caller (host-loop side).
 
@@ -175,11 +158,7 @@ class CallerHTTP:
             self._dst, method, path, body=body, headers=hdrs,
             timeout=self._timeout)
         resp = await asyncio.wrap_future(fut)
-        status = int(resp.get('status', 502))
-        rbody  = resp.get('body') or b''
-        if isinstance(rbody, str):
-            rbody = rbody.encode()
-        return RuntimeResponse(status, resp.get('headers') or {}, rbody)
+        return RuntimeResponse(*unpack_response_dict(resp))
 
     def _blocked(self, *_a, **_k):
         raise RuntimeError(

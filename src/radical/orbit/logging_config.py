@@ -3,7 +3,6 @@ Logging configuration for radical.orbit
 
 This module sets up standard Python logging with:
 - Uvicorn-style colored output
-- Support for correlation IDs in request context
 - Structured log format
 
 Import this module early in your application to configure logging.
@@ -13,34 +12,12 @@ import logging
 import os
 import sys
 import copy
-import contextvars
 from typing import Optional
-
-
-# Context variable for request correlation ID
-correlation_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
-    'correlation_id', default=None
-)
-
-
-def set_correlation_id(req_id: str) -> None:
-    """Set the correlation ID for the current async context."""
-    correlation_id.set(req_id)
-
-
-def get_correlation_id() -> Optional[str]:
-    """Get the correlation ID for the current async context."""
-    return correlation_id.get()
-
-
-def clear_correlation_id() -> None:
-    """Clear the correlation ID for the current async context."""
-    correlation_id.set(None)
 
 
 class ColoredFormatter(logging.Formatter):
     """
-    Log formatter with Uvicorn-style coloring and correlation ID support.
+    Log formatter with Uvicorn-style coloring.
     """
 
     def __init__(self, fmt: Optional[str] = None, datefmt: Optional[str] = None,
@@ -59,20 +36,9 @@ class ColoredFormatter(logging.Formatter):
             logging.CRITICAL: "\033[31;1m",  # Bold Red
         }
         self.RESET = "\033[0m"
-        self.DIM = "\033[2m"
 
     def format(self, record: logging.LogRecord) -> str:
         record = copy.copy(record)
-
-        # Add correlation ID if available
-        req_id = correlation_id.get()
-        if req_id:
-            # Truncate for readability
-            short_id = req_id[:8] if len(req_id) > 8 else req_id
-            if self.use_colors:
-                record.msg = f"{self.DIM}[{short_id}]{self.RESET} {record.msg}"
-            else:
-                record.msg = f"[{short_id}] {record.msg}"
 
         if not self.use_colors:
             return super().format(record)

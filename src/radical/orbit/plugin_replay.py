@@ -18,8 +18,8 @@ whole stream, not just its own endpoint's slice.
 
 Replay is **not** in the broker's default plugin set — the core stays stateless
 and this plugin is the one retaining subscriber, loaded per use case.  Operators
-add ``replay`` to the broker ``--plugins`` spec when a use case needs durable
-ephemeral-event delivery.
+add ``replay`` to the broker ``--plugins`` spec when a use case needs
+replay-after-reconnect for ephemeral events.
 
 Retention
 ---------
@@ -37,9 +37,10 @@ dropped, and lowest/highest ``seq`` for the global ring and each per-session
 buffer.
 
 Delivery is **at-least-once on the wire with ``seq`` dedup at the consumer =
-effectively-once**: a per-consumer cursor advances only on ACK, so a drop
-mid-replay re-sends rather than loses, and the consumer discards duplicates by
-``seq``.
+effectively-once**: ``fetch`` is stateless — the consumer passes its own
+``after_seq`` position each call — so a consumer that re-fetches the same
+``after_seq`` simply re-reads the batch, and duplicates are discarded by
+``seq``.  The server keeps no per-consumer cursor.
 '''
 
 from __future__ import annotations
@@ -53,7 +54,7 @@ from typing      import Any, Callable, Dict, List, Optional
 
 import msgpack
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 
 from .client               import PluginClient
 from .plugin_base          import Plugin
@@ -69,10 +70,9 @@ log = logging.getLogger('radical.orbit')
 _SESSION_MAX_AGE   = 600.0              # per-session buffer age bound  (s)
 _SESSION_MAX_BYTES = 4  * 1024 * 1024   # per-session buffer size bound (bytes)
 _GLOBAL_MAX_BYTES  = 16 * 1024 * 1024   # global session-less ring bound (bytes)
-_CURSOR_TTL        = 3600.0             # cursor inactivity expiry (s)
 _FETCH_MAX_EVENTS  = 256                # default per-fetch event cap
 _FETCH_MAX_BYTES   = 1024 * 1024        # default per-fetch byte cap
-_SWEEP_INTERVAL    = 30.0              # background age/cursor sweep cadence (s)
+_SWEEP_INTERVAL    = 30.0              # background age-eviction sweep cadence (s)
 
 
 # ---------------------------------------------------------------------------
@@ -160,27 +160,6 @@ class _RingBuffer:
 
 
 # ---------------------------------------------------------------------------
-# _Cursor — per-consumer replay position
-# ---------------------------------------------------------------------------
-
-class _Cursor:
-    '''A consumer's replay position: the highest ``seq`` it has ACKed.
-
-    Keyed by a client-chosen ``cursor_id``.  A *stable* consumer name makes
-    reconnect-resume work — the same cursor_id picks up exactly where the
-    consumer left off — mirroring the stable-endpoint-name reattach story.
-    The position advances only on ACK; it starts at ``-1`` so a fresh cursor
-    (no ``after_seq``) replays the whole retained buffer.
-    '''
-
-    __slots__ = ('position', 'last_access')
-
-    def __init__(self, position: int, last_access: float) -> None:
-        self.position    = position
-        self.last_access = last_access
-
-
-# ---------------------------------------------------------------------------
 # pattern matching — same None-wildcard semantics as protocol.SubscribePattern
 # ---------------------------------------------------------------------------
 
@@ -223,8 +202,8 @@ class ReplayClient(PluginClient):
     1. Register the live callback **first**
        (``runtime.register_callback(endpoint=..., plugin=..., topic=...)``), so
        no live event is missed while replay drains.
-    2. Drain ``replay_iter(cursor_id, patterns=..., session=...)``, feeding each
-       replayed event through the same handler as the live callback.
+    2. Drain ``replay_iter(patterns=..., session=...)``, feeding each replayed
+       event through the same handler as the live callback.
     3. **Dedup by ``seq``.**  Replayed events carry ``event['seq']``; keep a set
        of seen ``seq`` (per stream) and skip any already seen.  Live delivery
        now exposes the same broker-stamped ``seq`` too: register the live
@@ -237,47 +216,39 @@ class ReplayClient(PluginClient):
     overlap around the join point; the ``seq`` dedup discards the duplicates, so
     the handler observes each event once — at-least-once on the wire + ``seq``
     dedup = effectively-once.  A ``fetch`` reporting ``gap=True`` means retained
-    events were evicted before the cursor reached them: the consumer re-syncs
+    events were evicted before ``after_seq`` reached them: the consumer re-syncs
     state (topology + state-mirroring recover on reconnect regardless) instead
     of trusting continuity.
 
-    A stable ``cursor_id`` (a consumer name) makes reconnect-resume work: the
-    cursor picks up where the last ACK left off.
+    ``fetch`` is stateless — the consumer tracks its own ``after_seq`` position
+    (``replay_iter`` advances it via each batch's ``next_seq``), so a reconnect
+    resumes simply by passing the last position it held.
     '''
 
     def register_session(self, **_kwargs: Any) -> None:
         '''No-op: the replay routes are all session-less.'''
         return
 
-    def fetch(self, cursor_id: str, patterns: Optional[list] = None,
-              session: Optional[str] = None, after_seq: Optional[int] = None,
-              ack_seq: Optional[int] = None,
+    def fetch(self, after_seq: int, patterns: Optional[list] = None,
+              session: Optional[str] = None,
               max_events: Optional[int] = None) -> dict:
-        '''Pull one batch of retained events for *cursor_id*.
+        '''Pull one batch of retained events with ``seq > after_seq``.
 
-        *ack_seq*, when given, advances the stored cursor to that ``seq``
-        **before** the next batch is selected (a batch fetched without an ACK is
-        re-delivered on the next fetch — the at-least-once property).  *session*
-        selects the per-session buffer (``None`` = the global ring).  *patterns*
-        filters with the same None-wildcard semantics as a subscribe pattern.
+        Stateless: the server keeps no cursor — pass ``after_seq=-1`` to read
+        the whole retained buffer, or the last ``next_seq`` to resume.  A fetch
+        that repeats the same *after_seq* simply re-reads the batch (at-least-
+        once).  *session* selects the per-session buffer (``None`` = the global
+        ring); *patterns* filters with subscribe-pattern None-wildcard
+        semantics.
 
         Returns ``{events, next_seq, gap}``.
         '''
-        body: dict = {'cursor_id': cursor_id}
+        body: dict = {'after_seq': after_seq}
         if patterns   is not None: body['patterns']   = patterns
         if session    is not None: body['session']    = session
-        if after_seq  is not None: body['after_seq']  = after_seq
-        if ack_seq    is not None: body['ack_seq']    = ack_seq
         if max_events is not None: body['max_events'] = max_events
         resp = self._http.post(self._url('fetch'), json=body)
         self._raise(resp, 'fetch')
-        return resp.json()
-
-    def drop_cursor(self, cursor_id: str) -> dict:
-        '''Forget a cursor's stored position (cleanup).'''
-        resp = self._http.post(self._url('drop_cursor'),
-                               json={'cursor_id': cursor_id})
-        self._raise(resp, 'drop_cursor')
         return resp.json()
 
     def stats(self) -> dict:
@@ -286,30 +257,29 @@ class ReplayClient(PluginClient):
         self._raise(resp, 'stats')
         return resp.json()
 
-    def replay_iter(self, cursor_id: str, patterns: Optional[list] = None,
+    def replay_iter(self, patterns: Optional[list] = None,
                     session: Optional[str] = None,
-                    after_seq: Optional[int] = None,
+                    after_seq: int = -1,
                     max_events: Optional[int] = None):
-        '''Generator that drains replay: fetch, yield each event, ACK, repeat.
+        '''Generator that drains replay: fetch, yield events, advance, repeat.
 
-        Fetches a batch, yields its events, ACKs it (so the cursor advances),
-        and stops when a batch comes back empty.  This is the drain step of the
-        splice recipe (see the class docstring): register the live callback
-        first, then drive this generator, deduping by ``seq``.
+        Fetches a batch with ``seq > after_seq``, yields its events, advances
+        its own position to the batch's ``next_seq``, and stops when a batch
+        comes back empty.  This is the drain step of the splice recipe (see the
+        class docstring): register the live callback first, then drive this
+        generator, deduping by ``seq``.  Defaults to ``after_seq=-1`` (whole
+        retained buffer).
         '''
-        ack: Optional[int] = None
-        first = True
+        pos = after_seq
         while True:
-            resp = self.fetch(cursor_id, patterns=patterns, session=session,
-                              after_seq=(after_seq if first else None),
-                              ack_seq=ack, max_events=max_events)
-            first  = False
+            resp   = self.fetch(pos, patterns=patterns, session=session,
+                                max_events=max_events)
             events = resp.get('events') or []
             if not events:
                 break
             for event in events:
                 yield event
-            ack = resp['next_seq']
+            pos = resp['next_seq']
 
 
 # ---------------------------------------------------------------------------
@@ -320,9 +290,9 @@ class PluginReplay(Plugin):
     '''Broker-hosted event-replay plugin (the single retaining subscriber).
 
     Subscribes to the broker's raw event tap at load time (retention starts
-    immediately, not on first request) and serves pull-based replay with
-    per-consumer cursors.  Loaded per use case via the broker ``--plugins``
-    spec — it is **not** in the default set.
+    immediately, not on first request) and serves stateless pull-based replay:
+    a consumer passes its own ``after_seq`` position each fetch.  Loaded per use
+    case via the broker ``--plugins`` spec — it is **not** in the default set.
     '''
 
     plugin_name   = 'replay'
@@ -330,12 +300,11 @@ class PluginReplay(Plugin):
     client_class  = ReplayClient
     version       = '0.0.1'
 
-    # Retention / cursor tunables — injectable per instance for tests (mirrors
-    # the session_ttl / reclaim_drain precedent).
+    # Retention tunables — injectable per instance for tests (mirrors the
+    # session_ttl / reclaim_drain precedent).
     session_max_age   = _SESSION_MAX_AGE
     session_max_bytes = _SESSION_MAX_BYTES
     global_max_bytes  = _GLOBAL_MAX_BYTES
-    cursor_ttl        = _CURSOR_TTL
     default_max_events = _FETCH_MAX_EVENTS
     default_max_bytes  = _FETCH_MAX_BYTES
     sweep_interval    = _SWEEP_INTERVAL
@@ -369,9 +338,6 @@ class PluginReplay(Plugin):
         self._global = _RingBuffer(self.global_max_bytes)
         self._session_buffers: Dict[str, _RingBuffer] = {}
 
-        # Per-consumer cursors, keyed by client-chosen cursor_id.
-        self._cursors: Dict[str, _Cursor] = {}
-
         # Subscribe to the raw event tap NOW so retention starts at load time
         # (a late consumer must find events already buffered).  Absent (None)
         # off the broker — is_enabled keeps us from loading there anyway.
@@ -380,15 +346,14 @@ class PluginReplay(Plugin):
         if self._broker_tap is not None:
             self._untap = self._broker_tap(self._on_event)
 
-        # Background age/cursor sweeper — started only when a loop is already
-        # running (the broker constructs hosted plugins on the running host
-        # loop).  Tests without a loop drive _evict/_prune_cursors directly.
+        # Background age sweeper — started only when a loop is already running
+        # (the broker constructs hosted plugins on the running host loop).
+        # Tests without a loop drive _evict_aged directly.
         self._sweeper: Optional[asyncio.Task] = None
         self._maybe_start_sweeper()
 
-        self.add_route_post('fetch',       self._route_fetch)
-        self.add_route_post('drop_cursor', self._route_drop_cursor)
-        self.add_route_get ('stats',       self._route_stats)
+        self.add_route_post('fetch', self._route_fetch)
+        self.add_route_get ('stats', self._route_stats)
 
     # -- retention (raw-tap consumer; runs on the plugin-host loop) --------
 
@@ -428,14 +393,6 @@ class PluginReplay(Plugin):
         for buf in list(self._session_buffers.values()):
             buf.evict_aged(now)
 
-    def _prune_cursors(self, now: float) -> int:
-        '''Drop cursors idle longer than ``cursor_ttl``.  Returns the count.'''
-        stale = [cid for cid, cur in self._cursors.items()
-                 if now - cur.last_access > self.cursor_ttl]
-        for cid in stale:
-            self._cursors.pop(cid, None)
-        return len(stale)
-
     def _maybe_start_sweeper(self) -> None:
         if self._sweeper is not None:
             return
@@ -449,9 +406,7 @@ class PluginReplay(Plugin):
         while True:
             try:
                 await asyncio.sleep(self.sweep_interval)
-                now = self._now()
-                self._evict_aged(now)
-                self._prune_cursors(now)
+                self._evict_aged(self._now())
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -479,41 +434,25 @@ class PluginReplay(Plugin):
     # -- routes ------------------------------------------------------------
 
     async def _route_fetch(self, request: Request) -> dict:
-        '''Pull a batch for a cursor; ACK-advance first, then select.
+        '''Pull a batch with ``seq > after_seq`` (stateless — no cursor).
 
-        Body: ``{cursor_id, patterns?, session?, after_seq?, ack_seq?,
-        max_events?, max_bytes?}``.  Returns ``{events, next_seq, gap}`` where
-        ``gap`` is true when the cursor position has fallen below the buffer's
-        lowest retained ``seq`` (events were evicted — re-sync, don't trust
-        continuity).
+        Body: ``{after_seq?, patterns?, session?, max_events?, max_bytes?}``.
+        *after_seq* defaults to ``-1`` (whole retained buffer); the consumer
+        passes its own position and advances it by the returned ``next_seq``.
+        Returns ``{events, next_seq, gap}`` where ``gap`` is true when the
+        buffer's lowest retained ``seq`` has risen above ``after_seq`` (events
+        were evicted — re-sync, don't trust continuity).
         '''
         body = await request.json()
-        cursor_id = body.get('cursor_id')
-        if not cursor_id:
-            raise HTTPException(status_code=400,
-                                detail="fetch requires 'cursor_id'")
 
         patterns   = body.get('patterns') or []
         session    = body.get('session')
         after_seq  = body.get('after_seq')
-        ack_seq    = body.get('ack_seq')
+        lower      = int(after_seq) if after_seq is not None else -1
         max_events = int(body.get('max_events') or self.default_max_events)
         max_bytes  = int(body.get('max_bytes')  or self.default_max_bytes)
 
         now = self._now()
-        cur = self._cursors.get(cursor_id)
-        if cur is None:
-            cur = _Cursor(position=-1, last_access=now)
-            self._cursors[cursor_id] = cur
-        cur.last_access = now
-
-        # ACK advances the persistent cursor FIRST — a batch fetched without an
-        # ACK is therefore re-delivered on the next fetch (at-least-once).
-        if ack_seq is not None:
-            cur.position = max(cur.position, int(ack_seq))
-
-        lower = int(after_seq) if after_seq is not None else cur.position
-
         buf = (self._global if session is None
                else self._session_buffers.get(session))
         if buf is None:
@@ -526,19 +465,12 @@ class PluginReplay(Plugin):
         next_seq = events[-1]['seq'] if events else lower
         return {'events': events, 'next_seq': next_seq, 'gap': gap}
 
-    async def _route_drop_cursor(self, request: Request) -> dict:
-        body = await request.json()
-        cursor_id = body.get('cursor_id')
-        existed = self._cursors.pop(cursor_id, None) is not None
-        return {'dropped': existed}
-
     async def _route_stats(self, request: Request) -> dict:
-        now = self._now()
-        self._evict_aged(now)
+        '''Return retention stats: the global ring + each per-session buffer.'''
+        self._evict_aged(self._now())
         sessions = {sid: buf.stats()
                     for sid, buf in self._session_buffers.items()}
         return {
             'global'  : self._global.stats(),
             'sessions': sessions,
-            'cursors' : len(self._cursors),
         }
