@@ -21,6 +21,8 @@ Pools arrive only through ``register_session``; there is no on-disk pool
 manifest to load.
 '''
 
+from __future__ import annotations   # PEP 604 ``X | None`` hints on Python 3.9
+
 from dataclasses import dataclass, field
 from typing import Any
 
