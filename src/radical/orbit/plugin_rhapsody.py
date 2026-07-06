@@ -5,8 +5,6 @@ Exposes the RHAPSODY Session/Task API so that remote clients can submit
 and monitor compute / AI tasks on endpoint nodes.
 '''
 
-from __future__ import annotations   # PEP 604 ``X | None`` hints on Python 3.9
-
 import asyncio
 import base64
 import importlib

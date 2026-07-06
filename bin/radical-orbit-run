@@ -32,8 +32,6 @@ Exit code mirrors the task's exit code (0 on DONE without one, 1 on
 FAILED/CANCELED without one).
 """
 
-from __future__ import annotations   # PEP 604 ``X | None`` hints on Python 3.9
-
 import argparse
 import hashlib
 import logging
