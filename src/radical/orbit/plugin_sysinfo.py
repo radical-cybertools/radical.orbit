@@ -448,7 +448,11 @@ class SysInfoProvider:
                     "used": usage.used,
                     "percent": usage.percent
                 })
-            except PermissionError:
+            except OSError as e:
+                # Mountpoint unreadable (PermissionError) or vanished between
+                # disk_partitions() and disk_usage() (FileNotFoundError), or
+                # otherwise not stat-able — skip it rather than crash metrics.
+                log.debug("skipping disk %s: %s", part.mountpoint, e)
                 continue
 
         metrics["disks"] = disks

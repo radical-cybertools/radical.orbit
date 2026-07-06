@@ -1,5 +1,6 @@
 
 # pylint: disable=protected-access,unused-import,unused-variable,not-callable,unused-argument
+import psutil
 import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
@@ -66,6 +67,34 @@ def test_sysinfo_gpus_structure():
         assert 'name' in gpu
         # Dynamic metrics might not be present if nvidia-smi fails
         # So we only check static fields
+
+
+def test_sysinfo_disk_usage_unreadable_mountpoint_is_skipped(monkeypatch):
+    """A mountpoint whose disk_usage() raises OSError -- unreadable
+    (PermissionError) or vanished between disk_partitions() and disk_usage()
+    (FileNotFoundError) -- is skipped, not fatal; good mounts still appear."""
+    provider = SysInfoProvider()
+    # Pre-populate the CPU/GPU caches so get_metrics() does not spawn
+    # lscpu / nvidia-smi / rocm-smi subprocesses during the unit test.
+    provider._cpu_model = 'TestCPU'
+    provider._gpu_info  = []
+
+    _P = lambda mp, dev: type('_Part', (), {
+        'mountpoint': mp, 'device': dev, 'fstype': 'nfs', 'opts': 'rw'})()
+    good, gone = _P('/data', 'srv:/data'), _P('/vanished', 'srv:/gone')
+    monkeypatch.setattr(psutil, 'disk_partitions', lambda all=False: [good, gone])
+
+    def _usage(mp):
+        if mp == '/vanished':
+            raise FileNotFoundError(2, 'No such file or directory', mp)
+        return psutil._common.sdiskusage(total=100, used=40, free=60, percent=40.0)
+    monkeypatch.setattr(psutil, 'disk_usage', _usage)
+
+    metrics = provider.get_metrics()   # must not raise
+    mounts  = [d['mount'] for d in metrics['disks']]
+    assert '/data'     in mounts
+    assert '/vanished' not in mounts
+
 
 @pytest.mark.asyncio
 async def test_endpoint():
