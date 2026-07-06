@@ -24,6 +24,8 @@ import json as _json
 from typing       import Any, Dict, Tuple
 from urllib.parse import urlencode
 
+import httpx
+
 from .client import PluginClient  # noqa: F401  (re-export convenience)
 
 
@@ -77,7 +79,9 @@ class RuntimeResponse:
 
     def __init__(self, status: int, headers: Dict[str, str], body: bytes):
         self.status_code = status
-        self.headers     = headers or {}
+        # Case-insensitive like ``httpx.Response.headers`` so helpers doing
+        # ``resp.headers.get('Content-Type')`` match a lower-cased wire header.
+        self.headers     = httpx.Headers(headers or {})
         self.content     = body or b''
 
     @property

@@ -1146,9 +1146,18 @@ class PluginRhapsody(Plugin):
         if not isinstance(data, dict):
             data = {}
 
+        # Validate `backends` synchronously: a non-list (e.g. a bare string)
+        # would otherwise be iterated char-by-char and fail only in the
+        # background session init, long after the 200 was returned.
+        backends = data.get('backends')
+        if backends is not None and not isinstance(backends, list):
+            raise HTTPException(
+                status_code=400,
+                detail="'backends' must be a list of backend names")
+
         owner              = self._request_owner(request)
         sid, lifetime, ttl = self._normalize_session_policy(data)
-        backend_names      = self._backend_names(data.get('backends'))
+        backend_names      = self._backend_names(backends)
 
         self._ensure_cleanup_task()
 
@@ -1161,6 +1170,8 @@ class PluginRhapsody(Plugin):
 
         if sid is None:
             sid = f"session.{uuid.uuid4().hex[:8]}"
+            while sid in self._sessions:
+                sid = f"session.{uuid.uuid4().hex[:8]}"
 
         # Reconnect to an existing session — do not rebuild it.  Owner check
         # first (bug A5: a session created with an owner must not be hijacked

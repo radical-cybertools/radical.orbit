@@ -140,7 +140,7 @@ def spawn(coro, label: str, loop: Optional[asyncio.AbstractEventLoop] = None
     silently.  Every background task in the broker goes through here so a
     crash is logged (and thus reportable) rather than lost.
     """
-    loop = loop or asyncio.get_event_loop()
+    loop = loop or asyncio.get_running_loop()
     task = loop.create_task(coro)
 
     def _done(t: asyncio.Task) -> None:
@@ -380,7 +380,7 @@ class Broker:
         return {name: info.model_dump()
                 for name, info in self._participants_for_topology().items()}
 
-    def get_ui_modules(self) -> Dict[str, str]:
+    async def get_ui_modules(self) -> Dict[str, str]:
         """Gateway seam: ``{plugin_name: js_content}`` for broker-hosted
         plugins that ship a dynamically-registered ``ui_module``.
 
@@ -390,7 +390,9 @@ class Broker:
         as a file the plugin class points at, discoverable only through the
         host.  The read touches host-loop state (``BrokerPluginHost._plugins``),
         so it is fetched **across the host-loop boundary** — the routing loop
-        never touches host state.  Empty when the host is not up.
+        never touches host state.  ``async`` so the gateway (on the routing loop)
+        *awaits* the crossing instead of blocking it for up to 5s, which would
+        stall WS keepalives.  Empty when the host is not up.
         """
         host = self._plugin_host
         loop = self._host_loop
@@ -402,7 +404,7 @@ class Broker:
 
         try:
             cfut = asyncio.run_coroutine_threadsafe(_fetch(), loop)
-            return cfut.result(timeout=5.0)
+            return await asyncio.wrap_future(cfut)
         except Exception as e:
             log.debug("[Broker] get_ui_modules failed: %s", e)
             return {}
@@ -476,7 +478,8 @@ class Broker:
         self._host_thread = threading.Thread(
             target=_run, name='broker-host', daemon=True)
         self._host_thread.start()
-        ready.wait(timeout=5.0)
+        if not ready.wait(timeout=5.0):
+            raise RuntimeError("broker host loop thread failed to start")
 
         # The host is always built (empty plugin list is valid) so that
         # ``dst=='broker'`` requests always have somewhere to route — the
@@ -1081,11 +1084,22 @@ class Broker:
                 participants[name] = lost
         self._host_topology_prev = curr
         try:
-            asyncio.run_coroutine_threadsafe(
+            cfut = asyncio.run_coroutine_threadsafe(
                 self._plugin_host.on_topology_change(participants),
                 self._host_loop)
         except Exception as e:
             log.debug("[Broker] host topology delivery failed: %s", e)
+            return
+
+        def _log_delivery(f: 'concurrent.futures.Future') -> None:
+            if f.cancelled():
+                return
+            exc = f.exception()
+            if exc is not None:
+                log.error("[Broker] host topology delivery failed: %r", exc,
+                          exc_info=exc)
+
+        cfut.add_done_callback(_log_delivery)
 
     # ── low-level helpers ─────────────────────────────────────────────
 
@@ -1120,6 +1134,9 @@ class Broker:
             return '/'
         if path.startswith(prefix + '/'):
             return path[len(prefix):]
+        if path.startswith(prefix + '?'):
+            # '/broker?foo=bar' -> '/?foo=bar' (bare prefix + query string).
+            return '/' + path[len(prefix):]
         return path
 
     @staticmethod

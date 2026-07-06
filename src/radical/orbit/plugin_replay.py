@@ -94,6 +94,10 @@ class _RingBuffer:
         self.events: deque = deque()   # (seq, ts, size, event)
         self.nbytes  = 0
         self.dropped = 0
+        # Highest ``seq`` ever evicted — lets a fetch still report a gap after
+        # the matching events (or the whole buffer) have been evicted, when
+        # ``lowest_seq`` is None and can no longer bound the gap.
+        self.last_dropped_seq: Optional[int] = None
 
     def append(self, seq: int, ts: float, size: int,
                event: Dict[str, Any], now: float) -> None:
@@ -102,9 +106,11 @@ class _RingBuffer:
         self._enforce(now)
 
     def _drop_left(self) -> None:
-        _, _, size, _ = self.events.popleft()
+        seq, _, size, _ = self.events.popleft()
         self.nbytes  -= size
         self.dropped += 1
+        if self.last_dropped_seq is None or seq > self.last_dropped_seq:
+            self.last_dropped_seq = seq
 
     def _enforce(self, now: float) -> None:
         if self.max_age is not None:
@@ -390,8 +396,13 @@ class PluginReplay(Plugin):
 
     def _evict_aged(self, now: float) -> None:
         self._global.evict_aged(now)
-        for buf in list(self._session_buffers.values()):
+        for sid, buf in list(self._session_buffers.items()):
             buf.evict_aged(now)
+            # Drop a per-session buffer once it fully ages out, so a long-lived
+            # broker does not accumulate empty buffers for every session it ever
+            # saw.  A later event for the same session recreates it on demand.
+            if not buf.events:
+                del self._session_buffers[sid]
 
     def _maybe_start_sweeper(self) -> None:
         if self._sweeper is not None:
@@ -461,7 +472,12 @@ class PluginReplay(Plugin):
 
         events   = buf.select(lower, patterns, max_events, max_bytes)
         lowest   = buf.lowest_seq
-        gap      = lowest is not None and lowest > lower + 1
+        # Gap when events after ``lower`` were evicted.  ``lowest_seq`` bounds it
+        # while the buffer is non-empty; ``last_dropped_seq`` still reports it
+        # once everything matching (or the whole buffer) has been evicted.
+        gap      = (lowest is not None and lowest > lower + 1) or \
+                   (buf.last_dropped_seq is not None
+                    and buf.last_dropped_seq > lower)
         next_seq = events[-1]['seq'] if events else lower
         return {'events': events, 'next_seq': next_seq, 'gap': gap}
 

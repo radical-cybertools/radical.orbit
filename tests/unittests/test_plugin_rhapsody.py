@@ -221,6 +221,37 @@ def test_register_session_reconnect_real_status():
     assert resp.json()['status'] == 'failed'
 
 
+def test_register_session_backends_must_be_list():
+    '''A non-list `backends` (e.g. a bare string) is rejected synchronously
+    with 400 — it would otherwise fail only in the background init.'''
+    _, plugin, client = _make_plugin()
+    resp = client.post(f"{plugin.namespace}/register_session",
+                       json={"backends": "dragon_v3"})
+    assert resp.status_code == 400
+
+
+def test_register_session_sid_collision_mints_unique(monkeypatch):
+    '''Minting a fresh sid loops until it does not collide with a live one.'''
+    import radical.orbit.plugin_rhapsody as rmod
+    _, plugin, client = _make_plugin()
+
+    # Pre-occupy the id the first mint would produce so the loop must retry.
+    plugin._sessions['session.aaaaaaaa'] = object()
+
+    class _FakeUUID:
+        def __init__(self, h):
+            self.hex = h
+
+    seq = iter([_FakeUUID('aaaaaaaa' + '0' * 24),
+                _FakeUUID('bbbbbbbb' + '0' * 24)])
+    monkeypatch.setattr(rmod.uuid, 'uuid4', lambda: next(seq))
+
+    with patch.object(RhapsodySession, 'initialize', new_callable=AsyncMock):
+        resp = client.post(f"{plugin.namespace}/register_session")
+    assert resp.status_code == 200
+    assert resp.json()['sid'] == 'session.bbbbbbbb'   # skipped the collision
+
+
 @pytest.mark.asyncio
 async def test_register_default_session():
     '''register_session(sid='default') creates the persistent default

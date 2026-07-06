@@ -523,11 +523,14 @@ class PluginTaskDispatcher(Plugin):
                 if not (pool_dir.is_dir() and cfg_path.is_file()):
                     continue
                 payload = read_json(cfg_path, default=None)
-                if not payload or 'config' not in payload:
+                if not isinstance(payload, dict) or 'config' not in payload:
                     continue
                 try:
                     cfg = self._pool_config_from_dict(payload['config'])
-                except (ValueError, KeyError, PoolConfigError) as e:
+                except (ValueError, KeyError, TypeError, AttributeError,
+                        PoolConfigError) as e:
+                    # A non-dict/malformed ``config`` (corrupt file, hand-edit)
+                    # must not abort replay of every other pool — skip this one.
                     log.warning('task_dispatcher: skipping unreadable pool '
                                 'config %s: %s', cfg_path, e)
                     continue
@@ -831,7 +834,7 @@ class PluginTaskDispatcher(Plugin):
         return {
             'pools': {
                 name: self._summarize_pool(ps, verbose=True)
-                for name, ps in self._pools_for(sid).items()
+                for name, ps in self._pool_states.get(sid, {}).items()
             }
         }
 
@@ -996,7 +999,7 @@ class PluginTaskDispatcher(Plugin):
             return {'task_id': task_id, 'endpoint': endpoint_name,
                     'result': info}
 
-        for ps in self._pools_for(sid).values():
+        for ps in self._pool_states.get(sid, {}).values():
             rec = ps.tasks.get(task_id)
             if rec is not None:
                 return self._task_dict(rec)
@@ -1027,7 +1030,7 @@ class PluginTaskDispatcher(Plugin):
             return {'task_id': task_id, 'endpoint': endpoint_name,
                     'result': info}
 
-        for ps in self._pools_for(sid).values():
+        for ps in self._pool_states.get(sid, {}).values():
             rec = ps.tasks.get(task_id)
             if rec is not None:
                 return await self._cancel_task(ps, rec)
@@ -1120,7 +1123,7 @@ class PluginTaskDispatcher(Plugin):
 
         self._check_filename(filename)
 
-        for ps in self._pools_for(sid).values():
+        for ps in self._pool_states.get(sid, {}).values():
             rec = ps.tasks.get(task_id)
             if rec is None:
                 continue

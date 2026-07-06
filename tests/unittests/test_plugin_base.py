@@ -307,6 +307,45 @@ async def test_plugin_session_cleanup():
     assert "new_session" in plugin._sessions
 
 
+@pytest.mark.asyncio
+async def test_cleanup_loop_survives_sweep_error(monkeypatch):
+    '''A raising sweep must not kill the cleanup loop — it logs and keeps
+    running, so later expired sessions are still reclaimed.'''
+    app = FastAPI()
+    plugin = Plugin(app, "test_plugin")
+    plugin.session_class = PluginSession
+
+    calls = {'n': 0}
+
+    async def _sweep():
+        calls['n'] += 1
+        if calls['n'] == 1:
+            raise RuntimeError("boom")     # first sweep blows up
+        return 0
+
+    monkeypatch.setattr(plugin, '_cleanup_expired_sessions', _sweep)
+
+    # Collapse the loop's 5s cadence so the test does not sleep for real.
+    real_sleep = asyncio.sleep
+
+    async def _fast_sleep(_seconds):
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, 'sleep', _fast_sleep)
+
+    task = asyncio.ensure_future(plugin._cleanup_loop())
+    for _ in range(50):
+        await real_sleep(0)
+        if calls['n'] >= 3:
+            break
+    task.cancel()
+    try:    await task
+    except asyncio.CancelledError:
+        pass
+
+    assert calls['n'] >= 3   # survived the first-sweep RuntimeError
+
+
 # ---------------------------------------------------------------------------
 # Session policy: create-or-reconnect, lifetime validation, expiry, default
 # ---------------------------------------------------------------------------
@@ -359,6 +398,8 @@ async def test_session_mint_when_sid_omitted():
     {"lifetime": "ttl"},                       # ttl lifetime, no ttl
     {"lifetime": "ttl", "ttl": 0},             # ttl not > 0
     {"lifetime": "ttl", "ttl": -5},            # ttl not > 0
+    {"lifetime": "ttl", "ttl": float('nan')},  # NaN ttl (JSON NaN) — not finite
+    {"lifetime": "ttl", "ttl": float('inf')},  # non-finite ttl
     {"lifetime": "persistent", "ttl": 10},     # ttl with non-ttl lifetime
     {"lifetime": "ephemeral", "ttl": 10},      # ttl with non-ttl lifetime
     {"lifetime": "forever"},                   # unknown lifetime

@@ -733,3 +733,17 @@ def test_with_meta_seq_matches_replay_and_default_unchanged(harness):
     resp = replay.fetch(-1)
     retained = {e['seq'] for e in resp['events']}
     assert set(metas).issubset(retained)
+
+
+# ---------------------------------------------------------------------------
+# RuntimeResponse: case-insensitive headers (httpx.Headers surface)
+# ---------------------------------------------------------------------------
+
+def test_runtime_response_headers_case_insensitive():
+    """A helper doing resp.headers.get('Content-Type') must match a
+    lower-cased wire header — RuntimeResponse.headers is case-insensitive."""
+    from radical.orbit.runtime_client import RuntimeResponse
+    r = RuntimeResponse(200, {'content-type': 'application/json'}, b'{}')
+    assert r.headers.get('Content-Type') == 'application/json'
+    assert r.headers.get('content-type') == 'application/json'
+    assert r.json() == {}

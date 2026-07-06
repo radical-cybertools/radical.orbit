@@ -529,3 +529,65 @@ def test_cors_preflight_headers(harness):
     assert r.status_code in (200, 204)
     assert r.headers.get('access-control-allow-origin') == 'http://localhost:8080'
     assert r.headers.get('access-control-allow-credentials') == 'true'
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for header hygiene / namespace / notification-data handling
+# ---------------------------------------------------------------------------
+
+def test_full_namespace_no_trailing_slash():
+    """An empty/None namespace yields '/{name}' with no trailing slash."""
+    from radical.orbit.gateway import Gateway
+    assert Gateway._full_namespace('epA', '')          == '/epA'
+    assert Gateway._full_namespace('epA', None)        == '/epA'
+    assert Gateway._full_namespace('epA', '/sysinfo')  == '/epA/sysinfo'
+    assert Gateway._full_namespace('epA', 'sysinfo')   == '/epA/sysinfo'
+    # broker's own hosted plugins already carry the full form.
+    assert Gateway._full_namespace('broker', '/broker/x') == '/broker/x'
+
+
+def test_clean_response_headers_strips_framing():
+    """Hop-by-hop + content-length are dropped from the upstream response."""
+    from radical.orbit.gateway import Gateway
+    cleaned = Gateway._clean_response_headers({
+        'Content-Type':      'application/json',
+        'Content-Length':    '123',
+        'Transfer-Encoding': 'chunked',
+        'Connection':        'keep-alive',
+        'X-Custom':          'v',
+    })
+    lower = {k.lower() for k in cleaned}
+    assert 'content-length'    not in lower
+    assert 'transfer-encoding' not in lower
+    assert 'connection'        not in lower
+    assert cleaned['Content-Type'] == 'application/json'   # case preserved
+    assert cleaned['X-Custom']     == 'v'
+
+
+def test_on_event_preserves_falsy_data():
+    """A legit falsy notification payload (e.g. []) rides through unchanged;
+    only a genuinely absent 'data' becomes {}."""
+    from radical.orbit.gateway import Gateway
+
+    class _FakeLoop:
+        def call_soon_threadsafe(self, fn, *a):
+            fn(*a)
+
+    class _FakeBroker:
+        _loop = _FakeLoop()
+
+    pushed = []
+    g = Gateway.__new__(Gateway)
+    g._broker      = _FakeBroker()
+    g._sse_clients = {'client'}                    # non-empty -> proceed
+    g._push_all    = lambda frame: pushed.append(frame)
+
+    g._on_event({'src': 'e', 'plugin': 'p', 'topic': 't', 'data': []})
+    assert pushed
+    payload = json.loads(pushed[0][len('data: '):])
+    assert payload['data']['data'] == []           # falsy [] preserved
+
+    pushed.clear()
+    g._on_event({'src': 'e', 'plugin': 'p', 'topic': 't'})   # no 'data'
+    payload = json.loads(pushed[0][len('data: '):])
+    assert payload['data']['data'] == {}           # absent -> {}

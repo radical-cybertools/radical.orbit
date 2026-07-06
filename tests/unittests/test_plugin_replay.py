@@ -146,9 +146,13 @@ def test_age_eviction_and_dropped_counter():
     assert p._session_buffers['s'].stats()['retained'] == 2
 
     # jump past the age bound and force a lazy sweep
+    buf = p._session_buffers['s']
     clock['t'] = 1000.0 + 601.0
     p._evict_aged(clock['t'])
-    st = p._session_buffers['s'].stats()
+    # A fully-aged per-session buffer is pruned so a long-lived broker does not
+    # accumulate empty buffers forever (the counters live on the dropped ref).
+    assert 's' not in p._session_buffers
+    st = buf.stats()
     assert st['retained'] == 0
     assert st['dropped']  == 2
 
@@ -320,6 +324,24 @@ def test_gap_true_after_eviction():
     r2 = _run(p._route_fetch(_shim(
         {'session': 's', 'after_seq': 4})))
     assert r2['gap'] is False and r2['events'] == []
+
+
+def test_gap_reported_on_empty_buffer_after_full_eviction():
+    """Even after every retained event ages out, a fetch still reports a gap
+    via ``last_dropped_seq`` (``lowest_seq`` is None and can't bound it)."""
+    clock = {'t': 1000.0}
+    p = _make_plugin(session_max_age=100.0, session_max_bytes=10 ** 9)
+    p._now = lambda: clock['t']
+    p._on_event(_ev(0, session='s', ts=1000.0))
+    p._on_event(_ev(1, session='s', ts=1000.0))
+
+    # Age everything out.  The route's own ``buf.evict_aged`` empties the
+    # buffer (the plugin-level sweep would prune it, but a fetch does not).
+    clock['t'] = 1000.0 + 200.0
+    r = _run(p._route_fetch(_shim({'session': 's', 'after_seq': -1})))
+    assert r['events'] == []
+    assert r['gap'] is True                    # last_dropped_seq (1) > -1
+    assert p._session_buffers['s'].last_dropped_seq == 1
 
 
 def test_no_gap_on_contiguous_stream():

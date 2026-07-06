@@ -849,3 +849,44 @@ async def test_hosted_plugin_shutdown_cancels_background_tasks(make_broker):
 
 async def _run_on_loop(fn):
     fn()
+
+
+def test_strip_broker_prefix_handles_query(make_broker):
+    """The broker-prefix stripper handles the bare prefix, subpaths, and the
+    bare-prefix-plus-query form (`/broker?foo=bar` -> `/?foo=bar`)."""
+    b = make_broker()
+    assert b._strip_broker_prefix('/broker')         == '/'
+    assert b._strip_broker_prefix('/broker/x/y')     == '/x/y'
+    assert b._strip_broker_prefix('/broker?foo=bar') == '/?foo=bar'
+    assert b._strip_broker_prefix('/broker/x?f=b')   == '/x?f=b'
+    assert b._strip_broker_prefix('/other')          == '/other'
+
+
+@pytest.mark.asyncio
+async def test_restart_sender_delivers_buffered_events(make_broker):
+    """A sender cancelled mid-drain (wake cleared, items still buffered) must
+    not stall on restart — the fresh sender flushes the backlog immediately."""
+    broker = make_broker()
+    await broker.startup()
+    try:
+        er = broker._events
+        ws = FakeWS()
+        broker.registry['e1'] = ws
+        er.add_endpoint('e1')
+        oq = er._out['e1']
+
+        # Emulate the race: a buffered frame with wake cleared (as a prior
+        # sender would have left it after clearing wake, then being cancelled).
+        er.pause_sender('e1')
+        oq.push(b'frame1')
+        oq.wake.clear()
+
+        er.restart_sender('e1')
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if b'frame1' in ws.sent:
+                break
+        assert b'frame1' in ws.sent
+    finally:
+        broker.registry.pop('e1', None)
+        await broker.shutdown()

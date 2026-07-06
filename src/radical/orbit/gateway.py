@@ -108,6 +108,14 @@ _HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate",
                "proxy-authorization", "te", "trailers",
                "transfer-encoding", "upgrade", "authorization"}
 
+# Hop-by-hop headers stripped from the *upstream response* before it is handed
+# back to the client.  ``content-length``/``transfer-encoding`` describe the
+# upstream framing, not this hop's — forwarding them verbatim can corrupt the
+# client stream; Starlette recomputes the correct length for the body we return.
+_RESPONSE_HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate",
+                        "proxy-authorization", "te", "trailers",
+                        "transfer-encoding", "upgrade", "content-length"}
+
 
 # ---------------------------------------------------------------------------
 # Gateway
@@ -260,11 +268,14 @@ class Gateway:
         loop = self._routing_loop
         if loop is None:
             return
+        # Explicit None check — a legit falsy payload (0/False/[]/"") must ride
+        # through unchanged; only a genuinely absent ``data`` becomes ``{}``.
+        data = event.get('data')
         frame = self._sse_frame('notification', {
             "endpoint": event.get('src'),
             "plugin":   event.get('plugin'),
             "topic":    event.get('topic'),
-            "data":     event.get('data') or {},
+            "data":     {} if data is None else data,
         })
         loop.call_soon_threadsafe(self._push_all, frame)
 
@@ -299,6 +310,8 @@ class Gateway:
         participant advertises the full ``/broker/{instance}`` form).
         """
         prefix = '/' + name
+        if not ns:
+            return prefix          # empty/None ns -> '/{name}' (no trailing '/')
         if ns == prefix or ns.startswith(prefix + '/'):
             return ns
         if not ns.startswith('/'):
@@ -356,6 +369,17 @@ class Gateway:
             else:
                 headers[k] = v
         return headers
+
+    @staticmethod
+    def _clean_response_headers(headers) -> Dict[str, str]:
+        """Strip hop-by-hop (and ``content-length``) from an upstream response.
+
+        The framing headers describe the endpoint↔broker hop, not the
+        gateway↔client hop; forwarding them verbatim can corrupt the returned
+        stream.  Starlette sets the correct ``content-length`` for the body.
+        """
+        return {k: v for k, v in dict(headers or {}).items()
+                if k.lower() not in _RESPONSE_HOP_BY_HOP}
 
     # ── routes ─────────────────────────────────────────────────────────
 
@@ -487,7 +511,8 @@ class Gateway:
         plugin_name = filename[:-3]
         js = self._plugin_ui_module_js.get(plugin_name)
         if js is None:
-            self._plugin_ui_module_js.update(self._broker.get_ui_modules())
+            self._plugin_ui_module_js.update(
+                await self._broker.get_ui_modules())
             js = self._plugin_ui_module_js.get(plugin_name)
         if js is not None:
             return Response(js, media_type="application/javascript",
@@ -514,7 +539,7 @@ class Gateway:
                 request.method, forward_path, headers=headers, body=body)
             status, rheaders, rbody = unpack_response_dict(resp)
             return Response(content=rbody, status_code=status,
-                            headers=dict(rheaders))
+                            headers=self._clean_response_headers(rheaders))
 
         try:
             resp = await self._broker.caller.call(
@@ -536,7 +561,7 @@ class Gateway:
 
         status, rheaders, rbody = unpack_response_dict(resp)
         return Response(content=rbody, status_code=status,
-                        headers=dict(rheaders))
+                        headers=self._clean_response_headers(rheaders))
 
     # ── static-asset helpers ──────────────────────────────────────────
 

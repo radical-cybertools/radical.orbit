@@ -344,6 +344,11 @@ class EndpointRuntime(PluginHostBase):
             except Exception as e:
                 coro.close()
                 log.debug("[Runtime] graceful close failed: %s", e)
+        # Cancel the transport coroutine so a reconnect backoff-sleep is not
+        # left pending when its loop stops ("Task was destroyed" warnings).
+        if self._transport_future is not None:
+            self._transport_future.cancel()
+            self._transport_future = None
         # Cancel served-plugin background tasks on the work loop before it
         # stops, so no task is destroyed while pending.
         if self._work_loop is not None and self._work_loop.is_running() \
@@ -356,7 +361,7 @@ class EndpointRuntime(PluginHostBase):
                 coro.close()
         for loop, thread in ((self._transport_loop, self._transport_thread),
                              (self._work_loop, self._work_thread)):
-            if loop is not None:
+            if loop is not None and loop.is_running():
                 loop.call_soon_threadsafe(loop.stop)
             if thread is not None:
                 thread.join(timeout=5.0)
@@ -375,10 +380,16 @@ class EndpointRuntime(PluginHostBase):
                 pass
 
     async def _work_teardown(self) -> None:
+        tasks = []
         for plugin in list(self._plugins.values()):
             task = getattr(plugin, '_cleanup_task', None)
             if task is not None and not task.done():
                 task.cancel()
+                tasks.append(task)
+        # Await the cancellations so they complete before the loop closes
+        # (otherwise the loop tears down with the tasks still pending).
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def __enter__(self) -> 'EndpointRuntime':
         return self.start()
@@ -661,8 +672,10 @@ class EndpointRuntime(PluginHostBase):
             return (404, {'content-type': 'application/json'},
                     _json.dumps({"detail": f"No route: {req.method} {path}"
                                  }).encode())
-        content_type = (req.headers or {}).get('content-type',
-                                               'application/json')
+        # Case-insensitive content-type lookup: a client may send
+        # ``Content-Type`` and a plain dict ``.get('content-type')`` would miss.
+        lower_headers = {k.lower(): v for k, v in (req.headers or {}).items()}
+        content_type = lower_headers.get('content-type', 'application/json')
         # Trusted owner channel.  ``req.src`` is broker-stamped (the broker
         # overwrote the envelope src from the registered identity on every
         # forwarded request), so it — not any client-supplied copy — is the

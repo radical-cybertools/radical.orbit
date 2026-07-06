@@ -1,4 +1,5 @@
 import re
+import math
 import uuid
 import asyncio
 import inspect
@@ -482,7 +483,7 @@ class Plugin(object):
 
         if lifetime == 'ttl':
             if not isinstance(ttl, (int, float)) or isinstance(ttl, bool) \
-                    or ttl <= 0:
+                    or not math.isfinite(ttl) or ttl <= 0:
                 raise HTTPException(
                     status_code=409,
                     detail="lifetime='ttl' requires a positive ttl")
@@ -840,10 +841,19 @@ class Plugin(object):
             pass  # No running loop yet; will retry on next call
 
     async def _cleanup_loop(self) -> None:
-        """Background task: expire stale sessions every 5 seconds."""
+        """Background task: expire stale sessions every 5 seconds.
+
+        The per-iteration sweep is guarded so a single failing sweep logs and
+        the loop survives — a sweep that raised would otherwise kill the task
+        permanently and leak every subsequent expired session.
+        """
         while True:
             await asyncio.sleep(5)
-            await self._cleanup_expired_sessions()
+            try:
+                await self._cleanup_expired_sessions()
+            except Exception:
+                log.exception("[%s] session cleanup sweep failed",
+                              self.instance_name)
 
     async def shutdown(self) -> None:
         """Orderly plugin teardown (host-shutdown path).

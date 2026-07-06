@@ -84,6 +84,14 @@ class EventRouter:
 
     def restart_sender(self, name: str) -> None:
         self.pause_sender(name)
+        # The previous sender may have been cancelled mid-drain, after it had
+        # already cleared ``wake`` but with items still buffered (events that
+        # arrived while the endpoint was suspect).  Re-arm ``wake`` so the fresh
+        # sender delivers the backlog immediately instead of stalling on
+        # ``wake.wait()`` until the next push.
+        oq = self._out.get(name)
+        if oq is not None and oq.buf:
+            oq.wake.set()
         self._senders[name] = self._spawn(self._sender(name),
                                           'broker_sender:%s' % name)
 
