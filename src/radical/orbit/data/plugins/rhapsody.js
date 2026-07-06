@@ -38,7 +38,10 @@ export function template() {
       <button class="btn btn-success" data-action="submit">▶ Submit Task</button>
     </div>
     <div class="card rh-tasks-card">
-      <div class="card-title">📊 Task Monitor</div>
+      <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;">
+        <span>📊 Task Monitor</span>
+        <button class="btn btn-secondary btn-sm rh-cancel-all-btn" data-action="cancel-all" title="Cancel all tasks in this session">🛑 Cancel All</button>
+      </div>
       <div class="rh-table-area"><p style="color:var(--muted)">No tasks submitted yet.</p></div>
     </div>
   `;
@@ -59,6 +62,16 @@ export function init(page, api) {
   if (submitBtn) {
     submitBtn.addEventListener('click', () => submitTask(page, api));
   }
+
+  const cancelAllBtn = page.querySelector('[data-action="cancel-all"]');
+  if (cancelAllBtn) {
+    cancelAllBtn.addEventListener('click', () => cancelAllTasks(page, api));
+  }
+
+  // Populate the Task Monitor from tasks already in the endpoint session, so a
+  // page reload (or a panel opened after tasks were submitted elsewhere) isn't
+  // blank.  Fire-and-forget; a fresh/empty session simply yields no rows.
+  loadExistingTasks(page, api);
 }
 
 export function onNotification(data, page, api) {
@@ -174,6 +187,49 @@ function updateTaskRow(page, uid, state, data) {
   return true;
 }
 
+// Fetch tasks already known to the endpoint session (route: list_tasks/{sid},
+// RhapsodyPlugin.list_tasks -> {tasks: [...]}) and render any not already
+// shown.  Idempotent: existing rows are refreshed, not duplicated.
+// Best-effort — a missing session or transient error is swallowed.
+async function loadExistingTasks(page, api) {
+  let res;
+  try {
+    const sid = await api.getSession('rhapsody');
+    res = await api.fetch(`list_tasks/${sid}`, { quiet: true });
+  } catch (e) {
+    return;
+  }
+  const tasks = (res && res.tasks) || [];
+  for (const task of tasks) {
+    if (!task || !task.uid) continue;
+    if (rhTasks[task.uid]) {
+      // Already tracked (e.g. submitted from this tab) — just refresh state.
+      Object.assign(rhTasks[task.uid], task);
+      updateTaskRow(page, task.uid, task.state, task);
+      continue;
+    }
+    rhTasks[task.uid] = task;
+    addTaskRow(page, api, task);   // renders state/cancel affordance from task.state
+  }
+}
+
+// Cancel every task in the session (route: cancel_all/{sid},
+// RhapsodyPlugin.cancel_all_tasks).  Confirm + flash like the per-task cancel.
+async function cancelAllTasks(page, api) {
+  if (!confirm('Cancel ALL tasks in this session?')) return;
+  const btn = page.querySelector('[data-action="cancel-all"]');
+  if (btn) { btn.disabled = true; btn.textContent = '…'; }
+  try {
+    const sid = await api.getSession('rhapsody');
+    await api.fetch(`cancel_all/${sid}`, { method: 'POST' });
+    api.flash('Cancel requested for all tasks');
+  } catch (err) {
+    api.flash('Cancel all failed: ' + err.message, false);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '🛑 Cancel All'; }
+  }
+}
+
 // ─────────────────────────────────────────────────────────────
 //  Task detail overlay with polling
 // ─────────────────────────────────────────────────────────────
@@ -249,7 +305,20 @@ async function openTaskDetail(api, uid) {
           if (rhTasks[uid]) Object.assign(rhTasks[uid], upd);
         }
       } catch (e) {
-        // Silently ignore poll errors
+        // A 404/410 here means the session was reset (endpoint restarted or the
+        // sid expired) — apiFetch already tried to re-register once, so this
+        // task can no longer be polled.  Stop the interval and surface a clear
+        // "session reset" state instead of spinning forever.  Other (transient
+        // network) errors are left non-fatal so a one-off blip keeps polling.
+        const msg = (e && e.message) || '';
+        if (msg.includes('404') || msg.includes('410')) {
+          stopPoller();
+          const stateEl = document.getElementById('rh-detail-state');
+          if (stateEl) {
+            stateEl.className   = 'badge badge-red';
+            stateEl.textContent = 'session reset — reopen';
+          }
+        }
       }
     }, 3000);
   }

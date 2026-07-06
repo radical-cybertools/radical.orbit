@@ -1167,6 +1167,7 @@
     let BROKER = '';
     let eventSource = null;
     let sessions = {};   // key: "endpointName/pluginName" -> sid
+    let sessionRegBodies = {};   // key -> last register_session body (for auto-recovery re-register)
     let endpointData = {};   // endpointName -> plugin info from /endpoint/list
     let queueDataCache      = {}; // endpointName -> { queues: {...}, allocations: [...] }
     let jobAllocationCache  = {}; // endpointName -> allocation dict | null
@@ -1834,6 +1835,20 @@
           const t = await res.text();
           const errMsg = `HTTP ${res.status}: ${t}`;
 
+          // Stale-session auto-recovery: a 410 (expired) or a 404 whose detail
+          // is specifically "unknown session id" means the sid is dead — not
+          // that the job/task is missing.  Re-register once and retry with a
+          // fresh sid.  The `_sidRetried` guard caps this at a single retry so a
+          // persistently failing request can't loop.
+          const staleSession = res.status === 410 ||
+                               (res.status === 404 && t.includes('unknown session id'));
+          if (staleSession && !opts._sidRetried) {
+            const healedPath = await tryHealSession(path);
+            if (healedPath) {
+              return await apiFetch(healedPath, { ...opts, _sidRetried: true });
+            }
+          }
+
           // Show toast for HTTP errors (unless caller opts out)
           if (!opts.quiet) {
             if (res.status >= 500) {
@@ -1864,6 +1879,14 @@
       }
     }
 
+    // Drop a cached (or in-flight) session so the next getSession() re-registers.
+    // Used by the topology handler (endpoint restarted) and by apiFetch's stale
+    // session auto-recovery.  Deleting the key drops both a resolved sid and any
+    // in-flight registration promise stored under the same key.
+    function invalidateSession(endpointName, pluginName) {
+      delete sessions[`${endpointName}/${pluginName}`];
+    }
+
     async function registerSession(endpointName, pluginName, body = {}) {
       const key = `${endpointName}/${pluginName}`;
 
@@ -1872,6 +1895,11 @@
       // immediately prevents concurrent callers from racing into multiple
       // register_session RPCs.
       if (sessions[key]) return sessions[key];
+
+      // Remember the register body so a stale-session re-register (see
+      // apiFetch auto-recovery) reproduces the same session (e.g. rhapsody
+      // backends) rather than silently falling back to defaults.
+      sessionRegBodies[key] = body;
 
       const nsData = endpointData[endpointName]?.plugins?.[pluginName];
       if (!nsData) throw new Error(`Plugin ${pluginName} not found on ${endpointName}`);
@@ -1894,6 +1922,38 @@
 
     function getNs(endpointName, pluginName) {
       return endpointData[endpointName]?.plugins?.[pluginName]?.namespace;
+    }
+
+    // Stale-session auto-recovery.  When a session-scoped request 404/410s
+    // because the sid is unknown/expired (endpoint restarted, or the server's
+    // idle-expiry fired), find the cached session whose sid appears in this
+    // request path, invalidate + re-register it, and return a rebuilt path with
+    // the fresh sid so apiFetch can retry exactly once.  Returns null when no
+    // matching cached session is found or the re-register fails, so the caller
+    // surfaces the original error instead of looping.
+    async function tryHealSession(path) {
+      for (const [key, val] of Object.entries(sessions)) {
+        if (typeof val !== 'string') continue;   // still an in-flight promise
+        const slash = key.indexOf('/');
+        const en = key.slice(0, slash);
+        const pn = key.slice(slash + 1);
+        const ns = getNs(en, pn);
+        // Only heal a session whose namespace and sid both appear in this path.
+        if (!ns || !path.startsWith(ns + '/') || !path.includes(val)) continue;
+
+        const oldSid = val;
+        invalidateSession(en, pn);
+        let newSid;
+        try {
+          newSid = await registerSession(en, pn, sessionRegBodies[key] || {});
+        } catch (_) {
+          return null;   // re-register failed — let the original error surface
+        }
+        if (!newSid || newSid === oldSid) return null;
+        // Swap the stale sid for the fresh one (sid is a unique UUID segment).
+        return path.split(oldSid).join(newSid);
+      }
+      return null;
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -2016,6 +2076,7 @@
       BROKER = '';
       endpointData = {};
       sessions = {};
+      sessionRegBodies = {};
       queueDataCache     = {};
       jobAllocationCache = {};
       window.lastEndpoints = {};
@@ -2089,6 +2150,25 @@
           } else if (msg.topic === 'topology') {
             // Auto-refresh hierarchy on topology changes
             const endpoints = (msg.data && msg.data.endpoints) || {};
+
+            // Drop cached sessions for any endpoint whose presence changed.
+            // An endpoint that left (its old sids are dead) or (re)appeared (a
+            // restart reuses the name but starts with fresh, empty sessions)
+            // must not have its stale sids reused — invalidate them so the next
+            // getSession() re-registers against the live endpoint.
+            const prevNames = new Set(Object.keys(window.lastEndpoints || {}));
+            const curNames  = new Set(Object.keys(endpoints));
+            const changed   = new Set([...prevNames, ...curNames]);
+            for (const en of changed) {
+              if (prevNames.has(en) && curNames.has(en)) continue;  // unchanged
+              for (const key of Object.keys(sessions)) {
+                const slash = key.indexOf('/');
+                if (key.slice(0, slash) === en) {
+                  invalidateSession(en, key.slice(slash + 1));
+                }
+              }
+            }
+
             for (const [en, ed] of Object.entries(endpoints)) {
               endpointData[en] = ed;
             }

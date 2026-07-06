@@ -134,6 +134,11 @@ export function init(page, api) {
     }
   }
 
+  // Populate the Job Monitor from jobs already in the endpoint session, so a
+  // page reload (or a panel opened after jobs were submitted elsewhere) isn't
+  // blank.  Fire-and-forget; a fresh/empty session simply yields no rows.
+  loadExistingJobs(page, api);
+
   // Prefill from cached queue data if already available
   const qd = api.getQueueData();
   if (qd) replaceQueueAccountDropdowns(page, qd);
@@ -387,6 +392,32 @@ function updateJobRowTunnel(page, jobId, tunnelStatus) {
   badge.textContent = tunnelStatus;
 }
 
+// Fetch jobs already known to the endpoint session (route: list_jobs/{sid},
+// PSIJPlugin.list_jobs -> {jobs: [...]}) and render any not already shown.
+// Idempotent: existing rows are refreshed, not duplicated.  Best-effort — a
+// missing session or transient error is swallowed (quiet fetch, no toast).
+async function loadExistingJobs(page, api) {
+  let res;
+  try {
+    const sid = await api.getSession('psij');
+    res = await api.fetch(`list_jobs/${sid}`, { quiet: true });
+  } catch (e) {
+    return;
+  }
+  const jobs = (res && res.jobs) || [];
+  for (const job of jobs) {
+    if (!job || !job.job_id) continue;
+    if (psijJobs[job.job_id]) {
+      // Already tracked (e.g. submitted from this tab) — just refresh state.
+      Object.assign(psijJobs[job.job_id], job);
+      updateJobRow(page, job.job_id, job.state, job);
+      continue;
+    }
+    psijJobs[job.job_id] = job;
+    addJobRow(page, api, job);   // renders state/cancel affordance from job.state
+  }
+}
+
 // ─────────────────────────────────────────────────────────────
 //  Job detail overlay with streaming
 // ─────────────────────────────────────────────────────────────
@@ -468,7 +499,20 @@ async function openJobDetail(api, jobId) {
           }
         }
       } catch (e) {
-        // Silently ignore poll errors
+        // A 404/410 here means the session was reset (endpoint restarted or the
+        // sid expired) — apiFetch already tried to re-register once, so this
+        // job can no longer be polled.  Stop the interval and surface a clear
+        // "session reset" state instead of spinning forever.  Other (transient
+        // network) errors are left non-fatal so a one-off blip keeps polling.
+        const msg = (e && e.message) || '';
+        if (msg.includes('404') || msg.includes('410')) {
+          stopPoller();
+          const stateEl = document.getElementById('psij-detail-state');
+          if (stateEl) {
+            stateEl.className   = 'badge badge-red';
+            stateEl.textContent = 'session reset — reopen';
+          }
+        }
       }
     }, 3000);
   }
