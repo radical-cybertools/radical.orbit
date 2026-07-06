@@ -529,6 +529,21 @@ def read_token(endpoint):
     return token
 
 
+def _endpoint_argv(endpoint_name, broker_url, tunnel, login_host):
+    """Build the ``radical-orbit-endpoint.py`` argv for a child endpoint.
+
+    ``tunnel`` is one of ``'none'`` / ``'forward'`` / ``'reverse'`` (see
+    ``bin/radical-orbit-endpoint.py``).  Forward mode needs ``--tunnel-via``
+    (the login host the child opens ``ssh -L`` to); reverse / none do not.
+    """
+    args = ['--name', endpoint_name, '--url', broker_url]
+    if tunnel != 'none':
+        args += ['--tunnel', tunnel]
+        if tunnel == 'forward':
+            args += ['--tunnel-via', login_host]
+    return args
+
+
 def launch_iri(bc, endpoint, cfg, broker_url):
     """Connect to the IRI endpoint and submit a job that starts an endpoint.
 
@@ -544,9 +559,8 @@ def launch_iri(bc, endpoint, cfg, broker_url):
     COUNTERS[endpoint] += 1
 
     # Build the radical-orbit-endpoint.py CLI.  See bin/radical-orbit-endpoint.py.
-    args = ['--name', endpoint_name, '--url', broker_url]
-    if cfg['tunnel']:
-        args += ['--tunnel', '--tunnel-via', cfg['login_host']]
+    args = _endpoint_argv(endpoint_name, broker_url,
+                          cfg['tunnel'], cfg.get('login_host'))
 
     # Per-endpoint custom attributes.  Anything beyond queue/duration
     # (constraint, reservation, …) goes through ``attributes`` so the
@@ -710,16 +724,63 @@ def _heartbeat_dot():
     sys.stdout.flush()
 
 
-def _wait_for_endpoint(bc, name):
+class _JobFailureWatch:
+    """Subscribe to ``job_status`` notifications for one job and record its
+    first *terminal failure*.
+
+    The child endpoint only registers once its HPC job reaches ``RUNNING``; if
+    the job instead dies (bad submission, tunnel setup failure, scheduler
+    rejection) the endpoint never appears and a plain topology poll would block
+    for the full ``ENDPOINT_WAIT_SECONDS`` timeout.  Watching the job's own
+    status lets the wait bail the moment the job fails.  Both the IRI poller
+    and the psij watcher emit ``job_status`` with a ``{job_id, state}`` payload
+    (IRI states are lower-case, psij upper-case — compared case-folded)."""
+
+    _FAILED = {'failed', 'cancelled', 'canceled', 'error'}
+
+    def __init__(self, bc, job_id):
+        self._bc     = bc
+        self._job_id = job_id
+        self.failed  = False
+        self.reason  = None
+        # Bind the handler once: register/unregister match callbacks by
+        # identity, and each ``self._on_status`` access is a fresh bound method.
+        self._cb     = self._on_status
+        bc.register_callback(topic='job_status', callback=self._cb)
+
+    def _on_status(self, endpoint, plugin, topic, data):
+        if self.failed or data.get('job_id') != self._job_id:
+            return
+        state = str(data.get('state', '')).lower()
+        if state in self._FAILED:
+            self.reason = (data.get('error') or data.get('details')
+                           or f'job entered state {state!r}')
+            self.failed = True
+
+    def close(self):
+        try:
+            self._bc.unregister_callback(topic='job_status',
+                                         callback=self._cb)
+        except Exception:
+            pass
+
+
+def _wait_for_endpoint(bc, name, failure=None):
     """Poll ``bc.topology()`` until *name* registers, adding the demo's
-    heartbeat-dot progress UI and guaranteeing a trailing newline on
-    either path."""
+    heartbeat-dot progress UI and guaranteeing a trailing newline on either
+    path.  If *failure* (a :class:`_JobFailureWatch`) trips first — the child
+    job died before its endpoint connected — raise immediately instead of
+    blocking until the timeout."""
     start   = time.time()
     last_hb = start
     try:
         while time.time() - start < ENDPOINT_WAIT_SECONDS:
             if name in bc.topology():
                 return name
+            if failure is not None and failure.failed:
+                raise RuntimeError(
+                    f'endpoint {name!r} will not appear — its job failed: '
+                    f'{failure.reason}')
             time.sleep(3.0)
             if time.time() - last_hb >= 10.0:
                 _heartbeat_dot()
@@ -1363,10 +1424,14 @@ def _main_target(bc, broker_url, kind, name,
                  newline=False)
 
             t0 = time.time()
+            watch = _JobFailureWatch(bc, rec['job_id'])
             try:
-                first = _wait_for_endpoint(bc, rec['endpoint_name'])
+                first = _wait_for_endpoint(bc, rec['endpoint_name'],
+                                           failure=watch)
             except Exception as exc:
                 abort(f'wait_for_endpoint failed: {exc}')
+            finally:
+                watch.close()
             step(5, 'await child endpoint', f'up after {int(time.time() - t0)}s')
 
             _step_run(bc, broker_url, first, rec.get('cfg') or cfg)
@@ -1398,10 +1463,14 @@ def _main_target(bc, broker_url, kind, name,
                  newline=False)
 
             t0 = time.time()
+            watch = _JobFailureWatch(bc, rec['job_id'])
             try:
-                first = _wait_for_endpoint(bc, rec['endpoint_name'])
+                first = _wait_for_endpoint(bc, rec['endpoint_name'],
+                                           failure=watch)
             except Exception as exc:
                 abort(f'wait_for_endpoint failed: {exc}')
+            finally:
+                watch.close()
             step(5, 'await child endpoint', f'up after {int(time.time() - t0)}s')
 
             _step_run(bc, broker_url, first, rec.get('cfg') or cfg)
