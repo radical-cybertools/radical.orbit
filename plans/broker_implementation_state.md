@@ -4,15 +4,46 @@ Working state for the milestone-by-milestone implementation of
 `plans/broker_architecture_plan.md`. Updated by the supervising session as
 milestones land; read this first when resuming.
 
-Last update: 2026-07-03. THE PLAN IS FULLY IMPLEMENTED and hardened; all
-work is pushed as the stacked PR chain
-devel ← #64 ← #65 ← #66 ← #67 ← #68 ← #69 ← #72 ← #73 ← #74 ← #75 ← #76 ← #77
-(user merges top-down). Suite at the stack tip (feature/broker_12):
-887 passed, 2 skipped; flake8 clean. An e2e smoke of the running stack
-(broker+gateway+endpoint+replay, real processes/sockets) passed 11/11
-participant checks plus the gateway/auth/SSE matrix; its one real finding
-(--host silently ignored, broker always bound 0.0.0.0) is fixed in #76 and
-re-verified live (ss -tln shows 127.0.0.1 bind; hosted-plugin path intact).
+Last update: 2026-07-06. THE BROKER REWRITE IS FULLY MERGED into `devel`
+(the stacked chain #64–#77 plus the KISS-simplification pass #83), and all
+subsequent open-issue work is merged too (see "Post-broker issue work"
+below). `devel` is the single active line — there are **no open PRs**. Unit
+suite on devel: **913 passed, 2 skipped**; flake8 clean. A PR-gating CI
+(`.github/workflows/pr.yml`: flake8 + pytest on py3.10–3.12) now runs on
+every PR into devel; #91 was the first PR merged through it.
+
+The milestone table and per-milestone notes below are retained as the
+historical record of the rewrite; they are DONE/MERGED.
+
+## Post-broker issue work (through 2026-07-06)
+
+After the rewrite merged, the open GitHub issues were worked newest-first.
+All landed in `devel`:
+
+| Issue | PR | What |
+|---|---|---|
+| #44 | #78 | sysinfo `disk_usage` → catch `OSError` (vanished/unreadable mount) |
+| #70/#71 | #81 | docs: IRI plugin reference + machine setup guide |
+| #42 | #85 | edge cert pinning **re-targeted onto `runtime._ssl_context`** (pin-only via `create_default_context(cafile=...)`, fail-closed on missing cert); old bridge-stack PR #80 closed superseded |
+| #43 | — | resolved by the rewrite itself (sync `_disconnect`→`_remove_participant`, socket-guarded teardown); issue + PR #79 closed |
+| #82 | #86 | graceful child-job-failure — amsc `_JobFailureWatch` races `job_status` vs topology; + the `--tunnel <mode>` argv root-cause fix |
+| #22 | #87 | security residuals: gateway body cap, sysinfo/lucid/handler timeouts, `BrokerTuning.forwarded_call_cap` |
+| #9 | #88 | PR-gating CI (flake8 + pytest matrix); ruff/mypy deferred; **3.9 dropped** (asyncio event-loop tail) |
+| #34/#35/#39 | #89 | Explorer session auto-recovery + `list_tasks`/`list_jobs`-on-open + Cancel-All; **quickjs pytest JS harness** over shared `data/plugins/session_util.js` |
+| #40 | #90 | quinfo: surface extra squeue/qstat job fields + one shared `jobStateBadge` |
+| #14 | #91 | one canonical error envelope `{error,status_code,detail}` across runtime/broker/gateway/plugins — new `errors.py`, gateway HTTPException handler, staging ladder → `http_exception` |
+
+Every gemini-code-assist review thread on those PRs was replied-to and
+resolved. Stale local branches `fix/issue_42` / `fix/issue_43` are dead
+(their commits target deleted files) — safe to delete.
+
+**Next pickup:** #14's Phase 4 — job-state-vocabulary normalization through
+`batch_system.STATE_*` for `queue_info`/`psij` — was explicitly scoped OUT of
+#91 and is the cleanest follow-up. Other open tickets: #18 routing policy v1;
+ROSE track (#16/#21/#6); #38 psij Frontier/Anvil (hardware); assorted doc/UI/
+packaging (#3/#8/#11/#31/#32/#36/#37/#41).
+
+## Historical record (broker rewrite)
 
 Local-tree caveat: ~/bin/git-branch-status -a walks branches by CHECKOUT —
 it parks the repo on feature/broker_9 (lexicographically last) and can
