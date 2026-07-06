@@ -345,7 +345,8 @@ def test_xgfabric_client_stop_workflow():
 
 
 # ---------------------------------------------------------------------------
-# item 21/22: by-construction runtime adapters + endpoint-only classification
+# Cross-endpoint access rides the runtime consumer facade directly (no
+# adapter layer) + endpoint-only classification.
 # ---------------------------------------------------------------------------
 
 class _RecordingPlugin:
@@ -383,40 +384,40 @@ class _StubRuntime:
         return plug
 
 
-def test_runtime_adapters_list_and_plugin_view():
-    from radical.orbit.plugin_xgfabric import (_RuntimeBrokerAdapter,
-                                               _RuntimeEndpointAdapter)
+def test_get_plugin_calls_runtime_directly():
     topo = {'broker': {'role': 'broker'},
             'epA':    {'role': 'endpoint', 'plugins': {'psij': {}}}}
     rt = _StubRuntime(topo)
+    session = XGFabricSession('s1', runtime=rt)
 
-    bc = _RuntimeBrokerAdapter(rt)
-    assert set(bc.list_endpoints()) == {'broker', 'epA'}
-
-    ec = bc.get_endpoint_client('epA')
-    assert isinstance(ec, _RuntimeEndpointAdapter)
-
-    plug = ec.get_plugin('psij', foo='bar')
+    plug = session._get_plugin({'endpoint_name': 'epA'}, 'psij')
     assert (plug.endpoint, plug.name) == ('epA', 'psij')
-    assert rt.calls == [('epA', 'psij', {'foo': 'bar'})]
-    bc.close()                                       # no-op, must not raise
+    assert rt.calls == [('epA', 'psij', {})]
 
 
 @pytest.mark.asyncio
-async def test_submit_pilot_builds_calls_over_adapter_seam(tmp_path):
-    from radical.orbit.plugin_xgfabric import _RuntimeBrokerAdapter
+async def test_is_endpoint_online_checks_runtime_topology():
+    topo = {'epA': {'role': 'endpoint', 'plugins': {}}}
+    rt = _StubRuntime(topo)
+    session = XGFabricSession('s1', runtime=rt)
+
+    assert await session._is_endpoint_online({'endpoint_name': 'epA'}) is True
+    assert await session._is_endpoint_online({'endpoint_name': 'epZ'}) is False
+
+
+@pytest.mark.asyncio
+async def test_submit_pilot_uses_runtime_get_plugin(tmp_path):
     topo = {'epA': {'role': 'endpoint', 'plugins': {'psij': {}}}}
     rt   = _StubRuntime(topo, served={'sysinfo': object(), 'psij': object()})
 
     session = XGFabricSession('s1', workdir=str(tmp_path), runtime=rt)
-    session._bc = _RuntimeBrokerAdapter(rt)
 
     cluster = {'endpoint_name': 'epA', 'queue': 'debug', 'account': 'ACC',
                'duration': 1200, 'nodes': 2, 'executor': 'slurm'}
     job_id = await session._submit_pilot(cluster, 'https://broker:8000')
     assert job_id == 'job.1'
 
-    # get_plugin('psij') was reached via the broker/endpoint adapter seam.
+    # get_plugin('psij') was reached directly through the runtime facade.
     assert ('epA', 'psij', {}) in rt.calls
     plug = rt.plugins_created[('epA', 'psij')]
     spec, executor = plug.submitted[0]
@@ -431,6 +432,53 @@ async def test_submit_pilot_builds_calls_over_adapter_seam(tmp_path):
     assert '--name' in args and 'epA.1' in args
     pi = args.index('-p')
     assert set(args[pi + 1].split(',')) == {'sysinfo', 'psij'}
+
+
+# ---------------------------------------------------------------------------
+# A9: explicit ``cluster_type`` config override wins over the general
+# queue_info-presence rule; the general rule still governs when unset.
+# ---------------------------------------------------------------------------
+
+def test_classify_default_rule_queue_info_goes_allocate():
+    session = XGFabricSession('s1')
+    endpoints_info = {
+        'ep_queue': {'plugins': ['queue_info']},
+        'ep_plain': {'plugins': ['sysinfo']},
+    }
+    immediate, allocate = session._classify(endpoints_info, rc=None)
+    assert [c['name'] for c in allocate]  == ['ep_queue']
+    assert [c['name'] for c in immediate] == ['ep_plain']
+
+
+def test_classify_config_override_forces_immediate_despite_queue_info():
+    """UCSB-style site: has queue_info but must stay immediate."""
+    rc = ResourceConfig(cluster_configs={'ucsb': {'cluster_type': 'immediate'}})
+    endpoints_info = {'ucsb': {'plugins': ['queue_info']}}
+    session = XGFabricSession('s1')
+
+    immediate, allocate = session._classify(endpoints_info, rc)
+    assert [c['name'] for c in immediate] == ['ucsb']
+    assert allocate == []
+
+
+def test_classify_config_override_forces_allocate_despite_no_queue_info():
+    rc = ResourceConfig(cluster_configs={'headless': {'cluster_type': 'allocate'}})
+    endpoints_info = {'headless': {'plugins': []}}
+    session = XGFabricSession('s1')
+
+    immediate, allocate = session._classify(endpoints_info, rc)
+    assert [c['name'] for c in allocate] == ['headless']
+    assert immediate == []
+
+
+def test_classify_unknown_override_value_falls_back_to_default_rule():
+    rc = ResourceConfig(cluster_configs={'ep1': {'cluster_type': 'bogus'}})
+    endpoints_info = {'ep1': {'plugins': ['queue_info']}}
+    session = XGFabricSession('s1')
+
+    immediate, allocate = session._classify(endpoints_info, rc)
+    assert [c['name'] for c in allocate] == ['ep1']
+    assert immediate == []
 
 
 @pytest.mark.asyncio

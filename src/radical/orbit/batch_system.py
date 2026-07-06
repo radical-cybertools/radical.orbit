@@ -20,6 +20,8 @@ State vocabulary (used everywhere outside the backend modules):
     UNKNOWN    — backend reported nothing (job gone, transient error, no scheduler)
 """
 
+import subprocess
+
 from abc import ABC, abstractmethod
 
 
@@ -33,6 +35,50 @@ STATE_HELD      = 'HELD'
 STATE_UNKNOWN   = 'UNKNOWN'
 
 TERMINAL_STATES = frozenset({STATE_DONE, STATE_FAILED, STATE_CANCELLED})
+
+
+# ---------------------------------------------------------------------------
+# Subprocess helpers
+#
+# Every backend below shells out to a scheduler CLI (squeue, qstat, ...) with
+# the same five keyword arguments.  These two helpers are the one place that
+# knows how to run such a command; backends only decide what happens on
+# failure by picking one of the two.
+# ---------------------------------------------------------------------------
+
+def run_cmd(cmd, timeout=10, env=None) -> 'str | None':
+    """Run *cmd*, returning stdout, or None on any failure.
+
+    Failure covers a missing binary, a timeout, and a non-zero exit code.
+    For callers that treat "can't tell" as an ordinary, expected outcome
+    (e.g. probing job/node state).
+    """
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout, env=env)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout
+
+
+def run_cmd_strict(cmd, timeout=10, env=None) -> str:
+    """Run *cmd*, returning stdout, or raise RuntimeError on any failure.
+
+    Failure covers a missing binary, a timeout, and a non-zero exit code.
+    For callers where a failure must be surfaced as an error (cancel,
+    cached collectors).
+    """
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout, env=env)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"Command {cmd} failed: {exc}") from exc
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"Command {cmd} failed (rc={r.returncode}): {r.stderr.strip()}")
+    return r.stdout
 
 
 class BatchSystem(ABC):

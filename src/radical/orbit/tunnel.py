@@ -25,10 +25,11 @@ so the *consumer* (always the child endpoint on the compute node) can
 read the same path regardless of which side spawned the SSH.
 """
 
+import json
 import logging
 import os
 import pathlib
-import select
+import re
 import socket
 import subprocess
 import threading
@@ -39,11 +40,60 @@ log = logging.getLogger('radical.orbit')
 
 RELAY_BASE = pathlib.Path.home() / '.radical' / 'orbit' / 'tunnels'
 
+# Matches sshd's "Allocated port N for remote forward to ..." line that
+# OpenSSH 7.6+ prints on stderr when ``-R 0:host:port`` is used.
+_ALLOCATED_PORT_RE = re.compile(r'Allocated port (\d+) for remote forward')
+
 
 def relay_dir() -> pathlib.Path:
     """Return (and create) the rendezvous directory on the shared fs."""
     RELAY_BASE.mkdir(parents=True, exist_ok=True)
     return RELAY_BASE
+
+
+def _rendezvous_path(endpoint_name: str, suffix: str) -> pathlib.Path:
+    """Return the ``<endpoint_name>.<suffix>`` rendezvous file path."""
+    return relay_dir() / f'{endpoint_name}.{suffix}'
+
+
+def rendezvous_read(endpoint_name: str, suffix: str = 'port') -> 'int | None':
+    """Return the integer in the ``.port`` (or ``.pid``) rendezvous file.
+
+    Returns ``None`` when the file is absent or does not hold an integer.
+    """
+    try:
+        return int(_rendezvous_path(endpoint_name, suffix).read_text().strip())
+    except (ValueError, OSError):
+        return None
+
+
+def rendezvous_wait(endpoint_name: str) -> 'dict | None':
+    """Return the child's ``.req`` payload dict if present, else ``None``.
+
+    A ``readdir`` on the parent directory precedes the read to defeat NFSv3
+    negative-lookup caching: after a first miss the cached ENOENT can keep
+    reporting the file absent for tens of seconds even once the child has
+    written it on the shared filesystem (observed on ODO), and a readdir
+    forces fresh directory attributes.
+
+    Raises:
+        ValueError: the ``.req`` file exists but is not valid JSON.
+        OSError:    the ``.req`` file exists but could not be read.
+    """
+    req_file = _rendezvous_path(endpoint_name, 'req')
+    try:
+        present = req_file.name in set(os.listdir(str(req_file.parent)))
+    except OSError:
+        present = False
+    if not present:
+        return None
+    return json.loads(req_file.read_text())
+
+
+def rendezvous_clear(endpoint_name: str) -> None:
+    """Remove any stale ``.port``/``.pid``/``.req`` rendezvous files."""
+    for suffix in ('port', 'pid', 'req'):
+        _rendezvous_path(endpoint_name, suffix).unlink(missing_ok=True)
 
 
 def _pick_free_local_port() -> int:
@@ -154,9 +204,8 @@ def spawn_tunnel(login_host: str, broker_host: str, broker_port: int,
     log.info("[tunnel] SSH listener active on 127.0.0.1:%d for endpoint %r",
              port, endpoint_name)
 
-    rdir = relay_dir()
-    (rdir / f'{endpoint_name}.port').write_text(str(port))
-    (rdir / f'{endpoint_name}.pid').write_text(str(proc.pid))
+    _rendezvous_path(endpoint_name, 'port').write_text(str(port))
+    _rendezvous_path(endpoint_name, 'pid').write_text(str(proc.pid))
 
     return proc, port
 
@@ -177,78 +226,29 @@ def cleanup_tunnel(proc, endpoint_name: str = '') -> None:
         log.info("[tunnel] Terminated SSH process for endpoint %r", endpoint_name)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Reverse tunnel (login -> compute)
-# ─────────────────────────────────────────────────────────────────────────────
-
-import re
-
-# Matches sshd's "Allocated port N for remote forward to ..." line that
-# OpenSSH 7.6+ prints on stderr when ``-R 0:host:port`` is used.
-_ALLOCATED_PORT_RE = re.compile(r'Allocated port (\d+) for remote forward')
-
-
 def _parse_allocated_port(proc, log_lines: list, timeout: float) -> int:
     """Wait for OpenSSH to print "Allocated port N" on stderr.
 
-    Drains stderr line-by-line in the calling thread (separate stderr
-    drain not started yet, since we need to inspect the lines here).
-    Raises :class:`RuntimeError` on timeout or premature SSH exit.
+    Starts the shared stderr-drain thread and scans the lines it
+    accumulates for the allocated-port line until *timeout* seconds
+    elapse or the SSH process exits.  Raises :class:`RuntimeError` on
+    timeout or premature SSH exit.
     """
+    _start_stderr_drain(proc, log_lines)
     deadline = time.monotonic() + timeout
-    if proc.stderr is None:
-        raise RuntimeError("SSH stderr unavailable; cannot parse allocated port")
-
-    fd         = proc.stderr.fileno()
-    was_block  = os.get_blocking(fd)
-    buf        = b''
-
-    try:
-        os.set_blocking(fd, False)
-        while time.monotonic() < deadline:
-            remaining = max(0.0, deadline - time.monotonic())
-            ready, _, _ = select.select([fd], [], [], min(0.1, remaining))
-            if not ready:
-                if proc.poll() is not None:
-                    tail = '\n'.join(log_lines[-20:])
-                    raise RuntimeError(
-                        f"SSH reverse tunnel exited (rc={proc.returncode}) "
-                        f"before allocating a port\nSSH output (last 20 lines):"
-                        f"\n{tail}")
-                continue
-
-            try:
-                chunk = os.read(fd, 4096)
-            except BlockingIOError:
-                continue
-            if not chunk:
-                if proc.poll() is not None:
-                    tail = '\n'.join(log_lines[-20:])
-                    raise RuntimeError(
-                        f"SSH reverse tunnel exited (rc={proc.returncode}) "
-                        f"before allocating a port\nSSH output (last 20 lines):"
-                        f"\n{tail}")
-                continue
-
-            buf += chunk
-            while b'\n' in buf:
-                raw, buf = buf.split(b'\n', 1)
-                text = raw.decode('utf-8', errors='replace').rstrip('\r')
-                log_lines.append(text)
-                m = _ALLOCATED_PORT_RE.search(text)
-                if m:
-                    return int(m.group(1))
-
-            text = buf.decode('utf-8', errors='replace').rstrip('\r')
-            m = _ALLOCATED_PORT_RE.search(text)
+    scanned  = 0
+    while time.monotonic() < deadline:
+        while scanned < len(log_lines):
+            m = _ALLOCATED_PORT_RE.search(log_lines[scanned])
+            scanned += 1
             if m:
-                log_lines.append(text)
                 return int(m.group(1))
-    finally:
-        os.set_blocking(fd, was_block)
-
-    if buf:
-        log_lines.append(buf.decode('utf-8', errors='replace').rstrip())
+        if proc.poll() is not None:
+            tail = '\n'.join(log_lines[-20:])
+            raise RuntimeError(
+                f"SSH reverse tunnel exited (rc={proc.returncode}) before "
+                f"allocating a port\nSSH output (last 20 lines):\n{tail}")
+        time.sleep(0.1)
     tail = '\n'.join(log_lines[-20:])
     raise RuntimeError(
         f"SSH reverse tunnel did not allocate a port within {timeout:.0f}s\n"
@@ -303,17 +303,15 @@ def spawn_reverse_tunnel(compute_host: str, broker_host: str, broker_port: int,
         start_new_session=True,
     )
 
+    # ``_parse_allocated_port`` starts the stderr-drain thread itself and
+    # keeps it running, so the SSH process never blocks on a full pipe.
     log_lines: list = []
     port = _parse_allocated_port(proc, log_lines, allocate_timeout)
-    # Hand stderr off to a background drain thread so the SSH process
-    # doesn't block writing to a full pipe later in its life.
-    _start_stderr_drain(proc, log_lines)
 
     log.info("[tunnel] Reverse SSH allocated remote port %d on %s for endpoint %r",
              port, compute_host, endpoint_name)
 
-    rdir = relay_dir()
-    (rdir / f'{endpoint_name}.port').write_text(str(port))
-    (rdir / f'{endpoint_name}.pid').write_text(str(proc.pid))
+    _rendezvous_path(endpoint_name, 'port').write_text(str(port))
+    _rendezvous_path(endpoint_name, 'pid').write_text(str(proc.pid))
 
     return proc, port

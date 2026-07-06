@@ -7,7 +7,7 @@ from pydantic import ValidationError
 
 from radical.orbit.ui_schema import (
     UIConfig, UIForm, UIField, UIMonitor, UINotifications,
-    UIFieldOption, UIFormSubmit, ui_config_to_dict, validate_ui_config
+    UIFieldOption, UIFormSubmit, ui_config_to_dict
 )
 
 
@@ -217,31 +217,6 @@ class TestUIConfigToDict:
         assert isinstance(result, dict)
         assert result["title"] == "Test"
         assert result["icon"] == "🔌"
-
-
-class TestValidateUIConfig:
-    """Tests for validate_ui_config function."""
-
-    def test_none_returns_default(self):
-        result = validate_ui_config(None)
-        assert isinstance(result, UIConfig)
-        assert result.title == "Plugin"
-
-    def test_dict_converts_to_config(self):
-        d = {"title": "My Plugin", "icon": "🔧"}
-        result = validate_ui_config(d)
-        assert isinstance(result, UIConfig)
-        assert result.title == "My Plugin"
-        assert result.icon == "🔧"
-
-    def test_config_returns_same(self):
-        config = UIConfig(title="Test")
-        result = validate_ui_config(config)
-        assert result is config
-
-    def test_invalid_type_raises(self):
-        with pytest.raises(ValueError):
-            validate_ui_config("invalid")
 
 
 class TestPluginUIConfigs:

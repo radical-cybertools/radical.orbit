@@ -108,6 +108,85 @@ async def test_session_close():
 
 
 # ---------------------------------------------------------------------------
+# finding 10: shared PluginSession.start_status_poller adoption
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_start_polling_uses_shared_status_poller():
+    session = IRIInstanceSession('s1', endpoint='nersc', token='tok')
+    session._jobs['j1'] = {'resource_id': 'perlmutter', 'state': 'new'}
+
+    session._start_polling()
+    try:
+        task = session._status_poller_task
+        assert task is not None
+        assert not task.done()
+        # Idempotent — a second call while one is live keeps the same task.
+        session._start_polling()
+        assert session._status_poller_task is task
+    finally:
+        session.stop_status_poller()
+    await session._http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fetch_job_status_reports_change_and_updates_meta():
+    session = IRIInstanceSession('s1', endpoint='nersc', token='tok')
+    mock_resp = MagicMock()
+    mock_resp.is_success = True
+    mock_resp.json.return_value = {'status': {'state': 'RUNNING'}}
+    meta = {'resource_id': 'perlmutter', 'state': 'new', 'name': 'job1'}
+
+    with patch.object(session._http, 'get', new_callable=AsyncMock,
+                      return_value=mock_resp):
+        status = await session._fetch_job_status('j1', meta)
+
+    assert status == {'state': 'RUNNING'}
+    assert meta['state'] == 'running'
+    payload = session._job_payload('j1', meta, status)
+    assert payload == {
+        'job_id'     : 'j1',
+        'state'      : 'running',
+        'resource_id': 'perlmutter',
+        'name'       : 'job1',
+        'details'    : {'state': 'RUNNING'},
+    }
+    await session._http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fetch_job_status_no_change_returns_none():
+    session = IRIInstanceSession('s1', endpoint='nersc', token='tok')
+    mock_resp = MagicMock()
+    mock_resp.is_success = True
+    mock_resp.json.return_value = {'status': {'state': 'new'}}
+    meta = {'resource_id': 'perlmutter', 'state': 'new'}
+
+    with patch.object(session._http, 'get', new_callable=AsyncMock,
+                      return_value=mock_resp):
+        status = await session._fetch_job_status('j1', meta)
+
+    assert status is None
+    assert meta['state'] == 'new'
+    await session._http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fetch_job_status_failed_response_returns_none():
+    session = IRIInstanceSession('s1', endpoint='nersc', token='tok')
+    mock_resp = MagicMock()
+    mock_resp.is_success = False
+    meta = {'resource_id': 'perlmutter', 'state': 'new'}
+
+    with patch.object(session._http, 'get', new_callable=AsyncMock,
+                      return_value=mock_resp):
+        status = await session._fetch_job_status('j1', meta)
+
+    assert status is None
+    await session._http.aclose()
+
+
+# ---------------------------------------------------------------------------
 # _iri_raise utility
 # ---------------------------------------------------------------------------
 

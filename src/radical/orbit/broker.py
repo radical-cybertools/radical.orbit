@@ -12,15 +12,16 @@ routing loop*: every frame it touches is a handful of dict operations
 The hosted-plugin host runs on its **own event loop in its own thread**, so a
 blocking plugin handler stalls request *handling*, never liveness — the
 routing loop keeps answering WS keepalive pings the whole time.  The two loops
-exchange work through the M0-validated thread-aware handoff
-(``run_coroutine_threadsafe`` in either direction, coalesced).
+exchange work with ``run_coroutine_threadsafe`` in either direction.
 
 **Liveness is transport-level and two-stage.**  Server-wide WS keepalive
 (``ws_ping_interval``/``ws_ping_timeout`` on uvicorn) closes a silent socket;
 a socket drop makes the identity ``suspect`` immediately (topology signal); a
 grace timer then declares it ``lost`` (actionable — inflight calls to it
 fast-fail).  A valid re-register cancels the grace timer; a clean close skips
-``suspect`` (immediate removal).
+``suspect`` (immediate removal).  The grace timers live on the routing loop, so
+a loop stall cannot declare anyone lost while it lasts, and every suspect keeps
+its full grace window after the loop recovers.
 
 **Minimal core.**  The broker owns a *minimal* app: only the token-gated WS
 ``/register`` route.  HTTP catch-all, SSE ``/events``, the Explorer UI and CORS
@@ -29,7 +30,6 @@ constructor-declared **gateway seam**, the attributes/methods ``gateway.py`` is
 handed:
 
 * :attr:`Broker.app`               — the FastAPI app to mount HTTP routes on.
-* :attr:`Broker.pending`           — the broker-side pending-call table.
 * :attr:`Broker.caller`            — the :class:`BrokerCaller` handle.
 * :meth:`Broker.tap`               — subscribe to the raw event stream.
 * :meth:`Broker.topology_snapshot` — the current rich topology dict.
@@ -49,10 +49,10 @@ import logging
 import os
 import signal
 import threading
-import time
 
-from contextlib import asynccontextmanager
-from typing     import Any, Callable, Dict, List, Optional, Tuple
+from contextlib  import asynccontextmanager
+from dataclasses import dataclass
+from typing      import Any, Callable, Dict, List, Optional, Tuple
 
 import msgpack
 
@@ -76,6 +76,58 @@ BROKER_NAME = 'broker'
 
 
 # ---------------------------------------------------------------------------
+# Tunables
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BrokerTuning:
+    """Liveness/backpressure knobs, grouped out of the constructor.
+
+    Defaults are production values; unit tests pass a tuning object with tiny
+    timeouts (or mutate attributes) so no test has to sleep for real.
+
+    * ``ping_interval`` / ``ping_timeout`` — uvicorn WS keepalive; a silent
+      socket is closed at ``ping_interval + ping_timeout``.
+    * ``grace`` — the ``suspect`` → ``lost`` window.
+    * ``call_cap`` — a cap on **broker-originated** in-flight calls (the only
+      calls the broker itself waits on); overflow raises at the caller.
+    * ``call_timeout`` — backstop deadline on every in-flight correlation; a
+      responder that never answers is reaped and fast-failed with a 504.
+    * ``reap_interval`` — how often the reaper sweeps for expired calls.
+    * ``event_queue`` — per-subscriber delivery-queue depth.
+    * ``frame_cap`` — uvicorn ``ws_max_size`` / the protocol frame cap.
+    """
+
+    ping_interval: float = 1.0
+    ping_timeout:  float = 3.0
+    grace:         float = 10.0
+    call_cap:      int   = 1024
+    call_timeout:  float = 30.0
+    reap_interval: float = 5.0
+    event_queue:   int   = 1024
+    frame_cap:     int   = protocol.FRAME_CAP
+
+
+class _Call:
+    """One in-flight correlated call the broker is tracking.
+
+    ``future`` is set only for broker-originated calls (``src='broker'``, the
+    :class:`BrokerCaller` path); a forwarded endpoint↔endpoint call leaves it
+    ``None``.  ``deadline`` (loop time) bounds every entry so a responder that
+    never answers cannot leak the table.
+    """
+
+    __slots__ = ('src', 'dst', 'future', 'deadline')
+
+    def __init__(self, src: str, dst: str,
+                 future: Optional[asyncio.Future], deadline: float):
+        self.src      = src
+        self.dst      = dst
+        self.future   = future
+        self.deadline = deadline
+
+
+# ---------------------------------------------------------------------------
 # Supervised task creation
 # ---------------------------------------------------------------------------
 
@@ -88,7 +140,7 @@ def spawn(coro, label: str, loop: Optional[asyncio.AbstractEventLoop] = None
     silently.  Every background task in the broker goes through here so a
     crash is logged (and thus reportable) rather than lost.
     """
-    loop = loop or asyncio.get_event_loop()
+    loop = loop or asyncio.get_running_loop()
     task = loop.create_task(coro)
 
     def _done(t: asyncio.Task) -> None:
@@ -111,9 +163,9 @@ class BrokerCaller:
     """In-process caller handle: the broker calling an endpoint (``src='broker'``).
 
     :meth:`call` is awaitable on the routing loop; :meth:`call_threadsafe`
-    returns a ``concurrent.futures.Future`` for the plugin-host thread (the M7
-    dispatcher seam).  Both route through the single broker-side pending table
-    with the per-``src`` cap enforced synchronously at the caller.
+    returns a ``concurrent.futures.Future`` for the plugin-host thread (the
+    hosted task dispatcher uses it).  Both route through the broker's in-flight
+    table with the broker-call cap enforced synchronously at the caller.
     """
 
     def __init__(self, broker: 'Broker'):
@@ -125,8 +177,8 @@ class BrokerCaller:
                    timeout: Optional[float]          = None) -> Dict[str, Any]:
         """Send a ``request`` to *dst* and await its ``response`` (as a dict).
 
-        Raises ``RuntimeError`` immediately when the broker's pending table is
-        at the per-``src`` cap, or on an unroutable ``dst``; raises
+        Raises ``RuntimeError`` immediately when broker-originated in-flight
+        calls are at the cap, or on an unroutable ``dst``; raises
         ``asyncio.TimeoutError`` if *timeout* elapses first.
         """
         return await self._broker._broker_call(
@@ -151,15 +203,11 @@ class BrokerCaller:
 class Broker:
     """The active broker — lean routing loop + own-thread plugin host.
 
-    The transport/auth args are ``app``, ``cert``/``key``, ``host``/``port``,
-    ``plugins`` and ``token``/``no_auth``.  The tunable liveness/backpressure
-    knobs — ``ping_interval`` and
-    ``ping_timeout`` (uvicorn WS keepalive; ``ping_timeout`` doubles as the
-    loop-lag watchdog's stall budget), ``grace`` (``suspect`` → ``lost``
-    window), ``pending_cap`` (per-``src`` pending-table cap), ``event_queue``
-    (per-subscriber delivery depth), ``frame_cap`` (uvicorn ``ws_max_size``),
-    ``clock`` and ``watchdog_interval`` — are all injectable so unit tests run
-    with tiny values and no long sleeps.
+    The constructor takes the handful of things an operator sets — ``app``,
+    ``cert``/``key``, ``host``/``port``, ``plugins``, ``token``/``no_auth`` and
+    ``gateway``.  The liveness/backpressure knobs are grouped in an optional
+    :class:`BrokerTuning` object (unit tests pass one with tiny timeouts, or
+    mutate the resulting ``self._*`` attributes, so no test sleeps for real).
     """
 
     def __init__(self,
@@ -171,15 +219,8 @@ class Broker:
                  plugins:  str = '',
                  token:    Optional[str]     = None,
                  no_auth:  bool              = False,
-                 ping_interval:     float = 1.0,
-                 ping_timeout:      float = 3.0,
-                 grace:             float = 10.0,
-                 pending_cap:       int   = 1024,
-                 event_queue:       int   = 1024,
-                 frame_cap:         int   = protocol.FRAME_CAP,
-                 clock:             Callable[[], float] = time.monotonic,
-                 watchdog_interval: float = 1.0,
-                 gateway:           bool  = True):
+                 gateway:  bool              = True,
+                 tuning:   Optional[BrokerTuning] = None):
 
         # ── TLS config ───────────────────────────────────────────────
         cert_path, _ = utils.resolve_broker_cert(cli=cert)
@@ -200,15 +241,16 @@ class Broker:
         self._url_forms = utils.public_url_forms(self._host, self._port)
         self._url: str  = self._url_forms[0]
 
-        # ── Tunables ─────────────────────────────────────────────────
-        self._ping_interval     = ping_interval
-        self._ping_timeout       = ping_timeout
-        self._grace             = grace
-        self._pending_cap       = pending_cap
-        self._event_queue       = event_queue
-        self._frame_cap         = frame_cap
-        self._clock             = clock
-        self._watchdog_interval = watchdog_interval
+        # ── Tunables (unpacked to attributes; tests may set them) ─────
+        tuning = tuning or BrokerTuning()
+        self._ping_interval = tuning.ping_interval
+        self._ping_timeout  = tuning.ping_timeout
+        self._grace         = tuning.grace
+        self._call_cap      = tuning.call_cap
+        self._call_timeout  = tuning.call_timeout
+        self._reap_interval = tuning.reap_interval
+        self._event_queue   = tuning.event_queue
+        self._frame_cap     = tuning.frame_cap
         self._plugins_spec: str = plugins or ''
         self._gateway_enabled   = gateway
 
@@ -219,10 +261,9 @@ class Broker:
         self._resume_keys:   Dict[str, str]         = {}   # name -> resume_key
         self._grace_timers:  Dict[str, Any]         = {}   # name -> TimerHandle
 
-        # Topology-change listeners (the one minimal seam the M5 gateway needs
-        # beyond tap/pending/caller: topology changes do not flow through the
-        # raw event tap).  Fired synchronously on the routing loop from
-        # ``_broadcast_topology``.
+        # Topology-change listeners (the one seam the gateway needs beyond
+        # tap/caller: topology changes do not flow through the raw event tap).
+        # Fired synchronously on the routing loop from ``_broadcast_topology``.
         self._topology_listeners: List[Callable[[], None]] = []
 
         # Last rich topology delivered to the hosted-plugin host, so a
@@ -232,26 +273,25 @@ class Broker:
         # on the routing loop.
         self._host_topology_prev: Dict[str, Dict[str, Any]] = {}
 
-        # Correlation: one broker-side pending table (src='broker') plus a
-        # lightweight inflight forwarding table for grace-bounded fast-fail.
-        self.pending:  Dict[str, asyncio.Future]        = {}   # corr_id -> future
-        self._inflight: Dict[str, Tuple[str, str]]      = {}   # corr_id -> (src,dst)
+        # Correlation: one in-flight table keyed by ``corr_id``.  A
+        # broker-originated call carries an ``asyncio.Future``; a forwarded
+        # endpoint↔endpoint call carries ``None``.  Every entry has a deadline
+        # so an unanswered call is reaped (grace-bounded fast-fail on ``lost``,
+        # deadline sweep otherwise).
+        self._calls: Dict[str, _Call] = {}   # corr_id -> _Call
 
         # Event delivery + subscriptions live in a sibling module (the routing
         # loop stays lean); the router shares the live ``registry`` reference.
         self._prof     = rprof.Profiler('broker', ns='radical.orbit')
         self._events   = EventRouter(self.registry, spawn, self._prof,
-                                     event_queue, lambda: self._host_loop)
-
-        # Watchdog suppression window (loop-lag safety net).
-        self._suppress_until: float = 0.0
+                                     self._event_queue, lambda: self._host_loop)
 
         # Loops / host thread (populated in startup()).
         self._loop:      Optional[asyncio.AbstractEventLoop] = None
         self._host_loop: Optional[asyncio.AbstractEventLoop] = None
         self._host_thread: Optional[threading.Thread]        = None
         self._plugin_host: Optional[BrokerPluginHost]        = None
-        self._watchdog_task: Optional[asyncio.Task]          = None
+        self._reap_task: Optional[asyncio.Task]              = None
         self._started:   bool = False
 
         self.caller = BrokerCaller(self)
@@ -306,7 +346,7 @@ class Broker:
 
     def tap(self, callback: Callable[[Dict[str, Any]], Any]) -> Callable[[], None]:
         """Register an in-process subscriber for the raw (unfiltered) event
-        stream — the M8 replay plugin's hook and the M5 gateway's SSE fan-out.
+        stream — the replay plugin's hook and the gateway's SSE fan-out.
 
         The callback receives every event dict and is run supervised on the
         **plugin-host loop**, never the routing loop.  Returns an unsubscribe
@@ -340,9 +380,9 @@ class Broker:
         return {name: info.model_dump()
                 for name, info in self._participants_for_topology().items()}
 
-    def get_ui_modules(self) -> Dict[str, str]:
-        """Gateway seam (pre-flip item 2): ``{plugin_name: js_content}`` for
-        broker-hosted plugins that ship a dynamically-registered ``ui_module``.
+    async def get_ui_modules(self) -> Dict[str, str]:
+        """Gateway seam: ``{plugin_name: js_content}`` for broker-hosted
+        plugins that ship a dynamically-registered ``ui_module``.
 
         The static plugin JS the Explorer needs for the *packaged* plugins ships
         on disk (``data/plugins/*.js``); a hosted plugin registered at runtime —
@@ -350,7 +390,9 @@ class Broker:
         as a file the plugin class points at, discoverable only through the
         host.  The read touches host-loop state (``BrokerPluginHost._plugins``),
         so it is fetched **across the host-loop boundary** — the routing loop
-        never touches host state.  Empty when the host is not up.
+        never touches host state.  ``async`` so the gateway (on the routing loop)
+        *awaits* the crossing instead of blocking it for up to 5s, which would
+        stall WS keepalives.  Empty when the host is not up.
         """
         host = self._plugin_host
         loop = self._host_loop
@@ -362,7 +404,7 @@ class Broker:
 
         try:
             cfut = asyncio.run_coroutine_threadsafe(_fetch(), loop)
-            return cfut.result(timeout=5.0)
+            return await asyncio.wrap_future(cfut)
         except Exception as e:
             log.debug("[Broker] get_ui_modules failed: %s", e)
             return {}
@@ -370,7 +412,7 @@ class Broker:
     # ── lifecycle ─────────────────────────────────────────────────────
 
     async def startup(self) -> None:
-        """Capture the routing loop, start the host thread + the watchdog.
+        """Capture the routing loop, start the host thread + the call reaper.
 
         Idempotent; called from the FastAPI lifespan and directly from unit
         tests that drive the broker without uvicorn.
@@ -379,16 +421,16 @@ class Broker:
             return
         self._loop = asyncio.get_running_loop()
         self._start_host_thread()
-        self._watchdog_task = spawn(self._watchdog(), 'broker_watchdog')
+        self._reap_task = spawn(self._reap_calls(), 'broker_reap')
         self._started = True
 
     async def shutdown(self) -> None:
-        """Tear down: close sockets, stop the watchdog and the host thread."""
+        """Tear down: close sockets, stop the reaper and the host thread."""
         if not self._started:
             return
         self._started = False
-        if self._watchdog_task:
-            self._watchdog_task.cancel()
+        if self._reap_task:
+            self._reap_task.cancel()
         for name in list(self.registry):
             self._events.pause_sender(name)
         for name, ws in list(self.registry.items()):
@@ -436,7 +478,8 @@ class Broker:
         self._host_thread = threading.Thread(
             target=_run, name='broker-host', daemon=True)
         self._host_thread.start()
-        ready.wait(timeout=5.0)
+        if not ready.wait(timeout=5.0):
+            raise RuntimeError("broker host loop thread failed to start")
 
         # The host is always built (empty plugin list is valid) so that
         # ``dst=='broker'`` requests always have somewhere to route — the
@@ -449,7 +492,7 @@ class Broker:
             try:
                 host = BrokerPluginHost(
                     names, self._host_broadcast, BROKER_NAME,
-                    on_topology_changed=None, broker_url=self._url,
+                    broker_url=self._url,
                     broker_caller=self.caller, broker_tap=self.tap)
                 fut.set_result(host)
             except Exception as e:                         # pragma: no cover
@@ -494,12 +537,11 @@ class Broker:
                     ssl_certfile=self._cert,
                     ssl_keyfile=self._key,
                     log_level="info",
-                    # Transport enforces the frame cap; peek_routing does not.
+                    # Transport enforces the frame cap on inbound frames.
                     ws_max_size=self._frame_cap,
                     ws_per_message_deflate=True,
-                    # Server-wide WS keepalive — verified (M3) to disconnect a
-                    # silent client at ping_interval + ping_timeout on
-                    # uvicorn 0.46 + websockets 16.
+                    # Server-wide WS keepalive disconnects a silent client at
+                    # ping_interval + ping_timeout.
                     ws_ping_interval=self._ping_interval,
                     ws_ping_timeout=self._ping_timeout,
                     timeout_graceful_shutdown=3)
@@ -663,8 +705,8 @@ class Broker:
     # ── frame routing (the lean loop) ─────────────────────────────────
 
     async def _route_frame(self, name: str, data: bytes) -> None:
-        """Dispatch one inbound frame.  Pure msgpack dict ops — the measured
-        fast path never builds a pydantic model on the forwarding path."""
+        """Dispatch one inbound frame.  Pure msgpack dict ops — the forwarding
+        fast path never builds a pydantic model."""
         raw  = msgpack.unpackb(data, raw=False)
         kind = raw.get('kind')
 
@@ -681,7 +723,7 @@ class Broker:
 
     async def _route_request(self, src_name: str, raw: dict) -> None:
         # Never trust a client-supplied src — overwrite with the sender's
-        # registered name (plan security decision).
+        # registered name.
         raw['src'] = src_name
         dst        = raw.get('dst')
         corr_id    = raw.get('corr_id')
@@ -699,34 +741,36 @@ class Broker:
                                                   f"endpoint {dst!r} unknown"))
             return
 
-        self._inflight[corr_id] = (src_name, dst)
+        self._calls[corr_id] = _Call(src_name, dst, None,
+                                     self._loop.time() + self._call_timeout)
         await self._send(target, msgpack.packb(raw, use_bin_type=True))
 
     async def _route_response(self, src_name: str, raw: dict) -> None:
         corr_id = raw.get('corr_id')
         dst     = raw.get('dst')
-        self._inflight.pop(corr_id, None)
+        call    = self._calls.pop(corr_id, None)
         self._prof.prof('broker_route_response', uid=corr_id or '',
                         msg='%s->%s' % (src_name, dst))
 
         if dst == BROKER_NAME:
-            self._resolve_pending(corr_id, raw)
+            self._settle_call(call, raw)
             return
         target = self.registry.get(dst)
         if target is not None:
             await self._send(target, msgpack.packb(raw, use_bin_type=True))
 
-    # ── broker-as-caller (pending table) ──────────────────────────────
+    # ── broker-as-caller (in-flight table) ────────────────────────────
 
     async def _broker_call(self, dst: str, method: str, path: str, *,
                            body:    bytes,
                            headers: Optional[Dict[str, str]],
                            timeout: Optional[float]) -> Dict[str, Any]:
-        # Per-src pending cap — overflow raises synchronously at the caller.
-        if len(self.pending) >= self._pending_cap:
+        # Cap on broker-originated calls — overflow raises at the caller.
+        n_broker = sum(1 for c in self._calls.values() if c.future is not None)
+        if n_broker >= self._call_cap:
             raise RuntimeError(
-                f"broker pending table at cap ({self._pending_cap}): too many "
-                "in-flight calls")
+                f"broker in-flight calls at cap ({self._call_cap}): too many "
+                "broker-originated calls")
 
         req     = protocol.make_request(BROKER_NAME, dst, method, path,
                                         headers=headers, body=body)
@@ -736,20 +780,20 @@ class Broker:
             raise RuntimeError(f"endpoint {dst!r} unknown")
 
         fut = self._loop.create_future()
-        self.pending[corr_id]  = fut
-        self._inflight[corr_id] = (BROKER_NAME, dst)
+        self._calls[corr_id] = _Call(BROKER_NAME, dst, fut,
+                                     self._loop.time() + self._call_timeout)
         try:
             await self._send(target, protocol.pack_message(req, cap=self._frame_cap))
             return await asyncio.wait_for(fut, timeout=timeout)
         except Exception:
-            self.pending.pop(corr_id, None)
-            self._inflight.pop(corr_id, None)
+            self._calls.pop(corr_id, None)
             raise
 
-    def _resolve_pending(self, corr_id: str, resp: Dict[str, Any]) -> None:
-        fut = self.pending.pop(corr_id, None)
-        if fut is not None and not fut.done():
-            fut.set_result(resp)
+    @staticmethod
+    def _settle_call(call: Optional['_Call'], resp: Dict[str, Any]) -> None:
+        """Resolve a broker-originated call's future (no-op for forwarded)."""
+        if call is not None and call.future is not None and not call.future.done():
+            call.future.set_result(resp)
 
     # ── hosted-plugin host dispatch (across the thread boundary) ──────
 
@@ -780,11 +824,10 @@ class Broker:
                         body: Any = b'') -> Dict[str, Any]:
         """Invoke a broker-hosted plugin route across the thread boundary.
 
-        Gateway seam (pre-flip item 1): the HTTP catch-all proxies a
-        ``dst=='broker'`` request here instead of 404-ing on the routing-loop
-        registry.  Returns a ``{status, headers, body}`` dict (body is bytes),
-        the same passthrough shape :meth:`_dispatch_to_host` wraps into a wire
-        ``response``."""
+        Gateway seam: the HTTP catch-all proxies a ``dst=='broker'`` request
+        here instead of 404-ing on the routing-loop registry.  Returns a
+        ``{status, headers, body}`` dict (body is bytes), the same passthrough
+        shape :meth:`_dispatch_to_host` wraps into a wire ``response``."""
         if self._plugin_host is None:
             return {'status': 503, 'headers': {},
                     'body': json.dumps({"error": True,
@@ -817,17 +860,17 @@ class Broker:
                     'body': json.dumps({"error": True,
                                         "detail": str(e)}).encode()}
 
-    def _host_broadcast(self, topic: str, data: dict):
+    async def _host_broadcast(self, topic: str, data: dict) -> None:
         """``broadcast_fn`` handed to :class:`BrokerPluginHost`.
 
-        A hosted plugin's notification becomes a broker ``event`` fanned out on
-        the routing loop; topology pings just trigger a rebroadcast.  Runs on
-        the host loop, so the ingest is scheduled onto the routing loop.
+        Runs on the host loop and hands work to the routing loop: a hosted
+        plugin's ``notification`` becomes a broker ``event`` fanned out on the
+        routing loop; a ``topology`` change (a dynamically registered plugin)
+        triggers a full topology rebroadcast there.  ``ts``/``seq`` are left
+        unset — the event router assigns them on ingest.
         """
-        async def _noop() -> None:
-            return
         if self._loop is None:
-            return _noop()
+            return
         if topic == 'notification':
             raw = {
                 'kind':    'event',
@@ -836,13 +879,16 @@ class Broker:
                 'plugin':  data.get('plugin'),
                 'topic':   data.get('topic'),
                 'session': None,
-                'ts':      0.0,
-                'seq':     0,
                 'data':    data.get('data') or {},
             }
             self._loop.call_soon_threadsafe(
                 self._events.ingest, BROKER_NAME, raw)
-        return _noop()
+        elif topic == 'topology':
+            self._loop.call_soon_threadsafe(self._spawn_topology_broadcast)
+
+    def _spawn_topology_broadcast(self) -> None:
+        """Schedule a full topology rebroadcast on the routing loop."""
+        spawn(self._broadcast_topology(), 'broker_host_topology')
 
     # ── control ───────────────────────────────────────────────────────
 
@@ -874,9 +920,9 @@ class Broker:
     # ── liveness ──────────────────────────────────────────────────────
 
     async def _on_socket_drop(self, name: str, ws, clean: bool = False) -> None:
-        """Teardown guard (M0 lesson #2): a replaced socket's handler fires its
-        ``finally`` after resume installed the new socket — proceed only if
-        this socket is still the live one."""
+        """Teardown guard: a replaced socket's handler fires its ``finally``
+        after resume installed the new socket — proceed only if this socket is
+        still the live one."""
         if self.registry.get(name) is not ws:
             log.debug("[Broker] stale socket drop for %s ignored (replaced)", name)
             return
@@ -913,46 +959,42 @@ class Broker:
         if self.registry.get(name) is not ws:
             return
 
-        # Loop-lag watchdog: if the routing loop was blind (stalled) we must
-        # not mass-declare lost on resumption — re-arm and log instead.
-        if self._clock() < self._suppress_until:
-            log.warning("[Broker] watchdog window: suppressing lost for %s", name)
-            self._arm_grace(name, ws)
-            return
-
         self._prof.prof('broker_lost', uid=name)
         self._remove_participant(name)
         await self._fail_inflight_for(name)
         await self._broadcast_topology()
 
     async def _fail_inflight_for(self, name: str) -> None:
-        """Fast-fail every inflight entry touching *name* (M0 lesson #1).
+        """Fast-fail every in-flight call touching *name*.
 
-        A ``dst==name`` entry becomes a synthesized 504: broker-owned entries
-        resolve their pending future, endpoint-owned entries get the 504 sent
-        to the requester.  A ``src==name`` entry (the requester itself is gone)
-        is simply dropped — its response would go nowhere.
+        A ``dst==name`` entry is fast-failed with a synthesized 504 (the future
+        resolves for a broker-originated call, the requester gets the 504 for a
+        forwarded one).  A ``src==name`` entry (the requester itself is gone) is
+        simply dropped — its response would go nowhere.
         """
-        for corr_id, (src, dst) in list(self._inflight.items()):
-            if dst == name:
-                self._inflight.pop(corr_id, None)
-                if src == BROKER_NAME:
-                    self._resolve_pending(corr_id, {
-                        'kind': 'response', 'status': 504,
-                        'src': name, 'dst': BROKER_NAME, 'corr_id': corr_id,
-                        'headers': {}, 'body': b'', 'is_binary': False,
-                        'reason': 'endpoint lost'})
-                else:
-                    target = self.registry.get(src)
-                    if target is not None:
-                        out = protocol.Response(
-                            src=name, dst=src, status=504,
-                            body=b'endpoint lost', corr_id=corr_id)
-                        await self._send(target, protocol.pack_message(
-                            out, cap=self._frame_cap))
-            elif src == name:
+        for corr_id, call in list(self._calls.items()):
+            if call.dst == name:
+                self._calls.pop(corr_id, None)
+                await self._fail_call(corr_id, call, 'endpoint lost')
+            elif call.src == name:
                 # Requester gone — the response would go nowhere; drop it.
-                self._inflight.pop(corr_id, None)
+                self._calls.pop(corr_id, None)
+
+    async def _fail_call(self, corr_id: str, call: '_Call', reason: str) -> None:
+        """Synthesize a 504 for *call*: resolve its future, or send it upstream."""
+        if call.future is not None:
+            self._settle_call(call, {
+                'kind': 'response', 'status': 504,
+                'src': call.dst, 'dst': BROKER_NAME, 'corr_id': corr_id,
+                'headers': {}, 'body': b'', 'reason': reason})
+        else:
+            target = self.registry.get(call.src)
+            if target is not None:
+                out = protocol.Response(
+                    src=call.dst, dst=call.src, status=504,
+                    body=reason.encode(), corr_id=corr_id)
+                await self._send(target, protocol.pack_message(
+                    out, cap=self._frame_cap))
 
     def _remove_participant(self, name: str) -> None:
         """Free name + resume_key + meta + delivery machinery (no broadcast)."""
@@ -963,28 +1005,26 @@ class Broker:
         self._cancel_grace(name)
         self._events.remove_endpoint(name)
 
-    # ── loop-lag watchdog ─────────────────────────────────────────────
+    # ── call reaper ───────────────────────────────────────────────────
 
-    async def _watchdog(self) -> None:
-        """Measure routing-loop drift; open a suppression window on a stall."""
-        last = self._clock()
+    async def _reap_calls(self) -> None:
+        """Evict in-flight calls past their deadline.
+
+        Bounds the forwarded side of the in-flight table: a responder that
+        simply never answers (a buggy plugin) would otherwise leak an entry
+        forever.  Broker-originated calls usually clear via their own
+        ``wait_for`` timeout; the deadline is the backstop for both.
+        """
         while self._started:
             try:
-                await asyncio.sleep(self._watchdog_interval)
+                await asyncio.sleep(self._reap_interval)
             except asyncio.CancelledError:
                 return
-            last = self._watchdog_check(last, self._clock())
-
-    def _watchdog_check(self, last: float, now: float) -> float:
-        """One drift sample (factored out so tests can drive it with a fake
-        clock).  A drift beyond the heartbeat budget opens the window during
-        which ``lost`` declarations become log-only re-arms."""
-        drift = (now - last) - self._watchdog_interval
-        if drift > self._ping_timeout:
-            self._suppress_until = now + self._ping_timeout + self._grace
-            log.warning("[Broker] routing-loop stall %.2fs — suppressing lost",
-                        drift)
-        return now
+            now = self._loop.time()
+            for corr_id, call in list(self._calls.items()):
+                if call.deadline <= now:
+                    self._calls.pop(corr_id, None)
+                    await self._fail_call(corr_id, call, 'call timed out')
 
     # ── topology ──────────────────────────────────────────────────────
 
@@ -1044,11 +1084,22 @@ class Broker:
                 participants[name] = lost
         self._host_topology_prev = curr
         try:
-            asyncio.run_coroutine_threadsafe(
+            cfut = asyncio.run_coroutine_threadsafe(
                 self._plugin_host.on_topology_change(participants),
                 self._host_loop)
         except Exception as e:
             log.debug("[Broker] host topology delivery failed: %s", e)
+            return
+
+        def _log_delivery(f: 'concurrent.futures.Future') -> None:
+            if f.cancelled():
+                return
+            exc = f.exception()
+            if exc is not None:
+                log.error("[Broker] host topology delivery failed: %r", exc,
+                          exc_info=exc)
+
+        cfut.add_done_callback(_log_delivery)
 
     # ── low-level helpers ─────────────────────────────────────────────
 
@@ -1083,6 +1134,9 @@ class Broker:
             return '/'
         if path.startswith(prefix + '/'):
             return path[len(prefix):]
+        if path.startswith(prefix + '?'):
+            # '/broker?foo=bar' -> '/?foo=bar' (bare prefix + query string).
+            return '/' + path[len(prefix):]
         return path
 
     @staticmethod

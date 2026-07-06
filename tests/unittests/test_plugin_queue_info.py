@@ -180,14 +180,14 @@ def test_plugin_queue_info_initialization(mock_factory):
 @patch('radical.orbit.plugin_queue_info.make_queue_info')
 def test_plugin_queue_info_custom_name_and_conf(mock_factory):
     '''
-    Test PluginQueueInfo with custom name and backend config (slurm_conf
-    alias is the legacy kwarg).
+    Test PluginQueueInfo with custom name and backend config.
     '''
     mock_backend = Mock()
     mock_factory.return_value = mock_backend
 
     app = FastAPI()
-    plugin = PluginQueueInfo(app, instance_name="custom_queue", slurm_conf="/custom/slurm.conf")
+    plugin = PluginQueueInfo(app, instance_name="custom_queue",
+                             backend_conf="/custom/slurm.conf")
 
     assert plugin._instance_name == "custom_queue"
     # Backend is created with the conf path forwarded as conf_path
@@ -349,11 +349,11 @@ async def test_plugin_queue_info_unknown_session_error(mock_factory):
 
 
 # ---------------------------------------------------------------------------
-# QueueInfoSession.cancel_job (Tier 2)
+# QueueInfoSession.cancel_job
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-@patch('radical.orbit.batch_system_slurm.subprocess.run')
+@patch('subprocess.run')
 async def test_queue_info_session_cancel_job_success(mock_run):
     """cancel_job dispatches to the active batch system (SLURM here)."""
     from radical.orbit import batch_system as _bs
@@ -373,7 +373,7 @@ async def test_queue_info_session_cancel_job_success(mock_run):
 
 
 @pytest.mark.asyncio
-@patch('radical.orbit.batch_system_slurm.subprocess.run')
+@patch('subprocess.run')
 async def test_queue_info_session_cancel_job_failure(mock_run):
     """cancel_job raises HTTPException on scheduler failure."""
     from fastapi import HTTPException
@@ -403,7 +403,7 @@ async def test_queue_info_session_list_all_jobs():
 
 
 # ---------------------------------------------------------------------------
-# QueueInfoClient — session-less HTTP wrappers (Tier 1)
+# QueueInfoClient — session-less HTTP wrappers
 # ---------------------------------------------------------------------------
 
 def _make_queue_info_client(json_resp, status_code=200):

@@ -157,22 +157,3 @@ def ui_config_to_dict(config: Union[Dict, UIConfig, None]) -> Dict[str, Any]:
         return config
 
     return config.model_dump(exclude_none=True)
-
-
-def validate_ui_config(config: Union[Dict, UIConfig, None]) -> UIConfig:
-    """
-    Validate and normalize a UI config.
-
-    Accepts dict (for backward compat) or UIConfig instance.
-    Returns a validated UIConfig.
-    """
-    if config is None:
-        return UIConfig(title="Plugin")
-
-    if isinstance(config, UIConfig):
-        return config
-
-    if isinstance(config, dict):
-        return UIConfig(**config)
-
-    raise ValueError(f"Invalid ui_config type: {type(config)}")

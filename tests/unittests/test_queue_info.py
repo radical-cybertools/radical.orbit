@@ -9,10 +9,12 @@ import pytest
 
 from unittest.mock import patch, Mock, MagicMock
 
-from radical.orbit.queue_info import (QueueInfo, QueueInfoSlurm,
-                                     _unwrap, _parse_gpus,
-                                     _UNAVAIL_STATES)
-from radical.orbit.plugin_queue_info import _parse_slurm_time, PluginQueueInfo
+from radical.orbit.queue_info import QueueInfo
+from radical.orbit.queue_info_slurm import (QueueInfoSlurm,
+                                            _unwrap, _parse_gpus,
+                                            _UNAVAIL_STATES)
+from radical.orbit.batch_system_slurm import _parse_slurm_time
+from radical.orbit.plugin_queue_info import PluginQueueInfo
 
 FIXTURES = os.path.join(os.path.dirname(__file__), '..', 'fixtures', 'slurm')
 
@@ -192,14 +194,6 @@ class TestQueueInfoSlurmInit:
         assert qi._env['SLURM_CONF'] == '/custom/path/slurm.conf'
         assert len(qi._env) > 1
 
-    @patch('subprocess.run')
-    def test_run_returns_stdout(self, mock_run):
-        mock_run.return_value = Mock(stdout='test output', returncode=0)
-        qi     = QueueInfoSlurm()
-        result = qi._run(['echo', 'test'])
-        assert result == 'test output'
-        mock_run.assert_called_once()
-
 
 # ---- _collect_info tests ----------------------------------------------------
 
@@ -215,7 +209,7 @@ class TestCollectInfo:
 
         def side_effect(cmd, **kw):
             m = MagicMock()
-            m.check_returncode = MagicMock()
+            m.returncode = 0
             if cmd[0] == 'sinfo':
                 m.stdout = sinfo_stdout
             elif cmd[0] == 'scontrol':
@@ -246,7 +240,7 @@ class TestCollectInfo:
 
         def side_effect(cmd, **kw):
             m = MagicMock()
-            m.check_returncode = MagicMock()
+            m.returncode = 0
             if cmd[0] == 'sinfo':
                 m.stdout = sinfo_raw
             else:
@@ -270,6 +264,7 @@ class TestCollectInfo:
 
         def side_effect(cmd, **kw):
             m = Mock()
+            m.returncode = 0
             if cmd[0] == 'sinfo':
                 m.stdout = json.dumps(sinfo_output)
             elif cmd[0] == 'scontrol':
@@ -303,7 +298,7 @@ class TestCollectJobs:
 
         def side_effect(cmd, **kw):
             m = MagicMock()
-            m.check_returncode = MagicMock()
+            m.returncode = 0
             m.stdout = squeue_raw
             return m
 
@@ -331,7 +326,7 @@ class TestCollectJobs:
         def side_effect(cmd, **kw):
             calls.append(cmd)
             m = MagicMock()
-            m.check_returncode = MagicMock()
+            m.returncode = 0
             m.stdout = '{"jobs": []}'
             return m
 
@@ -385,7 +380,7 @@ class TestCollectAllocations:
 
         def side_effect(cmd, **kw):
             m = MagicMock()
-            m.check_returncode = MagicMock()
+            m.returncode = 0
             m.stdout = sacctmgr_raw
             return m
 
@@ -404,7 +399,7 @@ class TestCollectAllocations:
 
         def side_effect(cmd, **kw):
             m = MagicMock()
-            m.check_returncode = MagicMock()
+            m.returncode = 0
             m.stdout = parsable_raw
             return m
 
@@ -424,7 +419,7 @@ class TestCollectAllocations:
         def side_effect(cmd, **kw):
             call_count[0] += 1
             m = MagicMock()
-            m.check_returncode = MagicMock()
+            m.returncode = 0
 
             if '--json' in cmd:
                 raise RuntimeError('json not supported')
@@ -448,7 +443,7 @@ class TestCollectAllocations:
         def side_effect(cmd, **kw):
             calls.append(cmd)
             m = MagicMock()
-            m.check_returncode = MagicMock()
+            m.returncode = 0
             m.stdout = '{"associations": []}'
             return m
 
@@ -753,7 +748,7 @@ class TestGetJobAllocation:
              patch('subprocess.run',
                    return_value=Mock(returncode=1, stdout='',
                                      stderr='invalid job id')):
-            with pytest.raises(RuntimeError, match='squeue failed'):
+            with pytest.raises(RuntimeError, match='Cannot query runtime'):
                 plugin.get_job_allocation()
 
     def test_squeue_oserror_raises(self):

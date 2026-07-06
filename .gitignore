@@ -44,3 +44,8 @@ nosetests.xml
 # System
 .DS_Store
 Thumbs.db
+ve3/
+ve3b/
+*.pkl
+*.pem
+69e13a9.patch

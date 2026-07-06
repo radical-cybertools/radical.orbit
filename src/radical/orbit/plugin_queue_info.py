@@ -18,15 +18,22 @@ from .plugin_session_base import PluginSession
 from .plugin_base import Plugin
 from .client import PluginClient
 from .queue_info import make_queue_info, QueueInfo
-
-# Re-exported for tests / external callers that patch this name on the
-# plugin_queue_info module; the real class lives in queue_info_slurm.
-from .queue_info_slurm import QueueInfoSlurm   # noqa: F401
 from .batch_system import detect_batch_system
 
-# Re-exported for tests / external callers that imported this from the
-# old location. The real implementation lives in batch_system_slurm.
-from .batch_system_slurm import _parse_slurm_time   # noqa: F401
+
+def _uf(request: Request) -> tuple:
+    """Extract the (user, force) query params shared by the GET routes."""
+    user  = request.query_params.get('user')
+    force = request.query_params.get('force', '').lower() == 'true'
+    return user, force
+
+
+def _uf_params(user, force) -> dict:
+    """Build the {force, user?} query-param dict shared by the client calls."""
+    params = {'force': str(force).lower()}
+    if user:
+        params['user'] = user
+    return params
 
 
 class QueueInfoSession(PluginSession):
@@ -157,10 +164,7 @@ class QueueInfoClient(PluginClient):
         self._require_session()
 
         url = self._url(f"get_info/{self.sid}")
-        params = {"force": str(force).lower()}
-        if user:
-            params["user"] = user
-        resp = self._http.get(url, params=params)
+        resp = self._http.get(url, params=_uf_params(user, force))
         self._raise(resp)
         return resp.json()
 
@@ -181,10 +185,7 @@ class QueueInfoClient(PluginClient):
         self._require_session()
 
         url = self._url(f"list_jobs/{self.sid}/{queue}")
-        params = {"force": str(force).lower()}
-        if user:
-            params["user"] = user
-        resp = self._http.get(url, params=params)
+        resp = self._http.get(url, params=_uf_params(user, force))
         self._raise(resp)
         return resp.json()
 
@@ -202,10 +203,7 @@ class QueueInfoClient(PluginClient):
         self._require_session()
 
         url = self._url(f"list_all_jobs/{self.sid}")
-        params = {"force": str(force).lower()}
-        if user:
-            params["user"] = user
-        resp = self._http.get(url, params=params)
+        resp = self._http.get(url, params=_uf_params(user, force))
         self._raise(resp)
         return resp.json()
 
@@ -223,14 +221,9 @@ class QueueInfoClient(PluginClient):
         self._require_session()
 
         url = self._url(f"list_allocations/{self.sid}")
-        params = {"force": str(force).lower()}
-        if user:
-            params["user"] = user
-        resp = self._http.get(url, params=params)
+        resp = self._http.get(url, params=_uf_params(user, force))
         self._raise(resp)
         return resp.json()
-
-
 
     def job_allocation(self) -> 'dict | None':
         """Return endpoint job allocation info, or None if not inside a batch job.
@@ -311,7 +304,7 @@ class PluginQueueInfo(Plugin):
     }
 
     def __init__(self, app: FastAPI, instance_name='queue_info',
-                 backend_conf=None, slurm_conf=None):
+                 backend_conf=None):
         """
         Initialize the QueueInfo plugin.
 
@@ -322,15 +315,11 @@ class PluginQueueInfo(Plugin):
             backend_conf (str): Optional path to a scheduler config file
                 (e.g. slurm.conf). Forwarded to the backend; only the SLURM
                 backend uses it today.
-            slurm_conf (str): Deprecated alias for ``backend_conf``.
         """
         super().__init__(app, instance_name)
 
-        # Back-compat: prefer backend_conf when both are given.
-        conf = backend_conf if backend_conf is not None else slurm_conf
-
         # Create shared backend for all sessions
-        self._backend = make_queue_info(conf_path=conf)
+        self._backend = make_queue_info(conf_path=backend_conf)
 
         # Start background prefetch to populate cache
         self._backend.start_prefetch()
@@ -422,41 +411,33 @@ class PluginQueueInfo(Plugin):
 
     async def get_info(self, request: Request) -> dict:
         """Return queue/partition information."""
-        data = request.path_params
-        sid = data['sid']
-        user = request.query_params.get('user')
-        force = request.query_params.get('force', '').lower() == 'true'
+        sid = request.path_params['sid']
+        user, force = _uf(request)
 
         return await self._forward(sid, QueueInfoSession.get_info,
                                    user=user, force=force)
 
     async def list_jobs(self, request: Request) -> dict:
         """List jobs in a specified queue/partition."""
-        data = request.path_params
-        sid = data['sid']
-        queue = data['queue']
-        user = request.query_params.get('user')
-        force = request.query_params.get('force', '').lower() == 'true'
+        sid   = request.path_params['sid']
+        queue = request.path_params['queue']
+        user, force = _uf(request)
 
         return await self._forward(sid, QueueInfoSession.list_jobs,
                                    queue, user=user, force=force)
 
     async def list_all_jobs(self, request: Request) -> dict:
         """List all jobs for the user across all partitions."""
-        data  = request.path_params
-        sid   = data['sid']
-        user  = request.query_params.get('user')
-        force = request.query_params.get('force', '').lower() == 'true'
+        sid = request.path_params['sid']
+        user, force = _uf(request)
 
         return await self._forward(sid, QueueInfoSession.list_all_jobs,
                                    user=user, force=force)
 
     async def list_allocations(self, request: Request) -> dict:
         """List allocations/projects."""
-        data = request.path_params
-        sid = data['sid']
-        user = request.query_params.get('user')
-        force = request.query_params.get('force', '').lower() == 'true'
+        sid = request.path_params['sid']
+        user, force = _uf(request)
 
         return await self._forward(sid, QueueInfoSession.list_allocations,
                                    user=user, force=force)

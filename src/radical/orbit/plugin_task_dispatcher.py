@@ -1,39 +1,34 @@
 '''
 Task dispatcher plugin — elastic multi-pool task routing for radical.orbit.
 
-Hosts one :class:`PoolState` per pool declared in ``pools.json``.  Each
-``PoolState`` owns:
-- a pluggable :class:`DispatchStrategy` instance
-- a pilot lendpointr and pending task queue (append-only JSONL logs)
-- a shared-FS scratch area
-- an arrivals ring buffer and pilot-lag history
+Hosts one :class:`PoolState` per pool.  Each ``PoolState`` owns a
+:class:`~radical.orbit.task_dispatcher_strategy_conservative.ConservativePolicy`,
+a pilot ledger + pending task queue (one atomic ``state.json``), and a
+shared-FS scratch area.
 
 The dispatcher is a **broker-hosted plugin**: it runs on the broker's
-plugin-host loop and reaches endpoints through the in-process broker caller
-(``BrokerCaller.call_threadsafe``, awaited via ``asyncio.wrap_future`` on the
-host loop) — never a loopback HTTP client.  Pilots are submitted via
-``plugin_psij.submit_tunneled`` on a login-node endpoint.  When the pilot's
-child endpoint registers with the broker, its appearance in the rich topology
-(``on_topology_change``) is the dispatcher's signal that the pilot is ACTIVE —
-capacity is taken from the pool's pilot-size config.  Tasks then flow via
-``rhapsody.submit_tasks`` on the child endpoint; completion arrives as broker
-``event`` frames on the raw event tap.
+plugin-host loop and reaches endpoints through the in-process broker caller.
+Child plugin clients (``PSIJClient`` / ``RhapsodyClient``) are ordinary sync
+clients whose transport is a blocking caller shim (:class:`_CallerSyncHTTP`);
+the dispatcher drives their sync methods via ``asyncio.to_thread`` so the host
+loop is never blocked.  Pilots are submitted via ``plugin_psij.submit_tunneled``
+on a login-node endpoint.  When the pilot's child endpoint registers with the
+broker, its appearance in the rich topology (``on_topology_change``) is the
+dispatcher's signal that the pilot is ACTIVE — capacity is taken from the
+pool's pilot-size config.  Tasks then flow via ``rhapsody.submit_tasks`` on the
+child endpoint; completion arrives as broker ``event`` frames on the raw tap.
 
 Pools are strictly per-session: keyed ``(owning_sid, pool_name)``, pool names
 are session-local, and there is no cross-session attach.  A pool's pilots
 follow the owning session's lifetime — session close (owner ``lost`` +
 reclaim-drain, ttl expiry, or explicit ``cancel_all``) tears the pools down.
-
-See:
-- ``plans/task_dispatcher_design.md`` for the architecture
-- ``plans/task_dispatcher_makeflow.md`` for the implementation plan
+Pools arrive only via ``register_session``.
 '''
 
 from __future__ import annotations
 
 import asyncio
 import base64
-import json
 import logging
 import os
 import shutil
@@ -54,15 +49,14 @@ from .task_dispatcher_config            import (
     default_pool_config, parse_pools,
 )
 from .task_dispatcher_state             import (
-    PilotRecord, TaskRecord, EndpointModeRecord, StateLog,
+    PilotRecord, TaskRecord, PoolStore,
+    records_from, read_json, write_json_atomic,
     PILOT_PENDING, PILOT_STARTING, PILOT_ACTIVE,
     PILOT_DONE, PILOT_FAILED, PILOT_LIVE_STATES,
     TASK_QUEUED, TASK_RUNNING, TASK_DONE, TASK_FAILED, TASK_CANCELED,
     TASK_TERMINAL_STATES,
 )
-from .task_dispatcher_strategy          import (
-    DispatchStrategy, StrategyContext, load_strategy,
-)
+from .task_dispatcher_strategy_conservative import ConservativePolicy
 
 log = logging.getLogger('radical.orbit')
 
@@ -76,37 +70,59 @@ _DEFAULT_STATE_ROOT  = Path('~/.radical/orbit/task_dispatcher/state'
 _DEFAULT_SCRATCH_ROOT = Path('~/.radical/orbit/task_dispatcher/scratch'
                              ).expanduser()
 
-# State-directory pruning: directories whose mtime is older than this
-# threshold AND whose pool is no longer in self._pool_states get
-# deleted by the background sweeper (memory/project_broker_dispatcher.md
-# Phase 5).
+# State-directory pruning: a pool directory not backing an active pool AND
+# older than this threshold is removed by the housekeeping tick.
 _STATE_PRUNE_DAYS    = 30
 _PRUNE_INTERVAL_SEC  = 86400.0   # stale-dir pruning: once a day
 
-# Log compaction (C6): snapshot a pool's append-only logs when they
-# accrue _COMPACT_MAX_APPENDS records since the last snapshot, OR when
-# any uncompacted records have lingered _COMPACT_MAX_AGE_SEC.  Checked
-# every _COMPACT_INTERVAL_SEC so the age trigger can be tighter than the
-# daily stale-dir prune.
-_COMPACT_INTERVAL_SEC = 300.0    # check for due compactions every 5 min
-_COMPACT_MAX_APPENDS  = 1000     # size trigger
-_COMPACT_MAX_AGE_SEC  = 3600.0   # age trigger: don't let a tail linger >1h
-
-# Tick frequency for strategy.on_tick loops
+# Housekeeping tick frequency.
 _TICK_INTERVAL_SEC = 5.0
 
-# Sliding arrivals window — keep last N entries per pool
-_ARRIVALS_BUFFER_MAX = 1024
-_LAG_HISTORY_MAX     = 64
+# Handshake timeout — a pilot that hasn't handshaken in this long is
+# reconciled against psij job state.
+_HANDSHAKE_TIMEOUT_SEC = 300.0
 
-# Handshake timeout — if a pilot hasn't handshaken in this long we
-# reconcile against psij job state.
-_HANDSHAKE_TIMEOUT_SEC = 300.0  # 5 min, adjusted per observed lag history
 
-# Cached-state behavior on resubmit (design doc §5.1)
-#   DONE              → return cached (crash-recovery)
-#   FAILED/CANCELED   → overwrite, re-execute (Makeflow retry)
-#   RUNNING/QUEUED    → attach to existing wait (wrapper reconnect)
+# ---------------------------------------------------------------------------
+# Transport: sync child-plugin clients over the broker caller
+# ---------------------------------------------------------------------------
+
+class _CallerSyncHTTP:
+    '''Blocking transport over the broker's in-process caller.
+
+    Installed as a child plugin client's ``self._http`` in the broker-hosted
+    dispatcher.  Each verb routes over ``caller.call_threadsafe`` and blocks on
+    the returned future's ``.result()`` — safe because the dispatcher drives
+    every client method through ``asyncio.to_thread``, so the blocking happens
+    on a worker thread and the host loop is never held.  Responses are wrapped
+    in :class:`~radical.orbit.runtime_client.RuntimeResponse`, so the same
+    ``_raise`` / parsers every other transport uses apply unchanged.
+    '''
+
+    def __init__(self, caller, dst: str, timeout: float | None = None) -> None:
+        self._caller  = caller
+        self._dst     = dst
+        self._timeout = timeout
+
+    def request(self, method: str, url: str, *, json=None, content=None,
+                data=None, params=None, headers=None, **_kw):
+        from .runtime_client import (
+            _pack_request, unpack_response_dict, RuntimeResponse)
+        path, body, hdrs = _pack_request(
+            method, url, json=json, content=content, data=data,
+            params=params, headers=headers)
+        fut  = self._caller.call_threadsafe(
+            self._dst, method, path, body=body, headers=hdrs,
+            timeout=self._timeout)
+        resp = fut.result(self._timeout)
+        status, rhdrs, rbody = unpack_response_dict(resp)
+        return RuntimeResponse(status, rhdrs, rbody)
+
+    def get(self, url: str, **kw):
+        return self.request('GET', url, **kw)
+
+    def post(self, url: str, **kw):
+        return self.request('POST', url, **kw)
 
 
 # ---------------------------------------------------------------------------
@@ -116,13 +132,12 @@ _HANDSHAKE_TIMEOUT_SEC = 300.0  # 5 min, adjusted per observed lag history
 class PoolState:
     '''Plugin-level runtime state for one pool.
 
-    Distinct from :class:`PoolConfig`, which is the static declaration
-    loaded from disk.  :class:`PoolState` holds the live fleet, pending
-    queue, and strategy instance.
+    Distinct from :class:`PoolConfig`, which is the static declaration.
+    :class:`PoolState` holds the live fleet, pending queue, and policy
+    instance, and persists everything to one atomic ``state.json``.
 
-    Concurrency model: all mutations happen from the plugin's asyncio
-    event loop thread.  The strategy is called *only* from that thread
-    (callbacks and tick), so no in-strategy locking is needed.
+    Concurrency model: all mutations happen from the plugin's asyncio event
+    loop thread, so no in-state locking is needed.
     '''
 
     def __init__(self, config: PoolConfig, state_dir: Path,
@@ -138,153 +153,46 @@ class PoolState:
         state_dir.mkdir(parents=True, exist_ok=True)
         scratch_base.mkdir(parents=True, exist_ok=True)
 
-        self.pilot_log = StateLog(state_dir / 'pilot.log',
-                                  PilotRecord, 'pid')
-        self.task_log  = StateLog(state_dir / 'task.log',
-                                  TaskRecord,  'task_id')
+        # Single atomic per-pool store: config + pilots + tasks.
+        self.store = PoolStore(state_dir / 'state.json')
+        payload = self.store.load()
+        self.pilots: dict[str, PilotRecord] = records_from(
+            payload.get('pilots'), PilotRecord)
+        self.tasks:  dict[str, TaskRecord]  = records_from(
+            payload.get('tasks'), TaskRecord)
 
-        # Replay on startup.  Orphan-pilot reconciliation happens
-        # lazily in _reconcile_pilot when a psij status is queried.
-        self.pilots: dict[str, PilotRecord] = self.pilot_log.replay()
-        self.tasks:  dict[str, TaskRecord]  = self.task_log.replay()
+        # The dispatcher's one policy (no ABC, no pluggable loader).
+        self.policy = ConservativePolicy(config, config.strategy_config)
 
-        self.arrivals:      list[float] = []
-        self.lag_history:   list[float] = []
-
-        # Strategy instantiated last so it can see replayed state
-        self.strategy: DispatchStrategy = load_strategy(
-            config.strategy, config, config.strategy_config)
-
-        # Build StrategyContext once and reuse
-        self.ctx = StrategyContext(
-            config,
-            now_fn               = time.time,
-            pending_queue_fn     = self._pending_queue_snapshot,
-            pilots_fn            = self._pilots_snapshot,
-            arrivals_window_fn   = self._arrivals_window,
-            pilot_lag_history_fn = lambda: list(self.lag_history),
-            submit_pilot_fn      = self._strategy_submit_pilot,
-            cancel_pilot_fn      = self._strategy_cancel_pilot,
-            drain_pilot_fn       = self._strategy_drain_pilot,
-            logger               = log,
-        )
-
-    # -- snapshots for StrategyContext ------------------------------------
-
-    def _pending_queue_snapshot(self) -> list[TaskRecord]:
+    def pending_queue(self) -> list[TaskRecord]:
         '''Return pending tasks for this pool, priority-ordered.
 
-        The dispatcher sorts here so every strategy sees the same
-        canonical ordering unless it chooses to reorder.
+        The dispatcher sorts here so the policy sees one canonical ordering.
         '''
         pending = [t for t in self.tasks.values()
                    if t.state == TASK_QUEUED]
         pending.sort(key=lambda t: (-t.priority, t.arrival_ts))
         return pending
 
-    def _pilots_snapshot(self) -> list[PilotRecord]:
+    def live_pilots(self) -> list[PilotRecord]:
         '''Return live (non-terminal) pilots in this pool.'''
         return [p for p in self.pilots.values()
                 if p.state in PILOT_LIVE_STATES]
 
-    def _arrivals_window(self, seconds: float) -> list[float]:
-        '''Arrival timestamps within *seconds* of now.'''
-        cutoff = time.time() - seconds
-        return [ts for ts in self.arrivals if ts >= cutoff]
-
-    # -- strategy action hooks (called from strategy code) ----------------
-
-    def _strategy_submit_pilot(self, size_key: str | None) -> str:
-        '''Implements ``ctx.submit_pilot``: register a pilot and schedule
-        its psij submission.  Returns the dispatcher-local pilot id.
-        '''
-        size_key = size_key or self.config.default_size
-        if size_key not in self.config.pilot_sizes:
-            raise KeyError(
-                f"pool {self.config.name}: unknown pilot_size "
-                f"{size_key!r} (available: "
-                f"{sorted(self.config.pilot_sizes)})")
-
-        size   = self.config.pilot_sizes[size_key]
-        pid    = f'p.{uuid.uuid4().hex[:10]}'
-        record = PilotRecord(
-            pid              = pid,
-            pool             = self.config.name,
-            owning_sid       = self.owning_sid,
-            size_key         = size_key,
-            rhapsody_backend = size.rhapsody_backend,
-            state            = PILOT_PENDING,
-            submitted_at     = time.time(),
-            walltime_deadline= time.time() + size.walltime_sec,
-        )
-        self.pilots[pid] = record
-        self.pilot_log.append(record)
-
-        # Schedule the actual submission asynchronously
-        self._plugin._schedule_pilot_submit(self, record, size)
-
-        self._plugin._dispatch_notify('autoscale_decision', {
-            'pool'    : self.config.name,
-            'action'  : 'submit_pilot',
-            'pilot_id': pid,
-            'size_key': size_key,
-        })
-
-        return pid
-
-    def _strategy_cancel_pilot(self, pid: str) -> None:
-        record = self.pilots.get(pid)
-        if not record:
-            return
-        self._plugin._schedule_pilot_cancel(self, record)
-
-    def _strategy_drain_pilot(self, pid: str) -> None:
-        record = self.pilots.get(pid)
-        if not record:
-            return
-        record.accepting_new_tasks = False
-        self.pilot_log.append(record)
-
-    # -- housekeeping -----------------------------------------------------
-
-    def record_arrival(self, ts: float) -> None:
-        self.arrivals.append(ts)
-        if len(self.arrivals) > _ARRIVALS_BUFFER_MAX:
-            # cheap trim: drop the oldest half when we overflow
-            self.arrivals = self.arrivals[-(_ARRIVALS_BUFFER_MAX // 2):]
-
-    def record_pilot_lag(self, seconds: float) -> None:
-        self.lag_history.append(seconds)
-        if len(self.lag_history) > _LAG_HISTORY_MAX:
-            self.lag_history = self.lag_history[-_LAG_HISTORY_MAX:]
-
     def task_scratch_dir(self, task_id: str) -> Path:
-        '''Shared-FS scratch dir for one task.'''
+        '''Return (creating it) the shared-FS scratch dir for one task.'''
         d = self.scratch_base / task_id
         d.mkdir(parents=True, exist_ok=True)
         return d
 
-    def compact_logs(self) -> None:
-        '''Snapshot pilot/task logs that are due for compaction (C6).
-
-        Called from the plugin's compaction sweeper on the event-loop
-        thread, so it is serialised with appends — the snapshot captures
-        the current in-memory map and truncates the log atomically with
-        respect to writers.
-        '''
-        if self.pilot_log.needs_compaction(
-                max_appends=_COMPACT_MAX_APPENDS,
-                max_age_sec=_COMPACT_MAX_AGE_SEC):
-            self.pilot_log.snapshot(self.pilots)
-        if self.task_log.needs_compaction(
-                max_appends=_COMPACT_MAX_APPENDS,
-                max_age_sec=_COMPACT_MAX_AGE_SEC):
-            self.task_log.snapshot(self.tasks)
+    def persist(self) -> None:
+        '''Rewrite this pool's ``state.json`` atomically.'''
+        self.store.save(self.owning_sid, asdict(self.config),
+                        self.pilots, self.tasks)
 
     def close(self) -> None:
-        '''Release the logs' persistent file handles.'''
-        self.pilot_log.close()
-        self.task_log.close()
+        '''Release per-pool resources.  No-op (the store holds no handles).'''
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +211,7 @@ class TaskDispatcherSession(PluginSession):
     '''
 
     async def close(self) -> dict:
+        '''Tear down this session's pools, then run the base close.'''
         if self._plugin is not None:
             await self._plugin._teardown_session_pools(self._sid)
         return await super().close()
@@ -319,10 +228,9 @@ class TaskDispatcherClient(PluginClient):
                          **_kwargs: Any) -> None:
         '''Register a session, optionally declaring per-workflow pools.
 
-        *pools* may be a list of pool-config dicts (matches the
-        ``pools.json`` ``pools`` field) or a dict containing a
-        ``pools`` key.  None registers without declaring pools, which
-        causes the dispatcher to auto-materialise its built-in
+        *pools* may be a list of pool-config dicts or a dict containing a
+        ``pools`` key.  ``None`` registers without declaring pools, which
+        causes the dispatcher to auto-materialise this session's built-in
         ``default`` pool (idempotent across sessions).
         '''
         body: dict = {}
@@ -339,7 +247,7 @@ class TaskDispatcherClient(PluginClient):
         return resp.json()
 
     def fleet(self) -> dict:
-        '''Snapshot of the fleet across all pools (requires session).'''
+        '''Return a snapshot of the fleet across all pools (requires session).'''
         self._require_session()
         resp = self._http.get(self._url(f'fleet/{self.sid}'))
         self._raise(resp)
@@ -407,10 +315,8 @@ class TaskDispatcherClient(PluginClient):
                  content: bytes, overwrite: bool = False) -> dict:
         '''Upload one file into a task's scratch dir.  Returns ``{cwd, size}``.
 
-        NOTE: v1 uses a single base64-in-JSON body per file — radical.orbit's
-        broker forwards JSON over WebSocket, so multipart is not available.
-        Bulk-transfer optimization (tar-stream / dedicated binary staging
-        plugin) is deferred; see design doc §6.4.
+        v1 uses a single base64-in-JSON body per file; bulk-transfer
+        optimisation is deferred.
         '''
         self._require_session()
         payload = {
@@ -439,7 +345,7 @@ class TaskDispatcherClient(PluginClient):
 # ---------------------------------------------------------------------------
 
 class PluginTaskDispatcher(Plugin):
-    '''Endpoint-side task dispatcher with pluggable autoscaling and routing.'''
+    '''Broker-hosted task dispatcher: elastic pilot pools + conservative policy.'''
 
     plugin_name   = 'task_dispatcher'
     session_class = TaskDispatcherSession
@@ -449,19 +355,16 @@ class PluginTaskDispatcher(Plugin):
     ui_config = {
         'icon'          : '📦',
         'title'         : 'Task Dispatcher',
-        'description'   : 'Pluggable autoscaling task dispatcher: pools, pilots, strategies.',
+        'description'   : 'Elastic autoscaling task dispatcher: pools, pilots.',
         'refresh_button': True,
     }
 
     @classmethod
     def is_enabled(cls, app: FastAPI) -> bool:
-        '''Broker hosts only.
+        '''Return whether to load: broker hosts only.
 
-        The dispatcher is a broker-side plugin: it owns the global
-        pool/pilot/task state, observes topology events directly, and
-        proxies psij calls out to login-node endpoints that submit batch
-        jobs.  Running it on an endpoint would put it in the wrong half of
-        the architecture — see ``memory/project_broker_dispatcher.md``.
+        The dispatcher owns the global pool/pilot/task state, observes topology
+        events directly, and proxies psij calls out to login-node endpoints.
         '''
         from .utils import host_role
         return host_role(app)['role'] == 'broker'
@@ -475,64 +378,54 @@ class PluginTaskDispatcher(Plugin):
         self._state_root   = Path(state_root   or _DEFAULT_STATE_ROOT)
         self._scratch_root = Path(scratch_root or _DEFAULT_SCRATCH_ROOT)
 
-        # Broker seam (the dispatcher is broker-hosted only): the in-process
-        # caller handle and the raw event tap, injected by BrokerPluginHost.
-        # When these are absent (None) the dispatcher refuses any endpoint call
-        # cleanly (see _call).
+        # Broker seam (broker-hosted only): the in-process caller handle and
+        # the raw event tap, injected by BrokerPluginHost.  When absent the
+        # dispatcher refuses endpoint calls cleanly (child clients return None).
         self._broker_caller = getattr(app.state, 'broker_caller', None)
         self._broker_tap    = getattr(app.state, 'broker_tap', None)
         self._untap         = None
 
-        # Cached child-endpoint plugin clients (real PSIJClient/RhapsodyClient
-        # wired to the broker caller), keyed (dst, plugin, backend); each holds
-        # its registered session id.  Invalidated for a dst when it goes
-        # ``lost``.
+        # Cached child-endpoint plugin clients (sync PSIJClient/RhapsodyClient
+        # over the caller), keyed (dst, plugin, backend).  Invalidated for a
+        # dst when it goes ``lost``.
         self._child_clients: dict[tuple, Any] = {}
 
-        # Map of endpoint_name → set of loaded plugin names, refreshed on
-        # every topology change.  Used to (a) auto-resolve a pool's
-        # endpoint_name when it's None, and (b) validate the target of an
-        # endpoint-mode task submission.
+        # endpoint_name → set of loaded plugin names, refreshed on every
+        # topology change.  Used to auto-resolve a pool's endpoint_name and to
+        # validate the target of an endpoint-mode task submission.
         self._connected_endpoints: dict[str, set[str]] = {}
 
-        # Endpoint-mode task tracking: task_id → target_endpoint_name.  Endpoint
-        # mode bypasses pool state — the dispatcher is a transparent proxy to
-        # the target endpoint's rhapsody (plugin-global, session-less).  Backed
-        # by a small on-disk ledger (C4) so an in-flight endpoint-mode task
-        # survives a broker restart; terminal records are filtered out on
-        # replay so only live entries seed the dict.
-        self._endpoint_mode_log = StateLog(
-            self._state_root / 'endpoint_mode.log', EndpointModeRecord, 'task_id')
-        self._endpoint_mode_tasks: dict[str, str] = {
-            rec.task_id: rec.endpoint
-            for rec in self._endpoint_mode_log.replay().values()
-            if not rec.is_terminal()
-        }
+        # Endpoint-mode task tracking: task_id → target_endpoint_name.
+        # Endpoint mode bypasses pool state — the dispatcher is a transparent
+        # proxy to the target endpoint's rhapsody.  Backed by one atomic
+        # ``endpoint_mode.json`` so an in-flight task survives a broker restart.
+        self._endpoint_mode_path = self._state_root / 'endpoint_mode.json'
+        self._endpoint_mode_tasks: dict[str, str] = dict(
+            read_json(self._endpoint_mode_path, default={}) or {})
 
-        # Map rhapsody-task-uid → (owning_sid, pool_name, task_id) so the event
-        # tap can find the right TaskRecord when a pilot reports completion.
+        # rhapsody-task-uid → (owning_sid, pool_name, task_id) so the event tap
+        # can find the right TaskRecord when a pilot reports completion.
         self._uid_to_task: dict[str, tuple[str, str, str]] = {}
 
-        # Background loops (tick, handshake-timeout sweeper, state
-        # prune).  Loops don't actually run until _ensure_started is
-        # called from the first request handler — _main_loop stays None
-        # until then.
-        self._loops_started = False
-        self._loops_tasks: list[asyncio.Task] = []
-        self._main_loop: asyncio.AbstractEventLoop | None = None
+        # Single housekeeping loop; started once a running loop exists.
+        self._started = False
+        self._housekeeping_task: asyncio.Task | None = None
 
         # Pool state, keyed strictly per session: {owning_sid: {pool_name:
-        # PoolState}}.  Pool names are session-local; there is no cross-session
-        # attach.  Sessions declare pools via :meth:`register_session`.
+        # PoolState}}.  Sessions declare pools via :meth:`register_session`.
         self._pool_states: dict[str, dict[str, PoolState]] = {}
 
         # Restart-time replay: rebuild pool/pilot/task bookkeeping for ALL
-        # sessions from the sid-scoped durable store (built here, not lazy).
+        # sessions from the sid-scoped durable store.
         self._replay_state()
+
+        # Start the housekeeping loop + event tap if a loop is already running
+        # (the broker constructs hosted plugins on the running host loop).
+        self._maybe_start()
 
         # Routes
         self.add_route_get  ('pools',                         self._route_pools)
-        self.add_route_get  ('pool/{name}',                   self._route_pool_detail)
+        self.add_route_get  ('pool/{sid}/{name}',             self._route_pool_detail)
         self.add_route_get  ('fleet/{sid}',                   self._route_fleet)
         self.add_route_post ('submit/{sid}',                  self._route_submit)
         self.add_route_get  ('task/{sid}/{task_id}',          self._route_get_task)
@@ -545,7 +438,7 @@ class PluginTaskDispatcher(Plugin):
     # -- pool bookkeeping helpers ---------------------------------------
 
     def _pools_for(self, sid: str) -> dict[str, 'PoolState']:
-        '''This session's pools (created lazily; empty for a fresh sid).'''
+        '''Return this session's pools (empty for a fresh sid).'''
         return self._pool_states.setdefault(sid, {})
 
     def _all_pools(self):
@@ -555,17 +448,18 @@ class PluginTaskDispatcher(Plugin):
                 yield ps
 
     def _find_pool(self, sid: str, name: str) -> 'PoolState | None':
-        '''This session's pool by name, or ``None`` (strictly session-local).'''
+        '''Return this session's pool by name, or ``None`` (session-local).'''
         return self._pool_states.get(sid, {}).get(name)
 
     # -- materialisation ------------------------------------------------
 
     def _pool_dir(self, sid: str, cfg: PoolConfig) -> Path:
-        '''Sid-scoped, endpoint-tagged on-disk state directory for a pool.'''
+        '''Return the sid-scoped, endpoint-tagged on-disk state dir for a pool.'''
         endpoint_tag = cfg.endpoint_name or 'unbound'
         return self._state_root / sid / f'{cfg.name}__{endpoint_tag}'
 
     def _scratch_for(self, cfg: PoolConfig) -> Path:
+        '''Return the scratch base for *cfg*.'''
         return (Path(cfg.scratch_base).expanduser()
                 if cfg.scratch_base
                 else self._scratch_root / cfg.name)
@@ -576,8 +470,7 @@ class PluginTaskDispatcher(Plugin):
         Pools are strictly per-session (keyed ``(sid, cfg.name)``): a
         same-named pool in another session is a *distinct* pool.  Re-declaring
         a pool already present under this session returns the existing
-        :class:`PoolState` (idempotent reconnect) — there is no cross-session
-        attach and no config-compatibility check.
+        :class:`PoolState` (idempotent reconnect).
         '''
         if cfg.endpoint_name is None:
             picked = self._pick_endpoint_name()
@@ -596,54 +489,28 @@ class PluginTaskDispatcher(Plugin):
         ps = PoolState(cfg, state_dir, scratch_base, self, owning_sid=sid)
         pools[cfg.name] = ps
 
-        # Persist the config so restart-time replay can rebuild this pool
-        # (the append-only logs hold pilots/tasks, not the pool declaration).
-        self._write_pool_config(state_dir, sid, cfg)
+        # Persist immediately so restart-time replay can rebuild this pool.
+        ps.persist()
 
-        # Restart recovery (C4): rebuild the uid→task map from the replayed
-        # task log so a terminal event for a task that was RUNNING before the
-        # restart can still be correlated and advanced.
+        # Restart recovery: rebuild the uid→task map from the replayed task log
+        # so a terminal event for a task that was RUNNING before the restart
+        # can still be correlated and advanced.
         for rec in ps.tasks.values():
             if rec.state == TASK_RUNNING and rec.rhapsody_uid:
                 self._uid_to_task[rec.rhapsody_uid] = (sid, cfg.name, rec.task_id)
 
-        log.info('[%s] materialised pool %r (sid=%s) → endpoint %r '
-                 '(strategy=%s, sizes=%s)',
+        log.info('[%s] materialised pool %r (sid=%s) → endpoint %r (sizes=%s)',
                  self.instance_name, cfg.name, sid, cfg.endpoint_name,
-                 cfg.strategy, sorted(cfg.pilot_sizes))
-
-        # If the dispatcher is already running, kick off this pool's
-        # tick loop right away (otherwise _ensure_started will catch it).
-        if self._loops_started and self._main_loop \
-                and not self._main_loop.is_closed():
-            try:
-                self._loops_tasks.append(
-                    self._main_loop.create_task(self._tick_loop(ps)))
-            except RuntimeError:
-                pass   # loop not running (e.g. cross-request in TestClient)
+                 sorted(cfg.pilot_sizes))
         return ps
-
-    @staticmethod
-    def _write_pool_config(state_dir: Path, sid: str,
-                           cfg: PoolConfig) -> None:
-        '''Persist a pool's declaration next to its logs (``pool.json``).'''
-        try:
-            state_dir.mkdir(parents=True, exist_ok=True)
-            payload = {'owning_sid': sid, 'pool': asdict(cfg)}
-            (state_dir / 'pool.json').write_text(json.dumps(payload))
-        except OSError as e:
-            log.warning('task_dispatcher: could not persist pool config '
-                        'for %s: %s', cfg.name, e)
 
     def _replay_state(self) -> None:
         '''Rebuild pools for ALL sessions from the sid-scoped durable store.
 
-        Restart-time replay (built here, not lazy): scan
-        ``<state_root>/<sid>/<pool>__<endpoint>/pool.json``, reload each pool's
-        config, and re-materialise its :class:`PoolState` (which replays the
-        pilot/task logs).  Owner reconnection then reconciles naturally (M1
-        create-or-reconnect + M6 owner check); a pool whose owner never returns
-        is drained by the reclaim-drain / ttl path.
+        Scan ``<state_root>/<sid>/<pool>__<endpoint>/state.json``, reload each
+        pool's config, and re-materialise its :class:`PoolState` (which loads
+        the pilot/task maps).  Owner reconnection then reconciles naturally; a
+        pool whose owner never returns is drained by the reclaim / ttl path.
         '''
         if not self._state_root.exists():
             return
@@ -652,13 +519,18 @@ class PluginTaskDispatcher(Plugin):
                 continue
             sid = sid_dir.name
             for pool_dir in sorted(sid_dir.iterdir()):
-                cfg_path = pool_dir / 'pool.json'
+                cfg_path = pool_dir / 'state.json'
                 if not (pool_dir.is_dir() and cfg_path.is_file()):
                     continue
+                payload = read_json(cfg_path, default=None)
+                if not isinstance(payload, dict) or 'config' not in payload:
+                    continue
                 try:
-                    payload = json.loads(cfg_path.read_text())
-                    cfg = self._pool_config_from_dict(payload.get('pool', {}))
-                except (OSError, ValueError, KeyError, PoolConfigError) as e:
+                    cfg = self._pool_config_from_dict(payload['config'])
+                except (ValueError, KeyError, TypeError, AttributeError,
+                        PoolConfigError) as e:
+                    # A non-dict/malformed ``config`` (corrupt file, hand-edit)
+                    # must not abort replay of every other pool — skip this one.
                     log.warning('task_dispatcher: skipping unreadable pool '
                                 'config %s: %s', cfg_path, e)
                     continue
@@ -671,11 +543,10 @@ class PluginTaskDispatcher(Plugin):
         return next(iter(parsed.values()))
 
     def _pick_endpoint_name(self) -> str | None:
-        '''Auto-pick an endpoint_name when a pool was declared without one.
+        '''Auto-pick an endpoint_name for a pool declared without one.
 
-        Policy: lexically first connected endpoint that isn't us (the
-        broker endpoint).  Returns ``None`` if no eligible endpoint is
-        available; the caller decides whether to defer or fail.
+        Policy: lexically first connected endpoint that isn't us (the broker
+        endpoint).  Returns ``None`` when no eligible endpoint is available.
         '''
         self_endpoint = getattr(self._app.state, 'endpoint_name', None)
         candidates = sorted(e for e in self._connected_endpoints
@@ -684,170 +555,91 @@ class PluginTaskDispatcher(Plugin):
 
     # -- lifecycle ------------------------------------------------------
 
-    def _ensure_started(self) -> None:
-        '''Idempotent: start tick loops and the broker event-tap subscription.'''
-        if self._loops_started:
+    def _maybe_start(self) -> None:
+        '''Idempotently start the housekeeping loop + broker event-tap sub.
+
+        Started only when a loop is already running (the broker constructs
+        hosted plugins on the running host loop).  Unit tests without a loop
+        drive routes and callbacks directly.
+        '''
+        if self._started:
             return
-        self._loops_started = True
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            # No event loop yet; deferred to first request handler
-            self._loops_started = False
             return
+        self._started = True
+        self._housekeeping_task = loop.create_task(self._housekeeping())
 
-        self._main_loop = loop
-        for pool_state in self._all_pools():
-            self._loops_tasks.append(loop.create_task(
-                self._tick_loop(pool_state)))
-        self._loops_tasks.append(loop.create_task(
-            self._handshake_sweeper()))
-        self._loops_tasks.append(loop.create_task(
-            self._state_sweeper()))
-        self._loops_tasks.append(loop.create_task(
-            self._compaction_sweeper()))
-
-        # Subscribe to the broker's raw event tap for child-pilot task events
-        # (the old stack read these off the broker SSE stream).  The tap fires
-        # on the plugin-host loop — the dispatcher's own loop — so terminal
-        # handling runs inline with no cross-thread marshalling.
+        # Subscribe to the broker's raw event tap for child-pilot task events.
+        # The tap fires on the plugin-host loop — the dispatcher's own loop —
+        # so terminal handling runs inline with no cross-thread marshalling.
         if self._broker_tap is not None and self._untap is None:
             self._untap = self._broker_tap(self._on_event)
 
-    # ── transport: real plugin clients wired to the broker caller ─────────
+    async def _housekeeping(self) -> None:
+        '''One periodic loop: per-pool tick + drain, then handshake + prune.
 
-    def _caller_client(self, client_cls, plugin: str, dst: str):
-        '''Build a real plugin client whose async cores ride the broker caller.
-
-        The dispatcher drives psij/rhapsody through the very same
-        ``PSIJClient`` / ``RhapsodyClient`` helper code the user-thread clients
-        run — one implementation of paths, payload shapes, response parsing and
-        error mapping.  Only the transport seam differs:
-        :class:`~radical.orbit.runtime_client.CallerHTTP` awaits
-        ``call_threadsafe`` on the routing loop (via ``asyncio.wrap_future``)
-        so the host loop is never blocked, instead of a blocking HTTP call.  The
-        helper's base URL is the plugin namespace (``/{plugin}``) — the same
-        namespace-relative shape ``add_route_*`` registers.
+        Replaces the four separate sweeper loops.  Ticks every
+        ``_TICK_INTERVAL_SEC``; reconciles overdue pilot handshakes each tick;
+        prunes stale state dirs at most once per ``_PRUNE_INTERVAL_SEC``.
         '''
-        from .runtime_client import CallerHTTP
-        caller_http = CallerHTTP(self._broker_caller, dst)
-        client = client_cls(caller_http, f'/{plugin}',
-                            endpoint_id=dst, plugin_name=plugin)
-        client._async_http = caller_http   # route the a<method> cores here
-        return client
-
-    async def _tick_loop(self, pool_state: PoolState) -> None:
-        '''Periodic ``strategy.on_tick`` driver, per pool.'''
-        log.debug('[%s] tick loop started for pool %r',
-                  self.instance_name, pool_state.config.name)
-        while True:
-            try:
-                await asyncio.sleep(_TICK_INTERVAL_SEC)
-                pool_state.strategy.on_tick(pool_state.ctx)
-                self._drain_pending(pool_state)
-                self._apply_termination_policy(pool_state)
-            except asyncio.CancelledError:
-                return
-            except Exception as e:
-                log.exception('[%s] tick loop error in pool %r: %s',
-                              self.instance_name,
-                              pool_state.config.name, e)
-
-    async def _handshake_sweeper(self) -> None:
-        '''Reconcile pilots whose handshake is overdue.
-
-        Runs every tick.  For each PENDING/STARTING pilot older than the
-        effective timeout, queries psij for its job state and marks the
-        pilot FAILED if the job is terminal.
-        '''
+        last_prune = time.time()
         while True:
             try:
                 await asyncio.sleep(_TICK_INTERVAL_SEC)
                 now = time.time()
-                for pool_state in self._all_pools():
-                    for pilot in list(pool_state.pilots.values()):
-                        if pilot.state not in (PILOT_PENDING, PILOT_STARTING):
-                            continue
-                        timeout = self._effective_handshake_timeout(pool_state)
-                        if now - pilot.submitted_at < timeout:
-                            continue
-                        await self._reconcile_pilot(pool_state, pilot)
+                for ps in list(self._all_pools()):
+                    ps.policy.on_tick(ps, self._make_submit_pilot(ps))
+                    self._drain_pending(ps)
+                await self._reconcile_overdue_pilots(now)
+                if now - last_prune >= _PRUNE_INTERVAL_SEC:
+                    self._prune_stale_state_dirs()
+                    last_prune = now
             except asyncio.CancelledError:
                 return
             except Exception as e:
-                log.exception('[%s] handshake sweeper error: %s',
+                log.exception('[%s] housekeeping error: %s',
                               self.instance_name, e)
 
-    def _effective_handshake_timeout(self, pool_state: PoolState) -> float:
-        '''Observed lag-aware timeout for handshake arrival.'''
-        history = pool_state.lag_history
-        if not history:
-            return _HANDSHAKE_TIMEOUT_SEC
-        avg = sum(history) / len(history)
-        return max(_HANDSHAKE_TIMEOUT_SEC, 2 * avg)
+    async def shutdown(self) -> None:
+        '''Cancel the housekeeping loop and drop the event tap, then base close.'''
+        if self._housekeeping_task is not None \
+                and not self._housekeeping_task.done():
+            self._housekeeping_task.cancel()
+            try:    await self._housekeeping_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        if self._untap is not None:
+            try:    self._untap()
+            except Exception:
+                pass
+            self._untap = None
+        await super().shutdown()
 
-    async def _state_sweeper(self) -> None:
-        '''Prune state directories for pools no longer active.
+    async def _reconcile_overdue_pilots(self, now: float) -> None:
+        '''Reconcile PENDING/STARTING pilots overdue for a handshake.
 
-        Daily sweep: any subdir of ``self._state_root`` whose name is
-        not in the active pool set AND whose newest mtime is older
-        than ``_STATE_PRUNE_DAYS`` gets removed.  Workflow state for
-        terminated pools is kept for 30 days so post-mortem debugging
-        is possible; older state is dead weight.
+        For each such pilot older than ``_HANDSHAKE_TIMEOUT_SEC``, query psij
+        for its job state and mark it FAILED if the job is terminal.
         '''
-        # First sweep shortly after startup so a restart with stale
-        # state on disk doesn't wait a full day to clean up.
-        await asyncio.sleep(60.0)
-        while True:
-            try:
-                self._prune_stale_state_dirs()
-            except asyncio.CancelledError:
-                return
-            except Exception as e:
-                log.exception('[%s] state sweeper error: %s',
-                              self.instance_name, e)
-            try:
-                await asyncio.sleep(_PRUNE_INTERVAL_SEC)
-            except asyncio.CancelledError:
-                return
-
-    async def _compaction_sweeper(self) -> None:
-        '''Periodically snapshot append-only logs that are due (C6).
-
-        Runs on the event loop, so per-log compaction is serialised with
-        appends.  Each pool's logs are compacted on a size-or-age policy
-        (see :meth:`PoolState.compact_logs`); the endpoint-mode lendpointr is
-        compacted the same way so its terminal tombstones don't pile up.
-        '''
-        while True:
-            try:
-                await asyncio.sleep(_COMPACT_INTERVAL_SEC)
-                for pool_state in self._all_pools():
-                    pool_state.compact_logs()
-                if self._endpoint_mode_log.needs_compaction(
-                        max_appends=_COMPACT_MAX_APPENDS,
-                        max_age_sec=_COMPACT_MAX_AGE_SEC):
-                    live = {
-                        tid: EndpointModeRecord(task_id=tid, endpoint=endpoint,
-                                            state=TASK_RUNNING)
-                        for tid, endpoint in self._endpoint_mode_tasks.items()
-                    }
-                    self._endpoint_mode_log.snapshot(live)
-            except asyncio.CancelledError:
-                return
-            except Exception as e:
-                log.exception('[%s] compaction sweeper error: %s',
-                              self.instance_name, e)
+        for pool_state in list(self._all_pools()):
+            for pilot in list(pool_state.pilots.values()):
+                if pilot.state not in (PILOT_PENDING, PILOT_STARTING):
+                    continue
+                if now - pilot.submitted_at < _HANDSHAKE_TIMEOUT_SEC:
+                    continue
+                await self._reconcile_pilot(pool_state, pilot)
 
     def _prune_stale_state_dirs(self) -> None:
-        '''Synchronous worker for :meth:`_state_sweeper`.
+        '''Remove state dirs for pools no longer active and older than 30 days.
 
-        The store is sid-scoped: ``<state_root>/<sid>/<pool>__<endpoint>/``.
-        A pool directory is pruned iff it isn't backing an active pool AND its
-        newest file is older than ``_STATE_PRUNE_DAYS`` days; an emptied sid
-        directory is then removed too.  A live pool's state dir is identified
-        by its own :attr:`PoolState.state_dir`, so renames and endpoint changes
-        never collide.
+        The store is sid-scoped: ``<state_root>/<sid>/<pool>__<endpoint>/``.  A
+        pool dir is pruned iff it isn't backing an active pool AND its newest
+        file is older than ``_STATE_PRUNE_DAYS``; an emptied sid dir is then
+        removed too.
         '''
         if not self._state_root.exists():
             return
@@ -872,41 +664,104 @@ class PluginTaskDispatcher(Plugin):
                 except OSError as e:
                     log.warning('[%s] could not prune %s: %s',
                                 self.instance_name, entry, e)
-            # Drop an emptied sid directory (all its pools pruned / gone).
             try:
                 if sid_dir.is_dir() and not any(sid_dir.iterdir()):
                     sid_dir.rmdir()
             except OSError:
                 pass
 
+    # -- child plugin clients (sync, over the broker caller) --------------
+
+    def _make_child_client(self, client_cls, plugin: str, dst: str):
+        '''Build a sync plugin client whose transport is the broker caller.
+
+        The dispatcher drives psij/rhapsody through the very same
+        ``PSIJClient`` / ``RhapsodyClient`` sync helpers the user-thread clients
+        run — one implementation of paths, payloads, parsing and error mapping.
+        Only the transport differs: :class:`_CallerSyncHTTP` routes over the
+        in-process caller.  The client's sync methods are always invoked from
+        ``asyncio.to_thread`` so the blocking ``.result()`` never holds the host
+        loop.
+        '''
+        http = _CallerSyncHTTP(self._broker_caller, dst)
+        return client_cls(http, f'/{plugin}',
+                          endpoint_id=dst, plugin_name=plugin)
+
+    async def _get_psij_client(self, endpoint_name: str):
+        '''Return a caller-backed :class:`PSIJClient` for *endpoint_name*.
+
+        Registers (once) a psij session over the caller and caches the client
+        per ``(dst, 'psij', None)``.  Returns ``None`` when no caller is wired
+        or the endpoint / psij plugin is unreachable.
+        '''
+        if not endpoint_name:
+            log.warning('[%s] _get_psij_client called with empty endpoint_name',
+                        self.instance_name)
+            return None
+        if self._broker_caller is None:
+            return None
+        key    = (endpoint_name, 'psij', None)
+        client = self._child_clients.get(key)
+        if client is not None:
+            return client
+        from .plugin_psij import PSIJClient
+        client = self._make_child_client(PSIJClient, 'psij', endpoint_name)
+        try:
+            await asyncio.to_thread(client.register_session)
+        except Exception as e:
+            log.warning('[%s] psij session unavailable on %s: %s',
+                        self.instance_name, endpoint_name, e)
+            return None
+        self._child_clients[key] = client
+        return client
+
+    async def _get_rhapsody_client(self, child_endpoint: str,
+                                   backend: str | None = None):
+        '''Return a caller-backed :class:`RhapsodyClient` for a child.
+
+        Registers the rhapsody session (with *backend* when given), caches the
+        client per ``(dst, 'rhapsody', backend)``.  Returns ``None`` when no
+        caller is wired or the child / rhapsody plugin is unreachable.
+        '''
+        if self._broker_caller is None:
+            return None
+        key    = (child_endpoint, 'rhapsody', backend)
+        client = self._child_clients.get(key)
+        if client is not None:
+            return client
+        from .plugin_rhapsody import RhapsodyClient
+        client = self._make_child_client(RhapsodyClient, 'rhapsody',
+                                         child_endpoint)
+        try:
+            await asyncio.to_thread(
+                client.register_session,
+                backends=[backend] if backend else None)
+        except Exception as e:
+            log.warning('[%s] rhapsody session unavailable on %s: %s',
+                        self.instance_name, child_endpoint, e)
+            return None
+        self._child_clients[key] = client
+        return client
+
     # -- routes --------------------------------------------------------
 
     async def register_session(self, request: Request) -> dict:
-        '''Override the base ``register_session`` to accept per-session
-        pool declarations.
+        '''Override the base ``register_session`` to accept pool declarations.
 
         Request body (JSON, all fields optional)::
 
-            {
-              "pools": [<PoolConfig>, ...]   # same shape as pools.json
-            }
+            {"pools": [<PoolConfig>, ...]}
 
         Materialisation semantics (strict per-session isolation):
 
-        - The base allocates/reconnects the session ``sid`` (and records its
-          owner) first; declared pools then materialise under **that** ``sid``.
+        - The base allocates/reconnects the session ``sid`` first; declared
+          pools then materialise under **that** ``sid``.
         - Pools are keyed ``(owning_sid, pool_name)``: a same-named pool in
-          another session is a *distinct*, isolated pool — there is no
-          cross-session attach and no config-compatibility check.  Re-declaring
-          a pool this session already owns returns the existing one.
+          another session is a *distinct*, isolated pool.  Re-declaring a pool
+          this session already owns returns the existing one.
         - With no pools declared and no pool yet owned by this session, the
           dispatcher auto-materialises this session's own ``default`` pool.
-
-        Each pool's pilots follow the owning session's lifetime: session close
-        (owner ``lost`` + reclaim-drain, ttl expiry, or ``cancel_all``) tears
-        the pools down.
         '''
-        self._ensure_started()
         try:
             body = await request.json()
         except Exception:
@@ -933,8 +788,8 @@ class PluginTaskDispatcher(Plugin):
             except PoolConfigError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
 
-        # Base sid-allocation / owner-check / cleanup logic runs first so pools
-        # can be keyed on the resolved sid.
+        # Base sid-allocation / owner-check / cleanup runs first so pools can
+        # be keyed on the resolved sid.
         result = await super().register_session(request)
         sid    = result['sid']
 
@@ -949,7 +804,6 @@ class PluginTaskDispatcher(Plugin):
 
     async def _route_pools(self, request: Request) -> dict:
         '''List all pools across sessions, grouped by owning session id.'''
-        self._ensure_started()
         return {
             'pools': {
                 sid: {name: self._summarize_pool(ps)
@@ -959,30 +813,33 @@ class PluginTaskDispatcher(Plugin):
         }
 
     async def _route_pool_detail(self, request: Request) -> dict:
-        '''Detailed state for one pool by name (first owner found).  Session-less.'''
-        self._ensure_started()
+        '''Return detailed state for one of this session's pools by name.
+
+        Session-scoped (like ``fleet/{sid}``): a pool is addressable only under
+        its owning session, never by bare name across sessions.
+        '''
+        sid  = request.path_params['sid']
+        self._require_known_session(sid)
         name = request.path_params['name']
-        for pools in self._pool_states.values():
-            ps = pools.get(name)
-            if ps is not None:
-                return self._summarize_pool(ps, verbose=True)
-        raise HTTPException(status_code=404,
-                            detail=f'unknown pool: {name}')
+        ps = self._find_pool(sid, name)
+        if ps is None:
+            raise HTTPException(status_code=404,
+                                detail=f'unknown pool: {name}')
+        return self._summarize_pool(ps, verbose=True)
 
     async def _route_fleet(self, request: Request) -> dict:
-        '''Snapshot of this session's fleet.  Session-scoped, strictly isolated.'''
-        self._ensure_started()
+        '''Return this session's fleet snapshot.  Strictly isolated.'''
         sid = request.path_params['sid']
         self._require_known_session(sid)
         return {
             'pools': {
                 name: self._summarize_pool(ps, verbose=True)
-                for name, ps in self._pools_for(sid).items()
+                for name, ps in self._pool_states.get(sid, {}).items()
             }
         }
 
     async def _route_submit(self, request: Request) -> dict:
-        self._ensure_started()
+        '''Submit a task in pool mode or endpoint mode.'''
         sid = request.path_params['sid']
         self._require_known_session(sid)
         body = await request.json()
@@ -1019,12 +876,15 @@ class PluginTaskDispatcher(Plugin):
         inputs   = list(body.get('inputs',  []) or [])
         outputs  = list(body.get('outputs', []) or [])
 
-        # Cached-state behavior (design §5.1, §9.3)
+        # Cached-state behaviour on resubmit:
+        #   DONE            → return cached (crash-recovery)
+        #   RUNNING/QUEUED  → attach to existing wait (wrapper reconnect)
+        #   FAILED/CANCELED → overwrite, re-execute (retry)
         existing = pool_state.tasks.get(task_id)
         if existing is not None:
             if existing.state == TASK_DONE:
-                log.info('[%s] task %s DONE cached; returning '
-                         'without re-execution', self.instance_name, task_id)
+                log.info('[%s] task %s DONE cached; returning without '
+                         're-execution', self.instance_name, task_id)
                 return self._task_dict(existing)
             if existing.state in (TASK_RUNNING, TASK_QUEUED):
                 log.info('[%s] task %s already %s; attaching',
@@ -1047,17 +907,11 @@ class PluginTaskDispatcher(Plugin):
             arrival_ts   = now,
         )
         pool_state.tasks[task_id] = record
-        pool_state.task_log.append(record)
-        pool_state.record_arrival(now)
+        pool_state.persist()
 
         self._dispatch_notify('task_status', self._task_dict(record))
 
-        # Let the strategy react, then drain any ready dispatches.
-        try:
-            pool_state.strategy.on_task_arrived(pool_state.ctx, record)
-        except Exception as e:
-            log.exception('[%s] on_task_arrived raised: %s',
-                          self.instance_name, e)
+        # Drain any ready dispatches now (the policy scales up on the tick).
         self._drain_pending(pool_state)
 
         return self._task_dict(record)
@@ -1067,15 +921,10 @@ class PluginTaskDispatcher(Plugin):
             cmd: list, cwd: str, body: dict) -> dict:
         '''Endpoint-mode submit: transparent proxy to target's rhapsody.
 
-        No pool, no state log, no pilot fleet — the dispatcher just
-        forwards the task to the target endpoint's rhapsody session and
-        records ``task_id -> target_endpoint`` so subsequent get/cancel
-        can route back.  The mapping is cleared when the task hits a
-        terminal state (see :meth:`_on_event`).
-
-        The target endpoint's rhapsody plugin owns the backend choice —
-        the dispatcher doesn't pass a ``backends`` list so the endpoint's
-        own configured default applies.
+        No pool, no state log, no pilot fleet — the dispatcher just forwards the
+        task to the target endpoint's rhapsody session and records
+        ``task_id -> target_endpoint`` so subsequent get/cancel can route back.
+        The mapping is cleared when the task hits a terminal state.
         '''
         plugins = self._connected_endpoints.get(target_endpoint)
         if plugins is None:
@@ -1106,7 +955,7 @@ class PluginTaskDispatcher(Plugin):
             'task_backend_specific_kwargs': {'cwd': cwd},
         }
         try:
-            result = await rh.asubmit_tasks([task_dict])
+            result = await asyncio.to_thread(rh.submit_tasks, [task_dict])
         except Exception as e:
             log.exception('[%s] endpoint-mode submit to %s failed: %s',
                           self.instance_name, target_endpoint, e)
@@ -1116,23 +965,18 @@ class PluginTaskDispatcher(Plugin):
                        f'{target_endpoint}: {e}') from e
 
         self._endpoint_mode_tasks[task_id] = target_endpoint
-        # Persist the in-flight ledger entry (C4) so a broker restart can
-        # re-correlate this task; rhapsody uid (== task_id here) is what
-        # the event tap keys on for terminal cleanup.
-        self._endpoint_mode_log.append(
-            EndpointModeRecord(task_id=task_id, endpoint=target_endpoint,
-                           state=TASK_RUNNING))
+        self._persist_endpoint_mode()
         return {
-            'task_id': task_id,
-            'endpoint'   : target_endpoint,
-            'state'  : TASK_RUNNING,
-            'cmd'    : list(cmd),
-            'cwd'    : str(cwd),
-            'result' : result[0] if result else None,
+            'task_id' : task_id,
+            'endpoint': target_endpoint,
+            'state'   : TASK_RUNNING,
+            'cmd'     : list(cmd),
+            'cwd'     : str(cwd),
+            'result'  : result[0] if result else None,
         }
 
     async def _route_get_task(self, request: Request) -> dict:
-        self._ensure_started()
+        '''Return one task's record (pool mode) or rhapsody info (endpoint mode).'''
         sid = request.path_params['sid']
         self._require_known_session(sid)
         task_id = request.path_params['task_id']
@@ -1146,15 +990,16 @@ class PluginTaskDispatcher(Plugin):
                     status_code=503,
                     detail=f'rhapsody client unavailable on {endpoint_name}')
             try:
-                info = await rh.aget_task(task_id)
+                info = await asyncio.to_thread(rh.get_task, task_id)
             except Exception as e:
                 raise HTTPException(
                     status_code=502,
                     detail=f'rhapsody get_task failed on '
                            f'{endpoint_name}: {e}') from e
-            return {'task_id': task_id, 'endpoint': endpoint_name, 'result': info}
+            return {'task_id': task_id, 'endpoint': endpoint_name,
+                    'result': info}
 
-        for ps in self._pools_for(sid).values():
+        for ps in self._pool_states.get(sid, {}).values():
             rec = ps.tasks.get(task_id)
             if rec is not None:
                 return self._task_dict(rec)
@@ -1162,7 +1007,7 @@ class PluginTaskDispatcher(Plugin):
                             detail=f'unknown task: {task_id}')
 
     async def _route_cancel_task(self, request: Request) -> dict:
-        self._ensure_started()
+        '''Cancel one task (pool mode) or forward the cancel (endpoint mode).'''
         sid = request.path_params['sid']
         self._require_known_session(sid)
         task_id = request.path_params['task_id']
@@ -1176,15 +1021,16 @@ class PluginTaskDispatcher(Plugin):
                     status_code=503,
                     detail=f'rhapsody client unavailable on {endpoint_name}')
             try:
-                info = await rh.acancel_task(task_id)
+                info = await asyncio.to_thread(rh.cancel_task, task_id)
             except Exception as e:
                 raise HTTPException(
                     status_code=502,
                     detail=f'rhapsody cancel_task failed on '
                            f'{endpoint_name}: {e}') from e
-            return {'task_id': task_id, 'endpoint': endpoint_name, 'result': info}
+            return {'task_id': task_id, 'endpoint': endpoint_name,
+                    'result': info}
 
-        for ps in self._pools_for(sid).values():
+        for ps in self._pool_states.get(sid, {}).values():
             rec = ps.tasks.get(task_id)
             if rec is not None:
                 return await self._cancel_task(ps, rec)
@@ -1195,16 +1041,27 @@ class PluginTaskDispatcher(Plugin):
         '''Tear down this session's pools (cancel pilots, drop the pools).
 
         The explicit reclaim path for ``persistent``/``default`` pools, which
-        have no liveness-driven expiry (M1 decision).  Idempotent.
+        have no liveness-driven expiry.  Idempotent.
         '''
-        self._ensure_started()
         sid = request.path_params['sid']
         self._require_known_session(sid)
         n = await self._teardown_session_pools(sid)
         return {'sid': sid, 'pools_reclaimed': n}
 
+    @staticmethod
+    def _check_filename(name: str) -> None:
+        '''Reject a staging filename with a slash, ``..``, or empty component.
+
+        Files live at the top of the task scratch dir; relative subpaths are
+        not supported (they complicate safety).
+        '''
+        if '/' in name or '\\' in name or name in ('', '.', '..'):
+            raise HTTPException(
+                status_code=400,
+                detail=f'invalid filename for staging: {name!r}')
+
     async def _route_stage_in(self, request: Request) -> dict:
-        self._ensure_started()
+        '''Upload one base64 file into a pool task's scratch dir.'''
         sid = request.path_params['sid']
         self._require_known_session(sid)
         task_id = request.path_params['task_id']
@@ -1232,13 +1089,7 @@ class PluginTaskDispatcher(Plugin):
                 status_code=404,
                 detail=f'unknown pool: {pool_name}')
 
-        # Validate filename: no slashes, no ".." — files live at the
-        # top of the task scratch dir.  Relative subpaths could be
-        # supported later but complicate safety.
-        if '/' in filename or '\\' in filename or filename in ('', '.', '..'):
-            raise HTTPException(
-                status_code=400,
-                detail=f'invalid filename for stage_in: {filename!r}')
+        self._check_filename(filename)
 
         try:
             content = base64.b64decode(content_b64)
@@ -1258,7 +1109,7 @@ class PluginTaskDispatcher(Plugin):
         return {'cwd': str(scratch), 'size': len(content)}
 
     async def _route_stage_out(self, request: Request) -> dict:
-        self._ensure_started()
+        '''Download one file from a pool task's scratch dir.'''
         sid = request.path_params['sid']
         self._require_known_session(sid)
         task_id  = request.path_params['task_id']
@@ -1270,13 +1121,9 @@ class PluginTaskDispatcher(Plugin):
                 detail='stage_in/stage_out not supported for '
                        'endpoint-mode tasks (yet)')
 
-        if '/' in filename or '\\' in filename or filename in ('', '.', '..'):
-            raise HTTPException(
-                status_code=400,
-                detail=f'invalid filename for stage_out: {filename!r}')
+        self._check_filename(filename)
 
-        # Find the task's scratch dir (within this session's pools)
-        for ps in self._pools_for(sid).values():
+        for ps in self._pool_states.get(sid, {}).values():
             rec = ps.tasks.get(task_id)
             if rec is None:
                 continue
@@ -1304,28 +1151,22 @@ class PluginTaskDispatcher(Plugin):
         ``liveness == 'lost'`` entry for a participant that vanishes after the
         grace.  Two concerns share this signal:
 
-        - **Pilot child liveness.**  The dispatcher pre-binds
-          ``record.child_endpoint_name`` at submit time; a child that becomes
-          ``present`` activates a PENDING/STARTING pilot (capacity from the
-          pool's pilot-size config).  ``suspect`` pauses scheduling to that
-          pilot (a transient blip must not tear it down); ``lost`` finalises
-          the pilot — DONE if walltime elapsed, else FAILED — reclaiming its
-          capacity and re-enqueuing unfinished tasks.  Because ``lost`` is only
-          synthesized for a child that was actually ``present`` in this broker's
-          view, a replayed-ACTIVE pilot whose child has not reconnected after a
-          broker restart is never wrongly demoted — no ``_seen`` heuristic
-          needed.
+        - **Pilot child liveness.**  A child that becomes ``present`` activates
+          a PENDING/STARTING pilot; ``suspect`` pauses scheduling to it (a blip
+          must not tear it down); ``lost`` finalises the pilot — DONE if
+          walltime elapsed, else FAILED — reclaiming its capacity and
+          re-enqueuing unfinished tasks.
         - **Owner-session reclaim.**  ``super().on_topology_change`` arms the
-          reclaim-drain for a *session owner* declared ``lost`` (plugin_base,
-          M6); the drain then closes the session, which tears down its pools.
+          reclaim-drain for a *session owner* declared ``lost``; the drain then
+          closes the session, which tears down its pools.
 
-        Also refreshes the cached per-endpoint plugin set (endpoint auto-resolve
-        + endpoint-mode validation) from the non-lost participants.
+        Also refreshes the cached per-endpoint plugin set from the non-lost
+        participants.
         '''
         participants = participants or {}
 
-        # Refresh {endpoint_name: set(plugin_names)} from the non-lost, non-self
-        # participants.  'plugins' is the rich name-keyed dict in the star model.
+        # Refresh {endpoint_name: set(plugin_names)} from the non-lost,
+        # non-self participants.
         self_name = getattr(self._app.state, 'endpoint_name', None)
         new: dict[str, set[str]] = {}
         for name, info in participants.items():
@@ -1333,7 +1174,7 @@ class PluginTaskDispatcher(Plugin):
                 continue
             if (info or {}).get('liveness') == 'lost':
                 # Drop cached plugin-clients on a lost endpoint so a
-                # reconnecting one (endpoint-mode target) re-registers fresh.
+                # reconnecting one re-registers fresh.
                 for key in [k for k in self._child_clients if k[0] == name]:
                     self._child_clients.pop(key, None)
                 continue
@@ -1343,12 +1184,11 @@ class PluginTaskDispatcher(Plugin):
             new[name] = set(plugins)
         self._connected_endpoints = new
 
-        if self._loops_started:
-            for ps in self._all_pools():
-                self._reconcile_pilots_for(ps, participants)
+        for ps in self._all_pools():
+            self._reconcile_pilots_for(ps, participants)
 
-        # Owner-session reclaim-drain (M6): arms on a *lost* owner that owns
-        # ephemeral sessions, cancels on its return.
+        # Owner-session reclaim-drain: arms on a *lost* owner of ephemeral
+        # sessions, cancels on its return.
         await super().on_topology_change(participants)
 
     def _reconcile_pilots_for(self, ps: 'PoolState',
@@ -1362,28 +1202,26 @@ class PluginTaskDispatcher(Plugin):
             liveness = (info or {}).get('liveness') if info else None
 
             if liveness == 'present':
-                # Un-pause a pilot that had been paused on a suspect blip.
+                # Un-pause a pilot paused on a suspect blip.
                 if pilot.state == PILOT_ACTIVE and not pilot.accepting_new_tasks:
                     pilot.accepting_new_tasks = True
-                    ps.pilot_log.append(pilot)
+                    ps.persist()
                     self._drain_pending(ps)
                 if pilot.state in (PILOT_PENDING, PILOT_STARTING):
                     self._activate_pilot(ps, pilot)
 
             elif liveness == 'suspect':
-                # Pause scheduling to a suspect child (do NOT demote — a blip
-                # reaches suspect at most and must survive).
+                # Pause scheduling to a suspect child (do NOT demote).
                 if pilot.state == PILOT_ACTIVE and pilot.accepting_new_tasks:
                     pilot.accepting_new_tasks = False
-                    ps.pilot_log.append(pilot)
+                    ps.persist()
 
             elif liveness == 'lost':
                 if time.time() >= pilot.walltime_deadline:
                     self._mark_pilot_done(ps, pilot, 'walltime reached')
                 else:
                     self._mark_pilot_failed(
-                        ps, pilot,
-                        'child endpoint lost before walltime')
+                        ps, pilot, 'child endpoint lost before walltime')
                 self._drain_pending(ps)
 
     def _activate_pilot(self, ps: PoolState, pilot: PilotRecord) -> None:
@@ -1391,35 +1229,32 @@ class PluginTaskDispatcher(Plugin):
         size = ps.config.pilot_sizes.get(pilot.size_key)
         capacity = (size.nodes * size.cpus_per_node) if size else 0
         if capacity <= 0:
-            log.warning('[%s] cannot bind pilot %s: pool size '
-                        '%r has zero capacity',
-                        self.instance_name, pilot.pid, pilot.size_key)
+            log.warning('[%s] cannot bind pilot %s: pool size %r has zero '
+                        'capacity', self.instance_name, pilot.pid,
+                        pilot.size_key)
             return
 
         old_state = pilot.state
         pilot.capacity  = capacity
         pilot.state     = PILOT_ACTIVE
         pilot.active_at = time.time()
-        ps.pilot_log.append(pilot)
+        ps.persist()
 
         if pilot.active_at and pilot.submitted_at:
-            lag_observed = pilot.active_at - pilot.submitted_at
-            ps.record_pilot_lag(lag_observed)
             log.info('[%s] pilot %s registered as %s; lag=%.1fs',
-                     self.instance_name, pilot.pid,
-                     pilot.child_endpoint_name, lag_observed)
+                     self.instance_name, pilot.pid, pilot.child_endpoint_name,
+                     pilot.active_at - pilot.submitted_at)
 
         self._dispatch_notify('pilot_status', {
-            'pilot_id'  : pilot.pid,
-            'pool'      : ps.config.name,
-            'state'     : pilot.state,
+            'pilot_id'      : pilot.pid,
+            'pool'          : ps.config.name,
+            'state'         : pilot.state,
             'child_endpoint': pilot.child_endpoint_name,
-            'capacity'  : capacity,
+            'capacity'      : capacity,
         })
 
         try:
-            ps.strategy.on_pilot_state(
-                ps.ctx, pilot, old_state, PILOT_ACTIVE)
+            ps.policy.on_pilot_state(pilot, old_state, PILOT_ACTIVE)
         except Exception as e:
             log.exception('[%s] on_pilot_state raised: %s',
                           self.instance_name, e)
@@ -1428,99 +1263,56 @@ class PluginTaskDispatcher(Plugin):
 
     # -- pilot submission path -----------------------------------------
 
-    def _schedule_pilot_submit(self, pool_state: PoolState,
-                                record: PilotRecord,
-                                size: PilotSize) -> None:
-        '''Launch the actual psij submit in a background task.
+    def _make_submit_pilot(self, pool_state: PoolState):
+        '''Return a ``submit_pilot(size_key)`` callable bound to *pool_state*.'''
+        return lambda size_key: self._submit_pilot(pool_state, size_key)
 
-        Called from :meth:`PoolState._strategy_submit_pilot`.  We do not
-        await here so the strategy call returns immediately with the
-        pilot id.
+    def _submit_pilot(self, pool_state: PoolState,
+                      size_key: str | None) -> str:
+        '''Register a pilot and schedule its psij submission.
+
+        Called from the policy's ``on_tick`` (on the housekeeping loop).
+        Returns the dispatcher-local pilot id; the actual psij submission runs
+        as a background task so the caller returns immediately.
         '''
-        if not self._main_loop:
-            log.warning('[%s] no event loop; cannot submit pilot %s',
-                        self.instance_name, record.pid)
-            return
-        asyncio.run_coroutine_threadsafe(
-            self._do_pilot_submit(pool_state, record, size),
-            self._main_loop)
+        size_key = size_key or pool_state.config.default_size
+        if size_key not in pool_state.config.pilot_sizes:
+            raise KeyError(
+                f"pool {pool_state.config.name}: unknown pilot_size "
+                f"{size_key!r} (available: "
+                f"{sorted(pool_state.config.pilot_sizes)})")
 
-    def _schedule_pilot_cancel(self, pool_state: PoolState,
-                                record: PilotRecord) -> None:
-        if not self._main_loop:
-            return
-        asyncio.run_coroutine_threadsafe(
-            self._do_pilot_cancel(pool_state, record),
-            self._main_loop)
+        size   = pool_state.config.pilot_sizes[size_key]
+        pid    = f'p.{uuid.uuid4().hex[:10]}'
+        record = PilotRecord(
+            pid              = pid,
+            pool             = pool_state.config.name,
+            owning_sid       = pool_state.owning_sid,
+            size_key         = size_key,
+            rhapsody_backend = size.rhapsody_backend,
+            state            = PILOT_PENDING,
+            submitted_at     = time.time(),
+            walltime_deadline= time.time() + size.walltime_sec,
+        )
+        pool_state.pilots[pid] = record
+        pool_state.persist()
 
-    async def _get_psij_client(self, endpoint_name: str):
-        '''Return a broker-caller-backed :class:`PSIJClient` for *endpoint_name*.
+        asyncio.create_task(self._do_pilot_submit(pool_state, record, size))
 
-        Registers (once) a psij session over the caller and caches the client
-        per ``(dst, 'psij', None)``.  Returns ``None`` when no caller is wired
-        or the endpoint / psij plugin is unreachable.
-        '''
-        if not endpoint_name:
-            log.warning('[%s] _get_psij_client called with empty endpoint_name',
-                        self.instance_name)
-            return None
-        if self._broker_caller is None:
-            return None
-        key    = (endpoint_name, 'psij', None)
-        client = self._child_clients.get(key)
-        if client is not None:
-            return client
-        from .plugin_psij import PSIJClient
-        client = self._caller_client(PSIJClient, 'psij', endpoint_name)
-        try:
-            await client.aregister_session()
-        except Exception as e:
-            log.warning('[%s] psij session unavailable on %s: %s',
-                        self.instance_name, endpoint_name, e)
-            return None
-        self._child_clients[key] = client
-        return client
-
-    async def _get_rhapsody_client(self, child_endpoint: str,
-                                   backend: str | None = None):
-        '''Return a broker-caller-backed :class:`RhapsodyClient` for a child.
-
-        Registers the rhapsody session (with *backend* when given) and waits for
-        it to report ``ready`` via the real ``RhapsodyClient`` readiness poll.
-        Caches the client per ``(dst, 'rhapsody', backend)``.  Returns ``None``
-        when no caller is wired or the child / rhapsody plugin is unreachable.
-        '''
-        if self._broker_caller is None:
-            return None
-        key    = (child_endpoint, 'rhapsody', backend)
-        client = self._child_clients.get(key)
-        if client is not None:
-            return client
-        from .plugin_rhapsody import RhapsodyClient
-        client = self._caller_client(RhapsodyClient, 'rhapsody', child_endpoint)
-        try:
-            await client.aregister_session(
-                backends=[backend] if backend else None)
-        except Exception as e:
-            log.warning('[%s] rhapsody session unavailable on %s: %s',
-                        self.instance_name, child_endpoint, e)
-            return None
-        self._child_clients[key] = client
-        return client
+        self._dispatch_notify('autoscale_decision', {
+            'pool'    : pool_state.config.name,
+            'action'  : 'submit_pilot',
+            'pilot_id': pid,
+            'size_key': size_key,
+        })
+        return pid
 
     def _build_pilot_env(self, pool_state: PoolState,
                          record: PilotRecord) -> dict[str, str]:
-        '''Bootstrap env vars for the pilot's endpoint service.
-
-        The dispatcher signals "this is a pilot child endpoint" via
-        ``RADICAL_ORBIT_POOL`` / ``RADICAL_ORBIT_RHAPSODY_BACKEND`` /
-        ``RADICAL_ORBIT_SCRATCH_BASE``.  Broker/cert names use the same
-        ``RADICAL_ORBIT_BROKER_*`` vars that any plain endpoint service reads, so
-        the generic ``radical-orbit-endpoint-wrapper.sh`` works without renames.
-        '''
+        '''Build bootstrap env vars for the pilot's child endpoint service.'''
         broker_url = getattr(self._app.state, 'broker_url', '') or ''
         env: dict[str, str] = {
-            'RADICAL_ORBIT_BROKER_URL'           : str(broker_url),
+            'RADICAL_ORBIT_BROKER_URL'      : str(broker_url),
             'RADICAL_ORBIT_POOL'            : pool_state.config.name,
             'RADICAL_ORBIT_RHAPSODY_BACKEND': record.rhapsody_backend,
             'RADICAL_ORBIT_SCRATCH_BASE'    : str(pool_state.scratch_base),
@@ -1568,6 +1360,15 @@ class PluginTaskDispatcher(Plugin):
                 f'pool {pool_state.config.name!r} has no endpoint_name set')
             return
 
+        # Fail fast on the unconfigured default-pool queue sentinel rather than
+        # submit a pilot to a batch queue literally named 'default'.
+        if pool_state.config.queue == 'default':
+            self._mark_pilot_failed(
+                pool_state, record,
+                "pool queue is the 'default' sentinel; re-declare the pool "
+                "with an explicit 'queue' before submitting pilots")
+            return
+
         psij_c = await self._get_psij_client(endpoint_name)
         if psij_c is None:
             self._mark_pilot_failed(
@@ -1575,17 +1376,16 @@ class PluginTaskDispatcher(Plugin):
             return
 
         child_endpoint = f'{pool_state.config.name}_{record.pid}'
-        # Pre-bind so on_topology_change can match the registering child
-        # before the psij submit returns and we persist the next state.
+        # Pre-bind so on_topology_change can match the registering child.
         record.child_endpoint_name = child_endpoint
-        env        = self._build_pilot_env(pool_state, record)
-        job_spec   = self._build_job_spec(
-            pool_state, size, child_endpoint, env)
+        env      = self._build_pilot_env(pool_state, record)
+        job_spec = self._build_job_spec(pool_state, size, child_endpoint, env)
 
         try:
             from .batch_system import detect_batch_system
             executor = detect_batch_system().psij_executor
-            result   = await psij_c.asubmit_tunneled(job_spec, executor, 'none')
+            result   = await asyncio.to_thread(
+                psij_c.submit_tunneled, job_spec, executor, 'none')
         except Exception as e:
             log.exception('[%s] psij submit_tunneled failed for %s: %s',
                           self.instance_name, record.pid, e)
@@ -1594,23 +1394,24 @@ class PluginTaskDispatcher(Plugin):
 
         record.psij_job_id = result.get('job_id')
         record.state       = PILOT_STARTING
-        pool_state.pilot_log.append(record)
+        pool_state.persist()
         self._dispatch_notify('pilot_status', {
-            'pilot_id'    : record.pid,
-            'pool'        : pool_state.config.name,
-            'state'       : record.state,
-            'psij_job_id' : record.psij_job_id,
+            'pilot_id'   : record.pid,
+            'pool'       : pool_state.config.name,
+            'state'      : record.state,
+            'psij_job_id': record.psij_job_id,
         })
 
         try:
-            pool_state.strategy.on_pilot_state(
-                pool_state.ctx, record, PILOT_PENDING, PILOT_STARTING)
+            pool_state.policy.on_pilot_state(
+                record, PILOT_PENDING, PILOT_STARTING)
         except Exception as e:
             log.exception('[%s] on_pilot_state raised: %s',
                           self.instance_name, e)
 
     async def _do_pilot_cancel(self, pool_state: PoolState,
                                record: PilotRecord) -> None:
+        '''Best-effort psij cancel + FAILED for one pilot.'''
         if record.is_terminal():
             return
         endpoint_name = pool_state.config.endpoint_name
@@ -1622,11 +1423,11 @@ class PluginTaskDispatcher(Plugin):
             self._mark_pilot_failed(pool_state, record, 'cancel requested')
             return
         try:
-            await psij_c.acancel_job(record.psij_job_id)
+            await asyncio.to_thread(psij_c.cancel_job, record.psij_job_id)
         except Exception as e:
             log.warning('[%s] psij cancel failed for %s: %s',
                         self.instance_name, record.pid, e)
-        self._mark_pilot_failed(pool_state, record, 'cancelled by strategy')
+        self._mark_pilot_failed(pool_state, record, 'cancelled')
 
     async def _reconcile_pilot(self, pool_state: PoolState,
                                record: PilotRecord) -> None:
@@ -1640,7 +1441,8 @@ class PluginTaskDispatcher(Plugin):
         if psij_c is None:
             return
         try:
-            status = await psij_c.aget_job_status(record.psij_job_id)
+            status = await asyncio.to_thread(
+                psij_c.get_job_status, record.psij_job_id)
         except Exception as e:
             log.warning('[%s] psij get_job_status failed for %s: %s',
                         self.instance_name, record.pid, e)
@@ -1649,24 +1451,18 @@ class PluginTaskDispatcher(Plugin):
         state = str(status.get('state', '')).upper()
         if state in ('COMPLETED', 'DONE', 'FAILED', 'CANCELED'):
             self._mark_pilot_failed(
-                pool_state, record,
-                f'handshake timeout; psij state {state}')
+                pool_state, record, f'handshake timeout; psij state {state}')
 
     def _mark_pilot_failed(self, pool_state: PoolState,
                            record: PilotRecord, reason: str) -> None:
-        '''Mark a pilot FAILED, re-enqueue assigned tasks, notify strategy.'''
+        '''Mark a pilot FAILED, re-enqueue assigned tasks, notify the policy.'''
         log.warning('[%s] pilot %s → FAILED (%s)',
                     self.instance_name, record.pid, reason)
         self._finalize_pilot(pool_state, record, PILOT_FAILED, reason)
 
     def _mark_pilot_done(self, pool_state: PoolState,
                          record: PilotRecord, reason: str) -> None:
-        '''Mark a pilot DONE (clean end, e.g. walltime expiry).
-
-        Any task still assigned and non-terminal is re-enqueued — a job
-        that reached walltime mid-task should be retried on another
-        pilot, not silently dropped.
-        '''
+        '''Mark a pilot DONE (clean end, e.g. walltime expiry).'''
         log.info('[%s] pilot %s → DONE (%s)',
                  self.instance_name, record.pid, reason)
         self._finalize_pilot(pool_state, record, PILOT_DONE, reason)
@@ -1675,15 +1471,13 @@ class PluginTaskDispatcher(Plugin):
                         new_state: str, reason: str) -> None:
         '''Drive a pilot to a terminal state and reclaim its tasks.
 
-        Shared by the FAILED and DONE paths: persists the transition,
-        notifies clients, re-enqueues any non-terminal tasks that were
-        assigned to this pilot (clearing their stale rhapsody-uid
-        mapping so a late terminal event from the dead pilot can't
-        clobber the re-queued task), and signals the strategy.
+        Persists the transition, notifies clients, re-enqueues any non-terminal
+        tasks assigned to this pilot (clearing their stale rhapsody-uid mapping
+        so a late terminal event from the dead pilot can't clobber the requeued
+        task), and signals the policy.
         '''
         old_state = record.state
         record.state = new_state
-        pool_state.pilot_log.append(record)
         self._dispatch_notify('pilot_status', {
             'pilot_id': record.pid,
             'pool'    : pool_state.config.name,
@@ -1699,12 +1493,11 @@ class PluginTaskDispatcher(Plugin):
                     t.rhapsody_uid = None
                 t.state    = TASK_QUEUED
                 t.pilot_id = None
-                pool_state.task_log.append(t)
                 self._dispatch_notify('task_status', self._task_dict(t))
+        pool_state.persist()
 
         try:
-            pool_state.strategy.on_pilot_state(
-                pool_state.ctx, record, old_state, new_state)
+            pool_state.policy.on_pilot_state(record, old_state, new_state)
         except Exception as e:
             log.exception('[%s] on_pilot_state raised: %s',
                           self.instance_name, e)
@@ -1712,12 +1505,18 @@ class PluginTaskDispatcher(Plugin):
     # -- dispatch loop -------------------------------------------------
 
     def _drain_pending(self, pool_state: PoolState) -> None:
-        '''Ask the strategy for (task, pilot) pairs until it stops.'''
-        safety = 10_000
-        while safety > 0:
-            safety -= 1
+        '''Ask the policy for (task, pilot) pairs until it stops.
+
+        Bounded by the pending-queue length: a single drain can dispatch at
+        most as many tasks as are QUEUED.  A pick that repeats or returns a
+        non-QUEUED (stale) task is logged and breaks the drain — a broken
+        policy is visible rather than silently rate-limited.
+        '''
+        budget = len(pool_state.pending_queue())
+        while budget > 0:
+            budget -= 1
             try:
-                pair = pool_state.strategy.pick_dispatch(pool_state.ctx)
+                pair = pool_state.policy.pick_dispatch(pool_state)
             except Exception as e:
                 log.exception('[%s] pick_dispatch raised: %s',
                               self.instance_name, e)
@@ -1726,54 +1525,42 @@ class PluginTaskDispatcher(Plugin):
                 return
             task, pilot = pair
             if task.state != TASK_QUEUED:
-                # stale choice; skip and keep asking
-                continue
+                log.warning('[%s] pool %r: pick_dispatch returned non-QUEUED '
+                            'task %s (%s); stopping drain',
+                            self.instance_name, pool_state.config.name,
+                            task.task_id, task.state)
+                return
             self._assign(pool_state, task, pilot)
 
     def _assign(self, pool_state: PoolState,
                 task: TaskRecord, pilot: PilotRecord) -> None:
-        '''Claim the task for this pilot and schedule the rhapsody submit.
-
-        FIXME(per-task-backend):
-            The rhapsody backend used for this task is implicitly
-            inherited from ``pilot.rhapsody_backend`` (chosen at pilot
-            submit time via ``PilotSize.rhapsody_backend``).  A future
-            extension would call
-            ``self._strategy.pick_backend(task, pilot)`` here and, if it
-            returns non-None, override the task's target backend before
-            submit_tasks.  Paired extension-point doc in:
-              task_dispatcher_strategy.py::DispatchStrategy
-            (search ``FIXME(per-task-backend)``).
-        '''
+        '''Claim the task for this pilot and schedule the rhapsody submit.'''
         task.state      = TASK_RUNNING
         task.pilot_id   = pilot.pid
         task.started_at = time.time()
         pilot.in_flight     += 1
         pilot.started_tasks += 1
-        pool_state.task_log.append(task)
-        pool_state.pilot_log.append(pilot)
+        pool_state.persist()
 
         self._dispatch_notify('task_status', self._task_dict(task))
 
-        if self._main_loop:
-            asyncio.run_coroutine_threadsafe(
-                self._do_rhapsody_submit(pool_state, task, pilot),
-                self._main_loop)
+        asyncio.create_task(
+            self._do_rhapsody_submit(pool_state, task, pilot))
 
     async def _do_rhapsody_submit(self, pool_state: PoolState,
-                                   task: TaskRecord,
-                                   pilot: PilotRecord) -> None:
-        '''Post the task to the pilot's rhapsody session over the broker caller.'''
+                                  task: TaskRecord,
+                                  pilot: PilotRecord) -> None:
+        '''Post the task to the pilot's rhapsody session over the caller.'''
         if not pilot.child_endpoint_name:
             self._mark_task_failed(pool_state, task,
-                                    'child endpoint unavailable')
+                                   'child endpoint unavailable')
             return
 
         rh = await self._get_rhapsody_client(
             pilot.child_endpoint_name, pilot.rhapsody_backend)
         if rh is None:
             self._mark_task_failed(pool_state, task,
-                                    'rhapsody client unavailable')
+                                   'rhapsody client unavailable')
             return
 
         task_dict = {
@@ -1783,33 +1570,31 @@ class PluginTaskDispatcher(Plugin):
             'cwd'       : task.cwd,
             # rhapsody's concurrent backend reads cwd from
             # task_backend_specific_kwargs (BaseTask's top-level cwd is
-            # ignored).  Mirror it here so the task runs in its scratch
-            # dir and stage_out can find the outputs.
+            # ignored); mirror it here so the task runs in its scratch dir.
             'task_backend_specific_kwargs': {'cwd': task.cwd},
         }
         try:
-            result = await rh.asubmit_tasks([task_dict])
+            result = await asyncio.to_thread(rh.submit_tasks, [task_dict])
             if result:
                 rh_uid = result[0].get('uid')
                 if rh_uid:
                     task.rhapsody_uid = rh_uid
                     self._uid_to_task[rh_uid] = (pool_state.owning_sid,
-                                                  pool_state.config.name,
-                                                  task.task_id)
-                    pool_state.task_log.append(task)
+                                                 pool_state.config.name,
+                                                 task.task_id)
+                    pool_state.persist()
         except Exception as e:
             log.exception('[%s] rhapsody submit failed for %s: %s',
                           self.instance_name, task.task_id, e)
             self._mark_task_failed(pool_state, task,
-                                    f'rhapsody submit error: {e}')
+                                   f'rhapsody submit error: {e}')
 
     def _on_event(self, event: dict) -> None:
-        '''Broker raw-tap callback: a child rhapsody reported a task transition.
+        '''Broker raw-tap callback: a child rhapsody reported a transition.
 
         The tap fires on the plugin-host loop — the dispatcher's own loop — so
-        terminal handling runs inline (no cross-thread marshalling, unlike the
-        old SSE listener thread).  The tap is unfiltered, so filter here on
-        plugin/topic; the rhapsody uid → pool mapping is ``self._uid_to_task``.
+        terminal handling runs inline.  The tap is unfiltered, so filter here
+        on plugin/topic; the rhapsody uid → pool mapping is ``_uid_to_task``.
         '''
         if event.get('plugin') != 'rhapsody':
             return
@@ -1821,7 +1606,6 @@ class PluginTaskDispatcher(Plugin):
         if not uid or state not in ('DONE', 'FAILED', 'CANCELED', 'COMPLETED'):
             return
 
-        # Map rhapsody state → dispatcher state vocabulary
         target = {
             'DONE'     : TASK_DONE,
             'COMPLETED': TASK_DONE,
@@ -1831,21 +1615,17 @@ class PluginTaskDispatcher(Plugin):
         self._handle_task_terminal(uid, target, data)
 
     def _handle_task_terminal(self, uid: str, target_state: str,
-                               data: dict) -> None:
+                              data: dict) -> None:
         '''Host-loop handler for a child rhapsody task completion.'''
         # Endpoint-mode tasks: forget the mapping and re-emit the terminal
-        # status under the dispatcher's plugin name so clients that
-        # filter on plugin='task_dispatcher' still see the event.
+        # status under the dispatcher's plugin name so consumers filtering on
+        # plugin='task_dispatcher' still see the event.
         if uid in self._endpoint_mode_tasks:
             endpoint_name = self._endpoint_mode_tasks.pop(uid)
-            # Write the terminal lendpointr record so replay no longer
-            # resurrects this entry after a restart (C4).
-            self._endpoint_mode_log.append(
-                EndpointModeRecord(task_id=uid, endpoint=endpoint_name,
-                               state=target_state))
+            self._persist_endpoint_mode()
             self._dispatch_notify('task_status', {
                 'task_id'  : uid,
-                'endpoint'     : endpoint_name,
+                'endpoint' : endpoint_name,
                 'state'    : target_state,
                 'exit_code': data.get('exit_code'),
                 'error'    : data.get('error'),
@@ -1867,46 +1647,36 @@ class PluginTaskDispatcher(Plugin):
         task.exit_code   = data.get('exit_code')
         task.error       = data.get('error')
         task.finished_at = time.time()
-        pool_state.task_log.append(task)
 
         pilot = pool_state.pilots.get(task.pilot_id or '')
         if pilot is not None:
             pilot.in_flight = max(0, pilot.in_flight - 1)
-            pool_state.pilot_log.append(pilot)
+        pool_state.persist()
 
         self._dispatch_notify('task_status', self._task_dict(task))
-
-        if pilot is not None:
-            try:
-                pool_state.strategy.on_task_finished(
-                    pool_state.ctx, task, pilot)
-            except Exception as e:
-                log.exception('[%s] on_task_finished raised: %s',
-                              self.instance_name, e)
-
         self._drain_pending(pool_state)
 
     def _mark_task_failed(self, pool_state: PoolState,
                           task: TaskRecord, reason: str) -> None:
+        '''Mark one task FAILED and free its pilot slot.'''
         task.state       = TASK_FAILED
         task.error       = reason
         task.finished_at = time.time()
-        pool_state.task_log.append(task)
         pilot = pool_state.pilots.get(task.pilot_id or '')
         if pilot is not None:
             pilot.in_flight = max(0, pilot.in_flight - 1)
-            pool_state.pilot_log.append(pilot)
+        pool_state.persist()
         self._dispatch_notify('task_status', self._task_dict(task))
 
     async def _cancel_task(self, pool_state: PoolState,
                            task: TaskRecord) -> dict:
-        '''Cancel path: either remove from queue or cancel on pilot.'''
+        '''Cancel path: either remove from queue or cancel on the pilot.'''
         if task.state in TASK_TERMINAL_STATES:
             return self._task_dict(task)
         if task.state == TASK_QUEUED:
             task.state       = TASK_CANCELED
             task.finished_at = time.time()
-            pool_state.task_log.append(task)
+            pool_state.persist()
             self._dispatch_notify('task_status', self._task_dict(task))
             return self._task_dict(task)
 
@@ -1916,7 +1686,7 @@ class PluginTaskDispatcher(Plugin):
             rh = await self._get_rhapsody_client(pilot.child_endpoint_name)
             if rh is not None:
                 try:
-                    await rh.acancel_task(task.rhapsody_uid)
+                    await asyncio.to_thread(rh.cancel_task, task.rhapsody_uid)
                 except Exception as e:
                     log.warning('[%s] rhapsody cancel_task failed: %s',
                                 self.instance_name, e)
@@ -1924,46 +1694,43 @@ class PluginTaskDispatcher(Plugin):
         task.finished_at = time.time()
         if pilot is not None:
             pilot.in_flight = max(0, pilot.in_flight - 1)
-            pool_state.pilot_log.append(pilot)
-        pool_state.task_log.append(task)
+        pool_state.persist()
         self._dispatch_notify('task_status', self._task_dict(task))
         return self._task_dict(task)
 
-    # -- termination policy --------------------------------------------
-
-    def _apply_termination_policy(self, pool_state: PoolState) -> None:
-        '''Consult strategy.should_terminate_pilot for each live pilot.'''
-        for pilot in pool_state._pilots_snapshot():
-            try:
-                if pool_state.strategy.should_terminate_pilot(
-                        pool_state.ctx, pilot):
-                    pool_state.ctx.cancel_pilot(pilot.pid)
-            except Exception as e:
-                log.exception('[%s] should_terminate_pilot raised: %s',
-                              self.instance_name, e)
-
     # -- helpers -------------------------------------------------------
 
+    def _persist_endpoint_mode(self) -> None:
+        '''Rewrite the endpoint-mode ledger (task_id → endpoint) atomically.'''
+        try:
+            write_json_atomic(self._endpoint_mode_path,
+                              self._endpoint_mode_tasks)
+        except OSError as e:
+            log.warning('[%s] could not persist endpoint-mode ledger: %s',
+                        self.instance_name, e)
+
     def _require_known_session(self, sid: str) -> None:
+        '''Raise 404 unless *sid* is a known session.'''
         if sid not in self._sessions:
             raise HTTPException(status_code=404,
                                 detail=f'unknown session: {sid}')
 
     def _task_dict(self, task: TaskRecord) -> dict:
+        '''Return the plain-dict view of a task record.'''
         return asdict(task)
 
     def _pilot_dict(self, pilot: PilotRecord) -> dict:
+        '''Return the plain-dict view of a pilot record.'''
         return asdict(pilot)
 
     def _summarize_pool(self, ps: PoolState, verbose: bool = False) -> dict:
-        live = ps._pilots_snapshot()
-        pending = [t for t in ps.tasks.values()
-                   if t.state == TASK_QUEUED]
+        '''Return a summary dict for one pool (optionally verbose).'''
+        live = ps.live_pilots()
+        pending = [t for t in ps.tasks.values() if t.state == TASK_QUEUED]
         summary = {
             'name'        : ps.config.name,
             'queue'       : ps.config.queue,
             'account'     : ps.config.account,
-            'strategy'    : ps.config.strategy,
             'default_size': ps.config.default_size,
             'pilot_sizes' : {
                 name: {
@@ -1975,18 +1742,18 @@ class PluginTaskDispatcher(Plugin):
                 }
                 for name, size in ps.config.pilot_sizes.items()
             },
-            'live_pilots' : len(live),
+            'live_pilots'  : len(live),
             'pending_tasks': len(pending),
-            'min_pilots'  : ps.config.min_pilots,
-            'max_pilots'  : ps.config.max_pilots,
+            'min_pilots'   : ps.config.min_pilots,
+            'max_pilots'   : ps.config.max_pilots,
         }
         if verbose:
             summary['pilots'] = [self._pilot_dict(p) for p in live]
             summary['recent_tasks'] = [
                 self._task_dict(t)
                 for t in sorted(ps.tasks.values(),
-                                 key=lambda t: t.arrival_ts,
-                                 reverse=True)[:50]
+                                key=lambda t: t.arrival_ts,
+                                reverse=True)[:50]
             ]
         return summary
 
@@ -1996,11 +1763,8 @@ class PluginTaskDispatcher(Plugin):
         '''Tear down every pool owned by *sid*: cancel pilots, drop the pools.
 
         The session-close hook that ties a pool's pilots to the owning
-        session's lifetime.  Reached from :meth:`TaskDispatcherSession.close`
-        (owner ``lost`` + reclaim-drain, ttl expiry, ``unregister_session``)
-        and from ``cancel_all``.  Each live pilot is cancelled (best-effort
-        psij cancel + FAILED in the durable store); the pool's log handles are
-        closed and the pools are dropped.  Idempotent.
+        session's lifetime.  Each live pilot is cancelled (best-effort psij
+        cancel + FAILED); the pools are dropped.  Idempotent.
         '''
         pools = self._pool_states.pop(sid, None)
         if not pools:

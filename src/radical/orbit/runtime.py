@@ -13,7 +13,7 @@ callback plugin.
   raw frame ``send``/``recv`` — *nothing else*.  ``websockets`` client keepalive
   (``ping_interval``/``ping_timeout``) answers pings here regardless of what the
   work loop is doing, so a blocking plugin handler stalls request *handling*,
-  never liveness (M0 lesson 3: the stock library keepalive is genuinely
+  never liveness (the stock library keepalive is genuinely
   transport-independent).
 * A **work loop** (its own runtime-owned thread) does envelope pack/parse and
   all plugin/handler + consumer-call work.
@@ -21,10 +21,10 @@ callback plugin.
   transport or work loop (a slow user callback is user code and can never be
   "disciplined").
 
-Frames cross the two loops through the M0 coalesced handoff
-(:class:`radical.orbit.runtime_support.Handoff`): a bounded deque with a single
-outstanding ``call_soon_threadsafe`` per burst, swap-drained.  The inbound path
-is soft-bounded and **never blocks the transport loop** (M0 lesson 5); strict
+Frames cross the two loops with the stdlib primitives, so the transport thread
+never blocks the producer: an inbound frame is handed to the work loop with a
+single ``loop.call_soon_threadsafe(self._on_frame, data)``; an outbound frame is
+handed to the transport loop's :class:`asyncio.Queue` the same way.  Strict
 request backpressure is the 503 fast-fail at the concurrency cap.
 
 **Naming / session recovery.**  A zero-plugin consumer with no name given is
@@ -50,7 +50,6 @@ import threading
 import time
 import uuid
 
-from collections import deque
 from typing      import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qsl, urlparse, urlunparse
 
@@ -67,12 +66,35 @@ from .client            import PluginClient
 from .dispatch          import RequestShim, match_route
 from .plugin_base       import Plugin
 from .plugin_host_base  import PluginHostBase
-from .runtime_client    import RuntimePluginClient, RuntimeResponse, _RuntimeHTTP
-from .runtime_support   import CallbackDispatcher, Handoff
+from .runtime_client    import RuntimeResponse, _RuntimeHTTP
+from .runtime_support   import CallbackDispatcher
 from .ui_schema         import ui_config_to_dict
 
 
 log = logging.getLogger("radical.orbit.runtime")
+
+# ── Runtime tunables (defaults) ────────────────────────────────────────────
+# Operator-facing knobs are explicit constructor arguments; these numeric
+# defaults are speculative-generality seams a user never sets, so they live as
+# named constants instead.  Tests that need to shrink a timeout patch the
+# constant or set the corresponding private attribute (or pass the legacy
+# keyword, still accepted via ``**tuning`` for the cross-module test harnesses).
+_REQUEST_CAP    = 128     # served-request admission cap (503 fast-fail beyond)
+_CALLBACK_QUEUE = 1024    # bounded depth of the user-callback dispatcher
+_CALL_TIMEOUT   = 600.0   # default consumer-call timeout (seconds)
+_RETRY_AFTER    = 1.0     # Retry-After on a 503 (seconds)
+_PING_INTERVAL  = 1.0     # websockets client keepalive cadence
+_PING_TIMEOUT   = 3.0     # websockets client keepalive answer deadline
+_BACKOFF_START  = 0.5     # (re)connect backoff floor (seconds)
+_BACKOFF_MAX    = 10.0    # (re)connect backoff ceiling (seconds)
+_BACKOFF_FACTOR = 1.5     # (re)connect backoff growth factor
+
+# Legacy per-instance tunables still accepted as keyword arguments (they feed
+# private attributes) so existing harnesses keep constructing runtimes without
+# change; they are deliberately absent from the visible signature.
+_TUNING_KEYS = {'request_concurrency', 'accept_queue', 'callback_queue',
+                'call_timeout', 'retry_after', 'frame_cap',
+                'backoff_start', 'backoff_max', 'backoff_factor'}
 
 
 # ---------------------------------------------------------------------------
@@ -93,13 +115,14 @@ class EndpointRuntime(PluginHostBase):
                      :meth:`serve` is called.
         role:        Advertised role.  Defaults to ``'consumer'`` (no served
                      plugins) or ``'endpoint'``.
-        tunnel:      ``'none'`` / ``'forward'`` / ``'reverse'`` (see
-                     ``service.py``; boolean is not accepted).
-        request_concurrency: max concurrently-served requests (work loop).
-        accept_queue:        extra admitted-but-waiting requests before 503.
-        callback_queue:      bounded depth of the user-callback dispatcher.
-        ping_interval/ping_timeout: ``websockets`` client keepalive.
-        frame_cap:   ``max_size`` for the WS + the pack/parse cap.
+        tunnel:      ``'none'`` / ``'forward'`` / ``'reverse'`` (boolean is not
+                     accepted).
+        ping_interval/ping_timeout: ``websockets`` client keepalive cadence.
+
+    The numeric backpressure/backoff/frame-cap tunables are module-level
+    constants (``_REQUEST_CAP``, ``_BACKOFF_*`` …), not per-instance knobs; they
+    are still accepted as keyword arguments for existing test harnesses but are
+    intentionally absent from the visible signature.
     """
 
     def __init__(self,
@@ -113,24 +136,20 @@ class EndpointRuntime(PluginHostBase):
                  token:       Optional[str]  = None,
                  resume_key:  Optional[str]  = None,
                  app:         Optional[FastAPI] = None,
-                 request_concurrency: int   = 64,
-                 accept_queue:        int   = 64,
-                 callback_queue:      int   = 1024,
-                 call_timeout:        float = 600.0,
-                 retry_after:         float = 1.0,
-                 ping_interval:       float = 1.0,
-                 ping_timeout:        float = 3.0,
-                 frame_cap:           int   = protocol.FRAME_CAP,
-                 backoff_start:       float = 0.5,
-                 backoff_max:         float = 10.0,
-                 backoff_factor:      float = 1.5):
+                 ping_interval:       float = _PING_INTERVAL,
+                 ping_timeout:        float = _PING_TIMEOUT,
+                 **tuning):
 
         if tunnel not in ('none', 'forward', 'reverse'):
             raise ValueError(
                 f"tunnel must be one of 'none' / 'forward' / 'reverse'; "
                 f"got {tunnel!r}")
+        bad = set(tuning) - _TUNING_KEYS
+        if bad:
+            raise TypeError("unexpected keyword argument(s): %s"
+                            % ', '.join(sorted(bad)))
 
-        # ── URL / TLS / token resolution (service.py shapes) ──────────
+        # ── URL / TLS / token resolution ──────────────────────────────
         resolved_url, _ = utils.resolve_broker_url(cli=broker_url)
         self._broker_url: str = resolved_url
         scheme = urlparse(self._broker_url).scheme
@@ -151,7 +170,12 @@ class EndpointRuntime(PluginHostBase):
         self._tunnel_via = tunnel_via
         self._tunnel_proc = None
 
-        # ── Served-plugin FastAPI app (service.py mounting shape) ──────
+        # ── Served-plugin registration substrate ──────────────────────
+        # NOTE: this FastAPI app is **never served** — no server ever binds it.
+        # It is only the plugins' route-registration substrate: served plugins
+        # register their routes against it, and served-request dispatch reads
+        # ``app.state.direct_routes`` (via :meth:`match_route`).  The gateway
+        # alone owns a *served* FastAPI app.
         self._app: FastAPI = app if app is not None \
                                  else FastAPI(title="ORBIT Endpoint Runtime")
         self._plugins: Dict[str, Plugin] = {}
@@ -165,20 +189,20 @@ class EndpointRuntime(PluginHostBase):
 
         if plugins:
             self._load_plugins_from_filter(list(plugins))
-        # Keep the live list reference (dynamic serve() appends to it).
-        self._direct_routes = self._app.state.direct_routes
 
         # ── Tunables ───────────────────────────────────────────────────
-        self._request_concurrency = request_concurrency
-        self._accept_queue        = accept_queue
-        self._call_timeout        = call_timeout
-        self._retry_after         = retry_after
-        self._ping_interval       = ping_interval
-        self._ping_timeout        = ping_timeout
-        self._frame_cap           = frame_cap
-        self._backoff_start       = backoff_start
-        self._backoff_max         = backoff_max
-        self._backoff_factor      = backoff_factor
+        self._req_cap = _REQUEST_CAP
+        if 'request_concurrency' in tuning or 'accept_queue' in tuning:
+            self._req_cap = (int(tuning.get('request_concurrency', 0))
+                             + int(tuning.get('accept_queue', 0)))
+        self._call_timeout   = tuning.get('call_timeout',   _CALL_TIMEOUT)
+        self._retry_after    = tuning.get('retry_after',    _RETRY_AFTER)
+        self._ping_interval  = ping_interval
+        self._ping_timeout   = ping_timeout
+        self._frame_cap      = tuning.get('frame_cap',      protocol.FRAME_CAP)
+        self._backoff_start  = tuning.get('backoff_start',  _BACKOFF_START)
+        self._backoff_max    = tuning.get('backoff_max',    _BACKOFF_MAX)
+        self._backoff_factor = tuning.get('backoff_factor', _BACKOFF_FACTOR)
         self._prof = rprof.Profiler('endpoint', ns='radical.orbit')
 
         # ── Loops / threads (populated in start()) ────────────────────
@@ -188,13 +212,14 @@ class EndpointRuntime(PluginHostBase):
         self._transport_thread: Optional[threading.Thread] = None
         self._work_ident:      Optional[int] = None
         self._transport_ident: Optional[int] = None
-        self._cb = CallbackDispatcher(maxlen=callback_queue)
+        self._cb = CallbackDispatcher(
+            maxlen=tuning.get('callback_queue', _CALLBACK_QUEUE))
 
-        # inbound: transport thread -> work loop; outbound: work -> transport.
-        self._inbound  = Handoff(self._drain_inbound)
-        self._outbound = Handoff(self._drain_outbound)
-        self._outbox: deque      = deque()
-        self._outbox_evt: Optional[asyncio.Event] = None
+        # Outbound frames (any thread -> transport loop) ride one asyncio.Queue
+        # owned by the transport loop; the producer hands over with a
+        # non-blocking ``call_soon_threadsafe(put_nowait, ...)``.  Inbound frames
+        # go the mirror way straight to ``_on_frame`` on the work loop.
+        self._outbox: Optional[asyncio.Queue] = None
 
         # ── State ──────────────────────────────────────────────────────
         self._ws = None
@@ -206,9 +231,9 @@ class EndpointRuntime(PluginHostBase):
         self._topology_ready = threading.Event()
         self._transport_future = None
 
-        # served-request backpressure (touched on the work loop)
+        # served-request backpressure (touched on the work loop): one counter
+        # against one cap — a 503 fast-fail beyond it, nothing else.
         self._req_inflight = 0
-        self._req_sem: Optional[asyncio.Semaphore] = None
 
         # consumer pending table (touched on the work loop)
         self._pending: Dict[str, asyncio.Future] = {}
@@ -279,14 +304,16 @@ class EndpointRuntime(PluginHostBase):
             target=self._run_work_thread, args=(wk_ready,),
             name='orbit-work', daemon=True)
         self._work_thread.start()
-        wk_ready.wait(timeout=5.0)
+        if not wk_ready.wait(timeout=5.0):
+            raise RuntimeError("work loop thread failed to start")
 
         rt_ready = threading.Event()
         self._transport_thread = threading.Thread(
             target=self._run_transport_thread, args=(rt_ready,),
             name='orbit-transport', daemon=True)
         self._transport_thread.start()
-        rt_ready.wait(timeout=5.0)
+        if not rt_ready.wait(timeout=5.0):
+            raise RuntimeError("transport loop thread failed to start")
 
         self._transport_future = asyncio.run_coroutine_threadsafe(
             self._transport_main(), self._transport_loop)
@@ -317,6 +344,11 @@ class EndpointRuntime(PluginHostBase):
             except Exception as e:
                 coro.close()
                 log.debug("[Runtime] graceful close failed: %s", e)
+        # Cancel the transport coroutine so a reconnect backoff-sleep is not
+        # left pending when its loop stops ("Task was destroyed" warnings).
+        if self._transport_future is not None:
+            self._transport_future.cancel()
+            self._transport_future = None
         # Cancel served-plugin background tasks on the work loop before it
         # stops, so no task is destroyed while pending.
         if self._work_loop is not None and self._work_loop.is_running() \
@@ -329,7 +361,7 @@ class EndpointRuntime(PluginHostBase):
                 coro.close()
         for loop, thread in ((self._transport_loop, self._transport_thread),
                              (self._work_loop, self._work_thread)):
-            if loop is not None:
+            if loop is not None and loop.is_running():
                 loop.call_soon_threadsafe(loop.stop)
             if thread is not None:
                 thread.join(timeout=5.0)
@@ -348,10 +380,16 @@ class EndpointRuntime(PluginHostBase):
                 pass
 
     async def _work_teardown(self) -> None:
+        tasks = []
         for plugin in list(self._plugins.values()):
             task = getattr(plugin, '_cleanup_task', None)
             if task is not None and not task.done():
                 task.cancel()
+                tasks.append(task)
+        # Await the cancellations so they complete before the loop closes
+        # (otherwise the loop tears down with the tasks still pending).
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def __enter__(self) -> 'EndpointRuntime':
         return self.start()
@@ -366,8 +404,6 @@ class EndpointRuntime(PluginHostBase):
         asyncio.set_event_loop(loop)
         self._work_loop  = loop
         self._work_ident = threading.get_ident()
-        self._req_sem    = asyncio.Semaphore(self._request_concurrency)
-        self._inbound.bind(loop)
         loop.call_soon(ready.set)
         try:
             loop.run_forever()
@@ -379,8 +415,7 @@ class EndpointRuntime(PluginHostBase):
         asyncio.set_event_loop(loop)
         self._transport_loop  = loop
         self._transport_ident = threading.get_ident()
-        self._outbox_evt      = asyncio.Event()
-        self._outbound.bind(loop)
+        self._outbox          = asyncio.Queue()
         loop.call_soon(ready.set)
         try:
             loop.run_forever()
@@ -402,11 +437,10 @@ class EndpointRuntime(PluginHostBase):
             return
 
         backoff = self._backoff_start
-        ssl_check_hostname = True
         while not self._stopping and not self._fatal:
             try:
                 ws_url  = self._ws_url()
-                ssl_ctx = self._ssl_context(ws_url, ssl_check_hostname)
+                ssl_ctx = self._ssl_context(ws_url)
                 async with websockets.connect(
                         ws_url, ssl=ssl_ctx,
                         ping_interval=self._ping_interval,
@@ -430,19 +464,17 @@ class EndpointRuntime(PluginHostBase):
                     self._ws = ws
                     backoff  = self._backoff_start
                     self._registered.set()
+                    # Consumer calls survive a reconnect by design (same name,
+                    # broker still holds the route): pending futures are left in
+                    # place to be resolved by the correlated response.  Surface
+                    # that so a debugging reader sees why a call is still open.
+                    if self._pending:
+                        log.info("[Runtime] reconnected with %d call(s) still "
+                                 "pending across the reconnect", len(self._pending))
                     self._resync_subscriptions()
                     await self._serve_ws(ws)
 
             except ssl.SSLCertVerificationError as e:
-                verify_msg  = getattr(e, 'verify_message', str(e))
-                cert_pinned = bool(self._cert and os.path.exists(self._cert))
-                if self._classify_cert_error(
-                        verify_msg, cert_pinned, ssl_check_hostname) == 'relax':
-                    log.warning("[Runtime] TLS name/IP validation failed: %s; "
-                                "pinned cert present — continuing with name "
-                                "validation DISABLED (dev mode).", e)
-                    ssl_check_hostname = False
-                    continue
                 log.error("[Runtime] TLS verification failed: %s. Aborting.", e)
                 self._fatal = True
                 break
@@ -471,27 +503,25 @@ class EndpointRuntime(PluginHostBase):
             url += '/register'
         return url
 
-    def _ssl_context(self, ws_url: str, check_hostname: bool):
+    def _ssl_context(self, ws_url: str):
+        """Build the client TLS context.
+
+        With a **pinned** cert, ``CERT_REQUIRED`` against that cert already
+        authenticates the peer, so hostname matching (which a self-signed dev
+        cert commonly fails) is redundant — it is disabled up front rather than
+        reactively downgraded on an OpenSSL error string.  Without a pinned cert
+        the system trust store is used with full hostname verification.
+        """
         if not ws_url.startswith('wss://'):
             return None
         ctx = ssl.create_default_context()
-        ctx.check_hostname = check_hostname
-        ctx.verify_mode    = ssl.CERT_REQUIRED
+        ctx.verify_mode = ssl.CERT_REQUIRED
         if self._cert and os.path.exists(self._cert):
             ctx.load_verify_locations(self._cert)
+            ctx.check_hostname = False
+        else:
+            ctx.check_hostname = True
         return ctx
-
-    @staticmethod
-    def _classify_cert_error(verify_message: str, cert_pinned: bool,
-                             check_hostname: bool) -> str:
-        """A hostname/IP mismatch is benign only when a cert is pinned (then
-        ``CERT_REQUIRED`` already guarantees the peer); every other failure
-        aborts (mirrors ``EndpointService._classify_cert_error``)."""
-        msg = (verify_message or '').lower()
-        name_mismatch = 'hostname' in msg or 'ip address' in msg
-        if check_hostname and cert_pinned and name_mismatch:
-            return 'relax'
-        return 'abort'
 
     async def _do_register(self, ws) -> bool:
         reg = protocol.Register(
@@ -547,7 +577,9 @@ class EndpointRuntime(PluginHostBase):
         try:
             while not self._stopping:
                 data = await ws.recv()
-                self._inbound.push(data)
+                # Hand the raw frame to the work loop without blocking the
+                # transport thread (so keepalive is never starved).
+                self._work_loop.call_soon_threadsafe(self._on_frame, data)
         finally:
             sender.cancel()
             try:    await sender
@@ -555,30 +587,14 @@ class EndpointRuntime(PluginHostBase):
                 pass
 
     async def _sender(self, ws) -> None:
+        """Drain the outbound queue onto the socket (transport loop)."""
         try:
             while True:
-                await self._outbox_evt.wait()
-                self._outbox_evt.clear()
-                while self._outbox:
-                    data = self._outbox.popleft()
-                    await ws.send(data)
+                await ws.send(await self._outbox.get())
         except asyncio.CancelledError:
             return
         except Exception as e:
             log.debug("[Runtime] sender stopped: %s", e)
-
-    # ── handoff drains ─────────────────────────────────────────────────
-
-    def _drain_outbound(self, items: List[bytes]) -> None:
-        """Runs on the transport loop: queue frames for the sender."""
-        self._outbox.extend(items)
-        if self._outbox_evt is not None:
-            self._outbox_evt.set()
-
-    def _drain_inbound(self, items: List[bytes]) -> None:
-        """Runs on the work loop: parse + dispatch each inbound frame."""
-        for data in items:
-            self._on_frame(data)
 
     def _emit(self, msg) -> None:
         """Pack an envelope and hand it to the transport loop (thread-safe)."""
@@ -587,7 +603,11 @@ class EndpointRuntime(PluginHostBase):
         except protocol.ProtocolError as e:
             log.error("[Runtime] failed to pack %s: %s", msg.kind, e)
             return
-        self._outbound.push(data)
+        loop = self._transport_loop
+        if loop is None or self._outbox is None:
+            log.warning("[Runtime] dropping %s: transport not up yet", msg.kind)
+            return
+        loop.call_soon_threadsafe(self._outbox.put_nowait, data)
 
     # ── inbound dispatch (work loop) ───────────────────────────────────
 
@@ -611,8 +631,7 @@ class EndpointRuntime(PluginHostBase):
     # ── served-plugin dispatch (work loop) ─────────────────────────────
 
     def _admit_request(self, req: protocol.Request) -> None:
-        cap = self._request_concurrency + self._accept_queue
-        if self._req_inflight >= cap:
+        if self._req_inflight >= self._req_cap:
             # Fast-fail at the cap: 503 + Retry-After, never silently dropped.
             self._emit(protocol.make_response(
                 req, 503,
@@ -627,8 +646,7 @@ class EndpointRuntime(PluginHostBase):
 
     async def _serve_request(self, req: protocol.Request) -> None:
         try:
-            async with self._req_sem:
-                status, headers, body = await self._dispatch_served(req)
+            status, headers, body = await self._dispatch_served(req)
             self._emit(protocol.make_response(
                 req, status, headers=headers, body=body))
         except Exception as e:                             # pragma: no cover
@@ -654,8 +672,10 @@ class EndpointRuntime(PluginHostBase):
             return (404, {'content-type': 'application/json'},
                     _json.dumps({"detail": f"No route: {req.method} {path}"
                                  }).encode())
-        content_type = (req.headers or {}).get('content-type',
-                                               'application/json')
+        # Case-insensitive content-type lookup: a client may send
+        # ``Content-Type`` and a plain dict ``.get('content-type')`` would miss.
+        lower_headers = {k.lower(): v for k, v in (req.headers or {}).items()}
+        content_type = lower_headers.get('content-type', 'application/json')
         # Trusted owner channel.  ``req.src`` is broker-stamped (the broker
         # overwrote the envelope src from the registered identity on every
         # forwarded request), so it — not any client-supplied copy — is the
@@ -706,14 +726,17 @@ class EndpointRuntime(PluginHostBase):
              timeout: Optional[float] = None) -> RuntimeResponse:
         """Send a ``request`` to *dst* and block for its ``response``.
 
-        Returns a :class:`RuntimeResponse` (``.status``/``.headers``/``.body``
-        plus the httpx-ish surface the plugin helpers use).
+        Returns a :class:`RuntimeResponse` — the httpx-ish surface
+        (``.status_code``/``.headers``/``.content``/``.json()``) the plugin
+        helpers use.
         """
         timeout = self._call_timeout if timeout is None else timeout
         fut = asyncio.run_coroutine_threadsafe(
             self._call(dst, method, path, body, headers, timeout),
             self._work_loop)
-        return fut.result(timeout=None if timeout is None else timeout + 5.0)
+        # ``timeout`` is always a number here; the inner ``_call`` already
+        # enforces it, so give the blocking wait a small grace over it.
+        return fut.result(timeout=timeout + 5.0)
 
     # ── consumer: plugin client discovery ──────────────────────────────
 
@@ -741,15 +764,14 @@ class EndpointRuntime(PluginHostBase):
         if client_cls is None:
             raise RuntimeError(f"plugin client for {plugin_name!r} not known")
 
-        # Mix the concrete helper on top of the runtime transport seam.  The
-        # standard PluginClient ctor signature is preserved so helpers that
-        # override __init__ keep working.
-        combined = type('Runtime%s' % client_cls.__name__,
-                        (client_cls, RuntimePluginClient), {})
-        client = combined(_RuntimeHTTP(self, endpoint_name), namespace,
-                          broker_client=None, endpoint_id=endpoint_name,
-                          plugin_name=plugin_name)
-        client._runtime = self
+        # The concrete helper rides the runtime transport seam directly: its
+        # ``self._http`` is a :class:`_RuntimeHTTP` over the WebSocket, and it is
+        # handed ``broker_client=self`` so the base
+        # ``register_notification_callback`` forwards straight to this runtime's
+        # callback registry — no mixin, no synthesized class.
+        client = client_cls(_RuntimeHTTP(self, endpoint_name), namespace,
+                            broker_client=self, endpoint_id=endpoint_name,
+                            plugin_name=plugin_name)
         client.register_session(**session_kwargs)
         return client
 
@@ -915,8 +937,7 @@ class EndpointRuntime(PluginHostBase):
         one obvious way, matching the rest of the consumer-facing API.
 
         ``seq`` is a placeholder (0) — the broker stamps the authoritative
-        ``seq``/``ts`` on ingest.  Reuses the notification plumbing shape
-        ``service.py`` exposes as ``send_notification``.
+        ``seq``/``ts`` on ingest.
         """
         ev = protocol.Event(src=self._name, plugin=plugin_name, topic=topic,
                             session=None, ts=0.0, seq=0, data=data)
@@ -929,7 +950,7 @@ class EndpointRuntime(PluginHostBase):
         liveness}``)."""
         return dict(self._topology)
 
-    # ── tunnels (service.py shapes) ────────────────────────────────────
+    # ── tunnels ────────────────────────────────────────────────────────
 
     async def _open_tunnel_forward(self) -> None:
         """Forward mode: open ``ssh -L`` to the login host and rewrite the
@@ -981,6 +1002,9 @@ class EndpointRuntime(PluginHostBase):
 
         deadline = asyncio.get_running_loop().time() + wait_timeout
         while asyncio.get_running_loop().time() < deadline:
+            # Poll via listdir (not relay_file.exists()) on purpose: a directory
+            # read forces the shared-FS client (Lustre/NFS/DVS) to revalidate its
+            # cache, so a file the login-side spawner just wrote is seen promptly.
             try:    contents = set(os.listdir(str(relay_file.parent)))
             except OSError:
                 contents = set()

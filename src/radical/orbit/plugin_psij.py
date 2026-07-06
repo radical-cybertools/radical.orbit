@@ -25,15 +25,17 @@ import time
 
 from datetime import timedelta
 from typing import Any, Dict
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request
 
 import psij
 
+from . import batch_system
+from . import tunnel
 from .plugin_base import Plugin
 from .plugin_session_base import PluginSession
-from .client import PluginClient, _run_sync
-from .tunnel import relay_dir as _relay_dir
+from .client import PluginClient
 
 log = logging.getLogger("radical.orbit")
 
@@ -121,15 +123,12 @@ class PSIJSession(PluginSession):
     Session-specific PSIJ state.
     '''
 
-    poll_interval = PSIJ_POLL_INTERVAL
-
     def __init__(self, sid: str, **kwargs: Any):
         super().__init__(sid)
         self._jobs: Dict[str, Any] = {}       # job_id -> psij.Job
         self._job_meta: Dict[str, dict] = {}  # job_id -> submission metadata
         self._job_states: Dict[str, str] = {}  # track last known state per job
         self._cancelled_jobs: set = set()      # job_ids the user asked to cancel
-        self._poll_interval = kwargs.get('poll_interval', self.poll_interval)
         self._poll_task = None
 
         # Persistent output directory for this session's job stdout/stderr
@@ -164,6 +163,35 @@ class PSIJSession(PluginSession):
                     log.info("Cleaned up stale output dir: %s", entry)
             except Exception as e:
                 log.debug("Failed to clean up %s: %s", entry, e)
+
+    def _notify_state(self, job_id: str, status=None) -> None:
+        """Normalize, dedupe and emit a ``job_status`` notification.
+
+        The single source of job-status notifications: both the submit-time
+        psij callback and the background poll loop call this, so they share
+        one dedupe store (``self._job_states``) and one payload shape — a
+        transition can therefore never double-fire.  *status* defaults to the
+        job's current ``status`` (the poll path); the callback passes the
+        transition status it was handed.  A no-op when the state has not
+        changed since the last emission.
+        """
+        job = self._jobs.get(job_id)
+        if job is None:
+            return
+        if status is None:
+            status = job.status
+        state = self._effective_state(job_id, _normalize_state(status.state))
+        if state == self._job_states.get(job_id):
+            return
+        self._job_states[job_id] = state
+        is_terminal = state in TERMINAL_STATES
+        self.notify("job_status", {
+            "job_id":    job_id,
+            "state":     state,
+            "exit_code": status.exit_code if is_terminal else None,
+            "stdout":    _read_output_file(job, 'stdout_path') if is_terminal else "",
+            "stderr":    _read_output_file(job, 'stderr_path') if is_terminal else "",
+        })
 
     async def submit_job(self, job_spec_dict: Dict[str, Any], executor_name: str = 'local') -> Dict[str, Any]:
         '''
@@ -206,8 +234,7 @@ class PSIJSession(PluginSession):
             # filesystems= on every submission, which the UI / Python API
             # users are not expected to know.  Only applied when the
             # chosen executor matches the detected backend.
-            from .batch_system import detect_batch_system
-            backend = detect_batch_system()
+            backend = batch_system.detect_batch_system()
             defaults = (backend.default_custom_attributes()
                         if backend.psij_executor == executor_name else {})
             caller_ca = dict(job_spec_dict.get('custom_attributes') or {})
@@ -249,7 +276,7 @@ class PSIJSession(PluginSession):
 
             # Set poll interval for status updates
             if hasattr(ex, 'poll_interval'):
-                ex.poll_interval = self._poll_interval
+                ex.poll_interval = PSIJ_POLL_INTERVAL
 
             self._jobs[job.id] = job
 
@@ -266,36 +293,12 @@ class PSIJSession(PluginSession):
                 'duration':    attribs.get('duration'),
             }
 
-            # Register status callback BEFORE submit so no transitions are missed
-            plugin = self._plugin
+            # Register status callback BEFORE submit so no transitions are
+            # missed; it shares the dedupe/payload path with the poll loop.
             job_id = job.id
-            last_state = None
 
             def _on_status(j, status):
-                nonlocal last_state
-                state_str = _normalize_state(status.state)
-                state_str = self._effective_state(job_id, state_str)
-
-                # Skip if state hasn't changed
-                if state_str == last_state:
-                    return
-                last_state = state_str
-                is_terminal = state_str in TERMINAL_STATES
-
-                stdout_content = ""
-                stderr_content = ""
-                if is_terminal:
-                    stdout_content = _read_output_file(j, 'stdout_path')
-                    stderr_content = _read_output_file(j, 'stderr_path')
-
-                if plugin:
-                    plugin._dispatch_notify("job_status", {
-                        "job_id":    job_id,
-                        "state":     state_str,
-                        "exit_code": status.exit_code if is_terminal else None,
-                        "stdout":    stdout_content,
-                        "stderr":    stderr_content
-                    })
+                self._notify_state(job_id, status)
 
             job.set_job_status_callback(_on_status)
 
@@ -433,38 +436,12 @@ class PSIJSession(PluginSession):
                     await asyncio.sleep(0.5)
                     first = False
                 else:
-                    await asyncio.sleep(self._poll_interval)
+                    await asyncio.sleep(PSIJ_POLL_INTERVAL)
 
-                # Check all non-terminal jobs
-                for job_id, job in list(self._jobs.items()):
+                # Check all jobs; _notify_state normalizes/dedupes/notifies.
+                for job_id in list(self._jobs):
                     try:
-                        status    = job.status
-                        state_str = _normalize_state(status.state)
-                        state_str = self._effective_state(job_id, state_str)
-
-                        # Skip if state hasn't changed
-                        last_state = self._job_states.get(job_id)
-                        if state_str == last_state:
-                            continue
-                        self._job_states[job_id] = state_str
-
-                        is_terminal = state_str in TERMINAL_STATES
-
-                        stdout_content = ""
-                        stderr_content = ""
-                        if is_terminal:
-                            stdout_content = _read_output_file(job, 'stdout_path')
-                            stderr_content = _read_output_file(job, 'stderr_path')
-
-                        if self._plugin:
-                            self._plugin._dispatch_notify("job_status", {
-                                "job_id":    job_id,
-                                "state":     state_str,
-                                "exit_code": status.exit_code if is_terminal else None,
-                                "stdout":    stdout_content,
-                                "stderr":    stderr_content
-                            })
-
+                        self._notify_state(job_id)
                     except Exception as e:
                         log.debug("Error polling job %s: %s", job_id, e)
 
@@ -518,13 +495,6 @@ class PSIJClient(PluginClient):
         Returns:
             Job status info including metadata and stdout/stderr.
         """
-        return _run_sync(self.aget_job_status(
-            job_id, stdout_offset, stderr_offset))
-
-    async def aget_job_status(self, job_id: str,
-                              stdout_offset: int = 0,
-                              stderr_offset: int = 0) -> Dict[str, Any]:
-        """Async core for :meth:`get_job_status` (broker-hosted dispatcher)."""
         self._require_session()
 
         url    = self._url(ROUTE_STATUS.format(sid=self.sid, job_id=job_id))
@@ -534,7 +504,7 @@ class PSIJClient(PluginClient):
         if stderr_offset:
             params['stderr_offset'] = str(stderr_offset)
 
-        resp = await self._arequest("GET", url, params=params)
+        resp = self._http.get(url, params=params)
         self._raise(resp, f"job status {job_id!r}")
         return resp.json()
 
@@ -561,15 +531,11 @@ class PSIJClient(PluginClient):
         Returns:
             Cancellation result.
         """
-        return _run_sync(self.acancel_job(job_id))
-
-    async def acancel_job(self, job_id: str) -> Dict[str, Any]:
-        """Async core for :meth:`cancel_job` (broker-hosted dispatcher)."""
         self._require_session()
 
         url = self._url(ROUTE_CANCEL.format(sid=self.sid, job_id=job_id))
 
-        resp = await self._arequest("POST", url)
+        resp = self._http.post(url)
         self._raise(resp, f"cancel job {job_id!r}")
         return resp.json()
 
@@ -614,16 +580,6 @@ class PSIJClient(PluginClient):
             ValueError:   If *tunnel* is not one of the three string values.
             RuntimeError: If the server returns an error response.
         """
-        return _run_sync(self.asubmit_tunneled(job_spec, executor, tunnel))
-
-    async def asubmit_tunneled(self, job_spec: Dict[str, Any],
-                               executor: str = 'local',
-                               tunnel: str = 'none') -> Dict[str, Any]:
-        """Async core for :meth:`submit_tunneled` (broker-hosted dispatcher).
-
-        Same validation, path, payload and error mapping as the sync wrapper;
-        the dispatcher awaits this directly on the broker host loop.
-        """
         if tunnel not in ('none', 'forward', 'reverse'):
             raise ValueError(
                 f"tunnel must be one of 'none' / 'forward' / 'reverse'; "
@@ -634,7 +590,7 @@ class PSIJClient(PluginClient):
         url     = self._url(ROUTE_SUBMIT_TUNNELED.format(sid=self.sid))
         payload = {"job_spec": job_spec, "executor": executor, "tunnel": tunnel}
 
-        resp = await self._arequest("POST", url, json=payload)
+        resp = self._http.post(url, json=payload)
         self._raise(resp, f"psij submit_tunneled on {executor!r}")
         return resp.json()
 
@@ -747,7 +703,7 @@ class PluginPSIJ(Plugin):
         self._failure_reasons: dict = {}
 
         # Ensure relay directory exists at startup
-        _relay_dir()
+        tunnel.relay_dir()
 
         self._app.router.on_shutdown.append(self._cleanup_watchers)
 
@@ -843,13 +799,13 @@ class PluginPSIJ(Plugin):
 
         job_spec = data.get('job_spec', {})
         executor = data.get('executor', 'local')
-        tunnel   = data.get('tunnel', 'none')
+        mode     = data.get('tunnel', 'none')   # not ``tunnel`` — that's the module
 
-        if tunnel not in ('none', 'forward', 'reverse'):
+        if mode not in ('none', 'forward', 'reverse'):
             raise HTTPException(
                 status_code=400,
                 detail=f"tunnel must be one of 'none' / 'forward' / 'reverse'; "
-                       f"got {tunnel!r}")
+                       f"got {mode!r}")
 
         # --- resolve endpoint name from arguments ---
         args = list(job_spec.get('arguments') or [])
@@ -871,19 +827,13 @@ class PluginPSIJ(Plugin):
                 status_code=409,
                 detail=f"Tunnel watcher already active for endpoint '{endpoint_name}'")
 
-        # --- prepare rendezvous + inject child-side flags ---
-        relay_file: 'pathlib.Path | None' = None
-        if tunnel != 'none':
-            relay_file = _relay_dir() / f'{endpoint_name}.port'
-            relay_file.unlink(missing_ok=True)  # remove stale file from previous run
-            pid_file = _relay_dir() / f'{endpoint_name}.pid'
-            pid_file.unlink(missing_ok=True)
-            req_file = _relay_dir() / f'{endpoint_name}.req'
-            req_file.unlink(missing_ok=True)
+        # --- clear stale rendezvous files + inject child-side flags ---
+        if mode != 'none':
+            tunnel.rendezvous_clear(endpoint_name)  # drop any prior-run files
 
             if '--tunnel' not in args:
-                args.extend(['--tunnel', tunnel])
-            if tunnel == 'forward' and '--tunnel-via' not in args:
+                args.extend(['--tunnel', mode])
+            if mode == 'forward' and '--tunnel-via' not in args:
                 # Forward mode: child needs to know which login host to ssh to.
                 args.extend(['--tunnel-via', socket.gethostname()])
 
@@ -894,16 +844,18 @@ class PluginPSIJ(Plugin):
                                    job_spec_dict=job_spec,
                                    executor_name=executor)
 
-        if tunnel != 'none' and relay_file is not None:
+        if mode != 'none':
             native_id = resp.get('native_id')
             job_id    = resp.get('job_id')
             log.info("[psij] submit_tunneled mode=%s: endpoint=%s job_id=%s "
                      "native_id=%s -- watcher started",
-                     tunnel, endpoint_name, job_id, native_id)
-            task = asyncio.create_task(
-                self._tunnel_watcher(endpoint_name, native_id, job_id,
-                                     relay_file, tunnel))
-            self._watchers[endpoint_name] = task
+                     mode, endpoint_name, job_id, native_id)
+            if mode == 'forward':
+                watch = self._watch_forward(endpoint_name, native_id)
+            else:
+                watch = self._watch_reverse(sid, endpoint_name,
+                                            native_id, job_id)
+            self._watchers[endpoint_name] = asyncio.create_task(watch)
 
         # Augment response with endpoint_name for caller convenience
         resp['endpoint_name'] = endpoint_name
@@ -924,22 +876,9 @@ class PluginPSIJ(Plugin):
         - ``pid``        — SSH process PID on the compute node (read from
                            the pid rendezvous file) once active, else null.
         """
-        endpoint_name  = request.path_params['endpoint_name']
-        relay_file = _relay_dir() / f'{endpoint_name}.port'
-        pid_file   = _relay_dir() / f'{endpoint_name}.pid'
-
-        port = None
-        pid  = None
-        if relay_file.exists():
-            try:
-                port = int(relay_file.read_text().strip())
-            except (ValueError, OSError):
-                pass
-        if pid_file.exists():
-            try:
-                pid = int(pid_file.read_text().strip())
-            except (ValueError, OSError):
-                pass
+        endpoint_name = request.path_params['endpoint_name']
+        port = tunnel.rendezvous_read(endpoint_name, 'port')
+        pid  = tunnel.rendezvous_read(endpoint_name, 'pid')
 
         task = self._watchers.get(endpoint_name)
         if task is None:
@@ -967,60 +906,89 @@ class PluginPSIJ(Plugin):
     #  Internal tunnel helpers
     # ─────────────────────────────────────────────────────────────────────────
 
-    async def _tunnel_watcher(self, endpoint_name: str, native_id,
-                              job_id: 'str | None',
-                              relay_file: 'pathlib.Path',
-                              mode: str) -> None:
-        """Watch a tunneled-job's progress; behaviour depends on *mode*.
+    def _reverse_broker_target(self) -> tuple:
+        """Resolve the ``(host, port)`` the reverse ``ssh -R`` forwards to.
 
-        **forward** (compute → login): the child opens its own ``ssh -L``
-        and writes the rendezvous file.  This watcher only observes the
-        job state.  If the job goes terminal before the file appears,
-        the failure already manifests as the job's natural ``FAILED``
-        state — we do nothing (no parent-side cancel needed).
-
-        **reverse** (login → compute): once the job reaches ``RUNNING``
-        we look up the compute hostname via ``BatchSystem.job_nodes()``
-        and spawn ``ssh -R`` from this side.  On any spawn failure (or
-        the SSH process dying before/after writing the rendezvous file)
-        we record a reason in ``_failure_reasons[job_id]`` and call
-        ``cancel_job`` so the now-useless allocation is released; the
-        client then sees the cancel as ``FAILED`` (with our reason) via
-        :meth:`get_job_status`.
-
-        Args:
-            endpoint_name:  Logical name of the child endpoint service.
-            native_id:  Native scheduler job ID (SLURM/PBS/...).
-            job_id:     PsiJ job-id (key in ``_failure_reasons``).
-            relay_file: Shared-filesystem file the child reads
-                        regardless of who writes it.
-            mode:       ``'forward'`` or ``'reverse'``.  ``'none'``
-                        callers don't reach here.
+        Same value the child would resolve from its broker URL, handed to
+        OpenSSH's ``-R`` spec.
         """
-        from .batch_system import (detect_batch_system, STATE_CANCELLED,
-                                   STATE_UNKNOWN, TERMINAL_STATES)
-        from . import tunnel as _tunnel
-        batch = detect_batch_system()
+        broker_url = getattr(self._app.state, 'broker_url', '') or ''
+        parsed = urlparse(broker_url)
+        host = parsed.hostname or 'localhost'
+        port = parsed.port or (443 if parsed.scheme in ('https', 'wss') else 8000)
+        return host, port
 
-        log.info("[psij] Watcher started mode=%s for endpoint '%s' "
-                 "(job=%s native=%s, backend=%s) — relay file %s",
-                 mode, endpoint_name, job_id, native_id, batch.name, relay_file)
+    async def _watch_forward(self, endpoint_name: str, native_id) -> None:
+        """Observe a forward-mode tunneled job until its port file appears.
 
-        # In reverse mode this watcher *will* spawn an SSH process and
-        # is responsible for tearing it down.
-        ssh_proc = None
+        Forward mode (compute → login): the child opens its own ``ssh -L``
+        and writes the rendezvous port file, so this watcher only polls job
+        state.  When the job goes terminal or vanishes before the file
+        appears the failure already surfaces as the job's natural ``FAILED``
+        state, so there is nothing to clean up here.
+        """
+        batch = batch_system.detect_batch_system()
+        log.info("[psij] forward watcher for endpoint '%s' (native=%s, "
+                 "backend=%s)", endpoint_name, native_id, batch.name)
 
-        # Broker URL/port for the reverse spawn — same value the child
-        # would resolve, so we can hand it to OpenSSH's -R spec.
-        broker_host = 'localhost'
-        broker_port = 8000
-        if mode == 'reverse':
-            from urllib.parse import urlparse
-            broker_url = getattr(self._app.state, 'broker_url', '') or ''
-            parsed     = urlparse(broker_url)
-            broker_host = parsed.hostname or 'localhost'
-            broker_port = parsed.port or (443 if parsed.scheme in ('https', 'wss') else 8000)
+        last_state     = None
+        seen_known     = False
+        unknown_streak = 0
+        for attempt in range(300):       # up to ~10 min (2s × 300)
+            await asyncio.sleep(2)
 
+            if tunnel.rendezvous_read(endpoint_name) is not None:
+                log.info("[psij] endpoint '%s' forward tunnel active",
+                         endpoint_name)
+                return
+
+            state = await asyncio.to_thread(batch.job_state, native_id)
+
+            if state == batch_system.STATE_UNKNOWN:
+                unknown_streak += 1
+            else:
+                seen_known     = True
+                unknown_streak = 0
+
+            if state != last_state or attempt % 30 == 0:
+                log.info("[psij] forward watcher endpoint=%s job=%s state=%r "
+                         "(attempt %d/300)", endpoint_name, native_id,
+                         state or '(unknown)', attempt)
+                last_state = state
+
+            if state in batch_system.TERMINAL_STATES:
+                log.warning("[psij] job %s ended with state %s — forward tunnel "
+                            "port file never appeared", native_id, state)
+                return
+
+            if seen_known and unknown_streak >= UNKNOWN_TOLERANCE:
+                log.warning("[psij] job %s vanished from queue (state=UNKNOWN x "
+                            "%d) — forward tunnel port file never appeared",
+                            native_id, unknown_streak)
+                return
+
+        log.warning("[psij] forward watcher for endpoint '%s' timed out",
+                    endpoint_name)
+
+    async def _watch_reverse(self, sid: str, endpoint_name: str, native_id,
+                             job_id: 'str | None') -> None:
+        """Drive a reverse-mode tunnel and tear it down when the job ends.
+
+        Reverse mode (login → compute): the child publishes its compute
+        hostname in the ``.req`` rendezvous file; we spawn ``ssh -R`` from
+        this side, which writes the port file the child then reads.  On any
+        spawn failure — or the job going terminal / vanishing before the
+        tunnel comes up — we record a reason via :meth:`_fail_tunnel` and
+        cancel the now-useless allocation, so the client sees ``FAILED``
+        (with our reason) via :meth:`get_job_status`.  A plain operator
+        cancel keeps its natural ``CANCELLED`` state.
+        """
+        batch = batch_system.detect_batch_system()
+        broker_host, broker_port = self._reverse_broker_target()
+        log.info("[psij] reverse watcher for endpoint '%s' (job=%s native=%s "
+                 "backend=%s)", endpoint_name, job_id, native_id, batch.name)
+
+        ssh_proc       = None
         last_state     = None
         seen_known     = False
         unknown_streak = 0
@@ -1028,266 +996,201 @@ class PluginPSIJ(Plugin):
             for attempt in range(300):       # up to ~10 min (2s × 300)
                 await asyncio.sleep(2)
 
-                # Both modes: rendezvous file appearing is the success signal.
-                if relay_file.exists():
-                    try:
-                        port = int(relay_file.read_text().strip())
-                    except (ValueError, OSError):
-                        port = None
-                    log.info("[psij] endpoint '%s' tunnel active on port %s "
-                             "(mode=%s)", endpoint_name, port, mode)
-                    if mode == 'reverse':
-                        # Continue polling so we can tear ssh_proc down
-                        # cleanly when the job ends.
-                        await self._await_reverse_teardown(
-                            endpoint_name, native_id, ssh_proc, batch)
+                # Success: the remote port has been published.
+                if tunnel.rendezvous_read(endpoint_name) is not None:
+                    log.info("[psij] endpoint '%s' reverse tunnel active",
+                             endpoint_name)
+                    await self._await_reverse_teardown(
+                        endpoint_name, native_id, ssh_proc, batch)
                     return
 
-                # Reverse-mode side-channel: spawn ssh -R as soon as
-                # the job has been allocated a compute host.
                 state = await asyncio.to_thread(batch.job_state, native_id)
 
-                # Reverse-mode spawn: gate on the child's .req file
-                # ONLY.  We deliberately do NOT require state ==
-                # RUNNING: SLURM state polling is unreliable on some
-                # clusters (squeue can return UNKNOWN/empty for the
-                # entire lifetime of a short job; observed on ODO
-                # 2026-05-11) and is a stale-at-best proxy for
-                # "child is ready".  The .req file is authoritative
-                # — it can only have been produced by the running
-                # child, on its own compute node, after
-                # socket.gethostname() returned.  State polling
-                # below still aborts the watcher when the job
-                # reaches a TERMINAL state without producing .req.
-                if mode == 'reverse' and ssh_proc is None:
-                    req_file = relay_file.with_suffix('.req')
-                    # NFSv3 caches negative lookups (file-doesn't-exist)
-                    # for tens of seconds.  After the parent's first
-                    # `req_file.exists()` returns False, the cached
-                    # ENOENT keeps returning False even after the
-                    # child writes .req on the shared FS — observed
-                    # on ODO 2026-05-11 17:10: .req appeared at +21s,
-                    # parent kept seeing False for the whole 16s
-                    # window the file was on disk.  A readdir on the
-                    # parent dir invalidates the negative-lookup
-                    # cache by forcing fresh directory attributes.
+                # Spawn ssh -R once the child publishes its hostname via .req.
+                # The .req file — not job state — is the authoritative "child
+                # is ready" signal: squeue reports UNKNOWN for a short job's
+                # whole lifetime on some clusters, while .req can only exist
+                # once the child is actually running on its compute node.
+                if ssh_proc is None:
                     try:
-                        dir_contents = set(
-                            os.listdir(str(req_file.parent)))
-                    except OSError:
-                        dir_contents = set()
-                    if req_file.name in dir_contents:
-                        try:
-                            import json as _json
-                            compute_host = _json.loads(
-                                req_file.read_text()).get('hostname')
-                        except (ValueError, OSError) as exc:
-                            await self._fail_tunnel(
-                                endpoint_name, job_id, native_id,
-                                f"reverse SSH: .req file unreadable: {exc}")
-                            return
+                        req = tunnel.rendezvous_wait(endpoint_name)
+                    except (ValueError, OSError) as exc:
+                        await self._fail_tunnel(
+                            sid, endpoint_name, job_id, native_id,
+                            f"reverse SSH: .req file unreadable: {exc}")
+                        return
+                    if req is not None:
+                        compute_host = req.get('hostname')
                         if not compute_host:
                             await self._fail_tunnel(
-                                endpoint_name, job_id, native_id,
+                                sid, endpoint_name, job_id, native_id,
                                 "reverse SSH: .req file has no 'hostname' field")
                             return
-                        log.info("[psij] reverse: child .req says hostname=%s "
-                                 "for job %s, spawning ssh -R to %s:%s",
-                                 compute_host, native_id, broker_host, broker_port)
-                        # Retry the spawn for up to ~30s.  Some
-                        # sites' compute-node sshd refuses logins
-                        # from the login node for a short window
-                        # after the job is registered (e.g.
-                        # pam_slurm_adopt rejects until the job's
-                        # cgroup is fully established).  The retry
-                        # is transport-agnostic: any spawn failure
-                        # gets a fresh attempt 1s later.  Bail out
-                        # immediately if the job goes terminal in
-                        # the meantime — no point retrying once the
-                        # allocation is gone.
-                        last_exc = None
-                        for spawn_attempt in range(30):
-                            try:
-                                ssh_proc, port = await asyncio.to_thread(
-                                    _tunnel.spawn_reverse_tunnel,
-                                    compute_host, broker_host, broker_port,
-                                    endpoint_name)
-                                break
-                            except Exception as exc:
-                                last_exc = exc
-                                if (await asyncio.to_thread(
-                                        batch.job_state, native_id)
-                                        in TERMINAL_STATES):
-                                    await self._fail_tunnel(
-                                        endpoint_name, job_id, native_id,
-                                        f"reverse SSH spawn failed and job "
-                                        f"went terminal: {exc}")
-                                    return
-                                if spawn_attempt == 0:
-                                    log.info("[psij] reverse: first ssh -R "
-                                             "spawn rejected (likely "
-                                             "pam_slurm_adopt race), "
-                                             "retrying: %s", exc)
-                                else:
-                                    log.debug("[psij] reverse: ssh -R spawn "
-                                              "retry %d/30: %s",
-                                              spawn_attempt + 1, exc)
-                                await asyncio.sleep(1)
-                        else:
-                            await self._fail_tunnel(
-                                endpoint_name, job_id, native_id,
-                                f"reverse SSH spawn failed after 30 "
-                                f"attempts: {last_exc}")
-                            return
-                        self._tunnel_procs[endpoint_name] = ssh_proc
+                        log.info("[psij] reverse: child .req hostname=%s for "
+                                 "job %s, spawning ssh -R to %s:%s", compute_host,
+                                 native_id, broker_host, broker_port)
+                        ssh_proc = await self._spawn_reverse_ssh(
+                            sid, endpoint_name, native_id, job_id,
+                            compute_host, broker_host, broker_port, batch)
+                        if ssh_proc is None:
+                            return   # spawn failed; _fail_tunnel already fired
 
-                if state == STATE_UNKNOWN:
+                if state == batch_system.STATE_UNKNOWN:
                     unknown_streak += 1
                 else:
                     seen_known     = True
                     unknown_streak = 0
 
                 if state != last_state or attempt % 30 == 0:
-                    log.info("[psij] watcher endpoint=%s job=%s mode=%s "
-                             "state=%r (attempt %d/300)",
-                             endpoint_name, native_id, mode,
+                    log.info("[psij] reverse watcher endpoint=%s job=%s state=%r "
+                             "(attempt %d/300)", endpoint_name, native_id,
                              state or '(unknown)', attempt)
                     last_state = state
 
-                if state in TERMINAL_STATES:
-                    log.warning("[psij] Job %s ended with state %s — "
-                                "aborting watch (relay file %s never appeared)",
-                                native_id, state, relay_file)
-                    if mode == 'reverse' and ssh_proc is not None:
-                        # We had spawned SSH but the rendezvous file never
-                        # appeared.  Treat as tunnel failure.
+                if state in batch_system.TERMINAL_STATES:
+                    log.warning("[psij] job %s ended with state %s before "
+                                "reverse tunnel came up", native_id, state)
+                    if ssh_proc is not None:
                         await self._fail_tunnel(
-                            endpoint_name, job_id, native_id,
+                            sid, endpoint_name, job_id, native_id,
                             f"reverse SSH spawned but rendezvous file never "
                             f"appeared (job {state})", spawn_proc=ssh_proc)
-                    elif mode == 'reverse' and state != STATE_CANCELLED:
-                        # Job hit a terminal state before the child
-                        # could write .req — surface that as a tunnel
-                        # failure so the client gets a clear error.
-                        # CANCELLED is left alone: that's a deliberate
-                        # operator-initiated outcome and shouldn't be
-                        # converted to FAILED via _fail_tunnel.
+                    elif state != batch_system.STATE_CANCELLED:
+                        # A plain operator cancel (CANCELLED) is left as-is;
+                        # any other terminal state means the child never got
+                        # to write .req, which is a tunnel failure.
                         await self._fail_tunnel(
-                            endpoint_name, job_id, native_id,
-                            f"child never wrote .req (job ended {state} "
-                            f"before reverse tunnel could be set up)")
+                            sid, endpoint_name, job_id, native_id,
+                            f"child never wrote .req (job ended {state} before "
+                            f"reverse tunnel could be set up)")
                     return
 
                 if seen_known and unknown_streak >= UNKNOWN_TOLERANCE:
-                    log.warning("[psij] Job %s vanished from queue "
-                                "(state=UNKNOWN x %d) — aborting watch "
-                                "(relay file %s never appeared)",
-                                native_id, unknown_streak, relay_file)
-                    if mode == 'reverse' and ssh_proc is not None:
+                    log.warning("[psij] job %s vanished from queue (state="
+                                "UNKNOWN x %d) — reverse tunnel never came up",
+                                native_id, unknown_streak)
+                    if ssh_proc is not None:
                         await self._fail_tunnel(
-                            endpoint_name, job_id, native_id,
+                            sid, endpoint_name, job_id, native_id,
                             f"reverse SSH spawned but job vanished "
-                            f"(UNKNOWN x {unknown_streak})",
-                            spawn_proc=ssh_proc)
+                            f"(UNKNOWN x {unknown_streak})", spawn_proc=ssh_proc)
                     return
 
-            log.warning("[psij] Watcher for endpoint '%s' timed out waiting for "
-                        "tunnel port file %s", endpoint_name, relay_file)
-            if mode == 'reverse':
-                await self._fail_tunnel(
-                    endpoint_name, job_id, native_id,
-                    "tunnel watcher timed out before rendezvous file appeared",
-                    spawn_proc=ssh_proc)
+            log.warning("[psij] reverse watcher for endpoint '%s' timed out",
+                        endpoint_name)
+            await self._fail_tunnel(
+                sid, endpoint_name, job_id, native_id,
+                "tunnel watcher timed out before rendezvous file appeared",
+                spawn_proc=ssh_proc)
         finally:
             if ssh_proc is not None and ssh_proc.poll() is None:
-                _tunnel.cleanup_tunnel(ssh_proc, endpoint_name)
+                tunnel.cleanup_tunnel(ssh_proc, endpoint_name)
                 self._tunnel_procs.pop(endpoint_name, None)
 
-    async def _await_reverse_teardown(self, endpoint_name: str, native_id,
-                                       ssh_proc, batch) -> None:
-        """Once a reverse tunnel is active, poll the job state until
-        it reaches a terminal state, then tear down the SSH process."""
-        from .batch_system import TERMINAL_STATES, STATE_UNKNOWN
-        from . import tunnel as _tunnel
+    async def _spawn_reverse_ssh(self, sid: str, endpoint_name: str, native_id,
+                                 job_id: 'str | None', compute_host: str,
+                                 broker_host: str, broker_port: int, batch):
+        """Spawn ``ssh -R`` to *compute_host*, retrying briefly.
 
+        Returns the SSH process on success.  On failure records the reason
+        via :meth:`_fail_tunnel` (which cancels the job) and returns ``None``
+        so the caller stops watching.  The retry tolerates the
+        pam_slurm_adopt race where a compute node's sshd briefly refuses
+        login-node logins just after the job registers.
+        """
+        last_exc = None
+        for spawn_attempt in range(30):
+            try:
+                proc, port = await asyncio.to_thread(
+                    tunnel.spawn_reverse_tunnel,
+                    compute_host, broker_host, broker_port, endpoint_name)
+            except Exception as exc:
+                last_exc = exc
+                if await asyncio.to_thread(batch.job_state, native_id) \
+                        in batch_system.TERMINAL_STATES:
+                    await self._fail_tunnel(
+                        sid, endpoint_name, job_id, native_id,
+                        f"reverse SSH spawn failed and job went terminal: {exc}")
+                    return None
+                if spawn_attempt == 0:
+                    log.info("[psij] reverse: first ssh -R spawn rejected "
+                             "(likely pam_slurm_adopt race), retrying: %s", exc)
+                else:
+                    log.debug("[psij] reverse: ssh -R spawn retry %d/30: %s",
+                              spawn_attempt + 1, exc)
+                await asyncio.sleep(1)
+                continue
+            self._tunnel_procs[endpoint_name] = proc
+            log.info("[psij] reverse: ssh -R for endpoint '%s' active on remote "
+                     "port %d", endpoint_name, port)
+            return proc
+        await self._fail_tunnel(
+            sid, endpoint_name, job_id, native_id,
+            f"reverse SSH spawn failed after 30 attempts: {last_exc}")
+        return None
+
+    async def _await_reverse_teardown(self, endpoint_name: str, native_id,
+                                      ssh_proc, batch) -> None:
+        """Poll a live reverse tunnel's job until it ends, then tear down ssh -R."""
         try:
             while True:
                 await asyncio.sleep(5)
                 state = await asyncio.to_thread(batch.job_state, native_id)
-                if state in TERMINAL_STATES or state == STATE_UNKNOWN:
-                    log.info("[psij] reverse: job %s reached %s — "
-                             "tearing down ssh -R for endpoint %s",
-                             native_id, state, endpoint_name)
+                if state in batch_system.TERMINAL_STATES \
+                        or state == batch_system.STATE_UNKNOWN:
+                    log.info("[psij] reverse: job %s reached %s — tearing down "
+                             "ssh -R for endpoint %s", native_id, state,
+                             endpoint_name)
                     return
-                if ssh_proc.poll() is not None:
+                if ssh_proc is not None and ssh_proc.poll() is not None:
                     log.warning("[psij] reverse: ssh -R for endpoint %s exited "
                                 "(rc=%s) while job %s still running",
                                 endpoint_name, ssh_proc.returncode, native_id)
                     return
         finally:
-            _tunnel.cleanup_tunnel(ssh_proc, endpoint_name)
+            if ssh_proc is not None:
+                tunnel.cleanup_tunnel(ssh_proc, endpoint_name)
             self._tunnel_procs.pop(endpoint_name, None)
-            (_relay_dir() / f'{endpoint_name}.req').unlink(missing_ok=True)
+            tunnel.rendezvous_clear(endpoint_name)
 
-    async def _fail_tunnel(self, endpoint_name: str, job_id: 'str | None',
-                            native_id, reason: str, spawn_proc=None) -> None:
+    async def _fail_tunnel(self, sid: str, endpoint_name: str,
+                           job_id: 'str | None', native_id, reason: str,
+                           spawn_proc=None) -> None:
         """Record a tunnel failure and cancel the now-useless job.
 
-        Recorded reason surfaces via ``get_job_status`` as a synthesised
-        ``state='FAILED'`` plus an ``error`` field — see the override
-        in :meth:`get_job_status`.
+        The recorded reason surfaces via :meth:`get_job_status` as a
+        synthesised ``state='FAILED'`` plus an ``error`` field.  The cancel
+        goes through the owning session (via ``sid``) to release the
+        allocation.
         """
-        from . import tunnel as _tunnel
         log.error("[psij] tunnel failed for endpoint '%s' (job %s): %s",
                   endpoint_name, job_id, reason)
         if job_id:
             self._failure_reasons[job_id] = reason
         if spawn_proc is not None:
-            _tunnel.cleanup_tunnel(spawn_proc, endpoint_name)
+            tunnel.cleanup_tunnel(spawn_proc, endpoint_name)
             self._tunnel_procs.pop(endpoint_name, None)
-        # Clean up the child's .req rendezvous file on every failure
-        # path, not just when an ssh proc was spawned.  Otherwise an
-        # UNKNOWN-streak / terminal-state abort that fires before we
-        # ever entered the spawn branch leaves stale .req on disk,
-        # which the next watcher run might pick up after submit-time
-        # cleanup if the user re-submits very quickly.
-        (_relay_dir() / f'{endpoint_name}.req').unlink(missing_ok=True)
+        # Clear rendezvous files on every failure path so a fast re-submit
+        # can't pick up stale state.
+        tunnel.rendezvous_clear(endpoint_name)
         if job_id is not None:
             try:
-                # Use the underlying PSIJSession.cancel_job to release the
-                # allocation.  Fire-and-forget — the watcher has already
-                # failed-marked the job.
-                await self._dispatch_cancel(str(job_id))
+                # Fire-and-forget — the watcher has already failed-marked it.
+                await self._forward(sid, PSIJSession.cancel_job,
+                                    job_id=str(job_id))
             except Exception as exc:
                 log.warning("[psij] cancel after tunnel failure raised: %s",
                             exc)
 
-    async def _dispatch_cancel(self, job_id: str) -> None:
-        """Cancel a job by id from inside a watcher.
-
-        We can't call the HTTP route directly (we're not in a request
-        handler), so we walk the live PSIJSession instances looking for
-        the one that submitted *job_id*, and call its ``cancel_job``
-        directly.
-        """
-        for session in list(self._sessions.values()):
-            if not isinstance(session, PSIJSession):
-                continue
-            if job_id in getattr(session, '_jobs', {}):
-                await session.cancel_job(job_id)
-                return
-        log.warning("[psij] _dispatch_cancel: no session owns job %s", job_id)
-
     async def _cleanup_watchers(self) -> None:
         """Cancel all watcher tasks + tear down any open reverse SSH
         processes on plugin shutdown."""
-        from . import tunnel as _tunnel
         for _, task in list(self._watchers.items()):
             task.cancel()
         self._watchers.clear()
         for endpoint_name, proc in list(self._tunnel_procs.items()):
-            _tunnel.cleanup_tunnel(proc, endpoint_name)
-            (_relay_dir() / f'{endpoint_name}.req').unlink(missing_ok=True)
+            tunnel.cleanup_tunnel(proc, endpoint_name)
+            tunnel.rendezvous_clear(endpoint_name)
         self._tunnel_procs.clear()
 
 

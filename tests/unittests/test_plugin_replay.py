@@ -78,7 +78,6 @@ class _InProcHTTP:
     def post(self, url, json=None, **kw):
         body = json or {}
         if   url.endswith('/fetch'):        data = _run(self._p._route_fetch(_shim(body)))
-        elif url.endswith('/drop_cursor'):  data = _run(self._p._route_drop_cursor(_shim(body)))
         else:                               raise AssertionError(url)
         return _Resp(data)
 
@@ -147,9 +146,13 @@ def test_age_eviction_and_dropped_counter():
     assert p._session_buffers['s'].stats()['retained'] == 2
 
     # jump past the age bound and force a lazy sweep
+    buf = p._session_buffers['s']
     clock['t'] = 1000.0 + 601.0
     p._evict_aged(clock['t'])
-    st = p._session_buffers['s'].stats()
+    # A fully-aged per-session buffer is pruned so a long-lived broker does not
+    # accumulate empty buffers forever (the counters live on the dropped ref).
+    assert 's' not in p._session_buffers
+    st = buf.stats()
     assert st['retained'] == 0
     assert st['dropped']  == 2
 
@@ -160,7 +163,7 @@ def test_stats_shape():
     p._on_event(_ev(7))
     p._on_event(_ev(0, session='s'))
     st = _run(p._route_stats(_shim({})))
-    assert set(st) == {'global', 'sessions', 'cursors'}
+    assert set(st) == {'global', 'sessions'}
     g = st['global']
     assert set(g) == {'retained', 'bytes', 'dropped', 'lowest_seq',
                       'highest_seq'}
@@ -223,33 +226,34 @@ def test_fetch_pattern_filter():
     p._on_event(_ev(1, plugin='rhapsody', topic='task_status'))
     p._on_event(_ev(2, plugin='psij', topic='job_status'))
     r = _run(p._route_fetch(_shim(
-        {'cursor_id': 'c', 'patterns': [{'plugin': 'psij'}]})))
+        {'patterns': [{'plugin': 'psij'}]})))
     assert [e['seq'] for e in r['events']] == [0, 2]
 
 
 # ---------------------------------------------------------------------------
-# fetch/ack cursor advance + at-least-once (unacked re-delivery)
+# fetch advance + at-least-once (stateless: no server-side cursor)
 # ---------------------------------------------------------------------------
 
-def test_fetch_ack_cursor_advance_and_redelivery():
+def test_fetch_after_seq_advance_and_redelivery():
     p = _make_plugin()
     for i in range(3):
         p._on_event(_ev(i))
 
-    a = _run(p._route_fetch(_shim({'cursor_id': 'c'})))
+    a = _run(p._route_fetch(_shim({'after_seq': -1})))
     assert [e['seq'] for e in a['events']] == [0, 1, 2]
     assert a['next_seq'] == 2 and a['gap'] is False
 
-    # A second fetch WITHOUT ack re-delivers the same batch (at-least-once).
-    b = _run(p._route_fetch(_shim({'cursor_id': 'c'})))
+    # A second fetch from the SAME after_seq re-reads the batch (at-least-once
+    # — the server keeps no cursor).
+    b = _run(p._route_fetch(_shim({'after_seq': -1})))
     assert [e['seq'] for e in b['events']] == [0, 1, 2]
 
-    # ACK advances the cursor; the next fetch returns only newer events.
-    c = _run(p._route_fetch(_shim({'cursor_id': 'c', 'ack_seq': 2})))
-    assert c['events'] == [] and c['next_seq'] == 2
+    # Advancing after_seq to the previous next_seq returns only newer events.
+    c = _run(p._route_fetch(_shim({'after_seq': a['next_seq']})))
+    assert c['events'] == [] and c['next_seq'] == a['next_seq']
 
     p._on_event(_ev(3))
-    d = _run(p._route_fetch(_shim({'cursor_id': 'c', 'ack_seq': 2})))
+    d = _run(p._route_fetch(_shim({'after_seq': a['next_seq']})))
     assert [e['seq'] for e in d['events']] == [3]
 
 
@@ -257,44 +261,44 @@ def test_max_events_batches():
     p = _make_plugin()
     for i in range(5):
         p._on_event(_ev(i))
-    r = _run(p._route_fetch(_shim({'cursor_id': 'c', 'max_events': 2})))
+    r = _run(p._route_fetch(_shim({'max_events': 2})))
     assert [e['seq'] for e in r['events']] == [0, 1]
     assert r['next_seq'] == 1
 
 
 # ---------------------------------------------------------------------------
-# seq dedup end-to-end across a simulated drop mid-drain (replay_iter)
+# seq dedup across a re-fetch from the same after_seq (replay_iter)
 # ---------------------------------------------------------------------------
 
-def test_replay_iter_seq_dedup_across_drop():
+def test_replay_iter_seq_dedup_on_reread_from_same_after_seq():
     p = _make_plugin()
     for i in range(5):
         p._on_event(_ev(i))
     cl = _client(p)
 
-    # First drain aborts after two events WITHOUT ever acking (a mid-drain
-    # drop): replay_iter acks a batch only on its *next* fetch, which never
-    # runs once we break.
+    # First drain aborts after two events; the consumer never advances its
+    # own tracked position past after_seq=-1 (a mid-drain crash before
+    # persisting anything).
     partial = []
-    for ev in cl.replay_iter('cur', max_events=2):
+    for ev in cl.replay_iter(after_seq=-1, max_events=2):
         partial.append(ev['seq'])
         if len(partial) == 2:
             break
     assert partial == [0, 1]
 
-    # Fresh drain with the same cursor_id: the unacked prefix is re-delivered
-    # (at-least-once); the consumer dedups by seq.
+    # Fresh drain from the SAME after_seq=-1 (the consumer's last committed
+    # position): the whole buffer, including the already-seen prefix, is
+    # re-delivered (at-least-once); the consumer dedups by seq.
     seen = {}
-    for ev in cl.replay_iter('cur', max_events=2):
+    for ev in cl.replay_iter(after_seq=-1, max_events=2):
         seen[ev['seq']] = seen.get(ev['seq'], 0) + 1
 
     # every event delivered at least once; dedup yields each exactly once
     assert set(seen) == {0, 1, 2, 3, 4}
-    # the re-delivery actually happened (0/1 came back after the drop)
-    assert seen[0] == 1 and seen[1] == 1        # within the second drain
+    assert all(n == 1 for n in seen.values())
     # across BOTH drains 0 and 1 were delivered twice total → dedup earns keep
     total_deliveries = len(partial) + sum(seen.values())
-    assert total_deliveries == 2 + 5            # 2 dropped + 5 clean
+    assert total_deliveries == 2 + 5            # 2 re-read + 5 clean
 
 
 # ---------------------------------------------------------------------------
@@ -311,63 +315,46 @@ def test_gap_true_after_eviction():
     buf = p._session_buffers['s']
     assert buf.lowest_seq == 3 and buf.stats()['dropped'] == 3
 
-    # a fresh cursor (position -1) sits below the lowest retained seq -> gap
-    r = _run(p._route_fetch(_shim({'cursor_id': 'c', 'session': 's'})))
+    # a fresh after_seq=-1 sits below the lowest retained seq -> gap
+    r = _run(p._route_fetch(_shim({'session': 's'})))
     assert r['gap'] is True
     assert [e['seq'] for e in r['events']] == [3, 4]
 
-    # a cursor that only wants seq > 4 sees no gap
+    # a fetch that only wants seq > 4 sees no gap
     r2 = _run(p._route_fetch(_shim(
-        {'cursor_id': 'c2', 'session': 's', 'after_seq': 4})))
+        {'session': 's', 'after_seq': 4})))
     assert r2['gap'] is False and r2['events'] == []
+
+
+def test_gap_reported_on_empty_buffer_after_full_eviction():
+    """Even after every retained event ages out, a fetch still reports a gap
+    via ``last_dropped_seq`` (``lowest_seq`` is None and can't bound it)."""
+    clock = {'t': 1000.0}
+    p = _make_plugin(session_max_age=100.0, session_max_bytes=10 ** 9)
+    p._now = lambda: clock['t']
+    p._on_event(_ev(0, session='s', ts=1000.0))
+    p._on_event(_ev(1, session='s', ts=1000.0))
+
+    # Age everything out.  The route's own ``buf.evict_aged`` empties the
+    # buffer (the plugin-level sweep would prune it, but a fetch does not).
+    clock['t'] = 1000.0 + 200.0
+    r = _run(p._route_fetch(_shim({'session': 's', 'after_seq': -1})))
+    assert r['events'] == []
+    assert r['gap'] is True                    # last_dropped_seq (1) > -1
+    assert p._session_buffers['s'].last_dropped_seq == 1
 
 
 def test_no_gap_on_contiguous_stream():
     p = _make_plugin()
     for i in range(3):
         p._on_event(_ev(i))
-    r = _run(p._route_fetch(_shim({'cursor_id': 'c'})))
+    r = _run(p._route_fetch(_shim({})))
     assert r['gap'] is False
-
-
-# ---------------------------------------------------------------------------
-# cursor expiry + drop_cursor
-# ---------------------------------------------------------------------------
-
-def test_cursor_expiry_by_inactivity():
-    clock = {'t': 1000.0}
-    p = _make_plugin(cursor_ttl=100.0)
-    p._now = lambda: clock['t']
-
-    _run(p._route_fetch(_shim({'cursor_id': 'c'})))
-    assert 'c' in p._cursors
-
-    clock['t'] = 1000.0 + 101.0
-    assert p._prune_cursors(clock['t']) == 1
-    assert 'c' not in p._cursors
-
-
-def test_drop_cursor():
-    p = _make_plugin()
-    _run(p._route_fetch(_shim({'cursor_id': 'c'})))
-    r = _run(p._route_drop_cursor(_shim({'cursor_id': 'c'})))
-    assert r['dropped'] is True
-    assert 'c' not in p._cursors
-    r2 = _run(p._route_drop_cursor(_shim({'cursor_id': 'nope'})))
-    assert r2['dropped'] is False
-
-
-def test_fetch_requires_cursor_id():
-    from fastapi import HTTPException
-    p = _make_plugin()
-    with pytest.raises(HTTPException) as ei:
-        _run(p._route_fetch(_shim({})))
-    assert ei.value.status_code == 400
 
 
 def test_fetch_unknown_session_empty_no_gap():
     p = _make_plugin()
-    r = _run(p._route_fetch(_shim({'cursor_id': 'c', 'session': 'ghost'})))
+    r = _run(p._route_fetch(_shim({'session': 'ghost'})))
     assert r['events'] == [] and r['gap'] is False
 
 
@@ -486,8 +473,12 @@ def harness(tmp_path, monkeypatch):
     servers, runtimes = [], []
 
     def make_broker(**kw):
-        from radical.orbit.broker import Broker
-        defaults = dict(cert=str(cert), key=str(key), no_auth=True, grace=2.0)
+        from radical.orbit.broker import Broker, BrokerTuning
+        tuning = BrokerTuning(grace=2.0)
+        for _k in list(kw):
+            if hasattr(tuning, _k):
+                setattr(tuning, _k, kw.pop(_k))
+        defaults = dict(cert=str(cert), key=str(key), no_auth=True, tuning=tuning)
         defaults.update(kw)
         srv = _RunningBroker(Broker(**defaults)).start()
         servers.append(srv)
@@ -566,8 +557,7 @@ def test_e2e_late_consumer_replays_with_splice(harness):
     rc = consumer.get_plugin('broker', 'replay')
     replayed_ns  = []
     replayed_seq = []
-    for ev in rc.replay_iter('cons-cursor',
-                             patterns=[{'endpoint': 'epA'}]):
+    for ev in rc.replay_iter(patterns=[{'endpoint': 'epA'}]):
         replayed_ns.append(ev['data']['n'])
         replayed_seq.append(ev['seq'])
 

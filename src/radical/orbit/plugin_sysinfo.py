@@ -106,25 +106,21 @@ class SysInfoProvider:
 
     def _detect_gpus(self) -> List[Dict[str, Any]]:
         """
-        Detect available GPUs (NVIDIA, AMD, Intel) in parallel.
-        Each detector runs in its own thread with a 5 s timeout so a
-        slow or absent tool does not block the others.
-        """
-        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+        Detect available GPUs (NVIDIA, AMD, Intel).
 
+        Runs the three detectors sequentially; each has its own internal
+        subprocess timeout (5 s), and detection already runs off the request
+        path on the background prefetch thread (see ``start_prefetch``), so a
+        slow or absent tool costs that daemon thread time, never a caller.
+        """
         gpus: List[Dict[str, Any]] = []
-        detectors = [
-            self._detect_nvidia_gpus,
-            self._detect_amd_gpus,
-            self._detect_intel_gpus,
-        ]
-        with ThreadPoolExecutor(max_workers=3) as ex:
-            futures = [ex.submit(fn) for fn in detectors]
-            for future in futures:
-                try:
-                    gpus.extend(future.result(timeout=5))
-                except (FuturesTimeout, Exception):
-                    pass
+        for detector in (self._detect_nvidia_gpus,
+                         self._detect_amd_gpus,
+                         self._detect_intel_gpus):
+            try:
+                gpus.extend(detector())
+            except Exception:
+                pass
         return gpus
 
     def _detect_nvidia_gpus(self) -> List[Dict[str, Any]]:
@@ -189,7 +185,7 @@ class SysInfoProvider:
                 })
             return gpus
 
-        except (FileNotFoundError, subprocess.CalledProcessError, ImportError, Exception):
+        except Exception:
             return []
 
     def _detect_intel_gpus(self) -> List[Dict[str, Any]]:

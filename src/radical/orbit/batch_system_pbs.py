@@ -9,9 +9,9 @@ universal.
 
 import os
 import shutil
-import subprocess
 
-from .batch_system import (BatchSystem, register_backend,
+from .batch_system import (BatchSystem, register_backend, run_cmd,
+                           run_cmd_strict,
                            STATE_PENDING, STATE_RUNNING, STATE_DONE,
                            STATE_FAILED, STATE_CANCELLED,
                            STATE_HELD, STATE_UNKNOWN)
@@ -168,23 +168,13 @@ class PBSProBatchSystem(BatchSystem):
         return os.environ.get('PBS_JOBID')
 
     def job_state(self, native_id) -> str:
-        try:
-            r = subprocess.run(
-                ['qstat', '-f', str(native_id)],
-                capture_output=True, text=True, timeout=10)
-        except (OSError, subprocess.TimeoutExpired):
-            return STATE_UNKNOWN
-        if r.returncode != 0:
+        stdout = run_cmd(['qstat', '-f', str(native_id)], timeout=10)
+        if stdout is None:
             # try -x to look up finished jobs
-            try:
-                r = subprocess.run(
-                    ['qstat', '-x', '-f', str(native_id)],
-                    capture_output=True, text=True, timeout=10)
-            except (OSError, subprocess.TimeoutExpired):
-                return STATE_UNKNOWN
-            if r.returncode != 0:
-                return STATE_UNKNOWN
-        info = _parse_qstat_f(r.stdout)
+            stdout = run_cmd(['qstat', '-x', '-f', str(native_id)], timeout=10)
+        if stdout is None:
+            return STATE_UNKNOWN
+        info = _parse_qstat_f(stdout)
         code = info.get('job_state', '').strip()
         if not code:
             return STATE_UNKNOWN
@@ -194,15 +184,10 @@ class PBSProBatchSystem(BatchSystem):
         return state
 
     def job_nodes(self, native_id) -> list:
-        try:
-            r = subprocess.run(
-                ['qstat', '-f', str(native_id)],
-                capture_output=True, text=True, timeout=10)
-        except (OSError, subprocess.TimeoutExpired):
+        stdout = run_cmd(['qstat', '-f', str(native_id)], timeout=10)
+        if stdout is None:
             return []
-        if r.returncode != 0:
-            return []
-        info = _parse_qstat_f(r.stdout)
+        info = _parse_qstat_f(stdout)
         return _parse_exec_host(info.get('exec_host', ''))
 
     def nodelist(self) -> list:
@@ -211,10 +196,10 @@ class PBSProBatchSystem(BatchSystem):
         return _read_pbs_nodefile()
 
     def cancel(self, native_id) -> None:
-        r = subprocess.run(['qdel', str(native_id)],
-                           capture_output=True, text=True, timeout=10)
-        if r.returncode != 0:
-            raise RuntimeError(f"qdel failed: {r.stderr.strip()}")
+        try:
+            run_cmd_strict(['qdel', str(native_id)], timeout=10)
+        except RuntimeError as exc:
+            raise RuntimeError(f"qdel failed: {exc}") from exc
         self._cancelled.add(str(native_id))
 
     def job_allocation(self) -> 'dict | None':
@@ -236,49 +221,41 @@ class PBSProBatchSystem(BatchSystem):
         cpus_per_node = None
         gpus_per_node = None
 
-        try:
-            r = subprocess.run(
-                ['qstat', '-f', job_id],
-                capture_output=True, text=True, timeout=10)
-            if r.returncode == 0:
-                info = _parse_qstat_f(r.stdout)
-                runtime = _parse_pbs_walltime(
-                    info.get('Resource_List.walltime', ''))
-                if not n_nodes:
-                    nct = info.get('Resource_List.nodect', '')
-                    try:
-                        n_nodes = int(nct) if nct else None
-                    except ValueError:
-                        n_nodes = None
-                if not partition:
-                    partition = info.get('queue', '') or None
-                if not account:
-                    account = info.get('Account_Name', '') or None
-                if not job_name:
-                    job_name = info.get('Job_Name', '') or None
-                if not nodelist:
-                    eh = info.get('exec_host', '')
-                    if eh:
-                        nodelist = ','.join(_parse_exec_host(eh))
-
-                # Extract per-node resources from select=... when possible.
-                # Format: "1:ncpus=64:ngpus=4" or "2:ncpus=64".
-                select = info.get('Resource_List.select', '')
-                if select:
-                    chunk = select.split('+', 1)[0]
-                    tokens = chunk.split(':')
-                    for tok in tokens:
-                        if tok.startswith('ncpus='):
-                            try: cpus_per_node = int(tok[6:])
-                            except ValueError: pass
-                        elif tok.startswith('ngpus='):
-                            try: gpus_per_node = int(tok[6:])
-                            except ValueError: pass
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        stdout = run_cmd(['qstat', '-f', job_id], timeout=10)
+        if stdout is not None:
+            info = _parse_qstat_f(stdout)
+            runtime = _parse_pbs_walltime(
+                info.get('Resource_List.walltime', ''))
             if not n_nodes:
-                raise RuntimeError(
-                    f"PBS_JOBID={job_id!r} is set but cannot query qstat: {exc}"
-                ) from exc
+                nct = info.get('Resource_List.nodect', '')
+                try:
+                    n_nodes = int(nct) if nct else None
+                except ValueError:
+                    n_nodes = None
+            if not partition:
+                partition = info.get('queue', '') or None
+            if not account:
+                account = info.get('Account_Name', '') or None
+            if not job_name:
+                job_name = info.get('Job_Name', '') or None
+            if not nodelist:
+                eh = info.get('exec_host', '')
+                if eh:
+                    nodelist = ','.join(_parse_exec_host(eh))
+
+            # Extract per-node resources from select=... when possible.
+            # Format: "1:ncpus=64:ngpus=4" or "2:ncpus=64".
+            select = info.get('Resource_List.select', '')
+            if select:
+                chunk = select.split('+', 1)[0]
+                tokens = chunk.split(':')
+                for tok in tokens:
+                    if tok.startswith('ncpus='):
+                        try: cpus_per_node = int(tok[6:])
+                        except ValueError: pass
+                    elif tok.startswith('ngpus='):
+                        try: gpus_per_node = int(tok[6:])
+                        except ValueError: pass
 
         if not n_nodes:
             raise RuntimeError(

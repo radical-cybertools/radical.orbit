@@ -2,10 +2,76 @@
 
 import os
 import json
+import re
 import time
-import subprocess
 
-from .queue_info import (QueueInfo, _UNAVAIL_STATES, _unwrap, _parse_gpus)
+from .queue_info import QueueInfo
+from .batch_system import run_cmd_strict
+
+
+# Node states considered unavailable for scheduling (SLURM vocabulary).
+_UNAVAIL_STATES = {'DOWN',    'DRAIN',   'DRAINING',
+                   'FAIL',    'FAILING', 'MAINT',
+                   'FUTURE',  'POWER_DOWN', 'POWERED_DOWN',
+                   'NOT_RESPONDING', 'REBOOT_ISSUED'}
+
+
+def _unwrap(obj):
+    """
+    Extract a value from SLURM's {set, infinite, number} wrapper.
+
+    Returns:
+      The numeric value, or None if the field is infinite or unset.
+    """
+
+    if not isinstance(obj, dict):
+        return obj
+
+    if obj.get('infinite'):
+        return None
+    if not obj.get('set', True):
+        return None
+
+    return obj.get('number')
+
+
+def _parse_gpus(gres_str):
+    """
+    Parse GPU count from a SLURM GRES string.
+
+    Handles formats like:
+      "gpu:8(S:0-7)"
+      "gpu:mi250:8(S:0-7)"
+      "gpu:8"
+      "(null)"
+      ""
+
+    Returns:
+      int: number of GPUs, or 0 if none.
+    """
+
+    if not gres_str or gres_str == '(null)':
+        return 0
+
+    total = 0
+    for entry in gres_str.split(','):
+        entry = entry.strip()
+        if not entry.startswith('gpu'):
+            continue
+
+        # strip socket binding like (S:0-7)
+        entry = re.sub(r'\(.*?\)', '', entry)
+
+        parts = entry.split(':')
+        # gpu:N or gpu:TYPE:N
+        for part in reversed(parts):
+            try:
+                total += int(part)
+                break
+            except ValueError:
+                continue
+
+    return total
 
 
 class QueueInfoSlurm(QueueInfo):
@@ -32,19 +98,6 @@ class QueueInfoSlurm(QueueInfo):
             self._env['SLURM_CONF'] = slurm_conf
 
 
-    def _run(self, cmd):
-        """Run a subprocess with self._env, return stdout."""
-
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True,
-                                    timeout=60, env=self._env, check=True)
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(
-                f"Command {cmd} failed (rc={e.returncode}): "
-                f"{e.stderr.strip()}") from e
-        return result.stdout
-
-
     def _collect_info(self):
         """
         Collect queue/partition info via sinfo --json and scontrol show
@@ -55,13 +108,14 @@ class QueueInfoSlurm(QueueInfo):
         """
 
         # --- sinfo ---
-        stdout  = self._run(['sinfo', '--json'])
+        stdout  = run_cmd_strict(['sinfo', '--json'], timeout=60, env=self._env)
         entries = json.loads(stdout).get('sinfo', [])
 
         # --- scontrol show nodes (for real_memory) ---
         node_mem = {}
         try:
-            stdout = self._run(['scontrol', 'show', 'nodes', '--json'])
+            stdout = run_cmd_strict(['scontrol', 'show', 'nodes', '--json'],
+                                    timeout=60, env=self._env)
             nodes  = json.loads(stdout).get('nodes', [])
             for node in nodes:
                 name = node.get('name', '')
@@ -171,7 +225,7 @@ class QueueInfoSlurm(QueueInfo):
         cmd = ['squeue', '--json', '-p', queue]
         if user:
             cmd.extend(['--user', user])
-        stdout = self._run(cmd)
+        stdout = run_cmd_strict(cmd, timeout=60, env=self._env)
         jobs   = json.loads(stdout).get('jobs', [])
         return {'jobs': self._parse_squeue_jobs(jobs)}
 
@@ -182,7 +236,7 @@ class QueueInfoSlurm(QueueInfo):
         cmd = ['squeue', '--json']
         if user:
             cmd.extend(['--user', user])
-        stdout = self._run(cmd)
+        stdout = run_cmd_strict(cmd, timeout=60, env=self._env)
         jobs   = json.loads(stdout).get('jobs', [])
         return {'jobs': self._parse_squeue_jobs(jobs)}
 
@@ -217,7 +271,7 @@ class QueueInfoSlurm(QueueInfo):
         """Collect user's allowed partitions via sacctmgr --json."""
 
         cmd = ['sacctmgr', 'show', 'assoc', '--json', f'Users={user}']
-        stdout = self._run(cmd)
+        stdout = run_cmd_strict(cmd, timeout=60, env=self._env)
         data   = json.loads(stdout)
         assocs = data.get('associations') or data.get('association', [])
 
@@ -238,7 +292,7 @@ class QueueInfoSlurm(QueueInfo):
         """
 
         cmd = ['sacctmgr', 'show', 'assoc', '-P', '-n', f'Users={user}']
-        stdout = self._run(cmd)
+        stdout = run_cmd_strict(cmd, timeout=60, env=self._env)
 
         partitions = set()
         for line in stdout.strip().splitlines():
@@ -261,7 +315,7 @@ class QueueInfoSlurm(QueueInfo):
         if user:
             cmd.append(f'Users={user}')
 
-        stdout = self._run(cmd)
+        stdout = run_cmd_strict(cmd, timeout=60, env=self._env)
         data   = json.loads(stdout)
         assocs = data.get('associations') or data.get('association', [])
 
@@ -277,7 +331,7 @@ class QueueInfoSlurm(QueueInfo):
         if user:
             cmd.append(f'Users={user}')
 
-        stdout = self._run(cmd)
+        stdout = run_cmd_strict(cmd, timeout=60, env=self._env)
         return {'allocations': self._parse_assocs_parsable(stdout)}
 
 
@@ -351,20 +405,3 @@ class QueueInfoSlurm(QueueInfo):
             })
 
         return result
-
-
-# ---------------------------------------------------------------------------
-# Backwards-compat: get_job_nodes used to live as a static method on this
-# class (referenced by plugin_psij.py before the BatchSystem refactor).
-# Provide a thin shim that delegates to SlurmBatchSystem.job_nodes for the
-# remainder of the rewire.
-# ---------------------------------------------------------------------------
-
-def _get_job_nodes(native_id, env=None):
-    from .batch_system_slurm import SlurmBatchSystem
-    bs = SlurmBatchSystem()
-    nodes = bs.job_nodes(native_id)
-    return nodes
-
-
-QueueInfoSlurm.get_job_nodes = staticmethod(_get_job_nodes)  # type: ignore

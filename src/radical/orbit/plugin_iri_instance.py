@@ -23,12 +23,11 @@ Design notes
 * Routes omit ``{sid}`` — all requests use the one internal session.
 '''
 
-import asyncio
 import logging
 import os
 import time
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import httpx
 
@@ -114,7 +113,6 @@ class IRIInstanceSession(PluginSession):
 
         # job_id -> {resource_id, state, name, ...}
         self._jobs: Dict[str, Dict[str, Any]] = {}
-        self._poll_task = None
 
     # -- job submission (from IRISession) -----------------------------------
 
@@ -251,69 +249,53 @@ class IRIInstanceSession(PluginSession):
     # -- lifecycle ----------------------------------------------------------
 
     async def close(self) -> dict:
-        if self._poll_task and not self._poll_task.done():
-            self._poll_task.cancel()
-            try:
-                await self._poll_task
-            except asyncio.CancelledError:
-                pass
-            self._poll_task = None
+        # Poller cancellation is handled by the base close()/
+        # stop_status_poller(); only the http client needs closing here.
         await self._http.aclose()
         return await super().close()
 
     # -- background polling -------------------------------------------------
 
     def _start_polling(self) -> None:
-        if self._poll_task is None or self._poll_task.done():
-            self._poll_task = asyncio.create_task(self._poll_jobs())
+        '''(Re)start the shared status poller for the session's active jobs.'''
+        self.start_status_poller(
+            interval=IRI_POLL_INTERVAL,
+            items=lambda: self._jobs,
+            is_terminal=lambda meta: meta.get('state') in IRI_JOB_STATES_TERMINAL,
+            fetch=self._fetch_job_status,
+            to_payload=self._job_payload,
+            topic='job_status',
+            name=f'iri/{self._endpoint_key}')
 
-    async def _poll_jobs(self) -> None:
-        while True:
-            try:
-                await asyncio.sleep(IRI_POLL_INTERVAL)
-                if not self._active:
-                    break
+    async def _fetch_job_status(self, job_id: str,
+                                meta: Dict[str, Any]) -> Optional[Any]:
+        '''Poll one job; return the raw ``status`` value when its state changed.'''
+        resource_id = meta['resource_id']
+        resp = await self._http.get(
+            f'/api/v1/compute/status/{resource_id}/{job_id}')
+        if not resp.is_success:
+            return None
 
-                active = {jid: m for jid, m in list(self._jobs.items())
-                          if m.get('state') not in IRI_JOB_STATES_TERMINAL}
-                if not active:
-                    break
+        data      = resp.json()
+        status    = data.get('status', data)
+        new_state = (status.get('state', '')
+                     if isinstance(status, dict) else '').lower()
 
-                for job_id, meta in active.items():
-                    resource_id = meta['resource_id']
-                    try:
-                        resp = await self._http.get(
-                            f'/api/v1/compute/status/{resource_id}/{job_id}')
-                        if not resp.is_success:
-                            continue
-                        data      = resp.json()
-                        status    = data.get('status', data)
-                        new_state = (status.get('state', '')
-                                     if isinstance(status, dict) else '').lower()
+        if new_state and new_state != meta.get('state'):
+            meta['state'] = new_state
+            return status
+        return None
 
-                        if new_state and new_state != meta.get('state'):
-                            old_state     = meta['state']
-                            meta['state'] = new_state
-                            log.debug('[iri/%s] job %s: %s -> %s',
-                                      self._endpoint_key, job_id,
-                                      old_state, new_state)
-                            if self._plugin:
-                                self._plugin._dispatch_notify('job_status', {
-                                    'job_id'     : job_id,
-                                    'state'      : new_state,
-                                    'resource_id': resource_id,
-                                    'name'       : meta.get('name', ''),
-                                    'details'    : status,
-                                })
-                    except Exception as exc:
-                        log.debug('[iri/%s] poll error for job %s: %s',
-                                  self._endpoint_key, job_id, exc)
-
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                log.debug('[iri/%s] _poll_jobs error: %s',
-                          self._endpoint_key, exc)
+    @staticmethod
+    def _job_payload(job_id: str, meta: Dict[str, Any], status: Any) -> dict:
+        '''Build the ``job_status`` notification payload for one job.'''
+        return {
+            'job_id'     : job_id,
+            'state'      : meta['state'],
+            'resource_id': meta['resource_id'],
+            'name'       : meta.get('name', ''),
+            'details'    : status,
+        }
 
 
 # ---------------------------------------------------------------------------
