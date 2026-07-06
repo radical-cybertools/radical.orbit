@@ -69,6 +69,32 @@ def test_sysinfo_gpus_structure():
         # So we only check static fields
 
 
+def test_gpu_metric_subprocesses_pass_timeout(monkeypatch):
+    """The NVIDIA and AMD metric collectors must bound their subprocess calls
+    with a timeout (parity with the sibling static-detection calls)."""
+    import radical.orbit.plugin_sysinfo as mod
+
+    seen = []
+
+    def _fake_check_output(cmd, **kwargs):
+        seen.append((cmd[0], kwargs.get('timeout')))
+        if cmd[0] == 'nvidia-smi':
+            return '0, 10, 5, 8000, 2000, 6000\n'
+        return '{"card0": {}}'                          # rocm-smi json
+
+    monkeypatch.setattr(mod.subprocess, 'check_output', _fake_check_output)
+
+    provider = SysInfoProvider()
+    provider._get_gpu_metrics([
+        {'vendor': 'NVIDIA', 'index': 0, 'id': '0'},
+        {'vendor': 'AMD',    'index': 0, 'id': 'card0'},
+    ])
+
+    tools = dict(seen)
+    assert tools.get('nvidia-smi') == 5
+    assert tools.get('rocm-smi')   == 5
+
+
 def test_sysinfo_disk_usage_unreadable_mountpoint_is_skipped(monkeypatch):
     """A mountpoint whose disk_usage() raises OSError -- unreadable
     (PermissionError) or vanished between disk_partitions() and disk_usage()
