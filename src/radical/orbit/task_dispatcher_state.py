@@ -76,6 +76,7 @@ class PilotRecord:
     pool               : str           # pool name
     size_key           : str           # key into pool.pilot_sizes
     rhapsody_backend   : str           # resolved from PilotSize
+    owning_sid         : str         = ''      # session that owns this pool
     psij_job_id        : str | None  = None    # set after submit_tunneled
     child_endpoint_name    : str | None  = None    # set at handshake
     state              : str         = PILOT_PENDING
@@ -110,6 +111,7 @@ class TaskRecord:
     pool         : str
     cmd          : list[str]
     cwd          : str                          # shared-FS scratch path
+    owning_sid   : str         = ''             # session that owns the pool
     priority     : int         = 0              # passed through from Makeflow
     inputs       : list[str]   = field(default_factory=list)
     outputs      : list[str]   = field(default_factory=list)

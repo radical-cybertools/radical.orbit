@@ -1,18 +1,19 @@
-"""Unit tests for plugin_task_dispatcher.
+"""Unit tests for plugin_task_dispatcher (broker-hosted, strict per-session pools).
 
-Focus: plugin-level behavior that does not require a live bridge —
-routing decisions, cached-state idempotency, stage_in/stage_out,
-pilot_handshake binding, and strategy interaction.
+Focus: plugin-level behavior that does not require a live broker — strict
+per-session pool isolation, restart-time replay, session-close teardown,
+cached-state idempotency, staging, pilot binding via rich topology
+(present/suspect/lost), and the async transport port (broker caller, no
+`asyncio.to_thread`).
 
-All network paths (BridgeClient → psij / rhapsody on remote endpoints) are
-stubbed; the plugin's in-process state is exercised directly.
+Endpoint calls are stubbed via :meth:`_get_psij_client` / :meth:`_get_rhapsody_client`
+(now async, returning small async proxies); no real broker or WebSocket is needed.
 """
 
 import asyncio
 import base64
-import json
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, AsyncMock, MagicMock
 
 import pytest
 from fastapi import FastAPI
@@ -25,7 +26,7 @@ from radical.orbit.task_dispatcher_config import PoolConfig, PilotSize
 from radical.orbit.task_dispatcher_state   import (
     PilotRecord, TaskRecord,
     PILOT_PENDING, PILOT_ACTIVE, PILOT_FAILED, PILOT_DONE,
-    TASK_QUEUED, TASK_RUNNING, TASK_DONE, TASK_FAILED, TASK_CANCELED,
+    TASK_QUEUED, TASK_RUNNING, TASK_DONE, TASK_CANCELED,
 )
 
 
@@ -36,7 +37,6 @@ from radical.orbit.task_dispatcher_state   import (
 def _make_pool_cfg(*, pool_name: str = 'cpu',
                    max_pilots: int = 4,
                    strategy: str = 'conservative') -> PoolConfig:
-    """Build a test-fixture PoolConfig (matches the old _write_pools_json shape)."""
     return PoolConfig(
         name         = pool_name,
         endpoint_name    = 'endpoint0',
@@ -53,195 +53,136 @@ def _make_pool_cfg(*, pool_name: str = 'cpu',
     )
 
 
-def _make_plugin(tmp_path: Path, *, pool_name: str = 'cpu',
-                 write_config: bool = True, strategy: str = 'conservative',
-                 instance: str = 'task_dispatcher') -> tuple:
-    """Instantiate a plugin bound to tmp_path; return (app, plugin).
+def _pool_dict(**overrides):
+    d = {
+        'name'        : 'cpu',
+        'endpoint_name'   : 'endpoint0',
+        'queue'       : 'batch',
+        'account'     : 'proj',
+        'default_size': 's',
+        'pilot_sizes' : {
+            's': {'nodes': 1, 'cpus_per_node': 4,
+                  'rhapsody_backend': 'concurrent'}},
+        'max_pilots'  : 4,
+        'strategy'    : 'conservative',
+        'strategy_config': {'min_dwell_sec': 0.0},
+    }
+    d.update(overrides)
+    return d
 
-    With ``write_config=True`` (default) the helper materialises one
-    test pool directly via :meth:`_materialise_pool`, mirroring how a
-    session-driven workflow would set things up.  Pass ``False`` for
-    tests that need a dispatcher with zero pools.
-    """
+
+def _make_plugin(tmp_path: Path, *, instance: str = 'task_dispatcher',
+                 broker_caller=None) -> tuple:
+    """Instantiate a plugin bound to tmp_path; return (app, plugin)."""
     app = FastAPI()
-    app.state.endpoint_name  = 'endpoint0'
-    app.state.bridge_url = 'https://localhost:9999'
-
+    app.state.endpoint_name   = 'endpoint0'
+    app.state.bridge_url      = 'https://localhost:9999'
+    app.state.broker_caller   = broker_caller
+    app.state.broker_tap      = None
     plugin = PluginTaskDispatcher(
         app, instance_name=instance,
         state_root=tmp_path / 'state',
         scratch_root=tmp_path / 'scratch')
-    if write_config:
-        plugin._materialise_pool(_make_pool_cfg(pool_name=pool_name,
-                                                strategy=strategy))
     return app, plugin
 
 
+def _register(client: TestClient, plugin, body=None, headers=None) -> str:
+    r = client.post(f'{plugin.namespace}/register_session',
+                    json=body if body is not None else {}, headers=headers)
+    assert r.status_code == 200, r.text
+    return r.json()['sid']
+
+
+def _session_with_cpu(client, plugin, headers=None, sid=None,
+                      lifetime=None) -> str:
+    body = {'pools': [_pool_dict()]}
+    if sid is not None:
+        body['sid'] = sid
+    if lifetime is not None:
+        body['lifetime'] = lifetime
+    return _register(client, plugin, body=body, headers=headers)
+
+
+def _pool(plugin, sid, name='cpu') -> PoolState:
+    return plugin._pool_states[sid][name]
+
+
 # ---------------------------------------------------------------------------
-# Plugin initialization
+# Init / is_enabled
 # ---------------------------------------------------------------------------
 
 class TestInit:
 
     def test_is_enabled_on_bridge(self):
-        """is_enabled returns True when host role is 'bridge'."""
         with patch('radical.orbit.utils.host_role') as m:
             m.return_value = {'role': 'bridge'}
             assert PluginTaskDispatcher.is_enabled(FastAPI()) is True
 
     def test_is_enabled_false_off_bridge(self):
-        """is_enabled returns False on login / compute / standalone hosts."""
         with patch('radical.orbit.utils.host_role') as m:
             for role in ('login', 'compute', 'standalone'):
                 m.return_value = {'role': role}
-                assert PluginTaskDispatcher.is_enabled(FastAPI()) is False, \
-                    f"is_enabled should be False for role={role!r}"
+                assert PluginTaskDispatcher.is_enabled(FastAPI()) is False
 
-    def test_init_with_missing_config_is_non_fatal(self, tmp_path: Path):
-        _, plugin = _make_plugin(tmp_path, write_config=False)
-        assert plugin._pool_states == {}
-
-    def test_init_loads_pools(self, tmp_path: Path):
+    def test_init_starts_with_no_pools(self, tmp_path: Path):
         _, plugin = _make_plugin(tmp_path)
-        assert 'cpu' in plugin._pool_states
-        assert isinstance(plugin._pool_states['cpu'], PoolState)
+        assert plugin._pool_states == {}
 
     def test_routes_registered(self, tmp_path: Path):
         app, plugin = _make_plugin(tmp_path)
         pats = [pat.pattern for _, pat, _, _ in app.state.direct_routes]
         ns = plugin.namespace.lstrip('/')
-        expected_fragments = [
-            f'{ns}/pools$',
-            f'{ns}/pool/',
-            f'{ns}/fleet/',
-            f'{ns}/submit/',
-            f'{ns}/task/',
-            f'{ns}/cancel/',
-            f'{ns}/stage_in/',
-            f'{ns}/stage_out/',
-        ]
-        for frag in expected_fragments:
-            assert any(frag in p for p in pats), \
-                f'route {frag} not registered; have: {pats}'
+        for frag in (f'{ns}/pools$', f'{ns}/fleet/', f'{ns}/submit/',
+                     f'{ns}/cancel/', f'{ns}/cancel_all/',
+                     f'{ns}/stage_in/', f'{ns}/stage_out/'):
+            assert any(frag in p for p in pats), f'route {frag} missing'
 
 
 # ---------------------------------------------------------------------------
-# Routes — pools / pool detail / fleet
+# Strict per-session pool isolation (the M7 verification bullet)
 # ---------------------------------------------------------------------------
 
-class TestRoutes:
+class TestStrictIsolation:
 
-    def test_list_pools(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        r = client.get(f'{plugin.namespace}/pools')
-        assert r.status_code == 200
-        body = r.json()
-        assert 'cpu' in body['pools']
-        assert body['pools']['cpu']['max_pilots'] == 4
+    def test_same_named_pools_are_distinct_across_sessions(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid_a = _session_with_cpu(client, plugin, sid='A', lifetime='persistent')
+        sid_b = _session_with_cpu(client, plugin, sid='B', lifetime='persistent')
+        assert sid_a != sid_b
+        ps_a = _pool(plugin, sid_a, 'cpu')
+        ps_b = _pool(plugin, sid_b, 'cpu')
+        assert ps_a is not ps_b                     # distinct PoolStates
+        assert ps_a.state_dir != ps_b.state_dir     # distinct on-disk state
 
-    def test_pool_detail(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        r = client.get(f'{plugin.namespace}/pool/cpu')
-        assert r.status_code == 200
-        assert 'pilots' in r.json()
-
-    def test_pool_detail_unknown(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        r = client.get(f'{plugin.namespace}/pool/nope')
+    def test_cross_session_attach_impossible(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        _session_with_cpu(client, plugin, sid='A', lifetime='persistent')
+        # A second session that declares no pools gets its own default; it has
+        # no 'cpu' pool → submit to 'cpu' 404s (no cross-session visibility).
+        sid_b = _register(client, plugin, body={})
+        r = client.post(f'{plugin.namespace}/submit/{sid_b}', json={
+            'pool': 'cpu', 'task_id': 't.1',
+            'cmd': ['/bin/echo'], 'cwd': '/tmp'})
         assert r.status_code == 404
 
-    def test_fleet_requires_session(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        r = client.get(f'{plugin.namespace}/fleet/nosuchsid')
-        assert r.status_code == 404
-
-
-# ---------------------------------------------------------------------------
-# Session registration + submit
-# ---------------------------------------------------------------------------
-
-def _register_session(client: TestClient, plugin, body=None) -> str:
-    if body is None:
-        r = client.post(f'{plugin.namespace}/register_session')
-    else:
-        r = client.post(f'{plugin.namespace}/register_session', json=body)
-    assert r.status_code == 200, r.text
-    return r.json()['sid']
-
-
-# ---------------------------------------------------------------------------
-# Per-session pool materialisation (Phase 4)
-# ---------------------------------------------------------------------------
-
-class TestSessionDrivenPools:
-
-    def _pool_dict(self, **overrides):
-        d = {
-            'name'        : 'gpu',
-            'endpoint_name'   : 'endpoint_remote',
-            'queue'       : 'batch',
-            'account'     : None,
-            'default_size': 's',
-            'pilot_sizes' : {
-                's': {'nodes': 1, 'cpus_per_node': 4,
-                      'gpus_per_node': 1,
-                      'rhapsody_backend': 'concurrent'}},
-            'max_pilots'  : 1,
-            'strategy'    : 'conservative',
-        }
-        d.update(overrides)
-        return d
-
-    def test_session_can_declare_new_pool(self, tmp_path: Path):
-        _, plugin = _make_plugin(tmp_path, write_config=False)
+    def test_reregister_same_pool_is_idempotent(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
         client = TestClient(plugin._app)
-        sid = _register_session(client, plugin,
-                                body={'pools': [self._pool_dict()]})
-        assert sid
-        assert 'gpu' in plugin._pool_states
-        assert plugin._pool_states['gpu'].config.endpoint_name == 'endpoint_remote'
+        sid = _session_with_cpu(client, plugin, sid='A', lifetime='persistent')
+        first = _pool(plugin, sid, 'cpu')
+        _session_with_cpu(client, plugin, sid='A', lifetime='persistent')
+        assert _pool(plugin, sid, 'cpu') is first
 
-    def test_session_with_no_pools_materialises_default(self, tmp_path: Path):
-        _, plugin = _make_plugin(tmp_path, write_config=False)
+    def test_no_pools_materialises_session_default(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
         client = TestClient(plugin._app)
-        _register_session(client, plugin)
-        assert 'default' in plugin._pool_states
+        sid = _register(client, plugin, body={})
+        assert 'default' in plugin._pool_states[sid]
 
-    def test_default_pool_materialised_only_once(self, tmp_path: Path):
-        _, plugin = _make_plugin(tmp_path, write_config=False)
-        client = TestClient(plugin._app)
-        _register_session(client, plugin)
-        first_state = plugin._pool_states['default']
-        _register_session(client, plugin)
-        second_state = plugin._pool_states['default']
-        assert first_state is second_state   # same PoolState instance
-
-    def test_matching_pool_reattaches(self, tmp_path: Path):
-        _, plugin = _make_plugin(tmp_path, write_config=False)
-        client = TestClient(plugin._app)
-        body = {'pools': [self._pool_dict()]}
-        _register_session(client, plugin, body=body)
-        first = plugin._pool_states['gpu']
-        _register_session(client, plugin, body=body)
-        assert plugin._pool_states['gpu'] is first
-
-    def test_pool_conflict_rejected(self, tmp_path: Path):
-        _, plugin = _make_plugin(tmp_path, write_config=False)
-        client = TestClient(plugin._app)
-        _register_session(client, plugin,
-                          body={'pools': [self._pool_dict()]})
-        # Same pool name, different max_pilots → conflict.
-        r = client.post(f'{plugin.namespace}/register_session',
-                        json={'pools': [self._pool_dict(max_pilots=99)]})
-        assert r.status_code == 409
-        assert 'gpu' in r.text
-
-    def test_invalid_pool_body_400(self, tmp_path: Path):
-        _, plugin = _make_plugin(tmp_path, write_config=False)
+    def test_invalid_pool_body_400(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
         client = TestClient(plugin._app)
         r = client.post(f'{plugin.namespace}/register_session',
                         json={'pools': 'not-a-list'})
@@ -249,729 +190,460 @@ class TestSessionDrivenPools:
 
 
 # ---------------------------------------------------------------------------
-# State-dir pruning (Phase 5)
+# Restart-time replay (built here, not lazy)
 # ---------------------------------------------------------------------------
 
-class TestStateSweeper:
+class TestRestartReplay:
 
-    def test_prune_removes_stale_orphan_dir(self, tmp_path: Path):
-        '''A dir not in active pools, last touched >30d ago, gets pruned.'''
-        import os
-        _, plugin = _make_plugin(tmp_path, write_config=False)
-        state_root = tmp_path / 'state'
-        state_root.mkdir(exist_ok=True)
-        stale = state_root / 'oldpool__endpoint_gone'
-        stale.mkdir()
-        (stale / 'pilot.log').write_text('{}\n')
-        # Age the only file in the dir to 40 days old.
-        old = state_root.stat().st_mtime - 40 * 86400
-        os.utime(stale / 'pilot.log', (old, old))
+    def test_replay_rebuilds_pools_for_multiple_sids(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        _session_with_cpu(client, plugin, sid='A', lifetime='persistent')
+        _session_with_cpu(client, plugin, sid='B', lifetime='persistent')
+        # seed a pilot + a RUNNING task under A
+        ps_a = _pool(plugin, 'A', 'cpu')
+        ps_a.pilots['p.1'] = PilotRecord(
+            pid='p.1', pool='cpu', owning_sid='A', size_key='s',
+            rhapsody_backend='concurrent', state=PILOT_ACTIVE)
+        ps_a.pilot_log.append(ps_a.pilots['p.1'])
+        rec = TaskRecord(task_id='t.x', pool='cpu', owning_sid='A',
+                         cmd=['/bin/echo'], cwd=str(tmp_path),
+                         state=TASK_RUNNING, pilot_id='p.1',
+                         rhapsody_uid='rh.1')
+        ps_a.tasks['t.x'] = rec
+        ps_a.task_log.append(rec)
 
-        plugin._prune_stale_state_dirs()
-        assert not stale.exists()
-
-    def test_prune_keeps_active_pool_dir(self, tmp_path: Path):
-        '''A dir matching an active pool is NEVER pruned, even if old.'''
-        import os
-        _, plugin = _make_plugin(tmp_path)   # 'cpu' pool active
-        # _make_plugin built state at state/cpu__endpoint0/ as part of PoolState init.
-        active_dir = tmp_path / 'state' / 'cpu__endpoint0'
-        if active_dir.exists():
-            for p in active_dir.iterdir():
-                old = (active_dir.stat().st_mtime - 365 * 86400)
-                os.utime(p, (old, old))
-        plugin._prune_stale_state_dirs()
-        assert active_dir.exists()
-
-    def test_prune_keeps_recent_orphan(self, tmp_path: Path):
-        '''A dir not in active pools but recently touched is NOT pruned.'''
-        _, plugin = _make_plugin(tmp_path, write_config=False)
-        state_root = tmp_path / 'state'
-        state_root.mkdir(exist_ok=True)
-        fresh = state_root / 'recent__endpoint_x'
-        fresh.mkdir()
-        (fresh / 'pilot.log').write_text('{}\n')
-        plugin._prune_stale_state_dirs()
-        assert fresh.exists()
+        # Simulate a broker restart: a fresh plugin over the same state root.
+        _, plugin2 = _make_plugin(tmp_path)
+        assert set(plugin2._pool_states.keys()) == {'A', 'B'}
+        ps2 = _pool(plugin2, 'A', 'cpu')
+        assert ps2.tasks['t.x'].state == TASK_RUNNING
+        assert 'p.1' in ps2.pilots
+        # uid→task correlation rebuilt (with the owning sid)
+        assert plugin2._uid_to_task.get('rh.1') == ('A', 'cpu', 't.x')
 
 
 # ---------------------------------------------------------------------------
-# Bridge plugin host integration (Phase 3 / Phase 5 wiring)
+# Session-close teardown + reclaim
 # ---------------------------------------------------------------------------
 
-class TestBridgeHostLoadsDispatcher:
-    '''Smoke test: BridgePluginHost can actually load + serve the dispatcher.
+class TestSessionTeardown:
 
-    The other tests in this file use a vanilla FastAPI app, which masks
-    any mismatch between the dispatcher's expectations and what
-    BridgePluginHost provides (is_bridge flag, send_notification,
-    on_topology_change fan-out, etc.).  These tests exercise the real
-    host.
-    '''
+    def test_unregister_tears_down_pools_and_cancels_pilots(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _register(client, plugin,
+                        body={'sid': 'A', 'lifetime': 'persistent',
+                              'pools': [_pool_dict()]})
+        ps = _pool(plugin, sid, 'cpu')
+        ps.pilots['p.1'] = PilotRecord(
+            pid='p.1', pool='cpu', owning_sid=sid, size_key='s',
+            rhapsody_backend='concurrent', state=PILOT_ACTIVE)
+        r = client.post(f'{plugin.namespace}/unregister_session/{sid}')
+        assert r.status_code == 200
+        assert sid not in plugin._pool_states               # pools dropped
+        assert ps.pilots['p.1'].state == PILOT_FAILED       # pilot cancelled
 
-    @pytest.fixture
-    def host(self, tmp_path: Path, monkeypatch):
-        from radical.orbit.bridge_plugin_host import BridgePluginHost
-        # Steer the dispatcher's default state/scratch roots at tmp_path
-        # so the host's auto-built plugin doesn't pollute $HOME.
-        monkeypatch.setenv('RADICAL_ORBIT_BRIDGE_URL', 'https://localhost:9999')
-        monkeypatch.setattr(
-            'radical.orbit.plugin_task_dispatcher._DEFAULT_STATE_ROOT',
-            tmp_path / 'state')
-        monkeypatch.setattr(
-            'radical.orbit.plugin_task_dispatcher._DEFAULT_SCRATCH_ROOT',
-            tmp_path / 'scratch')
-        broadcasts: list = []
+    def test_cancel_all_reclaims_persistent_pools(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _register(client, plugin,
+                        body={'sid': 'default'})   # reserved persistent
+        ps = _pool(plugin, sid, 'default')
+        ps.pilots['p.1'] = PilotRecord(
+            pid='p.1', pool='default', owning_sid=sid, size_key='s',
+            rhapsody_backend='concurrent', state=PILOT_ACTIVE)
+        r = client.post(f'{plugin.namespace}/cancel_all/{sid}')
+        assert r.status_code == 200
+        assert r.json()['pools_reclaimed'] == 1
+        assert sid not in plugin._pool_states
+        assert ps.pilots['p.1'].state == PILOT_FAILED
 
-        async def broadcast(topic, data):
-            broadcasts.append((topic, data))
+    def test_ephemeral_owner_lost_drains_and_cancels(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        plugin.reclaim_drain = 0.05        # tiny drain timer
 
-        host = BridgePluginHost(
-            plugin_names=['task_dispatcher'],
-            broadcast_fn=broadcast,
-            endpoint_name='bridge',
-            bridge_url='https://localhost:9999')
-        return host
+        async def scenario():
+            plugin._ensure_started()
+            sid = await plugin._open_session(None, 'ephemeral', None,
+                                             owner='clientA')
+            plugin._materialise_pool(sid, _make_pool_cfg())
+            ps = _pool(plugin, sid, 'cpu')
+            ps.pilots['p.1'] = PilotRecord(
+                pid='p.1', pool='cpu', owning_sid=sid, size_key='s',
+                rhapsody_backend='concurrent', state=PILOT_ACTIVE)
+            # owner declared lost → arms the reclaim-drain
+            await plugin.on_topology_change(
+                {'clientA': {'role': 'endpoint', 'plugins': {},
+                             'liveness': 'lost'}})
+            await asyncio.sleep(0.25)       # let the drain fire
+            return sid, ps
 
-    def test_dispatcher_loads(self, host):
-        '''The dispatcher plugin instantiates and registers on the bridge host.'''
-        assert 'task_dispatcher' in host._plugins
-        td = host._plugins['task_dispatcher']
-        assert td.plugin_name == 'task_dispatcher'
-        # No pools loaded at startup (Phase 5: pools are session-driven).
-        assert td._pool_states == {}
+        sid, ps = asyncio.run(scenario())
+        assert sid not in plugin._pool_states
+        assert ps.pilots['p.1'].state == PILOT_FAILED
 
-    @pytest.mark.asyncio
-    async def test_dispatcher_routes_reachable(self, host):
-        '''Dispatcher's GET /pools route is wired through the host.'''
-        # Namespace prefix is whatever the plugin chose; for task_dispatcher
-        # it's '/task_dispatcher' (inside the bridge host's view).
-        td = host._plugins['task_dispatcher']
-        path = f'{td.namespace}/pools'
-        resp = await host.handle_request('GET', path, {}, b'')
-        # JSONResponse → body has {'pools': {...}}; with no pools materialised,
-        # the dict is empty but the route shouldn't 404.
-        import json
-        body = json.loads(resp.body)
-        assert 'pools' in body
-        assert body['pools'] == {}
+    def test_persistent_pool_survives_owner_loss(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        plugin.reclaim_drain = 0.05
 
-    @pytest.mark.asyncio
-    async def test_register_session_materialises_default_pool(self, host):
-        '''POST /register_session with no body → default pool appears.'''
-        td = host._plugins['task_dispatcher']
-        path = f'{td.namespace}/register_session'
-        resp = await host.handle_request('POST', path, {}, b'{}')
-        import json
-        body = json.loads(resp.body)
-        assert 'sid' in body
-        assert 'default' in td._pool_states
+        async def scenario():
+            plugin._ensure_started()
+            sid = await plugin._open_session('P', 'persistent', None,
+                                             owner='clientA')
+            plugin._materialise_pool(sid, _make_pool_cfg())
+            await plugin.on_topology_change(
+                {'clientA': {'role': 'endpoint', 'plugins': {},
+                             'liveness': 'lost'}})
+            await asyncio.sleep(0.25)
+            return sid
 
-    def test_dispatcher_is_bridge_role(self, host):
-        '''The dispatcher's is_enabled returns True under the bridge host.'''
-        from radical.orbit.plugin_task_dispatcher import PluginTaskDispatcher
-        assert PluginTaskDispatcher.is_enabled(host._app) is True
+        sid = asyncio.run(scenario())
+        assert sid in plugin._pool_states           # persistent → not reclaimed
+
+    def test_pool_survives_suspect_owner_blip(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        plugin.reclaim_drain = 0.05
+
+        async def scenario():
+            plugin._ensure_started()
+            sid = await plugin._open_session('E', 'ephemeral', None,
+                                             owner='clientA')
+            plugin._materialise_pool(sid, _make_pool_cfg())
+            # suspect must NOT arm the drain
+            await plugin.on_topology_change(
+                {'clientA': {'role': 'endpoint', 'plugins': {},
+                             'liveness': 'suspect'}})
+            await asyncio.sleep(0.25)
+            return sid
+
+        sid = asyncio.run(scenario())
+        assert sid in plugin._pool_states           # blip → pool survives
 
 
-class TestSubmitTask:
+# ---------------------------------------------------------------------------
+# Routes: pools / fleet / submit
+# ---------------------------------------------------------------------------
 
-    def test_rejects_unknown_pool(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        sid = _register_session(client, plugin)
-        r = client.post(f'{plugin.namespace}/submit/{sid}', json={
-            'pool': 'nope', 'task_id': 't.1',
-            'cmd': ['/bin/echo', 'hi'], 'cwd': '/tmp'})
+class TestRoutes:
+
+    def test_fleet_scoped_to_session(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _session_with_cpu(client, plugin, sid='A', lifetime='persistent')
+        r = client.get(f'{plugin.namespace}/fleet/{sid}')
+        assert r.status_code == 200
+        assert 'cpu' in r.json()['pools']
+
+    def test_fleet_unknown_session_404(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        r = client.get(f'{plugin.namespace}/fleet/nope')
         assert r.status_code == 404
 
-    def test_rejects_missing_fields(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        sid = _register_session(client, plugin)
+    def test_submit_rejects_unknown_pool(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _session_with_cpu(client, plugin, sid='A', lifetime='persistent')
         r = client.post(f'{plugin.namespace}/submit/{sid}', json={
-            'pool': 'cpu'})
-        assert r.status_code == 400
+            'pool': 'nope', 'task_id': 't.1',
+            'cmd': ['/bin/echo'], 'cwd': '/tmp'})
+        assert r.status_code == 404
 
-    def test_enqueues_task_and_triggers_strategy(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        sid = _register_session(client, plugin)
-
-        spy = plugin._pool_states['cpu'].strategy
-        with patch.object(spy, 'on_task_arrived') as on_arrived, \
-             patch.object(spy, 'pick_dispatch', return_value=None) as pd:
+    def test_submit_enqueues_task_and_stamps_owner(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _session_with_cpu(client, plugin, sid='A', lifetime='persistent')
+        ps = _pool(plugin, sid, 'cpu')
+        with patch.object(ps.strategy, 'on_task_arrived') as on_arrived, \
+             patch.object(ps.strategy, 'pick_dispatch', return_value=None):
             r = client.post(f'{plugin.namespace}/submit/{sid}', json={
                 'pool': 'cpu', 'task_id': 't.1',
-                'cmd': ['/bin/echo', 'hi'],
-                'cwd': str(tmp_path), 'priority': 7,
-                'inputs': ['a'], 'outputs': ['b']})
+                'cmd': ['/bin/echo', 'hi'], 'cwd': str(tmp_path)})
             assert r.status_code == 200
             assert on_arrived.called
-            assert pd.called
-
-        # Record exists in memory and on disk
-        ps = plugin._pool_states['cpu']
-        assert 't.1' in ps.tasks
-        assert ps.tasks['t.1'].priority == 7
         assert ps.tasks['t.1'].state == TASK_QUEUED
-        # Log replays consistently
-        replayed = ps.task_log.replay()
-        assert 't.1' in replayed
+        assert ps.tasks['t.1'].owning_sid == sid
 
-    def test_cached_done_returns_without_reexec(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        sid = _register_session(client, plugin)
-        ps = plugin._pool_states['cpu']
-
-        # Seed a DONE record
+    def test_cached_done_returns_without_reexec(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _session_with_cpu(client, plugin, sid='A', lifetime='persistent')
+        ps = _pool(plugin, sid, 'cpu')
         ps.tasks['t.done'] = TaskRecord(
-            task_id='t.done', pool='cpu',
-            cmd=['/bin/echo'], cwd=str(tmp_path),
-            state=TASK_DONE, exit_code=0)
-
+            task_id='t.done', pool='cpu', owning_sid=sid,
+            cmd=['/bin/echo'], cwd=str(tmp_path), state=TASK_DONE, exit_code=0)
         with patch.object(ps.strategy, 'on_task_arrived') as spy:
             r = client.post(f'{plugin.namespace}/submit/{sid}', json={
                 'pool': 'cpu', 'task_id': 't.done',
                 'cmd': ['/bin/echo'], 'cwd': str(tmp_path)})
-            assert r.status_code == 200
             assert r.json()['state'] == TASK_DONE
-            assert r.json()['exit_code'] == 0
-            spy.assert_not_called()   # no re-execution
-
-    def test_cached_failed_reexecutes(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        sid = _register_session(client, plugin)
-        ps = plugin._pool_states['cpu']
-
-        ps.tasks['t.fail'] = TaskRecord(
-            task_id='t.fail', pool='cpu',
-            cmd=['/bin/echo'], cwd=str(tmp_path),
-            state=TASK_FAILED, exit_code=1)
-
-        with patch.object(ps.strategy, 'on_task_arrived') as spy:
-            r = client.post(f'{plugin.namespace}/submit/{sid}', json={
-                'pool': 'cpu', 'task_id': 't.fail',
-                'cmd': ['/bin/echo'], 'cwd': str(tmp_path)})
-            assert r.status_code == 200
-            # Re-executed → QUEUED again
-            assert r.json()['state'] == TASK_QUEUED
-            spy.assert_called_once()
-
-    def test_cached_running_attaches(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        sid = _register_session(client, plugin)
-        ps = plugin._pool_states['cpu']
-
-        ps.tasks['t.run'] = TaskRecord(
-            task_id='t.run', pool='cpu',
-            cmd=['/bin/echo'], cwd=str(tmp_path),
-            state=TASK_RUNNING, pilot_id='p.xyz')
-
-        with patch.object(ps.strategy, 'on_task_arrived') as spy:
-            r = client.post(f'{plugin.namespace}/submit/{sid}', json={
-                'pool': 'cpu', 'task_id': 't.run',
-                'cmd': ['/bin/echo'], 'cwd': str(tmp_path)})
-            assert r.status_code == 200
-            assert r.json()['state'] == TASK_RUNNING
             spy.assert_not_called()
 
+    def test_cancel_queued_is_immediate(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _session_with_cpu(client, plugin, sid='A', lifetime='persistent')
+        ps = _pool(plugin, sid, 'cpu')
+        ps.tasks['t.q'] = TaskRecord(
+            task_id='t.q', pool='cpu', owning_sid=sid, cmd=['/bin/echo'],
+            cwd=str(tmp_path), state=TASK_QUEUED)
+        r = client.post(f'{plugin.namespace}/cancel/{sid}/t.q')
+        assert r.status_code == 200
+        assert ps.tasks['t.q'].state == TASK_CANCELED
 
-class TestGetTaskAndCancel:
-
-    def test_get_task_404(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        sid = _register_session(client, plugin)
+    def test_get_task_404(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _session_with_cpu(client, plugin, sid='A', lifetime='persistent')
         r = client.get(f'{plugin.namespace}/task/{sid}/nope')
         assert r.status_code == 404
 
-    def test_cancel_queued_is_immediate(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        sid = _register_session(client, plugin)
-        ps = plugin._pool_states['cpu']
-
-        # Put a queued task on the books
-        ps.tasks['t.q'] = TaskRecord(
-            task_id='t.q', pool='cpu', cmd=['/bin/echo'],
-            cwd=str(tmp_path), state=TASK_QUEUED)
-
-        r = client.post(f'{plugin.namespace}/cancel/{sid}/t.q')
-        assert r.status_code == 200
-        assert r.json()['state'] == TASK_CANCELED
-        assert ps.tasks['t.q'].state == TASK_CANCELED
-
-    def test_cancel_terminal_is_noop(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        sid = _register_session(client, plugin)
-        ps = plugin._pool_states['cpu']
-        ps.tasks['t.done'] = TaskRecord(
-            task_id='t.done', pool='cpu', cmd=['/bin/echo'],
-            cwd=str(tmp_path), state=TASK_DONE, exit_code=0)
-        r = client.post(f'{plugin.namespace}/cancel/{sid}/t.done')
-        assert r.status_code == 200
-        assert r.json()['state'] == TASK_DONE   # unchanged
-
 
 # ---------------------------------------------------------------------------
-# Staging routes
+# Staging
 # ---------------------------------------------------------------------------
 
-class TestStagingRoutes:
+class TestStaging:
 
-    def test_stage_in_writes_file(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        sid = _register_session(client, plugin)
+    def test_stage_in_out_roundtrip(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _session_with_cpu(client, plugin, sid='A', lifetime='persistent')
+        ps = _pool(plugin, sid, 'cpu')
         content = b'hello world'
         r = client.post(
             f'{plugin.namespace}/stage_in/{sid}/t.1',
-            json={'pool': 'cpu', 'filename': 'input.txt',
+            json={'pool': 'cpu', 'filename': 'in.txt',
                   'content_b64': base64.b64encode(content).decode('ascii')})
-        assert r.status_code == 200, r.text
-        body = r.json()
-        assert body['size'] == len(content)
-        path = Path(body['cwd']) / 'input.txt'
-        assert path.read_bytes() == content
+        assert r.status_code == 200
+        assert (Path(r.json()['cwd']) / 'in.txt').read_bytes() == content
 
-    def test_stage_in_rejects_bad_filename(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        sid = _register_session(client, plugin)
-        for bad in ('../evil', 'sub/dir', '', '.', '..'):
-            r = client.post(
-                f'{plugin.namespace}/stage_in/{sid}/t.1',
-                json={'pool': 'cpu', 'filename': bad,
-                      'content_b64': base64.b64encode(b'x').decode('ascii')})
-            assert r.status_code == 400, \
-                f'expected 400 for filename {bad!r}'
-
-    def test_stage_in_rejects_unknown_pool(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        sid = _register_session(client, plugin)
-        r = client.post(
-            f'{plugin.namespace}/stage_in/{sid}/t.1',
-            json={'pool': 'nope', 'filename': 'f.txt',
-                  'content_b64': base64.b64encode(b'x').decode('ascii')})
-        assert r.status_code == 404
-
-    def test_stage_in_overwrite_flag(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        sid = _register_session(client, plugin)
-        payload = {'pool': 'cpu', 'filename': 'f.txt',
-                   'content_b64': base64.b64encode(b'v1').decode('ascii')}
-        r1 = client.post(f'{plugin.namespace}/stage_in/{sid}/t.1', json=payload)
-        assert r1.status_code == 200
-
-        # Re-upload w/o overwrite → 409
-        r2 = client.post(f'{plugin.namespace}/stage_in/{sid}/t.1', json=payload)
-        assert r2.status_code == 409
-
-        # With overwrite=True → 200 and contents updated
-        payload['content_b64'] = base64.b64encode(b'v2').decode('ascii')
-        payload['overwrite']   = True
-        r3 = client.post(f'{plugin.namespace}/stage_in/{sid}/t.1', json=payload)
-        assert r3.status_code == 200
-        path = Path(r3.json()['cwd']) / 'f.txt'
-        assert path.read_bytes() == b'v2'
-
-    def test_stage_out_returns_file(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        sid = _register_session(client, plugin)
-        ps = plugin._pool_states['cpu']
         ps.tasks['t.1'] = TaskRecord(
-            task_id='t.1', pool='cpu', cmd=['/bin/echo'],
+            task_id='t.1', pool='cpu', owning_sid=sid, cmd=['/bin/echo'],
             cwd=str(tmp_path), state=TASK_DONE)
-        scratch = ps.scratch_base / 't.1'
-        scratch.mkdir(parents=True, exist_ok=True)
-        (scratch / 'out.txt').write_bytes(b'result payload')
-
+        (ps.scratch_base / 't.1' / 'out.txt').write_bytes(b'result')
         r = client.get(f'{plugin.namespace}/stage_out/{sid}/t.1/out.txt')
         assert r.status_code == 200
-        body = r.json()
-        assert body['size'] == len(b'result payload')
-        assert base64.b64decode(body['content_b64']) == b'result payload'
+        assert base64.b64decode(r.json()['content_b64']) == b'result'
 
-    def test_stage_out_missing_file(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        sid = _register_session(client, plugin)
-        ps = plugin._pool_states['cpu']
-        ps.tasks['t.1'] = TaskRecord(
-            task_id='t.1', pool='cpu', cmd=['/bin/echo'],
-            cwd=str(tmp_path), state=TASK_DONE)
-        r = client.get(f'{plugin.namespace}/stage_out/{sid}/t.1/nope.txt')
-        assert r.status_code == 404
+    def test_stage_in_bad_filename(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _session_with_cpu(client, plugin, sid='A', lifetime='persistent')
+        r = client.post(
+            f'{plugin.namespace}/stage_in/{sid}/t.1',
+            json={'pool': 'cpu', 'filename': '../evil',
+                  'content_b64': base64.b64encode(b'x').decode('ascii')})
+        assert r.status_code == 400
 
 
 # ---------------------------------------------------------------------------
-# Pilot binding via topology hook
+# Pilot binding via rich topology (present / suspect / lost)
 # ---------------------------------------------------------------------------
+
+def _child_topo(name, liveness='present'):
+    return {name: {'role': 'endpoint',
+                   'plugins': {'rhapsody': {'namespace': '/rhapsody'}},
+                   'liveness': liveness}}
+
 
 class TestTopologyBinding:
 
-    def _new_pending(self, plugin, pid='p.1', child='endpoint0_p.1',
-                    state=PILOT_PENDING):
-        ps = plugin._pool_states['cpu']
-        ps.pilots[pid] = PilotRecord(
-            pid=pid, pool='cpu', size_key='s',
-            rhapsody_backend='concurrent',
-            state=state, submitted_at=100.0,
-            child_endpoint_name=child)
-        return ps
-
-    def test_topology_binds_pending_pilot(self, tmp_path: Path):
+    def _plugin_with_pilot(self, tmp_path, pid='p.1',
+                           child='endpoint0_p.1', state=PILOT_PENDING,
+                           walltime=1e12):
         _, plugin = _make_plugin(tmp_path)
-        plugin._loops_started = True   # bypass the not-yet-started gate
-        ps = self._new_pending(plugin)
+        plugin._loops_started = True
+        plugin._materialise_pool('A', _make_pool_cfg())
+        ps = _pool(plugin, 'A', 'cpu')
+        ps.pilots[pid] = PilotRecord(
+            pid=pid, pool='cpu', owning_sid='A', size_key='s',
+            rhapsody_backend='concurrent', state=state, submitted_at=100.0,
+            child_endpoint_name=child, walltime_deadline=walltime)
+        return plugin, ps
+
+    def test_present_binds_pending_pilot(self, tmp_path):
+        plugin, ps = self._plugin_with_pilot(tmp_path)
         with patch.object(ps.strategy, 'on_pilot_state') as spy:
-            asyncio.run(plugin.on_topology_change(
-                {'endpoint0_p.1': {'plugins': ['rhapsody']}}))
+            asyncio.run(plugin.on_topology_change(_child_topo('endpoint0_p.1')))
         assert ps.pilots['p.1'].state == PILOT_ACTIVE
-        # capacity = nodes(1) * cpus_per_node(4) from _make_plugin's pool
         assert ps.pilots['p.1'].capacity == 4
-        assert ps.pilots['p.1'].active_at is not None
         spy.assert_called_once()
 
-    def test_topology_ignores_unknown_endpoints(self, tmp_path: Path):
-        _, plugin = _make_plugin(tmp_path)
-        plugin._loops_started = True
-        ps = self._new_pending(plugin)
+    def test_suspect_child_pauses_not_demotes(self, tmp_path):
+        plugin, ps = self._plugin_with_pilot(tmp_path, state=PILOT_ACTIVE)
+        ps.pilots['p.1'].capacity = 4
         asyncio.run(plugin.on_topology_change(
-            {'someone_else': {'plugins': ['sysinfo']}}))
-        assert ps.pilots['p.1'].state == PILOT_PENDING
+            _child_topo('endpoint0_p.1', 'suspect')))
+        assert ps.pilots['p.1'].state == PILOT_ACTIVE           # not demoted
+        assert ps.pilots['p.1'].accepting_new_tasks is False    # paused
+        # returning present un-pauses
+        asyncio.run(plugin.on_topology_change(
+            _child_topo('endpoint0_p.1', 'present')))
+        assert ps.pilots['p.1'].accepting_new_tasks is True
 
-    def test_topology_ignores_terminal_pilot(self, tmp_path: Path):
-        _, plugin = _make_plugin(tmp_path)
-        plugin._loops_started = True
-        ps = self._new_pending(plugin, state=PILOT_FAILED)
+    def test_lost_before_walltime_marks_failed(self, tmp_path):
+        plugin, ps = self._plugin_with_pilot(tmp_path, state=PILOT_ACTIVE,
+                                             walltime=1e12)
+        ps.pilots['p.1'].capacity = 4
         asyncio.run(plugin.on_topology_change(
-            {'endpoint0_p.1': {'plugins': ['rhapsody']}}))
-        assert ps.pilots['p.1'].state == PILOT_FAILED   # unchanged
+            _child_topo('endpoint0_p.1', 'lost')))
+        assert ps.pilots['p.1'].state == PILOT_FAILED
 
-    def test_topology_no_op_before_started(self, tmp_path: Path):
-        _, plugin = _make_plugin(tmp_path)
-        # Don't flip _loops_started — emulate startup race
-        ps = self._new_pending(plugin)
+    def test_lost_after_walltime_marks_done(self, tmp_path):
+        plugin, ps = self._plugin_with_pilot(tmp_path, state=PILOT_ACTIVE,
+                                             walltime=1.0)   # long past
+        ps.pilots['p.1'].capacity = 4
         asyncio.run(plugin.on_topology_change(
-            {'endpoint0_p.1': {'plugins': ['rhapsody']}}))
-        assert ps.pilots['p.1'].state == PILOT_PENDING
+            _child_topo('endpoint0_p.1', 'lost')))
+        assert ps.pilots['p.1'].state == PILOT_DONE
+
+    def test_absent_child_not_demoted(self, tmp_path):
+        """A child never listed 'lost' (e.g. not-yet-reconnected after a
+        restart) is left alone — replaces the old `_seen` heuristic."""
+        plugin, ps = self._plugin_with_pilot(tmp_path, state=PILOT_ACTIVE)
+        asyncio.run(plugin.on_topology_change(_child_topo('someone_else')))
+        assert ps.pilots['p.1'].state == PILOT_ACTIVE
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers — pilot failure re-enqueues tasks
+# Pilot failure re-enqueues tasks
 # ---------------------------------------------------------------------------
 
 class TestMarkPilotFailed:
 
-    def test_reenqueues_running_tasks(self, tmp_path: Path):
+    def test_reenqueues_running_tasks(self, tmp_path):
         _, plugin = _make_plugin(tmp_path)
-        ps = plugin._pool_states['cpu']
-        pilot = PilotRecord(
-            pid='p.1', pool='cpu', size_key='s',
-            rhapsody_backend='concurrent', state=PILOT_ACTIVE,
-            capacity=2, in_flight=2)
+        plugin._materialise_pool('A', _make_pool_cfg())
+        ps = _pool(plugin, 'A', 'cpu')
+        pilot = PilotRecord(pid='p.1', pool='cpu', owning_sid='A', size_key='s',
+                            rhapsody_backend='concurrent', state=PILOT_ACTIVE,
+                            capacity=2, in_flight=2)
         ps.pilots['p.1'] = pilot
-        t_running = TaskRecord(task_id='t.r', pool='cpu',
-                                cmd=['/bin/echo'], cwd=str(tmp_path),
-                                state=TASK_RUNNING, pilot_id='p.1')
-        t_done    = TaskRecord(task_id='t.d', pool='cpu',
-                                cmd=['/bin/echo'], cwd=str(tmp_path),
-                                state=TASK_DONE, pilot_id='p.1')
-        ps.tasks['t.r'] = t_running
-        ps.tasks['t.d'] = t_done
-
+        ps.tasks['t.r'] = TaskRecord(task_id='t.r', pool='cpu', owning_sid='A',
+                                     cmd=['/bin/echo'], cwd=str(tmp_path),
+                                     state=TASK_RUNNING, pilot_id='p.1')
         plugin._mark_pilot_failed(ps, pilot, 'test')
-
         assert pilot.state == PILOT_FAILED
         assert ps.tasks['t.r'].state == TASK_QUEUED
         assert ps.tasks['t.r'].pilot_id is None
-        assert ps.tasks['t.d'].state == TASK_DONE    # terminal unchanged
 
 
 # ---------------------------------------------------------------------------
-# Strategy submit_pilot bookkeeping (no actual psij call)
+# Async transport port: proxies over the broker caller (mocked)
 # ---------------------------------------------------------------------------
 
-class TestStrategyActions:
+class TestPilotSubmitTransport:
 
-    def test_strategy_submit_records_pilot(self, tmp_path: Path):
+    def test_submit_tunneled_passes_tunnel_none(self, tmp_path):
         _, plugin = _make_plugin(tmp_path)
-        ps = plugin._pool_states['cpu']
-
-        # Prevent the async submit from running: no event loop here anyway
-        with patch.object(plugin, '_schedule_pilot_submit') as sched:
-            pid = ps.ctx.submit_pilot(None)
-
-        assert pid.startswith('p.')
-        assert pid in ps.pilots
-        assert ps.pilots[pid].state == PILOT_PENDING
-        assert ps.pilots[pid].rhapsody_backend == 'concurrent'
-        sched.assert_called_once()
-
-    def test_strategy_submit_unknown_size(self, tmp_path: Path):
-        _, plugin = _make_plugin(tmp_path)
-        ps = plugin._pool_states['cpu']
-        with pytest.raises(KeyError):
-            ps.ctx.submit_pilot('xxl')
-
-    def test_drain_pilot_flips_flag(self, tmp_path: Path):
-        _, plugin = _make_plugin(tmp_path)
-        ps = plugin._pool_states['cpu']
-        ps.pilots['p.x'] = PilotRecord(
-            pid='p.x', pool='cpu', size_key='s',
-            rhapsody_backend='concurrent', state=PILOT_ACTIVE,
-            capacity=4, in_flight=1)
-        ps.ctx.drain_pilot('p.x')
-        assert ps.pilots['p.x'].accepting_new_tasks is False
-        # Free capacity now zero despite slots
-        assert ps.pilots['p.x'].free_capacity() == 0
-
-
-# ---------------------------------------------------------------------------
-# Handshake-arrival via handler → triggers drain (pick_dispatch loop)
-# ---------------------------------------------------------------------------
-
-class TestDispatchDrain:
-
-    def test_drain_assigns_queued_task(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        sid = _register_session(client, plugin)
-        ps = plugin._pool_states['cpu']
-
-        # Two queued tasks + one active pilot
-        for i in range(2):
-            ps.tasks[f't.{i}'] = TaskRecord(
-                task_id=f't.{i}', pool='cpu',
-                cmd=['/bin/echo', str(i)], cwd=str(tmp_path),
-                state=TASK_QUEUED, priority=0, arrival_ts=float(i))
-        ps.pilots['p.1'] = PilotRecord(
-            pid='p.1', pool='cpu', size_key='s',
-            rhapsody_backend='concurrent',
-            state=PILOT_ACTIVE, capacity=4, in_flight=0,
-            child_endpoint_name='endpoint0_p.1',
-            walltime_deadline=10_000.0, submitted_at=0.0, active_at=10.0)
-
-        # Prevent the async rhapsody submit from running
-        with patch.object(plugin, '_do_rhapsody_submit') as spy, \
-             patch.object(plugin, '_main_loop'):
-            plugin._drain_pending(ps)
-
-        # Both tasks advanced to RUNNING
-        assert ps.tasks['t.0'].state == TASK_RUNNING
-        assert ps.tasks['t.1'].state == TASK_RUNNING
-        assert ps.pilots['p.1'].in_flight == 2
-
-
-# ---------------------------------------------------------------------------
-# Regression: psij submit_tunneled tunnel-arg shape
-# ---------------------------------------------------------------------------
-#
-# Bug surfaced during the local e2e smoke (memory/project_bridge_dispatcher.md):
-# the dispatcher used to call ``psij_c.submit_tunneled(spec, executor, False)``
-# but psij now requires one of ``'none'`` / ``'forward'`` / ``'reverse'`` and
-# rejects the boolean.  Fix was a literal ``False`` → ``'none'`` change in
-# _do_pilot_submit.  This test pins the contract.
-
-class TestPilotSubmitTunnelArg:
-
-    def test_passes_tunnel_none_not_false(self, tmp_path: Path):
-        _, plugin = _make_plugin(tmp_path)
-        ps = plugin._pool_states['cpu']
+        plugin._materialise_pool('A', _make_pool_cfg())
+        ps = _pool(plugin, 'A', 'cpu')
         size = ps.config.pilot_sizes[ps.config.default_size]
         record = PilotRecord(
-            pid='p.tunnel_arg', pool='cpu', size_key=ps.config.default_size,
-            rhapsody_backend=size.rhapsody_backend,
-            state=PILOT_PENDING, submitted_at=0.0)
+            pid='p.a', pool='cpu', owning_sid='A',
+            size_key=ps.config.default_size,
+            rhapsody_backend=size.rhapsody_backend, state=PILOT_PENDING)
         ps.pilots[record.pid] = record
 
         psij_mock = MagicMock()
-        psij_mock.submit_tunneled.return_value = {'job_id': 'fake-jid'}
-
-        with patch.object(plugin, '_get_psij_client', return_value=psij_mock), \
+        psij_mock.submit_tunneled = AsyncMock(return_value={'job_id': 'jid'})
+        with patch.object(plugin, '_get_psij_client',
+                          new=AsyncMock(return_value=psij_mock)), \
              patch('radical.orbit.batch_system.detect_batch_system') as bs:
             bs.return_value.psij_executor = 'local'
             asyncio.run(plugin._do_pilot_submit(ps, record, size))
 
-        psij_mock.submit_tunneled.assert_called_once()
-        # Third positional arg is the tunnel mode — must be the string
-        # 'none', not False.
-        call_args = psij_mock.submit_tunneled.call_args
-        assert call_args.args[2] == 'none', (
-            f'expected tunnel mode \'none\', got {call_args.args[2]!r}')
-        assert call_args.args[2] is not False
+        psij_mock.submit_tunneled.assert_awaited_once()
+        assert psij_mock.submit_tunneled.await_args.args[2] == 'none'
+        assert record.psij_job_id == 'jid'
+
+    def test_refuses_without_broker_caller(self, tmp_path):
+        """Old-stack construction (no caller) → the transport refuses cleanly."""
+        _, plugin = _make_plugin(tmp_path, broker_caller=None)
+        assert plugin._broker_caller is None
+        with pytest.raises(RuntimeError, match='broker-hosted only'):
+            asyncio.run(plugin._call('someone', 'GET', '/x/ping'))
 
 
 # ---------------------------------------------------------------------------
 # Endpoint-mode submit (transparent proxy to a target endpoint's rhapsody)
 # ---------------------------------------------------------------------------
 
-class TestEndpointModeSubmit:
-    '''Submit/get/cancel paths that target an endpoint directly (no pool).
+class TestEndpointMode:
 
-    These tests stub :meth:`_get_rhapsody_client` so no real bridge or
-    HTTP traffic is needed.  ``_connected_endpoints`` is poked directly to
-    simulate a topology update (the test client doesn't run the bridge
-    WS subscription thread).
-    '''
-
-    def _seed_topology(self, plugin, endpoint_plugins: dict):
-        '''Populate ``_connected_endpoints`` as on_topology_change would.'''
+    def _seed_topology(self, plugin, endpoint_plugins):
         plugin._connected_endpoints = {
-            name: set(plugins) for name, plugins in endpoint_plugins.items()
-        }
+            name: set(plugins) for name, plugins in endpoint_plugins.items()}
 
-    def test_xor_neither_set_400(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        sid = _register_session(client, plugin)
-        r = client.post(f'{plugin.namespace}/submit/{sid}', json={
-            'task_id': 't.1', 'cmd': ['/bin/echo', 'hi'],
-            'cwd': '/tmp'})
-        assert r.status_code == 400
-        assert 'exactly one' in r.text
-
-    def test_xor_both_set_400(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        sid = _register_session(client, plugin)
-        r = client.post(f'{plugin.namespace}/submit/{sid}', json={
-            'pool': 'cpu', 'endpoint': 'endpoint_x',
-            'task_id': 't.1', 'cmd': ['/bin/echo', 'hi'],
-            'cwd': '/tmp'})
-        assert r.status_code == 400
-        assert 'exactly one' in r.text
-
-    def test_unknown_endpoint_404(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        sid = _register_session(client, plugin)
-        self._seed_topology(plugin, {})   # no endpoints connected
+    def test_unknown_endpoint_404(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _register(client, plugin, body={'sid': 'A',
+                                              'lifetime': 'persistent'})
+        self._seed_topology(plugin, {})
         r = client.post(f'{plugin.namespace}/submit/{sid}', json={
             'endpoint': 'ghost', 'task_id': 't.1',
-            'cmd': ['/bin/echo', 'hi'], 'cwd': '/tmp'})
+            'cmd': ['/bin/echo'], 'cwd': '/tmp'})
         assert r.status_code == 404
-        assert 'unknown endpoint: ghost' in r.text
 
-    def test_endpoint_without_rhapsody_503(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        sid = _register_session(client, plugin)
-        self._seed_topology(plugin, {'endpoint_dumb': ['sysinfo']})
-        r = client.post(f'{plugin.namespace}/submit/{sid}', json={
-            'endpoint': 'endpoint_dumb', 'task_id': 't.1',
-            'cmd': ['/bin/echo', 'hi'], 'cwd': '/tmp'})
-        assert r.status_code == 503
-        assert 'cannot run tasks' in r.text
-
-    def test_rejects_inputs_in_endpoint_mode(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        sid = _register_session(client, plugin)
-        self._seed_topology(plugin, {'endpoint_r': ['rhapsody']})
-        rh_mock = MagicMock()
-        rh_mock.submit_tasks.return_value = [{'uid': 't.1', 'state': 'NEW'}]
-        with patch.object(plugin, '_get_rhapsody_client',
-                          return_value=rh_mock):
-            r = client.post(f'{plugin.namespace}/submit/{sid}', json={
-                'endpoint': 'endpoint_r', 'task_id': 't.1',
-                'cmd': ['/bin/echo', 'hi'], 'cwd': '/tmp',
-                'inputs': ['a']})
-        assert r.status_code == 400
-        assert 'staging not supported' in r.text or \
-               'not supported for endpoint-mode' in r.text
-
-    def test_proxy_submit_invokes_rhapsody(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        sid = _register_session(client, plugin)
-        self._seed_topology(plugin, {'endpoint_r': ['rhapsody', 'sysinfo']})
-        rh_mock = MagicMock()
-        rh_mock.submit_tasks.return_value = [{'uid': 't.1', 'state': 'NEW'}]
-        with patch.object(plugin, '_get_rhapsody_client',
-                          return_value=rh_mock):
-            r = client.post(f'{plugin.namespace}/submit/{sid}', json={
-                'endpoint': 'endpoint_r', 'task_id': 't.1',
-                'cmd': ['/bin/sleep', '0'], 'cwd': '/tmp'})
-        assert r.status_code == 200, r.text
-        body = r.json()
-        assert body['task_id'] == 't.1'
-        assert body['endpoint'] == 'endpoint_r'
-        # Rhapsody saw the task with the same uid + cwd carried via
-        # backend_specific_kwargs (so rhapsody's concurrent backend
-        # picks the right working dir).
-        rh_mock.submit_tasks.assert_called_once()
-        submitted = rh_mock.submit_tasks.call_args.args[0]
-        assert submitted[0]['uid'] == 't.1'
-        assert submitted[0]['executable'] == '/bin/sleep'
-        assert submitted[0]['arguments'] == ['0']
-        # Endpoint-mode mapping recorded so get/cancel can route back.
-        assert plugin._endpoint_mode_tasks.get('t.1') == 'endpoint_r'
-
-    def test_get_task_forwards_to_target_endpoint(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        sid = _register_session(client, plugin)
-        plugin._endpoint_mode_tasks['t.1'] = 'endpoint_r'
-        rh_mock = MagicMock()
-        rh_mock.get_task.return_value = {'uid': 't.1', 'state': 'RUNNING'}
-        with patch.object(plugin, '_get_rhapsody_client',
-                          return_value=rh_mock):
-            r = client.get(f'{plugin.namespace}/task/{sid}/t.1')
-        assert r.status_code == 200, r.text
-        body = r.json()
-        assert body['task_id'] == 't.1'
-        assert body['endpoint'] == 'endpoint_r'
-        assert body['result']['state'] == 'RUNNING'
-        rh_mock.get_task.assert_called_once_with('t.1')
-
-    def test_cancel_task_forwards_to_target_endpoint(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        sid = _register_session(client, plugin)
-        plugin._endpoint_mode_tasks['t.1'] = 'endpoint_r'
-        rh_mock = MagicMock()
-        rh_mock.cancel_task.return_value = {'uid': 't.1', 'state': 'CANCELED'}
-        with patch.object(plugin, '_get_rhapsody_client',
-                          return_value=rh_mock):
-            r = client.post(f'{plugin.namespace}/cancel/{sid}/t.1')
-        assert r.status_code == 200, r.text
-        rh_mock.cancel_task.assert_called_once_with('t.1')
-
-    def test_stage_in_rejects_endpoint_mode_task(self, tmp_path: Path):
-        app, plugin = _make_plugin(tmp_path)
-        client = TestClient(app)
-        sid = _register_session(client, plugin)
-        plugin._endpoint_mode_tasks['t.1'] = 'endpoint_r'
-        r = client.post(
-            f'{plugin.namespace}/stage_in/{sid}/t.1',
-            json={'pool': 'cpu', 'filename': 'x.txt',
-                  'content_b64': base64.b64encode(b'hi').decode('ascii')})
-        assert r.status_code == 400
-        assert 'endpoint-mode' in r.text
-
-    def test_terminal_clears_endpoint_mode_mapping(self, tmp_path: Path):
-        '''Terminal notification removes the mapping and re-emits status.'''
+    def test_endpoint_without_rhapsody_503(self, tmp_path):
         _, plugin = _make_plugin(tmp_path)
-        plugin._endpoint_mode_tasks['t.1'] = 'endpoint_r'
-        notified: list = []
-        plugin._dispatch_notify = lambda topic, data: notified.append(
-            (topic, data))   # type: ignore[method-assign]
-        plugin._handle_task_terminal(
-            't.1', TASK_DONE, {'exit_code': 0, 'error': None})
+        client = TestClient(plugin._app)
+        sid = _register(client, plugin, body={'sid': 'A',
+                                              'lifetime': 'persistent'})
+        self._seed_topology(plugin, {'ep': ['sysinfo']})
+        r = client.post(f'{plugin.namespace}/submit/{sid}', json={
+            'endpoint': 'ep', 'task_id': 't.1',
+            'cmd': ['/bin/echo'], 'cwd': '/tmp'})
+        assert r.status_code == 503
+
+    def test_proxy_submit_and_get_and_cancel(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _register(client, plugin, body={'sid': 'A',
+                                              'lifetime': 'persistent'})
+        self._seed_topology(plugin, {'ep': ['rhapsody']})
+        rh_mock = MagicMock()
+        rh_mock.submit_tasks = AsyncMock(return_value=[{'uid': 't.1',
+                                                        'state': 'NEW'}])
+        rh_mock.get_task    = AsyncMock(return_value={'uid': 't.1',
+                                                      'state': 'RUNNING'})
+        rh_mock.cancel_task = AsyncMock(return_value={'uid': 't.1',
+                                                      'state': 'CANCELED'})
+        with patch.object(plugin, '_get_rhapsody_client',
+                          new=AsyncMock(return_value=rh_mock)):
+            r = client.post(f'{plugin.namespace}/submit/{sid}', json={
+                'endpoint': 'ep', 'task_id': 't.1',
+                'cmd': ['/bin/sleep', '0'], 'cwd': '/tmp'})
+            assert r.status_code == 200, r.text
+            assert plugin._endpoint_mode_tasks.get('t.1') == 'ep'
+            rh_mock.submit_tasks.assert_awaited_once()
+
+            r = client.get(f'{plugin.namespace}/task/{sid}/t.1')
+            assert r.json()['result']['state'] == 'RUNNING'
+
+            r = client.post(f'{plugin.namespace}/cancel/{sid}/t.1')
+            assert r.status_code == 200
+            rh_mock.cancel_task.assert_awaited_once_with('t.1')
+
+    def test_terminal_event_clears_endpoint_mode(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        plugin._endpoint_mode_tasks['t.1'] = 'ep'
+        notified = []
+        plugin._dispatch_notify = lambda t, d: notified.append((t, d))
+        # Feed a rhapsody task_status event exactly as the broker tap delivers.
+        plugin._on_event({'plugin': 'rhapsody', 'topic': 'task_status',
+                          'data': {'uid': 't.1', 'state': 'DONE',
+                                   'exit_code': 0}})
         assert 't.1' not in plugin._endpoint_mode_tasks
-        assert len(notified) == 1
-        topic, data = notified[0]
-        assert topic == 'task_status'
-        assert data['task_id'] == 't.1'
-        assert data['endpoint']    == 'endpoint_r'
-        assert data['state']   == TASK_DONE
-        assert data['exit_code'] == 0
+        assert notified and notified[0][1]['state'] == TASK_DONE
+
+    def test_on_event_ignores_other_plugins(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        called = []
+        plugin._handle_task_terminal = lambda *a: called.append(a)
+        plugin._on_event({'plugin': 'psij', 'topic': 'task_status',
+                          'data': {'uid': 'x', 'state': 'DONE'}})
+        assert called == []

@@ -27,7 +27,9 @@ class BridgePluginHost(PluginHostBase):
                        broadcast_fn        : Callable,
                        endpoint_name           : str      = 'bridge',
                        on_topology_changed : Optional[Callable] = None,
-                       bridge_url          : str      = ''):
+                       bridge_url          : str      = '',
+                       broker_caller       : Any      = None,
+                       broker_tap          : Optional[Callable] = None):
 
         self._name                : str      = endpoint_name
         self._broadcast_fn        : Callable = broadcast_fn
@@ -43,6 +45,11 @@ class BridgePluginHost(PluginHostBase):
         self._app.state.endpoint_name    = endpoint_name
         self._app.state.bridge_url   = bridge_url
         self._app.state.is_bridge    = True
+        # Broker seam for broker-hosted plugins (task_dispatcher): the in-process
+        # caller handle and the raw event tap.  Absent (None) under the old
+        # ``bridge.py`` construction — a broker-only plugin must refuse cleanly.
+        self._app.state.broker_caller = broker_caller
+        self._app.state.broker_tap    = broker_tap
 
         self._load_plugins_from_filter(plugin_names)
 
