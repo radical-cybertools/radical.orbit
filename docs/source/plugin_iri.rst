@@ -78,7 +78,7 @@ Client API
        currently connected.
    * - ``connect(endpoint, token)``
      - Connect to *endpoint* with *token*; registers ``iri.<endpoint>`` and
-       returns an :class:`IRIInstanceClient` bound to it.  Idempotent — an
+       returns an ``IRIInstanceClient`` bound to it.  Idempotent — an
        already-connected endpoint has its token refreshed in place.
    * - ``disconnect(endpoint)``
      - Tear down ``iri.<endpoint>`` and its sessions.
