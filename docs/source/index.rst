@@ -71,6 +71,8 @@ Contents:
    plugin_api.rst
    plugin_globus.rst
    plugin_queue_info.rst
+   plugin_iri.rst
+   machine_guide.rst
    rest_api.rst
    task_dispatcher_strategy.md
 
