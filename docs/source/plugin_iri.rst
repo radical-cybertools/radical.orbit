@@ -59,7 +59,7 @@ Disconnecting removes the instance and drops the token.
 
 The Explorer UI prompts for the token and shares it with the plugin through the
 ``iri_tokens`` browser storage key; from Python you pass it to
-:py:meth:`IRIConnectClient.connect`.
+``IRIConnectClient.connect()``.
 
 
 Client API
