@@ -76,6 +76,7 @@ def _patch_rhapsody():
 
 
 # Now import after the mock is in place
+from radical.orbit.plugin_base import DEFAULT_SID  # noqa: E402
 from radical.orbit.plugin_rhapsody import (  # noqa: E402
     PluginRhapsody,
     RhapsodySession,
@@ -164,6 +165,111 @@ def test_register_multiple_sessions():
 
     assert len(set(sids)) == 3
     assert len(plugin._sessions) == 3
+
+
+def test_register_session_policy_passthrough():
+    '''The rhapsody override forwards the base sid/lifetime/ttl policy:
+    explicit-sid create, reconnect, and 409 on an incoherent pair.'''
+    _, plugin, client = _make_plugin()
+
+    # Explicit sid + ttl lifetime create
+    resp = client.post(f"{plugin.namespace}/register_session",
+                       json={"sid": "s1", "lifetime": "ttl", "ttl": 30})
+    assert resp.status_code == 200
+    assert resp.json()['sid'] == "s1"
+    assert plugin._session_policy["s1"] == {'lifetime': 'ttl',
+                                            'ttl': 30.0, 'owner': None}
+    plugin._sessions["s1"]._init_ready.set()
+
+    # Reconnect with the same policy — no rebuild, same sid
+    obj  = plugin._sessions["s1"]
+    resp = client.post(f"{plugin.namespace}/register_session",
+                       json={"sid": "s1", "lifetime": "ttl", "ttl": 30})
+    assert resp.status_code == 200
+    assert resp.json()['sid'] == "s1"
+    assert plugin._sessions["s1"] is obj
+
+    # Incoherent pair maps to 409
+    resp = client.post(f"{plugin.namespace}/register_session",
+                       json={"lifetime": "ttl"})
+    assert resp.status_code == 409
+
+
+def test_register_session_reconnect_real_status():
+    '''Reconnect reports the session's real init status — 'ready' once
+    init completed, 'failed' once it errored — not 'initializing'.'''
+    _, plugin, client = _make_plugin()
+
+    resp = client.post(f"{plugin.namespace}/register_session",
+                       json={"sid": "s1"})
+    assert resp.status_code == 200
+    assert resp.json()['status'] == 'initializing'
+
+    # Reconnect to a ready session reports 'ready'
+    session = plugin._sessions["s1"]
+    session._init_ready.set()
+    resp = client.post(f"{plugin.namespace}/register_session",
+                       json={"sid": "s1"})
+    assert resp.status_code == 200
+    assert resp.json() == {'sid': 's1', 'status': 'ready'}
+
+    # ... and 'failed' once init errored
+    session._init_error = 'boom'
+    resp = client.post(f"{plugin.namespace}/register_session",
+                       json={"sid": "s1"})
+    assert resp.json()['status'] == 'failed'
+
+
+@pytest.mark.asyncio
+async def test_register_default_session():
+    '''register_session(sid='default') creates the persistent default
+    session, kicks its background init, and reports the real status.'''
+    _, plugin, _ = _make_plugin()
+
+    with patch.object(PluginRhapsody, '_init_session',
+                      new_callable=AsyncMock) as init_mock:
+        request = MagicMock(spec=Request)
+        request.json = AsyncMock(return_value={"sid": DEFAULT_SID})
+        resp = await plugin.register_session(request)
+        await asyncio.sleep(0)   # let the init task run
+
+    assert resp['sid']    == DEFAULT_SID
+    assert resp['status'] == 'initializing'
+    assert plugin._session_policy[DEFAULT_SID]['lifetime'] == 'persistent'
+    init_mock.assert_called_once_with(
+        DEFAULT_SID, plugin._sessions[DEFAULT_SID])
+
+    # Re-register once ready reports the real status; no rebuild, no re-init
+    session = plugin._sessions[DEFAULT_SID]
+    session._init_ready.set()
+    with patch.object(PluginRhapsody, '_init_session',
+                      new_callable=AsyncMock) as init_mock:
+        resp = await plugin.register_session(request)
+    assert resp == {'sid': DEFAULT_SID, 'status': 'ready'}
+    assert plugin._sessions[DEFAULT_SID] is session
+    init_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_default_session_via_forward():
+    '''An unregistered `_forward` to 'default' auto-creates the rhapsody
+    default session (persistent) and kicks its background init.'''
+    _, plugin, _ = _make_plugin()
+
+    assert DEFAULT_SID not in plugin._sessions
+    with patch.object(PluginRhapsody, '_init_session',
+                      new_callable=AsyncMock) as init_mock:
+        # The call itself 409s — init has not completed yet — but the
+        # session must exist afterwards with its init task started.
+        with pytest.raises(HTTPException) as exc_info:
+            await plugin._forward(DEFAULT_SID, RhapsodySession.list_tasks)
+        await asyncio.sleep(0)   # let the init task run
+
+    assert exc_info.value.status_code == 409
+    assert DEFAULT_SID in plugin._sessions
+    assert plugin._session_policy[DEFAULT_SID]['lifetime'] == 'persistent'
+    init_mock.assert_called_once_with(
+        DEFAULT_SID, plugin._sessions[DEFAULT_SID])
 
 
 def test_unregister_session():
