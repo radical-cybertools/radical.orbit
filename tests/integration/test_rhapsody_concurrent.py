@@ -106,6 +106,7 @@ async def test_watch_task_isolation_between_sessions():
             b = await b
         sess._rh_session = rh.Session(backends=[b], uid=sid)
         sess._active = True
+        sess._init_ready.set()   # mark init complete (no real initialize() here)
         return sess
 
     s1 = await make_rh_session('s1')
