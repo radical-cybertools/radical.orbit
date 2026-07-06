@@ -44,7 +44,7 @@ def _expand_special_tokens(requested: list, app: FastAPI,
                      isn't installed shouldn't break the default load.
 
     Other tokens are passed through unchanged for ``_resolve_plugin_names``
-    to handle (exact match, prefix match, or wildcard glob).
+    to handle (exact match or wildcard glob).
     """
     expanded = []
     for token in requested:
@@ -69,7 +69,6 @@ def _resolve_plugin_names(requested: list, available: list) -> list:
 
     Token forms accepted:
       - exact match: ``'sysinfo'``
-      - prefix match: ``'sys'`` -> ``'sysinfo'``
       - wildcard glob (fnmatch): ``'iri*'`` -> all names starting with ``iri``
 
     Special tokens ``'all'`` / ``'default'`` are not handled here; the
@@ -83,7 +82,7 @@ def _resolve_plugin_names(requested: list, available: list) -> list:
         Ordered list of resolved plugin names, deduplicated.
 
     Raises:
-        ValueError: If a token matches nothing or is ambiguous.
+        ValueError: If a token matches nothing.
     """
     result: list = []
     for token in requested:
@@ -98,15 +97,9 @@ def _resolve_plugin_names(requested: list, available: list) -> list:
         if token in available:
             result.append(token)
             continue
-        matches = [p for p in available if p.startswith(token)]
-        if not matches:
-            raise ValueError(
-                f"No plugin matches '{token}'. "
-                f"Available: {', '.join(sorted(available))}")
-        if len(matches) > 1:
-            raise ValueError(
-                f"Ambiguous plugin name '{token}': matches {sorted(matches)}")
-        result.append(matches[0])
+        raise ValueError(
+            f"No plugin matches '{token}'. "
+            f"Available: {', '.join(sorted(available))}")
 
     # Dedupe, preserving order
     seen: set = set()
@@ -167,8 +160,8 @@ class PluginHostBase:
 
         Args:
             plugin_filter: List of plugin name tokens.  Accepts exact names,
-                prefix matches (``sys`` -> ``sysinfo``), wildcards
-                (``iri*``), and the special tokens ``all`` and ``default``.
+                wildcards (``iri*``), and the special tokens ``all`` and
+                ``default``.
         """
         _discover_entry_points()
 
@@ -232,29 +225,20 @@ class PluginHostBase:
     async def deregister_dynamic_plugin(self, instance_name: str) -> None:
         """Remove a dynamically registered plugin instance.
 
-        Closes all sessions on the plugin, strips the plugin's routes from
-        the host's direct-dispatch table (otherwise a re-register would
-        leave the dead plugin's stale routes ahead of the new ones in
-        match order), and announces the topology change.  If
-        *instance_name* is not found this is a silent no-op.
+        Tears the plugin down via its own ``shutdown()`` (cleanup task +
+        every session), strips the plugin's routes from the host's
+        direct-dispatch table (otherwise a re-register would leave the dead
+        plugin's stale routes ahead of the new ones in match order), and
+        announces the topology change.  If *instance_name* is not found this
+        is a silent no-op.
         """
         plugin = self._plugins.pop(instance_name, None)
         if plugin is None:
             return
 
-        # Close all active sessions
-        for sid in list(plugin._sessions):
-            session = plugin._sessions.pop(sid, None)
-            if session:
-                try:
-                    await session.close()
-                except Exception as exc:
-                    log.warning('[PluginHost] Error closing session %s/%s: %s',
-                                instance_name, sid, exc)
-
-        # Cancel cleanup task if running
-        if plugin._cleanup_task and not plugin._cleanup_task.done():
-            plugin._cleanup_task.cancel()
+        # Full teardown: cancel the cleanup task and close every session.
+        # (Host-side route stripping is separate — see below.)
+        await plugin.shutdown()
 
         # Strip the plugin's routes from the direct-dispatch table.
         # ``Plugin._register_direct`` records every entry it adds in the

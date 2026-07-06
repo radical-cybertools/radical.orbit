@@ -212,6 +212,62 @@ async def test_endpoint_search():
 
 
 # ---------------------------------------------------------------------------
+# finding 10: shared PluginSession.start_status_poller adoption
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_start_polling_uses_shared_status_poller():
+    session = _make_session()
+    session._tasks['t1'] = {'status': 'ACTIVE', 'label': 'x'}
+
+    session._start_polling()
+    try:
+        task = session._status_poller_task
+        assert task is not None
+        assert not task.done()
+        # Idempotent — a second call while one is live keeps the same task.
+        session._start_polling()
+        assert session._status_poller_task is task
+    finally:
+        session.stop_status_poller()
+
+
+@pytest.mark.asyncio
+async def test_fetch_task_status_reports_change_and_updates_meta():
+    session = _make_session()
+    session._tc.get_task.return_value = {
+        'status': 'SUCCEEDED', 'bytes_transferred': 10,
+        'files_transferred': 1, 'nice_status': None}
+    meta = {'status': 'ACTIVE', 'label': 'job'}
+
+    res = await session._fetch_task_status('t1', meta)
+
+    assert res is not None
+    assert meta['status'] == 'SUCCEEDED'
+    payload = session._task_payload('t1', meta, res)
+    assert payload == {
+        'task_id'          : 't1',
+        'status'           : 'SUCCEEDED',
+        'label'            : 'job',
+        'bytes_transferred': 10,
+        'files_transferred': 1,
+        'nice_status'      : None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_fetch_task_status_no_change_returns_none():
+    session = _make_session()
+    session._tc.get_task.return_value = {'status': 'ACTIVE'}
+    meta = {'status': 'ACTIVE', 'label': ''}
+
+    res = await session._fetch_task_status('t1', meta)
+
+    assert res is None
+    assert meta['status'] == 'ACTIVE'
+
+
+# ---------------------------------------------------------------------------
 # Error mapping
 # ---------------------------------------------------------------------------
 
@@ -336,6 +392,31 @@ async def test_register_session_default_collection(endpoint_app):
         result  = await plugin.register_session(request)
     session = plugin._sessions[result['sid']]
     assert session._local_collection == 'cfg-uuid'
+
+
+@pytest.mark.asyncio
+async def test_register_session_records_policy_and_owner(endpoint_app):
+    '''finding 9: register_session goes through the base's _record_session /
+    _normalize_session_policy, not a bare _sessions/_session_last_access
+    write — so a globus session gets the same lifetime/owner bookkeeping
+    every other plugin's sessions get.'''
+    plugin  = PluginGlobus(endpoint_app)
+    request = MagicMock()
+    request.headers = {'x-orbit-src': 'ep1'}
+    async def _json():
+        return {'access_token': 'tok', 'lifetime': 'persistent'}
+    request.json = _json
+
+    with patch('radical.orbit.plugin_globus.globus_sdk'):
+        result = await plugin.register_session(request)
+
+    sid    = result['sid']
+    record = plugin._records[sid]
+    assert record.owner    == 'ep1'
+    assert record.lifetime == 'persistent'
+    assert record.ttl is None
+    # The back-compat last-access view still resolves through the record.
+    assert plugin._session_last_access[sid] == record.last_access
 
 
 # ---------------------------------------------------------------------------

@@ -1,14 +1,19 @@
 """Unit tests for task_dispatcher_state.
 
-Covers: record dataclasses, append/replay, snapshot compaction, malformed
-line recovery, schema-additive replay.
+Covers: record dataclasses, atomic JSON I/O helpers (``write_json_atomic`` /
+``read_json``), record (de)serialisation (``record_from_dict`` /
+``records_from`` / ``records_to``), and the per-pool durable store
+(``PoolStore``).  There is no append log, snapshot overlay, or compaction —
+persistence is one ``state.json`` per pool, rewritten atomically on every
+mutation; recovery is a single ``json.load``.
 """
 
-import json
 from pathlib import Path
 
 from radical.orbit.task_dispatcher_state import (
-    PilotRecord, TaskRecord, StateLog,
+    PilotRecord, TaskRecord, PoolStore,
+    read_json, write_json_atomic,
+    record_from_dict, records_from, records_to,
     PILOT_PENDING, PILOT_STARTING, PILOT_ACTIVE, PILOT_DONE, PILOT_FAILED,
     PILOT_TERMINAL_STATES, PILOT_LIVE_STATES,
     TASK_RUNNING, TASK_DONE, TASK_FAILED, TASK_CANCELED,
@@ -86,200 +91,142 @@ class TestTaskRecord:
 
 
 # ---------------------------------------------------------------------------
-# StateLog append/replay
+# Atomic JSON I/O
 # ---------------------------------------------------------------------------
 
-class TestStateLog:
+class TestAtomicJsonIO:
 
-    def test_append_and_replay_single_record(self, tmp_path: Path):
-        log = StateLog(tmp_path / 'pilot.log', PilotRecord, 'pid')
-        p = PilotRecord(pid='p.1', pool='cpu', size_key='s',
-                        rhapsody_backend='concurrent')
-        log.append(p)
-        state = log.replay()
-        assert set(state.keys()) == {'p.1'}
-        assert state['p.1'].pool == 'cpu'
+    def test_write_then_read_round_trip(self, tmp_path: Path):
+        path = tmp_path / 'x.json'
+        write_json_atomic(path, {'a': 1, 'b': [1, 2, 3]})
+        assert read_json(path) == {'a': 1, 'b': [1, 2, 3]}
 
-    def test_last_write_wins(self, tmp_path: Path):
-        log = StateLog(tmp_path / 'pilot.log', PilotRecord, 'pid')
-        p = PilotRecord(pid='p.1', pool='cpu', size_key='s',
-                        rhapsody_backend='concurrent',
-                        state=PILOT_PENDING)
-        log.append(p)
-        p.state = PILOT_ACTIVE
-        p.capacity = 8
-        log.append(p)
-        state = log.replay()
-        assert state['p.1'].state == PILOT_ACTIVE
-        assert state['p.1'].capacity == 8
+    def test_read_missing_file_returns_default(self, tmp_path: Path):
+        assert read_json(tmp_path / 'nope.json') is None
+        assert read_json(tmp_path / 'nope.json', default={}) == {}
 
-    def test_multiple_records(self, tmp_path: Path):
-        log = StateLog(tmp_path / 'task.log', TaskRecord, 'task_id')
-        for i in range(5):
-            log.append(TaskRecord(task_id=f't.{i}', pool='x',
-                                  cmd=[str(i)], cwd='/'))
-        state = log.replay()
-        assert set(state.keys()) == {f't.{i}' for i in range(5)}
+    def test_read_malformed_json_returns_default(self, tmp_path: Path):
+        path = tmp_path / 'bad.json'
+        path.write_text('{not valid json')
+        assert read_json(path, default={}) == {}
 
-    def test_malformed_line_skipped(self, tmp_path: Path):
-        log = StateLog(tmp_path / 'task.log', TaskRecord, 'task_id')
-        log.append(TaskRecord(task_id='t.good', pool='x', cmd=['a'], cwd='/'))
-        # Inject a garbage line
-        with log.path.open('a') as f:
-            f.write('not valid json\n')
-        log.append(TaskRecord(task_id='t.also_good', pool='x', cmd=['b'], cwd='/'))
-        state = log.replay()
-        assert set(state.keys()) == {'t.good', 't.also_good'}
+    def test_write_creates_parent_dirs(self, tmp_path: Path):
+        nested = tmp_path / 'a' / 'b' / 'c' / 'x.json'
+        write_json_atomic(nested, {'ok': True})
+        assert nested.is_file()
+        assert read_json(nested) == {'ok': True}
 
-    def test_unknown_fields_dropped_on_replay(self, tmp_path: Path):
-        """Future schema extensions survive loading of older logs."""
-        log = StateLog(tmp_path / 'pilot.log', PilotRecord, 'pid')
-        # Manually craft a log line with an unknown field
-        payload = {
+    def test_write_leaves_no_tempfile_behind(self, tmp_path: Path):
+        path = tmp_path / 'x.json'
+        write_json_atomic(path, {'a': 1})
+        leftovers = [p for p in tmp_path.iterdir() if p != path]
+        assert leftovers == []
+
+    def test_overwrite_replaces_content(self, tmp_path: Path):
+        path = tmp_path / 'x.json'
+        write_json_atomic(path, {'a': 1})
+        write_json_atomic(path, {'a': 2})
+        assert read_json(path) == {'a': 2}
+
+
+# ---------------------------------------------------------------------------
+# Record (de)serialisation
+# ---------------------------------------------------------------------------
+
+class TestRecordSerialisation:
+
+    def test_record_from_dict_round_trip(self):
+        p = record_from_dict(PilotRecord, {
+            'pid': 'p.1', 'pool': 'cpu', 'size_key': 's',
+            'rhapsody_backend': 'concurrent', 'state': PILOT_ACTIVE,
+        })
+        assert isinstance(p, PilotRecord)
+        assert p.pid == 'p.1' and p.state == PILOT_ACTIVE
+
+    def test_record_from_dict_drops_unknown_fields(self):
+        """Future schema extensions survive loading of an older state.json."""
+        p = record_from_dict(PilotRecord, {
             'pid': 'p.x', 'pool': 'cpu', 'size_key': 's',
-            'rhapsody_backend': 'concurrent',
-            'state': PILOT_ACTIVE, 'submitted_at': 1.0,
+            'rhapsody_backend': 'concurrent', 'submitted_at': 1.0,
             'future_field': 'whatever',
+        })
+        assert p.pool == 'cpu'
+        assert not hasattr(p, 'future_field')
+
+    def test_records_from_empty_or_none(self):
+        assert records_from(None, PilotRecord) == {}
+        assert records_from({}, PilotRecord) == {}
+
+    def test_records_to_and_from_round_trip(self):
+        pilots = {
+            'p.1': PilotRecord(pid='p.1', pool='cpu', size_key='s',
+                              rhapsody_backend='concurrent',
+                              state=PILOT_ACTIVE, capacity=8),
+            'p.2': PilotRecord(pid='p.2', pool='cpu', size_key='s',
+                              rhapsody_backend='concurrent'),
         }
-        with log.path.open('a') as f:
-            f.write(json.dumps(payload) + '\n')
-        state = log.replay()
-        assert state['p.x'].pool == 'cpu'
+        plain = records_to(pilots)
+        assert set(plain.keys()) == {'p.1', 'p.2'}
+        assert plain['p.1']['state'] == PILOT_ACTIVE
 
-    def test_empty_log_replay(self, tmp_path: Path):
-        log = StateLog(tmp_path / 'pilot.log', PilotRecord, 'pid')
-        assert log.replay() == {}
+        restored = records_from(plain, PilotRecord)
+        assert restored['p.1'].capacity == 8
+        assert restored['p.2'].state == PILOT_PENDING
 
 
 # ---------------------------------------------------------------------------
-# Snapshot compaction
+# PoolStore — one atomic state.json per pool
 # ---------------------------------------------------------------------------
 
-class TestSnapshot:
+class TestPoolStore:
 
-    def test_snapshot_truncates_log(self, tmp_path: Path):
-        log = StateLog(tmp_path / 'pilot.log', PilotRecord, 'pid')
-        log.append(PilotRecord(pid='p.1', pool='cpu', size_key='s',
-                               rhapsody_backend='concurrent'))
-        log.append(PilotRecord(pid='p.2', pool='cpu', size_key='s',
-                               rhapsody_backend='concurrent'))
-        state = log.replay()
+    def test_load_missing_file_returns_empty_dict(self, tmp_path: Path):
+        store = PoolStore(tmp_path / 'pool' / 'state.json')
+        assert store.load() == {}
 
-        log.snapshot(state)
-
-        assert log.snapshot_path.is_file()
-        assert log.path.stat().st_size == 0  # truncated
-
-        # Replay still gives the same state
-        state2 = log.replay()
-        assert set(state2.keys()) == {'p.1', 'p.2'}
-
-    def test_snapshot_plus_new_appends(self, tmp_path: Path):
-        log = StateLog(tmp_path / 'pilot.log', PilotRecord, 'pid')
-        log.append(PilotRecord(pid='p.a', pool='cpu', size_key='s',
-                               rhapsody_backend='concurrent',
-                               state=PILOT_ACTIVE))
-        log.snapshot(log.replay())
-
-        log.append(PilotRecord(pid='p.b', pool='cpu', size_key='s',
-                               rhapsody_backend='concurrent',
-                               state=PILOT_PENDING))
-        state = log.replay()
-        assert set(state.keys()) == {'p.a', 'p.b'}
-        assert state['p.a'].state == PILOT_ACTIVE
-
-    def test_snapshot_atomic_against_crash(self, tmp_path: Path):
-        """A corrupt snapshot file falls back to log-only replay."""
-        log = StateLog(tmp_path / 'pilot.log', PilotRecord, 'pid')
-        log.append(PilotRecord(pid='p.keep', pool='cpu', size_key='s',
-                               rhapsody_backend='concurrent'))
-        # Corrupt the snapshot file directly
-        log.snapshot_path.write_text("garbage")
-        state = log.replay()
-        # log-only replay still recovers
-        assert 'p.keep' in state
-
-    def test_snapshot_overwrite(self, tmp_path: Path):
-        log = StateLog(tmp_path / 'pilot.log', PilotRecord, 'pid')
-        log.append(PilotRecord(pid='p.1', pool='cpu', size_key='s',
-                               rhapsody_backend='concurrent',
-                               state=PILOT_PENDING))
-        log.snapshot(log.replay())
-
-        p = PilotRecord(pid='p.1', pool='cpu', size_key='s',
-                        rhapsody_backend='concurrent', state=PILOT_ACTIVE,
-                        capacity=4, active_at=5.0)
-        log.append(p)
-        log.snapshot(log.replay())
-
-        state = log.replay()
-        assert state['p.1'].state == PILOT_ACTIVE
-        assert state['p.1'].capacity == 4
-
-    def test_creates_parent_dirs(self, tmp_path: Path):
-        nested = tmp_path / 'a' / 'b' / 'c' / 'pilot.log'
-        log = StateLog(nested, PilotRecord, 'pid')
+    def test_save_creates_parent_dirs(self, tmp_path: Path):
+        nested = tmp_path / 'a' / 'b' / 'state.json'
+        store = PoolStore(nested)
         assert nested.parent.is_dir()
-        log.append(PilotRecord(pid='p', pool='x', size_key='s',
-                               rhapsody_backend='c'))
-        assert log.replay()['p'].pool == 'x'
 
-    def test_append_resumes_at_eof_after_truncate(self, tmp_path: Path):
-        """The held O_APPEND handle keeps working across a snapshot."""
-        log = StateLog(tmp_path / 'pilot.log', PilotRecord, 'pid')
-        for i in range(3):
-            log.append(PilotRecord(pid=f'p.{i}', pool='x', size_key='s',
-                                   rhapsody_backend='c'))
-        log.snapshot(log.replay())          # truncates through the handle
-        # Appends after truncation must land at the new (zero) EOF, not
-        # leave a sparse gap; replay should see snapshot + new record.
-        log.append(PilotRecord(pid='p.new', pool='x', size_key='s',
-                               rhapsody_backend='c'))
-        state = log.replay()
-        assert set(state.keys()) == {'p.0', 'p.1', 'p.2', 'p.new'}
+    def test_path_property(self, tmp_path: Path):
+        path = tmp_path / 'state.json'
+        store = PoolStore(path)
+        assert store.path == path
 
+    def test_save_and_load_round_trip(self, tmp_path: Path):
+        store = PoolStore(tmp_path / 'state.json')
+        pilots = {'p.1': PilotRecord(pid='p.1', pool='cpu', size_key='s',
+                                     rhapsody_backend='concurrent',
+                                     state=PILOT_ACTIVE, capacity=4)}
+        tasks = {'t.1': TaskRecord(task_id='t.1', pool='cpu',
+                                   cmd=['echo'], cwd='/tmp',
+                                   state=TASK_RUNNING)}
+        store.save('sid-1', {'name': 'cpu', 'queue': 'batch'}, pilots, tasks)
 
-# ---------------------------------------------------------------------------
-# Compaction triggers + handle lifecycle
-# ---------------------------------------------------------------------------
+        payload = store.load()
+        assert payload['owning_sid'] == 'sid-1'
+        assert payload['config'] == {'name': 'cpu', 'queue': 'batch'}
 
-class TestCompactionPolicy:
+        restored_pilots = records_from(payload['pilots'], PilotRecord)
+        restored_tasks  = records_from(payload['tasks'],  TaskRecord)
+        assert restored_pilots['p.1'].state == PILOT_ACTIVE
+        assert restored_pilots['p.1'].capacity == 4
+        assert restored_tasks['t.1'].state == TASK_RUNNING
+        assert restored_tasks['t.1'].cmd == ['echo']
 
-    def _log(self, tmp_path: Path) -> StateLog:
-        return StateLog(tmp_path / 'pilot.log', PilotRecord, 'pid')
+    def test_save_overwrites_previous_state(self, tmp_path: Path):
+        store = PoolStore(tmp_path / 'state.json')
+        store.save('sid', {}, {}, {})
+        pilots = {'p.1': PilotRecord(pid='p.1', pool='cpu', size_key='s',
+                                     rhapsody_backend='concurrent')}
+        store.save('sid', {}, pilots, {})
+        payload = store.load()
+        assert set(payload['pilots'].keys()) == {'p.1'}
 
-    def _rec(self, i: int) -> PilotRecord:
-        return PilotRecord(pid=f'p.{i}', pool='x', size_key='s',
-                           rhapsody_backend='c')
-
-    def test_no_compaction_when_idle(self, tmp_path: Path):
-        log = self._log(tmp_path)
-        assert log.needs_compaction(max_appends=1, max_age_sec=0.0) is False
-
-    def test_size_trigger(self, tmp_path: Path):
-        log = self._log(tmp_path)
-        for i in range(5):
-            log.append(self._rec(i))
-        assert log.needs_compaction(max_appends=5, max_age_sec=1e9) is True
-        assert log.needs_compaction(max_appends=6, max_age_sec=1e9) is False
-
-    def test_age_trigger(self, tmp_path: Path):
-        log = self._log(tmp_path)
-        log.append(self._rec(0))
-        # Below the size threshold, but past the age window → due.
-        future = log._last_snapshot_ts + 100.0
-        assert log.needs_compaction(max_appends=1000, max_age_sec=10.0,
-                                    now=future) is True
-
-    def test_counters_reset_after_snapshot(self, tmp_path: Path):
-        log = self._log(tmp_path)
-        for i in range(3):
-            log.append(self._rec(i))
-        log.snapshot(log.replay())
-        assert log.needs_compaction(max_appends=1, max_age_sec=1e9) is False
-
-    def test_close_is_idempotent(self, tmp_path: Path):
-        log = self._log(tmp_path)
-        log.append(self._rec(0))
-        log.close()
-        log.close()   # must not raise
+    def test_save_empty_pools_and_tasks(self, tmp_path: Path):
+        store = PoolStore(tmp_path / 'state.json')
+        store.save('sid', {'name': 'cpu'}, {}, {})
+        payload = store.load()
+        assert payload['pilots'] == {}
+        assert payload['tasks']  == {}

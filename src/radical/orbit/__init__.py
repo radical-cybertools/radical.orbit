@@ -1,4 +1,9 @@
 
+import logging
+
+log = logging.getLogger(__name__)
+
+
 # ── Public client surface — bind these BEFORE the plugin imports ─────────────
 
 from .plugin_base           import Plugin  # noqa: F401
@@ -11,10 +16,9 @@ from .broker            import Broker  # noqa: F401
 from .runtime           import EndpointRuntime  # noqa: F401
 from .client            import PluginClient  # noqa: F401
 
-# Public aliases — the participant star has one hub (the active broker, still
+# Public alias — the participant star has one hub (the active broker, still
 # reached through the ``Broker`` name until the rename PR) and one node type (the
 # endpoint runtime).  ``Endpoint`` is the natural counterpart to ``Broker``.
-Broker   = Broker
 Endpoint = EndpointRuntime
 
 
@@ -31,23 +35,23 @@ from .plugin_replay      import PluginReplay  # noqa: F401
 # Optional plugins with external dependencies.
 try:
     from .plugin_lucid import PluginLucid  # noqa: F401
-except ImportError:
-    pass
+except ImportError as e:
+    log.warning('optional plugin "lucid" not loaded: %s', e)
 
 try:
     from .plugin_psij import PluginPSIJ  # noqa: F401
-except ImportError:
-    pass
+except ImportError as e:
+    log.warning('optional plugin "psij" not loaded: %s', e)
 
 try:
     from .plugin_rhapsody import PluginRhapsody  # noqa: F401
-except ImportError:
-    pass
+except ImportError as e:
+    log.warning('optional plugin "rhapsody" not loaded: %s', e)
 
 try:
     from .plugin_globus import PluginGlobus  # noqa: F401
-except ImportError:
-    pass
+except ImportError as e:
+    log.warning('optional plugin "globus" not loaded: %s', e)
 
 
 # ── Version (generated at install time) ──────────────────────────────────────

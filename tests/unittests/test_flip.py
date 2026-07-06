@@ -117,7 +117,7 @@ def broker_client(tmp_path, monkeypatch):
     if not _have_openssl():
         pytest.skip("openssl not available")
     from radical.orbit import utils
-    from radical.orbit.broker import Broker
+    from radical.orbit.broker import Broker, BrokerTuning
 
     monkeypatch.setattr(utils, 'URL_FILE',   tmp_path / 'broker.url')
     monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'broker.token')
@@ -131,7 +131,7 @@ def broker_client(tmp_path, monkeypatch):
         check=True, capture_output=True)
 
     broker = Broker(cert=str(cert), key=str(key), no_auth=True,
-                    grace=0.05, ping_timeout=0.05, watchdog_interval=0.02)
+                    tuning=BrokerTuning(grace=0.05, ping_timeout=0.05))
     return broker
 
 
@@ -146,8 +146,9 @@ def test_gateway_serves_dynamic_ui_module(broker_client, monkeypatch):
     # A broker-hosted plugin registered at runtime (e.g. ``iri.nersc``) ships a
     # ui_module the packaged static tree does not carry — serve it from the
     # host's dynamic modules via the broker seam.
-    monkeypatch.setattr(broker_client, 'get_ui_modules',
-                        lambda: {'iri.nersc': '/* dynamic UI */'})
+    async def _fake_modules():
+        return {'iri.nersc': '/* dynamic UI */'}
+    monkeypatch.setattr(broker_client, 'get_ui_modules', _fake_modules)
     with TestClient(broker_client.app) as client:
         r = client.get('/plugins/iri.nersc.js')
         assert r.status_code == 200
@@ -156,7 +157,9 @@ def test_gateway_serves_dynamic_ui_module(broker_client, monkeypatch):
 
 
 def test_gateway_unknown_plugin_js_is_404(broker_client, monkeypatch):
-    monkeypatch.setattr(broker_client, 'get_ui_modules', lambda: {})
+    async def _no_modules():
+        return {}
+    monkeypatch.setattr(broker_client, 'get_ui_modules', _no_modules)
     with TestClient(broker_client.app) as client:
         assert client.get('/plugins/nope.js').status_code == 404
 

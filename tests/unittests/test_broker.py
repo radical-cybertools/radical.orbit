@@ -1,4 +1,4 @@
-"""Tests for :class:`radical.orbit.broker.Broker` (M3 broker core).
+"""Tests for :class:`radical.orbit.broker.Broker`.
 
 The suite drives the broker two ways, matching how the code is reached in
 production:
@@ -6,7 +6,7 @@ production:
 * Through its app with the Starlette ``TestClient`` (register handshake +
   token gate over a real WS), and
 * By direct method calls with a lightweight ``FakeWS`` where timing/teardown
-  can't be expressed through the client (drop/grace/watchdog).
+  can't be expressed through the client (drop/grace/reap).
 
 No test sleeps for more than ~1 s; liveness knobs are injected tiny.
 """
@@ -68,10 +68,17 @@ def make_broker(self_signed, tmp_path, monkeypatch):
 
     cert, key = self_signed
 
+    _TUNING_KEYS = ('ping_interval', 'ping_timeout', 'grace', 'call_cap',
+                    'call_timeout', 'reap_interval', 'event_queue', 'frame_cap')
+
     def _build(**kwargs):
-        from radical.orbit.broker import Broker
-        defaults = dict(cert=str(cert), key=str(key), no_auth=True,
-                        grace=0.05, ping_timeout=0.05, watchdog_interval=0.02)
+        from radical.orbit.broker import Broker, BrokerTuning
+        # Tiny liveness timers by default; tunable kwargs route to BrokerTuning.
+        tuning = BrokerTuning(ping_timeout=0.05, grace=0.05)
+        for _k in list(kwargs):
+            if _k in _TUNING_KEYS:
+                setattr(tuning, _k, kwargs.pop(_k))
+        defaults = dict(cert=str(cert), key=str(key), no_auth=True, tuning=tuning)
         defaults.update(kwargs)
         return Broker(**defaults)
 
@@ -280,7 +287,8 @@ async def test_request_routing_overwrites_client_src(make_broker):
         fwd = ws2.msgs()[0]
         assert fwd.kind == 'request'
         assert fwd.src  == 'e1'                          # overwritten
-        assert broker._inflight[req.corr_id] == ('e1', 'e2')
+        call = broker._calls[req.corr_id]
+        assert (call.src, call.dst, call.future) == ('e1', 'e2', None)
     finally:
         await broker.shutdown()
 
@@ -323,7 +331,7 @@ async def test_response_forwards_to_peer(make_broker):
 
         got = ws1.msgs()[0]
         assert got.kind == 'response' and got.status == 200
-        assert req.corr_id not in broker._inflight        # inflight popped
+        assert req.corr_id not in broker._calls           # in-flight entry popped
     finally:
         await broker.shutdown()
 
@@ -388,15 +396,17 @@ async def test_lost_fastfails_endpoint_and_broker_inflight(make_broker):
 
 
 @pytest.mark.asyncio
-async def test_pending_cap_raises_synchronously(make_broker):
-    broker = make_broker(pending_cap=2)
+async def test_call_cap_raises_synchronously(make_broker):
+    from radical.orbit.broker import _Call
+    broker = make_broker(call_cap=2)
     await broker.startup()
     try:
         ws2 = FakeWS()
         await _register(broker, 'e2', ws2)
         loop = asyncio.get_running_loop()
-        broker.pending['a'] = loop.create_future()
-        broker.pending['b'] = loop.create_future()
+        # Fill the cap with broker-originated (future-bearing) calls.
+        broker._calls['a'] = _Call('broker', 'e2', loop.create_future(), 1e9)
+        broker._calls['b'] = _Call('broker', 'e2', loop.create_future(), 1e9)
         with pytest.raises(RuntimeError):
             await broker.caller.call('e2', 'GET', '/x')
     finally:
@@ -619,35 +629,34 @@ async def test_reregister_cancels_grace(make_broker):
 
 
 # ---------------------------------------------------------------------------
-# Loop-lag watchdog
+# Call reaper: unanswered forwarded calls are bounded
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_watchdog_suppresses_lost_after_stall(make_broker):
-    clock = {'t': 0.0}
-    broker = make_broker(clock=lambda: clock['t'], ping_timeout=0.05, grace=0.05)
+async def test_reaper_fastfails_unanswered_forwarded_call(make_broker):
+    broker = make_broker(call_timeout=0.02, reap_interval=0.01)
     await broker.startup()
     try:
-        ws1 = FakeWS()
+        ws1, ws2 = FakeWS(), FakeWS()
         await _register(broker, 'e1', ws1)
-        await broker._on_socket_drop('e1', ws1, clean=False)
+        await _register(broker, 'e2', ws2)
 
-        # Simulate a routing-loop stall: a large drift opens the window.
-        clock['t'] = 100.0
-        broker._watchdog_check(0.0, 100.0)
-        assert broker._suppress_until > clock['t']
+        # e1 -> e2 forwarded call; e2 never answers.
+        req = protocol.make_request('e1', 'e2', 'GET', '/x')
+        await broker._route_frame('e1', protocol.pack_message(req))
+        assert req.corr_id in broker._calls
+        ws1.sent.clear()
 
-        # A lost firing inside the window must be a log-only re-arm.
-        broker._fire_lost('e1', ws1)
-        await asyncio.sleep(0)
-        assert 'e1' in broker.registry
-        assert 'e1' in broker._grace_timers
-
-        # Past the window, lost proceeds normally.
-        clock['t'] = 1000.0
-        broker._fire_lost('e1', ws1)
-        await asyncio.sleep(0)
-        assert 'e1' not in broker.registry
+        # The reaper evicts the stale entry and fast-fails the requester (504).
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if req.corr_id not in broker._calls and ws1.sent:
+                break
+            await asyncio.sleep(0.01)
+        assert req.corr_id not in broker._calls
+        resp = ws1.msgs()[0]
+        assert resp.kind == 'response' and resp.status == 504
+        assert resp.corr_id == req.corr_id
     finally:
         await broker.shutdown()
 
@@ -727,12 +736,16 @@ async def test_dst_broker_routes_into_host(make_broker):
         await broker._route_frame('e1', protocol.pack_message(req))
 
         # The host dispatch runs as a supervised background task; await it.
+        # (Other frames — e.g. a topology broadcast — may also arrive, so
+        # select the response rather than assuming it is first.)
+        def _responses():
+            return [m for m in ws1.msgs() if m.kind == 'response']
         for _ in range(200):
             await asyncio.sleep(0.005)
-            if ws1.sent:
+            if _responses():
                 break
-        resp = ws1.msgs()[0]
-        assert resp.kind == 'response' and resp.status == 200
+        resp = _responses()[0]
+        assert resp.status == 200
         assert b'pong' in resp.body
         assert resp.corr_id == req.corr_id
     finally:
@@ -768,7 +781,6 @@ async def test_gateway_seam_surface(make_broker):
 
         # The seam attributes/methods a later gateway is handed.
         assert broker.app is not None
-        assert broker.pending is broker.pending          # pending table
         assert broker.caller is not None                 # caller handle
         assert callable(broker.tap)
         snap = broker.topology_snapshot()
@@ -837,3 +849,44 @@ async def test_hosted_plugin_shutdown_cancels_background_tasks(make_broker):
 
 async def _run_on_loop(fn):
     fn()
+
+
+def test_strip_broker_prefix_handles_query(make_broker):
+    """The broker-prefix stripper handles the bare prefix, subpaths, and the
+    bare-prefix-plus-query form (`/broker?foo=bar` -> `/?foo=bar`)."""
+    b = make_broker()
+    assert b._strip_broker_prefix('/broker')         == '/'
+    assert b._strip_broker_prefix('/broker/x/y')     == '/x/y'
+    assert b._strip_broker_prefix('/broker?foo=bar') == '/?foo=bar'
+    assert b._strip_broker_prefix('/broker/x?f=b')   == '/x?f=b'
+    assert b._strip_broker_prefix('/other')          == '/other'
+
+
+@pytest.mark.asyncio
+async def test_restart_sender_delivers_buffered_events(make_broker):
+    """A sender cancelled mid-drain (wake cleared, items still buffered) must
+    not stall on restart — the fresh sender flushes the backlog immediately."""
+    broker = make_broker()
+    await broker.startup()
+    try:
+        er = broker._events
+        ws = FakeWS()
+        broker.registry['e1'] = ws
+        er.add_endpoint('e1')
+        oq = er._out['e1']
+
+        # Emulate the race: a buffered frame with wake cleared (as a prior
+        # sender would have left it after clearing wake, then being cancelled).
+        er.pause_sender('e1')
+        oq.push(b'frame1')
+        oq.wake.clear()
+
+        er.restart_sender('e1')
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if b'frame1' in ws.sent:
+                break
+        assert b'frame1' in ws.sent
+    finally:
+        broker.registry.pop('e1', None)
+        await broker.shutdown()

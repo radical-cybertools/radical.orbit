@@ -2,9 +2,9 @@
 
 import os
 import shutil
-import subprocess
 
-from .batch_system import (BatchSystem, register_backend,
+from .batch_system import (BatchSystem, register_backend, run_cmd,
+                           run_cmd_strict,
                            STATE_PENDING, STATE_RUNNING, STATE_DONE,
                            STATE_FAILED, STATE_CANCELLED, STATE_HELD,
                            STATE_UNKNOWN)
@@ -75,40 +75,23 @@ class SlurmBatchSystem(BatchSystem):
         return os.environ.get('SLURM_JOB_ID')
 
     def job_state(self, native_id) -> str:
-        try:
-            r = subprocess.run(
-                ['squeue', '--job', str(native_id),
-                 '--noheader', '--format=%T'],
-                capture_output=True, text=True, timeout=10)
-        except (OSError, subprocess.TimeoutExpired):
-            return STATE_UNKNOWN
-        if r.returncode != 0:
-            return STATE_UNKNOWN
-        for line in r.stdout.splitlines():
+        stdout = run_cmd(['squeue', '--job', str(native_id),
+                          '--noheader', '--format=%T'], timeout=10)
+        for line in (stdout or '').splitlines():
             line = line.strip()
             if line:
                 return _STATE_MAP.get(line, STATE_UNKNOWN)
         return STATE_UNKNOWN
 
     def job_nodes(self, native_id) -> list:
-        try:
-            r = subprocess.run(
-                ['squeue', '--job', str(native_id),
-                 '--noheader', '--format=%N'],
-                capture_output=True, text=True, timeout=10)
-        except (OSError, subprocess.TimeoutExpired):
+        nodelist = run_cmd(['squeue', '--job', str(native_id),
+                            '--noheader', '--format=%N'], timeout=10)
+        nodelist = (nodelist or '').strip()
+        if not nodelist:
             return []
-        nodelist = r.stdout.strip()
-        if r.returncode != 0 or not nodelist:
-            return []
-        try:
-            r2 = subprocess.run(
-                ['scontrol', 'show', 'hostnames', nodelist],
-                capture_output=True, text=True, timeout=10)
-            if r2.returncode == 0 and r2.stdout.strip():
-                return [h.strip() for h in r2.stdout.splitlines() if h.strip()]
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        out = run_cmd(['scontrol', 'show', 'hostnames', nodelist], timeout=10)
+        if out and out.strip():
+            return [h.strip() for h in out.splitlines() if h.strip()]
         return []
 
     def nodelist(self) -> list:
@@ -118,21 +101,16 @@ class SlurmBatchSystem(BatchSystem):
         raw = os.environ.get('SLURM_JOB_NODELIST')
         if not raw:
             return []
-        try:
-            r = subprocess.run(
-                ['scontrol', 'show', 'hostnames', raw],
-                capture_output=True, text=True, timeout=10)
-            if r.returncode == 0 and r.stdout.strip():
-                return [h.strip() for h in r.stdout.splitlines() if h.strip()]
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        out = run_cmd(['scontrol', 'show', 'hostnames', raw], timeout=10)
+        if out and out.strip():
+            return [h.strip() for h in out.splitlines() if h.strip()]
         return []
 
     def cancel(self, native_id) -> None:
-        r = subprocess.run(['scancel', str(native_id)],
-                           capture_output=True, text=True, timeout=10)
-        if r.returncode != 0:
-            raise RuntimeError(f"scancel failed: {r.stderr.strip()}")
+        try:
+            run_cmd_strict(['scancel', str(native_id)], timeout=10)
+        except RuntimeError as exc:
+            raise RuntimeError(f"scancel failed: {exc}") from exc
 
     def job_allocation(self) -> 'dict | None':
         job_id = os.environ.get('SLURM_JOB_ID')
@@ -147,16 +125,13 @@ class SlurmBatchSystem(BatchSystem):
 
         # walltime: query squeue for the per-job time limit
         try:
-            r = subprocess.run(
+            stdout = run_cmd_strict(
                 ['squeue', '--job', job_id, '--noheader', '--format=%l'],
-                capture_output=True, text=True, timeout=10)
-        except (OSError, subprocess.TimeoutExpired) as exc:
+                timeout=10)
+        except RuntimeError as exc:
             raise RuntimeError(
                 f"Cannot query runtime for job {job_id}: {exc}") from exc
-        if r.returncode != 0:
-            raise RuntimeError(
-                f"squeue failed for job {job_id}: {r.stderr.strip()}")
-        runtime = _parse_slurm_time(r.stdout.strip())
+        runtime = _parse_slurm_time(stdout.strip())
 
         def _intenv(key):
             v = os.environ.get(key)

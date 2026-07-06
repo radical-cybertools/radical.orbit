@@ -33,15 +33,17 @@ def test_resolve_plugin_names_exact():
     assert result == ["psij", "sysinfo"]
 
 
-def test_resolve_plugin_names_prefix():
+def test_resolve_plugin_names_prefix_dropped():
+    # The prefix-match form was dropped: a partial name no longer resolves.
     available = ["sysinfo", "psij", "queue_info"]
-    result = _resolve_plugin_names(["sys", "q"], available)
-    assert result == ["sysinfo", "queue_info"]
+    with pytest.raises(ValueError, match="No plugin matches 'sys'"):
+        _resolve_plugin_names(["sys", "q"], available)
 
 
-def test_resolve_plugin_names_ambiguous_raises():
+def test_resolve_plugin_names_partial_is_no_match():
+    # What used to be an "ambiguous" prefix is now simply an unknown name.
     available = ["sysinfo", "syslog"]
-    with pytest.raises(ValueError, match="Ambiguous"):
+    with pytest.raises(ValueError, match="No plugin matches 'sys'"):
         _resolve_plugin_names(["sys"], available)
 
 

@@ -114,8 +114,7 @@ class LucidClient(PluginClient):
         """
         Submit a pilot.
         """
-        if not self.sid:
-            raise RuntimeError("No active session")
+        self._require_session()
 
         url = self._url(f"pilot_submit/{self.sid}")
         resp = self._http.post(url, json={'description': description})
@@ -126,8 +125,7 @@ class LucidClient(PluginClient):
         """
         Submit a task.
         """
-        if not self.sid:
-            raise RuntimeError("No active session")
+        self._require_session()
 
         url = self._url(f"task_submit/{self.sid}")
         resp = self._http.post(url, json={'description': description})
@@ -138,8 +136,7 @@ class LucidClient(PluginClient):
         """
         Wait for a task to complete.
         """
-        if not self.sid:
-            raise RuntimeError("No active session")
+        self._require_session()
 
         url = self._url(f"task_wait/{self.sid}/{tid}")
         resp = self._http.get(url)
@@ -200,9 +197,9 @@ class PluginLucid(Plugin):
             JSONResponse: A JSON response containing the pilot ID ('pid').
         """
         data = request.path_params
-        json = await request.json()
+        body = await request.json()
         sid = data['sid']
-        desc = json['description']
+        desc = body['description']
 
         return await self._forward(sid, LucidSession.pilot_submit, desc)
 
@@ -218,9 +215,9 @@ class PluginLucid(Plugin):
             JSONResponse: A JSON response containing the task ID ('tid').
         """
         data = request.path_params
-        json = await request.json()
+        body = await request.json()
         sid = data['sid']
-        desc = json['description']
+        desc = body['description']
 
         return await self._forward(sid, LucidSession.task_submit, desc)
 

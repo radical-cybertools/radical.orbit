@@ -290,7 +290,7 @@ def test_tunnel_status_active(tmp_path):
     mock_task.done.return_value = False
     plugin._watchers['myendpoint'] = mock_task
 
-    with patch('radical.orbit.plugin_psij._relay_dir', return_value=tmp_path):
+    with patch('radical.orbit.tunnel.RELAY_BASE', tmp_path):
         client = TestClient(app)
         resp = client.get(f"{plugin.namespace}/tunnel_status/myendpoint")
         assert resp.status_code == 200
@@ -314,7 +314,6 @@ async def _drive_watcher(plugin, state_seq, tmp_path, caplog):
     fake_batch = MagicMock()
     fake_batch.name = 'slurm'
     fake_batch.job_state = _next_state
-    relay_file = tmp_path / 'endpoint.port'
     # The radical.orbit logger has propagate=False so external
     # ``basicConfig(force=True)`` calls during runtime can't wipe its
     # file handler.  pytest's ``caplog`` attaches its capture handler
@@ -325,12 +324,12 @@ async def _drive_watcher(plugin, state_seq, tmp_path, caplog):
     try:
         with patch('radical.orbit.batch_system.detect_batch_system',
                    return_value=fake_batch), \
+             patch('radical.orbit.tunnel.RELAY_BASE', tmp_path), \
              patch('radical.orbit.plugin_psij.asyncio.sleep',
                    new=AsyncMock(return_value=None)):
             caplog.set_level(_logging.WARNING, logger='radical.orbit')
             await asyncio.wait_for(
-                plugin._tunnel_watcher('endpoint1', '12345', 'endpoint-job.x',
-                                        relay_file, 'forward'),
+                plugin._watch_forward('endpoint1', '12345'),
                 timeout=5.0)
     finally:
         re_log.removeHandler(caplog.handler)
@@ -430,8 +429,8 @@ async def test_reverse_tunnel_watcher_happy_path(tmp_path, monkeypatch):
          patch('radical.orbit.plugin_psij.asyncio.to_thread',
                new=_to_thread_inline):
         await asyncio.wait_for(
-            plugin._tunnel_watcher('endpoint-r', '12345', 'endpoint-job.r',
-                                    relay_file, 'reverse'),
+            plugin._watch_reverse('sid-r', 'endpoint-r', '12345',
+                                  'endpoint-job.r'),
             timeout=5.0)
 
     # No tunnel-failure recorded; the job_id is NOT in _failure_reasons
@@ -467,21 +466,21 @@ async def test_reverse_tunnel_watcher_spawn_failure(tmp_path, monkeypatch):
 
     cancelled: list = []
 
-    async def fake_dispatch_cancel(job_id):
-        cancelled.append(job_id)
+    async def fake_forward(sid, func, **kwargs):
+        # _fail_tunnel cancels the useless allocation via the owning session.
+        cancelled.append(kwargs.get('job_id'))
+        return {}
 
     with patch('radical.orbit.batch_system.detect_batch_system',
                return_value=fake_batch), \
          patch('radical.orbit.tunnel.spawn_reverse_tunnel',
                side_effect=fake_spawn_raises), \
-         patch.object(plugin, '_dispatch_cancel',
-                       side_effect=fake_dispatch_cancel), \
+         patch.object(plugin, '_forward', new=fake_forward), \
          patch('radical.orbit.plugin_psij.asyncio.sleep',
                new=AsyncMock(return_value=None)):
         await asyncio.wait_for(
-            plugin._tunnel_watcher('endpoint-rfail', '54321',
-                                    'endpoint-job.rfail', relay_file,
-                                    'reverse'),
+            plugin._watch_reverse('sid-rf', 'endpoint-rfail', '54321',
+                                  'endpoint-job.rfail'),
             timeout=5.0)
 
     assert 'endpoint-job.rfail' in plugin._failure_reasons
