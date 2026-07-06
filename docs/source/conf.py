@@ -28,7 +28,7 @@ print(sys.path)
 
 # Add any Sphinx extension module names here, as strings. They can be extensions
 # coming with Sphinx (named 'sphinx.ext.*') or your custom ones.
-extensions = ['sphinx.ext.autodoc', 'sphinx.ext.doctest', 'sphinx.ext.intersphinx', 'sphinx.ext.todo', 'sphinx.ext.coverage', 'sphinx.ext.mathjax', 'sphinx.ext.ifconfig', 'sphinx.ext.viewcode', 'myst_parser']
+extensions = ['sphinx.ext.autodoc', 'sphinx.ext.napoleon', 'sphinx.ext.doctest', 'sphinx.ext.intersphinx', 'sphinx.ext.todo', 'sphinx.ext.coverage', 'sphinx.ext.mathjax', 'sphinx.ext.ifconfig', 'sphinx.ext.viewcode', 'myst_parser']
 
 [extensions]
 todo_include_todos=True
@@ -36,8 +36,14 @@ todo_include_todos=True
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
 
-# The suffix of source filenames.
-source_suffix = '.rst'
+# The suffix of source filenames.  Markdown is handled by myst_parser (see the
+# extensions list) so the star-model guides can be authored in either format.
+source_suffix = ['.rst', '.md']
+
+# Auto-generate '#slug' anchors for Markdown headings up to this depth, so
+# in-page TOC links (e.g. getting_started.md) resolve without explicit
+# (anchor)= targets.
+myst_heading_anchors = 3
 
 # The encoding of source files.
 #source_encoding = 'utf-8-sig'

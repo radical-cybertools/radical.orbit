@@ -13,7 +13,7 @@ Q1 focuses on establishing **service infrastructure, plugin baselines, and first
 that enable later work on RHAPSODY, ROSE, and xGFabric without committing to full implementations.
 
 RADICAL‑Endpoint acts as the **enabling substrate**:
-- secure Bridge/Endpoint communication,
+- secure broker/endpoint communication,
 - plugin‑based service exposure,
 - protocol stability,
 - early integration paths.
@@ -40,7 +40,7 @@ RADICAL‑Endpoint acts as the **enabling substrate**:
 ### Issues
 
 - **Audit & document plugin base**
-- **Endpoint/Bridge protocol specification**
+- **Endpoint/broker protocol specification**
 - **RHAPSODY request/response mapping**
 - **RHAPSODY plugin skeleton**
 - **ROSE integration prep (control‑plane stubs)**
@@ -66,7 +66,7 @@ integration paths for RHAPSODY and ROSE.
 - **xGFabric API skeleton as RD plugin**
 - **xGFabric end‑to‑end scripted demo**
 - **Error propagation & status normalization**
-- **Bridge auth hook points**
+- **Broker auth hook points**
 - **ROSE plugin skeleton**
 
 **Outcome:**  

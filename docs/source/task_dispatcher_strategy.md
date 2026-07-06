@@ -10,7 +10,7 @@ The task dispatcher delegates three concerns to a pluggable
 Pilot replacement emerges from submission + termination; no separate
 hook is needed.
 
-Strategies never touch psij, rhapsody, or the bridge directly.  All
+Strategies never touch psij, rhapsody, or the broker directly.  All
 side-effecting actions flow through the ``StrategyContext`` supplied
 by the dispatcher.  This keeps the research surface stable across
 plumbing changes.
@@ -19,7 +19,7 @@ plumbing changes.
 
 In ``pools.json``:
 
-```json
+```text
 {
   "pools": [{
     "name": "cpu",
@@ -107,7 +107,7 @@ ctx.drain_pilot(pid)             # stop routing new tasks to one
 
 Accessors return snapshots — they're safe to iterate but shouldn't be
 cached across strategy calls.  Action hooks are non-blocking; the
-actual psij submission / bridge call happens on a worker.
+actual psij submission / broker call happens on a worker.
 
 ## Shipped strategies
 

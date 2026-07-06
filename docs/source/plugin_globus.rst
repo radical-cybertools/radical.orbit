@@ -9,10 +9,10 @@ The ``globus`` plugin stages files via `Globus Online
 <https://www.globus.org/>`_ (the Transfer API).  Globus moves data
 **collection-to-collection** out of band, so the plugin is an *orchestrator*:
 it submits transfers between two Globus collections and monitors task state.
-Bytes never flow through the client, endpoint, or bridge — which distinguishes it
-from the byte-streaming :ref:`staging <plugin_api>` plugin.
+Bytes never flow through the consumer, endpoint, or broker — which distinguishes it
+from the byte-streaming ``staging`` plugin.
 
-The plugin is **endpoint-side** (it is not loaded on the bridge) and is only
+The plugin is **endpoint-side** (it is not hosted on the broker) and is only
 enabled when `globus-sdk <https://globus-sdk-python.readthedocs.io/>`_ is
 importable.
 
@@ -86,11 +86,12 @@ Client API
 
 .. code-block:: python
 
-   from radical.orbit import BridgeClient
+   from radical.orbit import EndpointRuntime
 
-   bc     = BridgeClient()
-   ec     = bc.get_endpoint_client(bc.list_endpoints()[0])
-   globus = ec.get_plugin('globus')
+   rt     = EndpointRuntime()
+   rt.start(wait=True)
+   eid    = next(n for n in rt.topology() if n != 'broker')
+   globus = rt.get_plugin(eid, 'globus')
 
    # access token, or refresh_token=… + client_id=…
    globus.register_session(access_token='…', local_collection='…')
@@ -114,12 +115,10 @@ Methods:
    ``{"source", "destination", "recursive"}`` dicts.  Returns
    ``{task_id, submission_id, status}``.
 
-``get_task(task_id)`` / ``task_wait(task_id, timeout=60, polling_interval=10)`` /
-``cancel_task(task_id)`` / ``list_tasks(limit=100)``
+``get_task(task_id)`` / ``task_wait(task_id, timeout=60, polling_interval=10)`` / ``cancel_task(task_id)`` / ``list_tasks(limit=100)``
    Task monitoring and control.
 
-``ls(collection, path=None)`` / ``mkdir(collection, path)`` /
-``rename(collection, oldpath, newpath)`` / ``delete(collection, paths, recursive=False, label=None)``
+``ls(collection, path=None)`` / ``mkdir(collection, path)`` / ``rename(collection, oldpath, newpath)`` / ``delete(collection, paths, recursive=False, label=None)``
    Filesystem operations on a collection (``delete`` submits a Globus delete
    task).
 

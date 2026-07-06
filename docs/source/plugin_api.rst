@@ -7,26 +7,26 @@ This section documents all available plugins in the ORBIT system.
 Base Classes
 ============
 
-PluginClient
-------------
-
-.. autoclass:: radical.orbit.plugin_client_base.PluginClient
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
-ClientManagedPlugin
--------------------
-
-.. autoclass:: radical.orbit.plugin_client_managed.ClientManagedPlugin
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
 Plugin
 ------
 
 .. autoclass:: radical.orbit.plugin_base.Plugin
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+PluginSession
+-------------
+
+.. autoclass:: radical.orbit.plugin_session_base.PluginSession
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+PluginClient
+------------
+
+.. autoclass:: radical.orbit.client.PluginClient
    :members:
    :undoc-members:
    :show-inheritance:
