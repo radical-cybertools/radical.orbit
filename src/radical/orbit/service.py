@@ -448,6 +448,27 @@ class EndpointService(PluginHostBase):
             return 'relax'
         return 'abort'
 
+    @staticmethod
+    def _build_ssl_context(cert: Optional[str],
+                           check_hostname: bool) -> ssl.SSLContext:
+        """Build the TLS context for the outbound WSS connection to the bridge.
+
+        When a bridge certificate is pinned (``--cert``), trust **only** that
+        certificate — pass it as the sole ``cafile`` so the system CA store is
+        *not* loaded (issue #42).  Otherwise a bridge presenting any cert that
+        chains to a system-trusted CA, or a different self-signed cert
+        generated on the same host, would be accepted in place of the
+        configured one, defeating ``CERT_REQUIRED``.  Without a pinned cert we
+        fall back to the system store (standard public-CA trust).
+        """
+        if cert and os.path.exists(cert):
+            ctx = ssl.create_default_context(cafile=cert)
+        else:
+            ctx = ssl.create_default_context()
+        ctx.check_hostname = check_hostname
+        ctx.verify_mode    = ssl.CERT_REQUIRED
+        return ctx
+
     async def run(self) -> None:
         """
         Main async entry point.
@@ -500,15 +521,12 @@ class EndpointService(PluginHostBase):
                 if not ws_url.endswith("/register"):
                     ws_url += "/register"
 
-                # Determine if we need SSL
+                # Determine if we need SSL.  The context trusts ONLY the
+                # pinned bridge cert (issue #42) — see _build_ssl_context.
                 ssl_ctx = None
                 if ws_url.startswith("wss://"):
-                    ssl_ctx = ssl.create_default_context()
-                    ssl_ctx.check_hostname = ssl_check_hostname
-                    ssl_ctx.verify_mode = ssl.CERT_REQUIRED
-                    # Cert path was already resolved + validated in __init__.
-                    if self._cert and os.path.exists(self._cert):
-                        ssl_ctx.load_verify_locations(self._cert)
+                    ssl_ctx = self._build_ssl_context(self._cert,
+                                                      ssl_check_hostname)
 
                 async with websockets.connect(ws_url,
                                               ssl=ssl_ctx,
