@@ -174,7 +174,7 @@ with open('%s/requirements.txt' % root, encoding='utf-8') as freq:
 with open('%s/docs/requirements.txt' % root, encoding='utf-8') as fdoc:
     doc_requirements = fdoc.readlines()
 
-test_requirements = ['pytest', 'pytest-asyncio']
+test_requirements = ['pytest', 'pytest-asyncio', 'quickjs']
 lint_requirements = ['flake8', 'pylint']
 dev_requirements  = test_requirements + lint_requirements + doc_requirements
 
