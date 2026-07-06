@@ -40,6 +40,8 @@ Contents:
    plugin_development.rst
    plugin_api.rst
    plugin_globus.rst
+   plugin_iri.rst
+   machine_guide.rst
    rest_api.rst
 
 
