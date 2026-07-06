@@ -39,7 +39,12 @@ def _raise(resp, context: str = '') -> None:
         parts = [f"HTTP {resp.status_code}"]
         if context: parts.append(context)
         if detail:  parts.append(detail)
-        raise RuntimeError(' — '.join(parts))
+        exc = RuntimeError(' — '.join(parts))
+        # Expose the HTTP status so callers can branch on it (the canonical
+        # error envelope carries it as ``status_code``; the wire status is the
+        # authoritative source here).
+        exc.status_code = resp.status_code
+        raise exc
 
 
 class PluginClient:

@@ -313,6 +313,15 @@ def test_serve_and_call_plugin_end_to_end(harness):
     assert resp.status_code == 200
     assert resp.json() == {'pong': True}
 
+    # A served-request error carries the canonical rich envelope: an unknown
+    # route on the served plugin 404s with {"error", "status_code", "detail"}.
+    miss = b.call('epA', 'GET', '/echo_rt/does_not_exist')
+    assert miss.status_code == 404
+    body = miss.json()
+    assert body['error']       is True
+    assert body['status_code'] == 404
+    assert 'No route' in body['detail']
+
 
 # ---------------------------------------------------------------------------
 # pending-table timeout (and no leak: a later call still works)

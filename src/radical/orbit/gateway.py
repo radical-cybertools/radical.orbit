@@ -72,9 +72,11 @@ from fastapi.responses          import JSONResponse, FileResponse
 from fastapi.middleware.cors    import CORSMiddleware
 from starlette.middleware.base  import BaseHTTPMiddleware
 from starlette.responses        import StreamingResponse
+from starlette.exceptions       import HTTPException as StarletteHTTPException
 
 from . import utils
 from . import protocol
+from .errors        import error_dict
 from .queues        import BoundedDropOldestQueue
 from .runtime_client import unpack_response_dict
 
@@ -231,8 +233,7 @@ class Gateway:
         if not utils.tokens_match(self._request_token(request), self._token):
             return JSONResponse(
                 status_code=401,
-                content={"error": True, "status_code": 401,
-                         "detail": "missing or invalid broker token"})
+                content=error_dict(401, "missing or invalid broker token"))
         return await call_next(request)
 
     # ── event subscriptions (SSE fan-out) ─────────────────────────────
@@ -410,6 +411,22 @@ class Gateway:
             "/{endpoint_name}/{path:path}", self._route_proxy,
             methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
             tags=["Proxy"], summary="Proxy requests to endpoint plugins")
+        # Render the gateway's OWN raised HTTPExceptions in the canonical error
+        # envelope (FastAPI defaults to a bare ``{"detail": ...}``).  FastAPI's
+        # HTTPException subclasses the Starlette one, so this covers both.  Note:
+        # we deliberately do NOT handle RequestValidationError — that would
+        # flatten the structured 422 body — and proxied plugin responses are
+        # returned as ``Response`` objects (never raised), so they bypass this.
+        app.add_exception_handler(StarletteHTTPException,
+                                  self._http_exception_handler)
+
+    @staticmethod
+    async def _http_exception_handler(request: Request,
+                                      exc: StarletteHTTPException):
+        """Render a raised HTTPException as the canonical error envelope."""
+        return JSONResponse(error_dict(exc.status_code, exc.detail),
+                            status_code=exc.status_code,
+                            headers=getattr(exc, 'headers', None))
 
     # ── route handlers ────────────────────────────────────────────────
 

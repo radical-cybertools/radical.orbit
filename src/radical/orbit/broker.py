@@ -44,7 +44,6 @@ re-registration is first-come after a restart.
 import asyncio
 import concurrent.futures
 import itertools
-import json
 import logging
 import os
 import signal
@@ -68,6 +67,7 @@ from . import utils
 
 from .broker_plugin_host import BrokerPluginHost
 from .broker_events      import EventRouter
+from .errors             import error_body, error_dict
 
 
 log = logging.getLogger("radical.orbit.broker")
@@ -584,8 +584,7 @@ class Broker:
         if not utils.tokens_match(token, self._token):
             return JSONResponse(
                 status_code=401,
-                content={"error": True, "status_code": 401,
-                         "detail": "missing or invalid broker token"})
+                content=error_dict(401, "missing or invalid broker token"))
         return await call_next(request)
 
     # ── /register ─────────────────────────────────────────────────────
@@ -841,8 +840,7 @@ class Broker:
         shape :meth:`_dispatch_to_host` wraps into a wire ``response``."""
         if self._plugin_host is None:
             return {'status': 503, 'headers': {},
-                    'body': json.dumps({"error": True,
-                                        "detail": "no broker host"}).encode()}
+                    'body': error_body(503, "no broker host")}
         query = ''
         if '?' in path:
             path, query = path.split('?', 1)
@@ -862,14 +860,12 @@ class Broker:
         except HTTPException as e:
             return {'status': e.status_code,
                     'headers': {'content-type': 'application/json'},
-                    'body': json.dumps({"error": True,
-                                        "detail": e.detail}).encode()}
+                    'body': error_body(e.status_code, e.detail)}
         except Exception as e:
             log.exception("[Broker] host dispatch failed: %s", e)
             return {'status': 500,
                     'headers': {'content-type': 'application/json'},
-                    'body': json.dumps({"error": True,
-                                        "detail": str(e)}).encode()}
+                    'body': error_body(500, str(e))}
 
     async def _host_broadcast(self, topic: str, data: dict) -> None:
         """``broadcast_fn`` handed to :class:`BrokerPluginHost`.
@@ -1132,8 +1128,7 @@ class Broker:
         out = protocol.Response(
             src=BROKER_NAME, dst=req_raw.get('src'), status=status,
             headers={'content-type': 'application/json'},
-            body=json.dumps({"error": True, "status_code": status,
-                             "detail": detail}).encode(),
+            body=error_body(status, detail),
             corr_id=req_raw.get('corr_id'))
         return protocol.pack_message(out, cap=self._frame_cap)
 

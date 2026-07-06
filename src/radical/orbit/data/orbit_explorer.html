@@ -1834,7 +1834,14 @@
             if (ok) return await apiFetch(path, { ...opts, _retried: true });
           }
           const t = await res.text();
-          const errMsg = `HTTP ${res.status}: ${t}`;
+          // Canonical error envelope is {"error":true,"status_code":N,"detail":".."}
+          // — surface the human message (`detail`), not the whole JSON blob.
+          // Fall back to the raw text if the body is not JSON or has no detail.
+          // `t` itself stays untouched for the stale-session heal path below.
+          let msg = t;
+          try { const j = JSON.parse(t); if (j && j.detail) msg = j.detail; }
+          catch (e) { /* not JSON — keep raw text */ }
+          const errMsg = `HTTP ${res.status}: ${msg}`;
 
           // Stale-session auto-recovery: a 410 (expired) or a 404 whose detail
           // is specifically "unknown session id" means the sid is dead — not

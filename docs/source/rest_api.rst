@@ -393,14 +393,45 @@ All plugin endpoints return standard HTTP status codes:
 
 - ``200`` — Success
 - ``400`` — Bad request (missing/invalid parameters)
+- ``401`` — Missing or invalid broker token (ingress auth)
 - ``403`` — Session owned by another participant (cross-owner reattach)
 - ``404`` — Session, resource, or endpoint not found
 - ``409`` — Conflict (e.g. incoherent/conflicting session lifetime policy)
 - ``410`` — Session expired (TTL exceeded)
 - ``500`` — Internal server error
-- ``503`` — Broker at concurrency cap (too many in-flight calls)
+- ``502`` — Bad gateway (upstream participant returned an invalid response)
+- ``503`` — Broker/endpoint at concurrency cap (too many in-flight calls)
 - ``504`` — Upstream (participant) timeout
 
-Error body format::
+Error body format
+-----------------
 
-    {"detail": "human-readable error message"}
+Every synthesized error carries one canonical envelope::
+
+    {"error": true, "status_code": <int>, "detail": "human-readable message"}
+
+This is a superset of the older ``{"detail": ...}`` body: ``detail`` is always
+present (so existing consumers keep working), and ``error`` + ``status_code``
+are additive.  ``status_code`` mirrors the HTTP status on the wire, which is
+useful for clients that read the body without the transport status (e.g. the
+endpoint runtime tunnels an HTTP response over the WebSocket).
+
+The one exception is request-validation (``422``): FastAPI's structured
+validation body is preserved as-is and is *not* rewrapped in this envelope.
+
+Error status matrix
+-------------------
+
+===========  ===========================================================
+Status       Meaning
+===========  ===========================================================
+``400``      Bad request — missing or invalid parameters
+``401``      Missing or invalid broker token (ingress auth gate)
+``403``      Forbidden — permission denied / cross-owner session reattach
+``404``      Not found — session, resource, route, or endpoint
+``409``      Conflict — e.g. target already exists, incoherent lifetime
+``500``      Internal server error — unhandled handler exception
+``502``      Bad gateway — upstream participant returned an invalid response
+``503``      At concurrency cap — too many in-flight calls (with ``Retry-After``)
+``504``      Upstream timeout — participant handler exceeded the call deadline
+===========  ===========================================================

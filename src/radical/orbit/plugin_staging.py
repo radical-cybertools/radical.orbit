@@ -16,6 +16,7 @@ from starlette.requests import Request
 from .plugin_base import Plugin
 from .plugin_session_base import PluginSession
 from .client import PluginClient
+from .errors import http_exception
 
 log = logging.getLogger("radical.orbit")
 
@@ -406,12 +407,11 @@ class PluginStaging(Plugin):
         try:
             result = await session.put_file(filename, content_b64, overwrite=overwrite)
             return result
-        except FileExistsError as e:
-            raise HTTPException(status_code=409, detail=str(e)) from e
-        except PermissionError as e:
-            raise HTTPException(status_code=403, detail=str(e)) from e
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
+        except (FileExistsError, PermissionError, ValueError) as e:
+            # status_for maps: FileExistsError→409, PermissionError→403,
+            # ValueError→400 (identical to the former hand-rolled ladder; the
+            # staging client reverses these codes).
+            raise http_exception(e) from e
 
     async def get_endpoint(self, request: Request) -> dict:
         """
@@ -438,12 +438,9 @@ class PluginStaging(Plugin):
         try:
             result = await session.get_file(filename)
             return result
-        except FileNotFoundError as e:
-            raise HTTPException(status_code=404, detail=str(e)) from e
-        except PermissionError as e:
-            raise HTTPException(status_code=403, detail=str(e)) from e
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
+        except (FileNotFoundError, PermissionError, ValueError) as e:
+            # FileNotFoundError→404, PermissionError→403, ValueError→400.
+            raise http_exception(e) from e
 
     async def list_endpoint(self, request: Request) -> dict:
         """
@@ -470,11 +467,8 @@ class PluginStaging(Plugin):
         try:
             result = await session.list_dir(path)
             return result
-        except FileNotFoundError as e:
-            raise HTTPException(status_code=404, detail=str(e)) from e
-        except NotADirectoryError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
-        except PermissionError as e:
-            raise HTTPException(status_code=403, detail=str(e)) from e
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
+        except (FileNotFoundError, NotADirectoryError,
+                PermissionError, ValueError) as e:
+            # FileNotFoundError→404, NotADirectoryError→400, PermissionError→403,
+            # ValueError→400.
+            raise http_exception(e) from e
