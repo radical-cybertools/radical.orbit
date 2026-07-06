@@ -740,6 +740,20 @@ class Bridge:
             except Exception as e:
                 log.warning("[Bridge] Error shutting down endpoint %s: %s",
                             endpoint_name, e)
+
+            # Free the name synchronously (issue #43): closing the socket above
+            # only schedules the register handler's disconnect cleanup, which
+            # races a re-registration under the same name (rejected as "already
+            # used").  Drop it from both maps here so the name is immediately
+            # available; the register handler's ``endpoint_ws.get(name) == ws``
+            # guard then makes its own cleanup a no-op.
+            if self_.endpoint_ws.get(endpoint_name) == ws:
+                del self_.endpoint_ws[endpoint_name]
+                if endpoint_name in self_.endpoints["endpoints"]:
+                    del self_.endpoints["endpoints"][endpoint_name]
+                    await self_._broadcast_event("topology", self_.endpoints)
+                    await self_._broadcast_topology_to_endpoints()
+
             return JSONResponse({"status": "shutdown", "endpoint": endpoint_name})
 
         @app.post("/bridge/terminate", tags=["Management"])

@@ -226,6 +226,30 @@ def test_disconnect_removes_endpoint_from_both_maps(make_bridge):
     json.dumps(bridge.endpoints)
 
 
+def test_management_disconnect_frees_name_immediately(make_bridge):
+    """The ``/endpoint/disconnect/{name}`` management route must free the name
+    synchronously so a re-registration is not rejected as "already used"
+    while the socket-close cleanup is still pending (issue #43)."""
+    bridge = make_bridge()
+    client = TestClient(bridge.app)
+
+    with client.websocket_connect("/register") as ws:
+        _register(ws)
+        assert _wait_until(lambda: _registered(bridge))
+        assert "thinkie" in bridge.endpoint_ws
+
+        resp = client.post("/endpoint/disconnect/thinkie")
+        assert resp.status_code == 200
+
+        # Freed by the route itself — no waiting on the async socket cleanup.
+        assert "thinkie" not in bridge.endpoint_ws
+        assert "thinkie" not in bridge.endpoints["endpoints"]
+
+    # Unknown / already-freed name -> 404, not a lingering reservation.
+    resp = client.post("/endpoint/disconnect/thinkie")
+    assert resp.status_code == 404
+
+
 # ---------------------------------------------------------------------------
 # _strip_headers — bridge credential must not leak to endpoint plugins
 # ---------------------------------------------------------------------------
