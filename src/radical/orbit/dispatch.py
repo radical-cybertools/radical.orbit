@@ -32,18 +32,26 @@ import msgpack
 class RequestShim:
     """Lightweight adapter for starlette ``Request``.
 
-    Provides the three interfaces that every plugin handler uses:
-    ``path_params``, ``query_params``, and ``await .json()`` / ``await .body()``.
+    Provides the interfaces that every plugin handler uses: ``path_params``,
+    ``query_params``, ``headers``, and ``await .json()`` / ``await .body()``.
     Encoding-agnostic: stores raw bytes, decodes lazily based on content_type.
+
+    ``headers`` is a plain dict.  The serving runtime injects the trusted
+    ``x-orbit-src`` owner header here (see ``runtime._dispatch_served``); the
+    old-stack ``service.py`` and the broker gateway pass no such header, so
+    ``headers.get('x-orbit-src')`` is ``None`` there (owner-less,
+    capability-style within the token trust domain).
     """
 
     def __init__(self, path_params : dict,
                        query_params: dict,
                        body_bytes  : bytes,
-                       content_type: str = 'application/json'):
+                       content_type: str  = 'application/json',
+                       headers     : dict = None):
         self.path_params  = path_params
         self.query_params = query_params
         self.content_type = content_type
+        self.headers      = headers if headers is not None else {}
         self._body        = body_bytes
         self._decoded     = None
 

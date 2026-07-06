@@ -16,6 +16,7 @@ from fastapi import FastAPI, HTTPException
 from starlette.routing import Route
 from starlette.requests import Request
 from unittest.mock import Mock
+import asyncio
 import uuid
 import time
 import pytest
@@ -563,6 +564,176 @@ def test_plugin_ui_config_default():
 
     # Default should be None
     assert plugin.ui_config is None
+
+
+# ---------------------------------------------------------------------------
+# Session ownership + owner-checked reattach (M6)
+# ---------------------------------------------------------------------------
+
+def _owned_request(payload, owner=None):
+    '''Request mock whose headers carry the trusted x-orbit-src owner
+    (the header the serving runtime injects from the broker-stamped src).'''
+    async def _json():
+        return payload
+    request = Mock(spec=Request)
+    request.json    = _json
+    request.headers = {} if owner is None else {'x-orbit-src': owner}
+    return request
+
+
+def _fresh_plugin():
+    app    = FastAPI()
+    plugin = Plugin(app, "test_plugin")
+    plugin.session_class = PluginSession
+    return plugin
+
+
+@pytest.mark.asyncio
+async def test_session_owner_recorded_from_header():
+    '''register_session records owner from the x-orbit-src header at create.'''
+    plugin = _fresh_plugin()
+    data = await plugin.register_session(_owned_request({"sid": "s1"}, "epB"))
+    assert data['sid'] == "s1"
+    assert plugin._session_policy["s1"]["owner"] == "epB"
+
+
+@pytest.mark.asyncio
+async def test_session_owner_none_without_header():
+    '''No x-orbit-src header (old stack / gateway) -> owner None.'''
+    plugin = _fresh_plugin()
+    await plugin.register_session(_owned_request({"sid": "s1"}))
+    assert plugin._session_policy["s1"]["owner"] is None
+
+
+@pytest.mark.asyncio
+async def test_session_same_owner_reattach_ok():
+    '''Reattach by the same owner re-states policy and succeeds.'''
+    plugin = _fresh_plugin()
+    await plugin.register_session(_owned_request({"sid": "s1"}, "epB"))
+    data = await plugin.register_session(_owned_request({"sid": "s1"}, "epB"))
+    assert data['sid'] == "s1"
+
+
+@pytest.mark.asyncio
+async def test_session_different_owner_reattach_403():
+    '''Reattach by a different owner (or none) to a bound session -> 403.'''
+    plugin = _fresh_plugin()
+    await plugin.register_session(_owned_request({"sid": "s1"}, "epB"))
+
+    with pytest.raises(HTTPException) as exc:
+        await plugin.register_session(_owned_request({"sid": "s1"}, "attacker"))
+    assert exc.value.status_code == 403
+
+    with pytest.raises(HTTPException) as exc:
+        await plugin.register_session(_owned_request({"sid": "s1"}))  # no owner
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_session_ownerless_reattach_unaffected():
+    '''An owner-less session accepts any reattach and stays owner-less.'''
+    plugin = _fresh_plugin()
+    await plugin.register_session(_owned_request({"sid": "s1"}))          # None
+    data = await plugin.register_session(_owned_request({"sid": "s1"}, "x"))
+    assert data['sid'] == "s1"
+    assert plugin._session_policy["s1"]["owner"] is None
+
+
+@pytest.mark.asyncio
+async def test_default_session_owner_none_even_with_header():
+    '''The shared reserved default session always records owner None.'''
+    plugin = _fresh_plugin()
+    await plugin.register_session(_owned_request({"sid": "default"}, "epB"))
+    assert plugin._session_policy["default"]["owner"] is None
+
+
+# ---------------------------------------------------------------------------
+# Owner-liveness driven ephemeral reclaim (M6): suspect never reclaims,
+# lost arms the drain, owner return cancels, ttl/persistent survive
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_suspect_does_not_arm_drain():
+    '''A blip reaching 'suspect' must NOT arm the reclaim drain.'''
+    plugin = _fresh_plugin()
+    plugin.reclaim_drain = 0.05
+    await plugin.register_session(_owned_request({"sid": "s1"}, "epB"))
+    await plugin.on_topology_change({"epB": {"liveness": "suspect"}})
+    assert not plugin._drain_timers                    # nothing armed
+    await asyncio.sleep(0.12)
+    assert "s1" in plugin._sessions                    # session survives
+
+
+@pytest.mark.asyncio
+async def test_lost_arms_drain_and_reclaims_ephemeral():
+    '''An owner declared 'lost' reclaims its ephemeral sessions after the
+    drain; a persistent session of the same owner survives.'''
+    plugin = _fresh_plugin()
+    plugin.reclaim_drain = 0.05
+    await plugin.register_session(_owned_request({"sid": "s1"}, "epB"))
+    await plugin.register_session(
+        _owned_request({"sid": "p1", "lifetime": "persistent"}, "epB"))
+
+    await plugin.on_topology_change({"epB": {"liveness": "lost"}})
+    assert "epB" in plugin._drain_timers
+    await asyncio.sleep(0.15)
+
+    assert "s1" not in plugin._sessions
+    assert "s1" not in plugin._session_policy
+    assert "p1" in plugin._sessions                    # persistent survives
+
+
+@pytest.mark.asyncio
+async def test_owner_return_cancels_drain():
+    '''An owner seen 'present' again before the drain fires cancels it.'''
+    plugin = _fresh_plugin()
+    plugin.reclaim_drain = 0.1
+    await plugin.register_session(_owned_request({"sid": "s1"}, "epB"))
+
+    await plugin.on_topology_change({"epB": {"liveness": "lost"}})
+    assert "epB" in plugin._drain_timers
+    await plugin.on_topology_change({"epB": {"liveness": "present"}})
+    assert "epB" not in plugin._drain_timers
+
+    await asyncio.sleep(0.2)
+    assert "s1" in plugin._sessions                    # not reclaimed
+
+
+@pytest.mark.asyncio
+async def test_owner_bound_ephemeral_not_idle_expired():
+    '''An owner-bound ephemeral session is governed by liveness, not the idle
+    timeout; an owner-less one still idle-expires (old-stack behavior).'''
+    plugin = _fresh_plugin()
+    plugin.session_ttl = 1                             # tiny idle timeout
+
+    await plugin.register_session(_owned_request({"sid": "bound"}, "epB"))
+    await plugin.register_session(_owned_request({"sid": "free"}))   # owner None
+
+    # Backdate both well past the idle timeout.
+    plugin._session_last_access["bound"] = time.time() - 100
+    plugin._session_last_access["free"]  = time.time() - 100
+
+    cleaned = await plugin._cleanup_expired_sessions()
+    assert cleaned == 1
+    assert "bound" in plugin._sessions                 # liveness-governed
+    assert "free" not in plugin._sessions              # idle-expired
+
+
+@pytest.mark.asyncio
+async def test_ttl_and_persistent_never_armed_by_owner_loss():
+    '''An owner with only ttl/persistent sessions arms no drain on loss.'''
+    plugin = _fresh_plugin()
+    plugin.reclaim_drain = 0.05
+    await plugin.register_session(
+        _owned_request({"sid": "t1", "lifetime": "ttl", "ttl": 100}, "epB"))
+    await plugin.register_session(
+        _owned_request({"sid": "p1", "lifetime": "persistent"}, "epB"))
+
+    await plugin.on_topology_change({"epB": {"liveness": "lost"}})
+    assert not plugin._drain_timers
+    await asyncio.sleep(0.1)
+    assert "t1" in plugin._sessions
+    assert "p1" in plugin._sessions
 
 
 if __name__ == '__main__':
