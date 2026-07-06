@@ -149,6 +149,18 @@ no requirement exists)**. **E is explicitly deferred** for discussion.
   `plugin_iri_instance.py`, `plugin_lucid.py`, `plugin_sysinfo.py` — A9, B2-xg,
   B3-poller (globus/iri), D-sysinfo, minor nits, B1.
 
+## Residual tracked follow-ups (branch 13 is green; these are deferred, not blocking)
+
+- **C6 finish**: a small `_LastAccessView` write-through shim remains in
+  `plugin_base.py` so globus/iri/rhapsody source could stay green during Wave 1;
+  globus now records policy/owner via the base, so the shim's last remaining
+  writers are few — remove it (and re-evaluate `_default_lock`/`_ensure_default_session`
+  vs. rhapsody's lazy default) in a small follow-up.
+- **Endpoint-mode** (dispatcher finding 4) was left in place (E-adjacent) rather than
+  deleted — revisit with E.
+- **Unused Pydantic UI models** in `ui_schema.py` (only `UIConfig`/`ui_config_to_dict`
+  have callers) — a possible further trim, left conservative.
+
 ## Acceptance
 
 Per wave and at the end: `PYTHONPATH=$PWD/src ve3/bin/python -m pytest
