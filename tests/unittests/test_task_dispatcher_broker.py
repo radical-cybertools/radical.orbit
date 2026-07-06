@@ -21,6 +21,7 @@ import httpx
 import pytest
 
 from radical.orbit.plugin_base import Plugin
+from radical.orbit.plugin_session_base import PluginSession
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +66,30 @@ class _FakePilot(Plugin):
 
     async def _ping(self, request):
         return {'pong': True}
+
+
+class _FakePsij(Plugin):
+    """A psij-shaped served plugin: base ``register_session`` + a canned
+    ``submit_tunneled/{sid}`` that echoes what crossed the wire.
+
+    Registered under a distinct ``plugin_name`` (so the real ``PluginPSIJ``
+    stays in the class registry) but mounted at instance name ``psij`` so its
+    namespace is ``/psij`` — exactly what a real ``PSIJClient`` formats.
+    """
+    plugin_name   = 'fake_psij'
+    session_class = PluginSession
+    version       = '0.0.1'
+
+    def __init__(self, app, instance_name: str = 'psij'):
+        super().__init__(app, instance_name)
+        self.add_route_post('submit_tunneled/{sid}', self._submit_tunneled)
+
+    async def _submit_tunneled(self, request):
+        data = await request.json()
+        return {'job_id':        'j.1',
+                'native_id':     'n.1',
+                'echo_tunnel':   data.get('tunnel'),
+                'echo_executor': data.get('executor')}
 
 
 # ---------------------------------------------------------------------------
@@ -127,13 +152,15 @@ def harness(self_signed, tmp_path, monkeypatch):
         servers.append(srv)
         return srv
 
-    def make_runtime(url, wait=True, **kw):
+    def make_runtime(url, wait=True, serve=None, **kw):
         from radical.orbit.runtime import EndpointRuntime
         defaults = dict(broker_url=url, token=None, ping_interval=1.0,
                         ping_timeout=3.0, backoff_start=0.05, backoff_max=0.2)
         defaults.update(kw)
         rt = EndpointRuntime(**defaults)
         runtimes.append(rt)
+        for p in (serve or []):
+            rt.serve(p)                    # mount before connecting
         rt.start(wait=wait, timeout=10.0)
         return rt
 
@@ -154,7 +181,7 @@ def harness(self_signed, tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def _dispatcher(srv):
-    return srv.broker._host._plugins['task_dispatcher']
+    return srv.broker._plugin_host._plugins['task_dispatcher']
 
 
 def test_dispatcher_wired_with_caller_and_tap(harness):
@@ -184,6 +211,36 @@ def test_dispatcher_calls_child_via_caller(harness):
     if isinstance(body, str):
         body = body.encode()
     assert json.loads(body)['pong'] is True
+
+
+def test_dispatcher_drives_real_psij_helper_via_caller(harness):
+    """End-to-end: the dispatcher builds a REAL ``PSIJClient`` wired to the
+    broker caller (``CallerHTTP``) and drives its async cores against a real
+    child endpoint — register + ``asubmit_tunneled`` — with the payload and
+    response crossing the routing loop intact.  This is the convergence the
+    proxies were replaced by: one helper implementation, caller-backed.
+    """
+    import asyncio
+
+    make_broker, make_runtime = harness
+    srv = make_broker(plugins='task_dispatcher')
+    make_runtime(srv.url, name='ep', serve=[_FakePsij])
+
+    td = _dispatcher(srv)
+
+    async def _drive():
+        psij = await td._get_psij_client('ep')      # real PSIJClient over caller
+        assert psij is not None
+        assert psij.sid                              # session registered
+        return await psij.asubmit_tunneled(
+            {'executable': '/bin/true'}, 'local', 'none')
+
+    result = asyncio.run(_drive())
+    assert result['job_id']        == 'j.1'
+    assert result['echo_tunnel']   == 'none'         # payload shape crossed intact
+    assert result['echo_executor'] == 'local'
+    # The client is cached for reuse on the next dispatcher call.
+    assert ('ep', 'psij', None) in td._child_clients
 
 
 def test_gateway_http_to_hosted_dispatcher(harness):

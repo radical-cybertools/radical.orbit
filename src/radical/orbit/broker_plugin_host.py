@@ -166,6 +166,20 @@ class BrokerPluginHost(PluginHostBase):
     # helpers
     # ------------------------------------------------------------------
 
+    async def shutdown(self) -> None:
+        """Stop every hosted plugin's background work (broker shutdown path).
+
+        Runs on the host loop; drives each plugin's ``shutdown`` hook (cancel
+        cleanup / reclaim-drain tasks, close sessions) so the host loop can be
+        torn down without pending plugin tasks.
+        """
+        for pname, plugin in list(self._plugins.items()):
+            try:
+                await plugin.shutdown()
+            except Exception as e:
+                log.warning('[BrokerPluginHost] %s shutdown failed: %s',
+                            pname, e)
+
     def get_ui_modules(self) -> Dict[str, str]:
         """Return {plugin_name: js_content} for plugins with UI modules."""
         modules: Dict[str, str] = {}

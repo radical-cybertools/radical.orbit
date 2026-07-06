@@ -196,7 +196,9 @@ def main():
     print(f"\nSubmitting sub-endpoint job to {executor}...")
 
     if use_tunnel:
-        result = psij.submit_tunneled(job_spec, executor=executor, tunnel=True)
+        # Reverse SSH tunnel (login -> compute), per this example's prose.
+        result = psij.submit_tunneled(job_spec, executor=executor,
+                                      tunnel='reverse')
     else:
         result = psij.submit_job(job_spec, executor=executor)
 

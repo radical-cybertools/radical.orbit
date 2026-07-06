@@ -530,7 +530,7 @@ def test_e2e_late_consumer_replays_with_splice(harness):
     make_broker, make_runtime = harness
     srv = make_broker(plugins='replay')
 
-    replay = srv.broker._host._plugins['replay']
+    replay = srv.broker._plugin_host._plugins['replay']
     assert replay is not None
 
     # emitter endpoint emits 5 events BEFORE any consumer exists

@@ -114,7 +114,11 @@ def main():
         relay_file = _pl.Path.home() / '.radical' / 'orbit' / 'tunnels' / f'{args.name}.port'
         print(f"  Relay port file: {relay_file}")
 
-    result = psij.submit_tunneled(job_spec, executor=args.executor, tunnel=args.tunnel)
+    # This example demonstrates the reverse tunnel (login -> compute); '--tunnel'
+    # selects it, its absence means the child connects to the broker directly.
+    tunnel_mode = 'reverse' if args.tunnel else 'none'
+    result = psij.submit_tunneled(job_spec, executor=args.executor,
+                                  tunnel=tunnel_mode)
 
     job_id    = result['job_id']
     native_id = result.get('native_id', '?')

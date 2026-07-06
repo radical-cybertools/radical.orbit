@@ -715,7 +715,7 @@ async def test_dst_broker_routes_into_host(make_broker):
         # Register the test plugin onto the host (on the host loop).
         import asyncio as _a
         fut = _a.run_coroutine_threadsafe(
-            broker._host.register_dynamic_plugin(_EchoPlugin, 'echo'),
+            broker._plugin_host.register_dynamic_plugin(_EchoPlugin, 'echo'),
             broker._host_loop)
         fut.result(timeout=5.0)
 
@@ -777,3 +777,63 @@ async def test_gateway_seam_surface(make_broker):
         assert broker.auth_enabled is False              # no_auth=True
     finally:
         await broker.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# --host bind address survives startup (item 14 regression)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_host_bind_arg_reaches_uvicorn_after_startup(make_broker,
+                                                           monkeypatch):
+    """The constructor ``host`` must reach ``uvicorn.run`` even after startup
+    built the hosted-plugin host — the plugin host lives on its own attribute
+    (``_plugin_host``), so it never clobbers the bind address (``_host``)."""
+    broker = make_broker(host='127.0.0.1')
+    await broker.startup()
+    try:
+        # The hosted-plugin host is reachable at its own attribute; call_host
+        # still routes into it (empty host → 404 on an unknown route).
+        assert broker._plugin_host is not None
+        resp = await broker.call_host('GET', '/no-such-route')
+        assert resp['status'] in (404, 503)
+
+        captured = {}
+        import uvicorn
+        monkeypatch.setattr(uvicorn, 'run',
+                            lambda app, **kw: captured.update(kw))
+        broker.run()
+        assert captured['host'] == '127.0.0.1'
+    finally:
+        await broker.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# clean hosted-plugin shutdown — no orphaned background tasks (item 19)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_hosted_plugin_shutdown_cancels_background_tasks(make_broker):
+    """Broker.shutdown() drives the hosted plugins' shutdown hook so their
+    background tasks (e.g. the session-cleanup loop) are cancelled before the
+    host loop is torn down — no 'Task was destroyed but it is pending'."""
+    broker = make_broker(plugins='sysinfo', gateway=False)
+    await broker.startup()
+    plugin = broker._plugin_host.plugins['sysinfo']
+
+    # Arm the plugin's background session-cleanup task on the host loop.
+    def _arm():
+        plugin._ensure_cleanup_task()
+    asyncio.run_coroutine_threadsafe(
+        _run_on_loop(_arm), broker._host_loop).result(timeout=5.0)
+    assert plugin._cleanup_task is not None
+    assert not plugin._cleanup_task.done()
+
+    await broker.shutdown()
+
+    # The cleanup task was cancelled cleanly during shutdown.
+    assert plugin._cleanup_task.done()
+
+
+async def _run_on_loop(fn):
+    fn()

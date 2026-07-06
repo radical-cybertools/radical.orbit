@@ -32,10 +32,24 @@ import psij
 
 from .plugin_base import Plugin
 from .plugin_session_base import PluginSession
-from .client import PluginClient
+from .client import PluginClient, _run_sync
 from .tunnel import relay_dir as _relay_dir
 
 log = logging.getLogger("radical.orbit")
+
+# ---------------------------------------------------------------------------
+# Route templates — single-sourced so the ``add_route_*`` registration and the
+# client-helper (and broker-hosted dispatcher) URL formatting cannot drift.
+# Each template doubles as the ``add_route_*`` path (``{name}`` = path param)
+# and as a ``.format(...)`` string for the helpers.  Every psij route is
+# formatted by a ``PSIJClient`` helper, so all of them are lifted here.
+# ---------------------------------------------------------------------------
+ROUTE_SUBMIT          = 'submit/{sid}'
+ROUTE_SUBMIT_TUNNELED = 'submit_tunneled/{sid}'
+ROUTE_TUNNEL_STATUS   = 'tunnel_status/{endpoint_name}'
+ROUTE_STATUS          = 'status/{sid}/{job_id}'
+ROUTE_LIST_JOBS       = 'list_jobs/{sid}'
+ROUTE_CANCEL          = 'cancel/{sid}/{job_id}'
 
 # Default poll interval for job status updates (in seconds)
 PSIJ_POLL_INTERVAL = 5.0
@@ -483,7 +497,7 @@ class PSIJClient(PluginClient):
         """
         self._require_session()
 
-        url = self._url(f"submit/{self.sid}")
+        url = self._url(ROUTE_SUBMIT.format(sid=self.sid))
         payload = {"job_spec": job_spec, "executor": executor}
 
         resp = self._http.post(url, json=payload)
@@ -504,16 +518,23 @@ class PSIJClient(PluginClient):
         Returns:
             Job status info including metadata and stdout/stderr.
         """
+        return _run_sync(self.aget_job_status(
+            job_id, stdout_offset, stderr_offset))
+
+    async def aget_job_status(self, job_id: str,
+                              stdout_offset: int = 0,
+                              stderr_offset: int = 0) -> Dict[str, Any]:
+        """Async core for :meth:`get_job_status` (broker-hosted dispatcher)."""
         self._require_session()
 
-        url    = self._url(f"status/{self.sid}/{job_id}")
+        url    = self._url(ROUTE_STATUS.format(sid=self.sid, job_id=job_id))
         params = {}
         if stdout_offset:
             params['stdout_offset'] = str(stdout_offset)
         if stderr_offset:
             params['stderr_offset'] = str(stderr_offset)
 
-        resp = self._http.get(url, params=params)
+        resp = await self._arequest("GET", url, params=params)
         self._raise(resp, f"job status {job_id!r}")
         return resp.json()
 
@@ -526,7 +547,7 @@ class PSIJClient(PluginClient):
         """
         self._require_session()
 
-        resp = self._http.get(self._url(f"list_jobs/{self.sid}"))
+        resp = self._http.get(self._url(ROUTE_LIST_JOBS.format(sid=self.sid)))
         self._raise(resp)
         return resp.json()
 
@@ -540,11 +561,15 @@ class PSIJClient(PluginClient):
         Returns:
             Cancellation result.
         """
+        return _run_sync(self.acancel_job(job_id))
+
+    async def acancel_job(self, job_id: str) -> Dict[str, Any]:
+        """Async core for :meth:`cancel_job` (broker-hosted dispatcher)."""
         self._require_session()
 
-        url = self._url(f"cancel/{self.sid}/{job_id}")
+        url = self._url(ROUTE_CANCEL.format(sid=self.sid, job_id=job_id))
 
-        resp = self._http.post(url)
+        resp = await self._arequest("POST", url)
         self._raise(resp, f"cancel job {job_id!r}")
         return resp.json()
 
@@ -589,6 +614,16 @@ class PSIJClient(PluginClient):
             ValueError:   If *tunnel* is not one of the three string values.
             RuntimeError: If the server returns an error response.
         """
+        return _run_sync(self.asubmit_tunneled(job_spec, executor, tunnel))
+
+    async def asubmit_tunneled(self, job_spec: Dict[str, Any],
+                               executor: str = 'local',
+                               tunnel: str = 'none') -> Dict[str, Any]:
+        """Async core for :meth:`submit_tunneled` (broker-hosted dispatcher).
+
+        Same validation, path, payload and error mapping as the sync wrapper;
+        the dispatcher awaits this directly on the broker host loop.
+        """
         if tunnel not in ('none', 'forward', 'reverse'):
             raise ValueError(
                 f"tunnel must be one of 'none' / 'forward' / 'reverse'; "
@@ -596,10 +631,10 @@ class PSIJClient(PluginClient):
 
         self._require_session()
 
-        url     = self._url(f"submit_tunneled/{self.sid}")
+        url     = self._url(ROUTE_SUBMIT_TUNNELED.format(sid=self.sid))
         payload = {"job_spec": job_spec, "executor": executor, "tunnel": tunnel}
 
-        resp = self._http.post(url, json=payload)
+        resp = await self._arequest("POST", url, json=payload)
         self._raise(resp, f"psij submit_tunneled on {executor!r}")
         return resp.json()
 
@@ -620,7 +655,8 @@ class PSIJClient(PluginClient):
             - ``port`` — assigned tunnel port (int) once active, else null.
             - ``pid`` — SSH process PID, once spawned, else null.
         """
-        resp = self._http.get(self._url(f"tunnel_status/{endpoint_name}"))
+        resp = self._http.get(self._url(
+            ROUTE_TUNNEL_STATUS.format(endpoint_name=endpoint_name)))
         self._raise(resp, f"tunnel_status {endpoint_name!r}")
         return resp.json()
 
@@ -715,12 +751,12 @@ class PluginPSIJ(Plugin):
 
         self._app.router.on_shutdown.append(self._cleanup_watchers)
 
-        self.add_route_post('submit/{sid}',                    self.submit_job)
-        self.add_route_post('submit_tunneled/{sid}',           self.submit_tunneled)
-        self.add_route_get('tunnel_status/{endpoint_name}',        self.tunnel_status)
-        self.add_route_get('status/{sid}/{job_id}',            self.get_job_status)
-        self.add_route_get('list_jobs/{sid}',                  self.list_jobs)
-        self.add_route_post('cancel/{sid}/{job_id}',           self.cancel_job)
+        self.add_route_post(ROUTE_SUBMIT,          self.submit_job)
+        self.add_route_post(ROUTE_SUBMIT_TUNNELED, self.submit_tunneled)
+        self.add_route_get (ROUTE_TUNNEL_STATUS,   self.tunnel_status)
+        self.add_route_get (ROUTE_STATUS,          self.get_job_status)
+        self.add_route_get (ROUTE_LIST_JOBS,       self.list_jobs)
+        self.add_route_post(ROUTE_CANCEL,          self.cancel_job)
 
     async def submit_job(self, request: Request) -> dict:
         sid = request.path_params['sid']
