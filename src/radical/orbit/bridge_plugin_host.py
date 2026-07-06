@@ -47,8 +47,13 @@ class BridgePluginHost(PluginHostBase):
         self._load_plugins_from_filter(plugin_names)
 
         # Reference the live list — not a copy — so dynamically registered
-        # plugin routes are visible immediately.
-        self._direct_routes: list = getattr(self._app.state, 'direct_routes', [])
+        # plugin routes are visible immediately.  Ensure the list exists on
+        # app.state first: with an empty plugin set nothing created it yet, so
+        # a bare ``getattr(..., [])`` default would detach from the list a
+        # later dynamic plugin appends to (its routes would never match).
+        if not hasattr(self._app.state, 'direct_routes'):
+            self._app.state.direct_routes = []
+        self._direct_routes: list = self._app.state.direct_routes
 
     # ------------------------------------------------------------------
     # topology announcement  (PluginHostBase contract)
