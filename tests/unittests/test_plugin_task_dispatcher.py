@@ -3,13 +3,16 @@
 Focus: plugin-level behavior that does not require a live broker — strict
 per-session pool isolation, restart-time replay, session-close teardown,
 cached-state idempotency, staging, pilot binding via rich topology
-(present/suspect/lost), and the async transport port (broker caller, no
-`asyncio.to_thread`).
+(present/suspect/lost), and the transport port (broker caller +
+``asyncio.to_thread``).
 
 Endpoint calls are stubbed via :meth:`_get_psij_client` / :meth:`_get_rhapsody_client`
-(async; in production they return real caller-backed ``PSIJClient`` /
-``RhapsodyClient`` helpers, driven here through their ``a<method>`` async cores);
-no real broker or WebSocket is needed.
+(async factories; in production they return real caller-backed ``PSIJClient`` /
+``RhapsodyClient`` helpers).  The dispatcher drives those clients' plain SYNC
+methods (``submit_tunneled`` / ``get_task`` / ``cancel_task`` / ``submit_tasks``
+— there are no async ``a<method>`` twins) via ``asyncio.to_thread``, so a plain
+``MagicMock`` returning a JSON-serializable dict is all a stub needs; no real
+broker or WebSocket is required.
 """
 
 import asyncio
@@ -208,13 +211,12 @@ class TestRestartReplay:
         ps_a.pilots['p.1'] = PilotRecord(
             pid='p.1', pool='cpu', owning_sid='A', size_key='s',
             rhapsody_backend='concurrent', state=PILOT_ACTIVE)
-        ps_a.pilot_log.append(ps_a.pilots['p.1'])
         rec = TaskRecord(task_id='t.x', pool='cpu', owning_sid='A',
                          cmd=['/bin/echo'], cwd=str(tmp_path),
                          state=TASK_RUNNING, pilot_id='p.1',
                          rhapsody_uid='rh.1')
         ps_a.tasks['t.x'] = rec
-        ps_a.task_log.append(rec)
+        ps_a.persist()
 
         # Simulate a broker restart: a fresh plugin over the same state root.
         _, plugin2 = _make_plugin(tmp_path)
@@ -266,7 +268,7 @@ class TestSessionTeardown:
         _, plugin = _make_plugin(tmp_path)
 
         async def scenario():
-            plugin._ensure_started()
+            plugin._maybe_start()
             sid = await plugin._open_session(None, 'ephemeral', None,
                                              owner='clientA')
             plugin._materialise_pool(sid, _make_pool_cfg())
@@ -292,7 +294,7 @@ class TestSessionTeardown:
         plugin.reclaim_drain = 0.05
 
         async def scenario():
-            plugin._ensure_started()
+            plugin._maybe_start()
             sid = await plugin._open_session('P', 'persistent', None,
                                              owner='clientA')
             plugin._materialise_pool(sid, _make_pool_cfg())
@@ -310,7 +312,7 @@ class TestSessionTeardown:
         plugin.reclaim_drain = 0.05
 
         async def scenario():
-            plugin._ensure_started()
+            plugin._maybe_start()
             sid = await plugin._open_session('E', 'ephemeral', None,
                                              owner='clientA')
             plugin._materialise_pool(sid, _make_pool_cfg())
@@ -359,13 +361,15 @@ class TestRoutes:
         client = TestClient(plugin._app)
         sid = _session_with_cpu(client, plugin, sid='A', lifetime='persistent')
         ps = _pool(plugin, sid, 'cpu')
-        with patch.object(ps.strategy, 'on_task_arrived') as on_arrived, \
-             patch.object(ps.strategy, 'pick_dispatch', return_value=None):
+        with patch.object(ps.policy, 'pick_dispatch',
+                         return_value=None) as pick_dispatch:
             r = client.post(f'{plugin.namespace}/submit/{sid}', json={
                 'pool': 'cpu', 'task_id': 't.1',
                 'cmd': ['/bin/echo', 'hi'], 'cwd': str(tmp_path)})
             assert r.status_code == 200
-            assert on_arrived.called
+            # submit drains any ready dispatches immediately (the policy
+            # itself scales up on the housekeeping tick, not here).
+            assert pick_dispatch.called
         assert ps.tasks['t.1'].state == TASK_QUEUED
         assert ps.tasks['t.1'].owning_sid == sid
 
@@ -377,12 +381,12 @@ class TestRoutes:
         ps.tasks['t.done'] = TaskRecord(
             task_id='t.done', pool='cpu', owning_sid=sid,
             cmd=['/bin/echo'], cwd=str(tmp_path), state=TASK_DONE, exit_code=0)
-        with patch.object(ps.strategy, 'on_task_arrived') as spy:
+        with patch.object(ps.policy, 'pick_dispatch') as spy:
             r = client.post(f'{plugin.namespace}/submit/{sid}', json={
                 'pool': 'cpu', 'task_id': 't.done',
                 'cmd': ['/bin/echo'], 'cwd': str(tmp_path)})
             assert r.json()['state'] == TASK_DONE
-            spy.assert_not_called()
+            spy.assert_not_called()   # cached-DONE returns before draining
 
     def test_cancel_queued_is_immediate(self, tmp_path):
         _, plugin = _make_plugin(tmp_path)
@@ -458,7 +462,6 @@ class TestTopologyBinding:
                            child='endpoint0_p.1', state=PILOT_PENDING,
                            walltime=1e12):
         _, plugin = _make_plugin(tmp_path)
-        plugin._loops_started = True
         plugin._materialise_pool('A', _make_pool_cfg())
         ps = _pool(plugin, 'A', 'cpu')
         ps.pilots[pid] = PilotRecord(
@@ -469,7 +472,7 @@ class TestTopologyBinding:
 
     def test_present_binds_pending_pilot(self, tmp_path):
         plugin, ps = self._plugin_with_pilot(tmp_path)
-        with patch.object(ps.strategy, 'on_pilot_state') as spy:
+        with patch.object(ps.policy, 'on_pilot_state') as spy:
             asyncio.run(plugin.on_topology_change(_child_topo('endpoint0_p.1')))
         assert ps.pilots['p.1'].state == PILOT_ACTIVE
         assert ps.pilots['p.1'].capacity == 4
@@ -551,16 +554,19 @@ class TestPilotSubmitTransport:
             rhapsody_backend=size.rhapsody_backend, state=PILOT_PENDING)
         ps.pilots[record.pid] = record
 
+        # The dispatcher drives child clients' SYNC methods via
+        # asyncio.to_thread (there are no async `a<method>` twins anymore),
+        # so a plain MagicMock returning a dict is all `submit_tunneled` needs.
         psij_mock = MagicMock()
-        psij_mock.asubmit_tunneled = AsyncMock(return_value={'job_id': 'jid'})
+        psij_mock.submit_tunneled = MagicMock(return_value={'job_id': 'jid'})
         with patch.object(plugin, '_get_psij_client',
                           new=AsyncMock(return_value=psij_mock)), \
              patch('radical.orbit.batch_system.detect_batch_system') as bs:
             bs.return_value.psij_executor = 'local'
             asyncio.run(plugin._do_pilot_submit(ps, record, size))
 
-        psij_mock.asubmit_tunneled.assert_awaited_once()
-        assert psij_mock.asubmit_tunneled.await_args.args[2] == 'none'
+        psij_mock.submit_tunneled.assert_called_once()
+        assert psij_mock.submit_tunneled.call_args.args[2] == 'none'
         assert record.psij_job_id == 'jid'
 
     def test_refuses_without_broker_caller(self, tmp_path):
@@ -612,12 +618,14 @@ class TestEndpointMode:
         sid = _register(client, plugin, body={'sid': 'A',
                                               'lifetime': 'persistent'})
         self._seed_topology(plugin, {'ep': ['rhapsody']})
+        # SYNC method names: the dispatcher drives them via asyncio.to_thread
+        # (no async `a<method>` twins anymore); plain MagicMocks suffice.
         rh_mock = MagicMock()
-        rh_mock.asubmit_tasks = AsyncMock(return_value=[{'uid': 't.1',
-                                                         'state': 'NEW'}])
-        rh_mock.aget_task    = AsyncMock(return_value={'uid': 't.1',
+        rh_mock.submit_tasks = MagicMock(return_value=[{'uid': 't.1',
+                                                        'state': 'NEW'}])
+        rh_mock.get_task     = MagicMock(return_value={'uid': 't.1',
                                                        'state': 'RUNNING'})
-        rh_mock.acancel_task = AsyncMock(return_value={'uid': 't.1',
+        rh_mock.cancel_task  = MagicMock(return_value={'uid': 't.1',
                                                        'state': 'CANCELED'})
         with patch.object(plugin, '_get_rhapsody_client',
                           new=AsyncMock(return_value=rh_mock)):
@@ -626,14 +634,14 @@ class TestEndpointMode:
                 'cmd': ['/bin/sleep', '0'], 'cwd': '/tmp'})
             assert r.status_code == 200, r.text
             assert plugin._endpoint_mode_tasks.get('t.1') == 'ep'
-            rh_mock.asubmit_tasks.assert_awaited_once()
+            rh_mock.submit_tasks.assert_called_once()
 
             r = client.get(f'{plugin.namespace}/task/{sid}/t.1')
             assert r.json()['result']['state'] == 'RUNNING'
 
             r = client.post(f'{plugin.namespace}/cancel/{sid}/t.1')
             assert r.status_code == 200
-            rh_mock.acancel_task.assert_awaited_once_with('t.1')
+            rh_mock.cancel_task.assert_called_once_with('t.1')
 
     def test_terminal_event_clears_endpoint_mode(self, tmp_path):
         _, plugin = _make_plugin(tmp_path)

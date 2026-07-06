@@ -730,6 +730,6 @@ def test_with_meta_seq_matches_replay_and_default_unchanged(harness):
     # The same authoritative seqs are what the broker-hosted replay plugin
     # retained for these events.
     replay = b.get_plugin('broker', 'replay')
-    resp = replay.fetch('c1')
+    resp = replay.fetch(-1)
     retained = {e['seq'] for e in resp['events']}
     assert set(metas).issubset(retained)
