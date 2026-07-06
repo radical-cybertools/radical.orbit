@@ -407,14 +407,16 @@ async function loadExistingJobs(page, api) {
   const jobs = (res && res.jobs) || [];
   for (const job of jobs) {
     if (!job || !job.job_id) continue;
-    if (psijJobs[job.job_id]) {
-      // Already tracked (e.g. submitted from this tab) — just refresh state.
-      Object.assign(psijJobs[job.job_id], job);
+    psijJobs[job.job_id] = Object.assign(psijJobs[job.job_id] || {}, job);
+    // Idempotency is keyed off the DOM row, NOT the module-level psijJobs cache:
+    // that cache is an ES-module singleton that persists across reloads /
+    // reconnects / endpoint switches, so a freshly-rebuilt (empty) table still
+    // needs the row added even when the job is already in the cache.
+    if (page.querySelector(`tr[data-job-id="${CSS.escape(job.job_id)}"]`)) {
       updateJobRow(page, job.job_id, job.state, job);
-      continue;
+    } else {
+      addJobRow(page, api, job);   // renders state/cancel affordance from job.state
     }
-    psijJobs[job.job_id] = job;
-    addJobRow(page, api, job);   // renders state/cancel affordance from job.state
   }
 }
 

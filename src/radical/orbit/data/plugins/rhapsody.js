@@ -202,14 +202,16 @@ async function loadExistingTasks(page, api) {
   const tasks = (res && res.tasks) || [];
   for (const task of tasks) {
     if (!task || !task.uid) continue;
-    if (rhTasks[task.uid]) {
-      // Already tracked (e.g. submitted from this tab) — just refresh state.
-      Object.assign(rhTasks[task.uid], task);
+    rhTasks[task.uid] = Object.assign(rhTasks[task.uid] || {}, task);
+    // Idempotency is keyed off the DOM row, NOT the module-level rhTasks cache:
+    // that cache is an ES-module singleton that persists across reloads /
+    // reconnects / endpoint switches, so a freshly-rebuilt (empty) table still
+    // needs the row added even when the task is already in the cache.
+    if (page.querySelector(`tr[data-uid="${CSS.escape(task.uid)}"]`)) {
       updateTaskRow(page, task.uid, task.state, task);
-      continue;
+    } else {
+      addTaskRow(page, api, task);   // renders state/cancel affordance from task.state
     }
-    rhTasks[task.uid] = task;
-    addTaskRow(page, api, task);   // renders state/cancel affordance from task.state
   }
 }
 

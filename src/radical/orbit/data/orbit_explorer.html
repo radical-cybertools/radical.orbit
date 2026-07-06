@@ -1168,6 +1168,7 @@
     let eventSource = null;
     let sessions = {};   // key: "endpointName/pluginName" -> sid
     let sessionRegBodies = {};   // key -> last register_session body (for auto-recovery re-register)
+    let healingSessions  = {};   // key -> in-flight re-register promise (single-flight heal)
     let endpointData = {};   // endpointName -> plugin info from /endpoint/list
     let queueDataCache      = {}; // endpointName -> { queues: {...}, allocations: [...] }
     let jobAllocationCache  = {}; // endpointName -> allocation dict | null
@@ -1883,7 +1884,9 @@
     // session auto-recovery.  Deleting the key drops both a resolved sid and any
     // in-flight registration promise stored under the same key.
     function invalidateSession(endpointName, pluginName) {
-      delete sessions[`${endpointName}/${pluginName}`];
+      const key = `${endpointName}/${pluginName}`;
+      delete sessions[key];
+      delete sessionRegBodies[key];   // drop the register body too (no leak on churn)
     }
 
     async function registerSession(endpointName, pluginName, body = {}) {
@@ -1944,11 +1947,18 @@
       const m  = su.matchSessionForPath(path, sessions, getNs);
       if (!m) return null;
 
-      invalidateSession(m.endpoint, m.plugin);
+      // Single-flight: concurrent pollers that all 404 on the same session
+      // coalesce onto ONE re-registration instead of each spawning their own.
+      if (!healingSessions[m.key]) {
+        const body = sessionRegBodies[m.key] || {};   // capture before invalidate
+        invalidateSession(m.endpoint, m.plugin);
+        healingSessions[m.key] =
+          registerSession(m.endpoint, m.plugin, body)
+            .finally(() => { delete healingSessions[m.key]; });
+      }
       let newSid;
       try {
-        newSid = await registerSession(m.endpoint, m.plugin,
-                                       sessionRegBodies[m.key] || {});
+        newSid = await healingSessions[m.key];
       } catch (_) {
         return null;   // re-register failed — let the original error surface
       }
@@ -2077,6 +2087,7 @@
       endpointData = {};
       sessions = {};
       sessionRegBodies = {};
+      healingSessions  = {};
       queueDataCache     = {};
       jobAllocationCache = {};
       window.lastEndpoints = {};
