@@ -362,6 +362,29 @@ def test_503_fast_fail_at_concurrency_cap(harness):
 
 
 # ---------------------------------------------------------------------------
+# a stuck served handler is bounded by _call_timeout (504) and frees its slot
+# ---------------------------------------------------------------------------
+
+def test_served_handler_timeout_504_and_slot_freed(harness):
+    make_broker, make_runtime = harness
+    srv = make_broker()
+
+    # Shrink the serve-layer deadline; the single slot must be reclaimed after
+    # the timeout so a follow-up request still succeeds.
+    a = make_runtime(srv.url, name='epA', plugins=['echo_rt'],
+                     request_concurrency=1, accept_queue=0, call_timeout=0.3)
+    b = make_runtime(srv.url, name='epB')
+    assert _wait_topology(b, 'epA', 'echo_rt', timeout=5.0)
+
+    resp = b.call('epA', 'GET', '/echo_rt/slow/800', timeout=3.0)
+    assert resp.status_code == 504
+    # Slot released by the finally path — the endpoint is not permanently 503.
+    assert _wait(lambda: a._req_inflight == 0, timeout=2.0)
+    ok = b.call('epA', 'GET', '/echo_rt/ping', timeout=2.0)
+    assert ok.status_code == 200
+
+
+# ---------------------------------------------------------------------------
 # event round-trip with auto-subscribe; callback fires on the callback thread
 # ---------------------------------------------------------------------------
 

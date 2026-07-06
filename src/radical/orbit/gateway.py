@@ -74,6 +74,7 @@ from starlette.middleware.base  import BaseHTTPMiddleware
 from starlette.responses        import StreamingResponse
 
 from . import utils
+from . import protocol
 from .queues        import BoundedDropOldestQueue
 from .runtime_client import unpack_response_dict
 
@@ -520,6 +521,33 @@ class Gateway:
         raise HTTPException(status_code=404,
                             detail=f"Plugin '{filename}' not found")
 
+    @staticmethod
+    async def _read_body_capped(request: Request, cap: int) -> bytes:
+        """Read the request body, rejecting oversized payloads (memory-DoS
+        guard on the public catch-all proxy).
+
+        Fast-fail on a declared ``Content-Length`` over *cap* before reading a
+        byte, and guard the actual read for chunked/lying clients by
+        accumulating from the stream and bailing with 413 once the running
+        total exceeds *cap*."""
+        declared = request.headers.get('content-length')
+        if declared is not None:
+            try:
+                if int(declared) > cap:
+                    raise HTTPException(status_code=413,
+                                        detail="request body too large")
+            except ValueError:
+                pass                       # malformed header — fall to the read
+        chunks = []
+        total  = 0
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > cap:
+                raise HTTPException(status_code=413,
+                                    detail="request body too large")
+            chunks.append(chunk)
+        return b''.join(chunks)
+
     async def _route_proxy(self, endpoint_name: str, path: str,
                            request: Request):
         # Map the HTTP URL ``/{endpoint}/{plugin_ns}/...`` onto the star model:
@@ -528,7 +556,7 @@ class Gateway:
         if request.url.query:
             forward_path += '?' + str(request.url.query)
 
-        body    = await request.body()
+        body    = await self._read_body_capped(request, protocol.FRAME_CAP)
         headers = self._strip_headers(request)
 
         # dst == the broker's own hosted-plugin participant: route into the
