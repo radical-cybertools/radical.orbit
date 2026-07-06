@@ -69,6 +69,12 @@ def test_endpoint_argv_none_has_no_tunnel_args():
         == ['--name', 'ep', '--url', 'u']
 
 
+def test_endpoint_argv_forward_requires_login_host():
+    # forward mode with no login_host would append None to argv -> raise instead.
+    with pytest.raises(ValueError, match='login_host'):
+        amsc._endpoint_argv('ep', 'u', 'forward', None)
+
+
 # ── _wait_for_endpoint ─────────────────────────────────────────────────────
 
 def test_wait_returns_when_endpoint_appears():
@@ -112,3 +118,14 @@ def test_watch_subscribes_and_only_trips_on_own_terminal_failure():
 
     watch.close()
     assert bc.subs == []
+
+
+def test_watch_ignores_malformed_payload():
+    # The callback runs on the dispatcher thread; a None / non-dict payload must
+    # not raise (that would kill the thread).
+    bc    = _FakeBC()
+    watch = amsc._JobFailureWatch(bc, 'job-1')
+    watch._on_status('b', 'p', 'job_status', None)
+    watch._on_status('b', 'p', 'job_status', 'not-a-dict')
+    watch._on_status('b', 'p', 'job_status', 42)
+    assert not watch.failed

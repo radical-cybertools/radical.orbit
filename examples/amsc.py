@@ -540,6 +540,10 @@ def _endpoint_argv(endpoint_name, broker_url, tunnel, login_host):
     if tunnel != 'none':
         args += ['--tunnel', tunnel]
         if tunnel == 'forward':
+            if not login_host:
+                raise ValueError(
+                    "tunnel 'forward' requires a login_host (the host the "
+                    "child opens 'ssh -L' to)")
             args += ['--tunnel-via', login_host]
     return args
 
@@ -749,7 +753,11 @@ class _JobFailureWatch:
         bc.register_callback(topic='job_status', callback=self._cb)
 
     def _on_status(self, endpoint, plugin, topic, data):
-        if self.failed or data.get('job_id') != self._job_id:
+        # Runs on the callback-dispatcher thread; a malformed/None payload must
+        # not raise here (it would kill that thread), so guard the type.
+        if self.failed or not isinstance(data, dict):
+            return
+        if data.get('job_id') != self._job_id:
             return
         state = str(data.get('state', '')).lower()
         if state in self._FAILED:
