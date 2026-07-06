@@ -12,6 +12,8 @@ submissions through a callable passed to :meth:`on_tick`.  The ``_Harness``
 below stands in for a real ``PoolState``.
 """
 
+from __future__ import annotations   # PEP 604 ``X | None`` hints on Python 3.9
+
 import pytest
 
 from radical.orbit.task_dispatcher_config import PoolConfig, PilotSize
