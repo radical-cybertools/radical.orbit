@@ -47,6 +47,74 @@ let queueDataCache = {};
 // Shared with api.escHtml — set in init()
 let escHtml = s => String(s || '');  // safe fallback until init()
 
+// Shared job-state → badge colour map, covering the common SLURM and PBS
+// state vocabularies so states like CANCELLED / TIMEOUT / SUSPENDED get a
+// meaningful colour instead of falling through to grey.
+const JOB_STATE_BADGES = {
+  RUNNING      : 'badge-green',
+  COMPLETING   : 'badge-green',
+  COMPLETED    : 'badge-blue',
+  PENDING      : 'badge-orange',
+  CONFIGURING  : 'badge-orange',
+  SUSPENDED    : 'badge-orange',
+  PREEMPTED    : 'badge-orange',
+  HELD         : 'badge-orange',
+  FAILED       : 'badge-red',
+  TIMEOUT      : 'badge-red',
+  NODE_FAIL    : 'badge-red',
+  BOOT_FAIL    : 'badge-red',
+  DEADLINE     : 'badge-red',
+  OUT_OF_MEMORY: 'badge-red',
+  CANCELLED    : 'badge-gray',
+  CANCELED     : 'badge-gray',
+  MOVED        : 'badge-gray',
+};
+
+function jobStateBadge(state) {
+  return JOB_STATE_BADGES[String(state || '').toUpperCase()] || 'badge-gray';
+}
+
+// One job-detail grid row (label + value); value is inserted verbatim, so
+// callers escape it as needed.
+function jobDetailRow(label, value) {
+  return `
+      <div class="job-detail-item">
+        <span class="label">${label}</span>
+        <span class="value">${value}</span>
+      </div>`;
+}
+
+// Conditional extra rows for the newly-surfaced job fields (issue #40).
+// Absent/empty fields are skipped so overlays don't show blank rows.
+function extraJobDetailRows(job) {
+  let rows = '';
+  if (job.reason && job.reason !== 'None')
+    rows += jobDetailRow('Reason', escHtml(job.reason));
+  if (job.qos)
+    rows += jobDetailRow('QoS', escHtml(job.qos));
+  if (job.dependency)
+    rows += jobDetailRow('Dependency', escHtml(job.dependency));
+  if (job.work_dir)
+    rows += jobDetailRow('Working Dir', escHtml(job.work_dir));
+  if (job.command)
+    rows += jobDetailRow('Command', escHtml(job.command));
+  if (job.exit_code !== undefined && job.exit_code !== null)
+    rows += jobDetailRow('Exit Code', escHtml(String(job.exit_code)));
+  if (job.array_job_id !== undefined && job.array_job_id !== null)
+    rows += jobDetailRow('Array Job ID', escHtml(String(job.array_job_id)));
+  if (job.array_task_id !== undefined && job.array_task_id !== null)
+    rows += jobDetailRow('Array Task ID', escHtml(String(job.array_task_id)));
+  if (job.tres_req)
+    rows += jobDetailRow('TRES (req)', escHtml(job.tres_req));
+  if (job.tres_alloc)
+    rows += jobDetailRow('TRES (alloc)', escHtml(job.tres_alloc));
+  if (job.std_out)
+    rows += jobDetailRow('Std Out', escHtml(job.std_out));
+  if (job.std_err)
+    rows += jobDetailRow('Std Err', escHtml(job.std_err));
+  return rows;
+}
+
 export function init(page, api) {
   escHtml = api.escHtml;
   // Bind refresh button
@@ -248,8 +316,8 @@ async function loadQueueJobs(api, sid, queue, btn) {
 
       for (const j of jobs) {
         const jobId = j.job_id || j.id || '-';
-        const st = j.state || j.job_state || '-';
-        const badge = { 'RUNNING': 'badge-green', 'PENDING': 'badge-orange', 'COMPLETED': 'badge-blue', 'FAILED': 'badge-red' }[st] || 'badge-gray';
+        const st = j.state || '-';
+        const badge = jobStateBadge(st);
         const eid = escHtml(jobId);
         const cancelBtn = CANCELLABLE.has(st)
           ? `<button class="task-cancel-btn cancel-job-btn" data-job-id="${eid}" title="Cancel job ${eid}">❌</button>`
@@ -259,7 +327,7 @@ async function loadQueueJobs(api, sid, queue, btn) {
           <td><span class="badge ${badge}">${escHtml(st)}</span></td>
           <td>${escHtml(j.job_name || j.name || '-')}</td>
           <td>${escHtml(j.user || j.user_name || '-')}</td>
-          <td>${j.nodes || j.num_nodes || '-'}</td>
+          <td>${j.nodes || '-'}</td>
           <td>${formatDuration(j.time_used)}</td>
           <td>${cancelBtn}</td>
         </tr>`;
@@ -314,8 +382,8 @@ function showJobDetail(jobId) {
   const detailPanel = document.getElementById('job-detail-panel');
   if (!detailPanel) return;
 
-  const st = job.state || job.job_state || '-';
-  const badge = { 'RUNNING': 'badge-green', 'PENDING': 'badge-orange', 'COMPLETED': 'badge-blue', 'FAILED': 'badge-red' }[st] || 'badge-gray';
+  const st = job.state || '-';
+  const badge = jobStateBadge(st);
 
   detailPanel.innerHTML = `
     <h4>📋 Job Details: ${escHtml(job.job_id || job.id || '-')}</h4>
@@ -342,7 +410,7 @@ function showJobDetail(jobId) {
       </div>
       <div class="job-detail-item">
         <span class="label">Nodes</span>
-        <span class="value">${job.nodes || job.num_nodes || '-'}</span>
+        <span class="value">${job.nodes || '-'}</span>
       </div>
       <div class="job-detail-item">
         <span class="label">CPUs</span>
@@ -371,7 +439,7 @@ function showJobDetail(jobId) {
       <div class="job-detail-item">
         <span class="label">Priority</span>
         <span class="value">${job.priority || '-'}</span>
-      </div>
+      </div>${extraJobDetailRows(job)}
     </div>
   `;
   detailPanel.style.display = 'block';
@@ -408,8 +476,8 @@ async function loadMyJobs(content, api, sid) {
     for (const j of jobs) {
       const jobId = j.job_id || j.id || '-';
       const eid = escHtml(jobId);
-      const st = j.state || j.job_state || '-';
-      const badge = { 'RUNNING': 'badge-green', 'PENDING': 'badge-orange', 'COMPLETED': 'badge-blue', 'FAILED': 'badge-red' }[st] || 'badge-gray';
+      const st = j.state || '-';
+      const badge = jobStateBadge(st);
       const cancelBtn = CANCELLABLE.has(st)
         ? `<button class="task-cancel-btn my-cancel-job-btn" data-job-id="${eid}" title="Cancel job ${eid}">❌</button>`
         : '';
@@ -418,7 +486,7 @@ async function loadMyJobs(content, api, sid) {
         <td><span class="badge ${badge}">${escHtml(st)}</span></td>
         <td>${escHtml(j.job_name || j.name || '-')}</td>
         <td>${escHtml(j.partition || '-')}</td>
-        <td>${j.nodes || j.num_nodes || '-'}</td>
+        <td>${j.nodes || '-'}</td>
         <td>${formatDuration(j.time_used)}</td>
         <td>${cancelBtn}</td>
       </tr>`;
@@ -464,8 +532,8 @@ function showJobDetailOverlay(jobId, api) {
   const job = myJobsData.find(j => (j.job_id || j.id) === jobId);
   if (!job) return;
 
-  const st = job.state || job.job_state || '-';
-  const badge = { 'RUNNING': 'badge-green', 'PENDING': 'badge-orange', 'COMPLETED': 'badge-blue', 'FAILED': 'badge-red' }[st] || 'badge-gray';
+  const st = job.state || '-';
+  const badge = jobStateBadge(st);
 
   const body = `
     <div class="job-detail-grid">
@@ -491,7 +559,7 @@ function showJobDetailOverlay(jobId, api) {
       </div>
       <div class="job-detail-item">
         <span class="label">Nodes</span>
-        <span class="value">${job.nodes || job.num_nodes || '-'}</span>
+        <span class="value">${job.nodes || '-'}</span>
       </div>
       <div class="job-detail-item">
         <span class="label">CPUs</span>
@@ -520,7 +588,7 @@ function showJobDetailOverlay(jobId, api) {
       <div class="job-detail-item">
         <span class="label">Priority</span>
         <span class="value">${job.priority || '-'}</span>
-      </div>
+      </div>${extraJobDetailRows(job)}
     </div>
   `;
 

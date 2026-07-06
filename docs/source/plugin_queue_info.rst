@@ -6,8 +6,9 @@ Plugin: ``queue_info``
 ######################
 
 The ``queue_info`` plugin exposes batch system queue information, job
-listings, and allocation data via REST endpoints.  It currently supports
-SLURM (24.11.5+) and is designed for easy extension to other batch systems.
+listings, and allocation data via REST endpoints.  It supports SLURM
+(24.11.5+) and PBSPro, with a no-op backend on hosts where neither is
+present, and is designed for easy extension to other batch systems.
 
 
 Architecture
@@ -19,9 +20,12 @@ The plugin consists of three layers:
    Abstract base class defining the backend interface and providing
    thread-safe caching with a configurable TTL (default 1 hour).
 
-``QueueInfoSlurm``
-   SLURM implementation that calls ``sinfo``, ``squeue``, ``scontrol``,
-   and ``sacctmgr`` with ``--json`` output and parses the results.
+``QueueInfoSlurm`` / ``QueueInfoPBSPro`` / ``QueueInfoNone``
+   Backend implementations.  ``QueueInfoSlurm`` calls ``sinfo``,
+   ``squeue``, ``scontrol``, and ``sacctmgr`` with ``--json`` output;
+   ``QueueInfoPBSPro`` parses ``qstat`` / ``pbsnodes`` text output; the
+   ``None`` backend is a graceful no-op.  The active backend is chosen
+   automatically by :func:`make_queue_info`.
 
 ``PluginQueueInfo``
    Endpoint plugin that exposes the backend via REST endpoints and manages
@@ -66,9 +70,28 @@ All paths are relative to the plugin namespace
 ``GET /list_jobs/{cid}/{queue}?user=<name>&force=true``
    List jobs in a partition.  Optionally filter by user.
 
+``GET /list_all_jobs/{cid}?user=<name>&force=true``
+   List all of the user's jobs across every partition.
+
 ``GET /list_allocations/{cid}?user=<name>&force=true``
    List SLURM associations (accounts/allocations).  Optionally filter by
    user.
+
+``POST /cancel/{cid}/{job_id}``
+   Cancel a job via the active batch system (``scancel`` / ``qdel``).
+
+``GET /backend``
+   Session-less.  Report the active backend: ``{"backend": "slurm" |
+   "pbs" | "none"}``.
+
+``GET /job_allocation``
+   Session-less.  Return the **endpoint** process's own batch allocation
+   (``{"allocation": {...}}``), or ``{"allocation": null}`` when the
+   endpoint runs on a login node.
+
+``GET /nodelist``
+   Session-less.  Return the expanded hostname list of the endpoint's own
+   allocation (``{"nodelist": [...]}``); empty on a login node.
 
 
 Data structures
@@ -124,13 +147,34 @@ Job list (``list_jobs``)
          "start_time":  1700000000,
          "priority":    50000,
          "account":     "proj_alpha",
-         "node_list":   "node010-node019"
+         "node_list":   "node010-node019",
+         "reason":      "",
+         "qos":         "normal",
+         "dependency":  "",
+         "std_out":     "/home/alice/job.out",
+         "std_err":     "/home/alice/job.err",
+         "work_dir":    "/home/alice/run",
+         "command":     "/home/alice/run.sh",
+         "exit_code":   null,
+         "array_job_id":  null,
+         "array_task_id": null,
+         "tres_req":    "cpu=1280,mem=...",
+         "tres_alloc":  "cpu=1280,node=10,...",
+         "restart_cnt": 0
        }
      ]
    }
 
 ``time_limit`` and ``time_used`` are in minutes and seconds respectively.
 ``time_limit`` is ``null`` for unlimited jobs.
+
+The fields from ``reason`` onward are additional per-job detail surfaced
+for the Explorer's job-detail overlay.  They are populated from whatever
+the scheduler reports (``squeue --json`` fields on SLURM, ``qstat -f``
+attributes on PBSPro — where PBSPro also adds ``owner`` and ``mem_used``)
+and default to ``""`` / ``null`` when the scheduler does not provide them,
+so older SLURM releases and PBS jobs without the attribute still parse.
+Array-job and TRES fields apply to SLURM only.
 
 
 Allocations (``list_allocations``)
@@ -158,6 +202,39 @@ Allocations (``list_allocations``)
 
 When ``user`` is empty, the row represents an account-level association.
 The ``*_node_hours`` fields are reserved for future accounting integration.
+
+
+Client API
+==========
+
+``QueueInfoClient`` (obtained via ``endpoint.get_plugin(name, 'queue_info')``)
+exposes:
+
+``get_info(user=None, force=False)``
+   Queue/partition information (session required).
+
+``list_jobs(queue, user=None, force=False)``
+   Jobs in a single partition (session required).
+
+``list_all_jobs(user=None, force=False)``
+   All of the user's jobs across every partition (session required).
+
+``list_allocations(user=None, force=False)``
+   Associations / allocations (session required).
+
+``cancel_job(job_id)``
+   Cancel a job through the active batch system (session required).
+
+``job_allocation()``
+   Session-less.  The endpoint's own batch allocation summary, or ``None``
+   on a login node.
+
+``nodelist()``
+   Session-less.  Expanded hostnames of the endpoint's own allocation.
+
+``backend()``
+   Session-less.  The active backend name: ``'slurm'``, ``'pbs'``, or
+   ``'none'``.
 
 
 Example

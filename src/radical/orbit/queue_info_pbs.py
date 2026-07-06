@@ -111,6 +111,21 @@ _STATE_DISPLAY = {
 }
 
 
+def _pbs_var_value(varlist: str, key: str) -> str:
+    """Return the value of *key* from a PBSPro ``Variable_List`` string.
+
+    ``Variable_List`` is a comma-separated ``NAME=value`` list (e.g.
+    ``PBS_O_HOME=/home/x,PBS_O_WORKDIR=/scratch/x``).  Returns '' when the
+    key is absent.
+    """
+    for item in varlist.split(','):
+        if '=' in item:
+            k, v = item.split('=', 1)
+            if k.strip() == key:
+                return v.strip()
+    return ''
+
+
 def _acl_match(acl_str: str, candidates: set) -> bool:
     """Check a PBSPro ACL list against a set of identifier *candidates*.
 
@@ -464,6 +479,17 @@ class QueueInfoPBSPro(QueueInfo):
         except ValueError:
             cpus_n = 0
 
+        try:
+            priority = int(info.get('Priority', '0') or 0)
+        except (ValueError, TypeError):
+            priority = 0
+
+        def _int_or_none(s):
+            try:
+                return int(s)
+            except (ValueError, TypeError):
+                return None
+
         # PBSPro timestamps (qtime, stime, mtime) are RFC-2822-ish strings;
         # parse what we can, leave 0 otherwise.
         def _ts(key):
@@ -487,7 +513,20 @@ class QueueInfoPBSPro(QueueInfo):
             'time_used'  : wall_used or 0,
             'submit_time': _ts('qtime'),
             'start_time' : _ts('stime'),
-            'priority'   : 0,
+            'priority'   : priority,
             'account'    : info.get('Account_Name', ''),
             'node_list'  : ','.join(_parse_exec_host(info.get('exec_host', ''))),
+            # extra detail surfaced for the Explorer (issue #40); additive,
+            # defensive — absent qstat -f attributes default to ''/None
+            'owner'      : info.get('Job_Owner', ''),
+            'reason'     : info.get('comment', ''),
+            'qos'        : info.get('Resource_List.qos', ''),
+            'dependency' : info.get('depend', ''),
+            'std_out'    : info.get('Output_Path', ''),
+            'std_err'    : info.get('Error_Path', ''),
+            'work_dir'   : _pbs_var_value(info.get('Variable_List', ''),
+                                          'PBS_O_WORKDIR'),
+            'command'    : info.get('Submit_arguments', ''),
+            'exit_code'  : _int_or_none(info.get('Exit_status')),
+            'mem_used'   : info.get('resources_used.mem', ''),
         }

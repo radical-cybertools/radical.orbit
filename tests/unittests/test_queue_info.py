@@ -365,6 +365,97 @@ class TestCollectJobs:
         assert result['jobs'][0]['job_id'] == '12345'
 
 
+# ---- _parse_squeue_jobs extra-fields tests (issue #40) ----------------------
+
+class TestParseSqueueJobsExtras:
+    """Extra per-job detail surfaced from squeue --json (issue #40)."""
+
+    def test_rich_fields_surfaced(self):
+        jobs = [{
+            'job_id'                   : 200001,
+            'name'                     : 'rich_job',
+            'user_name'                : 'alice',
+            'partition'                : 'gpu',
+            'job_state'                : ['PENDING'],
+            'node_count'               : {'set': True, 'number': 4},
+            'state_reason'             : 'Priority',
+            'qos'                      : 'high',
+            'dependency'               : 'afterok:100000',
+            'standard_output'          : '/home/alice/job.out',
+            'standard_error'           : '/home/alice/job.err',
+            'current_working_directory': '/home/alice/work',
+            'command'                  : '/home/alice/run.sh',
+            'exit_code'                : {'status': ['SUCCESS'],
+                                          'return_code': {'set': True,
+                                                          'number': 0}},
+            'array_job_id'             : {'set': True, 'number': 200001},
+            'array_task_id'            : {'set': True, 'number': 7},
+            'tres_req_str'             : 'cpu=8,mem=32G',
+            'tres_alloc_str'           : 'cpu=8,mem=32G,node=4',
+            'restart_cnt'              : 2,
+        }]
+
+        job = QueueInfoSlurm._parse_squeue_jobs(jobs)[0]
+
+        assert job['reason']        == 'Priority'
+        assert job['qos']           == 'high'
+        assert job['dependency']    == 'afterok:100000'
+        assert job['std_out']       == '/home/alice/job.out'
+        assert job['std_err']       == '/home/alice/job.err'
+        assert job['work_dir']      == '/home/alice/work'
+        assert job['command']       == '/home/alice/run.sh'
+        assert job['exit_code']     == 0
+        assert job['array_job_id']  == 200001
+        assert job['array_task_id'] == 7
+        assert job['tres_req']      == 'cpu=8,mem=32G'
+        assert job['tres_alloc']    == 'cpu=8,mem=32G,node=4'
+        assert job['restart_cnt']   == 2
+
+    def test_absent_fields_default(self):
+        """Older SLURM without the extra keys yields graceful defaults."""
+
+        jobs = [{
+            'job_id'   : 200002,
+            'name'     : 'plain_job',
+            'user_name': 'bob',
+            'partition': 'compute',
+            'job_state': ['RUNNING'],
+        }]
+
+        job = QueueInfoSlurm._parse_squeue_jobs(jobs)[0]
+
+        assert job['reason']        == ''
+        assert job['qos']           == ''
+        assert job['dependency']    == ''
+        assert job['std_out']       == ''
+        assert job['std_err']       == ''
+        assert job['work_dir']      == ''
+        assert job['command']       == ''
+        assert job['exit_code']     is None
+        assert job['array_job_id']  is None
+        assert job['array_task_id'] is None
+        assert job['tres_req']      == ''
+        assert job['tres_alloc']    == ''
+        assert job['restart_cnt']   is None
+
+    def test_exit_code_plain_wrapper(self):
+        """Older squeue JSON: exit_code as a plain {set,number} wrapper."""
+
+        jobs = [{'job_id'   : 3,
+                 'job_state': ['COMPLETED'],
+                 'exit_code': {'set': True, 'infinite': False, 'number': 1}}]
+
+        job = QueueInfoSlurm._parse_squeue_jobs(jobs)[0]
+        assert job['exit_code'] == 1
+
+    def test_reason_key_fallback(self):
+        """When only the legacy 'reason' key is present it is used."""
+
+        jobs = [{'job_id': 4, 'job_state': ['PENDING'], 'reason': 'Resources'}]
+        job  = QueueInfoSlurm._parse_squeue_jobs(jobs)[0]
+        assert job['reason'] == 'Resources'
+
+
 # ---- _collect_allocations tests ---------------------------------------------
 
 class TestCollectAllocations:
