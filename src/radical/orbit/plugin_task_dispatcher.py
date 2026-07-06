@@ -44,8 +44,6 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-import msgpack
-
 from fastapi import FastAPI, HTTPException, Request
 
 from .client                            import PluginClient
@@ -80,7 +78,7 @@ _DEFAULT_SCRATCH_ROOT = Path('~/.radical/orbit/task_dispatcher/scratch'
 
 # State-directory pruning: directories whose mtime is older than this
 # threshold AND whose pool is no longer in self._pool_states get
-# deleted by the background sweeper (memory/project_bridge_dispatcher.md
+# deleted by the background sweeper (memory/project_broker_dispatcher.md
 # Phase 5).
 _STATE_PRUNE_DAYS    = 30
 _PRUNE_INTERVAL_SEC  = 86400.0   # stale-dir pruning: once a day
@@ -109,81 +107,6 @@ _HANDSHAKE_TIMEOUT_SEC = 300.0  # 5 min, adjusted per observed lag history
 #   DONE              → return cached (crash-recovery)
 #   FAILED/CANCELED   → overwrite, re-execute (Makeflow retry)
 #   RUNNING/QUEUED    → attach to existing wait (wrapper reconnect)
-
-
-# Rhapsody child-session readiness poll (mirrors RhapsodyClient._poll_session_ready)
-_RH_READY_TIMEOUT_SEC = 120.0
-_RH_READY_POLL_SEC    = 1.0
-
-
-# ---------------------------------------------------------------------------
-# Remote plugin proxies — async calls to child endpoints over the broker caller
-# ---------------------------------------------------------------------------
-
-class _RemoteError(Exception):
-    '''A non-2xx ``response`` from a child endpoint's plugin route.'''
-
-    def __init__(self, status: int, detail: Any) -> None:
-        self.status = status
-        self.detail = detail
-        super().__init__(f'remote error {status}: {detail}')
-
-
-class _RemotePlugin:
-    '''Async facade for one child-endpoint plugin session.
-
-    All child-endpoint traffic rides the in-process broker caller
-    (``call_threadsafe`` → ``asyncio.wrap_future`` on the host loop) — there is
-    no loopback HTTP client and no worker-thread offload.  Bound to a resolved
-    ``(dst, sid)`` so the concrete proxies below just format paths.
-    '''
-
-    def __init__(self, plugin: 'PluginTaskDispatcher', dst: str,
-                 sid: str) -> None:
-        self._plugin = plugin
-        self._dst    = dst
-        self.sid     = sid
-
-    async def _get(self, path: str) -> Any:
-        return await self._plugin._call_json(self._dst, 'GET', path)
-
-    async def _post(self, path: str, payload: dict | None = None) -> Any:
-        return await self._plugin._call_json(self._dst, 'POST', path, payload)
-
-
-class _PsijProxy(_RemotePlugin):
-    '''The three psij operations the dispatcher drives on a login endpoint.'''
-
-    async def submit_tunneled(self, job_spec: dict, executor: str,
-                              tunnel: str) -> dict:
-        return await self._post(
-            f'/psij/submit_tunneled/{self.sid}',
-            {'job_spec': job_spec, 'executor': executor, 'tunnel': tunnel})
-
-    async def cancel_job(self, job_id: str) -> dict:
-        return await self._post(f'/psij/cancel/{self.sid}/{job_id}')
-
-    async def get_job_status(self, job_id: str) -> dict:
-        return await self._get(f'/psij/status/{self.sid}/{job_id}')
-
-
-class _RhapsodyProxy(_RemotePlugin):
-    '''The three rhapsody operations the dispatcher drives on a child pilot.'''
-
-    async def submit_tasks(self, task_dicts: list[dict]) -> list[dict]:
-        # msgpack ``{"tasks": [...]}`` body — the shape RhapsodyClient's
-        # single-batch submit sends on the wire.
-        body = msgpack.packb({'tasks': task_dicts}, use_bin_type=True)
-        resp = await self._plugin._call(
-            self._dst, 'POST', f'/rhapsody/submit/{self.sid}',
-            body=body, headers={'content-type': 'application/msgpack'})
-        return self._plugin._decode_json(resp)
-
-    async def get_task(self, uid: str) -> dict:
-        return await self._get(f'/rhapsody/task/{self.sid}/{uid}')
-
-    async def cancel_task(self, uid: str) -> dict:
-        return await self._post(f'/rhapsody/cancel/{self.sid}/{uid}')
 
 
 # ---------------------------------------------------------------------------
@@ -485,7 +408,7 @@ class TaskDispatcherClient(PluginClient):
         '''Upload one file into a task's scratch dir.  Returns ``{cwd, size}``.
 
         NOTE: v1 uses a single base64-in-JSON body per file — radical.orbit's
-        bridge forwards JSON over WebSocket, so multipart is not available.
+        broker forwards JSON over WebSocket, so multipart is not available.
         Bulk-transfer optimization (tar-stream / dedicated binary staging
         plugin) is deferred; see design doc §6.4.
         '''
@@ -532,16 +455,16 @@ class PluginTaskDispatcher(Plugin):
 
     @classmethod
     def is_enabled(cls, app: FastAPI) -> bool:
-        '''Bridge hosts only.
+        '''Broker hosts only.
 
-        The dispatcher is a bridge-side plugin: it owns the global
+        The dispatcher is a broker-side plugin: it owns the global
         pool/pilot/task state, observes topology events directly, and
         proxies psij calls out to login-node endpoints that submit batch
         jobs.  Running it on an endpoint would put it in the wrong half of
-        the architecture — see ``memory/project_bridge_dispatcher.md``.
+        the architecture — see ``memory/project_broker_dispatcher.md``.
         '''
         from .utils import host_role
-        return host_role(app)['role'] == 'bridge'
+        return host_role(app)['role'] == 'broker'
 
     def __init__(self, app: FastAPI,
                  instance_name: str = 'task_dispatcher',
@@ -553,16 +476,18 @@ class PluginTaskDispatcher(Plugin):
         self._scratch_root = Path(scratch_root or _DEFAULT_SCRATCH_ROOT)
 
         # Broker seam (the dispatcher is broker-hosted only): the in-process
-        # caller handle and the raw event tap, injected by BridgePluginHost.
-        # Under the old ``bridge.py`` construction these are absent (None) and
-        # the dispatcher refuses any endpoint call cleanly (see _call).
+        # caller handle and the raw event tap, injected by BrokerPluginHost.
+        # When these are absent (None) the dispatcher refuses any endpoint call
+        # cleanly (see _call).
         self._broker_caller = getattr(app.state, 'broker_caller', None)
         self._broker_tap    = getattr(app.state, 'broker_tap', None)
         self._untap         = None
 
-        # Cached child-endpoint plugin sessions: (dst, plugin, backend) → sid.
-        # Invalidated for a dst when it goes ``lost``.
-        self._child_sessions: dict[tuple, str] = {}
+        # Cached child-endpoint plugin clients (real PSIJClient/RhapsodyClient
+        # wired to the broker caller), keyed (dst, plugin, backend); each holds
+        # its registered session id.  Invalidated for a dst when it goes
+        # ``lost``.
+        self._child_clients: dict[tuple, Any] = {}
 
         # Map of endpoint_name → set of loaded plugin names, refreshed on
         # every topology change.  Used to (a) auto-resolve a pool's
@@ -749,7 +674,7 @@ class PluginTaskDispatcher(Plugin):
         '''Auto-pick an endpoint_name when a pool was declared without one.
 
         Policy: lexically first connected endpoint that isn't us (the
-        bridge endpoint).  Returns ``None`` if no eligible endpoint is
+        broker endpoint).  Returns ``None`` if no eligible endpoint is
         available; the caller decides whether to defer or fail.
         '''
         self_endpoint = getattr(self._app.state, 'endpoint_name', None)
@@ -783,60 +708,33 @@ class PluginTaskDispatcher(Plugin):
             self._compaction_sweeper()))
 
         # Subscribe to the broker's raw event tap for child-pilot task events
-        # (the old stack read these off the bridge SSE stream).  The tap fires
+        # (the old stack read these off the broker SSE stream).  The tap fires
         # on the plugin-host loop — the dispatcher's own loop — so terminal
         # handling runs inline with no cross-thread marshalling.
         if self._broker_tap is not None and self._untap is None:
             self._untap = self._broker_tap(self._on_event)
 
-    # ── transport: async calls to child endpoints over the broker caller ──
+    # ── transport: real plugin clients wired to the broker caller ─────────
 
-    async def _call(self, dst: str, method: str, path: str, *,
-                    body: bytes = b'', headers: dict | None = None,
-                    timeout: float | None = None) -> dict:
-        '''Send one ``request`` to *dst* and await its ``response`` dict.
+    def _caller_client(self, client_cls, plugin: str, dst: str):
+        '''Build a real plugin client whose async cores ride the broker caller.
 
-        The dispatcher is broker-hosted: every endpoint call rides the
-        in-process ``BrokerCaller`` (``call_threadsafe`` schedules onto the
-        routing loop; ``asyncio.wrap_future`` awaits it on the host loop
-        without blocking).  Refuses cleanly when no caller is wired (the old
-        ``bridge.py`` host, where the dispatcher is not meant to run).
+        The dispatcher drives psij/rhapsody through the very same
+        ``PSIJClient`` / ``RhapsodyClient`` helper code the user-thread clients
+        run — one implementation of paths, payload shapes, response parsing and
+        error mapping.  Only the transport seam differs:
+        :class:`~radical.orbit.runtime_client.CallerHTTP` awaits
+        ``call_threadsafe`` on the routing loop (via ``asyncio.wrap_future``)
+        so the host loop is never blocked, instead of a blocking HTTP call.  The
+        helper's base URL is the plugin namespace (``/{plugin}``) — the same
+        namespace-relative shape ``add_route_*`` registers.
         '''
-        caller = self._broker_caller
-        if caller is None:
-            raise RuntimeError(
-                'task_dispatcher is broker-hosted only: no broker caller '
-                'available (this plugin cannot reach endpoints on this host)')
-        fut = caller.call_threadsafe(dst, method, path,
-                                     body=body, headers=headers or {},
-                                     timeout=timeout)
-        return await asyncio.wrap_future(fut)
-
-    @staticmethod
-    def _decode_json(resp: dict) -> Any:
-        '''Decode a broker ``response`` dict, raising on a non-2xx status.'''
-        status = int(resp.get('status', 502))
-        rbody  = resp.get('body') or b''
-        if isinstance(rbody, str):
-            rbody = rbody.encode()
-        data = json.loads(rbody) if rbody else {}
-        if status >= 400:
-            detail = data.get('detail', data) if isinstance(data, dict) else data
-            raise _RemoteError(status, detail)
-        return data
-
-    async def _call_json(self, dst: str, method: str, path: str,
-                         payload: dict | None = None,
-                         timeout: float | None = None) -> Any:
-        '''JSON-in / JSON-out convenience over :meth:`_call`.'''
-        body    = b''
-        headers = None
-        if payload is not None:
-            body    = json.dumps(payload).encode()
-            headers = {'content-type': 'application/json'}
-        resp = await self._call(dst, method, path, body=body,
-                                headers=headers, timeout=timeout)
-        return self._decode_json(resp)
+        from .runtime_client import CallerHTTP
+        caller_http = CallerHTTP(self._broker_caller, dst)
+        client = client_cls(caller_http, f'/{plugin}',
+                            endpoint_id=dst, plugin_name=plugin)
+        client._async_http = caller_http   # route the a<method> cores here
+        return client
 
     async def _tick_loop(self, pool_state: PoolState) -> None:
         '''Periodic ``strategy.on_tick`` driver, per pool.'''
@@ -1208,7 +1106,7 @@ class PluginTaskDispatcher(Plugin):
             'task_backend_specific_kwargs': {'cwd': cwd},
         }
         try:
-            result = await rh.submit_tasks([task_dict])
+            result = await rh.asubmit_tasks([task_dict])
         except Exception as e:
             log.exception('[%s] endpoint-mode submit to %s failed: %s',
                           self.instance_name, target_endpoint, e)
@@ -1248,7 +1146,7 @@ class PluginTaskDispatcher(Plugin):
                     status_code=503,
                     detail=f'rhapsody client unavailable on {endpoint_name}')
             try:
-                info = await rh.get_task(task_id)
+                info = await rh.aget_task(task_id)
             except Exception as e:
                 raise HTTPException(
                     status_code=502,
@@ -1278,7 +1176,7 @@ class PluginTaskDispatcher(Plugin):
                     status_code=503,
                     detail=f'rhapsody client unavailable on {endpoint_name}')
             try:
-                info = await rh.cancel_task(task_id)
+                info = await rh.acancel_task(task_id)
             except Exception as e:
                 raise HTTPException(
                     status_code=502,
@@ -1434,10 +1332,10 @@ class PluginTaskDispatcher(Plugin):
             if name == self_name:
                 continue
             if (info or {}).get('liveness') == 'lost':
-                # Drop cached plugin-sessions on a lost endpoint so a
+                # Drop cached plugin-clients on a lost endpoint so a
                 # reconnecting one (endpoint-mode target) re-registers fresh.
-                for key in [k for k in self._child_sessions if k[0] == name]:
-                    self._child_sessions.pop(key, None)
+                for key in [k for k in self._child_clients if k[0] == name]:
+                    self._child_clients.pop(key, None)
                 continue
             plugins = (info or {}).get('plugins', {})
             if isinstance(plugins, dict):
@@ -1555,84 +1453,60 @@ class PluginTaskDispatcher(Plugin):
             self._do_pilot_cancel(pool_state, record),
             self._main_loop)
 
-    async def _child_session(self, dst: str, plugin: str,
-                             payload: dict | None = None,
-                             backend: str | None = None) -> str | None:
-        '''Register (once) a plugin session on a child endpoint; cache the sid.
+    async def _get_psij_client(self, endpoint_name: str):
+        '''Return a broker-caller-backed :class:`PSIJClient` for *endpoint_name*.
 
-        The session is registered over the broker caller (``/{plugin}/
-        register_session``) and cached per ``(dst, plugin, backend)`` so
-        repeated ops on the same child reuse it.  Returns ``None`` when the
-        child / plugin is unreachable.
-        '''
-        key = (dst, plugin, backend)
-        sid = self._child_sessions.get(key)
-        if sid is not None:
-            return sid
-        try:
-            data = await self._call_json(
-                dst, 'POST', f'/{plugin}/register_session', payload or {})
-        except Exception as e:
-            log.warning('[%s] %s session unavailable on %s: %s',
-                        self.instance_name, plugin, dst, e)
-            return None
-        sid = data.get('sid')
-        if not sid:
-            return None
-        self._child_sessions[key] = sid
-        return sid
-
-    async def _get_psij_client(self, endpoint_name: str) -> '_PsijProxy | None':
-        '''Return an async :class:`_PsijProxy` targeting *endpoint_name*.
-
-        All traffic rides the in-process broker caller (no loopback HTTP, no
-        worker-thread offload).  Returns ``None`` when the endpoint / psij
-        plugin is unreachable.
+        Registers (once) a psij session over the caller and caches the client
+        per ``(dst, 'psij', None)``.  Returns ``None`` when no caller is wired
+        or the endpoint / psij plugin is unreachable.
         '''
         if not endpoint_name:
             log.warning('[%s] _get_psij_client called with empty endpoint_name',
                         self.instance_name)
             return None
-        sid = await self._child_session(endpoint_name, 'psij')
-        if sid is None:
+        if self._broker_caller is None:
             return None
-        return _PsijProxy(self, endpoint_name, sid)
+        key    = (endpoint_name, 'psij', None)
+        client = self._child_clients.get(key)
+        if client is not None:
+            return client
+        from .plugin_psij import PSIJClient
+        client = self._caller_client(PSIJClient, 'psij', endpoint_name)
+        try:
+            await client.aregister_session()
+        except Exception as e:
+            log.warning('[%s] psij session unavailable on %s: %s',
+                        self.instance_name, endpoint_name, e)
+            return None
+        self._child_clients[key] = client
+        return client
 
     async def _get_rhapsody_client(self, child_endpoint: str,
-                                   backend: str | None = None
-                                   ) -> '_RhapsodyProxy | None':
-        '''Return an async :class:`_RhapsodyProxy` for a child endpoint.
+                                   backend: str | None = None):
+        '''Return a broker-caller-backed :class:`RhapsodyClient` for a child.
 
-        Registers the rhapsody session (with *backend* when the session does
-        not exist yet), waiting for it to report ``ready``.  Returns ``None``
-        when the child / rhapsody plugin is unreachable.
+        Registers the rhapsody session (with *backend* when given) and waits for
+        it to report ``ready`` via the real ``RhapsodyClient`` readiness poll.
+        Caches the client per ``(dst, 'rhapsody', backend)``.  Returns ``None``
+        when no caller is wired or the child / rhapsody plugin is unreachable.
         '''
-        payload = {'backends': [backend]} if backend else {}
-        sid = await self._child_session(child_endpoint, 'rhapsody',
-                                        payload=payload, backend=backend)
-        if sid is None:
+        if self._broker_caller is None:
             return None
-        await self._await_rhapsody_ready(child_endpoint, sid)
-        return _RhapsodyProxy(self, child_endpoint, sid)
-
-    async def _await_rhapsody_ready(self, dst: str, sid: str) -> None:
-        '''Poll until a child rhapsody session is ready (mirrors the helper).
-
-        Rhapsody inits its session asynchronously; ``list_tasks`` answers 409
-        until it is ready.  Poll that (over the broker caller) until non-409 or
-        the timeout — best-effort, so a submit that races init still surfaces
-        its own error.
-        '''
-        deadline = time.time() + _RH_READY_TIMEOUT_SEC
-        while time.time() < deadline:
-            try:
-                resp = await self._call(dst, 'GET',
-                                        f'/rhapsody/list_tasks/{sid}')
-                if int(resp.get('status', 502)) != 409:
-                    return
-            except Exception:
-                return
-            await asyncio.sleep(_RH_READY_POLL_SEC)
+        key    = (child_endpoint, 'rhapsody', backend)
+        client = self._child_clients.get(key)
+        if client is not None:
+            return client
+        from .plugin_rhapsody import RhapsodyClient
+        client = self._caller_client(RhapsodyClient, 'rhapsody', child_endpoint)
+        try:
+            await client.aregister_session(
+                backends=[backend] if backend else None)
+        except Exception as e:
+            log.warning('[%s] rhapsody session unavailable on %s: %s',
+                        self.instance_name, child_endpoint, e)
+            return None
+        self._child_clients[key] = client
+        return client
 
     def _build_pilot_env(self, pool_state: PoolState,
                          record: PilotRecord) -> dict[str, str]:
@@ -1640,20 +1514,20 @@ class PluginTaskDispatcher(Plugin):
 
         The dispatcher signals "this is a pilot child endpoint" via
         ``RADICAL_ORBIT_POOL`` / ``RADICAL_ORBIT_RHAPSODY_BACKEND`` /
-        ``RADICAL_ORBIT_SCRATCH_BASE``.  Bridge/cert names use the same
-        ``RADICAL_ORBIT_BRIDGE_*`` vars that any plain endpoint service reads, so
+        ``RADICAL_ORBIT_SCRATCH_BASE``.  Broker/cert names use the same
+        ``RADICAL_ORBIT_BROKER_*`` vars that any plain endpoint service reads, so
         the generic ``radical-orbit-endpoint-wrapper.sh`` works without renames.
         '''
-        bridge_url = getattr(self._app.state, 'bridge_url', '') or ''
+        broker_url = getattr(self._app.state, 'broker_url', '') or ''
         env: dict[str, str] = {
-            'RADICAL_ORBIT_BRIDGE_URL'           : str(bridge_url),
+            'RADICAL_ORBIT_BROKER_URL'           : str(broker_url),
             'RADICAL_ORBIT_POOL'            : pool_state.config.name,
             'RADICAL_ORBIT_RHAPSODY_BACKEND': record.rhapsody_backend,
             'RADICAL_ORBIT_SCRATCH_BASE'    : str(pool_state.scratch_base),
         }
-        cert = os.environ.get('RADICAL_ORBIT_BRIDGE_CERT')
+        cert = os.environ.get('RADICAL_ORBIT_BROKER_CERT')
         if cert:
-            env['RADICAL_ORBIT_BRIDGE_CERT'] = cert
+            env['RADICAL_ORBIT_BROKER_CERT'] = cert
         return env
 
     def _build_job_spec(self, pool_state: PoolState,
@@ -1711,7 +1585,7 @@ class PluginTaskDispatcher(Plugin):
         try:
             from .batch_system import detect_batch_system
             executor = detect_batch_system().psij_executor
-            result   = await psij_c.submit_tunneled(job_spec, executor, 'none')
+            result   = await psij_c.asubmit_tunneled(job_spec, executor, 'none')
         except Exception as e:
             log.exception('[%s] psij submit_tunneled failed for %s: %s',
                           self.instance_name, record.pid, e)
@@ -1748,7 +1622,7 @@ class PluginTaskDispatcher(Plugin):
             self._mark_pilot_failed(pool_state, record, 'cancel requested')
             return
         try:
-            await psij_c.cancel_job(record.psij_job_id)
+            await psij_c.acancel_job(record.psij_job_id)
         except Exception as e:
             log.warning('[%s] psij cancel failed for %s: %s',
                         self.instance_name, record.pid, e)
@@ -1766,7 +1640,7 @@ class PluginTaskDispatcher(Plugin):
         if psij_c is None:
             return
         try:
-            status = await psij_c.get_job_status(record.psij_job_id)
+            status = await psij_c.aget_job_status(record.psij_job_id)
         except Exception as e:
             log.warning('[%s] psij get_job_status failed for %s: %s',
                         self.instance_name, record.pid, e)
@@ -1914,7 +1788,7 @@ class PluginTaskDispatcher(Plugin):
             'task_backend_specific_kwargs': {'cwd': task.cwd},
         }
         try:
-            result = await rh.submit_tasks([task_dict])
+            result = await rh.asubmit_tasks([task_dict])
             if result:
                 rh_uid = result[0].get('uid')
                 if rh_uid:
@@ -2042,7 +1916,7 @@ class PluginTaskDispatcher(Plugin):
             rh = await self._get_rhapsody_client(pilot.child_endpoint_name)
             if rh is not None:
                 try:
-                    await rh.cancel_task(task.rhapsody_uid)
+                    await rh.acancel_task(task.rhapsody_uid)
                 except Exception as e:
                     log.warning('[%s] rhapsody cancel_task failed: %s',
                                 self.instance_name, e)

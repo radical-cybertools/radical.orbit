@@ -4,7 +4,7 @@ x-common-image: &common-image
 x-endpoint-service: &endpoint-service
   <<: *common-image
   environment:
-    - RADICAL_ORBIT_BRIDGE_URL=https://${RADICAL_ORBIT_BRIDGE_HOSTNAME:-bridge}:8000
+    - RADICAL_ORBIT_BROKER_URL=https://${RADICAL_ORBIT_BROKER_HOSTNAME:-broker}:8000
   command: [ "bash", "-c", "radical-orbit-endpoint-wrapper.sh -n $$(hostname) --plugins psij,rhapsody,staging,task_dispatcher" ]
   volumes:
     - radical-orbit-volume:/app:ro
@@ -13,7 +13,7 @@ x-endpoint-service: &endpoint-service
   depends_on:
     image-builder:
       condition: service_completed_successfully
-    bridge:
+    broker:
       condition: service_healthy
 
 services:
@@ -26,18 +26,18 @@ services:
       dockerfile: docker/Dockerfile
       args:
         RADICAL_ORBIT_BRANCH: ${RADICAL_ORBIT_BRANCH:-master}
-        GENERATE_BRIDGE_CERT: "true"
-        BRIDGE_IP: "127.0.0.1"
-        BRIDGE_HOSTNAME: ${RADICAL_ORBIT_BRIDGE_HOSTNAME:-bridge}
+        GENERATE_BROKER_CERT: "true"
+        BROKER_IP: "127.0.0.1"
+        BROKER_HOSTNAME: ${RADICAL_ORBIT_BROKER_HOSTNAME:-broker}
     command: [ "echo", "Build complete" ]
     networks:
       - radical-orbit-network
 
-  bridge:
+  broker:
     <<: *common-image
-    container_name: radical-orbit-bridge
-    hostname: ${RADICAL_ORBIT_BRIDGE_HOSTNAME:-bridge}
-    command: [ "radical-orbit-bridge.py" ]
+    container_name: radical-orbit-broker
+    hostname: ${RADICAL_ORBIT_BROKER_HOSTNAME:-broker}
+    command: [ "radical-orbit-broker.py" ]
     healthcheck:
       test:
         - CMD-SHELL
@@ -71,7 +71,7 @@ services:
     container_name: radical-orbit-client
     hostname: client
     environment:
-      - RADICAL_ORBIT_BRIDGE_URL=https://${RADICAL_ORBIT_BRIDGE_HOSTNAME:-bridge}:8000
+      - RADICAL_ORBIT_BROKER_URL=https://${RADICAL_ORBIT_BROKER_HOSTNAME:-broker}:8000
     command: [ "tail", "-f", "/dev/null" ]
     volumes:
       - radical-orbit-volume:/app:ro
@@ -80,7 +80,7 @@ services:
     depends_on:
       image-builder:
         condition: service_completed_successfully
-      bridge:
+      broker:
         condition: service_healthy
       endpoint-a:
         condition: service_started

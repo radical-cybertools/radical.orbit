@@ -7,7 +7,9 @@ cached-state idempotency, staging, pilot binding via rich topology
 `asyncio.to_thread`).
 
 Endpoint calls are stubbed via :meth:`_get_psij_client` / :meth:`_get_rhapsody_client`
-(now async, returning small async proxies); no real broker or WebSocket is needed.
+(async; in production they return real caller-backed ``PSIJClient`` /
+``RhapsodyClient`` helpers, driven here through their ``a<method>`` async cores);
+no real broker or WebSocket is needed.
 """
 
 import asyncio
@@ -76,7 +78,7 @@ def _make_plugin(tmp_path: Path, *, instance: str = 'task_dispatcher',
     """Instantiate a plugin bound to tmp_path; return (app, plugin)."""
     app = FastAPI()
     app.state.endpoint_name   = 'endpoint0'
-    app.state.bridge_url      = 'https://localhost:9999'
+    app.state.broker_url      = 'https://localhost:9999'
     app.state.broker_caller   = broker_caller
     app.state.broker_tap      = None
     plugin = PluginTaskDispatcher(
@@ -113,12 +115,12 @@ def _pool(plugin, sid, name='cpu') -> PoolState:
 
 class TestInit:
 
-    def test_is_enabled_on_bridge(self):
+    def test_is_enabled_on_broker(self):
         with patch('radical.orbit.utils.host_role') as m:
-            m.return_value = {'role': 'bridge'}
+            m.return_value = {'role': 'broker'}
             assert PluginTaskDispatcher.is_enabled(FastAPI()) is True
 
-    def test_is_enabled_false_off_bridge(self):
+    def test_is_enabled_false_off_broker(self):
         with patch('radical.orbit.utils.host_role') as m:
             for role in ('login', 'compute', 'standalone'):
                 m.return_value = {'role': role}
@@ -548,23 +550,26 @@ class TestPilotSubmitTransport:
         ps.pilots[record.pid] = record
 
         psij_mock = MagicMock()
-        psij_mock.submit_tunneled = AsyncMock(return_value={'job_id': 'jid'})
+        psij_mock.asubmit_tunneled = AsyncMock(return_value={'job_id': 'jid'})
         with patch.object(plugin, '_get_psij_client',
                           new=AsyncMock(return_value=psij_mock)), \
              patch('radical.orbit.batch_system.detect_batch_system') as bs:
             bs.return_value.psij_executor = 'local'
             asyncio.run(plugin._do_pilot_submit(ps, record, size))
 
-        psij_mock.submit_tunneled.assert_awaited_once()
-        assert psij_mock.submit_tunneled.await_args.args[2] == 'none'
+        psij_mock.asubmit_tunneled.assert_awaited_once()
+        assert psij_mock.asubmit_tunneled.await_args.args[2] == 'none'
         assert record.psij_job_id == 'jid'
 
     def test_refuses_without_broker_caller(self, tmp_path):
-        """Old-stack construction (no caller) → the transport refuses cleanly."""
+        """Old-stack construction (no caller) → the child-client factory
+        refuses cleanly (None), so pilot/rhapsody paths mark work failed
+        instead of touching a loop.  (The old `_call` refusal moved here when
+        the dispatcher started driving the real caller-backed helpers.)"""
         _, plugin = _make_plugin(tmp_path, broker_caller=None)
         assert plugin._broker_caller is None
-        with pytest.raises(RuntimeError, match='broker-hosted only'):
-            asyncio.run(plugin._call('someone', 'GET', '/x/ping'))
+        assert asyncio.run(plugin._get_psij_client('someone')) is None
+        assert asyncio.run(plugin._get_rhapsody_client('someone')) is None
 
 
 # ---------------------------------------------------------------------------
@@ -606,12 +611,12 @@ class TestEndpointMode:
                                               'lifetime': 'persistent'})
         self._seed_topology(plugin, {'ep': ['rhapsody']})
         rh_mock = MagicMock()
-        rh_mock.submit_tasks = AsyncMock(return_value=[{'uid': 't.1',
-                                                        'state': 'NEW'}])
-        rh_mock.get_task    = AsyncMock(return_value={'uid': 't.1',
-                                                      'state': 'RUNNING'})
-        rh_mock.cancel_task = AsyncMock(return_value={'uid': 't.1',
-                                                      'state': 'CANCELED'})
+        rh_mock.asubmit_tasks = AsyncMock(return_value=[{'uid': 't.1',
+                                                         'state': 'NEW'}])
+        rh_mock.aget_task    = AsyncMock(return_value={'uid': 't.1',
+                                                       'state': 'RUNNING'})
+        rh_mock.acancel_task = AsyncMock(return_value={'uid': 't.1',
+                                                       'state': 'CANCELED'})
         with patch.object(plugin, '_get_rhapsody_client',
                           new=AsyncMock(return_value=rh_mock)):
             r = client.post(f'{plugin.namespace}/submit/{sid}', json={
@@ -619,14 +624,14 @@ class TestEndpointMode:
                 'cmd': ['/bin/sleep', '0'], 'cwd': '/tmp'})
             assert r.status_code == 200, r.text
             assert plugin._endpoint_mode_tasks.get('t.1') == 'ep'
-            rh_mock.submit_tasks.assert_awaited_once()
+            rh_mock.asubmit_tasks.assert_awaited_once()
 
             r = client.get(f'{plugin.namespace}/task/{sid}/t.1')
             assert r.json()['result']['state'] == 'RUNNING'
 
             r = client.post(f'{plugin.namespace}/cancel/{sid}/t.1')
             assert r.status_code == 200
-            rh_mock.cancel_task.assert_awaited_once_with('t.1')
+            rh_mock.acancel_task.assert_awaited_once_with('t.1')
 
     def test_terminal_event_clears_endpoint_mode(self, tmp_path):
         _, plugin = _make_plugin(tmp_path)

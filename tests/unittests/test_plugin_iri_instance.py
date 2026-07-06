@@ -21,12 +21,12 @@ from radical.orbit.iri_endpoints import IRI_ENDPOINTS
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def bridge_app():
+def broker_app():
     app = FastAPI()
-    app.state.is_bridge    = True
+    app.state.is_broker    = True
     app.state.endpoint_service = MagicMock()
-    app.state.endpoint_name    = 'bridge'
-    app.state.bridge_url   = ''
+    app.state.endpoint_name    = 'broker'
+    app.state.broker_url   = ''
     return app
 
 
@@ -34,8 +34,8 @@ def bridge_app():
 # PluginIRIInstance construction
 # ---------------------------------------------------------------------------
 
-def test_instance_init(bridge_app):
-    plugin = PluginIRIInstance(bridge_app, 'iri.nersc',
+def test_instance_init(broker_app):
+    plugin = PluginIRIInstance(broker_app, 'iri.nersc',
                               endpoint='nersc', token='tok123')
     assert plugin.instance_name == 'iri.nersc'
     assert plugin._endpoint_key == 'nersc'
@@ -43,20 +43,20 @@ def test_instance_init(bridge_app):
     assert plugin.session_ttl == 0
 
 
-def test_instance_bad_endpoint(bridge_app):
+def test_instance_bad_endpoint(broker_app):
     with pytest.raises(Exception, match='Unknown endpoint'):
-        PluginIRIInstance(bridge_app, 'iri.bad',
+        PluginIRIInstance(broker_app, 'iri.bad',
                           endpoint='bad', token='tok')
 
 
-def test_instance_empty_token(bridge_app):
+def test_instance_empty_token(broker_app):
     with pytest.raises(Exception, match='token must not be empty'):
-        PluginIRIInstance(bridge_app, 'iri.nersc',
+        PluginIRIInstance(broker_app, 'iri.nersc',
                           endpoint='nersc', token='')
 
 
-def test_instance_ui_config_dynamic(bridge_app):
-    plugin = PluginIRIInstance(bridge_app, 'iri.nersc',
+def test_instance_ui_config_dynamic(broker_app):
+    plugin = PluginIRIInstance(broker_app, 'iri.nersc',
                               endpoint='nersc', token='tok')
     assert 'NERSC' in plugin.ui_config['title']
 
@@ -66,10 +66,10 @@ def test_instance_no_plugin_name():
     assert not hasattr(PluginIRIInstance, 'plugin_name')
 
 
-def test_update_token_rotates_plugin_and_session(bridge_app):
+def test_update_token_rotates_plugin_and_session(broker_app):
     """``update_token`` refreshes the bearer token on the plugin and on
     the auto-session's outbound httpx client (Authorization header)."""
-    plugin = PluginIRIInstance(bridge_app, 'iri.nersc',
+    plugin = PluginIRIInstance(broker_app, 'iri.nersc',
                               endpoint='nersc', token='old-token')
     sess = plugin._sessions[plugin._auto_sid]
     assert plugin._token == 'old-token'
@@ -88,8 +88,8 @@ def test_update_token_rotates_plugin_and_session(bridge_app):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_register_session_returns_auto_sid(bridge_app):
-    plugin = PluginIRIInstance(bridge_app, 'iri.nersc',
+async def test_register_session_returns_auto_sid(broker_app):
+    plugin = PluginIRIInstance(broker_app, 'iri.nersc',
                               endpoint='nersc', token='tok')
     request = MagicMock()
     result = await plugin.register_session(request)
@@ -148,8 +148,8 @@ def test_iri_raise_500():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_list_resources_route(bridge_app):
-    plugin  = PluginIRIInstance(bridge_app, 'iri.nersc',
+async def test_list_resources_route(broker_app):
+    plugin  = PluginIRIInstance(broker_app, 'iri.nersc',
                                endpoint='nersc', token='tok')
     session = plugin._sessions[plugin._auto_sid]
 
@@ -166,8 +166,8 @@ async def test_list_resources_route(bridge_app):
 
 
 @pytest.mark.asyncio
-async def test_submit_job_route(bridge_app):
-    plugin  = PluginIRIInstance(bridge_app, 'iri.nersc',
+async def test_submit_job_route(broker_app):
+    plugin  = PluginIRIInstance(broker_app, 'iri.nersc',
                                endpoint='nersc', token='tok')
     session = plugin._sessions[plugin._auto_sid]
 

@@ -154,7 +154,7 @@ async def test_submit_tunneled_missing_name(mock_psij):
     payload = {
         "job_spec": {
             "executable": "radical-orbit-endpoint-wrapper.sh",
-            "arguments": ["--url", "http://bridge:8000"]
+            "arguments": ["--url", "http://broker:8000"]
         },
         "executor": "local"
     }
@@ -180,7 +180,7 @@ async def test_submit_tunneled_no_tunnel(mock_psij):
     payload = {
         "job_spec": {
             "executable": "radical-orbit-endpoint-wrapper.sh",
-            "arguments": ["--url", "http://bridge:8000", "-n", "test-endpoint"]
+            "arguments": ["--url", "http://broker:8000", "-n", "test-endpoint"]
         },
         "executor": "local",
         "tunnel": "none",
@@ -217,7 +217,7 @@ async def test_submit_tunneled_with_tunnel(mock_psij):
         payload = {
             "job_spec": {
                 "executable": "radical-orbit-endpoint-wrapper.sh",
-                "arguments": ["--url", "http://bridge:8000", "-n", "tunnel-endpoint"],
+                "arguments": ["--url", "http://broker:8000", "-n", "tunnel-endpoint"],
             },
             "executor": "slurm",
             "tunnel": "forward",
@@ -256,7 +256,7 @@ async def test_submit_tunneled_duplicate_watcher(mock_psij):
     payload = {
         "job_spec": {
             "executable": "radical-orbit-endpoint-wrapper.sh",
-            "arguments": ["--url", "http://bridge:8000", "-n", "dup-endpoint"]
+            "arguments": ["--url", "http://broker:8000", "-n", "dup-endpoint"]
         },
         "executor": "local"
     }
@@ -395,7 +395,7 @@ async def test_reverse_tunnel_watcher_happy_path(tmp_path, monkeypatch):
 
     app = FastAPI()
     plugin = PluginPSIJ(app)
-    app.state.bridge_url = 'https://bridge:8000'
+    app.state.broker_url = 'https://broker:8000'
 
     fake_batch = MagicMock()
     fake_batch.name = 'slurm'
@@ -448,7 +448,7 @@ async def test_reverse_tunnel_watcher_spawn_failure(tmp_path, monkeypatch):
 
     app = FastAPI()
     plugin = PluginPSIJ(app)
-    app.state.bridge_url = 'https://bridge:8000'
+    app.state.broker_url = 'https://broker:8000'
 
     fake_batch = MagicMock()
     fake_batch.name = 'slurm'

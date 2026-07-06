@@ -5,7 +5,7 @@ This directory contains the Docker configuration to run the [Multi-Endpoint Make
 ## Infrastructure Overview
 
 The `docker-compose.yaml` file defines the following services:
-- **bridge**: The central coordination point for the workflow.
+- **broker**: The central coordination point for the workflow.
 - **endpoint-a**: A radical.orbit instance named `endpoint_a`.
 - **endpoint-b**: A radical.orbit instance named `endpoint_b`.
 - **client**: A container for launching the Makeflow workflow.
@@ -32,12 +32,12 @@ export RADICAL_ORBIT_BRANCH=feature/task-dispatcher
    *Note: On the first run, this will build the images. Alternatively, you can build them manually using the `./build.sh` script (see [Building the Image](#building-the-image) below).*
 
 2. **Wait for services to be ready:**
-   The endpoint services depend on the bridge being healthy. You can monitor the startup process with:
+   The endpoint services depend on the broker being healthy. You can monitor the startup process with:
 
    ```bash
    docker compose logs -f
    ```
-   Wait until you see messages indicating that `endpoint_a` and `endpoint_b` have successfully connected to the bridge. Press `Ctrl+C` to stop following logs.
+   Wait until you see messages indicating that `endpoint_a` and `endpoint_b` have successfully connected to the broker. Press `Ctrl+C` to stop following logs.
 
 3. **Run the workflow:**
    Execute the Makeflow workflow from the client container. Since the workflow file is copied into the image, you can run it directly:
@@ -90,4 +90,4 @@ For more control over the build process (e.g., specifying a different branch or 
 - `-p <platform>`: The target build platform, e.g., `linux/amd64` or `linux/arm64` (default: `linux/amd64`).
 - `-c`: Build without cache (`--no-cache`).
 
-The script also passes bridge configuration arguments (`GENERATE_BRIDGE_CERT`, `BRIDGE_IP`, `BRIDGE_HOSTNAME`) to the Docker build process.
+The script also passes broker configuration arguments (`GENERATE_BROKER_CERT`, `BROKER_IP`, `BROKER_HOSTNAME`) to the Docker build process.

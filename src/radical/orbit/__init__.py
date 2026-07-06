@@ -12,9 +12,9 @@ from .runtime           import EndpointRuntime  # noqa: F401
 from .client            import PluginClient  # noqa: F401
 
 # Public aliases — the participant star has one hub (the active broker, still
-# reached through the ``Bridge`` name until the rename PR) and one node type (the
-# endpoint runtime).  ``Endpoint`` is the natural counterpart to ``Bridge``.
-Bridge   = Broker
+# reached through the ``Broker`` name until the rename PR) and one node type (the
+# endpoint runtime).  ``Endpoint`` is the natural counterpart to ``Broker``.
+Broker   = Broker
 Endpoint = EndpointRuntime
 
 

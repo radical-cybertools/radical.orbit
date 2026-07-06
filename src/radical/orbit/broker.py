@@ -22,12 +22,11 @@ grace timer then declares it ``lost`` (actionable — inflight calls to it
 fast-fail).  A valid re-register cancels the grace timer; a clean close skips
 ``suspect`` (immediate removal).
 
-**Build-alongside.**  This module lives next to the untouched ``bridge.py``
-(``bin/`` still defaults to the old stack) and owns a *minimal* app: only the
-token-gated WS ``/register`` route.  HTTP catch-all, SSE ``/events``, the
-Explorer UI and CORS are the M5 gateway module's job — it attaches onto this
-same app through the constructor-declared **gateway seam**, the
-attributes/methods a later ``gateway.py`` is handed:
+**Minimal core.**  The broker owns a *minimal* app: only the token-gated WS
+``/register`` route.  HTTP catch-all, SSE ``/events``, the Explorer UI and CORS
+are the gateway module's job — it attaches onto this same app through the
+constructor-declared **gateway seam**, the attributes/methods ``gateway.py`` is
+handed:
 
 * :attr:`Broker.app`               — the FastAPI app to mount HTTP routes on.
 * :attr:`Broker.pending`           — the broker-side pending-call table.
@@ -37,7 +36,7 @@ attributes/methods a later ``gateway.py`` is handed:
 * :attr:`Broker.token` / :attr:`Broker.auth_enabled` — the credential config.
 
 Resume keys live in broker memory only — a broker restart clears them, so
-re-registration is first-come after a restart (same as the old stack).
+re-registration is first-come after a restart.
 """
 
 # pylint: disable=protected-access
@@ -67,7 +66,7 @@ from . import _prof as rprof
 from . import protocol
 from . import utils
 
-from .bridge_plugin_host import BridgePluginHost
+from .broker_plugin_host import BrokerPluginHost
 from .broker_events      import EventRouter
 
 
@@ -152,9 +151,9 @@ class BrokerCaller:
 class Broker:
     """The active broker — lean routing loop + own-thread plugin host.
 
-    The transport/auth args (``app``, ``cert``/``key``, ``host``/``port``,
-    ``plugins``, ``token``/``no_auth``) mirror :class:`radical.orbit.bridge.\
-Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
+    The transport/auth args are ``app``, ``cert``/``key``, ``host``/``port``,
+    ``plugins`` and ``token``/``no_auth``.  The tunable liveness/backpressure
+    knobs — ``ping_interval`` and
     ``ping_timeout`` (uvicorn WS keepalive; ``ping_timeout`` doubles as the
     loop-lag watchdog's stall budget), ``grace`` (``suspect`` → ``lost``
     window), ``pending_cap`` (per-``src`` pending-table cap), ``event_queue``
@@ -183,17 +182,17 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
                  gateway:           bool  = True):
 
         # ── TLS config ───────────────────────────────────────────────
-        cert_path, _ = utils.resolve_bridge_cert(cli=cert)
-        key_path,  _ = utils.resolve_bridge_key (cli=key, cert=cert_path)
+        cert_path, _ = utils.resolve_broker_cert(cli=cert)
+        key_path,  _ = utils.resolve_broker_key (cli=key, cert=cert_path)
         self._cert: str = str(cert_path)
         self._key : str = str(key_path)
 
-        # ── Ingress auth token (carried over from the bridge) ─────────
+        # ── Ingress auth token ────────────────────────────────────────
         self._auth_enabled: bool          = not utils.auth_disabled(no_auth)
         self._token:        Optional[str] = None
         self._token_source: str           = 'disabled'
         if self._auth_enabled:
-            self._token, self._token_source = utils.ensure_bridge_token(cli=token)
+            self._token, self._token_source = utils.ensure_broker_token(cli=token)
 
         # ── Advertised URL ───────────────────────────────────────────
         self._host = host
@@ -251,13 +250,13 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
         self._loop:      Optional[asyncio.AbstractEventLoop] = None
         self._host_loop: Optional[asyncio.AbstractEventLoop] = None
         self._host_thread: Optional[threading.Thread]        = None
-        self._host:      Optional[BridgePluginHost]          = None
+        self._plugin_host: Optional[BrokerPluginHost]        = None
         self._watchdog_task: Optional[asyncio.Task]          = None
         self._started:   bool = False
 
         self.caller = BrokerCaller(self)
 
-        # Profiling — ported from the bridge with broker_* labels
+        # Profiling — broker_* labels
         # (``self._prof`` is created above with the event router).
         self._req_ctr  = itertools.count()
 
@@ -268,7 +267,7 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
                           description="ORBIT active broker — participant star hub.",
                           version="0.1.0")
         self._app: FastAPI = app
-        self._app.state.is_bridge = True   # role detection: broker hosts plugins
+        self._app.state.is_broker = True   # role detection: broker hosts plugins
 
         self._setup_middleware()
         self._register_routes()
@@ -349,11 +348,11 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
         on disk (``data/plugins/*.js``); a hosted plugin registered at runtime —
         the ``iri.<endpoint>`` instances ``iri_connect`` mints — carries its JS
         as a file the plugin class points at, discoverable only through the
-        host.  The read touches host-loop state (``BridgePluginHost._plugins``),
+        host.  The read touches host-loop state (``BrokerPluginHost._plugins``),
         so it is fetched **across the host-loop boundary** — the routing loop
         never touches host state.  Empty when the host is not up.
         """
-        host = self._host
+        host = self._plugin_host
         loop = self._host_loop
         if host is None or loop is None:
             return {}
@@ -397,7 +396,26 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
             except Exception as e:
                 log.debug("[Broker] close of %s failed: %s", name, e)
         self.registry.clear()
+        self._shutdown_host_plugins()
         self._stop_host_thread()
+
+    def _shutdown_host_plugins(self) -> None:
+        """Ask the hosted plugins to stop their background work cleanly.
+
+        Runs the host's plugin-shutdown path *on the host loop* (cancelling each
+        plugin's cleanup / reclaim-drain tasks and closing sessions) and waits a
+        bounded window, so a subsequent ``_stop_host_thread`` does not tear the
+        loop down with plugin tasks still pending (the "Task was destroyed but
+        it is pending" warnings)."""
+        host = self._plugin_host
+        loop = self._host_loop
+        if host is None or loop is None:
+            return
+        try:
+            cfut = asyncio.run_coroutine_threadsafe(host.shutdown(), loop)
+            cfut.result(timeout=5.0)
+        except Exception as e:
+            log.debug("[Broker] host plugin shutdown failed: %s", e)
 
     def _start_host_thread(self) -> None:
         """Bring up the hosted-plugin host on its own loop/thread.
@@ -429,16 +447,16 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
 
         def _build() -> None:
             try:
-                host = BridgePluginHost(
+                host = BrokerPluginHost(
                     names, self._host_broadcast, BROKER_NAME,
-                    on_topology_changed=None, bridge_url=self._url,
+                    on_topology_changed=None, broker_url=self._url,
                     broker_caller=self.caller, broker_tap=self.tap)
                 fut.set_result(host)
             except Exception as e:                         # pragma: no cover
                 fut.set_exception(e)
 
         self._host_loop.call_soon_threadsafe(_build)
-        self._host = fut.result(timeout=30.0)
+        self._plugin_host = fut.result(timeout=30.0)
         if names:
             log.info("[Broker] hosted plugins: %s", names)
 
@@ -767,7 +785,7 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
         registry.  Returns a ``{status, headers, body}`` dict (body is bytes),
         the same passthrough shape :meth:`_dispatch_to_host` wraps into a wire
         ``response``."""
-        if self._host is None:
+        if self._plugin_host is None:
             return {'status': 503, 'headers': {},
                     'body': json.dumps({"error": True,
                                         "detail": "no broker host"}).encode()}
@@ -776,7 +794,7 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
             path, query = path.split('?', 1)
         try:
             cfut = asyncio.run_coroutine_threadsafe(
-                self._host.handle_request(
+                self._plugin_host.handle_request(
                     method       = method,
                     path         = path,
                     headers      = headers or {},
@@ -800,7 +818,7 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
                                         "detail": str(e)}).encode()}
 
     def _host_broadcast(self, topic: str, data: dict):
-        """``broadcast_fn`` handed to :class:`BridgePluginHost`.
+        """``broadcast_fn`` handed to :class:`BrokerPluginHost`.
 
         A hosted plugin's notification becomes a broker ``event`` fanned out on
         the routing loop; topology pings just trigger a rebroadcast.  Runs on
@@ -832,7 +850,7 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
         op = raw.get('op')
         if op == 'terminate':
             # Process floor: self-SIGTERM (uvicorn's own handler stops it),
-            # mirroring bridge.terminate_bridge.
+            # mirroring broker.terminate_broker.
             log.info("[Broker] terminate requested by %s", name)
             spawn(self._delayed_terminate(), 'broker_terminate')
         elif op == 'disconnect':
@@ -979,8 +997,9 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
                 liveness=self._liveness.get(name, 'present'))
         # The broker is itself a participant (its hosted-plugin host).
         broker_plugins: Dict[str, Dict[str, Any]] = {}
-        if self._host is not None:
-            broker_plugins = self._host.get_topology_info().get('plugins', {})
+        if self._plugin_host is not None:
+            broker_plugins = \
+                self._plugin_host.get_topology_info().get('plugins', {})
         parts[BROKER_NAME] = protocol.ParticipantInfo(
             role='broker', plugins=broker_plugins, liveness='present')
         return parts
@@ -1012,7 +1031,7 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
         served-plugin delivery.  A fresh broker starts with an empty ``prev``,
         so a not-yet-reconnected child is never synthesized ``lost`` (it was
         never ``present`` in this broker's view)."""
-        if self._host is None or self._host_loop is None:
+        if self._plugin_host is None or self._host_loop is None:
             return
         curr = self.topology_snapshot()
         participants = dict(curr)
@@ -1026,7 +1045,8 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
         self._host_topology_prev = curr
         try:
             asyncio.run_coroutine_threadsafe(
-                self._host.on_topology_change(participants), self._host_loop)
+                self._plugin_host.on_topology_change(participants),
+                self._host_loop)
         except Exception as e:
             log.debug("[Broker] host topology delivery failed: %s", e)
 

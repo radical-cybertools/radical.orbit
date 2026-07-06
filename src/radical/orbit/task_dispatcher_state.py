@@ -10,7 +10,7 @@ Two record types survive dispatcher restarts:
 
 Persistence is an append-only JSONL log per pool
 (``pilot.log``, ``task.log``) plus periodic ``snapshot.json``.  On plugin
-startup the log is replayed and cross-referenced with the bridge's
+startup the log is replayed and cross-referenced with the broker's
 topology to reconcile orphan pilots.
 
 State machines
@@ -134,7 +134,7 @@ class EndpointModeRecord:
     '''Lendpointr entry for one endpoint-mode task (transparent rhapsody proxy).
 
     Endpoint-mode tasks bypass pool state, so they need their own tiny
-    persisted lendpointr to survive a bridge restart (C4): an in-flight
+    persisted lendpointr to survive a broker restart (C4): an in-flight
     entry lets get/cancel routes re-resolve the target endpoint after
     replay.  A terminal record is appended on completion and filtered
     out on replay, so the lendpointr self-prunes via the usual

@@ -50,7 +50,7 @@ def _make_plugin(**attrs):
     """A PluginReplay on a fresh app with a capturing fake tap."""
     taps = []
     app = FastAPI()
-    app.state.is_bridge   = True
+    app.state.is_broker   = True
     app.state.broker_tap  = lambda cb: (taps.append(cb)
                                         or (lambda: taps.remove(cb)))
     p = PluginReplay(app, 'replay')
@@ -377,13 +377,13 @@ def test_fetch_unknown_session_empty_no_gap():
 
 def test_is_enabled_requires_broker_and_tap():
     app = FastAPI()
-    app.state.is_bridge  = True
+    app.state.is_broker  = True
     app.state.broker_tap = lambda cb: (lambda: None)
     assert PluginReplay.is_enabled(app) is True
 
     # broker host but no tap -> disabled
     app2 = FastAPI()
-    app2.state.is_bridge = True
+    app2.state.is_broker = True
     assert PluginReplay.is_enabled(app2) is False
 
     # not a broker host -> disabled even if a tap were present
@@ -397,7 +397,7 @@ def test_not_in_default_plugin_set():
     # 'default' special token must not expand to include it.
     from radical.orbit.plugin_host_base import _expand_special_tokens
     app = FastAPI()
-    app.state.is_bridge = True
+    app.state.is_broker = True
     available = Plugin.get_plugin_names()
     assert 'replay' in available
     expanded = _expand_special_tokens(['default'], app, available)
@@ -471,9 +471,9 @@ def harness(tmp_path, monkeypatch):
         pytest.skip("openssl not available")
     import os
     from radical.orbit import utils
-    monkeypatch.setattr(utils, 'URL_FILE',   tmp_path / 'bridge.url')
-    monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'bridge.token')
-    monkeypatch.delenv('RADICAL_ORBIT_BRIDGE_TOKEN', raising=False)
+    monkeypatch.setattr(utils, 'URL_FILE',   tmp_path / 'broker.url')
+    monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'broker.token')
+    monkeypatch.delenv('RADICAL_ORBIT_BROKER_TOKEN', raising=False)
     cert = tmp_path / 'cert.pem'
     key  = tmp_path / 'key.pem'
     subprocess.run(
@@ -530,7 +530,7 @@ def test_e2e_late_consumer_replays_with_splice(harness):
     make_broker, make_runtime = harness
     srv = make_broker(plugins='replay')
 
-    replay = srv.broker._host._plugins['replay']
+    replay = srv.broker._plugin_host._plugins['replay']
     assert replay is not None
 
     # emitter endpoint emits 5 events BEFORE any consumer exists

@@ -7,7 +7,7 @@ A strategy owns three concerns within its pool:
 2. Task dispatch   — which task off the queue runs on which pilot.
 3. Pilot termination — when to cancel a pilot (beyond walltime expiry).
 
-Strategies never touch psij, rhapsody, or the bridge directly.  All
+Strategies never touch psij, rhapsody, or the broker directly.  All
 side-effecting actions flow through :class:`StrategyContext`, which the
 dispatcher supplies.  This keeps the research surface independent of
 plumbing changes.
@@ -48,9 +48,9 @@ class StrategyContext:
     The dispatcher constructs one context per pool and reuses it across
     strategy invocations.  Accessor methods return snapshots; action methods
     schedule dispatcher-side work (they do not block on the underlying batch
-    system or bridge).
+    system or broker).
 
-    The strategy must not import psij, rhapsody, httpx, or BridgeClient.
+    The strategy must not import psij, rhapsody, httpx, or the runtime.
     All side effects are expressed through this object.
     '''
 

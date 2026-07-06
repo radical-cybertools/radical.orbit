@@ -1,10 +1,10 @@
 '''
 Globus plugin — file staging via Globus Online (Transfer API).
 
-Endpoint-side plugin (not loaded on the bridge).  Globus moves data
+Endpoint-side plugin (not loaded on the broker).  Globus moves data
 *collection-to-collection* out of band, so this plugin is an orchestrator:
 it submits transfers between two Globus collections (identified by UUID) and
-monitors task state.  Bytes never flow through the endpoint or the bridge.
+monitors task state.  Bytes never flow through the endpoint or the broker.
 
 Auth lifecycle
 --------------
@@ -543,7 +543,7 @@ class PluginGlobus(Plugin):
     @classmethod
     def is_enabled(cls, app: FastAPI) -> bool:
         '''Endpoint-only, and only when globus-sdk is importable.'''
-        return bool(globus_sdk) and not getattr(app.state, 'is_bridge', False)
+        return bool(globus_sdk) and not getattr(app.state, 'is_broker', False)
 
     def __init__(self, app: FastAPI, instance_name: str = 'globus'):
         super().__init__(app, instance_name)

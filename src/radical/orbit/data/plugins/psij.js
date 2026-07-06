@@ -67,7 +67,7 @@ export function template() {
         <input type="checkbox" class="p-tunnel" style="margin-right:4px;" />
         Reverse SSH tunnel
       </label>
-      <input class="p-tunnel-port" type="text" style="width:80px; margin-left:8px; display:inline-block; text-align:right;" placeholder="port" title="Bridge port for reverse tunnel" />
+      <input class="p-tunnel-port" type="text" style="width:80px; margin-left:8px; display:inline-block; text-align:right;" placeholder="port" title="Broker port for reverse tunnel" />
     </div>
     <div class="card psij-jobs-card">
       <div class="card-title">📊 Job Monitor</div>
@@ -120,14 +120,14 @@ export function init(page, api) {
   const argsInput = page.querySelector('.p-args');
   if (argsInput && !argsInput.value) {
     const nextName = getNextEndpointChildName(api.endpointName);
-    argsInput.value = `--url ${api.bridgeUrl} --name ${nextName} -p all`;
+    argsInput.value = `--url ${api.brokerUrl} --name ${nextName} -p all`;
   }
 
-  // Pre-populate tunnel port from bridge URL
+  // Pre-populate tunnel port from broker URL
   const portInput = page.querySelector('.p-tunnel-port');
   if (portInput && !portInput.value) {
     try {
-      const urlPort = new URL(api.bridgeUrl).port || '8000';
+      const urlPort = new URL(api.brokerUrl).port || '8000';
       portInput.value = urlPort;
     } catch (_) {
       portInput.value = '8000';

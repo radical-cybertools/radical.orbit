@@ -29,22 +29,22 @@ RUN micromamba install -y -n $ENV_NAME -f /tmp/environment.yml && \
 ARG MAMBA_DOCKERFILE_ACTIVATE=1
 ENV PATH="/opt/conda/bin:${PATH}"
 
-ENV RADICAL_ORBIT_BRIDGE_CERT="/app/private/bridge_cert.pem"
-ENV RADICAL_ORBIT_BRIDGE_KEY="/app/private/bridge_key.pem"
+ENV RADICAL_ORBIT_BROKER_CERT="/app/private/broker_cert.pem"
+ENV RADICAL_ORBIT_BROKER_KEY="/app/private/broker_key.pem"
 
-ARG GENERATE_BRIDGE_CERT=false
-ARG BRIDGE_IP=127.0.0.1
-ARG BRIDGE_HOSTNAME=localhost
-RUN if [ "$GENERATE_BRIDGE_CERT" = "true" ]; then \
-        mkdir -p $(dirname "$RADICAL_ORBIT_BRIDGE_CERT") && \
+ARG GENERATE_BROKER_CERT=false
+ARG BROKER_IP=127.0.0.1
+ARG BROKER_HOSTNAME=localhost
+RUN if [ "$GENERATE_BROKER_CERT" = "true" ]; then \
+        mkdir -p $(dirname "$RADICAL_ORBIT_BROKER_CERT") && \
         openssl req -x509 -nodes -days 3650 -newkey rsa:4096 \
-            -keyout "${RADICAL_ORBIT_BRIDGE_KEY}" \
-            -out "${RADICAL_ORBIT_BRIDGE_CERT}" \
-            -subj "/CN=${BRIDGE_IP}" \
-            -addext "subjectAltName = IP:${BRIDGE_IP},DNS:${BRIDGE_HOSTNAME},IP:127.0.0.1,DNS:localhost"; \
-        echo "Certificate generated for ${BRIDGE_HOSTNAME} and ${BRIDGE_IP}"; \
+            -keyout "${RADICAL_ORBIT_BROKER_KEY}" \
+            -out "${RADICAL_ORBIT_BROKER_CERT}" \
+            -subj "/CN=${BROKER_IP}" \
+            -addext "subjectAltName = IP:${BROKER_IP},DNS:${BROKER_HOSTNAME},IP:127.0.0.1,DNS:localhost"; \
+        echo "Certificate generated for ${BROKER_HOSTNAME} and ${BROKER_IP}"; \
     else \
-        echo "Skipping certificate generation (GENERATE_BRIDGE_CERT is not true)."; \
+        echo "Skipping certificate generation (GENERATE_BROKER_CERT is not true)."; \
     fi
 
 WORKDIR /home/$MAMBA_USER

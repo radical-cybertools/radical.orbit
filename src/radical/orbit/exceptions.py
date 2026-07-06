@@ -88,14 +88,14 @@ class ConnectionError(EndpointError):
     pass
 
 
-class BridgeConnectionError(ConnectionError):
-    """Raised when connection to the bridge fails."""
+class BrokerConnectionError(ConnectionError):
+    """Raised when connection to the broker fails."""
 
     def __init__(self, url: str, reason: Optional[str] = None):
-        msg = f"Failed to connect to bridge: {url}"
+        msg = f"Failed to connect to broker: {url}"
         if reason:
             msg += f" - {reason}"
-        super().__init__(msg, code="BRIDGE_CONNECTION_FAILED")
+        super().__init__(msg, code="BROKER_CONNECTION_FAILED")
         self.url = url
         self.reason = reason
 
@@ -144,7 +144,7 @@ def exception_to_http_status(exc: Exception) -> int:
         return 400
     elif isinstance(exc, TimeoutError):
         return 504
-    elif isinstance(exc, BridgeConnectionError):
+    elif isinstance(exc, BrokerConnectionError):
         return 503
     elif isinstance(exc, EndpointDisconnectedError):
         return 503

@@ -71,8 +71,8 @@ def test_spawn_tunnel_uses_picked_port(tmp_path, monkeypatch,
     proc = _FakeProc()
     with patch('subprocess.Popen', return_value=proc) as popen:
         got_proc, got_port = _tunnel.spawn_tunnel(
-            login_host='login01', bridge_host='bridge',
-            bridge_port=8000, endpoint_name='myendpoint')
+            login_host='login01', broker_host='broker',
+            broker_port=8000, endpoint_name='myendpoint')
 
     assert got_port == port
     assert got_proc is proc
@@ -80,7 +80,7 @@ def test_spawn_tunnel_uses_picked_port(tmp_path, monkeypatch,
     argv = popen.call_args[0][0]
     assert argv[0] == 'ssh' and '-N' in argv
     assert '-L' in argv
-    assert f'{port}:bridge:8000' in argv
+    assert f'{port}:broker:8000' in argv
     # No '-R' anywhere — module is compute -> login only.
     assert '-R' not in argv
     assert argv[-1] == 'login01'
@@ -101,7 +101,7 @@ def test_spawn_tunnel_raises_when_ssh_exits(tmp_path, monkeypatch):
     proc.returncode = 255
     with patch('subprocess.Popen', return_value=proc):
         with pytest.raises(RuntimeError, match='exited.*before listener'):
-            _tunnel.spawn_tunnel('login01', 'bridge', 8000, 'e1',
+            _tunnel.spawn_tunnel('login01', 'broker', 8000, 'e1',
                                  listen_timeout=0.1)
 
 
@@ -115,7 +115,7 @@ def test_spawn_tunnel_raises_on_listener_timeout(tmp_path, monkeypatch):
     proc = _FakeProc(poll_result=None)   # alive throughout
     with patch('subprocess.Popen', return_value=proc):
         with pytest.raises(RuntimeError, match='did not come up within'):
-            _tunnel.spawn_tunnel('login01', 'bridge', 8000, 'e2',
+            _tunnel.spawn_tunnel('login01', 'broker', 8000, 'e2',
                                  listen_timeout=0.1)
 
 
@@ -172,14 +172,14 @@ def test_parse_allocated_port_times_out_without_output():
 # EndpointRuntime._open_tunnel_forward
 # ---------------------------------------------------------------------------
 
-def _make_endpoint_service(bridge_url='http://bridge:8000', tunnel_via=None):
+def _make_endpoint_service(broker_url='http://broker:8000', tunnel_via=None):
     """Build a zero-plugin EndpointRuntime (pure consumer — no plugin loader).
 
     Default URL uses ``http://`` (not ``https://``) so the cert
     resolution path is skipped — these tests don't exercise TLS.
     """
     from radical.orbit.runtime import EndpointRuntime
-    return EndpointRuntime(broker_url=bridge_url, name='endpoint1',
+    return EndpointRuntime(broker_url=broker_url, name='endpoint1',
                            tunnel='forward', tunnel_via=tunnel_via)
 
 

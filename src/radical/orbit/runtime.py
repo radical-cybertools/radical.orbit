@@ -47,6 +47,7 @@ import random
 import socket
 import ssl
 import threading
+import time
 import uuid
 
 from collections import deque
@@ -82,8 +83,8 @@ class EndpointRuntime(PluginHostBase):
     """A participant: serve and/or consume over one outbound WS to the broker.
 
     Args:
-        broker_url:  Broker URL.  CLI > env (``RADICAL_ORBIT_BRIDGE_URL``) >
-                     file — resolved via :func:`utils.resolve_bridge_url`.
+        broker_url:  Broker URL.  CLI > env (``RADICAL_ORBIT_BROKER_URL``) >
+                     file — resolved via :func:`utils.resolve_broker_url`.
         cert:        Broker TLS cert (only for ``https``/``wss``).
         name:        Stable participant name.  ``None`` → ``consumer.<uuid8>``
                      (auto-named consumers cannot recover sessions on restart).
@@ -130,15 +131,15 @@ class EndpointRuntime(PluginHostBase):
                 f"got {tunnel!r}")
 
         # ── URL / TLS / token resolution (service.py shapes) ──────────
-        resolved_url, _ = utils.resolve_bridge_url(cli=broker_url)
+        resolved_url, _ = utils.resolve_broker_url(cli=broker_url)
         self._broker_url: str = resolved_url
         scheme = urlparse(self._broker_url).scheme
         if scheme in ('https', 'wss'):
-            resolved_cert, _ = utils.resolve_bridge_cert(cli=cert)
+            resolved_cert, _ = utils.resolve_broker_cert(cli=cert)
             self._cert: Optional[str] = str(resolved_cert)
         else:
             self._cert = None
-        self._token: Optional[str] = utils.resolve_bridge_token(cli=token)[0]
+        self._token: Optional[str] = utils.resolve_broker_token(cli=token)[0]
 
         # ── Identity / role ───────────────────────────────────────────
         self._name: str = name or ('consumer.%s' % uuid.uuid4().hex[:8])
@@ -154,10 +155,10 @@ class EndpointRuntime(PluginHostBase):
         self._app: FastAPI = app if app is not None \
                                  else FastAPI(title="ORBIT Endpoint Runtime")
         self._plugins: Dict[str, Plugin] = {}
-        self._app.state.bridge_url       = self._broker_url
+        self._app.state.broker_url       = self._broker_url
         self._app.state.endpoint_name    = self._name
         self._app.state.endpoint_service = self
-        self._app.state.is_bridge        = False
+        self._app.state.is_broker        = False
         if not hasattr(self._app.state, 'direct_routes'):
             self._app.state.direct_routes = []
         self._direct_routes: list = self._app.state.direct_routes
@@ -200,6 +201,9 @@ class EndpointRuntime(PluginHostBase):
         self._stopping = False
         self._fatal    = False
         self._registered = threading.Event()
+        # Set once the first topology frame lands (the broker sends it right
+        # after register_ack) so start(wait=True) can also wait for it.
+        self._topology_ready = threading.Event()
         self._transport_future = None
 
         # served-request backpressure (touched on the work loop)
@@ -261,8 +265,12 @@ class EndpointRuntime(PluginHostBase):
     def start(self, wait: bool = True, timeout: float = 30.0) -> 'EndpointRuntime':
         """Bring up both loops + the callback thread and connect.
 
-        With *wait* the call blocks until the first ``register_ack`` (or
-        *timeout*); either way calls block on the work loop via futures.
+        With *wait* the call blocks until the first ``register_ack`` **and** the
+        first topology frame (the broker sends it right after the ack) land, or
+        until *timeout* — so after ``start(wait=True)`` returns, :meth:`topology`
+        reflects the broker's snapshot at registration time and an immediate
+        :meth:`get_plugin` will not race a not-yet-populated topology.  Either
+        way calls block on the work loop via futures.
         """
         self._cb.start()
 
@@ -284,7 +292,12 @@ class EndpointRuntime(PluginHostBase):
             self._transport_main(), self._transport_loop)
 
         if wait:
+            deadline = time.monotonic() + timeout
             self._registered.wait(timeout=timeout)
+            # Also wait (within the same budget) for the first topology frame,
+            # so topology() is populated before start() returns.
+            remaining = max(0.0, deadline - time.monotonic())
+            self._topology_ready.wait(timeout=remaining)
         return self
 
     def wait_registered(self, timeout: float = 30.0) -> bool:
@@ -734,7 +747,7 @@ class EndpointRuntime(PluginHostBase):
         combined = type('Runtime%s' % client_cls.__name__,
                         (client_cls, RuntimePluginClient), {})
         client = combined(_RuntimeHTTP(self, endpoint_name), namespace,
-                          bridge_client=None, endpoint_id=endpoint_name,
+                          broker_client=None, endpoint_id=endpoint_name,
                           plugin_name=plugin_name)
         client._runtime = self
         client.register_session(**session_kwargs)
@@ -745,17 +758,25 @@ class EndpointRuntime(PluginHostBase):
     def register_callback(self, endpoint_id: Optional[str] = None,
                           plugin_name: Optional[str] = None,
                           topic: Optional[str] = None,
-                          callback: Callable = None) -> None:
+                          callback: Callable = None,
+                          with_meta: bool = False) -> None:
         """Register an event callback and auto-``subscribe`` for its pattern.
 
-        Same tuple semantics as ``BridgeClient.register_callback``: ``None`` is
-        a wildcard; filtering happens at the edge.
+        Tuple semantics: ``None`` is a wildcard; filtering happens at the edge.
+
+        By default the callback is invoked as
+        ``callback(endpoint, plugin, topic, data)``.  With *with_meta* it is
+        invoked as ``callback(endpoint, plugin, topic, data, meta)`` where
+        ``meta = {'seq': int, 'ts': float, 'session': str | None}`` carries the
+        broker-stamped envelope metadata (additive; the wire is unchanged).  The
+        broker ``seq`` is the same authoritative value the replay plugin
+        retains, so live delivery can dedup on it.
         """
         if callback is None:
             raise ValueError("callback is required")
         key = (endpoint_id, plugin_name, topic)
         with self._cb_lock:
-            self._callbacks.setdefault(key, []).append(callback)
+            self._callbacks.setdefault(key, []).append((callback, with_meta))
         self._emit(protocol.Subscribe(
             src=self._name,
             patterns=[protocol.SubscribePattern(
@@ -768,8 +789,9 @@ class EndpointRuntime(PluginHostBase):
         key = (endpoint_id, plugin_name, topic)
         with self._cb_lock:
             cbs = self._callbacks.get(key)
-            if cbs and callback in cbs:
-                cbs.remove(callback)
+            if cbs:
+                self._callbacks[key] = [(cb, m) for (cb, m) in cbs
+                                        if cb is not callback]
         self._emit(protocol.Unsubscribe(
             src=self._name,
             patterns=[protocol.SubscribePattern(
@@ -799,42 +821,60 @@ class EndpointRuntime(PluginHostBase):
         endpoint, plugin, topic = ev.src, ev.plugin, ev.topic
         data = ev.data
         with self._cb_lock:
-            matched: List[Callable] = []
+            matched: List[tuple] = []
             for (e, p, t), cbs in self._callbacks.items():
                 if (e is None or e == endpoint) and \
                    (p is None or p == plugin) and \
                    (t is None or t == topic):
                     matched.extend(cbs)
-        for cb in matched:
-            self._cb.submit(cb, endpoint, plugin, topic, data)
+        meta = None
+        for cb, with_meta in matched:
+            if with_meta:
+                if meta is None:
+                    meta = {'seq': ev.seq, 'ts': ev.ts, 'session': ev.session}
+                self._cb.submit(cb, endpoint, plugin, topic, data, meta)
+            else:
+                self._cb.submit(cb, endpoint, plugin, topic, data)
 
     def _on_topology(self, msg: protocol.Topology) -> None:
         new_topo = {name: info.model_dump()
                     for name, info in msg.participants.items()}
         prev = self._topology
         self._topology = new_topo
+        # One-shot ``lost`` synthesis — a single diff feeding two consumers
+        # (consumer topology callbacks AND served plugins) so both observe the
+        # loss exactly once, identically.  The stored snapshot
+        # (``self._topology`` / :meth:`topology`) keeps the broker's
+        # tombstone-free view and never retains the synthesized entry.
+        participants = self._synthesize_lost(prev, new_topo)
         with self._cb_lock:
             cbs = list(self._topology_callbacks)
-        snapshot = dict(new_topo)
         for cb in cbs:
-            self._cb.submit(cb, snapshot)
+            self._cb.submit(cb, participants)
         # Served plugins react to the rich topology (owner-liveness → session
         # reclaim-drain in plugin_base).  Consumers have no served plugins.
         if self._plugins:
-            self._dispatch_topology_to_plugins(prev, new_topo)
+            for plugin in list(self._plugins.values()):
+                self._work_loop.create_task(
+                    self._invoke_topology(plugin, participants))
+        # Unblock start(wait=True): the first topology frame has landed.
+        self._topology_ready.set()
 
-    def _dispatch_topology_to_plugins(self,
-                                      prev: Dict[str, Dict[str, Any]],
-                                      curr: Dict[str, Dict[str, Any]]) -> None:
-        """Deliver the rich topology to served plugins, synthesizing a
-        ``lost`` entry for a participant that has vanished after being seen.
+    @staticmethod
+    def _synthesize_lost(prev: Dict[str, Dict[str, Any]],
+                         curr: Dict[str, Dict[str, Any]]
+                         ) -> Dict[str, Dict[str, Any]]:
+        """Return *curr* plus a synthesized ``liveness='lost'`` entry for every
+        participant that has vanished after being seen.
 
         The wire carries no tombstone: the broker broadcasts ``suspect`` on a
         socket drop and, once the grace elapses, simply drops the participant
         from the topology.  A participant absent from *curr* that was
-        ``present``/``suspect`` in *prev* is therefore the post-grace
-        ``lost`` — synthesized here (as a copy carrying ``liveness='lost'``)
-        so served plugins observe the loss exactly once."""
+        ``present``/``suspect`` in *prev* is therefore the post-grace ``lost`` —
+        synthesized here (as a copy carrying ``liveness='lost'``) so both the
+        consumer callbacks and the served plugins observe the loss exactly once.
+        The result is delivery-only; the caller keeps *curr* as the stored
+        snapshot so the synthesized entry never lingers."""
         participants = dict(curr)
         for name, info in prev.items():
             if name in curr:
@@ -843,9 +883,7 @@ class EndpointRuntime(PluginHostBase):
                 lost = dict(info)
                 lost['liveness'] = 'lost'
                 participants[name] = lost
-        for plugin in list(self._plugins.values()):
-            self._work_loop.create_task(
-                self._invoke_topology(plugin, participants))
+        return participants
 
     async def _invoke_topology(self, plugin, participants: Dict[str, Any]
                                ) -> None:
@@ -868,9 +906,13 @@ class EndpointRuntime(PluginHostBase):
 
     # ── notifications from served plugins ──────────────────────────────
 
-    async def send_notification(self, plugin_name: str, topic: str,
-                                data: Dict[str, Any]) -> None:
+    def send_notification(self, plugin_name: str, topic: str,
+                          data: Dict[str, Any]) -> None:
         """Turn a served plugin's notification into a broker ``event`` frame.
+
+        A plain sync method (the body only packs + hands off to the transport
+        loop, never awaits) so consumer code can call it from any thread — the
+        one obvious way, matching the rest of the consumer-facing API.
 
         ``seq`` is a placeholder (0) — the broker stamps the authoritative
         ``seq``/``ts`` on ingest.  Reuses the notification plumbing shape
@@ -929,8 +971,8 @@ class EndpointRuntime(PluginHostBase):
         req_payload = _json.dumps({
             'endpoint_name': self._name,
             'hostname':      socket.gethostname(),
-            'bridge_host':   broker_host,
-            'bridge_port':   broker_port,
+            'broker_host':   broker_host,
+            'broker_port':   broker_port,
         })
         tmp = req_file.with_suffix('.req.tmp')
         tmp.write_text(req_payload)

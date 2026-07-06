@@ -23,6 +23,20 @@ from .client import PluginClient
 
 log = logging.getLogger("radical.orbit")
 
+# ---------------------------------------------------------------------------
+# Route templates — single-sourced so the ``add_route_*`` registration and the
+# client-helper (and broker-hosted dispatcher) URL formatting cannot drift.
+# Each template doubles as the ``add_route_*`` path (``{name}`` = path param)
+# and as a ``.format(...)`` string for the helpers.  Every rhapsody route is
+# formatted by a ``RhapsodyClient`` helper, so all of them are lifted here.
+# ---------------------------------------------------------------------------
+ROUTE_SUBMIT      = 'submit/{sid}'
+ROUTE_WAIT        = 'wait/{sid}'
+ROUTE_LIST_TASKS  = 'list_tasks/{sid}'
+ROUTE_TASK        = 'task/{sid}/{uid}'
+ROUTE_CANCEL      = 'cancel/{sid}/{uid}'
+ROUTE_CANCEL_ALL  = 'cancel_all/{sid}'
+
 TERMINAL_STATES     = {'DONE', 'FAILED', 'CANCELED', 'COMPLETED'}
 WATCH_CONCURRENCY   = 64
 WS_PAYLOAD_LIMIT    = 8 * 1024 * 1024  # target max per batch (conservative)
@@ -855,7 +869,7 @@ class RhapsodyClient(PluginClient):
         blocks until a ``session_status`` SSE notification confirms
         that the session is ready (or until *init_timeout* seconds).
 
-        Falls back to polling when no ``BridgeClient`` is available.
+        Falls back to polling when no event subscription is available.
 
         Args:
             backends: List of backend names (e.g. ``['dragon_v3']``).
@@ -949,7 +963,7 @@ class RhapsodyClient(PluginClient):
         while time.time() < deadline:
             try:
                 resp = self._http.get(
-                    self._url(f"list_tasks/{self.sid}"))
+                    self._url(ROUTE_LIST_TASKS.format(sid=self.sid)))
                 if resp.status_code != 409:
                     return  # session is ready (or already errored)
             except Exception:
@@ -957,6 +971,80 @@ class RhapsodyClient(PluginClient):
             time.sleep(1.0)
         raise RuntimeError(
             f"Session init timed out after {timeout}s (poll)")
+
+    async def _apoll_session_ready(self, timeout: float = 120) -> None:
+        """Async twin of :meth:`_poll_session_ready` (broker-hosted dispatcher).
+
+        Rhapsody inits its session off-thread and answers 409 until ready;
+        poll ``list_tasks`` over the async transport until non-409 or timeout.
+        Mirrors the sync poll's semantics (swallow transient errors, raise on
+        timeout).
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                resp = await self._arequest(
+                    "GET", self._url(ROUTE_LIST_TASKS.format(sid=self.sid)))
+                if resp.status_code != 409:
+                    return
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+        raise RuntimeError(
+            f"Session init timed out after {timeout}s (poll)")
+
+    async def aregister_session(self, backends: list[str] | None = None,
+                                init_timeout: float = 120) -> None:
+        """Async session registration for the broker-hosted dispatcher.
+
+        The dispatcher has no SSE channel, so this mirrors the sync
+        :meth:`register_session` no-SSE branch: POST ``register_session`` with
+        the requested backends, then poll until the session leaves the
+        initializing (409) state.
+        """
+        payload: dict = {}
+        if backends:
+            payload['backends'] = backends
+        resp = await self._arequest(
+            "POST", self._url("register_session"), json=payload)
+        self._raise(resp)
+        data      = resp.json()
+        self._sid = data['sid']
+        if data.get('status') != 'ready':
+            await self._apoll_session_ready(init_timeout)
+
+    async def asubmit_tasks(self, task_dicts: list[dict]) -> list[dict]:
+        """Single-batch async submit for the broker-hosted dispatcher.
+
+        Mirrors the sync :meth:`submit_tasks` single-batch wire shape (one
+        msgpack ``{"tasks": [...]}`` body) without the user-thread
+        template-compression / pipelining path — the dispatcher submits one
+        task at a time.
+        """
+        self._require_session()
+        url  = self._url(ROUTE_SUBMIT.format(sid=self.sid))
+        body = msgpack.packb({"tasks": task_dicts}, use_bin_type=True)
+        resp = await self._arequest(
+            "POST", url, content=body,
+            headers={"content-type": "application/msgpack"})
+        self._raise(resp, f"submit {len(task_dicts)} task(s)")
+        return resp.json()
+
+    async def aget_task(self, uid: str) -> dict:
+        """Async core mirroring :meth:`get_task` (broker-hosted dispatcher)."""
+        self._require_session()
+        resp = await self._arequest(
+            "GET", self._url(ROUTE_TASK.format(sid=self.sid, uid=uid)))
+        self._raise(resp)
+        return resp.json()
+
+    async def acancel_task(self, uid: str) -> dict:
+        """Async core mirroring :meth:`cancel_task` (broker-hosted dispatcher)."""
+        self._require_session()
+        resp = await self._arequest(
+            "POST", self._url(ROUTE_CANCEL.format(sid=self.sid, uid=uid)))
+        self._raise(resp)
+        return resp.json()
 
     @staticmethod
     def _serialize_task(td: dict) -> None:
@@ -1046,7 +1134,7 @@ class RhapsodyClient(PluginClient):
         # --- try template compression for homogeneous batches ---
         # If all tasks share the same fields (except uid), send a
         # template + list of UIDs instead of N full copies.
-        url = self._url(f"submit/{self.sid}")
+        url = self._url(ROUTE_SUBMIT.format(sid=self.sid))
         if len(task_dicts) > 1:
             ref      = task_dicts[0]
             ref_keys = set(ref) - {'uid'}
@@ -1174,7 +1262,7 @@ class RhapsodyClient(PluginClient):
         ``self._completed``.  This method checks the accumulator and
         blocks only until every requested UID appears there.
 
-        Falls back to periodic polling when no ``BridgeClient`` is
+        Falls back to periodic polling when no event subscription is
         available (e.g. direct construction in tests).
 
         Args:
@@ -1269,7 +1357,7 @@ class RhapsodyClient(PluginClient):
                          timeout: float | None = None) -> list[dict]:
         """Fallback wait via periodic polling (no SSE available)."""
 
-        url     = self._url(f"wait/{self.sid}")
+        url     = self._url(ROUTE_WAIT.format(sid=self.sid))
         payload: dict = {"uids": uids}
         if timeout is not None:
             payload["timeout"] = timeout
@@ -1297,7 +1385,7 @@ class RhapsodyClient(PluginClient):
         """List all tasks in this session."""
         self._require_session()
 
-        resp = self._http.get(self._url(f"list_tasks/{self.sid}"))
+        resp = self._http.get(self._url(ROUTE_LIST_TASKS.format(sid=self.sid)))
         self._raise(resp)
         return resp.json()
 
@@ -1307,7 +1395,7 @@ class RhapsodyClient(PluginClient):
         """
         self._require_session()
 
-        url = self._url(f"task/{self.sid}/{uid}")
+        url = self._url(ROUTE_TASK.format(sid=self.sid, uid=uid))
         resp = self._http.get(url)
         self._raise(resp)
         return resp.json()
@@ -1318,7 +1406,7 @@ class RhapsodyClient(PluginClient):
         """
         self._require_session()
 
-        url = self._url(f"cancel/{self.sid}/{uid}")
+        url = self._url(ROUTE_CANCEL.format(sid=self.sid, uid=uid))
         resp = self._http.post(url)
         self._raise(resp)
         return resp.json()
@@ -1329,7 +1417,7 @@ class RhapsodyClient(PluginClient):
         """
         self._require_session()
 
-        url = self._url(f"cancel_all/{self.sid}")
+        url = self._url(ROUTE_CANCEL_ALL.format(sid=self.sid))
         resp = self._http.post(url)
         self._raise(resp)
         return resp.json()
@@ -1408,7 +1496,7 @@ class PluginRhapsody(Plugin):
     def is_enabled(cls, app: FastAPI) -> bool:
         """Rhapsody loads on compute nodes (inside an allocation) and on
         standalone hosts (no batch system at all).  Both can host Dragon
-        workers; bridges and login nodes deliberately don't load Rhapsody.
+        workers; brokers and login nodes deliberately don't load Rhapsody.
         """
         from .utils import host_role
         return host_role(app)['role'] in ('compute', 'standalone')
@@ -1416,12 +1504,12 @@ class PluginRhapsody(Plugin):
     def __init__(self, app: FastAPI, instance_name: str = "rhapsody"):
         super().__init__(app, instance_name)
 
-        self.add_route_post('submit/{sid}', self.submit_tasks)
-        self.add_route_post('wait/{sid}', self.wait_tasks)
-        self.add_route_get('list_tasks/{sid}', self.list_tasks)
-        self.add_route_get('task/{sid}/{uid}', self.get_task)
-        self.add_route_post('cancel/{sid}/{uid}', self.cancel_task)
-        self.add_route_post('cancel_all/{sid}', self.cancel_all_tasks)
+        self.add_route_post(ROUTE_SUBMIT,     self.submit_tasks)
+        self.add_route_post(ROUTE_WAIT,       self.wait_tasks)
+        self.add_route_get (ROUTE_LIST_TASKS, self.list_tasks)
+        self.add_route_get (ROUTE_TASK,       self.get_task)
+        self.add_route_post(ROUTE_CANCEL,     self.cancel_task)
+        self.add_route_post(ROUTE_CANCEL_ALL, self.cancel_all_tasks)
 
     async def register_session(self, request: Request) -> dict:
         """Register a new Rhapsody session.

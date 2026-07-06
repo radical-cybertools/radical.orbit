@@ -1,7 +1,7 @@
 '''
 IRI Connect Plugin — endpoint configurator for dynamic IRI instances.
 
-Bridge-only plugin that lets users connect to IRI endpoints (NERSC, OLCF, …).
+Broker-only plugin that lets users connect to IRI endpoints (NERSC, OLCF, …).
 On successful connect it dynamically registers a ``PluginIRIInstance`` under
 the name ``iri.<endpoint>`` (e.g. ``iri.nersc``), which then appears as a
 first-class node in the Explorer tree.
@@ -25,7 +25,7 @@ log = logging.getLogger('radical.orbit')
 
 
 class IRIConnectClient(PluginClient):
-    '''Client-side helper for the ``iri_connect`` bridge plugin.
+    '''Client-side helper for the ``iri_connect`` broker plugin.
 
     ``connect()`` returns a ready-to-use :class:`IRIInstanceClient` bound to
     the dynamically registered ``iri.<endpoint>`` plugin instance.
@@ -50,7 +50,7 @@ class IRIConnectClient(PluginClient):
     def connect(self, endpoint: str, token: str) -> 'IRIInstanceClient':
         '''Connect to an IRI endpoint and return a client for the instance.
 
-        Idempotent: if the instance is already up, the bridge refreshes the
+        Idempotent: if the instance is already up, the broker refreshes the
         token in place and returns ``status='token_updated'``.  Either way
         we return a fresh client bound to the running instance.
         '''
@@ -62,7 +62,7 @@ class IRIConnectClient(PluginClient):
         namespace = f'/{self._endpoint_id}/{iname}'
         client    = IRIInstanceClient(
             self._http, namespace,
-            bridge_client=self._bc,
+            broker_client=self._bc,
             endpoint_id=self._endpoint_id,
             plugin_name=iname)
         client.register_session()
@@ -70,7 +70,7 @@ class IRIConnectClient(PluginClient):
 
 
 class PluginIRIConnect(Plugin):
-    '''Bridge-only endpoint configurator for IRI.'''
+    '''Broker-only endpoint configurator for IRI.'''
 
     plugin_name   = 'iri_connect'
     session_class = None
@@ -87,7 +87,7 @@ class PluginIRIConnect(Plugin):
 
     @classmethod
     def is_enabled(cls, app: FastAPI) -> bool:
-        return getattr(app.state, 'is_bridge', False)
+        return getattr(app.state, 'is_broker', False)
 
     def __init__(self, app: FastAPI, instance_name: str = 'iri_connect'):
         super().__init__(app, instance_name)
@@ -100,7 +100,7 @@ class PluginIRIConnect(Plugin):
     # -- helpers ------------------------------------------------------------
 
     def _host(self):
-        '''Return the BridgePluginHost (our plugin host).'''
+        '''Return the BrokerPluginHost (our plugin host).'''
         host = getattr(self._app.state, 'endpoint_service', None)
         if host is None:
             raise HTTPException(status_code=500,

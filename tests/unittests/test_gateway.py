@@ -131,10 +131,10 @@ class _RunningBroker:
 def harness(self_signed, tmp_path, monkeypatch):
     """Factory yielding (make_broker, make_runtime); tears everything down."""
     from radical.orbit import utils
-    monkeypatch.setattr(utils, 'URL_FILE',   tmp_path / 'bridge.url')
-    monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'bridge.token')
-    monkeypatch.delenv('RADICAL_ORBIT_BRIDGE_TOKEN', raising=False)
-    monkeypatch.delenv('RADICAL_ORBIT_BRIDGE_URL',   raising=False)
+    monkeypatch.setattr(utils, 'URL_FILE',   tmp_path / 'broker.url')
+    monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'broker.token')
+    monkeypatch.delenv('RADICAL_ORBIT_BROKER_TOKEN', raising=False)
+    monkeypatch.delenv('RADICAL_ORBIT_BROKER_URL',   raising=False)
     cert, key = self_signed
 
     servers  = []
@@ -233,7 +233,7 @@ def test_auth_gate_401_without_token_and_cookie_flow(harness):
     # No token -> 401 on a capability route.
     r = httpx.post(srv.url + '/endpoint/list')
     assert r.status_code == 401
-    assert r.json()['detail'] == 'missing or invalid bridge token'
+    assert r.json()['detail'] == 'missing or invalid broker token'
 
     # Bearer token passes.
     r = httpx.post(srv.url + '/endpoint/list',
@@ -244,11 +244,11 @@ def test_auth_gate_401_without_token_and_cookie_flow(harness):
     r = httpx.post(srv.url + '/auth',
                    headers={'authorization': 'Bearer sekret'})
     assert r.status_code == 200
-    assert r.cookies.get('orbit_bridge_token') == 'sekret'
+    assert r.cookies.get('orbit_broker_token') == 'sekret'
 
     # The cookie alone then passes.
     r = httpx.post(srv.url + '/endpoint/list',
-                   cookies={'orbit_bridge_token': 'sekret'})
+                   cookies={'orbit_broker_token': 'sekret'})
     assert r.status_code == 200
 
 
@@ -283,7 +283,7 @@ def test_explorer_served_at_root(harness):
 
 
 # ---------------------------------------------------------------------------
-# Discovery: /endpoint/list bridge-era shape (namespaces present)
+# Discovery: /endpoint/list broker-era shape (namespaces present)
 # ---------------------------------------------------------------------------
 
 def test_endpoint_list_shape_with_live_endpoint(harness):
@@ -298,8 +298,8 @@ def test_endpoint_list_shape_with_live_endpoint(harness):
     assert r.status_code == 200
     data = r.json()['data']
 
-    # Bridge-era envelope: {bridge:{url}, endpoints:{...}}.
-    assert 'url' in data['bridge']
+    # Broker-era envelope: {broker:{url}, endpoints:{...}}.
+    assert 'url' in data['broker']
     endpoints = data['endpoints']
     assert 'epA'    in endpoints
     assert 'broker' in endpoints                          # broker is a participant
@@ -477,7 +477,7 @@ def test_terminate_and_alias_self_sigterm(harness, monkeypatch):
     monkeypatch.setattr(bmod.os, 'kill',
                         lambda pid, sig: killed.setdefault('sig', sig))
 
-    r = httpx.post(srv.url + '/bridge/terminate')
+    r = httpx.post(srv.url + '/broker/terminate')
     assert r.status_code == 200
     assert r.json()['status'] == 'terminating'
     assert _wait(lambda: killed.get('sig') == bmod.signal.SIGTERM, timeout=2.0)

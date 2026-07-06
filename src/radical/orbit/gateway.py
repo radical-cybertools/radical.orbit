@@ -52,9 +52,9 @@ they are capability-style within the token trust domain.  Only TTL/persistent
 sessions are meaningful for such callers; owner-checked reattach (403) is an M6
 concern.
 
-The gateway preserves the **exact** bridge-era HTTP surface (paths, response
-shapes, SSE message envelopes) so the Explorer UI keeps working unchanged; it is
-the compat tier the broker-native runtime does not need.
+The gateway serves the **exact** HTTP surface (paths, response shapes, SSE
+message envelopes) that the Explorer UI and other HTTP clients expect; it is the
+compat tier that broker-native participants do not need.
 """
 
 # pylint: disable=protected-access
@@ -82,9 +82,9 @@ log = logging.getLogger("radical.orbit.gateway")
 
 # Per proxied request: the gateway forwards an HTTP request to the endpoint over
 # the shared broker pending table and waits this many seconds for the response
-# before returning 504.  Carried over verbatim from the bridge (``bridge.py``
-# ``REQUEST_TIMEOUT``): a submit batch of thousands of tasks (whose dragon-side
-# ProcessGroup creation takes seconds per task) genuinely takes this long.
+# before returning 504.  It is deliberately long: a submit batch of thousands of
+# tasks (whose dragon-side ProcessGroup creation takes seconds per task)
+# genuinely takes this long.
 REQUEST_TIMEOUT = 600
 
 # The name the broker reserves for its own hosted-plugin participant.  Kept in
@@ -92,9 +92,8 @@ REQUEST_TIMEOUT = 600
 # module import cycle (broker imports gateway).
 BROKER_NAME = 'broker'
 
-# Allowed CORS origins — carried over from ``Bridge._setup_middleware``.  LUCID
-# needs credentials; browsers reject credentials + wildcard origin, so the
-# allow-list is explicit.
+# Allowed CORS origins.  LUCID needs credentials; browsers reject credentials +
+# wildcard origin, so the allow-list is explicit.
 CORS_ORIGINS = [
     "http://localhost",
     "http://localhost:8080",
@@ -103,7 +102,7 @@ CORS_ORIGINS = [
     "https://dev-1.bv-brc.org",
 ]
 
-# Hop-by-hop headers plus the bridge credential, stripped before a request is
+# Hop-by-hop headers plus the broker credential, stripped before a request is
 # forwarded to an endpoint (so the shared token never rides on to plugins).
 _HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate",
                "proxy-authorization", "te", "trailers",
@@ -171,8 +170,7 @@ class Gateway:
         # registered at runtime (the ``iri.<endpoint>`` instances) — the packaged
         # ``data/plugins/*.js`` covers the static plugins.  Written and read on
         # the routing loop (``serve_plugin``, refreshed on a miss from
-        # ``Broker.get_ui_modules()``); no lock needed.  Mirrors the bridge's
-        # ``_plugin_ui_module_js`` (the bridge cached the same host modules).
+        # ``Broker.get_ui_modules()``); no lock needed.
         self._plugin_ui_module_js: Dict[str, str] = {}
 
         self._setup_middleware()
@@ -194,7 +192,7 @@ class Gateway:
     def _setup_middleware(self) -> None:
         """Attach the ingress token gate + the CORS allow-list.
 
-        Ported from ``Bridge._setup_middleware``: auth is added *before* CORS so
+        Auth is added *before* CORS so
         CORS ends up outermost (Starlette applies the most-recently-added
         middleware first), which means a 401 still carries CORS headers and the
         browser can read it.  The broker suppresses its own HTTP auth middleware
@@ -213,7 +211,7 @@ class Gateway:
 
     @staticmethod
     def _request_token(request: Request) -> Optional[str]:
-        """Bearer header first, else the ``orbit_bridge_token`` cookie (the
+        """Bearer header first, else the ``orbit_broker_token`` cookie (the
         browser/SSE path minted by ``POST /auth``)."""
         auth = request.headers.get('authorization', '')
         if auth.lower().startswith('bearer '):
@@ -223,7 +221,7 @@ class Gateway:
     async def _auth_dispatch(self, request: Request, call_next):
         """Require the shared token on every capability-bearing HTTP route.
 
-        Exempt (ported verbatim from the bridge): CORS preflight (``OPTIONS``),
+        Exempt (ported verbatim from the broker): CORS preflight (``OPTIONS``),
         the UI shell (``/``), and the static plugin JS (``/plugins/...``) —
         these carry no capability and must load so the Explorer can prompt for
         the token.  ``POST /auth`` is *not* exempt: it is reached only with a
@@ -240,7 +238,7 @@ class Gateway:
             return JSONResponse(
                 status_code=401,
                 content={"error": True, "status_code": 401,
-                         "detail": "missing or invalid bridge token"})
+                         "detail": "missing or invalid broker token"})
         return await call_next(request)
 
     # ── event subscriptions (SSE fan-out) ─────────────────────────────
@@ -260,15 +258,15 @@ class Gateway:
 
     @staticmethod
     def _sse_frame(topic: str, data: Any) -> str:
-        """Format one SSE frame exactly as the bridge wrote it on the wire:
+        """Format one SSE frame as HTTP clients expect it:
         ``data: {"topic": <topic>, "data": <data>}\\n\\n`` (no keepalive
-        comments — the bridge emitted none)."""
+        comments)."""
         return "data: %s\n\n" % json.dumps({"topic": topic, "data": data})
 
     def _on_event(self, event: Dict[str, Any]) -> None:
         """Raw event tap callback — runs on the **plugin-host loop**.
 
-        Renders the legacy notification envelope
+        Renders the SSE notification envelope
         ``{topic: 'notification', data: {endpoint, plugin, topic, data}}`` and
         hands it to the routing loop, which owns the per-client queues.
         """
@@ -288,8 +286,8 @@ class Gateway:
     def _on_topology(self) -> None:
         """Topology-change listener — runs on the **routing loop**.
 
-        Emits the legacy topology envelope with the same ``{bridge, endpoints}``
-        payload the discovery route returns (the exact shape the bridge sent).
+        Emits the topology envelope with the same ``{broker, endpoints}``
+        payload the discovery route returns (the exact shape HTTP clients consume).
         The dynamic ``ui_module`` cache is refreshed lazily on a ``serve_plugin``
         miss (a bounded cross-thread fetch off the hot path) rather than here, so
         a topology change never blocks the routing loop on host-loop state.
@@ -304,14 +302,14 @@ class Gateway:
         for q in list(self._sse_clients):
             q.push(frame)
 
-    # ── discovery snapshot (bridge-era shape) ─────────────────────────
+    # ── discovery snapshot (HTTP shape) ───────────────────────────────
 
     @staticmethod
     def _full_namespace(name: str, ns: str) -> str:
-        """Present a star-model namespace the way the old API did.
+        """Present a star-model namespace the way HTTP clients expect.
 
         Endpoint plugins advertise **endpoint-relative** namespaces
-        (``/{instance}``); the bridge-era clients + Explorer consume the *full*
+        (``/{instance}``); HTTP clients + the Explorer consume the *full*
         ``/{endpoint}/{instance}`` prefix.  Prefix the endpoint name unless the
         namespace is already rooted at it (the broker's own hosted-plugin
         participant advertises the full ``/broker/{instance}`` form).
@@ -324,11 +322,11 @@ class Gateway:
         return prefix + ns
 
     def _discovery_snapshot(self) -> Dict[str, Any]:
-        """Build the bridge-era discovery structure from the topology snapshot.
+        """Build the HTTP discovery structure from the topology snapshot.
 
-        Shape (unchanged from the bridge)::
+        Shape::
 
-            {"bridge":    {"url": <broker url>},
+            {"broker":    {"url": <broker url>},
              "endpoints": {<name>: {"endpoint": {...},
                                     "plugins":  {<pname>: {namespace, ...}}}}}
 
@@ -347,16 +345,16 @@ class Gateway:
                              "liveness": info.get('liveness')},
                 "plugins":  plugins,
             }
-        return {"bridge":    {"url": self._broker.url},
+        return {"broker":    {"url": self._broker.url},
                 "endpoints": endpoints}
 
-    # ── header hygiene (ported from Bridge._strip_headers) ────────────
+    # ── header hygiene ────────────────────────────────────────────────
 
     @staticmethod
     def _strip_headers(request: Request) -> Dict[str, str]:
-        """Drop hop-by-hop headers + the bridge credential before forwarding.
+        """Drop hop-by-hop headers + the broker credential before forwarding.
 
-        The ``authorization`` header and the ``orbit_bridge_token`` cookie are
+        The ``authorization`` header and the ``orbit_broker_token`` cookie are
         removed so the shared token is never forwarded to endpoint plugins; any
         other cookies are preserved.
         """
@@ -422,7 +420,7 @@ class Gateway:
             self_._routing_loop = asyncio.get_running_loop()
             q = _SSEQueue(self_._sse_depth)
             self_._sse_clients.add(q)
-            # The bridge sends the current topology as the first SSE frame.
+            # The broker sends the current topology as the first SSE frame.
             q.push(self_._sse_frame('topology', self_._discovery_snapshot()))
 
             async def event_generator():
@@ -463,7 +461,7 @@ class Gateway:
                                  "endpoint": endpoint_name})
 
         async def _terminate():
-            # Route both terminate paths through the broker's self-SIGTERM floor
+            # Route the terminate path through the broker's self-SIGTERM floor
             # (``_handle_control`` schedules the delayed ``os.kill``).
             await self_._broker._handle_control('gateway', {'op': 'terminate'})
             return JSONResponse({
@@ -471,12 +469,7 @@ class Gateway:
                 "message": "Broker will terminate shortly. "
                            "Endpoints will not be shut down."})
 
-        # Exact old path — the Explorer JS calls it; ``/broker/terminate`` is the
-        # forward-looking alias the rename PR keeps once the old one retires.
-        @app.post("/bridge/terminate", tags=["Management"])
-        async def terminate_bridge():
-            return await _terminate()
-
+        # Administrative terminate — the Explorer JS posts here.
         @app.post("/broker/terminate", tags=["Management"])
         async def terminate_broker():
             return await _terminate()
@@ -522,7 +515,7 @@ class Gateway:
             tags=["Proxy"],
             summary="Proxy requests to endpoint plugins")
         async def proxy(endpoint_name: str, path: str, request: Request):
-            # Map the bridge-era URL ``/{endpoint}/{plugin_ns}/...`` onto the
+            # Map the HTTP URL ``/{endpoint}/{plugin_ns}/...`` onto the
             # star model: dst = endpoint, path = the endpoint-relative remainder.
             forward_path = '/' + path
             if request.url.query:
@@ -556,7 +549,7 @@ class Gateway:
                     status_code=504,
                     detail="Upstream (endpoint) timeout") from exc
             except RuntimeError as exc:
-                # Unroutable dst (unknown endpoint) mirrors the bridge's 404;
+                # Unroutable dst (unknown endpoint) mirrors the broker's 404;
                 # a full pending table is a 503.
                 if 'unknown' in str(exc):
                     raise HTTPException(
@@ -572,7 +565,7 @@ class Gateway:
             return Response(content=rbody, status_code=status,
                             headers=dict(rheaders))
 
-    # ── static-asset helpers (ported from the bridge) ─────────────────
+    # ── static-asset helpers ──────────────────────────────────────────
 
     @staticmethod
     def _no_cache() -> Dict[str, str]:

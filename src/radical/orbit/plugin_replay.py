@@ -226,7 +226,12 @@ class ReplayClient(PluginClient):
     2. Drain ``replay_iter(cursor_id, patterns=..., session=...)``, feeding each
        replayed event through the same handler as the live callback.
     3. **Dedup by ``seq``.**  Replayed events carry ``event['seq']``; keep a set
-       of seen ``seq`` (per stream) and skip any already seen.
+       of seen ``seq`` (per stream) and skip any already seen.  Live delivery
+       now exposes the same broker-stamped ``seq`` too: register the live
+       callback with ``runtime.register_callback(..., with_meta=True)`` and read
+       ``meta['seq']`` (the identical authoritative value this plugin retains),
+       so the dedup keys on the broker ``seq`` on both streams — no application
+       key needed.
 
     Because live delivery starts *before* replay finishes, the two streams
     overlap around the join point; the ``seq`` dedup discards the duplicates, so
@@ -351,7 +356,7 @@ class PluginReplay(Plugin):
         disabled when the tap is absent (e.g. a host with no ``broker_tap``).
         '''
         from .utils import host_role
-        if host_role(app)['role'] != 'bridge':
+        if host_role(app)['role'] != 'broker':
             return False
         return getattr(app.state, 'broker_tap', None) is not None
 
@@ -452,6 +457,24 @@ class PluginReplay(Plugin):
             except Exception as e:
                 log.exception('[%s] replay sweeper error: %s',
                               self.instance_name, e)
+
+    async def shutdown(self) -> None:
+        '''Cancel the background sweeper and drop the raw-event tap, then run
+        the base teardown (cleanup task + sessions).  Keeps the host loop free
+        of pending plugin tasks on broker shutdown.'''
+        if self._sweeper is not None and not self._sweeper.done():
+            self._sweeper.cancel()
+            try:    await self._sweeper
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        if self._untap is not None:
+            try:    self._untap()
+            except Exception:
+                pass
+            self._untap = None
+        await super().shutdown()
 
     # -- routes ------------------------------------------------------------
 

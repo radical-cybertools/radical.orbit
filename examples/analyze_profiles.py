@@ -2,7 +2,7 @@
 """
 Analyze radical.prof profiles from an Endpoint throughput benchmark run.
 
-Reads client.prof, bridge.prof, endpoint.prof from a directory, combines
+Reads client.prof, broker.prof, endpoint.prof from a directory, combines
 them into a single timeline, and reports per-phase latency statistics
 clustered by batch size and homogeneous/heterogeneous task mode.
 
@@ -12,7 +12,7 @@ Usage:
     profile_dir defaults to the current working directory.
 
 The script expects the throughput benchmark to have been run with
-RADICAL_ORBIT_PROFILE=True set in all three processes (client, bridge,
+RADICAL_ORBIT_PROFILE=True set in all three processes (client, broker,
 endpoint).
 """
 
@@ -33,12 +33,12 @@ PHASES = [
     # Client
     ('client_send',       'client_recv',        'client_rtt'),
 
-    # Bridge inbound
-    ('bridge_recv',       'bridge_body_prep',   'bridge_http_recv'),
-    ('bridge_body_prep',  'bridge_ser',         'bridge_body_prep'),
-    ('bridge_ser',        'bridge_ser_done',    'bridge_req_ser'),
-    ('bridge_ser_done',   'bridge_ws_send',     'bridge_pre_ws_send'),
-    ('bridge_ws_send',    'bridge_ws_sent',     'bridge_ws_send'),
+    # Broker inbound
+    ('broker_recv',       'broker_body_prep',   'broker_http_recv'),
+    ('broker_body_prep',  'broker_ser',         'broker_body_prep'),
+    ('broker_ser',        'broker_ser_done',    'broker_req_ser'),
+    ('broker_ser_done',   'broker_ws_send',     'broker_pre_ws_send'),
+    ('broker_ws_send',    'broker_ws_sent',     'broker_ws_send'),
 
     # Endpoint inbound
     ('endpoint_deser',        'endpoint_deser_done',    'endpoint_ws_deser'),
@@ -53,10 +53,10 @@ PHASES = [
     ('endpoint_resp_ser',     'endpoint_resp_ser_done', 'endpoint_resp_model_ser'),
     ('endpoint_ws_send',      'endpoint_ws_sent',       'endpoint_ws_send'),
 
-    # Bridge outbound
-    ('bridge_deser',      'bridge_deser_done',  'bridge_resp_deser'),
-    ('bridge_ws_recv',    'bridge_resp_ser',     'bridge_pre_resp_ser'),
-    ('bridge_resp_ser',   'bridge_reply',       'bridge_resp_ser'),
+    # Broker outbound
+    ('broker_deser',      'broker_deser_done',  'broker_resp_deser'),
+    ('broker_ws_recv',    'broker_resp_ser',     'broker_pre_resp_ser'),
+    ('broker_resp_ser',   'broker_reply',       'broker_resp_ser'),
 ]
 
 
@@ -65,7 +65,7 @@ PHASES = [
 def _load_profiles(prof_dir):
     """Find and load .prof files, return combined timeline."""
 
-    patterns = ['client.prof', 'client.task.prof', 'bridge.prof', 'endpoint.prof']
+    patterns = ['client.prof', 'client.task.prof', 'broker.prof', 'endpoint.prof']
     prof_files = []
     for pat in patterns:
         found = glob.glob(os.path.join(prof_dir, pat))
@@ -124,8 +124,8 @@ def _classify_request(req_data):
     """
     msg = req_data['_msg']
 
-    # The bridge_recv or endpoint_recv message contains "METHOD /path"
-    route_msg = msg.get('endpoint_recv', msg.get('bridge_recv', ''))
+    # The broker_recv or endpoint_recv message contains "METHOD /path"
+    route_msg = msg.get('endpoint_recv', msg.get('broker_recv', ''))
 
     if 'submit/' in route_msg:
         # Determine batch size from body_ser_done message (byte count)
@@ -195,7 +195,7 @@ def _cluster_into_rounds(requests, durations):
     def _earliest(req_id):
         events = requests[req_id]['_events']
         return events.get('client_send',
-               events.get('bridge_recv',
+               events.get('broker_recv',
                events.get('endpoint_recv', float('inf'))))
 
     sorted_ids = sorted(requests.keys(), key=_earliest)
@@ -383,8 +383,8 @@ def main():
             t_vals = []
             for rid in rids:
                 events = requests[rid]['_events']
-                t0 = events.get('client_send', events.get('bridge_recv'))
-                t1 = events.get('client_recv', events.get('bridge_reply'))
+                t0 = events.get('client_send', events.get('broker_recv'))
+                t1 = events.get('client_recv', events.get('broker_reply'))
                 if t0 is not None and t1 is not None:
                     t_vals.append(t1 - t0)
 

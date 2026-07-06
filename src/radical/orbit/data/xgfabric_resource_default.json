@@ -1,4 +1,4 @@
 {
   "name"            : "default",
-  "bridge_url"      : "https://localhost:8000",
+  "broker_url"      : "https://localhost:8000",
 }

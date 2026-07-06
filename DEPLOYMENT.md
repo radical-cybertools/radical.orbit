@@ -8,7 +8,7 @@
         |  HTTPS (8000)
         v
   ┌─────────────┐
-  │   Bridge    │  ← public-facing, DMZ or bastion
+  │   Broker    │  ← public-facing, DMZ or bastion
   └─────────────┘
         |
         |  WSS (outbound from HPC)
@@ -18,45 +18,45 @@
   └─────────────┘   └─────────────┘
 ```
 
-**Key point**: endpoints initiate the outbound WebSocket connection to the bridge.
+**Key point**: endpoints initiate the outbound WebSocket connection to the broker.
 No inbound ports need to be opened on the HPC firewall.
 
-## Bridge Setup
+## Broker Setup
 
-The bridge is a single FastAPI/uvicorn process running the active broker: a
+The broker is a single FastAPI/uvicorn process running the active broker: a
 WebSocket `/register` hub that routes between participants, with the gateway
 compat tier (HTTP REST, SSE, Explorer) attached on the same port by default. It
 holds no job state — all session state lives in the endpoint processes.
 
 ```sh
 # HTTP (development only)
-./bin/radical-orbit-bridge.py
+./bin/radical-orbit-broker.py
 
 # HTTPS (production)
-export RADICAL_ORBIT_BRIDGE_CERT=/path/to/cert.pem
-export RADICAL_ORBIT_BRIDGE_KEY=/path/to/key.pem
-./bin/radical-orbit-bridge.py
+export RADICAL_ORBIT_BROKER_CERT=/path/to/cert.pem
+export RADICAL_ORBIT_BROKER_KEY=/path/to/key.pem
+./bin/radical-orbit-broker.py
 
 # Headless broker (WebSocket ingress only, no HTTP/SSE/Explorer)
-./bin/radical-orbit-bridge.py --no-gateway
+./bin/radical-orbit-broker.py --no-gateway
 ```
 
 Set the bind address/port with `--host` / `--port` (defaults `0.0.0.0:8000`).
 
-### systemd Unit File (Bridge)
+### systemd Unit File (Broker)
 
 ```ini
 [Unit]
-Description=ORBIT Bridge
+Description=ORBIT Broker
 After=network.target
 
 [Service]
 Type=simple
 User=radical
 WorkingDirectory=/opt/orbit
-Environment=RADICAL_ORBIT_BRIDGE_CERT=/opt/orbit/certs/bridge_cert.pem
-Environment=RADICAL_ORBIT_BRIDGE_KEY=/opt/orbit/certs/bridge_key.pem
-ExecStart=/opt/orbit/bin/radical-orbit-bridge.py
+Environment=RADICAL_ORBIT_BROKER_CERT=/opt/orbit/certs/broker_cert.pem
+Environment=RADICAL_ORBIT_BROKER_KEY=/opt/orbit/certs/broker_key.pem
+ExecStart=/opt/orbit/bin/radical-orbit-broker.py
 Restart=on-failure
 RestartSec=5s
 
@@ -73,7 +73,7 @@ or as long-running daemon processes on login nodes.
 # Direct launch (login node daemon)
 ./bin/radical-orbit-endpoint.py \
   --name my-hpc-endpoint \
-  --url  wss://bridge.example.org:8000 \
+  --url  wss://broker.example.org:8000 \
   -p     sysinfo,psij,queue_info,staging
 
 # Via SLURM batch script
@@ -89,11 +89,11 @@ sbatch endpoint_job.sh
 #SBATCH --nodes=1
 #SBATCH --time=24:00:00
 
-export RADICAL_ORBIT_BRIDGE_CERT=/path/to/bridge_cert.pem
+export RADICAL_ORBIT_BROKER_CERT=/path/to/broker_cert.pem
 
 ./bin/radical-orbit-endpoint-wrapper.sh \
   --name "$SLURM_CLUSTER_NAME-endpoint" \
-  --url  wss://bridge.example.org:8000 \
+  --url  wss://broker.example.org:8000 \
   -p     sysinfo,psij,queue_info,staging,rhapsody
 ```
 
@@ -123,13 +123,13 @@ GET /my-endpoint/psij/health
    "uptime_seconds": 3600.0, "active_sessions": 2}
 ```
 
-The bridge itself does not yet have a dedicated `/health` endpoint, but
+The broker itself does not yet have a dedicated `/health` endpoint, but
 `GET /endpoint/list` returning 200 is a reliable liveness check.
 
 For load-balancer health probes:
 
 ```sh
-curl -sk https://bridge:8000/endpoint/list -X POST | jq .
+curl -sk https://broker:8000/endpoint/list -X POST | jq .
 ```
 
 ## Observability
@@ -139,14 +139,14 @@ variable (falling back to the generic `RADICAL_LOG_LVL`):
 
 ```sh
 # DEBUG logging
-RADICAL_ORBIT_LOG_LVL=DEBUG ./bin/radical-orbit-bridge.py
+RADICAL_ORBIT_LOG_LVL=DEBUG ./bin/radical-orbit-broker.py
 ```
 
 Key log namespaces:
 
 | Namespace          | Content                                      |
 |--------------------|----------------------------------------------|
-| `radical.orbit`     | Bridge, endpoint service, plugin base             |
+| `radical.orbit`     | Broker, endpoint service, plugin base             |
 | `radical.orbit.client` | Python client, SSE listener               |
 
 Structured logging is not yet enabled; logs go to stderr by default.

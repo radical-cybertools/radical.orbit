@@ -1,7 +1,7 @@
 """Direct-dispatch machinery shared by the endpoint hosts.
 
 Both the WebSocket endpoint (``service.py`` / ``runtime.py``) and the
-broker-hosted plugin host (``bridge_plugin_host.py``) bypass the ASGI/FastAPI
+broker-hosted plugin host (``broker_plugin_host.py``) bypass the ASGI/FastAPI
 stack on the hot request path: they match a forwarded request against a plain
 route table and feed the handler a lightweight request stand-in.  The two
 pieces of that fast path live here so every host imports the *same* code:
@@ -14,7 +14,7 @@ pieces of that fast path live here so every host imports the *same* code:
   tuples ``Plugin._register_direct`` appends to ``app.state.direct_routes``).
 
 This is a pure extraction — the behaviour is exactly what ``service.py`` and
-``bridge_plugin_host.py`` carried inline before, and the old test suite proves
+``broker_plugin_host.py`` carried inline before, and the old test suite proves
 the move changed nothing.
 """
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""radical-orbit-run — submit one task to the bridge task dispatcher and
+"""radical-orbit-run — submit one task to the broker task dispatcher and
 block until it reaches a terminal state.
 
 Invoked per Makeflow rule by ``radical-orbit-makeflow-prep``-rewritten

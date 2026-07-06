@@ -6,9 +6,9 @@ CONTEXT_DIR="$( dirname "$DOCKER_DIR" )"
 IMAGE_NAME="${RADICAL_ORBIT_IMAGE:-radicalcybertools/radical.orbit}"
 IMAGE_TAG="${RADICAL_ORBIT_TAG:-latest}"
 BRANCH="${RADICAL_ORBIT_BRANCH:-master}"
-GENERATE_BRIDGE_CERT=true
-BRIDGE_IP=127.0.0.1
-BRIDGE_HOSTNAME=${RADICAL_ORBIT_BRIDGE_HOSTNAME:-bridge}
+GENERATE_BROKER_CERT=true
+BROKER_IP=127.0.0.1
+BROKER_HOSTNAME=${RADICAL_ORBIT_BROKER_HOSTNAME:-broker}
 PLATFORM="linux/amd64"  # linux/amd64,linux/arm64
 NO_CACHE=""
 
@@ -35,8 +35,8 @@ echo "Dockerfile: $DOCKER_DIR/Dockerfile"
 echo "radical.orbit branch: $BRANCH"
 
 docker build $NO_CACHE --platform $PLATFORM \
-             --build-arg GENERATE_BRIDGE_CERT="$GENERATE_BRIDGE_CERT" \
-             --build-arg BRIDGE_IP="$BRIDGE_IP" \
-             --build-arg BRIDGE_HOSTNAME="$BRIDGE_HOSTNAME" \
+             --build-arg GENERATE_BROKER_CERT="$GENERATE_BROKER_CERT" \
+             --build-arg BROKER_IP="$BROKER_IP" \
+             --build-arg BROKER_HOSTNAME="$BROKER_HOSTNAME" \
              --build-arg RADICAL_ORBIT_BRANCH="$BRANCH" \
              -t "$FULL_TAG" -f "$DOCKER_DIR/Dockerfile" "$CONTEXT_DIR"

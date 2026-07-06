@@ -26,9 +26,9 @@ command itself.
 
 ## Prerequisites
 
-1. A radical.orbit **bridge** running somewhere reachable
-   (`RADICAL_ORBIT_BRIDGE_URL` set).
-2. Two radical.orbit **endpoints** connected to that bridge:
+1. A radical.orbit **broker** running somewhere reachable
+   (`RADICAL_ORBIT_BROKER_URL` set).
+2. Two radical.orbit **endpoints** connected to that broker:
    - one named `endpoint_a` with the `task_dispatcher`, `rhapsody`, `staging`,
      and `psij` plugins loaded
    - one named `endpoint_b` with the same plugins loaded
@@ -46,15 +46,15 @@ command itself.
 scp pools.json endpoint_a_host:~/.radical/orbit/task_dispatcher/pools.json
 scp pools.json endpoint_b_host:~/.radical/orbit/task_dispatcher/pools.json
 
-# Start the bridge on the client host
-radical-orbit-bridge.py &
+# Start the broker on the client host
+radical-orbit-broker.py &
 
 # Start endpoint_a on its login node
-RADICAL_ORBIT_BRIDGE_URL=... radical-orbit-endpoint-wrapper.sh -n endpoint_a \
+RADICAL_ORBIT_BROKER_URL=... radical-orbit-endpoint-wrapper.sh -n endpoint_a \
     --plugins task_dispatcher,rhapsody,staging,psij &
 
 # Start endpoint_b on its login node
-RADICAL_ORBIT_BRIDGE_URL=... radical-orbit-endpoint-wrapper.sh -n endpoint_b \
+RADICAL_ORBIT_BROKER_URL=... radical-orbit-endpoint-wrapper.sh -n endpoint_b \
     --plugins task_dispatcher,rhapsody,staging,psij &
 
 # On the client host, run the workflow
@@ -79,7 +79,7 @@ wrapper:
 2. Calls `task_dispatcher.submit_task` with a stable `task_id`
    computed from the command plus its inputs, outputs, and the
    preprocessor-generated `--run-id`.
-3. Subscribes to the bridge's SSE stream and blocks on a
+3. Subscribes to the broker's SSE stream and blocks on a
    `task_status` notification for that `task_id`.
 4. On success, downloads declared outputs (`--out`) via
    `task_dispatcher.stage_out`.
@@ -98,14 +98,14 @@ direct endpoint-to-endpoint transport is needed.
 
 ## Observability
 
-The bridge's `/events` SSE channel broadcasts three topics from the
+The broker's `/events` SSE channel broadcasts three topics from the
 dispatcher:
 
 - `task_status`         — rule-level state transitions
 - `pilot_status`        — pilot lifecycle events
 - `autoscale_decision`  — logged every time the strategy submits a pilot
 
-The bridge's Explorer UI (at the bridge's root URL) shows all of these
+The broker's Explorer UI (at the broker's root URL) shows all of these
 live.
 
 ## Known limitations in v1

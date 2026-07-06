@@ -5,7 +5,7 @@ A ``PoolConfig`` is a durable resource scope that owns a fleet of
 pilots and a single dispatch strategy.  Each pool carries a menu of
 named ``PilotSize`` entries; the strategy picks one by key when it
 decides to submit a new pilot.  See ``plans/task_dispatcher_design.md``
-and ``memory/project_bridge_dispatcher.md`` for the surrounding design.
+and ``memory/project_broker_dispatcher.md`` for the surrounding design.
 
 The ``rhapsody_backend`` field on ``PilotSize`` is **required** — there
 is deliberately no pool-level default and no cascade, to keep the
@@ -28,7 +28,7 @@ import json
 
 # Reserved pool name auto-materialised by the dispatcher when a
 # session registers without declaring any pools.  See
-# memory/project_bridge_dispatcher.md (Phase 4) for the lifecycle.
+# memory/project_broker_dispatcher.md (Phase 4) for the lifecycle.
 DEFAULT_POOL_NAME: str = 'default'
 
 

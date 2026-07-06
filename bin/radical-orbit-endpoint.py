@@ -4,7 +4,7 @@
 All logic lives in :class:`radical.orbit.runtime.EndpointRuntime` (also exported
 as ``radical.orbit.Endpoint``) — the single node abstraction that dials the
 broker over one outbound WebSocket and serves (and/or consumes) plugins.  This
-script keeps its bridge-era filename and CLI surface; it handles argparse, log
+script keeps its broker-era filename and CLI surface; it handles argparse, log
 configuration, and signal-driven shutdown, then hands off to the runtime.
 """
 
@@ -27,16 +27,16 @@ def main():
     parser = argparse.ArgumentParser(description="ORBIT Service")
     parser.add_argument("--name",      "-n", nargs="?", help="Endpoint name")
     parser.add_argument("--url",       "-u", nargs="?",
-                        help="Broker URL.  CLI > $RADICAL_ORBIT_BRIDGE_URL > "
-                             "~/.radical/orbit/bridge.url.")
+                        help="Broker URL.  CLI > $RADICAL_ORBIT_BROKER_URL > "
+                             "~/.radical/orbit/broker.url.")
     parser.add_argument("--cert",      "-c", nargs="?",
                         help="Broker TLS cert path.  CLI > "
-                             "$RADICAL_ORBIT_BRIDGE_CERT > "
-                             "~/.radical/orbit/bridge_cert.pem.")
+                             "$RADICAL_ORBIT_BROKER_CERT > "
+                             "~/.radical/orbit/broker_cert.pem.")
     parser.add_argument("--token",     "-t",
                         help="Shared broker auth token.  CLI > "
-                             "$RADICAL_ORBIT_BRIDGE_TOKEN > "
-                             "~/.radical/orbit/bridge.token.")
+                             "$RADICAL_ORBIT_BROKER_TOKEN > "
+                             "~/.radical/orbit/broker.token.")
     parser.add_argument("--plugins",   "-p", default="default",
                         help="Comma-separated plugins to load (default: "
                              "the role-specific default set).  Special "

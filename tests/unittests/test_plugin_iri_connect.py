@@ -17,7 +17,7 @@ from radical.orbit.plugin_iri_connect import PluginIRIConnect
 # ---------------------------------------------------------------------------
 
 class _MockHost:
-    """Minimal stand-in for BridgePluginHost."""
+    """Minimal stand-in for BrokerPluginHost."""
 
     def __init__(self):
         self._plugins = {}
@@ -35,13 +35,13 @@ class _MockHost:
 
 
 @pytest.fixture
-def bridge_app():
+def broker_app():
     app  = FastAPI()
     host = _MockHost()
-    app.state.is_bridge    = True
+    app.state.is_broker    = True
     app.state.endpoint_service = host
-    app.state.endpoint_name    = 'bridge'
-    app.state.bridge_url   = ''
+    app.state.endpoint_name    = 'broker'
+    app.state.broker_url   = ''
     return app, host
 
 
@@ -55,19 +55,19 @@ def _cleanup_registry():
 # Plugin basics
 # ---------------------------------------------------------------------------
 
-def test_is_enabled_on_bridge(bridge_app):
-    app, _ = bridge_app
+def test_is_enabled_on_broker(broker_app):
+    app, _ = broker_app
     assert PluginIRIConnect.is_enabled(app) is True
 
 
 def test_is_disabled_on_endpoint():
     app = FastAPI()
-    app.state.is_bridge = False
+    app.state.is_broker = False
     assert PluginIRIConnect.is_enabled(app) is False
 
 
-def test_init(bridge_app):
-    app, _ = bridge_app
+def test_init(broker_app):
+    app, _ = broker_app
     plugin = PluginIRIConnect(app)
     assert plugin.instance_name == 'iri_connect'
 
@@ -77,8 +77,8 @@ def test_init(bridge_app):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_list_endpoints(bridge_app):
-    app, _ = bridge_app
+async def test_list_endpoints(broker_app):
+    app, _ = broker_app
     plugin = PluginIRIConnect(app)
     request = MagicMock()
     result = await plugin.list_endpoints(request)
@@ -92,8 +92,8 @@ async def test_list_endpoints(bridge_app):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_connect(bridge_app):
-    app, host = bridge_app
+async def test_connect(broker_app):
+    app, host = broker_app
     plugin = PluginIRIConnect(app)
 
     request = MagicMock()
@@ -106,11 +106,11 @@ async def test_connect(bridge_app):
 
 
 @pytest.mark.asyncio
-async def test_connect_reconnect_updates_token(bridge_app):
+async def test_connect_reconnect_updates_token(broker_app):
     """A second connect for the same endpoint refreshes the bearer token
     in place (no 409) — clients can rotate stale credentials without
     disconnecting first."""
-    app, host = bridge_app
+    app, host = broker_app
     plugin = PluginIRIConnect(app)
 
     request = MagicMock()
@@ -134,8 +134,8 @@ async def test_connect_reconnect_updates_token(bridge_app):
 
 
 @pytest.mark.asyncio
-async def test_connect_bad_endpoint(bridge_app):
-    app, _ = bridge_app
+async def test_connect_bad_endpoint(broker_app):
+    app, _ = broker_app
     plugin = PluginIRIConnect(app)
 
     request = MagicMock()
@@ -146,8 +146,8 @@ async def test_connect_bad_endpoint(bridge_app):
 
 
 @pytest.mark.asyncio
-async def test_connect_empty_token(bridge_app):
-    app, _ = bridge_app
+async def test_connect_empty_token(broker_app):
+    app, _ = broker_app
     plugin = PluginIRIConnect(app)
 
     request = MagicMock()
@@ -158,8 +158,8 @@ async def test_connect_empty_token(bridge_app):
 
 
 @pytest.mark.asyncio
-async def test_disconnect(bridge_app):
-    app, host = bridge_app
+async def test_disconnect(broker_app):
+    app, host = broker_app
     plugin = PluginIRIConnect(app)
 
     # Connect first
@@ -178,8 +178,8 @@ async def test_disconnect(bridge_app):
 
 
 @pytest.mark.asyncio
-async def test_disconnect_not_found(bridge_app):
-    app, _ = bridge_app
+async def test_disconnect_not_found(broker_app):
+    app, _ = broker_app
     plugin = PluginIRIConnect(app)
 
     request = MagicMock()
@@ -193,8 +193,8 @@ async def test_disconnect_not_found(bridge_app):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_status(bridge_app):
-    app, host = bridge_app
+async def test_status(broker_app):
+    app, host = broker_app
     plugin = PluginIRIConnect(app)
 
     # Connect one endpoint
@@ -214,8 +214,8 @@ async def test_status(bridge_app):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_register_session_dummy(bridge_app):
-    app, _ = bridge_app
+async def test_register_session_dummy(broker_app):
+    app, _ = broker_app
     plugin = PluginIRIConnect(app)
     request = MagicMock()
     result = await plugin.register_session(request)

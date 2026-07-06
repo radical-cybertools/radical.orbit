@@ -8,15 +8,15 @@ Two directions are supported, selected per-target by the caller:
   block the reverse direction (Aurora, Perlmutter).
   Spawned by :func:`spawn_tunnel`::
 
-      ssh -L <port>:<bridge_host>:<bridge_port> <login_host> -N
+      ssh -L <port>:<broker_host>:<broker_port> <login_host> -N
 
 * **Reverse** (login -> compute): the parent endpoint running on the
   login node opens an SSH connection to the compute node, asking
   ``sshd`` there to listen on a remote port that forwards back to
-  the bridge.  Used on sites that allow login -> compute SSH and
+  the broker.  Used on sites that allow login -> compute SSH and
   block compute -> login (Odo).  Spawned by :func:`spawn_reverse_tunnel`::
 
-      ssh -R 0:<bridge_host>:<bridge_port> <compute_host> -N
+      ssh -R 0:<broker_host>:<broker_port> <compute_host> -N
 
 In both cases the resulting port (forward: local on compute; reverse:
 remote on compute, allocated by sshd) is written to a rendezvous file
@@ -101,7 +101,7 @@ def _start_stderr_drain(proc, log_lines: list) -> threading.Thread:
     return t
 
 
-def spawn_tunnel(login_host: str, bridge_host: str, bridge_port: int,
+def spawn_tunnel(login_host: str, broker_host: str, broker_port: int,
                  endpoint_name: str, listen_timeout: float = 15.0) -> tuple:
     """Open a compute -> login ssh -L tunnel and return ``(proc, port)``.
 
@@ -112,8 +112,8 @@ def spawn_tunnel(login_host: str, bridge_host: str, bridge_port: int,
 
     Args:
         login_host:     Host to SSH *to* (the submitting login node).
-        bridge_host:    Bridge hostname (the destination of the forward).
-        bridge_port:    Bridge port.
+        broker_host:    Broker hostname (the destination of the forward).
+        broker_port:    Broker port.
         endpoint_name:      Used in log messages and rendezvous file names.
         listen_timeout: Seconds to wait for the local listener to come up.
 
@@ -126,7 +126,7 @@ def spawn_tunnel(login_host: str, bridge_host: str, bridge_port: int,
             listener didn't open within *listen_timeout* seconds.
     """
     port = _pick_free_local_port()
-    forward = f'{port}:{bridge_host}:{bridge_port}'
+    forward = f'{port}:{broker_host}:{broker_port}'
 
     ssh_cmd = [
         'ssh', '-N',
@@ -255,7 +255,7 @@ def _parse_allocated_port(proc, log_lines: list, timeout: float) -> int:
         f"SSH output (last 20 lines):\n{tail}")
 
 
-def spawn_reverse_tunnel(compute_host: str, bridge_host: str, bridge_port: int,
+def spawn_reverse_tunnel(compute_host: str, broker_host: str, broker_port: int,
                          endpoint_name: str, allocate_timeout: float = 30.0) -> tuple:
     """Open a login -> compute ssh -R tunnel and return ``(proc, port)``.
 
@@ -265,8 +265,8 @@ def spawn_reverse_tunnel(compute_host: str, bridge_host: str, bridge_port: int,
 
     Args:
         compute_host:     Compute node hostname to SSH *to* (the child's host).
-        bridge_host:      Bridge hostname (the destination of the forward).
-        bridge_port:      Bridge port.
+        broker_host:      Broker hostname (the destination of the forward).
+        broker_port:      Broker port.
         endpoint_name:        Used in log messages and rendezvous file names.
         allocate_timeout: Seconds to wait for "Allocated port N" on stderr.
 
@@ -278,7 +278,7 @@ def spawn_reverse_tunnel(compute_host: str, bridge_host: str, bridge_port: int,
         RuntimeError: SSH exited before allocating a port, or the
             allocated-port line didn't appear within *allocate_timeout*.
     """
-    forward = f'0:{bridge_host}:{bridge_port}'
+    forward = f'0:{broker_host}:{broker_port}'
 
     ssh_cmd = [
         'ssh', '-N',

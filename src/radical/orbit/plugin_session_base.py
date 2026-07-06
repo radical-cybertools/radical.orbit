@@ -51,7 +51,7 @@ class PluginSession:
     - Works from background threads (uses thread-safe scheduling)
     - `_plugin` is None if the session was not created by a Plugin (e.g., in tests)
 
-    Notifications are delivered to clients via SSE at the bridge's
+    Notifications are delivered to clients via SSE at the broker's
     `/events` endpoint. The notification payload includes:
     - endpoint: Name of the endpoint that sent the notification
     - plugin: Name of the plugin that sent the notification

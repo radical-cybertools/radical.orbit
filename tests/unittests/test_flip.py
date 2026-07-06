@@ -1,6 +1,6 @@
 """Final-flip smoke tests.
 
-Guards the flip itself: the bridge-era ``bin/`` entry points now construct the
+Guards the flip itself: the broker-era ``bin/`` entry points now construct the
 new stack (``Broker`` + ``EndpointRuntime``), and the broker's ``gateway``
 module serves the Explorer shell and a broker-hosted plugin's
 dynamically-registered ``ui_module`` (the ``iri.<endpoint>`` UI path — packaged
@@ -46,8 +46,8 @@ def _have_openssl() -> bool:
 # bin/ entry points: argparse + object construction (no server run)
 # ---------------------------------------------------------------------------
 
-def test_bridge_entrypoint_constructs_broker(monkeypatch, tmp_path):
-    mod = _load_bin('radical-orbit-bridge.py')
+def test_broker_entrypoint_constructs_broker(monkeypatch, tmp_path):
+    mod = _load_bin('radical-orbit-broker.py')
     captured = {}
 
     def fake_broker(**kw):
@@ -55,9 +55,9 @@ def test_bridge_entrypoint_constructs_broker(monkeypatch, tmp_path):
         return MagicMock()
 
     monkeypatch.setattr(mod, 'Broker', fake_broker)
-    monkeypatch.setenv('RADICAL_ORBIT_LOG_FILE', str(tmp_path / 'bridge.log'))
+    monkeypatch.setenv('RADICAL_ORBIT_LOG_FILE', str(tmp_path / 'broker.log'))
     monkeypatch.setattr(sys, 'argv',
-                        ['radical-orbit-bridge.py', '--no-auth', '--no-gateway',
+                        ['radical-orbit-broker.py', '--no-auth', '--no-gateway',
                          '--port', '9123', '--plugins', 'sysinfo'])
     mod.main()
 
@@ -67,13 +67,13 @@ def test_bridge_entrypoint_constructs_broker(monkeypatch, tmp_path):
     assert captured['plugins'] == 'sysinfo'
 
 
-def test_bridge_entrypoint_gateway_on_by_default(monkeypatch, tmp_path):
-    mod = _load_bin('radical-orbit-bridge.py')
+def test_broker_entrypoint_gateway_on_by_default(monkeypatch, tmp_path):
+    mod = _load_bin('radical-orbit-broker.py')
     captured = {}
     monkeypatch.setattr(mod, 'Broker',
                         lambda **kw: captured.update(kw) or MagicMock())
-    monkeypatch.setenv('RADICAL_ORBIT_LOG_FILE', str(tmp_path / 'bridge.log'))
-    monkeypatch.setattr(sys, 'argv', ['radical-orbit-bridge.py', '--no-auth'])
+    monkeypatch.setenv('RADICAL_ORBIT_LOG_FILE', str(tmp_path / 'broker.log'))
+    monkeypatch.setattr(sys, 'argv', ['radical-orbit-broker.py', '--no-auth'])
     mod.main()
     assert captured['gateway'] is True
 
@@ -119,8 +119,8 @@ def broker_client(tmp_path, monkeypatch):
     from radical.orbit import utils
     from radical.orbit.broker import Broker
 
-    monkeypatch.setattr(utils, 'URL_FILE',   tmp_path / 'bridge.url')
-    monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'bridge.token')
+    monkeypatch.setattr(utils, 'URL_FILE',   tmp_path / 'broker.url')
+    monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'broker.token')
 
     cert = tmp_path / 'cert.pem'
     key  = tmp_path / 'key.pem'
@@ -162,7 +162,7 @@ def test_gateway_unknown_plugin_js_is_404(broker_client, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# gateway auth: traversal normalization (ported from the deleted bridge suite)
+# gateway auth: traversal normalization (ported from the deleted broker suite)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -174,8 +174,8 @@ async def test_gateway_auth_dispatch_normalizes_traversal(tmp_path, monkeypatch)
     from radical.orbit import utils
     from radical.orbit.broker import Broker
 
-    monkeypatch.setattr(utils, 'URL_FILE',   tmp_path / 'bridge.url')
-    monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'bridge.token')
+    monkeypatch.setattr(utils, 'URL_FILE',   tmp_path / 'broker.url')
+    monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'broker.token')
     cert = tmp_path / 'cert.pem'
     key  = tmp_path / 'key.pem'
     subprocess.run(

@@ -6,14 +6,14 @@ ROSE active learning over ORBIT
 
 A self-contained, end-to-end illustration of how to drive a ROSE
 ``SequentialActiveLearner`` workflow against a remote HPC node via the
-ORBIT bridge.  The compute itself is an MPI simulation that
+ORBIT broker.  The compute itself is an MPI simulation that
 shares state through a Dragon distributed dictionary (DDict) — but the
 focus of this example is the *plumbing*:
 
     Client (this script)
         │
         ▼  rhapsody.get_backend('orbit')      ← auto-discovers a suitable
-        │                                       endpoint through the bridge
+        │                                       endpoint through the broker
         ▼  WorkflowEngine.create(engine)     ← asyncflow on top
         │
         ▼  SequentialActiveLearner(asyncflow) ← ROSE driver
@@ -24,11 +24,11 @@ focus of this example is the *plumbing*:
 
 What makes this example interesting
 ───────────────────────────────────
-  • **Endpoint auto-selection** — no bridge URL or endpoint name hard-coded.
-    ``rhapsody.get_backend('orbit')`` reads ``RADICAL_ORBIT_BRIDGE_URL`` from
+  • **Endpoint auto-selection** — no broker URL or endpoint name hard-coded.
+    ``rhapsody.get_backend('orbit')`` reads ``RADICAL_ORBIT_BROKER_URL`` from
     the environment and picks the first connected endpoint that advertises
     a Rhapsody plugin (defaults: ``https://localhost:8000`` is *not*
-    assumed; set ``RADICAL_ORBIT_BRIDGE_URL`` if your bridge runs elsewhere).
+    assumed; set ``RADICAL_ORBIT_BROKER_URL`` if your broker runs elsewhere).
 
   • **Closure discipline** — DragonExecutionBackendV3 cloudpickles every
     function task before launching it.  Live DDict handles, the ACL
@@ -52,14 +52,14 @@ DDict key layout (shared across all Dragon-managed processes)
 
 Run
 ───
-    # In one terminal: start the bridge
-    ./bin/radical-orbit-bridge.py
+    # In one terminal: start the broker
+    ./bin/radical-orbit-broker.py
 
     # In another: start an endpoint with the rhapsody plugin loaded
     ./bin/radical-orbit-endpoint-wrapper.sh
 
     # Then:
-    export RADICAL_ORBIT_BRIDGE_URL=https://localhost:8000   # optional
+    export RADICAL_ORBIT_BROKER_URL=https://localhost:8000   # optional
     python examples/example_rose.py
 """
 
@@ -94,14 +94,14 @@ MAX_ITER:           int   = 15     # hard cap on iterations
 async def make_engine():
     """Build a Rhapsody Endpoint backend and wrap it in an asyncflow engine.
 
-    With no arguments, ``get_backend('orbit')`` resolves the bridge URL
-    from ``$RADICAL_ORBIT_BRIDGE_URL`` and auto-selects the first connected
+    With no arguments, ``get_backend('orbit')`` resolves the broker URL
+    from ``$RADICAL_ORBIT_BROKER_URL`` and auto-selects the first connected
     endpoint advertising an enabled ``rhapsody`` plugin.  A ``RuntimeError``
     surfaces from ``await backend`` if no candidate is found.
     """
     backend = rhapsody.get_backend('orbit')
     engine  = await backend
-    print(f"Bridge: {backend._bridge_url}")
+    print(f"Broker: {backend._broker_url}")
     print(f"Endpoint:   {backend._endpoint_name}")
     return await WorkflowEngine.create(engine)
 

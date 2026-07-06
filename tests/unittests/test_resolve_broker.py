@@ -1,5 +1,5 @@
 # pylint: disable=protected-access
-"""Unit tests for the bridge config resolver in ``radical.orbit.utils``.
+"""Unit tests for the broker config resolver in ``radical.orbit.utils``.
 
 The resolver is purely deterministic given (CLI arg, env, filesystem)
 state, so each test sets exactly that triple and asserts the outcome.
@@ -28,10 +28,16 @@ def isolated_dir(tmp_path, monkeypatch):
     Yields the tmp directory so tests can drop files into it directly.
     """
     monkeypatch.setattr(utils, 'DEFAULT_DIR', tmp_path)
-    monkeypatch.setattr(utils, 'URL_FILE',  tmp_path / 'bridge.url')
-    monkeypatch.setattr(utils, 'CERT_FILE', tmp_path / 'bridge_cert.pem')
-    monkeypatch.setattr(utils, 'KEY_FILE',  tmp_path / 'bridge_key.pem')
-    for v in (utils.ENV_URL, utils.ENV_CERT, utils.ENV_KEY):
+    monkeypatch.setattr(utils, 'URL_FILE',  tmp_path / 'broker.url')
+    monkeypatch.setattr(utils, 'CERT_FILE', tmp_path / 'broker_cert.pem')
+    monkeypatch.setattr(utils, 'KEY_FILE',  tmp_path / 'broker_key.pem')
+    # Neutralize the pre-rename predecessor files so a developer's real
+    # ``~/.radical/orbit/bridge.*`` cannot leak in via the fallback path.
+    monkeypatch.setattr(utils, 'URL_FILE_LEGACY',  tmp_path / 'bridge.url')
+    monkeypatch.setattr(utils, 'CERT_FILE_LEGACY', tmp_path / 'bridge_cert.pem')
+    monkeypatch.setattr(utils, 'KEY_FILE_LEGACY',  tmp_path / 'bridge_key.pem')
+    for v in (utils.ENV_URL, utils.ENV_CERT, utils.ENV_KEY,
+              utils.ENV_URL_LEGACY, utils.ENV_CERT_LEGACY, utils.ENV_KEY_LEGACY):
         monkeypatch.delenv(v, raising=False)
     yield tmp_path
 
@@ -73,8 +79,8 @@ def _have_openssl() -> bool:
 def test_url_cli_wins_over_env_and_file(isolated_dir, monkeypatch):
     """CLI > env > file when all three are set."""
     monkeypatch.setenv(utils.ENV_URL, 'https://from-env:8000')
-    (isolated_dir / 'bridge.url').write_text('https://from-file:8000\n')
-    url, src = utils.resolve_bridge_url(cli='https://from-cli:8000')
+    (isolated_dir / 'broker.url').write_text('https://from-file:8000\n')
+    url, src = utils.resolve_broker_url(cli='https://from-cli:8000')
     assert url == 'https://from-cli:8000'
     assert src == 'cli'
 
@@ -82,16 +88,16 @@ def test_url_cli_wins_over_env_and_file(isolated_dir, monkeypatch):
 def test_url_env_wins_over_file(isolated_dir, monkeypatch):
     """Env > file when CLI is absent."""
     monkeypatch.setenv(utils.ENV_URL, 'https://from-env:8000')
-    (isolated_dir / 'bridge.url').write_text('https://from-file:8000\n')
-    url, src = utils.resolve_bridge_url()
+    (isolated_dir / 'broker.url').write_text('https://from-file:8000\n')
+    url, src = utils.resolve_broker_url()
     assert url == 'https://from-env:8000'
     assert src == 'env'
 
 
 def test_url_file_used_when_no_cli_no_env(isolated_dir):
     """File is the lowest precedence successful source."""
-    (isolated_dir / 'bridge.url').write_text('https://from-file:8000\n')
-    url, src = utils.resolve_bridge_url()
+    (isolated_dir / 'broker.url').write_text('https://from-file:8000\n')
+    url, src = utils.resolve_broker_url()
     assert url == 'https://from-file:8000'
     assert src == 'file'
 
@@ -99,33 +105,53 @@ def test_url_file_used_when_no_cli_no_env(isolated_dir):
 def test_url_trailing_slash_stripped(isolated_dir, monkeypatch):
     """Resolver strips a single trailing slash for consistency."""
     monkeypatch.setenv(utils.ENV_URL, 'https://x:8000/')
-    url, _ = utils.resolve_bridge_url()
+    url, _ = utils.resolve_broker_url()
     assert url == 'https://x:8000'
 
 
 def test_url_errors_when_unconfigured(isolated_dir):
     """Nothing set anywhere → ValueError."""
-    with pytest.raises(ValueError, match='Bridge URL required'):
-        utils.resolve_bridge_url()
+    with pytest.raises(ValueError, match='Broker URL required'):
+        utils.resolve_broker_url()
+
+
+def test_url_legacy_env_fallback(isolated_dir, monkeypatch):
+    """The pre-rename ``BRIDGE`` env var resolves when the ``BROKER`` one is unset."""
+    monkeypatch.setenv(utils.ENV_URL_LEGACY, 'https://from-legacy:8000')
+    url, src = utils.resolve_broker_url()
+    assert url == 'https://from-legacy:8000'
+    assert src == 'env'
+    # The broker-named var wins when both are set.
+    monkeypatch.setenv(utils.ENV_URL, 'https://from-new:8000')
+    url, _ = utils.resolve_broker_url()
+    assert url == 'https://from-new:8000'
+
+
+def test_url_legacy_file_fallback(isolated_dir):
+    """The pre-rename ``bridge.url`` file is read when ``broker.url`` is absent."""
+    (isolated_dir / 'bridge.url').write_text('https://from-legacy-file:8000\n')
+    url, src = utils.resolve_broker_url()
+    assert url == 'https://from-legacy-file:8000'
+    assert src == 'file'
 
 
 # ---------------------------------------------------------------------------
 # URL file write (atomic)
 # ---------------------------------------------------------------------------
 
-def test_write_bridge_url_file_creates_parents(tmp_path):
-    """``write_bridge_url_file`` mkdirs parent dirs and writes the file."""
-    target = tmp_path / 'fresh' / 'bridge.url'
-    utils.write_bridge_url_file('https://here:8000', path=target)
+def test_write_broker_url_file_creates_parents(tmp_path):
+    """``write_broker_url_file`` mkdirs parent dirs and writes the file."""
+    target = tmp_path / 'fresh' / 'broker.url'
+    utils.write_broker_url_file('https://here:8000', path=target)
     assert target.read_text().strip() == 'https://here:8000'
     assert target.parent.is_dir()
 
 
-def test_write_bridge_url_file_overwrites(tmp_path):
+def test_write_broker_url_file_overwrites(tmp_path):
     """Subsequent writes replace the file content (atomic via os.replace)."""
-    target = tmp_path / 'bridge.url'
-    utils.write_bridge_url_file('https://first:8000', path=target)
-    utils.write_bridge_url_file('https://second:8000', path=target)
+    target = tmp_path / 'broker.url'
+    utils.write_broker_url_file('https://first:8000', path=target)
+    utils.write_broker_url_file('https://second:8000', path=target)
     assert target.read_text().strip() == 'https://second:8000'
 
 
@@ -156,8 +182,8 @@ def test_public_url_forms_specific_host_uses_literal():
 
 def test_public_url_forms_specific_hostname_uses_literal():
     """Hostname is also literal — no FQDN substitution."""
-    forms = utils.public_url_forms('my-bridge', 8000)
-    assert forms == ['https://my-bridge:8000']
+    forms = utils.public_url_forms('my-broker', 8000)
+    assert forms == ['https://my-broker:8000']
 
 
 def test_public_url_forms_ipv6_bracket_wrapped():
@@ -176,9 +202,9 @@ def test_cert_cli_wins(isolated_dir, self_signed, monkeypatch):
     other = isolated_dir / 'other_cert.pem'
     other.write_bytes(cert.read_bytes())
     monkeypatch.setenv(utils.ENV_CERT, str(other))
-    (isolated_dir / 'bridge_cert.pem').write_bytes(cert.read_bytes())
+    (isolated_dir / 'broker_cert.pem').write_bytes(cert.read_bytes())
 
-    path, src = utils.resolve_bridge_cert(cli=str(cert))
+    path, src = utils.resolve_broker_cert(cli=str(cert))
     assert path == cert
     assert src == 'cli'
 
@@ -187,36 +213,55 @@ def test_cert_env_wins_over_file(isolated_dir, self_signed, monkeypatch):
     """Env > file when CLI is absent."""
     cert, _ = self_signed
     monkeypatch.setenv(utils.ENV_CERT, str(cert))
-    other = isolated_dir / 'bridge_cert.pem'
+    other = isolated_dir / 'broker_cert.pem'
     other.write_bytes(cert.read_bytes())   # different file, same content
 
-    path, src = utils.resolve_bridge_cert()
+    path, src = utils.resolve_broker_cert()
     assert path == cert
     assert src == 'env'
 
 
 def test_cert_file_fallback(isolated_dir, self_signed):
-    """File at ``DEFAULT_DIR/bridge_cert.pem`` used when no env / no CLI."""
+    """File at ``DEFAULT_DIR/broker_cert.pem`` used when no env / no CLI."""
     cert, _ = self_signed
-    target = isolated_dir / 'bridge_cert.pem'
+    target = isolated_dir / 'broker_cert.pem'
     target.write_bytes(cert.read_bytes())
 
-    path, src = utils.resolve_bridge_cert()
+    path, src = utils.resolve_broker_cert()
     assert path == target
+    assert src == 'file'
+
+
+def test_cert_legacy_file_fallback(isolated_dir, self_signed):
+    """The pre-rename ``bridge_cert.pem`` is read when ``broker_cert.pem`` is absent."""
+    cert, _ = self_signed
+    (isolated_dir / 'bridge_cert.pem').write_bytes(cert.read_bytes())
+
+    path, src = utils.resolve_broker_cert()
+    assert path == isolated_dir / 'bridge_cert.pem'
     assert src == 'file'
 
 
 def test_cert_missing_everywhere_raises(isolated_dir):
     """Nothing configured → ValueError."""
     with pytest.raises(ValueError, match='TLS cert required'):
-        utils.resolve_bridge_cert()
+        utils.resolve_broker_cert()
+
+
+def test_cert_missing_error_names_both_checked_paths(isolated_dir):
+    """The TLS-cert error names BOTH the broker file and the legacy fallback."""
+    with pytest.raises(ValueError) as ei:
+        utils.resolve_broker_cert()
+    msg = str(ei.value)
+    assert str(utils.CERT_FILE)        in msg
+    assert str(utils.CERT_FILE_LEGACY) in msg
 
 
 def test_cert_path_set_but_file_missing(isolated_dir, monkeypatch):
     """Env-pointed cert that doesn't exist → FileNotFoundError."""
     monkeypatch.setenv(utils.ENV_CERT, '/nonexistent/cert.pem')
     with pytest.raises(FileNotFoundError):
-        utils.resolve_bridge_cert()
+        utils.resolve_broker_cert()
 
 
 def test_cert_invalid_content_raises(isolated_dir, monkeypatch):
@@ -225,18 +270,18 @@ def test_cert_invalid_content_raises(isolated_dir, monkeypatch):
     bad.write_text('this is not a TLS certificate')
     monkeypatch.setenv(utils.ENV_CERT, str(bad))
     with pytest.raises(ssl.SSLError):
-        utils.resolve_bridge_cert()
+        utils.resolve_broker_cert()
 
 
 # ---------------------------------------------------------------------------
-# Key resolution (bridge-only, mode 0o600 enforced)
+# Key resolution (broker-only, mode 0o600 enforced)
 # ---------------------------------------------------------------------------
 
 def test_key_resolves_when_strict_mode(isolated_dir, self_signed, monkeypatch):
     """A 0o600 key resolves cleanly."""
     cert, key = self_signed
     monkeypatch.setenv(utils.ENV_KEY, str(key))
-    path, src = utils.resolve_bridge_key()
+    path, src = utils.resolve_broker_key()
     assert path == key
     assert src == 'env'
 
@@ -245,8 +290,17 @@ def test_key_with_cert_validates_pair(isolated_dir, self_signed, monkeypatch):
     """Passing *cert* validates the cert/key pair (load_cert_chain)."""
     cert, key = self_signed
     monkeypatch.setenv(utils.ENV_KEY, str(key))
-    path, _ = utils.resolve_bridge_key(cert=cert)
+    path, _ = utils.resolve_broker_key(cert=cert)
     assert path == key
+
+
+def test_key_missing_error_names_both_checked_paths(isolated_dir):
+    """The TLS-key error names BOTH the broker file and the legacy fallback."""
+    with pytest.raises(ValueError) as ei:
+        utils.resolve_broker_key()
+    msg = str(ei.value)
+    assert str(utils.KEY_FILE)        in msg
+    assert str(utils.KEY_FILE_LEGACY) in msg
 
 
 def test_key_refuses_world_readable(isolated_dir, self_signed, monkeypatch):
@@ -255,7 +309,7 @@ def test_key_refuses_world_readable(isolated_dir, self_signed, monkeypatch):
     os.chmod(key, 0o644)
     monkeypatch.setenv(utils.ENV_KEY, str(key))
     with pytest.raises(PermissionError, match='too permissive'):
-        utils.resolve_bridge_key()
+        utils.resolve_broker_key()
 
 
 def test_key_refuses_group_readable(isolated_dir, self_signed, monkeypatch):
@@ -264,20 +318,20 @@ def test_key_refuses_group_readable(isolated_dir, self_signed, monkeypatch):
     os.chmod(key, 0o640)
     monkeypatch.setenv(utils.ENV_KEY, str(key))
     with pytest.raises(PermissionError, match='too permissive'):
-        utils.resolve_bridge_key()
+        utils.resolve_broker_key()
 
 
 def test_key_missing_everywhere_raises(isolated_dir):
     """Nothing configured → ValueError."""
     with pytest.raises(ValueError, match='TLS key required'):
-        utils.resolve_bridge_key()
+        utils.resolve_broker_key()
 
 
 def test_key_path_set_but_file_missing(isolated_dir, monkeypatch):
     """Env-pointed key that doesn't exist → FileNotFoundError."""
     monkeypatch.setenv(utils.ENV_KEY, '/nonexistent/key.pem')
     with pytest.raises(FileNotFoundError):
-        utils.resolve_bridge_key()
+        utils.resolve_broker_key()
 
 
 def test_key_owner_readable_only_passes(isolated_dir, self_signed, monkeypatch):
@@ -285,7 +339,7 @@ def test_key_owner_readable_only_passes(isolated_dir, self_signed, monkeypatch):
     _, key = self_signed
     os.chmod(key, 0o400)
     monkeypatch.setenv(utils.ENV_KEY, str(key))
-    path, _ = utils.resolve_bridge_key()
+    path, _ = utils.resolve_broker_key()
     assert path == key
     # Restore so later teardown can unlink.
     os.chmod(key, 0o600)

@@ -21,7 +21,7 @@ log = logging.getLogger('radical.orbit')
 # ---------------------------------------------------------------------------
 
 DEFAULT_PLUGINS_BY_ROLE: Dict[str, List[str]] = {
-    'bridge'    : ['iri*',     'staging', 'sysinfo', 'task_dispatcher'],
+    'broker'    : ['iri*',     'staging', 'sysinfo', 'task_dispatcher'],
     'login'     : ['psij',     'staging', 'sysinfo', 'queue_info'],
     'compute'   : ['rhapsody', 'staging', 'sysinfo', 'queue_info'],
     'standalone': ['psij',     'staging', 'sysinfo', 'rhapsody', 'queue_info'],
@@ -29,7 +29,7 @@ DEFAULT_PLUGINS_BY_ROLE: Dict[str, List[str]] = {
 
 
 # ---------------------------------------------------------------------------
-# Utility functions (shared by BridgePluginHost and EndpointService)
+# Utility functions (shared by BrokerPluginHost and EndpointService)
 # ---------------------------------------------------------------------------
 
 def _expand_special_tokens(requested: list, app: FastAPI,
@@ -136,13 +136,13 @@ def _discover_entry_points() -> None:
 
 
 # ---------------------------------------------------------------------------
-# PluginHostBase — mixin for BridgePluginHost and EndpointService
+# PluginHostBase — mixin for BrokerPluginHost and EndpointService
 # ---------------------------------------------------------------------------
 
 class PluginHostBase:
     """Shared plugin loading and dynamic registration logic.
 
-    Both ``BridgePluginHost`` and ``EndpointService`` manage a set of plugins
+    Both ``BrokerPluginHost`` and ``EndpointService`` manage a set of plugins
     attached to a ``FastAPI`` app.  This mixin extracts the common parts:
 
     * Static loading from a filter list (startup)
@@ -284,7 +284,7 @@ class PluginHostBase:
         """Broadcast a topology change to connected clients.
 
         Subclass must override:
-        * **BridgePluginHost** — SSE broadcast to Explorer clients.
-        * **EndpointService** — ``topology`` WebSocket message to bridge.
+        * **BrokerPluginHost** — SSE broadcast to Explorer clients.
+        * **EndpointService** — ``topology`` WebSocket message to broker.
         """
         raise NotImplementedError

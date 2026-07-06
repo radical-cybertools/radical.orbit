@@ -55,9 +55,9 @@ def test_onclick_functions_defined(html):
 _SKIP_CLASSES = {
     'layoutClass',
     # form input selectors (queried by JS, styled inline or via parent)
-    'bridge-account', 'bridge-duration', 'bridge-endpoint-name',
-    'bridge-executor', 'bridge-jobs-output', 'bridge-nodes',
-    'bridge-queue', 'bridge-target',
+    'broker-account', 'broker-duration', 'broker-endpoint-name',
+    'broker-executor', 'broker-jobs-output', 'broker-nodes',
+    'broker-queue', 'broker-target',
     # JS DOM hooks
     'endpoint-label', 'psij-attribute-rows', 'psij-attributes-container',
     'p-attr-key', 'p-attr-val',

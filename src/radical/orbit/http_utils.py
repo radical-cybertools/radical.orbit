@@ -1,6 +1,6 @@
 """HTTP client factory with stale-keepalive retry.
 
-NAT / firewall devices on the path between client and bridge will
+NAT / firewall devices on the path between client and broker will
 silently RST idle TCP connections.  httpx then surfaces this on the
 next reuse as ``RemoteProtocolError("Server disconnected without
 sending a response.")`` (or ``ReadError`` if the RST lands mid-handshake).

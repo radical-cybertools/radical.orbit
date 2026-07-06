@@ -54,7 +54,7 @@ async def main():
 
     # ---- set up Rhapsody session with Endpoint backend ---
     # Endpoint auto-discovery: ``get_backend('orbit')`` with no
-    # ``bridge_url`` / ``endpoint_name`` resolves the bridge URL via
+    # ``broker_url`` / ``endpoint_name`` resolves the broker URL via
     # radical.orbit.utils and selects the first connected endpoint
     # advertising the rhapsody plugin.  ``await backend`` raises
     # RuntimeError if no candidate is found.
@@ -68,7 +68,7 @@ async def main():
     )
     backend = await backend
 
-    print(f"Bridge:         {backend._bridge_url}")
+    print(f"Broker:         {backend._broker_url}")
     print(f"Endpoint:           {backend._endpoint_name}")
     print(f"Tasks:          {args.tasks}")
     print(f"Batch window:   {args.batch_window}s")

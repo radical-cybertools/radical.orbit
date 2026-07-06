@@ -1,8 +1,8 @@
 """
-Integration tests for OrbitExecutionBackend → Bridge → Endpoint → Rhapsody plugin.
+Integration tests for OrbitExecutionBackend → Broker → Endpoint → Rhapsody plugin.
 
 These tests require:
-  - A running bridge (RADICAL_ORBIT_BRIDGE_URL set or default localhost:8000)
+  - A running broker (RADICAL_ORBIT_BROKER_URL set or default localhost:8000)
   - A connected endpoint with the rhapsody plugin loaded (concurrent backend)
 
 Run with:
@@ -28,8 +28,8 @@ except ImportError:
     ENDPOINT_AVAILABLE = False
 
 
-def _get_bridge_url():
-    return os.environ.get('RADICAL_ORBIT_BRIDGE_URL', 'http://localhost:8000')
+def _get_broker_url():
+    return os.environ.get('RADICAL_ORBIT_BROKER_URL', 'http://localhost:8000')
 
 
 def _get_endpoint_name():
@@ -38,7 +38,7 @@ def _get_endpoint_name():
         pytest.skip("radical.orbit not installed")
 
     try:
-        rt   = EndpointRuntime(broker_url=_get_bridge_url())
+        rt   = EndpointRuntime(broker_url=_get_broker_url())
         rt.start(wait=True)
         eids = [n for n in rt.topology() if n != 'broker']
         rt.stop()
@@ -65,7 +65,7 @@ pytestmark = [
 async def _make_backend(endpoint_name, backends=None):
     """Create and initialize an OrbitExecutionBackend."""
     backend = OrbitExecutionBackend(
-        bridge_url=_get_bridge_url(),
+        broker_url=_get_broker_url(),
         endpoint_name=endpoint_name,
         backends=backends or ['concurrent'],
     )

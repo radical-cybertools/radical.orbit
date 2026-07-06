@@ -7,7 +7,7 @@ Orchestrates CFDaAI workflows across multiple HPC clusters. Provides:
 - Real-time progress notifications via SSE
 
 The plugin runs on a local endpoint and communicates with remote endpoints
-(UCSB, Perlmutter) via the bridge.
+(UCSB, Perlmutter) via the broker.
 '''
 
 import asyncio
@@ -36,8 +36,8 @@ log = logging.getLogger("radical.orbit")
 
 
 # -----------------------------------------------------------------------------
-# Cross-endpoint access over the endpoint runtime (replaces the loopback
-# BridgeClient).  XGFabric runs on an endpoint node and reaches *other*
+# Cross-endpoint access over the endpoint runtime.
+# XGFabric runs on an endpoint node and reaches *other*
 # endpoints' plugins through its own :class:`EndpointRuntime` consumer facade
 # (``get_plugin(dst, plugin)`` / ``topology()``) — every call rides the single
 # outbound WebSocket to the broker, no loopback HTTP.  These thin adapters keep
@@ -45,8 +45,19 @@ log = logging.getLogger("radical.orbit")
 # surface the workflow code already speaks.
 # -----------------------------------------------------------------------------
 
+def _endpoint_participants(topology: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only role ``'endpoint'`` participants for cluster classification.
+
+    The runtime hands xgfabric the full rich topology (the broker and any
+    ``consumer.*`` participants included); only endpoints are candidates for the
+    immediate/allocate cluster split, so non-endpoint roles are filtered out
+    explicitly where the topology enters the plugin."""
+    return {name: info for name, info in (topology or {}).items()
+            if (info or {}).get('role') == 'endpoint'}
+
+
 class _RuntimeEndpointAdapter:
-    """BridgeClient-``EndpointClient``-shaped view of one remote endpoint."""
+    """``get_plugin``-shaped view of one remote endpoint."""
 
     def __init__(self, runtime: Any, endpoint_name: str):
         self._runtime       = runtime
@@ -57,8 +68,8 @@ class _RuntimeEndpointAdapter:
                                         **session_kwargs)
 
 
-class _RuntimeBridgeAdapter:
-    """BridgeClient-shaped view backed by the endpoint runtime consumer."""
+class _RuntimeBrokerAdapter:
+    """``get_endpoint_client``-shaped view backed by the endpoint runtime consumer."""
 
     def __init__(self, runtime: Any):
         self._runtime = runtime
@@ -79,10 +90,10 @@ class _RuntimeBridgeAdapter:
 
 @dataclass
 class ResourceConfig:
-    """Resource configuration — bridge connection and per-cluster scheduler settings."""
+    """Resource configuration — broker connection and per-cluster scheduler settings."""
     name: str = "default"
-    bridge_url: str = "https://localhost:8000"
-    bridge_cert: Optional[str] = None
+    broker_url: str = "https://localhost:8000"
+    broker_cert: Optional[str] = None
     # Per-endpoint overrides used when submitting pilots via psij.
     # Keys are endpoint names; values are dicts with any of:
     #   queue, account, duration, nodes, executor, workflow_path, custom_attributes
@@ -204,7 +215,7 @@ class XGFabricSession(PluginSession):
     """
 
     def __init__(self, sid: str, workdir: Optional[str] = None, endpoint_name: Optional[str] = None,
-                 bridge_url: Optional[str] = None, bridge_cert: Optional[str] = None,
+                 broker_url: Optional[str] = None, broker_cert: Optional[str] = None,
                  runtime: Any = None):
         super().__init__(sid)
         # The endpoint runtime this session reaches other endpoints through
@@ -217,8 +228,8 @@ class XGFabricSession(PluginSession):
         self._config_dir.mkdir(exist_ok=True)
 
         self._endpoint_name = endpoint_name or 'local'
-        self._bridge_url = bridge_url
-        self._bridge_cert = bridge_cert
+        self._broker_url = broker_url
+        self._broker_cert = broker_cert
         self._http        = make_async_http_client(verify=self._verify())
         self._connected_endpoints: Dict[str, Any] = {}  # Cached connected endpoints
         self._current_config: Optional[WorkflowConfig] = None
@@ -227,7 +238,7 @@ class XGFabricSession(PluginSession):
         self._workflow_task: Optional[asyncio.Task] = None
         self._cancel_requested = False
 
-        # Bridge client for communicating with other endpoints
+        # Broker client for communicating with other endpoints
         self._bc = None
         # Cache of resolved home dirs per endpoint (populated on first use)
         self._homedir_cache: Dict[str, str] = {}
@@ -236,7 +247,7 @@ class XGFabricSession(PluginSession):
 
     def _verify(self) -> Any:
         """Return SSL verification argument for httpx calls."""
-        return self._bridge_cert if self._bridge_cert else False
+        return self._broker_cert if self._broker_cert else False
 
     async def _http_get(self, url: str, **kwargs) -> Any:
         """Run httpx.get using the session AsyncClient."""
@@ -371,7 +382,7 @@ class XGFabricSession(PluginSession):
         if self._current_config:
             self._state.config_name = self._current_config.name
 
-        # Query connected endpoints from bridge (if not running a workflow)
+        # Query connected endpoints from broker (if not running a workflow)
         if self._state.status != 'running':
             immediate, allocate = await self._get_connected_endpoints()
             log.info("[XGFabric] get_status: immediate=%s  allocate=%s",
@@ -388,7 +399,7 @@ class XGFabricSession(PluginSession):
         return asdict(self._state)
 
     async def _get_connected_endpoints(self) -> tuple[List[Dict], List[Dict]]:
-        """Return (immediate, allocate) cluster lists from cache or bridge query.
+        """Return (immediate, allocate) cluster lists from cache or broker query.
 
         Endpoints with the queue_info plugin AND a working scheduler go into
         allocate_clusters; all others go into immediate_clusters.
@@ -431,7 +442,7 @@ class XGFabricSession(PluginSession):
             return [], []
 
         try:
-            topo = self._runtime.topology()
+            topo = _endpoint_participants(self._runtime.topology())
             endpoints_info = {name: {'plugins': list((info.get('plugins') or {}).keys())}
                           for name, info in topo.items()}
             log.info("[XGFabric] _get_connected_endpoints: broker reported %d endpoints: %s",
@@ -549,21 +560,21 @@ class XGFabricSession(PluginSession):
         cfg = self._current_config
 
         rc = self._current_resource_config
-        log.info("[XGFabric] _execute_workflow: starting — session.bridge_url=%s",
-                 self._bridge_url)
+        log.info("[XGFabric] _execute_workflow: starting — session.broker_url=%s",
+                 self._broker_url)
 
-        # Always prefer the live bridge URL from the session over the resource config —
+        # Always prefer the live broker URL from the session over the resource config —
         # the saved URL may be stale (e.g. localhost vs public IP).
-        bridge_url  = self._bridge_url  or (rc.bridge_url  if rc else 'https://localhost:8000')
-        bridge_cert = self._bridge_cert or (rc.bridge_cert if rc else None)
-        log.info("[XGFabric] _execute_workflow: effective bridge_url=%s  cert=%s",
-                 bridge_url, bridge_cert)
+        broker_url  = self._broker_url  or (rc.broker_url  if rc else 'https://localhost:8000')
+        broker_cert = self._broker_cert or (rc.broker_cert if rc else None)
+        log.info("[XGFabric] _execute_workflow: effective broker_url=%s  cert=%s",
+                 broker_url, broker_cert)
         self._update_state('connecting', 'Connecting to broker...')
         if self._runtime is None:
             raise RuntimeError(
                 "xgfabric workflow execution requires an endpoint runtime "
                 "(cross-endpoint access rides the runtime consumer facade)")
-        self._bc = _RuntimeBridgeAdapter(self._runtime)
+        self._bc = _RuntimeBrokerAdapter(self._runtime)
 
         # Discover which clusters are connected right now (always live, ignores config)
         self._update_state('verifying', 'Verifying endpoints...')
@@ -591,7 +602,7 @@ class XGFabricSession(PluginSession):
         # Phase 2: Submit pilot (async)
         if allocate:
             self._update_state('pilot_submit', f"Submitting pilot job to {allocate['name']}...")
-            pilot_id = await self._submit_pilot(allocate, bridge_url)
+            pilot_id = await self._submit_pilot(allocate, broker_url)
             self._state.pilot_jobs[allocate['name']] = pilot_id
 
         # Phase 3: Stage data and run simulations
@@ -680,7 +691,7 @@ class XGFabricSession(PluginSession):
     async def _is_endpoint_online(self, cluster: Dict) -> bool:
         """Check if cluster's child endpoint is online."""
         if not self._bc:
-            raise RuntimeError("No active bridge connection")
+            raise RuntimeError("No active broker connection")
         endpoint_name = cluster.get('child_endpoint_name') or cluster['endpoint_name']
         endpoints = await asyncio.to_thread(self._bc.list_endpoints)
         return endpoint_name in endpoints
@@ -688,7 +699,7 @@ class XGFabricSession(PluginSession):
     def _get_plugin(self, cluster: Dict, plugin_name: str) -> Any:
         """Get plugin client for a cluster."""
         if not self._bc:
-            raise RuntimeError("No active bridge connection")
+            raise RuntimeError("No active broker connection")
         endpoint_name = cluster.get('child_endpoint_name') or cluster['endpoint_name']
         ec = self._bc.get_endpoint_client(endpoint_name)
         return ec.get_plugin(plugin_name)
@@ -854,14 +865,14 @@ class XGFabricSession(PluginSession):
     # Pilot Job
     # -------------------------------------------------------------------------
 
-    async def _submit_pilot(self, cluster: Dict, bridge_url: str) -> str:
+    async def _submit_pilot(self, cluster: Dict, broker_url: str) -> str:
         """Submit pilot job to spawn child endpoint."""
         if not self._bc:
-            raise RuntimeError("No active bridge connection")
+            raise RuntimeError("No active broker connection")
         ec = self._bc.get_endpoint_client(cluster['endpoint_name'])
         psij: Any = await asyncio.to_thread(ec.get_plugin, 'psij')
 
-        args = ["--url", bridge_url, "--name", cluster['endpoint_name'] + ".1"]
+        args = ["--url", broker_url, "--name", cluster['endpoint_name'] + ".1"]
 
         # Spawn the child endpoint with this endpoint's own served-plugin set
         # (the runtime's mounted plugins), defaulting to the role default.
@@ -1177,7 +1188,7 @@ class XGFabricSession(PluginSession):
                 if not cfg:
                     raise RuntimeError("No active workflow configuration")
                 if not self._bc:
-                    raise RuntimeError("No active bridge connection")
+                    raise RuntimeError("No active broker connection")
                 all_clusters = (self._state.immediate_clusters +
                                 self._state.allocate_clusters)
                 for c in all_clusters:
@@ -1199,7 +1210,7 @@ class XGFabricSession(PluginSession):
             try:
                 self._bc.close()
             except Exception as e:
-                log.exception("[XGFabric] Error closing bridge client: %s", e)
+                log.exception("[XGFabric] Error closing broker client: %s", e)
         await self._http.aclose()
         return await super().close()
 
@@ -1306,8 +1317,8 @@ class PluginXGFabric(Plugin):
 
     @classmethod
     def is_enabled(cls, app: FastAPI) -> bool:
-        """XGFabric loads on endpoint nodes (login or compute) — not on the bridge."""
-        return not getattr(app.state, 'is_bridge', False)
+        """XGFabric loads on endpoint nodes (login or compute) — not on the broker."""
+        return not getattr(app.state, 'is_broker', False)
 
     def __init__(self, app: FastAPI, workdir: Optional[str] = None):
         super().__init__(app, 'xgfabric')
@@ -1333,7 +1344,7 @@ class PluginXGFabric(Plugin):
         self.add_route_post('stop/{sid}', self.stop_workflow)
 
     def _create_session(self, sid: str, **_) -> XGFabricSession:
-        """Create session with workdir, endpoint name, and bridge connection info."""
+        """Create session with workdir, endpoint name, and broker connection info."""
         endpoint_name = getattr(self._app.state, 'endpoint_name', 'local')
 
         # Get the broker URL from the endpoint runtime.  Cert path comes from
@@ -1341,16 +1352,16 @@ class PluginXGFabric(Plugin):
         # this is the internal session-creation path.
         from . import utils
         endpoint_service = getattr(self._app.state, 'endpoint_service', None)
-        bridge_url = getattr(endpoint_service, 'broker_url', None) \
+        broker_url = getattr(endpoint_service, 'broker_url', None) \
             if endpoint_service else None
         try:
-            cert_path, _ = utils.resolve_bridge_cert()
-            bridge_cert  = str(cert_path)
+            cert_path, _ = utils.resolve_broker_cert()
+            broker_cert  = str(cert_path)
         except (ValueError, FileNotFoundError):
-            bridge_cert  = None
+            broker_cert  = None
 
-        log.info("[XGFabric] _create_session: sid=%s  endpoint=%s  bridge_url=%s  cached_endpoints=%s",
-                 sid, endpoint_name, bridge_url, list(self._connected_endpoints.keys()))
+        log.info("[XGFabric] _create_session: sid=%s  endpoint=%s  broker_url=%s  cached_endpoints=%s",
+                 sid, endpoint_name, broker_url, list(self._connected_endpoints.keys()))
 
         # The endpoint runtime (consumer facade) this plugin runs under; the
         # session reaches other endpoints through it.
@@ -1359,7 +1370,7 @@ class PluginXGFabric(Plugin):
         # Use super() so the base class injects the _notify callback into the session
         session = super()._create_session(sid,
                       workdir=self._workdir, endpoint_name=endpoint_name,
-                      bridge_url=bridge_url, bridge_cert=bridge_cert,
+                      broker_url=broker_url, broker_cert=broker_cert,
                       runtime=runtime)
         if not isinstance(session, XGFabricSession):
             raise RuntimeError(f"Expected XGFabricSession, got {type(session).__name__}")
@@ -1371,7 +1382,10 @@ class PluginXGFabric(Plugin):
         return session
 
     async def on_topology_change(self, endpoints: dict):
-        """Handle topology updates from the bridge."""
+        """Handle topology updates from the broker."""
+        # Classify only real endpoints — drop the broker + consumer participants
+        # the runtime now includes in the rich topology.
+        endpoints = _endpoint_participants(endpoints)
         prev  = set(self._connected_endpoints or {})
         curr  = set(endpoints)
         self._connected_endpoints = endpoints
