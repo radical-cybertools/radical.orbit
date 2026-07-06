@@ -163,6 +163,56 @@ class TestCollectJobs:
         assert j['time_limit'] == 3600
 
 
+# ---------------------------------------------------------------------------
+# _render_job extra-fields (issue #40)
+# ---------------------------------------------------------------------------
+
+def test_render_job_surfaces_extra_fields():
+    info = {
+        'job_state'             : 'R',
+        'queue'                 : 'compute',
+        'Job_Owner'             : 'alice@login1',
+        'Job_Name'              : 'job1',
+        'Resource_List.nodect'  : '2',
+        'Resource_List.ncpus'   : '128',
+        'Resource_List.walltime': '01:00:00',
+        'Priority'              : '150',
+        'comment'               : 'Job run at some point',
+        'depend'                : 'afterok:99.x',
+        'Output_Path'           : 'login1:/home/alice/job.o1',
+        'Error_Path'            : 'login1:/home/alice/job.e1',
+        'Submit_arguments'      : 'run.sh',
+        'Exit_status'           : '0',
+        'Variable_List'         : 'PBS_O_HOME=/home/alice,'
+                                  'PBS_O_WORKDIR=/home/alice/work',
+        'resources_used.mem'    : '1048576kb',
+    }
+    j = QueueInfoPBSPro._render_job('1.x', info)
+    assert j['owner']      == 'alice@login1'
+    assert j['priority']   == 150
+    assert j['reason']     == 'Job run at some point'
+    assert j['dependency'] == 'afterok:99.x'
+    assert j['std_out']    == 'login1:/home/alice/job.o1'
+    assert j['std_err']    == 'login1:/home/alice/job.e1'
+    assert j['command']    == 'run.sh'
+    assert j['exit_code']  == 0
+    assert j['work_dir']   == '/home/alice/work'
+    assert j['mem_used']   == '1048576kb'
+
+
+def test_render_job_defaults_when_absent():
+    """qstat -f records missing the extra attributes degrade gracefully."""
+    info = {'job_state': 'Q', 'queue': 'compute'}
+    j = QueueInfoPBSPro._render_job('2.x', info)
+    assert j['owner']      == ''
+    assert j['priority']   == 0
+    assert j['reason']     == ''
+    assert j['dependency'] == ''
+    assert j['exit_code']  is None
+    assert j['work_dir']   == ''
+    assert j['mem_used']   == ''
+
+
 def test_collect_allocations_returns_empty_without_sbank():
     """When sbank-list-allocations is unavailable we degrade gracefully."""
     backend = QueueInfoPBSPro()

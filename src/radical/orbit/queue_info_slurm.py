@@ -35,6 +35,23 @@ def _unwrap(obj):
     return obj.get('number')
 
 
+def _exit_code(job):
+    """
+    Extract a numeric exit/return code from a squeue JSON job object.
+
+    Newer SLURM wraps it as ``{status, return_code:{set,number}, signal}``;
+    older versions expose a plain ``{set, infinite, number}`` wrapper.
+    Returns None when the field is absent or unset.
+    """
+
+    ec = job.get('exit_code')
+    if isinstance(ec, dict):
+        if 'return_code' in ec:
+            return _unwrap(ec.get('return_code'))
+        return _unwrap(ec)
+    return ec
+
+
 def _parse_gpus(gres_str):
     """
     Parse GPU count from a SLURM GRES string.
@@ -200,6 +217,10 @@ class QueueInfoSlurm(QueueInfo):
 
             time_used = int(now - start) if (state == 'RUNNING' and start > 0) else 0
 
+            reason = job.get('state_reason')
+            if reason is None:
+                reason = job.get('reason', '')
+
             result.append({
                 'job_id'     : str(job.get('job_id', '')),
                 'job_name'   : job.get('name', ''),
@@ -215,6 +236,21 @@ class QueueInfoSlurm(QueueInfo):
                 'priority'   : _unwrap(job.get('priority', {}))   or 0,
                 'account'    : job.get('account', ''),
                 'node_list'  : job.get('nodes', ''),
+                # extra detail surfaced for the Explorer (issue #40); all
+                # additive with None/'' defaults so older SLURM still parses
+                'reason'       : reason or '',
+                'qos'          : job.get('qos', ''),
+                'dependency'   : job.get('dependency', ''),
+                'std_out'      : job.get('standard_output', ''),
+                'std_err'      : job.get('standard_error', ''),
+                'work_dir'     : job.get('current_working_directory', ''),
+                'command'      : job.get('command', ''),
+                'exit_code'    : _exit_code(job),
+                'array_job_id' : _unwrap(job.get('array_job_id')),
+                'array_task_id': _unwrap(job.get('array_task_id')),
+                'tres_req'     : job.get('tres_req_str', ''),
+                'tres_alloc'   : job.get('tres_alloc_str', ''),
+                'restart_cnt'  : _unwrap(job.get('restart_cnt')),
             })
         return result
 
