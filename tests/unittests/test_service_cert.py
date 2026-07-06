@@ -1,16 +1,16 @@
-"""TLS certificate-error policy for the endpoint service.
+"""TLS certificate-error policy for the endpoint runtime.
 
 A hostname / IP-address mismatch is tolerated (relax name validation + warn)
 *only* when an explicit certificate is pinned (``--cert``); with no pinned cert
 that would be a real security downgrade, so it aborts.  Every other certificate
 failure (expired, untrusted issuer, self-signed-not-pinned, …) aborts too —
-reconnecting cannot recover from a bad certificate.  ``run()`` re-raises on
-``'abort'``, which the entrypoint turns into a non-zero exit.
+reconnecting cannot recover from a bad certificate.  The transport loop aborts
+on ``'abort'``, which the entrypoint turns into a non-zero exit.
 """
 
-from radical.orbit.service import EndpointService
+from radical.orbit.runtime import EndpointRuntime
 
-_classify = EndpointService._classify_cert_error
+_classify = EndpointRuntime._classify_cert_error
 
 
 def test_name_or_ip_mismatch_with_pinned_cert_relaxes():

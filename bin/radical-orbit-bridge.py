@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Thin entry point for the ORBIT Bridge.
 
-All bridge logic lives in :class:`radical.orbit.bridge.Bridge`.  This
-script just parses CLI options and constructs the class.
+All logic lives in :class:`radical.orbit.broker.Broker` — the active hub of the
+participant star (routing loop + own-thread plugin host).  This script keeps its
+bridge-era filename and CLI surface; only the implementation behind it flips.
+The HTTP/SSE/Explorer compat tier is the broker's ``gateway`` module, on by
+default (``--no-gateway`` for a headless broker).
 """
 
 import argparse
@@ -10,7 +13,7 @@ import logging
 import os
 
 import radical.orbit.logging_config as _lc
-from radical.orbit.bridge import Bridge
+from radical.orbit.broker import Broker
 
 
 def main():
@@ -29,7 +32,7 @@ def main():
                         help='Bind port (default: 8000).')
     parser.add_argument('--plugins', '-p', default='default',
                         help='Comma-separated plugins to host on the '
-                             'bridge (default: the bridge role default '
+                             'broker (default: the broker role default '
                              'set — see plugin_host_base.'
                              'DEFAULT_PLUGINS_BY_ROLE).  Special tokens: '
                              '"default" (role default), "all" (every '
@@ -45,6 +48,10 @@ def main():
     parser.add_argument('--no-auth', action='store_true',
                         help='Disable ingress authentication (local dev only). '
                              'Also via $RADICAL_ORBIT_BRIDGE_NO_AUTH=1.')
+    parser.add_argument('--no-gateway', action='store_true',
+                        help='Run a headless broker: only the token-gated '
+                             'WebSocket /register ingress, no HTTP/SSE/Explorer '
+                             'compat tier.  The gateway is on by default.')
     args = parser.parse_args()
 
     log_level_name = (os.environ.get('RADICAL_ORBIT_LOG_LVL')
@@ -56,13 +63,14 @@ def main():
     logging.getLogger('radical.orbit').info(
         "Log level: %s; log file: %s", log_level_name, log_file)
 
-    Bridge(cert=args.cert,
+    Broker(cert=args.cert,
            key=args.key,
            host=args.host,
            port=args.port,
            plugins=args.plugins,
            token=args.token,
-           no_auth=args.no_auth).run()
+           no_auth=args.no_auth,
+           gateway=not args.no_gateway).run()
 
 
 if __name__ == "__main__":

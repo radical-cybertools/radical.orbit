@@ -22,7 +22,7 @@ except ImportError:
     ENDPOINT_BACKEND_AVAILABLE = False
 
 try:
-    from radical.orbit import BridgeClient
+    from radical.orbit import EndpointRuntime
     ENDPOINT_AVAILABLE = True
 except ImportError:
     ENDPOINT_AVAILABLE = False
@@ -38,14 +38,15 @@ def _get_endpoint_name():
         pytest.skip("radical.orbit not installed")
 
     try:
-        bc   = BridgeClient(url=_get_bridge_url())
-        eids = bc.list_endpoints()
-        bc.close()
+        rt   = EndpointRuntime(broker_url=_get_bridge_url())
+        rt.start(wait=True)
+        eids = [n for n in rt.topology() if n != 'broker']
+        rt.stop()
     except Exception as e:
-        pytest.skip(f"Cannot reach bridge: {e}")
+        pytest.skip(f"Cannot reach broker: {e}")
 
     if not eids:
-        pytest.skip("No endpoints connected to bridge")
+        pytest.skip("No endpoints connected to broker")
     return eids[0]
 
 

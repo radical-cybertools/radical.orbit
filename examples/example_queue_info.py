@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 
-from radical.orbit import BridgeClient
+from radical.orbit import EndpointRuntime
 
 
 def main():
 
-    bc   = BridgeClient()
-    eids = bc.list_endpoints()
+    rt   = EndpointRuntime()
+    rt.start(wait=True)
+    eids = [n for n in rt.topology() if n != 'broker']
     print(f"Found {len(eids)} Endpoint(s): {eids}")
 
     for eid in eids:
-        ec = bc.get_endpoint_client(eid)
-        plugins = ec.list_plugins()
+        plugins = rt.topology().get(eid, {}).get('plugins', {})
         if not plugins.get('queue_info', {}).get('enabled', False):
             print(f"\n[{eid}] No batch scheduler available — skipping")
             continue
-        qi = ec.get_plugin('queue_info')
+        qi = rt.get_plugin(eid, 'queue_info')
 
         info   = qi.get_info()
         queues = info.get('queues', {})
@@ -30,7 +30,7 @@ def main():
         allocs = qi.list_allocations()
         render_allocations(eid, allocs.get('allocations', []))
 
-    bc.close()
+    rt.stop()
 
 
 def _fmt_time(minutes):

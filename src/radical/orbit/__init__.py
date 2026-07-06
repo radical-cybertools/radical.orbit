@@ -7,12 +7,15 @@ from .ui_schema             import (UIConfig, UIForm, UIField,  # noqa: F401
                                     UIMonitor, UINotifications,
                                     ui_config_to_dict)
 
-from .service           import EndpointService  # noqa: F401
-from .bridge            import Bridge  # noqa: F401
-from .client            import BridgeClient, EndpointClient, PluginClient  # noqa: F401
+from .broker            import Broker  # noqa: F401
+from .runtime           import EndpointRuntime  # noqa: F401
+from .client            import PluginClient  # noqa: F401
 
-# Public alias — ``Endpoint`` is the natural counterpart to ``Bridge``.
-Endpoint = EndpointService
+# Public aliases — the participant star has one hub (the active broker, still
+# reached through the ``Bridge`` name until the rename PR) and one node type (the
+# endpoint runtime).  ``Endpoint`` is the natural counterpart to ``Bridge``.
+Bridge   = Broker
+Endpoint = EndpointRuntime
 
 
 # ── Plugins ──────────────────────────────────────────────────────────────────

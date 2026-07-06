@@ -4,7 +4,7 @@ import argparse
 import json
 import sys
 import time
-from radical.orbit import BridgeClient
+from radical.orbit import EndpointRuntime
 
 
 def my_notification_cb(endpoint: str, plugin: str, topic: str, data: dict):
@@ -53,8 +53,9 @@ def main():
 
     config = get_config(args.config)
 
-    bc = BridgeClient()
-    eids = bc.list_endpoints()
+    rt = EndpointRuntime()
+    rt.start(wait=True)
+    eids = [n for n in rt.topology() if n != 'broker']
 
     if not eids:
         print("No endpoints found.")
@@ -85,19 +86,19 @@ def main():
 
     print(f"Using endpoint: {eid}")
 
-    ec = bc.get_endpoint_client(eid)
-    pi = ec.get_plugin('psij')
+    pi = rt.get_plugin(eid, 'psij')
 
-    # Register for asynchronous bridge notifications
+    # Register for asynchronous broker notifications
     pi.register_notification_callback(my_notification_cb)
 
     job_spec = config.get("job_spec")
     attrs = job_spec.get("attributes", {})
     
     # Optional: Automatically discover queues and accounts if they aren't provided
-    if "queue_info" in ec.list_plugins() and (not attrs.get("queue_name") or not attrs.get("account")):
+    if "queue_info" in rt.topology().get(eid, {}).get('plugins', {}) \
+            and (not attrs.get("queue_name") or not attrs.get("account")):
         print("Discovering queue information...")
-        qi = ec.get_plugin("queue_info")
+        qi = rt.get_plugin(eid, "queue_info")
         
         if not attrs.get("queue_name"):
             info = qi.get_info()
@@ -152,7 +153,7 @@ def main():
     except Exception as e:
         print(f"An error occurred: {e}")
 
-    bc.close()
+    rt.stop()
 
 
 if __name__ == "__main__":

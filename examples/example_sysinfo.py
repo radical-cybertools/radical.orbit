@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from radical.orbit import BridgeClient
+from radical.orbit import EndpointRuntime
 
 
 def bytes2human(n):
@@ -19,18 +19,18 @@ def bytes2human(n):
 
 def main():
 
-    bc = BridgeClient()
-    eids = bc.list_endpoints()
+    rt = EndpointRuntime()
+    rt.start(wait=True)
+    eids = [n for n in rt.topology() if n != 'broker']
     print(f"Found {len(eids)} Endpoint(s): {eids}")
 
     for eid in eids:
-        ec = bc.get_endpoint_client(eid)
-        si = ec.get_plugin('sysinfo')
+        si = rt.get_plugin(eid, 'sysinfo')
 
         metrics = si.get_metrics()
         render_metrics(eid, metrics)
 
-    bc.close()
+    rt.stop()
 
 
 def render_metrics(eid: str, m: dict):

@@ -341,6 +341,33 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
         return {name: info.model_dump()
                 for name, info in self._participants_for_topology().items()}
 
+    def get_ui_modules(self) -> Dict[str, str]:
+        """Gateway seam (pre-flip item 2): ``{plugin_name: js_content}`` for
+        broker-hosted plugins that ship a dynamically-registered ``ui_module``.
+
+        The static plugin JS the Explorer needs for the *packaged* plugins ships
+        on disk (``data/plugins/*.js``); a hosted plugin registered at runtime —
+        the ``iri.<endpoint>`` instances ``iri_connect`` mints — carries its JS
+        as a file the plugin class points at, discoverable only through the
+        host.  The read touches host-loop state (``BridgePluginHost._plugins``),
+        so it is fetched **across the host-loop boundary** — the routing loop
+        never touches host state.  Empty when the host is not up.
+        """
+        host = self._host
+        loop = self._host_loop
+        if host is None or loop is None:
+            return {}
+
+        async def _fetch() -> Dict[str, str]:
+            return host.get_ui_modules()
+
+        try:
+            cfut = asyncio.run_coroutine_threadsafe(_fetch(), loop)
+            return cfut.result(timeout=5.0)
+        except Exception as e:
+            log.debug("[Broker] get_ui_modules failed: %s", e)
+            return {}
+
     # ── lifecycle ─────────────────────────────────────────────────────
 
     async def startup(self) -> None:
@@ -709,9 +736,18 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
     # ── hosted-plugin host dispatch (across the thread boundary) ──────
 
     async def _dispatch_to_host(self, src_name: str, raw: dict) -> None:
-        """Route a ``dst='broker'`` request into the host and reply."""
+        """Route a ``dst='broker'`` request into the host and reply.
+
+        A participant consumer discovers the broker's hosted plugins with the
+        full ``/broker/{plugin}`` namespace (the topology display form), so it
+        builds request paths rooted there; the host matches routes on the
+        endpoint-relative ``/{plugin}`` form.  Strip the leading ``/broker``
+        segment before dispatch — the same normalization the gateway proxy does
+        by URL routing (``endpoint_name == 'broker'`` → forward the remainder).
+        """
         resp = await self.call_host(
-            raw.get('method', 'GET'), raw.get('path', '/'),
+            raw.get('method', 'GET'),
+            self._strip_broker_prefix(raw.get('path', '/')),
             headers=raw.get('headers', {}), body=raw.get('body', b''))
         out = protocol.Response(
             src=BROKER_NAME, dst=src_name, status=int(resp['status']),
@@ -1018,6 +1054,16 @@ Bridge`.  The tunable liveness/backpressure knobs — ``ping_interval`` and
                              "detail": detail}).encode(),
             corr_id=req_raw.get('corr_id'))
         return protocol.pack_message(out, cap=self._frame_cap)
+
+    @staticmethod
+    def _strip_broker_prefix(path: str) -> str:
+        """Drop a leading ``/broker`` segment from *path* (query preserved)."""
+        prefix = '/' + BROKER_NAME
+        if path == prefix:
+            return '/'
+        if path.startswith(prefix + '/'):
+            return path[len(prefix):]
+        return path
 
     @staticmethod
     def _as_bytes(body) -> bytes:

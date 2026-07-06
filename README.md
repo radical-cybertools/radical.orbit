@@ -86,9 +86,12 @@ For pure local development you can disable the gate (loud warning):
 ```
 
 ### 2. Starting the Bridge
-The Bridge server exposes a REST API and a WebSocket endpoint (`/register`):
+The Bridge process runs the active broker: a WebSocket `/register` hub that
+routes between participants, plus the on-by-default gateway compat tier (HTTP
+REST API, SSE `/events`, and the Explorer). Pass `--no-gateway` for a headless
+broker (WebSocket ingress only).
 ```sh
-./bin/radical-orbit-bridge.py        # prints the auth token + URL on startup
+./bin/radical-orbit-bridge.py        # prints the auth token source + URL on startup
 ```
 
 ### 3. Starting the Endpoint Service
@@ -144,7 +147,7 @@ Inherits from `PluginClient`. An abstraction layer enabling local Python develop
 
 ## Programming with ORBIT
 
-You can interact with Endpoint services pragmatically using the Python `BridgeClient` SDK. Example scripts reside in the `examples/` directory.
+You can interact with other participants' plugins programmatically using the Python `EndpointRuntime` SDK — a zero-plugin runtime is a pure consumer that dials the broker over one outbound WebSocket and reaches plugins with `get_plugin(endpoint, plugin)`. Example scripts reside in the `examples/` directory.
 
 ### Submitting PsiJ Jobs
 The `psij` plugin exposes a normalized interface for interacting with different HPC batch system schedulers via PSI/J.
@@ -161,7 +164,7 @@ job_spec = {
         "slurm.constraint": "V100"
     }
 }
-pi = ec.get_plugin('psij')
+pi = rt.get_plugin('my-endpoint', 'psij')   # rt = EndpointRuntime().start()
 pi.submit_job(job_spec)
 ```
 
@@ -169,7 +172,7 @@ pi.submit_job(job_spec)
 You can query batch scheduling resources programmatically to auto-discover appropriate queues and limits before job submission.
 
 ```python
-qi = ec.get_plugin('queue_info')
+qi = rt.get_plugin('my-endpoint', 'queue_info')
 info = qi.get_info()           # Returns cluster hardware topologies and queue states
 allocs = qi.list_allocations() # Returns active account allocations for the user
 jobs = qi.list_jobs('debug')   # Returns jobs in the specified queue (filtered to current user by default)
@@ -251,7 +254,11 @@ radical-orbit-bridge.py [options]
   --key  KEY     TLS key path; mode 0o600       (CLI > env > file)
   --host HOST    Bind address (default: 0.0.0.0)
   --port PORT    Bind port    (default: 8000)
-  -p PLUGINS     Bridge-hosted plugins (default: role default set)
+  -p PLUGINS     Broker-hosted plugins (default: role default set)
+  --no-auth      Disable ingress auth (local dev only)
+  --no-gateway   Headless broker: only the token-gated WebSocket
+                 /register ingress, no HTTP/SSE/Explorer compat tier
+                 (the gateway is on by default)
 ```
 
 ### Endpoint Service CLI Args
@@ -292,4 +299,4 @@ Or in code: `logging.getLogger("radical.orbit").setLevel(logging.DEBUG)`.
 : The PsiJ executor may be misconfigured. Check the endpoint log for PsiJ errors. For SLURM, verify the account and queue names are valid with `sinfo` and `sacctmgr`.
 
 **SSL verification error when connecting**
-: For `https://` / `wss://` URLs the cert is required — `BridgeClient` and endpoint services raise `ValueError` if no cert is resolved (CLI > env > file).  Either set `RADICAL_ORBIT_BRIDGE_CERT` to the `.pem` from setup, drop the file at `~/.radical/orbit/bridge_cert.pem`, or use a plain `http://` / `ws://` URL (cert resolution is then skipped entirely — dev mode only).
+: For `https://` / `wss://` URLs the cert is required — the `EndpointRuntime` (consumers and endpoints) raises `ValueError` if no cert is resolved (CLI > env > file).  Either set `RADICAL_ORBIT_BRIDGE_CERT` to the `.pem` from setup, drop the file at `~/.radical/orbit/bridge_cert.pem`, or use a plain `http://` / `ws://` URL (cert resolution is then skipped entirely — dev mode only).

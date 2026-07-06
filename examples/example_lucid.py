@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 
-from radical.orbit import BridgeClient
+from radical.orbit import EndpointRuntime
 
 
 def main():
 
-    bc = BridgeClient()
-    eids = bc.list_endpoints()
+    rt = EndpointRuntime()
+    rt.start(wait=True)
+    eids = [n for n in rt.topology() if n != 'broker']
 
     if not eids:
         print("No endpoints found.")
@@ -15,8 +16,7 @@ def main():
     eid = eids[0]
     print(f"Using endpoint: {eid}")
 
-    ec = bc.get_endpoint_client(eid)
-    lucid = ec.get_plugin('lucid')
+    lucid = rt.get_plugin(eid, 'lucid')
 
     print("Submitting pilot...")
     res = lucid.pilot_submit({
@@ -41,7 +41,7 @@ def main():
         stdout = res['task']['stdout'].strip()
         print(f"Task {tid} result: {stdout}")
 
-    bc.close()
+    rt.stop()
 
 
 if __name__ == "__main__":

@@ -5,11 +5,11 @@ Example: file staging via Globus Online (Transfer API).
 Submits a transfer between two Globus collections, waits for it to finish,
 and lists the destination directory.  Globus moves the data
 collection-to-collection out of band — nothing flows through the client,
-endpoint, or bridge.
+endpoint, or broker.
 
 Requirements
 ------------
-* A running bridge with at least one connected endpoint that loads the
+* A running broker with at least one connected endpoint that loads the
   ``globus`` plugin (needs ``globus-sdk`` installed on the endpoint).
 * A Globus Transfer token.  Acquire one via Globus Auth (for example with the
   Globus CLI), and export it, e.g.::
@@ -27,7 +27,7 @@ resolves to the endpoint's configured local collection.
 import os
 import time
 
-from radical.orbit import BridgeClient
+from radical.orbit import EndpointRuntime
 
 # Public Globus tutorial collections (guest collections, world-readable demo
 # data under /home/share/godata/).  Override via env for real endpoints.
@@ -59,16 +59,16 @@ def _auth_kwargs() -> dict:
 
 def main():
 
-    bc   = BridgeClient()
-    eids = bc.list_endpoints()
+    rt   = EndpointRuntime()
+    rt.start(wait=True)
+    eids = [n for n in rt.topology() if n != 'broker']
 
     if not eids:
         print('No endpoints connected - start an endpoint service first')
-        bc.close()
+        rt.stop()
         return
 
-    ec     = bc.get_endpoint_client(eids[0])
-    globus = ec.get_plugin('globus')
+    globus = rt.get_plugin(eids[0], 'globus')
 
     # Register a session carrying the Globus token.
     globus.register_session(**_auth_kwargs())
@@ -103,7 +103,7 @@ def main():
 
     finally:
         globus.close()
-        bc.close()
+        rt.stop()
         print('Done.')
 
 

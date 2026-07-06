@@ -1,37 +1,40 @@
 #!/usr/bin/env python3
-"""Thin entry point for the ORBIT Service.
+"""Thin entry point for the ORBIT endpoint (participant) runtime.
 
-All logic lives in :class:`radical.orbit.service.EndpointService` (also
-exported as ``radical.orbit.Endpoint``).  This script handles argparse,
-log configuration, signal handlers, and forwards to the class.
+All logic lives in :class:`radical.orbit.runtime.EndpointRuntime` (also exported
+as ``radical.orbit.Endpoint``) — the single node abstraction that dials the
+broker over one outbound WebSocket and serves (and/or consumes) plugins.  This
+script keeps its bridge-era filename and CLI surface; it handles argparse, log
+configuration, and signal-driven shutdown, then hands off to the runtime.
 """
 
 import argparse
-import asyncio
 import logging
 import os
 import signal
+import socket
 import sys
+import threading
 
-from radical.orbit.service import EndpointService
+from radical.orbit.runtime import EndpointRuntime
 import radical.orbit.logging_config as _lc
 
 
 log = logging.getLogger("radical.orbit.endpoint")
 
 
-async def main():
+def main():
     parser = argparse.ArgumentParser(description="ORBIT Service")
     parser.add_argument("--name",      "-n", nargs="?", help="Endpoint name")
     parser.add_argument("--url",       "-u", nargs="?",
-                        help="Bridge URL.  CLI > $RADICAL_ORBIT_BRIDGE_URL > "
+                        help="Broker URL.  CLI > $RADICAL_ORBIT_BRIDGE_URL > "
                              "~/.radical/orbit/bridge.url.")
     parser.add_argument("--cert",      "-c", nargs="?",
-                        help="Bridge TLS cert path.  CLI > "
+                        help="Broker TLS cert path.  CLI > "
                              "$RADICAL_ORBIT_BRIDGE_CERT > "
                              "~/.radical/orbit/bridge_cert.pem.")
     parser.add_argument("--token",     "-t",
-                        help="Shared bridge auth token.  CLI > "
+                        help="Shared broker auth token.  CLI > "
                              "$RADICAL_ORBIT_BRIDGE_TOKEN > "
                              "~/.radical/orbit/bridge.token.")
     parser.add_argument("--plugins",   "-p", default="default",
@@ -40,7 +43,7 @@ async def main():
                              "tokens: 'default' (role's default set), "
                              "'all' (every registered plugin).  Wildcards "
                              "allowed: 'iri*'.  Prefix matching supported: "
-                             "'sys'→sysinfo.  Combine, e.g.: '-p default,rose'.")
+                             "'sys'->sysinfo.  Combine, e.g.: '-p default,rose'.")
     parser.add_argument("--log-level", "-l",
                         default=(os.environ.get("RADICAL_ORBIT_LOG_LVL")
                                  or os.environ.get("RADICAL_LOG_LVL") or "INFO"),
@@ -49,7 +52,7 @@ async def main():
                              "RADICAL_ORBIT_LOG_LVL / RADICAL_LOG_LVL)")
     parser.add_argument("--tunnel", default='none',
                         choices=['none', 'forward', 'reverse'],
-                        help="SSH tunnel mode for the bridge connection. "
+                        help="SSH tunnel mode for the broker connection. "
                              "'none' connects directly; 'forward' opens "
                              "ssh -L from this (compute) node to the "
                              "login host (compute->login); 'reverse' "
@@ -64,7 +67,9 @@ async def main():
     args = parser.parse_args()
 
     level = getattr(logging, args.log_level.upper(), logging.INFO)
-    endpoint_name = args.name or 'endpoint'
+    # A serving endpoint wants a stable, recoverable name (auto-``consumer.<uuid>``
+    # naming is for fire-and-forget consumers only), so default to the hostname.
+    endpoint_name = args.name or socket.gethostname()
     log_file = (os.environ.get('RADICAL_ORBIT_LOG_FILE')
                 or os.path.expanduser(
                     f'~/.radical/orbit/logs/{endpoint_name}.log'))
@@ -74,39 +79,39 @@ async def main():
 
     plugins = [t.strip() for t in args.plugins.split(',') if t.strip()]
 
-    # EndpointService resolves URL + cert via radical.orbit.utils (CLI > env > file).
-    service = EndpointService(bridge_url=args.url,
-                          cert       =args.cert,
-                          name       =args.name,
-                          plugins    =plugins,
-                          tunnel     =args.tunnel,
-                          tunnel_via =args.tunnel_via,
-                          token      =args.token)
+    # EndpointRuntime resolves URL + cert via radical.orbit.utils (CLI > env > file).
+    runtime = EndpointRuntime(broker_url=args.url,
+                              cert       =args.cert,
+                              name       =endpoint_name,
+                              plugins    =plugins,
+                              tunnel     =args.tunnel,
+                              tunnel_via =args.tunnel_via,
+                              token      =args.token)
 
-    loop = asyncio.get_running_loop()
+    stop = threading.Event()
 
-    def signal_handler():
+    def signal_handler(signum, frame):
         log.info("Received shutdown signal")
-        service.stop()
+        stop.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, signal_handler)
+        signal.signal(sig, signal_handler)
 
-    log.info("Starting ORBIT Service (%s)", service.bridge_url)
+    log.info("Starting ORBIT endpoint (%s)", runtime.broker_url)
 
     try:
-        await service.run()
-    except asyncio.CancelledError:
-        log.info("Service cancelled")
+        runtime.start(wait=True)
+        stop.wait()
+    except KeyboardInterrupt:
+        pass
     except Exception:
-        log.exception("Service crashed")
+        log.exception("Endpoint crashed")
         sys.exit(1)
     finally:
-        log.info("Service stopped")
+        log.info("Endpoint stopping")
+        runtime.stop()
+        log.info("Endpoint stopped")
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    main()

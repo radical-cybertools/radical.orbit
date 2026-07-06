@@ -552,14 +552,14 @@ def test_callback_dispatcher_drop_oldest_counter():
 
 
 # ---------------------------------------------------------------------------
-# dispatch.py move: service.py re-export + shared function
+# dispatch.py move: shared RequestShim/match_route across hosts
 # ---------------------------------------------------------------------------
 
 def test_dispatch_move_reexport():
     from radical.orbit import dispatch
-    from radical.orbit import service
+    from radical.orbit import runtime as _runtime
     from radical.orbit import bridge_plugin_host
-    assert service.RequestShim is dispatch.RequestShim
+    assert _runtime.RequestShim is dispatch.RequestShim
     assert bridge_plugin_host.RequestShim is dispatch.RequestShim
     assert callable(dispatch.match_route)
     # A route table the shared matcher understands.
