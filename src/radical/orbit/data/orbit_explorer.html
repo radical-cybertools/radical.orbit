@@ -1840,9 +1840,8 @@
           // that the job/task is missing.  Re-register once and retry with a
           // fresh sid.  The `_sidRetried` guard caps this at a single retry so a
           // persistently failing request can't loop.
-          const staleSession = res.status === 410 ||
-                               (res.status === 404 && t.includes('unknown session id'));
-          if (staleSession && !opts._sidRetried) {
+          const su = await ensureSU();
+          if (su.isStaleSession(res.status, t) && !opts._sidRetried) {
             const healedPath = await tryHealSession(path);
             if (healedPath) {
               return await apiFetch(healedPath, { ...opts, _sidRetried: true });
@@ -1924,6 +1923,15 @@
       return endpointData[endpointName]?.plugins?.[pluginName]?.namespace;
     }
 
+    // Pure session-heal helpers (isStaleSession / matchSessionForPath / swapSid)
+    // live in a shared, unit-tested module; load it once, lazily, on first use
+    // (only ever hit on an error path, so no cost on the happy path).
+    let SU = null;
+    async function ensureSU() {
+      if (!SU) SU = await import('/plugins/session_util.js');
+      return SU;
+    }
+
     // Stale-session auto-recovery.  When a session-scoped request 404/410s
     // because the sid is unknown/expired (endpoint restarted, or the server's
     // idle-expiry fired), find the cached session whose sid appears in this
@@ -1932,28 +1940,20 @@
     // matching cached session is found or the re-register fails, so the caller
     // surfaces the original error instead of looping.
     async function tryHealSession(path) {
-      for (const [key, val] of Object.entries(sessions)) {
-        if (typeof val !== 'string') continue;   // still an in-flight promise
-        const slash = key.indexOf('/');
-        const en = key.slice(0, slash);
-        const pn = key.slice(slash + 1);
-        const ns = getNs(en, pn);
-        // Only heal a session whose namespace and sid both appear in this path.
-        if (!ns || !path.startsWith(ns + '/') || !path.includes(val)) continue;
+      const su = await ensureSU();
+      const m  = su.matchSessionForPath(path, sessions, getNs);
+      if (!m) return null;
 
-        const oldSid = val;
-        invalidateSession(en, pn);
-        let newSid;
-        try {
-          newSid = await registerSession(en, pn, sessionRegBodies[key] || {});
-        } catch (_) {
-          return null;   // re-register failed — let the original error surface
-        }
-        if (!newSid || newSid === oldSid) return null;
-        // Swap the stale sid for the fresh one (sid is a unique UUID segment).
-        return path.split(oldSid).join(newSid);
+      invalidateSession(m.endpoint, m.plugin);
+      let newSid;
+      try {
+        newSid = await registerSession(m.endpoint, m.plugin,
+                                       sessionRegBodies[m.key] || {});
+      } catch (_) {
+        return null;   // re-register failed — let the original error surface
       }
-      return null;
+      if (!newSid || newSid === m.sid) return null;
+      return su.swapSid(path, m.sid, newSid);
     }
 
     // ─────────────────────────────────────────────────────────────
