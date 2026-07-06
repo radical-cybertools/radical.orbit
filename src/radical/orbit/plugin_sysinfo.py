@@ -10,6 +10,7 @@ import glob
 import os
 import re
 import time
+import asyncio
 import threading
 import psutil
 import socket
@@ -522,7 +523,9 @@ class SysInfoSession(PluginSession):
         Return current system metrics.
         """
         self._check_active()
-        return self._provider.get_metrics()
+        # Offload the blocking collection (GPU-probe subprocesses) to a
+        # worker thread so it never stalls the event loop for other requests.
+        return await asyncio.to_thread(self._provider.get_metrics)
 
 
 

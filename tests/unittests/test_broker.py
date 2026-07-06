@@ -295,7 +295,7 @@ async def test_request_routing_overwrites_client_src(make_broker):
 
 @pytest.mark.asyncio
 async def test_forwarded_call_table_cap_fast_fails_503(make_broker):
-    from radical.orbit.broker import _Call, _CALLS_CAP
+    from radical.orbit.broker import _Call
     broker = make_broker()
     await broker.startup()
     try:
@@ -306,9 +306,10 @@ async def test_forwarded_call_table_cap_fast_fails_503(make_broker):
         ws2.sent.clear()
 
         # Fill the forwarded-call table to the ceiling.
-        for i in range(_CALLS_CAP):
+        cap = broker._forwarded_call_cap
+        for i in range(cap):
             broker._calls['fill-%d' % i] = _Call('e1', 'e2', None, 1e9)
-        assert len(broker._calls) == _CALLS_CAP
+        assert len(broker._calls) == cap
 
         req = protocol.make_request('e1', 'e2', 'GET', '/x')
         await broker._route_frame('e1', protocol.pack_message(req))
@@ -318,7 +319,7 @@ async def test_forwarded_call_table_cap_fast_fails_503(make_broker):
         assert resp.kind == 'response' and resp.status == 503
         assert resp.corr_id == req.corr_id
         assert not ws2.sent                             # not forwarded to dst
-        assert len(broker._calls) == _CALLS_CAP         # table did not grow
+        assert len(broker._calls) == cap                # table did not grow
         assert req.corr_id not in broker._calls
     finally:
         await broker.shutdown()

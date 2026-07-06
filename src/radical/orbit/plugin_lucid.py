@@ -109,7 +109,16 @@ class LucidSession(PluginSession):
                 asyncio.to_thread(self._tmgr.wait_tasks, tid),
                 timeout=_TASK_WAIT_TIMEOUT)
         except asyncio.TimeoutError:
-            raise HTTPException(status_code=504, detail="task wait timed out")
+            # wait_for cancels the awaiting coroutine but NOT the worker
+            # thread blocked in wait_tasks -- cancel the (now long-stuck)
+            # task so RP drives it terminal and the thread returns instead
+            # of leaking.
+            try:
+                await asyncio.to_thread(self._tmgr.cancel_tasks, [tid])
+            except Exception:
+                pass
+            raise HTTPException(status_code=504,
+                                detail="task wait timed out; task cancelled")
         task = await asyncio.to_thread(self._tmgr.get_tasks, tid)
         return {"tid": tid, "task": task.as_dict()}
 
