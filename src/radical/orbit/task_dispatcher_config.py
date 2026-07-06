@@ -1,11 +1,10 @@
 '''
-Task dispatcher — pool configuration schema and loader.
+Task dispatcher — pool configuration schema and parser.
 
-A ``PoolConfig`` is a durable resource scope that owns a fleet of
-pilots and a single dispatch strategy.  Each pool carries a menu of
-named ``PilotSize`` entries; the strategy picks one by key when it
-decides to submit a new pilot.  See ``plans/task_dispatcher_design.md``
-and ``memory/project_broker_dispatcher.md`` for the surrounding design.
+A ``PoolConfig`` is a durable resource scope that owns a fleet of pilots and
+the conservative dispatch policy.  Each pool carries a menu of named
+``PilotSize`` entries; the policy picks one by key when it decides to submit a
+new pilot.
 
 The ``rhapsody_backend`` field on ``PilotSize`` is **required** — there
 is deliberately no pool-level default and no cascade, to keep the
@@ -17,18 +16,17 @@ first by lexical name).  Sessions can declare arbitrary pool names; the
 single reserved name :data:`DEFAULT_POOL_NAME` (``"default"``) is
 materialised automatically by the dispatcher when a session registers
 without declaring any pools.
+
+Pools arrive only through ``register_session``; there is no on-disk pool
+manifest to load.
 '''
 
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
-import json
 
-
-# Reserved pool name auto-materialised by the dispatcher when a
-# session registers without declaring any pools.  See
-# memory/project_broker_dispatcher.md (Phase 4) for the lifecycle.
+# Reserved pool name auto-materialised by the dispatcher when a session
+# registers without declaring any pools.
 DEFAULT_POOL_NAME: str = 'default'
 
 
@@ -40,9 +38,9 @@ DEFAULT_POOL_NAME: str = 'default'
 class PilotSize:
     '''One named pilot shape in a pool's ``pilot_sizes`` menu.
 
-    The dispatch strategy picks a size by its key name when submitting a
+    The dispatch policy picks a size by its key name when submitting a
     pilot; the values here end up in the psij ``JobSpec`` and as env vars
-    passed to the pilot wrapper (see design doc §6.1).
+    passed to the pilot wrapper.
     '''
     nodes           : int
     cpus_per_node   : int
@@ -70,7 +68,7 @@ class PoolConfig:
     min_pilots      : int  = 0
     max_pilots      : int  = 4
     scratch_base    : str | None = None  # None → default scratch tree
-    strategy        : str  = 'conservative'  # entry-point name or 'module:ClassName'
+    strategy        : str  = 'conservative'  # retained for config compat
     strategy_config : dict[str, Any] = field(default_factory=dict)
 
 
@@ -79,55 +77,17 @@ class PoolConfig:
 # ---------------------------------------------------------------------------
 
 class PoolConfigError(ValueError):
-    '''Raised when pools.json is malformed or violates schema invariants.'''
+    '''Raised when a pool declaration violates schema invariants.'''
     pass
 
 
-def load_pools(path: str | Path) -> dict[str, PoolConfig]:
-    '''Load and validate a ``pools.json`` file.
+def parse_pools(raw: Any, source: str = '<dict>') -> dict[str, PoolConfig]:
+    '''Validate and parse a declaration dict into a ``{name: PoolConfig}``.
 
-    Returns a mapping ``pool_name → PoolConfig``.  Raises
+    *raw* is a JSON object whose ``"pools"`` key holds an array of pool
+    records (the same shape a ``register_session`` body carries).  Raises
     :class:`PoolConfigError` with an actionable message on any schema
     violation.
-
-    The file format is a JSON object whose top-level key is ``"pools"``
-    holding an array of pool records.  Example::
-
-        {
-          "pools": [
-            {
-              "name": "cpu_small",
-              "queue": "batch",
-              "account": "proj123",
-              "default_size": "s",
-              "pilot_sizes": {
-                "s": {"nodes": 1, "cpus_per_node": 64,
-                      "rhapsody_backend": "concurrent"}
-              },
-              "min_pilots": 0,
-              "max_pilots": 4,
-              "strategy": "conservative"
-            }
-          ]
-        }
-    '''
-    p = Path(path)
-    if not p.is_file():
-        raise PoolConfigError(f"pool config file not found: {p}")
-
-    try:
-        raw = json.loads(p.read_text())
-    except json.JSONDecodeError as e:
-        raise PoolConfigError(f"pool config {p} is not valid JSON: {e}") from e
-
-    return parse_pools(raw, source=str(p))
-
-
-def parse_pools(raw: Any, source: str = '<dict>') -> dict[str, PoolConfig]:
-    '''Validate and parse a pre-loaded dict into a ``{name: PoolConfig}``.
-
-    Factored out of ``load_pools`` so tests can exercise validation
-    without touching the filesystem.
     '''
     if not isinstance(raw, dict):
         raise PoolConfigError(
@@ -282,10 +242,12 @@ def default_pool_config(queue: str = 'default') -> PoolConfig:
     declaring any pools.  ``endpoint_name`` is ``None`` so the dispatcher
     auto-selects a connected compute endpoint at materialisation time.
 
-    *queue* defaults to ``"default"`` because the schema's ``queue``
-    field is required non-empty; the dispatcher will override this
-    with an endpoint-appropriate value during materialisation (caller
-    can also pass a known queue here).
+    *queue* defaults to the sentinel ``"default"`` only because the schema
+    requires a non-empty ``queue``.  That sentinel is **not** a real batch
+    queue: the dispatcher refuses to submit a pilot for it and fails the
+    pilot fast (see ``PluginTaskDispatcher._do_pilot_submit``).  Pass a real
+    queue here, or re-declare the pool with an explicit ``queue``, to run
+    pilots.
     '''
     return PoolConfig(
         name            = DEFAULT_POOL_NAME,

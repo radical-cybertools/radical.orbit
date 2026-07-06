@@ -44,7 +44,6 @@ import asyncio
 import json
 import logging
 import os
-import time
 import uuid
 
 from typing import Any, Dict, List, Optional
@@ -185,7 +184,6 @@ class GlobusSession(PluginSession):
 
         # task_id -> {status, label}
         self._tasks: Dict[str, Dict[str, Any]] = {}
-        self._poll_task: Optional[asyncio.Task] = None
 
     # -- helpers ------------------------------------------------------------
 
@@ -347,63 +345,44 @@ class GlobusSession(PluginSession):
         return _as_dict(await self._call(
             self._tc.get_endpoint, coll, context='get_endpoint'))
 
-    # -- lifecycle ----------------------------------------------------------
-
-    async def close(self) -> dict:
-        if self._poll_task and not self._poll_task.done():
-            self._poll_task.cancel()
-            try:
-                await self._poll_task
-            except asyncio.CancelledError:
-                pass
-            self._poll_task = None
-        return await super().close()
-
     # -- background polling -------------------------------------------------
+    #
+    # Lifecycle (task cancellation on close) is handled by the base
+    # ``PluginSession.close()`` / ``stop_status_poller()`` — no override
+    # needed here.
 
     def _start_polling(self) -> None:
-        if self._poll_task is None or self._poll_task.done():
-            self._poll_task = asyncio.create_task(self._poll_tasks())
+        '''(Re)start the shared status poller for the session's active tasks.'''
+        self.start_status_poller(
+            interval=GLOBUS_POLL_INTERVAL,
+            items=lambda: self._tasks,
+            is_terminal=lambda meta: meta.get('status') in GLOBUS_TERMINAL,
+            fetch=self._fetch_task_status,
+            to_payload=self._task_payload,
+            topic='transfer_status',
+            name='globus')
 
-    async def _poll_tasks(self) -> None:
-        while True:
-            try:
-                await asyncio.sleep(GLOBUS_POLL_INTERVAL)
-                if not self._active:
-                    break
+    async def _fetch_task_status(self, task_id: str,
+                                 meta: Dict[str, Any]) -> Optional[dict]:
+        '''Poll one task; return the raw Globus result when its status changed.'''
+        res    = _as_dict(await asyncio.to_thread(self._tc.get_task, task_id))
+        status = res.get('status')
+        if status and status != meta.get('status'):
+            meta['status'] = status
+            return res
+        return None
 
-                active = {tid: m for tid, m in list(self._tasks.items())
-                          if m.get('status') not in GLOBUS_TERMINAL}
-                if not active:
-                    break
-
-                for task_id, meta in active.items():
-                    try:
-                        res    = _as_dict(await asyncio.to_thread(
-                            self._tc.get_task, task_id))
-                        status = res.get('status')
-                        if status and status != meta.get('status'):
-                            old           = meta['status']
-                            meta['status'] = status
-                            log.debug('[globus] task %s: %s -> %s',
-                                      task_id, old, status)
-                            if self._plugin:
-                                self._plugin._dispatch_notify('transfer_status', {
-                                    'task_id'          : task_id,
-                                    'status'           : status,
-                                    'label'            : meta.get('label', ''),
-                                    'bytes_transferred': res.get('bytes_transferred'),
-                                    'files_transferred': res.get('files_transferred'),
-                                    'nice_status'      : res.get('nice_status'),
-                                })
-                    except Exception as exc:
-                        log.debug('[globus] poll error for task %s: %s',
-                                  task_id, exc)
-
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                log.debug('[globus] _poll_tasks error: %s', exc)
+    @staticmethod
+    def _task_payload(task_id: str, meta: Dict[str, Any], res: dict) -> dict:
+        '''Build the ``transfer_status`` notification payload for one task.'''
+        return {
+            'task_id'          : task_id,
+            'status'           : meta['status'],
+            'label'            : meta.get('label', ''),
+            'bytes_transferred': res.get('bytes_transferred'),
+            'files_transferred': res.get('files_transferred'),
+            'nice_status'      : res.get('nice_status'),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -573,7 +552,15 @@ class PluginGlobus(Plugin):
 
         Body: ``{"access_token": ...}`` or
         ``{"refresh_token": ..., "client_id": ...}``, plus optional
-        ``local_collection``.
+        ``local_collection`` and the usual session-policy fields
+        (``sid``/``lifetime``/``ttl`` — see ``Plugin.register_session``).
+
+        Unlike the base ``register_session``, this override needs the
+        credential fields out of the body *before* the session object can be
+        constructed, so it drives session creation itself — but it still
+        records the result through the base's ``_record_session`` /
+        ``_normalize_session_policy`` so a globus session gets the same
+        lifetime/owner bookkeeping every other plugin's sessions get.
         '''
         try:
             data = await request.json()
@@ -592,7 +579,11 @@ class PluginGlobus(Plugin):
                        "'refresh_token'+'client_id'")
 
         self._ensure_cleanup_task()
-        sid = f'session.{uuid.uuid4().hex[:8]}'
+        owner              = self._request_owner(request)
+        sid, lifetime, ttl = self._normalize_session_policy(data)
+        if sid is None:
+            sid = f'session.{uuid.uuid4().hex[:8]}'
+
         try:
             session = self._create_session(
                 sid, access_token=access_token, refresh_token=refresh_token,
@@ -600,8 +591,7 @@ class PluginGlobus(Plugin):
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        self._sessions[sid]            = session
-        self._session_last_access[sid] = time.time()
+        self._record_session(sid, session, lifetime, ttl, owner)
         log.info('[globus] Registered session %s', sid)
         return {'sid': sid}
 

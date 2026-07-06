@@ -1,17 +1,15 @@
 """Unit tests for task_dispatcher_config.
 
-Covers: PilotSize/PoolConfig parsing, JSON file loading, schema errors,
-multiple pools and multiple sizes, round-trip.
+Covers: PilotSize/PoolConfig parsing, schema errors, multiple pools and
+multiple sizes, the built-in default-pool factory.  There is no on-disk pool
+manifest to load — pools arrive only through ``register_session``.
 """
-
-import json
-from pathlib import Path
 
 import pytest
 
 from radical.orbit.task_dispatcher_config import (
     DEFAULT_POOL_NAME, PilotSize, PoolConfigError,
-    default_pool_config, load_pools, parse_pools,
+    default_pool_config, parse_pools,
 )
 
 
@@ -138,6 +136,11 @@ class TestDefaultPool:
         size = p.pilot_sizes[p.default_size]
         assert isinstance(size, PilotSize)
         assert size.rhapsody_backend == 'concurrent'
+        # The zero-config default's queue is the unconfigured 'default'
+        # sentinel, not a real batch queue: the dispatcher refuses to submit
+        # a pilot for it (see PluginTaskDispatcher._do_pilot_submit) rather
+        # than silently submitting to a queue literally named 'default'.
+        assert p.queue == 'default'
 
     def test_default_pool_queue_override(self):
         p = default_pool_config(queue='regular')
@@ -224,26 +227,3 @@ class TestSchemaErrors:
     def test_endpoint_name_non_string_rejected(self):
         with pytest.raises(PoolConfigError, match="endpoint_name"):
             parse_pools(_minimal_pool_dict(endpoint_name=42))
-
-
-# ---------------------------------------------------------------------------
-# load_pools (filesystem)
-# ---------------------------------------------------------------------------
-
-class TestLoadPools:
-
-    def test_load_from_file(self, tmp_path: Path):
-        path = tmp_path / 'pools.json'
-        path.write_text(json.dumps(_minimal_pool_dict()))
-        pools = load_pools(path)
-        assert set(pools.keys()) == {'cpu'}
-
-    def test_load_missing_file(self, tmp_path: Path):
-        with pytest.raises(PoolConfigError, match="not found"):
-            load_pools(tmp_path / 'nope.json')
-
-    def test_load_malformed_json(self, tmp_path: Path):
-        path = tmp_path / 'pools.json'
-        path.write_text("{not valid json")
-        with pytest.raises(PoolConfigError, match="not valid JSON"):
-            load_pools(path)

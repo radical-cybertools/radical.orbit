@@ -4,9 +4,13 @@
       reclaimed, tasks re-enqueued; suspect blip does not tear down; a child
       never seen ``present`` (post-restart) is never demoted.
 - C4  restart correlation: pools + ``_uid_to_task`` rebuilt from the sid-scoped
-      durable store; endpoint-mode ledger replayed (terminal entries filtered).
+      durable store (``_replay_state`` / ``PoolStore``); the endpoint-mode
+      ledger (a plain ``task_id -> endpoint`` dict, atomically persisted) is
+      replayed too.
 - C5  a late terminal event for a re-enqueued task's stale uid is ignored.
-- C6  endpoint-mode ledger self-prunes via snapshot.
+- C6  a completed endpoint-mode task is dropped from the ledger immediately
+      (no separate compaction step — the persisted dict only ever holds live
+      entries).
 - H2  guard against the loop-state-fragile ``run_until_complete`` antipattern.
 """
 
@@ -19,7 +23,7 @@ from fastapi import FastAPI
 from radical.orbit.plugin_task_dispatcher import PluginTaskDispatcher
 from radical.orbit.task_dispatcher_config import PoolConfig, PilotSize
 from radical.orbit.task_dispatcher_state import (
-    PilotRecord, TaskRecord, EndpointModeRecord,
+    PilotRecord, TaskRecord,
     PILOT_ACTIVE, PILOT_DONE, PILOT_FAILED,
     TASK_QUEUED, TASK_RUNNING, TASK_DONE,
 )
@@ -87,7 +91,6 @@ class TestPhantomPilotRecovery:
 
     def test_lost_after_walltime_marks_done(self, tmp_path):
         plugin = _make_plugin(tmp_path)
-        plugin._loops_started = True
         ps, pilot = _active_pilot(plugin, walltime_deadline=time.time() - 1)
         ps.tasks['t.1'] = TaskRecord(task_id='t.1', pool='cpu', owning_sid=_SID,
                                      cmd=['/bin/echo'], cwd=str(tmp_path),
@@ -97,20 +100,18 @@ class TestPhantomPilotRecovery:
         assert pilot.state == PILOT_DONE
         assert ps.tasks['t.1'].state == TASK_QUEUED
         assert ps.tasks['t.1'].pilot_id is None
-        assert ps._pilots_snapshot() == []
+        assert ps.live_pilots() == []
 
     def test_lost_before_walltime_marks_failed(self, tmp_path):
         plugin = _make_plugin(tmp_path)
-        plugin._loops_started = True
         ps, pilot = _active_pilot(plugin, walltime_deadline=time.time() + 1000)
         _topo(plugin, 'endpoint0_p.1', 'present')
         _topo(plugin, 'endpoint0_p.1', 'lost')
         assert pilot.state == PILOT_FAILED
-        assert ps._pilots_snapshot() == []
+        assert ps.live_pilots() == []
 
     def test_suspect_blip_does_not_demote(self, tmp_path):
         plugin = _make_plugin(tmp_path)
-        plugin._loops_started = True
         _, pilot = _active_pilot(plugin, walltime_deadline=time.time() + 1000)
         _topo(plugin, 'endpoint0_p.1', 'present')
         _topo(plugin, 'endpoint0_p.1', 'suspect')
@@ -121,7 +122,6 @@ class TestPhantomPilotRecovery:
         """Restart race: an ACTIVE pilot whose child never appears 'present'
         (never synthesized 'lost') survives — no `_seen` heuristic needed."""
         plugin = _make_plugin(tmp_path)
-        plugin._loops_started = True
         _, pilot = _active_pilot(plugin, walltime_deadline=time.time() + 1000)
         _topo(plugin, 'some_other_endpoint', 'present')
         assert pilot.state == PILOT_ACTIVE
@@ -140,7 +140,7 @@ class TestRestartCorrelation:
                          cmd=['/bin/echo'], cwd=str(tmp_path),
                          state=TASK_RUNNING, pilot_id='p.1', rhapsody_uid='rh.1')
         ps.tasks['t.x'] = rec
-        ps.task_log.append(rec)
+        ps.persist()
 
         plugin2 = _make_plugin(tmp_path, with_pool=False)   # fresh; replay only
         assert _SID in plugin2._pool_states
@@ -150,20 +150,24 @@ class TestRestartCorrelation:
 
     def test_endpoint_mode_ledger_replayed(self, tmp_path):
         plugin = _make_plugin(tmp_path, with_pool=False)
-        plugin._endpoint_mode_log.append(
-            EndpointModeRecord(task_id='t.e', endpoint='gpuendpoint',
-                               state=TASK_RUNNING))
+        plugin._endpoint_mode_tasks['t.e'] = 'gpuendpoint'
+        plugin._persist_endpoint_mode()
+
         plugin2 = _make_plugin(tmp_path, with_pool=False)
         assert plugin2._endpoint_mode_tasks.get('t.e') == 'gpuendpoint'
 
-    def test_endpoint_mode_terminal_filtered(self, tmp_path):
+    def test_endpoint_mode_terminal_dropped_immediately(self, tmp_path):
+        """A completed endpoint-mode task is popped (and re-persisted) the
+        moment its terminal event is handled — the on-disk ledger is a plain
+        dict of live entries only, so a restart never sees the terminal
+        one."""
         plugin = _make_plugin(tmp_path, with_pool=False)
-        plugin._endpoint_mode_log.append(
-            EndpointModeRecord(task_id='t.e', endpoint='gpuendpoint',
-                               state=TASK_RUNNING))
-        plugin._endpoint_mode_log.append(
-            EndpointModeRecord(task_id='t.e', endpoint='gpuendpoint',
-                               state=TASK_DONE))
+        plugin._endpoint_mode_tasks['t.e'] = 'gpuendpoint'
+        plugin._persist_endpoint_mode()
+
+        plugin._handle_task_terminal('t.e', TASK_DONE, {})
+        assert 't.e' not in plugin._endpoint_mode_tasks
+
         plugin2 = _make_plugin(tmp_path, with_pool=False)
         assert 't.e' not in plugin2._endpoint_mode_tasks
 
@@ -196,25 +200,11 @@ class TestStaleUid:
 
 
 # ---------------------------------------------------------------------------
-# C6 — endpoint-mode ledger self-prunes via snapshot
+# C6 — endpoint-mode ledger only ever holds live entries (see
+# TestRestartCorrelation.test_endpoint_mode_terminal_dropped_immediately: a
+# terminal task is popped from ``_endpoint_mode_tasks`` and re-persisted the
+# moment its terminal event is handled, so there is nothing left to compact).
 # ---------------------------------------------------------------------------
-
-class TestEndpointModeCompaction:
-
-    def test_snapshot_drops_terminal_entries(self, tmp_path):
-        plugin = _make_plugin(tmp_path, with_pool=False)
-        log = plugin._endpoint_mode_log
-        plugin._endpoint_mode_tasks['t.live'] = 'e1'
-        log.append(EndpointModeRecord(task_id='t.live', endpoint='e1',
-                                      state=TASK_RUNNING))
-        log.append(EndpointModeRecord(task_id='t.gone', endpoint='e2',
-                                      state=TASK_DONE))
-        live = {tid: EndpointModeRecord(task_id=tid, endpoint=ep,
-                                        state=TASK_RUNNING)
-                for tid, ep in plugin._endpoint_mode_tasks.items()}
-        log.snapshot(live)
-        assert set(log.replay().keys()) == {'t.live'}
-
 
 # ---------------------------------------------------------------------------
 # H2 — regression guard against the loop-state-fragile antipattern

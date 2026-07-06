@@ -9,6 +9,7 @@ import pytest
 from radical.orbit import batch_system as bs
 from radical.orbit.batch_system import (
     BatchSystem, NullBatchSystem, detect_batch_system, reset_detection,
+    run_cmd, run_cmd_strict,
     STATE_PENDING, STATE_RUNNING, STATE_DONE, STATE_FAILED,
     STATE_CANCELLED, STATE_HELD, STATE_UNKNOWN, TERMINAL_STATES)
 from radical.orbit.batch_system_slurm import SlurmBatchSystem, _parse_slurm_time
@@ -395,6 +396,64 @@ class TestParseExecHost:
 
     def test_empty(self):
         assert _parse_exec_host('') == []
+
+
+# ---------------------------------------------------------------------------
+# run_cmd / run_cmd_strict
+# ---------------------------------------------------------------------------
+
+class TestRunCmd:
+
+    def test_returns_stdout_on_success(self):
+        with patch('subprocess.run',
+                   return_value=MagicMock(returncode=0, stdout='hello\n')):
+            assert run_cmd(['echo', 'hello']) == 'hello\n'
+
+    def test_none_on_nonzero_rc(self):
+        with patch('subprocess.run',
+                   return_value=MagicMock(returncode=1, stdout='', stderr='x')):
+            assert run_cmd(['false']) is None
+
+    def test_none_on_oserror(self):
+        with patch('subprocess.run', side_effect=OSError('no such file')):
+            assert run_cmd(['nonexistent']) is None
+
+    def test_none_on_timeout(self):
+        with patch('subprocess.run',
+                   side_effect=subprocess.TimeoutExpired(['sleep'], timeout=10)):
+            assert run_cmd(['sleep', '100']) is None
+
+    def test_passes_timeout_and_env(self):
+        with patch('subprocess.run',
+                   return_value=MagicMock(returncode=0, stdout='')) as m:
+            run_cmd(['x'], timeout=42, env={'A': 'B'})
+        assert m.call_args.kwargs['timeout'] == 42
+        assert m.call_args.kwargs['env'] == {'A': 'B'}
+
+
+class TestRunCmdStrict:
+
+    def test_returns_stdout_on_success(self):
+        with patch('subprocess.run',
+                   return_value=MagicMock(returncode=0, stdout='hello\n')):
+            assert run_cmd_strict(['echo', 'hello']) == 'hello\n'
+
+    def test_raises_on_nonzero_rc(self):
+        with patch('subprocess.run',
+                   return_value=MagicMock(returncode=1, stdout='', stderr='nope')):
+            with pytest.raises(RuntimeError, match='nope'):
+                run_cmd_strict(['false'])
+
+    def test_raises_on_oserror(self):
+        with patch('subprocess.run', side_effect=OSError('no such file')):
+            with pytest.raises(RuntimeError, match='no such file'):
+                run_cmd_strict(['nonexistent'])
+
+    def test_raises_on_timeout(self):
+        with patch('subprocess.run',
+                   side_effect=subprocess.TimeoutExpired(['sleep'], timeout=10)):
+            with pytest.raises(RuntimeError):
+                run_cmd_strict(['sleep', '100'])
 
 
 # ---------------------------------------------------------------------------

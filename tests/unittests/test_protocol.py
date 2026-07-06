@@ -9,7 +9,7 @@ from radical.orbit.protocol import (
     Identity, SubscribePattern, ParticipantInfo,
     Request, Response, Event, Register, RegisterAck,
     Subscribe, Unsubscribe, Topology, Control,
-    mint_id, mint_corr_id, pack_message, parse_message, peek_routing,
+    mint_id, mint_corr_id, pack_message, parse_message,
     make_request, make_response,
 )
 
@@ -35,7 +35,7 @@ class TestIdHelpers:
     def test_mint_id_unique(self):
         assert mint_id() != mint_id()
 
-    def test_mint_corr_id_namespaced_by_src(self):
+    def test_mint_corr_id_prefixed_by_src(self):
         cid = mint_corr_id('endpoint-1')
         assert cid.startswith('endpoint-1:')
 
@@ -51,7 +51,7 @@ class TestRoundTrip:
             src='client.1', dst='endpoint.1', method='POST',
             path='/rhapsody/submit/session.abc',
             headers={'content-type': 'application/json'},
-            body=NON_UTF8_BODY, is_binary=True,
+            body=NON_UTF8_BODY,
             corr_id=mint_corr_id('client.1'))
         parsed, _ = _roundtrip(msg)
         assert isinstance(parsed, Request)
@@ -63,14 +63,13 @@ class TestRoundTrip:
         assert parsed.headers == {'content-type': 'application/json'}
         assert parsed.body == NON_UTF8_BODY
         assert isinstance(parsed.body, bytes)
-        assert parsed.is_binary is True
         assert parsed.corr_id == msg.corr_id
 
     def test_response_roundtrip(self):
         msg = Response(
             src='endpoint.1', dst='client.1', status=200,
             headers={'content-type': 'application/octet-stream'},
-            body=NON_UTF8_BODY, is_binary=True, corr_id='client.1:abc')
+            body=NON_UTF8_BODY, corr_id='client.1:abc')
         parsed, _ = _roundtrip(msg)
         assert isinstance(parsed, Response)
         assert parsed.status == 200
@@ -99,14 +98,20 @@ class TestRoundTrip:
         parsed, _ = _roundtrip(msg)
         assert parsed.session is None
 
+    def test_event_ts_seq_default_none(self):
+        # Senders leave ts/seq unset; the broker assigns them on ingest.
+        msg = Event(src='e1', plugin='p', topic='t')
+        parsed, _ = _roundtrip(msg)
+        assert parsed.ts is None
+        assert parsed.seq is None
+
     def test_register_roundtrip(self):
         msg = Register(
             src='endpoint.1',
             identity=Identity(name='endpoint.1', credential='tok',
                                resume_key=None),
             role='endpoint',
-            plugins=[{'name': 'sysinfo', 'namespace': '/endpoint.1/sysinfo/x'}],
-            capabilities={'protocol_version': PROTOCOL_VERSION})
+            plugins=[{'name': 'sysinfo', 'namespace': '/endpoint.1/sysinfo/x'}])
         parsed, _ = _roundtrip(msg)
         assert isinstance(parsed, Register)
         assert parsed.identity.name == 'endpoint.1'
@@ -115,12 +120,11 @@ class TestRoundTrip:
         assert parsed.role == 'endpoint'
         assert parsed.plugins == [
             {'name': 'sysinfo', 'namespace': '/endpoint.1/sysinfo/x'}]
-        assert parsed.capabilities == {'protocol_version': PROTOCOL_VERSION}
 
     def test_register_ack_roundtrip_ok(self):
         msg = RegisterAck(
             src='broker', dst='endpoint.1', ok=True, reason=None,
-            capabilities={}, resume_key='rk-123')
+            resume_key='rk-123')
         parsed, _ = _roundtrip(msg)
         assert parsed.ok is True
         assert parsed.reason is None
@@ -129,7 +133,7 @@ class TestRoundTrip:
     def test_register_ack_roundtrip_failure(self):
         msg = RegisterAck(
             src='broker', dst='endpoint.1', ok=False,
-            reason='name in use', capabilities={}, resume_key='')
+            reason='name in use', resume_key='')
         parsed, _ = _roundtrip(msg)
         assert parsed.ok is False
         assert parsed.reason == 'name in use'
@@ -209,7 +213,6 @@ class TestMakeRequestResponse:
         assert req.path == '/health'
         assert req.body == b''
         assert req.headers == {}
-        assert req.is_binary is False
 
     def test_make_request_explicit_corr_id(self):
         req = make_request('client.1', 'endpoint.1', 'GET', '/health',
@@ -266,7 +269,7 @@ class TestErrors:
 
     def test_unknown_kind(self):
         raw  = {'version': PROTOCOL_VERSION, 'id': mint_id(), 'corr_id': None,
-                'channel': None, 'src': 'a', 'dst': 'b', 'kind': 'bogus'}
+                'src': 'a', 'dst': 'b', 'kind': 'bogus'}
         data = msgpack.packb(raw, use_bin_type=True)
         with pytest.raises(ProtocolError, match='unknown message kind'):
             parse_message(data)
@@ -274,8 +277,8 @@ class TestErrors:
     def test_missing_required_field(self):
         # request without 'method'
         raw  = {'version': PROTOCOL_VERSION, 'id': mint_id(), 'corr_id': None,
-                'channel': None, 'src': 'a', 'dst': 'b', 'kind': 'request',
-                'path': '/x', 'headers': {}, 'body': b'', 'is_binary': False}
+                'src': 'a', 'dst': 'b', 'kind': 'request',
+                'path': '/x', 'headers': {}, 'body': b''}
         data = msgpack.packb(raw, use_bin_type=True)
         with pytest.raises(ProtocolError, match="invalid 'request' message"):
             parse_message(data)
@@ -302,7 +305,7 @@ class TestErrors:
 
     def test_control_invalid_op_rejected(self):
         raw  = {'version': PROTOCOL_VERSION, 'id': mint_id(), 'corr_id': None,
-                'channel': None, 'src': 'broker', 'dst': None,
+                'src': 'broker', 'dst': None,
                 'kind': 'control', 'op': 'reboot', 'data': {}}
         data = msgpack.packb(raw, use_bin_type=True)
         with pytest.raises(ProtocolError, match="invalid 'control' message"):
@@ -313,45 +316,3 @@ class TestErrors:
             msg = Control(src='broker', op=op)
             parsed, _ = _roundtrip(msg)
             assert parsed.op == op
-
-
-class TestPeekRouting:
-    """peek_routing extracts routing fields without pydantic validation."""
-
-    def test_agrees_with_parse_message_on_valid_frame(self):
-        msg  = make_request('client.1', 'endpoint.1', 'GET', '/health')
-        data = pack_message(msg)
-        kind, src, dst, corr_id = peek_routing(data)
-        parsed = parse_message(data)
-        assert kind == parsed.kind == 'request'
-        assert src == parsed.src == 'client.1'
-        assert dst == parsed.dst == 'endpoint.1'
-        assert corr_id == parsed.corr_id
-
-    def test_survives_invalid_non_routing_field(self):
-        # 'method' missing entirely -- parse_message would reject this,
-        # but peek_routing only looks at kind/src/dst/corr_id.
-        raw  = {'version': PROTOCOL_VERSION, 'id': mint_id(),
-                'corr_id': 'client.1:abc', 'channel': None,
-                'src': 'client.1', 'dst': 'endpoint.1', 'kind': 'request'}
-        data = msgpack.packb(raw, use_bin_type=True)
-        with pytest.raises(ProtocolError):
-            parse_message(data)
-        kind, src, dst, corr_id = peek_routing(data)
-        assert kind == 'request'
-        assert src == 'client.1'
-        assert dst == 'endpoint.1'
-        assert corr_id == 'client.1:abc'
-
-    def test_does_not_validate_unknown_kind(self):
-        raw  = {'kind': 'bogus', 'src': 'a', 'dst': 'b', 'corr_id': None}
-        data = msgpack.packb(raw, use_bin_type=True)
-        kind, src, dst, corr_id = peek_routing(data)
-        assert kind == 'bogus'
-        assert src == 'a'
-        assert dst == 'b'
-        assert corr_id is None
-
-    def test_malformed_msgpack_raises(self):
-        with pytest.raises(ProtocolError, match='malformed msgpack'):
-            peek_routing(b'\xff\xff\xff\xff\xff\xff')

@@ -5,19 +5,10 @@ Backend implementations live in queue_info_slurm.py and queue_info_pbs.py.
 """
 
 import getpass
-import re
 import time
 import threading
 
 from abc import ABC, abstractmethod
-
-
-# Node states considered unavailable for scheduling (SLURM vocabulary;
-# kept here for legacy reasons but only used by the SLURM backend).
-_UNAVAIL_STATES = {'DOWN',    'DRAIN',   'DRAINING',
-                   'FAIL',    'FAILING', 'MAINT',
-                   'FUTURE',  'POWER_DOWN', 'POWERED_DOWN',
-                   'NOT_RESPONDING', 'REBOOT_ISSUED'}
 
 
 def _resolve_user(user):
@@ -33,64 +24,6 @@ def _resolve_user(user):
     if user == '*':
         return None
     return user
-
-
-def _unwrap(obj):
-    """
-    Extract a value from SLURM's {set, infinite, number} wrapper.
-
-    Returns:
-      The numeric value, or None if the field is infinite or unset.
-    """
-
-    if not isinstance(obj, dict):
-        return obj
-
-    if obj.get('infinite'):
-        return None
-    if not obj.get('set', True):
-        return None
-
-    return obj.get('number')
-
-
-def _parse_gpus(gres_str):
-    """
-    Parse GPU count from a SLURM GRES string.
-
-    Handles formats like:
-      "gpu:8(S:0-7)"
-      "gpu:mi250:8(S:0-7)"
-      "gpu:8"
-      "(null)"
-      ""
-
-    Returns:
-      int: number of GPUs, or 0 if none.
-    """
-
-    if not gres_str or gres_str == '(null)':
-        return 0
-
-    total = 0
-    for entry in gres_str.split(','):
-        entry = entry.strip()
-        if not entry.startswith('gpu'):
-            continue
-
-        # strip socket binding like (S:0-7)
-        entry = re.sub(r'\(.*?\)', '', entry)
-
-        parts = entry.split(':')
-        # gpu:N or gpu:TYPE:N
-        for part in reversed(parts):
-            try:
-                total += int(part)
-                break
-            except ValueError:
-                continue
-
-    return total
 
 
 class QueueInfo(ABC):
@@ -306,7 +239,7 @@ def make_queue_info(batch=None, conf_path=None) -> 'QueueInfo':
     # site specializations like AuroraPBSBatchSystem (name='pbs-aurora',
     # psij_executor='pbs') still route to the PBS queue_info backend.
     if batch.psij_executor == 'slurm':
-        from .queue_info_slurm import QueueInfoSlurm  # noqa: F811
+        from .queue_info_slurm import QueueInfoSlurm
         return QueueInfoSlurm(slurm_conf=conf_path)
     if batch.psij_executor == 'pbs':
         from .queue_info_pbs import QueueInfoPBSPro
@@ -314,8 +247,3 @@ def make_queue_info(batch=None, conf_path=None) -> 'QueueInfo':
 
     from .queue_info_none import QueueInfoNone
     return QueueInfoNone()
-
-
-# Backwards-compat re-exports. External code (and the test suite) imports
-# QueueInfoSlurm from this module; keep that path live.
-from .queue_info_slurm import QueueInfoSlurm   # noqa: E402, F401

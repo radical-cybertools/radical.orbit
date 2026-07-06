@@ -26,13 +26,9 @@ class TestResolvePluginNames:
         available = ['sysinfo', 'psij', 'queue_info']
         assert _resolve_plugin_names(['psij'], available) == ['psij']
 
-    def test_prefix_match(self):
-        available = ['sysinfo', 'psij', 'queue_info']
-        assert _resolve_plugin_names(['sys'], available) == ['sysinfo']
-
     def test_multiple(self):
         available = ['sysinfo', 'psij', 'queue_info']
-        result = _resolve_plugin_names(['sys', 'psij'], available)
+        result = _resolve_plugin_names(['sysinfo', 'psij'], available)
         assert result == ['sysinfo', 'psij']
 
     def test_no_match(self):
@@ -40,14 +36,15 @@ class TestResolvePluginNames:
         with pytest.raises(ValueError, match="No plugin matches 'foo'"):
             _resolve_plugin_names(['foo'], available)
 
-    def test_ambiguous(self):
-        available = ['iri_connect', 'iri_instance', 'psij']
-        # Prefix 'ir' is ambiguous (matches iri, iri_info)
-        with pytest.raises(ValueError, match="Ambiguous"):
-            _resolve_plugin_names(['ir'], available)
+    def test_prefix_no_longer_matches(self):
+        """The ambiguous prefix-match form was dropped: a partial name is an
+        error, not a resolution."""
+        available = ['sysinfo', 'psij', 'queue_info']
+        with pytest.raises(ValueError, match="No plugin matches 'sys'"):
+            _resolve_plugin_names(['sys'], available)
 
-    def test_exact_match_priority_over_prefix(self):
-        """Exact match wins even when it is also a prefix of another name."""
+    def test_exact_match_only(self):
+        """An exact name resolves even when it is a prefix of another name."""
         available = ['iri_connect', 'iri_connect_v2', 'psij']
         assert _resolve_plugin_names(['iri_connect'], available) == ['iri_connect']
 

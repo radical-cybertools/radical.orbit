@@ -5,9 +5,10 @@ This module provides the base :class:`PluginClient` helper that every plugin's
 ``client_class`` subclasses (``SysInfoClient``, ``PSIJClient``, …).  It speaks a
 small ``httpx``-shaped transport surface (``self._http.get/post`` +
 :meth:`PluginClient._request`) so a helper is transport-agnostic: the endpoint
-runtime rides it over a WebSocket by swapping in a transport shim
-(:class:`radical.orbit.runtime_client.RuntimePluginClient`), and plugin-level
-``TestClient`` tests ride it over HTTP.
+runtime rides it over a WebSocket by injecting a
+:class:`radical.orbit.runtime_client._RuntimeHTTP` transport (and passing the
+runtime as ``broker_client`` so notifications register against the runtime's
+callback registry), and plugin-level ``TestClient`` tests ride it over HTTP.
 
 Notification Callbacks
 ----------------------
@@ -41,29 +42,6 @@ def _raise(resp, context: str = '') -> None:
         raise RuntimeError(' — '.join(parts))
 
 
-def _run_sync(coro):
-    """Drive a client async-core coroutine to completion on the sync transport.
-
-    A helper's public sync method (``PSIJClient.submit_tunneled`` …) is a thin
-    wrapper around its ``async def`` core; the core awaits
-    :meth:`PluginClient._arequest`, whose default implementation returns the
-    sync :meth:`PluginClient._request` result **without suspending** (no event
-    loop, no future).  The coroutine therefore completes in a single ``send``,
-    so this driver reduces the sync path to the same ``self._http.<verb>(...)``
-    call the helpers made before — bit-identical, and never touching an event
-    loop.  A core that *does* suspend here (i.e. was handed an async transport)
-    is a bug, and is reported as such.
-    """
-    try:
-        coro.send(None)
-    except StopIteration as e:
-        return e.value
-    coro.close()
-    raise RuntimeError(
-        'client async core suspended on the sync transport — a caller-backed '
-        'async core must be awaited, not driven synchronously')
-
-
 class PluginClient:
     """
     Base helper class for Endpoint Plugins (Application side).
@@ -82,8 +60,9 @@ class PluginClient:
         psij.register_notification_callback(on_job_status, topic="job_status")
 
     The base implementation registers over an injected notification client
-    (``self._bc``); :class:`~radical.orbit.runtime_client.RuntimePluginClient`
-    overrides these to ride the runtime's callback registry over the WebSocket.
+    (``self._bc``); the endpoint runtime passes itself as ``self._bc`` (via
+    ``get_plugin(..., broker_client=runtime)``), so these calls ride the
+    runtime's callback registry over the WebSocket with no subclass.
     """
 
     def __init__(self, http_client, base_url: str, broker_client=None,
@@ -94,14 +73,6 @@ class PluginClient:
         self._endpoint_id = endpoint_id
         self._plugin_name = plugin_name
         self._sid: Optional[str] = None
-        # Async transport for the ``a<method>`` cores.  ``None`` (the default,
-        # incl. every user-thread client) routes async cores through the sync
-        # ``_request`` — driven by ``_run_sync`` in one step, bit-identical.
-        # The broker-hosted dispatcher installs a caller-backed transport here
-        # (a ``CallerHTTP``) so the cores await the routing loop.  An explicit
-        # attribute (not attribute-sniffing) so a ``MagicMock`` ``_http`` in a
-        # test never looks like an async transport.
-        self._async_http = None
 
     def register_notification_callback(self, callback: Callable, topic: Optional[str] = None) -> None:
         """
@@ -152,27 +123,12 @@ class PluginClient:
         """Single transport seam for every helper-facing call.
 
         Dispatches to the matching verb method on ``self._http``
-        (``self._http.post`` / ``.get`` / …) so behaviour is **bit-identical**
-        to the direct ``self._http.post(...)`` calls the 11 plugin helpers
-        make (and the old suite mocks).  The seam is overridable in two ways:
-        swap ``self._http`` for a transport shim (what ``RuntimePluginClient``
-        does), or override this method.
+        (``self._http.post`` / ``.get`` / …).  The seam is overridable by
+        swapping ``self._http`` for a transport shim — the broker-hosted
+        dispatcher installs a caller-backed sync transport there so the same
+        helper methods route over the in-process caller.
         """
         return getattr(self._http, method.lower())(url, **kwargs)
-
-    async def _arequest(self, method: str, url: str, **kwargs):
-        """Async twin of :meth:`_request` — the transport seam for async cores.
-
-        When an async transport is installed (``self._async_http`` — the
-        broker-hosted :class:`~radical.orbit.runtime_client.CallerHTTP`), await
-        it so the call rides the routing loop without ever blocking the host
-        loop.  Otherwise fall back to the sync :meth:`_request`; driven by
-        :func:`_run_sync` that fallback completes in one step without an event
-        loop, keeping the user-thread sync path bit-identical.
-        """
-        if self._async_http is not None:
-            return await self._async_http.arequest(method, url, **kwargs)
-        return self._request(method, url, **kwargs)
 
     def _raise(self, resp, context: str = '') -> None:
         """Raise RuntimeError with HTTP status, origin, optional context, and server detail."""
@@ -196,26 +152,20 @@ class PluginClient:
         Subclasses may override to accept plugin-specific keyword
         arguments (e.g. ``backends``).
         """
-        return _run_sync(self.aregister_session(
-            sid=sid, lifetime=lifetime, ttl=ttl, **kwargs))
+        resp = self._request("POST", self._url("register_session"),
+                             json=self._session_payload(sid, lifetime, ttl))
+        self._raise(resp)
+        self._sid = resp.json()['sid']
 
-    async def aregister_session(self, sid: Optional[str] = None,
-                                lifetime: Optional[str] = None,
-                                ttl: Optional[float] = None,
-                                **kwargs: Any) -> None:
-        """Async core for :meth:`register_session` (see it for arguments).
-
-        Shares one wire implementation between the user-thread sync wrapper and
-        the broker-hosted dispatcher (which awaits it on the host loop).
-        """
+    @staticmethod
+    def _session_payload(sid: Optional[str], lifetime: Optional[str],
+                         ttl: Optional[float]):
+        """Build the ``register_session`` request body (``None`` when empty)."""
         payload = {}
         if sid      is not None: payload['sid']      = sid
         if lifetime is not None: payload['lifetime'] = lifetime
         if ttl      is not None: payload['ttl']      = ttl
-        resp = await self._arequest("POST", self._url("register_session"),
-                                    json=payload or None)
-        self._raise(resp)
-        self._sid = resp.json()['sid']
+        return payload or None
 
     def unregister_session(self) -> None:
         """

@@ -27,7 +27,6 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 
-from .http_utils import make_async_http_client
 from .plugin_session_base import PluginSession
 from .plugin_base import Plugin
 from .client import PluginClient
@@ -37,12 +36,10 @@ log = logging.getLogger("radical.orbit")
 
 # -----------------------------------------------------------------------------
 # Cross-endpoint access over the endpoint runtime.
-# XGFabric runs on an endpoint node and reaches *other*
-# endpoints' plugins through its own :class:`EndpointRuntime` consumer facade
+# XGFabric runs on an endpoint node and reaches *other* endpoints' plugins
+# through its own :class:`EndpointRuntime` consumer facade
 # (``get_plugin(dst, plugin)`` / ``topology()``) — every call rides the single
-# outbound WebSocket to the broker, no loopback HTTP.  These thin adapters keep
-# the small ``list_endpoints`` / ``get_endpoint_client(name).get_plugin(...)``
-# surface the workflow code already speaks.
+# outbound WebSocket to the broker, no loopback HTTP.
 # -----------------------------------------------------------------------------
 
 def _endpoint_participants(topology: Dict[str, Any]) -> Dict[str, Any]:
@@ -56,34 +53,6 @@ def _endpoint_participants(topology: Dict[str, Any]) -> Dict[str, Any]:
             if (info or {}).get('role') == 'endpoint'}
 
 
-class _RuntimeEndpointAdapter:
-    """``get_plugin``-shaped view of one remote endpoint."""
-
-    def __init__(self, runtime: Any, endpoint_name: str):
-        self._runtime       = runtime
-        self._endpoint_name = endpoint_name
-
-    def get_plugin(self, plugin_name: str, **session_kwargs) -> Any:
-        return self._runtime.get_plugin(self._endpoint_name, plugin_name,
-                                        **session_kwargs)
-
-
-class _RuntimeBrokerAdapter:
-    """``get_endpoint_client``-shaped view backed by the endpoint runtime consumer."""
-
-    def __init__(self, runtime: Any):
-        self._runtime = runtime
-
-    def list_endpoints(self) -> List[str]:
-        return list(self._runtime.topology().keys())
-
-    def get_endpoint_client(self, endpoint_name: str) -> _RuntimeEndpointAdapter:
-        return _RuntimeEndpointAdapter(self._runtime, endpoint_name)
-
-    def close(self) -> None:
-        pass
-
-
 # -----------------------------------------------------------------------------
 # Configuration Dataclasses
 # -----------------------------------------------------------------------------
@@ -94,9 +63,12 @@ class ResourceConfig:
     name: str = "default"
     broker_url: str = "https://localhost:8000"
     broker_cert: Optional[str] = None
-    # Per-endpoint overrides used when submitting pilots via psij.
-    # Keys are endpoint names; values are dicts with any of:
-    #   queue, account, duration, nodes, executor, workflow_path, custom_attributes
+    # Per-endpoint overrides used when submitting pilots via psij, and for
+    # cluster classification.  Keys are endpoint names; values are dicts with
+    # any of:
+    #   queue, account, duration, nodes, executor, workflow_path,
+    #   custom_attributes, cluster_type ('immediate'|'allocate' — wins over
+    #   the general queue_info-presence rule in XGFabricSession._classify)
     cluster_configs: Dict[str, Dict] = field(default_factory=dict)
 
 
@@ -215,8 +187,7 @@ class XGFabricSession(PluginSession):
     """
 
     def __init__(self, sid: str, workdir: Optional[str] = None, endpoint_name: Optional[str] = None,
-                 broker_url: Optional[str] = None, broker_cert: Optional[str] = None,
-                 runtime: Any = None):
+                 broker_url: Optional[str] = None, runtime: Any = None):
         super().__init__(sid)
         # The endpoint runtime this session reaches other endpoints through
         # (its consumer facade); injected by the plugin at session creation.
@@ -229,8 +200,6 @@ class XGFabricSession(PluginSession):
 
         self._endpoint_name = endpoint_name or 'local'
         self._broker_url = broker_url
-        self._broker_cert = broker_cert
-        self._http        = make_async_http_client(verify=self._verify())
         self._connected_endpoints: Dict[str, Any] = {}  # Cached connected endpoints
         self._current_config: Optional[WorkflowConfig] = None
         self._current_resource_config: Optional[ResourceConfig] = None
@@ -238,24 +207,10 @@ class XGFabricSession(PluginSession):
         self._workflow_task: Optional[asyncio.Task] = None
         self._cancel_requested = False
 
-        # Broker client for communicating with other endpoints
-        self._bc = None
         # Cache of resolved home dirs per endpoint (populated on first use)
         self._homedir_cache: Dict[str, str] = {}
         # Active rhapsody client + pending task UIDs for the current batch (for cleanup)
         self._pending_tasks: Optional[tuple] = None  # (rhapsody_client, set[uid])
-
-    def _verify(self) -> Any:
-        """Return SSL verification argument for httpx calls."""
-        return self._broker_cert if self._broker_cert else False
-
-    async def _http_get(self, url: str, **kwargs) -> Any:
-        """Run httpx.get using the session AsyncClient."""
-        return await self._http.get(url, **kwargs)
-
-    async def _http_post(self, url: str, **kwargs) -> Any:
-        """Run httpx.post using the session AsyncClient."""
-        return await self._http.post(url, **kwargs)
 
     async def _resolve_path(self, endpoint_name: str, path: str) -> str:
         """Expand a leading '~' to the home directory on the remote endpoint."""
@@ -317,24 +272,37 @@ class XGFabricSession(PluginSession):
                 log.warning("Failed to read config %s: %s", f, e)
         return sorted(configs, key=lambda x: x['name'])
 
-    async def load_config(self, name: str) -> Dict:
-        """Load a workflow config by name, path, or builtin alias ('default', 'test')."""
-        _builtins = {
-            'default': 'xgfabric_workflow_default.json',
-            'test':    'xgfabric_workflow_test.json',
-        }
-        if name in _builtins:
-            return self._load_builtin_config(_builtins[name])
+    def _resolve_config_path(self, name: str, builtins: Dict[str, str]):
+        """Resolve a config name to a builtin dict or a config-file ``Path``.
+
+        ``name`` may be a builtin alias (looked up in ``builtins`` and read
+        straight from package data), an absolute or already-existing path, or
+        a bare name resolved under the session's config dir.  Shared by
+        :meth:`load_config` (workflow configs) and
+        :meth:`_load_resource_config` (resource configs) — only the builtin
+        alias map differs between the two.
+        """
+        if name in builtins:
+            return self._load_builtin_config(builtins[name])
 
         p = Path(name)
         if p.is_absolute() or p.exists():
-            config_file = p if p.suffix else p.with_suffix('.json')
-        else:
-            config_file = self._config_dir / (name if name.endswith('.json') else f'{name}.json')
-        if not config_file.exists():
+            return p if p.suffix else p.with_suffix('.json')
+        return self._config_dir / (name if name.endswith('.json') else f'{name}.json')
+
+    async def load_config(self, name: str) -> Dict:
+        """Load a workflow config by name, path, or builtin alias ('default', 'test')."""
+        resolved = self._resolve_config_path(name, {
+            'default': 'xgfabric_workflow_default.json',
+            'test':    'xgfabric_workflow_test.json',
+        })
+        if isinstance(resolved, dict):
+            return resolved
+
+        if not resolved.exists():
             raise HTTPException(status_code=404, detail=f"Config '{name}' not found")
 
-        with open(config_file) as f:
+        with open(resolved) as f:
             data = json.load(f)
         self._current_config = dict_to_config(data)
         return data
@@ -398,42 +366,63 @@ class XGFabricSession(PluginSession):
 
         return asdict(self._state)
 
+    @staticmethod
+    def _cluster(endpoint_name: str, rc: Optional['ResourceConfig']) -> Dict:
+        """Build the base cluster-info dict for one endpoint.
+
+        Per-endpoint overrides from ``rc.cluster_configs`` (queue, account,
+        ``cluster_type``, …) are layered on top of the defaults.
+        """
+        base = {'name': endpoint_name, 'endpoint_name': endpoint_name,
+                'has_gpu': False, 'online': True, 'tasks_running': 0}
+        if rc:
+            base.update(rc.cluster_configs.get(endpoint_name, {}))
+        return base
+
+    def _classify(self, endpoints_info: Dict,
+                  rc: Optional['ResourceConfig']) -> tuple[List[Dict], List[Dict]]:
+        """Classify ``endpoints_info`` into (immediate, allocate) cluster lists.
+
+        An explicit ``cluster_type: 'immediate'|'allocate'`` in
+        ``rc.cluster_configs[endpoint_name]`` wins; otherwise endpoints with
+        the ``queue_info`` plugin go to allocate and everything else to
+        immediate.
+        """
+        immediate, allocate = [], []
+        for endpoint_name, endpoint_info in endpoints_info.items():
+            plugins  = endpoint_info.get('plugins', [])
+            override = rc.cluster_configs.get(endpoint_name, {}).get('cluster_type') \
+                if rc else None
+
+            if override in ('immediate', 'allocate'):
+                cluster_type = override
+                log.info("[XGFabric]   %s -> %s (config override)",
+                         endpoint_name, cluster_type)
+            elif 'queue_info' in plugins:
+                cluster_type = 'allocate'
+                log.info("[XGFabric]   %s -> allocate (queue_info enabled)", endpoint_name)
+            else:
+                cluster_type = 'immediate'
+                log.info("[XGFabric]   %s -> immediate (no scheduler)", endpoint_name)
+
+            target = allocate if cluster_type == 'allocate' else immediate
+            target.append(self._cluster(endpoint_name, rc))
+        return immediate, allocate
+
     async def _get_connected_endpoints(self) -> tuple[List[Dict], List[Dict]]:
         """Return (immediate, allocate) cluster lists from cache or broker query.
 
         Endpoints with the queue_info plugin AND a working scheduler go into
-        allocate_clusters; all others go into immediate_clusters.
+        allocate_clusters; all others go into immediate_clusters (unless a
+        ``cluster_type`` override in the resource config says otherwise).
         """
         rc = self._current_resource_config
-        def _cluster(endpoint_name: str) -> Dict:
-            base = {'name': endpoint_name, 'endpoint_name': endpoint_name,
-                    'has_gpu': False, 'online': True, 'tasks_running': 0}
-            if rc:
-                base.update(rc.cluster_configs.get(endpoint_name, {}))
-            return base
-
-        async def _classify(endpoints_info: Dict) -> tuple[List[Dict], List[Dict]]:
-            """Classify endpoints_info dict into (immediate, allocate)."""
-            immediate, allocate = [], []
-            for endpoint_name, endpoint_info in endpoints_info.items():
-                plugins = endpoint_info.get('plugins', [])
-                # ucsb endpoints are always immediate (no batch scheduler available)
-                if 'ucsb' in endpoint_name:
-                    log.info("[XGFabric]   %s -> immediate (ucsb)", endpoint_name)
-                    immediate.append(_cluster(endpoint_name))
-                elif 'queue_info' in plugins:
-                    log.info("[XGFabric]   %s -> allocate (queue_info enabled)", endpoint_name)
-                    allocate.append(_cluster(endpoint_name))
-                else:
-                    log.info("[XGFabric]   %s -> immediate (no scheduler)", endpoint_name)
-                    immediate.append(_cluster(endpoint_name))
-            return immediate, allocate
 
         # Use cached topology if available (populated by on_topology_change)
         if self._connected_endpoints:
             log.info("[XGFabric] _get_connected_endpoints: using cached topology (%d endpoints)",
                      len(self._connected_endpoints))
-            return await _classify(self._connected_endpoints)
+            return self._classify(self._connected_endpoints, rc)
 
         # Fallback: query the broker topology (over the runtime) and classify.
         log.info("[XGFabric] _get_connected_endpoints: no cached topology — "
@@ -447,7 +436,7 @@ class XGFabricSession(PluginSession):
                           for name, info in topo.items()}
             log.info("[XGFabric] _get_connected_endpoints: broker reported %d endpoints: %s",
                      len(endpoints_info), list(endpoints_info.keys()))
-            return await _classify(endpoints_info)
+            return self._classify(endpoints_info, rc)
 
         except Exception as e:
             log.info("[XGFabric] _get_connected_endpoints: topology query failed — %s", e)
@@ -489,22 +478,18 @@ class XGFabricSession(PluginSession):
 
     async def _load_resource_config(self, name: str) -> Dict:
         """Load a resource config by name or builtin alias ('default', 'test')."""
-        _builtins = {
-            'default':    'xgfabric_resource_default.json',
+        resolved = self._resolve_config_path(name, {
+            'default':     'xgfabric_resource_default.json',
             '__default__': 'xgfabric_resource_default.json',
             'test':        'xgfabric_resource_test.json',
             '__test__':    'xgfabric_resource_test.json',
-        }
-        if name in _builtins:
-            return self._load_builtin_config(_builtins[name])
+        })
+        if isinstance(resolved, dict):
+            return resolved
 
-        p = Path(name)
-        config_file = (p if p.suffix else p.with_suffix('.json')) \
-            if (p.is_absolute() or p.exists()) \
-            else self._config_dir / (name if name.endswith('.json') else f'{name}.json')
-        if not config_file.exists():
+        if not resolved.exists():
             raise HTTPException(status_code=404, detail=f"Resource config '{name}' not found")
-        with open(config_file) as f:
+        with open(resolved) as f:
             return json.load(f)
 
     async def stop_workflow(self) -> Dict:
@@ -565,16 +550,13 @@ class XGFabricSession(PluginSession):
 
         # Always prefer the live broker URL from the session over the resource config —
         # the saved URL may be stale (e.g. localhost vs public IP).
-        broker_url  = self._broker_url  or (rc.broker_url  if rc else 'https://localhost:8000')
-        broker_cert = self._broker_cert or (rc.broker_cert if rc else None)
-        log.info("[XGFabric] _execute_workflow: effective broker_url=%s  cert=%s",
-                 broker_url, broker_cert)
+        broker_url = self._broker_url or (rc.broker_url if rc else 'https://localhost:8000')
+        log.info("[XGFabric] _execute_workflow: effective broker_url=%s", broker_url)
         self._update_state('connecting', 'Connecting to broker...')
         if self._runtime is None:
             raise RuntimeError(
                 "xgfabric workflow execution requires an endpoint runtime "
                 "(cross-endpoint access rides the runtime consumer facade)")
-        self._bc = _RuntimeBrokerAdapter(self._runtime)
 
         # Discover which clusters are connected right now (always live, ignores config)
         self._update_state('verifying', 'Verifying endpoints...')
@@ -690,19 +672,17 @@ class XGFabricSession(PluginSession):
 
     async def _is_endpoint_online(self, cluster: Dict) -> bool:
         """Check if cluster's child endpoint is online."""
-        if not self._bc:
-            raise RuntimeError("No active broker connection")
+        if not self._runtime:
+            raise RuntimeError("No active endpoint runtime")
         endpoint_name = cluster.get('child_endpoint_name') or cluster['endpoint_name']
-        endpoints = await asyncio.to_thread(self._bc.list_endpoints)
-        return endpoint_name in endpoints
+        return endpoint_name in self._runtime.topology()
 
     def _get_plugin(self, cluster: Dict, plugin_name: str) -> Any:
         """Get plugin client for a cluster."""
-        if not self._bc:
-            raise RuntimeError("No active broker connection")
+        if not self._runtime:
+            raise RuntimeError("No active endpoint runtime")
         endpoint_name = cluster.get('child_endpoint_name') or cluster['endpoint_name']
-        ec = self._bc.get_endpoint_client(endpoint_name)
-        return ec.get_plugin(plugin_name)
+        return self._runtime.get_plugin(endpoint_name, plugin_name)
 
     # -------------------------------------------------------------------------
     # Task rendering
@@ -867,10 +847,9 @@ class XGFabricSession(PluginSession):
 
     async def _submit_pilot(self, cluster: Dict, broker_url: str) -> str:
         """Submit pilot job to spawn child endpoint."""
-        if not self._bc:
-            raise RuntimeError("No active broker connection")
-        ec = self._bc.get_endpoint_client(cluster['endpoint_name'])
-        psij: Any = await asyncio.to_thread(ec.get_plugin, 'psij')
+        if not self._runtime:
+            raise RuntimeError("No active endpoint runtime")
+        psij: Any = await asyncio.to_thread(self._get_plugin, cluster, 'psij')
 
         args = ["--url", broker_url, "--name", cluster['endpoint_name'] + ".1"]
 
@@ -891,11 +870,11 @@ class XGFabricSession(PluginSession):
             }
         }
 
-        executor = cluster.get('executor') or await self._discover_executor(ec)
+        executor = cluster.get('executor') or await self._discover_executor(cluster)
         result = await asyncio.to_thread(psij.submit_job, pilot_spec, executor)
         return result['job_id']
 
-    async def _discover_executor(self, ec) -> str:
+    async def _discover_executor(self, cluster: Dict) -> str:
         """Ask the remote endpoint's queue_info plugin which scheduler it uses.
 
         Returns the matching PsiJ executor name. Falls back to 'slurm' (the
@@ -903,7 +882,7 @@ class XGFabricSession(PluginSession):
         query fails.
         """
         try:
-            qi = await asyncio.to_thread(ec.get_plugin, 'queue_info')
+            qi = await asyncio.to_thread(self._get_plugin, cluster, 'queue_info')
             backend = await asyncio.to_thread(qi.backend)
         except Exception as exc:
             log.info("[XGFabric] _discover_executor: probe failed (%s) — "
@@ -1187,14 +1166,13 @@ class XGFabricSession(PluginSession):
                 cfg = self._current_config
                 if not cfg:
                     raise RuntimeError("No active workflow configuration")
-                if not self._bc:
-                    raise RuntimeError("No active broker connection")
+                if not self._runtime:
+                    raise RuntimeError("No active endpoint runtime")
                 all_clusters = (self._state.immediate_clusters +
                                 self._state.allocate_clusters)
                 for c in all_clusters:
                     if c.get('name') == cluster_name:
-                        ec   = self._bc.get_endpoint_client(c['endpoint_name'])
-                        psij = await asyncio.to_thread(ec.get_plugin, 'psij')
+                        psij = await asyncio.to_thread(self._get_plugin, c, 'psij')
                         await asyncio.to_thread(psij.cancel_job, pilot_id)
                         log.info("Cancelled pilot job %s", pilot_id)
                         break
@@ -1206,12 +1184,6 @@ class XGFabricSession(PluginSession):
         if self._workflow_task and not self._workflow_task.done():
             self._cancel_requested = True
             self._workflow_task.cancel()
-        if self._bc:
-            try:
-                self._bc.close()
-            except Exception as e:
-                log.exception("[XGFabric] Error closing broker client: %s", e)
-        await self._http.aclose()
         return await super().close()
 
 
@@ -1347,31 +1319,20 @@ class PluginXGFabric(Plugin):
         """Create session with workdir, endpoint name, and broker connection info."""
         endpoint_name = getattr(self._app.state, 'endpoint_name', 'local')
 
-        # Get the broker URL from the endpoint runtime.  Cert path comes from
-        # the shared resolver (CLI > env > file) — we ignore CLI here since
-        # this is the internal session-creation path.
-        from . import utils
-        endpoint_service = getattr(self._app.state, 'endpoint_service', None)
-        broker_url = getattr(endpoint_service, 'broker_url', None) \
-            if endpoint_service else None
-        try:
-            cert_path, _ = utils.resolve_broker_cert()
-            broker_cert  = str(cert_path)
-        except (ValueError, FileNotFoundError):
-            broker_cert  = None
+        # The endpoint runtime (consumer facade) this plugin runs under; the
+        # session reaches other endpoints through it, and also supplies the
+        # live broker URL (used for the pilot's ``--url``).
+        runtime = getattr(self._app.state, 'endpoint_service', None)
+        broker_url = getattr(runtime, 'broker_url', None) if runtime else None
 
         log.info("[XGFabric] _create_session: sid=%s  endpoint=%s  broker_url=%s  cached_endpoints=%s",
                  sid, endpoint_name, broker_url, list(self._connected_endpoints.keys()))
 
-        # The endpoint runtime (consumer facade) this plugin runs under; the
-        # session reaches other endpoints through it.
-        runtime = getattr(self._app.state, 'endpoint_service', None)
-
-        # Use super() so the base class injects the _notify callback into the session
+        # Use super() so the base class injects the ``_plugin`` back-reference
+        # the session needs for notify()/_dispatch_notify().
         session = super()._create_session(sid,
                       workdir=self._workdir, endpoint_name=endpoint_name,
-                      broker_url=broker_url, broker_cert=broker_cert,
-                      runtime=runtime)
+                      broker_url=broker_url, runtime=runtime)
         if not isinstance(session, XGFabricSession):
             raise RuntimeError(f"Expected XGFabricSession, got {type(session).__name__}")
 

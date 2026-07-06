@@ -178,8 +178,12 @@ def harness(self_signed, tmp_path, monkeypatch):
     runtimes = []
 
     def make_broker(ws_ping_interval=20.0, ws_ping_timeout=20.0, **kw):
-        from radical.orbit.broker import Broker
-        defaults = dict(cert=str(cert), key=str(key), no_auth=True, grace=2.0)
+        from radical.orbit.broker import Broker, BrokerTuning
+        tuning = BrokerTuning(grace=2.0)
+        for _k in list(kw):
+            if hasattr(tuning, _k):
+                setattr(tuning, _k, kw.pop(_k))
+        defaults = dict(cert=str(cert), key=str(key), no_auth=True, tuning=tuning)
         defaults.update(kw)
         broker = Broker(**defaults)
         srv = _RunningBroker(broker, ws_ping_interval, ws_ping_timeout).start()
@@ -445,8 +449,8 @@ def test_owner_channel_broker_stamped_not_spoofable(harness):
     sid = resp.json()['sid']
 
     plugin = a._plugins['echo_rt']
-    assert _wait(lambda: sid in plugin._session_policy, timeout=2.0)
-    assert plugin._session_policy[sid]['owner'] == 'epB'    # not 'attacker'
+    assert _wait(lambda: sid in plugin._records, timeout=2.0)
+    assert plugin._records[sid].owner == 'epB'    # not 'attacker'
 
 
 # ---------------------------------------------------------------------------
@@ -473,7 +477,7 @@ def test_served_plugin_observes_lost_and_reclaims(harness):
     resp = b.call('epA', 'POST', '/liveness_rt/register_session', body=b'{}')
     sid = resp.json()['sid']
     assert _wait(lambda: sid in plugin._sessions, timeout=2.0)
-    assert plugin._session_policy[sid]['owner'] == 'epB'
+    assert plugin._records[sid].owner == 'epB'
     assert _wait(lambda: ('epB', 'present') in plugin.observed, timeout=5.0)
 
     # Hard-drop B: abort the WS transport (TCP RST, no close frame) so the
@@ -726,6 +730,20 @@ def test_with_meta_seq_matches_replay_and_default_unchanged(harness):
     # The same authoritative seqs are what the broker-hosted replay plugin
     # retained for these events.
     replay = b.get_plugin('broker', 'replay')
-    resp = replay.fetch('c1')
+    resp = replay.fetch(-1)
     retained = {e['seq'] for e in resp['events']}
     assert set(metas).issubset(retained)
+
+
+# ---------------------------------------------------------------------------
+# RuntimeResponse: case-insensitive headers (httpx.Headers surface)
+# ---------------------------------------------------------------------------
+
+def test_runtime_response_headers_case_insensitive():
+    """A helper doing resp.headers.get('Content-Type') must match a
+    lower-cased wire header — RuntimeResponse.headers is case-insensitive."""
+    from radical.orbit.runtime_client import RuntimeResponse
+    r = RuntimeResponse(200, {'content-type': 'application/json'}, b'{}')
+    assert r.headers.get('Content-Type') == 'application/json'
+    assert r.headers.get('content-type') == 'application/json'
+    assert r.json() == {}
