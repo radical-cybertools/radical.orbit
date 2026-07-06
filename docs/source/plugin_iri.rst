@@ -15,7 +15,7 @@ It comes in two cooperating parts:
 
 ``iri_connect``
    A **bridge-side** configurator.  It lists the known IRI facility endpoints
-   and, on :py:meth:`connect`, dynamically registers a per-endpoint instance
+   and, on ``connect()``, dynamically registers a per-endpoint instance
    plugin named ``iri.<endpoint>`` (e.g. ``iri.nersc``) that then appears as a
    first-class node in the Explorer tree.
 
