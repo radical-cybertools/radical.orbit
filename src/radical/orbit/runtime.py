@@ -506,20 +506,27 @@ class EndpointRuntime(PluginHostBase):
     def _ssl_context(self, ws_url: str):
         """Build the client TLS context.
 
-        With a **pinned** cert, ``CERT_REQUIRED`` against that cert already
-        authenticates the peer, so hostname matching (which a self-signed dev
-        cert commonly fails) is redundant — it is disabled up front rather than
-        reactively downgraded on an OpenSSL error string.  Without a pinned cert
-        the system trust store is used with full hostname verification.
+        With a **pinned** cert, trust ONLY that certificate — never the system
+        CA store (#42) — so a broker presenting any other system-trusted or
+        same-host cert is rejected; ``CERT_REQUIRED`` against the pinned cert
+        already authenticates the peer, so hostname matching (which a
+        self-signed dev cert commonly fails) is redundant and disabled up front.
+        A pinned-but-missing cert **fails closed** —
+        ``create_default_context(cafile=...)`` raises rather than silently
+        downgrading to system trust.  Without a pinned cert the system trust
+        store is used with full hostname verification.
         """
         if not ws_url.startswith('wss://'):
             return None
-        ctx = ssl.create_default_context()
-        ctx.verify_mode = ssl.CERT_REQUIRED
-        if self._cert and os.path.exists(self._cert):
-            ctx.load_verify_locations(self._cert)
+        if self._cert:
+            # cafile makes this cert the ONLY trust root (no system store);
+            # a missing file raises here -> fail closed.
+            ctx = ssl.create_default_context(cafile=self._cert)
+            ctx.verify_mode    = ssl.CERT_REQUIRED
             ctx.check_hostname = False
         else:
+            ctx = ssl.create_default_context()
+            ctx.verify_mode    = ssl.CERT_REQUIRED
             ctx.check_hostname = True
         return ctx
 
