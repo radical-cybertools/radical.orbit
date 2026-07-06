@@ -180,7 +180,11 @@ class GlobusSession(PluginSession):
             raise ValueError(
                 "provide either 'access_token' or 'refresh_token'+'client_id'")
 
-        self._tc = globus_sdk.TransferClient(authorizer=authorizer)
+        # Bound every HTTP call so a hung Globus endpoint cannot block the
+        # offload thread indefinitely (mirrors the IRI client's timeout=30).
+        self._tc = globus_sdk.TransferClient(
+            authorizer=authorizer,
+            transport_params={"http_timeout": 60})
 
         # task_id -> {status, label}
         self._tasks: Dict[str, Dict[str, Any]] = {}

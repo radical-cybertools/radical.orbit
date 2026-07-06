@@ -281,7 +281,7 @@ class SysInfoProvider:
                     "--query-gpu=index,utilization.gpu,utilization.memory,memory.total,memory.used,memory.free",
                     "--format=csv,noheader,nounits"
                 ]
-                ret = subprocess.check_output(cmd, text=True)
+                ret = subprocess.check_output(cmd, text=True, timeout=5)
 
                 # Parse
                 n_metrics = {}
@@ -311,7 +311,7 @@ class SysInfoProvider:
             try:
                 # rocm-smi --showuse --showmeminfo vram --json
                 cmd = ["rocm-smi", "--showuse", "--showmeminfo", "vram", "--json"]
-                ret = subprocess.check_output(cmd, text=True)
+                ret = subprocess.check_output(cmd, text=True, timeout=5)
                 data = json.loads(ret)
 
                 for g in amd_gpus:

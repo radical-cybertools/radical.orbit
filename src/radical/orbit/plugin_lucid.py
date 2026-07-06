@@ -8,7 +8,7 @@ __license__   = 'MIT'
 
 import asyncio
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from starlette.requests import Request
 
 import radical.pilot as rp
@@ -16,6 +16,11 @@ import radical.pilot as rp
 from .plugin_session_base import PluginSession
 from .plugin_base import Plugin
 from .client import PluginClient
+
+
+# Bounded default wait so a task that never terminates cannot pin a shared
+# default-executor thread forever (starving every other plugin's offloads).
+_TASK_WAIT_TIMEOUT = 3600.0
 
 
 class LucidSession(PluginSession):
@@ -99,7 +104,12 @@ class LucidSession(PluginSession):
         """
         self._check_active()
 
-        await asyncio.to_thread(self._tmgr.wait_tasks, tid)
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(self._tmgr.wait_tasks, tid),
+                timeout=_TASK_WAIT_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="task wait timed out")
         task = await asyncio.to_thread(self._tmgr.get_tasks, tid)
         return {"tid": tid, "task": task.as_dict()}
 

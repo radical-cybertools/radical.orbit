@@ -74,6 +74,11 @@ log = logging.getLogger("radical.orbit.broker")
 
 BROKER_NAME = 'broker'
 
+# Fast-fail ceiling on the forwarded-call table.  Every relayed ``request``
+# frame inserts a ``_Call`` bounded only by deadline eviction in ``_reap_calls``;
+# this caps the table so a flood cannot grow it without bound (503 beyond).
+_CALLS_CAP = 4096
+
 
 # ---------------------------------------------------------------------------
 # Tunables
@@ -739,6 +744,13 @@ class Broker:
             await self._send(self.registry.get(src_name),
                              self._error_response(raw, 502,
                                                   f"endpoint {dst!r} unknown"))
+            return
+
+        if len(self._calls) >= _CALLS_CAP:
+            await self._send(self.registry.get(src_name),
+                             self._error_response(raw, 503,
+                                                  "broker forwarded-call table "
+                                                  "at cap"))
             return
 
         self._calls[corr_id] = _Call(src_name, dst, None,
