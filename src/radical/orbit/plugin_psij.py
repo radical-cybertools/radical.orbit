@@ -35,7 +35,7 @@ from . import batch_system
 from . import tunnel
 from .plugin_base import Plugin
 from .plugin_session_base import PluginSession
-from .client import PluginClient, _run_sync
+from .client import PluginClient
 
 log = logging.getLogger("radical.orbit")
 
@@ -495,13 +495,6 @@ class PSIJClient(PluginClient):
         Returns:
             Job status info including metadata and stdout/stderr.
         """
-        return _run_sync(self.aget_job_status(
-            job_id, stdout_offset, stderr_offset))
-
-    async def aget_job_status(self, job_id: str,
-                              stdout_offset: int = 0,
-                              stderr_offset: int = 0) -> Dict[str, Any]:
-        """Async core for :meth:`get_job_status` (broker-hosted dispatcher)."""
         self._require_session()
 
         url    = self._url(ROUTE_STATUS.format(sid=self.sid, job_id=job_id))
@@ -511,7 +504,7 @@ class PSIJClient(PluginClient):
         if stderr_offset:
             params['stderr_offset'] = str(stderr_offset)
 
-        resp = await self._arequest("GET", url, params=params)
+        resp = self._http.get(url, params=params)
         self._raise(resp, f"job status {job_id!r}")
         return resp.json()
 
@@ -538,15 +531,11 @@ class PSIJClient(PluginClient):
         Returns:
             Cancellation result.
         """
-        return _run_sync(self.acancel_job(job_id))
-
-    async def acancel_job(self, job_id: str) -> Dict[str, Any]:
-        """Async core for :meth:`cancel_job` (broker-hosted dispatcher)."""
         self._require_session()
 
         url = self._url(ROUTE_CANCEL.format(sid=self.sid, job_id=job_id))
 
-        resp = await self._arequest("POST", url)
+        resp = self._http.post(url)
         self._raise(resp, f"cancel job {job_id!r}")
         return resp.json()
 
@@ -591,16 +580,6 @@ class PSIJClient(PluginClient):
             ValueError:   If *tunnel* is not one of the three string values.
             RuntimeError: If the server returns an error response.
         """
-        return _run_sync(self.asubmit_tunneled(job_spec, executor, tunnel))
-
-    async def asubmit_tunneled(self, job_spec: Dict[str, Any],
-                               executor: str = 'local',
-                               tunnel: str = 'none') -> Dict[str, Any]:
-        """Async core for :meth:`submit_tunneled` (broker-hosted dispatcher).
-
-        Same validation, path, payload and error mapping as the sync wrapper;
-        the dispatcher awaits this directly on the broker host loop.
-        """
         if tunnel not in ('none', 'forward', 'reverse'):
             raise ValueError(
                 f"tunnel must be one of 'none' / 'forward' / 'reverse'; "
@@ -611,7 +590,7 @@ class PSIJClient(PluginClient):
         url     = self._url(ROUTE_SUBMIT_TUNNELED.format(sid=self.sid))
         payload = {"job_spec": job_spec, "executor": executor, "tunnel": tunnel}
 
-        resp = await self._arequest("POST", url, json=payload)
+        resp = self._http.post(url, json=payload)
         self._raise(resp, f"psij submit_tunneled on {executor!r}")
         return resp.json()
 

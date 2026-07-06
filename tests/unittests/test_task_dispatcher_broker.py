@@ -219,10 +219,11 @@ def test_dispatcher_calls_child_via_caller(harness):
 
 def test_dispatcher_drives_real_psij_helper_via_caller(harness):
     """End-to-end: the dispatcher builds a REAL ``PSIJClient`` wired to the
-    broker caller (``CallerHTTP``) and drives its async cores against a real
-    child endpoint — register + ``asubmit_tunneled`` — with the payload and
-    response crossing the routing loop intact.  This is the convergence the
-    proxies were replaced by: one helper implementation, caller-backed.
+    broker caller (a sync ``_CallerSyncHTTP`` transport) and drives its plain
+    sync helpers via ``asyncio.to_thread`` against a real child endpoint —
+    register + ``submit_tunneled`` — with the payload and response crossing the
+    routing loop intact.  One helper implementation, caller-backed, host loop
+    never blocked.
     """
     import asyncio
 
@@ -236,8 +237,8 @@ def test_dispatcher_drives_real_psij_helper_via_caller(harness):
         psij = await td._get_psij_client('ep')      # real PSIJClient over caller
         assert psij is not None
         assert psij.sid                              # session registered
-        return await psij.asubmit_tunneled(
-            {'executable': '/bin/true'}, 'local', 'none')
+        return await asyncio.to_thread(
+            psij.submit_tunneled, {'executable': '/bin/true'}, 'local', 'none')
 
     result = asyncio.run(_drive())
     assert result['job_id']        == 'j.1'
