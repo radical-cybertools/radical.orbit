@@ -922,3 +922,18 @@ async def test_restart_sender_delivers_buffered_events(make_broker):
     finally:
         broker.registry.pop('e1', None)
         await broker.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# canonical error envelope (issue #14): _error_response carries the rich shape
+# ---------------------------------------------------------------------------
+
+def test_error_response_carries_rich_envelope(make_broker):
+    import json as _json
+    broker = make_broker()
+    packed = broker._error_response({'src': 'epX', 'corr_id': 'c1'},
+                                    404, 'no such route')
+    msg = protocol.parse_message(packed)
+    assert msg.status == 404
+    assert _json.loads(msg.body) == {"error": True, "status_code": 404,
+                                     "detail": "no such route"}

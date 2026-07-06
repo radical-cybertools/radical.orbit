@@ -379,6 +379,19 @@ def test_proxy_unknown_endpoint_is_404(harness):
     assert r.status_code == 404
 
 
+def test_gateway_raised_httpexception_uses_rich_envelope(harness):
+    # A gateway-raised HTTPException (disconnecting the broker host is a 400)
+    # renders the canonical envelope, not FastAPI's bare {"detail": ...}.
+    make_broker, _ = harness
+    srv = make_broker()
+    r = httpx.post(srv.url + '/endpoint/disconnect/broker')
+    assert r.status_code == 400
+    body = r.json()
+    assert body['error']       is True
+    assert body['status_code'] == 400
+    assert 'broker' in body['detail'].lower()
+
+
 # ---------------------------------------------------------------------------
 # Long 504 deadline carried over (config value; not waited on)
 # ---------------------------------------------------------------------------

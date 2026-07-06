@@ -64,6 +64,7 @@ from . import utils
 
 from .client            import PluginClient
 from .dispatch          import RequestShim, match_route
+from .errors            import error_body
 from .plugin_base       import Plugin
 from .plugin_host_base  import PluginHostBase
 from .runtime_client    import RuntimeResponse, _RuntimeHTTP
@@ -644,9 +645,7 @@ class EndpointRuntime(PluginHostBase):
                 req, 503,
                 headers={'content-type': 'application/json',
                          'retry-after': str(self._retry_after)},
-                body=_json.dumps({"error": True, "status_code": 503,
-                                  "detail": "endpoint at concurrency cap"
-                                  }).encode()))
+                body=error_body(503, "endpoint at concurrency cap")))
             return
         self._req_inflight += 1
         self._work_loop.create_task(self._serve_request(req))
@@ -663,15 +662,13 @@ class EndpointRuntime(PluginHostBase):
             self._emit(protocol.make_response(
                 req, 504,
                 headers={'content-type': 'application/json'},
-                body=_json.dumps({"error": True, "status_code": 504,
-                                  "detail": "handler timed out"
-                                  }).encode()))
+                body=error_body(504, "handler timed out")))
         except Exception as e:                             # pragma: no cover
             log.exception("[Runtime] request handling error: %s", e)
             self._emit(protocol.make_response(
                 req, 500,
                 headers={'content-type': 'application/json'},
-                body=_json.dumps({"error": True, "detail": str(e)}).encode()))
+                body=error_body(500, str(e))))
         finally:
             self._req_inflight -= 1
 
@@ -687,8 +684,7 @@ class EndpointRuntime(PluginHostBase):
         handler, path_params = match_route(self._direct_routes, req.method, path)
         if handler is None:
             return (404, {'content-type': 'application/json'},
-                    _json.dumps({"detail": f"No route: {req.method} {path}"
-                                 }).encode())
+                    error_body(404, f"No route: {req.method} {path}"))
         # Case-insensitive content-type lookup: a client may send
         # ``Content-Type`` and a plain dict ``.get('content-type')`` would miss.
         lower_headers = {k.lower(): v for k, v in (req.headers or {}).items()}
@@ -707,12 +703,11 @@ class EndpointRuntime(PluginHostBase):
             result = await handler(shim)
         except HTTPException as e:
             return (e.status_code, {'content-type': 'application/json'},
-                    _json.dumps({"detail": e.detail}).encode())
+                    error_body(e.status_code, e.detail))
         except Exception as e:
             log.exception("[Runtime] handler error: %s %s", req.method, path)
             return (500, {'content-type': 'application/json'},
-                    _json.dumps({"error": "endpoint-invoke-failed",
-                                 "detail": str(e)}).encode())
+                    error_body(500, str(e)))
         if hasattr(result, 'status_code'):
             return (result.status_code, dict(result.headers), bytes(result.body))
         return (200, {'content-type': 'application/json'},
