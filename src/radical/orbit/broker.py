@@ -91,6 +91,8 @@ class BrokerTuning:
     * ``grace`` — the ``suspect`` → ``lost`` window.
     * ``call_cap`` — a cap on **broker-originated** in-flight calls (the only
       calls the broker itself waits on); overflow raises at the caller.
+    * ``forwarded_call_cap`` — a cap on the **forwarded** endpoint↔endpoint
+      call table; a flood beyond it fast-fails with a 503.
     * ``call_timeout`` — backstop deadline on every in-flight correlation; a
       responder that never answers is reaped and fast-failed with a 504.
     * ``reap_interval`` — how often the reaper sweeps for expired calls.
@@ -102,6 +104,7 @@ class BrokerTuning:
     ping_timeout:  float = 3.0
     grace:         float = 10.0
     call_cap:      int   = 1024
+    forwarded_call_cap: int = 4096
     call_timeout:  float = 30.0
     reap_interval: float = 5.0
     event_queue:   int   = 1024
@@ -247,6 +250,7 @@ class Broker:
         self._ping_timeout  = tuning.ping_timeout
         self._grace         = tuning.grace
         self._call_cap      = tuning.call_cap
+        self._forwarded_call_cap = tuning.forwarded_call_cap
         self._call_timeout  = tuning.call_timeout
         self._reap_interval = tuning.reap_interval
         self._event_queue   = tuning.event_queue
@@ -739,6 +743,13 @@ class Broker:
             await self._send(self.registry.get(src_name),
                              self._error_response(raw, 502,
                                                   f"endpoint {dst!r} unknown"))
+            return
+
+        if len(self._calls) >= self._forwarded_call_cap:
+            await self._send(self.registry.get(src_name),
+                             self._error_response(raw, 503,
+                                                  "broker forwarded-call table "
+                                                  "at cap"))
             return
 
         self._calls[corr_id] = _Call(src_name, dst, None,

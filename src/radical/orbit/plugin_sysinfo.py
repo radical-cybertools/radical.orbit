@@ -10,6 +10,7 @@ import glob
 import os
 import re
 import time
+import asyncio
 import threading
 import psutil
 import socket
@@ -281,7 +282,7 @@ class SysInfoProvider:
                     "--query-gpu=index,utilization.gpu,utilization.memory,memory.total,memory.used,memory.free",
                     "--format=csv,noheader,nounits"
                 ]
-                ret = subprocess.check_output(cmd, text=True)
+                ret = subprocess.check_output(cmd, text=True, timeout=5)
 
                 # Parse
                 n_metrics = {}
@@ -311,7 +312,7 @@ class SysInfoProvider:
             try:
                 # rocm-smi --showuse --showmeminfo vram --json
                 cmd = ["rocm-smi", "--showuse", "--showmeminfo", "vram", "--json"]
-                ret = subprocess.check_output(cmd, text=True)
+                ret = subprocess.check_output(cmd, text=True, timeout=5)
                 data = json.loads(ret)
 
                 for g in amd_gpus:
@@ -522,7 +523,9 @@ class SysInfoSession(PluginSession):
         Return current system metrics.
         """
         self._check_active()
-        return self._provider.get_metrics()
+        # Offload the blocking collection (GPU-probe subprocesses) to a
+        # worker thread so it never stalls the event loop for other requests.
+        return await asyncio.to_thread(self._provider.get_metrics)
 
 
 
