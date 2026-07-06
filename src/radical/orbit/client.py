@@ -598,6 +598,18 @@ class PluginClient:
         """Construct full URL for a path."""
         return f"{self._base_url}/{path.lstrip('/')}"
 
+    def _request(self, method: str, url: str, **kwargs):
+        """Single transport seam for every helper-facing call.
+
+        Dispatches to the matching verb method on ``self._http``
+        (``self._http.post`` / ``.get`` / …) so behaviour is **bit-identical**
+        to the direct ``self._http.post(...)`` calls the 11 plugin helpers
+        make (and the old suite mocks).  The seam is overridable in two ways:
+        swap ``self._http`` for a transport shim (what ``RuntimePluginClient``
+        does), or override this method.
+        """
+        return getattr(self._http, method.lower())(url, **kwargs)
+
     def _raise(self, resp, context: str = '') -> None:
         """Raise RuntimeError with HTTP status, origin, optional context, and server detail."""
         origin = '/'.join(filter(None, [self._endpoint_id, self._plugin_name]))
@@ -624,8 +636,8 @@ class PluginClient:
         if sid      is not None: payload['sid']      = sid
         if lifetime is not None: payload['lifetime'] = lifetime
         if ttl      is not None: payload['ttl']      = ttl
-        resp = self._http.post(self._url("register_session"),
-                               json=payload or None)
+        resp = self._request("POST", self._url("register_session"),
+                             json=payload or None)
         self._raise(resp)
         self._sid = resp.json()['sid']
 
@@ -634,7 +646,8 @@ class PluginClient:
         Unregister the current session.
         """
         if self._sid:
-            resp = self._http.post(self._url(f"unregister_session/{self._sid}"))
+            resp = self._request(
+                "POST", self._url(f"unregister_session/{self._sid}"))
             self._raise(resp)
             self._sid = None
 

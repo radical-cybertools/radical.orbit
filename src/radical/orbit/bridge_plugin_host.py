@@ -9,7 +9,7 @@ from starlette.responses import JSONResponse
 
 from radical.orbit.plugin_base      import Plugin
 from radical.orbit.plugin_host_base import PluginHostBase
-from radical.orbit.service          import RequestShim
+from radical.orbit.dispatch         import RequestShim, match_route
 from radical.orbit.ui_schema        import ui_config_to_dict
 
 log = logging.getLogger("radical.orbit.bridge")
@@ -98,12 +98,7 @@ class BridgePluginHost(PluginHostBase):
 
     def match_route(self, method: str, path: str
                     ) -> Tuple[Optional[Callable], Optional[dict]]:
-        for rt_method, pattern, param_names, handler in self._direct_routes:
-            if rt_method == method:
-                m = pattern.match(path)
-                if m:
-                    return handler, dict(zip(param_names, m.groups()))
-        return None, None
+        return match_route(self._direct_routes, method, path)
 
     async def handle_request(self, method: str, path: str,
                              headers: dict, body_bytes: bytes,

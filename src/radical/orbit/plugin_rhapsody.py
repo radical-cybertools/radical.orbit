@@ -165,7 +165,15 @@ class RhapsodySession(PluginSession):
                     b = await b
                 backends.append(b)
 
-            self._rh_session = rh.Session(backends=backends, uid=self._sid)
+            # Offload the blocking ``rh.Session`` construction to a worker
+            # thread (the established ``_prepare_batch`` offload pattern) so it
+            # never runs on the work loop.  This is work-loop hygiene, not
+            # liveness-critical: M0 measures Dragon init holding the GIL for
+            # only ~2.8 ms (runtime bring-up releases the GIL), so with
+            # transport isolation the keepalive never depends on this offload —
+            # it just keeps the work loop responsive to other requests.
+            self._rh_session = await asyncio.to_thread(
+                rh.Session, backends=backends, uid=self._sid)
 
             # start_telemetry only exists on newer rhapsody; older
             # installs don't support it. Skip silently if unavailable.
