@@ -591,3 +591,53 @@ def test_on_event_preserves_falsy_data():
     g._on_event({'src': 'e', 'plugin': 'p', 'topic': 't'})   # no 'data'
     payload = json.loads(pushed[0][len('data: '):])
     assert payload['data']['data'] == {}           # absent -> {}
+
+
+def _make_stream_request(headers, chunks):
+    """Build a minimal fake Request exposing ``.headers`` and ``.stream()``."""
+    from starlette.datastructures import Headers
+
+    class _FakeRequest:
+        def __init__(self):
+            self.headers = Headers(headers)
+
+        async def stream(self):
+            for chunk in chunks:
+                yield chunk
+
+    return _FakeRequest()
+
+
+def test_read_body_capped_rejects_oversized_content_length():
+    """A declared Content-Length over the cap is a 413 before any read."""
+    import asyncio
+    from fastapi import HTTPException
+    from radical.orbit.gateway import Gateway
+
+    req = _make_stream_request({'content-length': str(5 * 1024 * 1024)}, [])
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(Gateway._read_body_capped(req, 4 * 1024 * 1024))
+    assert exc.value.status_code == 413
+
+
+def test_read_body_capped_rejects_oversized_stream():
+    """A lying/chunked client whose bytes exceed the cap is a 413 mid-read."""
+    import asyncio
+    from fastapi import HTTPException
+    from radical.orbit.gateway import Gateway
+
+    chunks = [b'x' * (1024 * 1024)] * 5          # 5 MiB, no Content-Length
+    req = _make_stream_request({}, chunks)
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(Gateway._read_body_capped(req, 4 * 1024 * 1024))
+    assert exc.value.status_code == 413
+
+
+def test_read_body_capped_accepts_within_cap():
+    """A body within the cap is returned intact."""
+    import asyncio
+    from radical.orbit.gateway import Gateway
+
+    req = _make_stream_request({'content-length': '6'}, [b'abc', b'def'])
+    body = asyncio.run(Gateway._read_body_capped(req, 4 * 1024 * 1024))
+    assert body == b'abcdef'

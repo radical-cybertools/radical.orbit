@@ -653,9 +653,19 @@ class EndpointRuntime(PluginHostBase):
 
     async def _serve_request(self, req: protocol.Request) -> None:
         try:
-            status, headers, body = await self._dispatch_served(req)
+            status, headers, body = await asyncio.wait_for(
+                self._dispatch_served(req), timeout=self._call_timeout)
             self._emit(protocol.make_response(
                 req, status, headers=headers, body=body))
+        except asyncio.TimeoutError:
+            # A stuck handler must not pin its admission slot forever (the
+            # finally below releases it); fast-fail with a 504.
+            self._emit(protocol.make_response(
+                req, 504,
+                headers={'content-type': 'application/json'},
+                body=_json.dumps({"error": True, "status_code": 504,
+                                  "detail": "handler timed out"
+                                  }).encode()))
         except Exception as e:                             # pragma: no cover
             log.exception("[Runtime] request handling error: %s", e)
             self._emit(protocol.make_response(
