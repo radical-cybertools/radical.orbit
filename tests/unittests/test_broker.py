@@ -972,3 +972,9 @@ def test_broker_url_announce_has_export_help_and_no_register():
     # every advertised form is printed
     assert 'https://host.example.org:8000' in text
     assert 'https://10.0.0.5:8000'         in text
+
+
+def test_broker_url_announce_empty_forms_no_crash():
+    # Guard: an empty url_forms must not IndexError on url_forms[0].
+    from radical.orbit.broker import Broker
+    assert Broker._url_announce_lines([], 'RADICAL_ORBIT_BROKER_URL') == []

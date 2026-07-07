@@ -524,8 +524,9 @@ class Broker:
         env var endpoints and clients resolve the broker URL from.
         """
         lines = [f'[Broker] URL: {form}' for form in url_forms]
-        lines.append('[Broker] to connect an endpoint or client, run first:\n'
-                     f'    export {env_var}={url_forms[0]}')
+        if url_forms:
+            lines.append('[Broker] to connect an endpoint or client, run first:')
+            lines.append(f'    export {env_var}={url_forms[0]}')
         return lines
 
     def run(self) -> None:
