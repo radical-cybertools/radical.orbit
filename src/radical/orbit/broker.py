@@ -916,24 +916,26 @@ class Broker:
         os.kill(os.getpid(), signal.SIGTERM)
 
     async def _disconnect(self, target: str) -> None:
-        """Operator terminate: tell the endpoint to exit, then remove + close.
+        """Operator terminate: remove the endpoint, then tell it to exit.
 
         A bare socket close is not enough — the endpoint runtime treats any
-        ``ConnectionClosed`` as "connection lost" and reconnects.  Send a
-        ``terminate`` control first (its ``_on_control`` stops the runtime), so
-        the endpoint actually exits instead of reappearing; then remove it
-        immediately and close the socket."""
+        ``ConnectionClosed`` as "connection lost" and reconnects.  Remove the
+        participant **synchronously** (before any ``await``, so a concurrent
+        reconnect under the same name can't be clobbered across a yield), then
+        send a ``terminate`` control on the captured socket — its
+        ``_on_control`` stops the runtime, so the endpoint exits instead of
+        reappearing — and close it."""
         ws = self.registry.get(target)
         if ws is None:
             return
+        self._remove_participant(target)
+        await self._broadcast_topology()
         try:
             await self._send(ws, protocol.pack_message(
                 protocol.Control(src=BROKER_NAME, dst=target, op='terminate'),
                 cap=self._frame_cap))
         except Exception as e:
             log.debug("[Broker] terminate control to %s failed: %s", target, e)
-        self._remove_participant(target)
-        await self._broadcast_topology()
         spawn(self._close_quiet(ws), 'broker_disconnect_close')
 
     # ── liveness ──────────────────────────────────────────────────────
