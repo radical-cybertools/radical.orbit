@@ -515,12 +515,25 @@ class Broker:
 
     # ── run (uvicorn) ─────────────────────────────────────────────────
 
+    @staticmethod
+    def _url_announce_lines(url_forms: List[str], env_var: str) -> List[str]:
+        """Startup URL banner + a copy-paste help line.
+
+        Each advertised URL is the canonical FQDN/IP form and carries no
+        ``/register`` (the endpoint appends that); the help line exports the
+        env var endpoints and clients resolve the broker URL from.
+        """
+        lines = [f'[Broker] URL: {form}' for form in url_forms]
+        lines.append('[Broker] to connect an endpoint or client, run first:\n'
+                     f'    export {env_var}={url_forms[0]}')
+        return lines
+
     def run(self) -> None:
         """Start uvicorn.  Blocks until shutdown."""
         import uvicorn
 
-        for form in self._url_forms:
-            print(f'[Broker] URL: {form}', flush=True)
+        for line in self._url_announce_lines(self._url_forms, utils.ENV_URL):
+            print(line, flush=True)
         # Lifespan (startup/shutdown) is attached at FastAPI construction.
         # Never echo the token (CWE-532); report only its source/path.
         if not self._auth_enabled:
