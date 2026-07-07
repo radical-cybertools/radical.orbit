@@ -31,13 +31,7 @@ def isolated_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(utils, 'URL_FILE',  tmp_path / 'broker.url')
     monkeypatch.setattr(utils, 'CERT_FILE', tmp_path / 'broker_cert.pem')
     monkeypatch.setattr(utils, 'KEY_FILE',  tmp_path / 'broker_key.pem')
-    # Neutralize the pre-rename predecessor files so a developer's real
-    # ``~/.radical/orbit/bridge.*`` cannot leak in via the fallback path.
-    monkeypatch.setattr(utils, 'URL_FILE_LEGACY',  tmp_path / 'bridge.url')
-    monkeypatch.setattr(utils, 'CERT_FILE_LEGACY', tmp_path / 'bridge_cert.pem')
-    monkeypatch.setattr(utils, 'KEY_FILE_LEGACY',  tmp_path / 'bridge_key.pem')
-    for v in (utils.ENV_URL, utils.ENV_CERT, utils.ENV_KEY,
-              utils.ENV_URL_LEGACY, utils.ENV_CERT_LEGACY, utils.ENV_KEY_LEGACY):
+    for v in (utils.ENV_URL, utils.ENV_CERT, utils.ENV_KEY):
         monkeypatch.delenv(v, raising=False)
     yield tmp_path
 
@@ -113,26 +107,6 @@ def test_url_errors_when_unconfigured(isolated_dir):
     """Nothing set anywhere → ValueError."""
     with pytest.raises(ValueError, match='Broker URL required'):
         utils.resolve_broker_url()
-
-
-def test_url_legacy_env_fallback(isolated_dir, monkeypatch):
-    """The pre-rename ``BRIDGE`` env var resolves when the ``BROKER`` one is unset."""
-    monkeypatch.setenv(utils.ENV_URL_LEGACY, 'https://from-legacy:8000')
-    url, src = utils.resolve_broker_url()
-    assert url == 'https://from-legacy:8000'
-    assert src == 'env'
-    # The broker-named var wins when both are set.
-    monkeypatch.setenv(utils.ENV_URL, 'https://from-new:8000')
-    url, _ = utils.resolve_broker_url()
-    assert url == 'https://from-new:8000'
-
-
-def test_url_legacy_file_fallback(isolated_dir):
-    """The pre-rename ``bridge.url`` file is read when ``broker.url`` is absent."""
-    (isolated_dir / 'bridge.url').write_text('https://from-legacy-file:8000\n')
-    url, src = utils.resolve_broker_url()
-    assert url == 'https://from-legacy-file:8000'
-    assert src == 'file'
 
 
 # ---------------------------------------------------------------------------
@@ -232,29 +206,17 @@ def test_cert_file_fallback(isolated_dir, self_signed):
     assert src == 'file'
 
 
-def test_cert_legacy_file_fallback(isolated_dir, self_signed):
-    """The pre-rename ``bridge_cert.pem`` is read when ``broker_cert.pem`` is absent."""
-    cert, _ = self_signed
-    (isolated_dir / 'bridge_cert.pem').write_bytes(cert.read_bytes())
-
-    path, src = utils.resolve_broker_cert()
-    assert path == isolated_dir / 'bridge_cert.pem'
-    assert src == 'file'
-
-
 def test_cert_missing_everywhere_raises(isolated_dir):
     """Nothing configured → ValueError."""
     with pytest.raises(ValueError, match='TLS cert required'):
         utils.resolve_broker_cert()
 
 
-def test_cert_missing_error_names_both_checked_paths(isolated_dir):
-    """The TLS-cert error names BOTH the broker file and the legacy fallback."""
+def test_cert_missing_error_names_broker_file(isolated_dir):
+    """The TLS-cert error names the broker cert file."""
     with pytest.raises(ValueError) as ei:
         utils.resolve_broker_cert()
-    msg = str(ei.value)
-    assert str(utils.CERT_FILE)        in msg
-    assert str(utils.CERT_FILE_LEGACY) in msg
+    assert str(utils.CERT_FILE) in str(ei.value)
 
 
 def test_cert_path_set_but_file_missing(isolated_dir, monkeypatch):
@@ -294,13 +256,11 @@ def test_key_with_cert_validates_pair(isolated_dir, self_signed, monkeypatch):
     assert path == key
 
 
-def test_key_missing_error_names_both_checked_paths(isolated_dir):
-    """The TLS-key error names BOTH the broker file and the legacy fallback."""
+def test_key_missing_error_names_broker_file(isolated_dir):
+    """The TLS-key error names the broker key file."""
     with pytest.raises(ValueError) as ei:
         utils.resolve_broker_key()
-    msg = str(ei.value)
-    assert str(utils.KEY_FILE)        in msg
-    assert str(utils.KEY_FILE_LEGACY) in msg
+    assert str(utils.KEY_FILE) in str(ei.value)
 
 
 def test_key_refuses_world_readable(isolated_dir, self_signed, monkeypatch):

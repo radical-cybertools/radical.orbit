@@ -59,10 +59,7 @@ read it from the file. Resolution
 no config; for a remote broker, copy the token or set the env var. The Explorer
 prompts for it and then rides an HttpOnly cookie minted by `POST /auth`. Disable
 the gate for local dev with `--no-auth` (or `RADICAL_ORBIT_BROKER_NO_AUTH=1`).
-The `BROKER`-named env var and the `broker.token` file each fall back to their
-pre-rename `RADICAL_ORBIT_BRIDGE_TOKEN` / `bridge.token` predecessor when the
-`BROKER` name is unset/absent, so tokens configured before the rename keep
-authenticating; only `broker.token` is ever written. Helpers live in `utils.py`
+Helpers live in `utils.py`
 (`resolve_broker_token`, `ensure_broker_token`, `auth_disabled`, `tokens_match`);
 the broker core gates the WS `/register` handshake (`Broker._auth_dispatch`) and
 the gateway gates HTTP ingress (`Gateway._auth_dispatch`, minting the `/auth`
