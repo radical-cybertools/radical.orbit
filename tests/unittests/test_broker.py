@@ -937,3 +937,24 @@ def test_error_response_carries_rich_envelope(make_broker):
     assert msg.status == 404
     assert _json.loads(msg.body) == {"error": True, "status_code": 404,
                                      "detail": "no such route"}
+
+
+@pytest.mark.asyncio
+async def test_disconnect_sends_terminate_control(make_broker):
+    # Operator disconnect must TERMINATE the endpoint — send a `terminate`
+    # control so its runtime exits — not just drop the socket, which the
+    # runtime treats as "connection lost" and reconnects.
+    broker = make_broker()
+    await broker.startup()
+    try:
+        ws1 = FakeWS()
+        await _register(broker, 'e1', ws1)
+        ws1.sent.clear()
+
+        await broker._disconnect('e1')
+
+        ctrls = [m for m in ws1.msgs() if m.kind == 'control']
+        assert ctrls and ctrls[0].op == 'terminate'
+        assert broker.registry.get('e1') is None          # removed from routing
+    finally:
+        await broker.shutdown()
