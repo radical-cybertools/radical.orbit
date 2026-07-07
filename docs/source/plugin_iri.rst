@@ -14,7 +14,7 @@ plugin/client model as every other ORBIT plugin.
 It comes in two cooperating parts:
 
 ``iri_connect``
-   A **bridge-side** configurator.  It lists the known IRI facility endpoints
+   A **broker-side** configurator.  It lists the known IRI facility endpoints
    and, on ``connect()``, dynamically registers a per-endpoint instance
    plugin named ``iri.<endpoint>`` (e.g. ``iri.nersc``) that then appears as a
    first-class node in the Explorer tree.
@@ -53,7 +53,7 @@ Authentication
 ==============
 
 A facility access token is supplied at ``connect`` time.  The token is held in
-**bridge process memory** (inside the instance's HTTP client) for the lifetime
+**broker process memory** (inside the instance's HTTP client) for the lifetime
 of the ``iri.<endpoint>`` instance and is **never written to disk**.
 Disconnecting removes the instance and drops the token.
 
@@ -122,11 +122,10 @@ Usage
 
 .. code-block:: python
 
-   from radical.orbit.client import BridgeClient
+   from radical.orbit import EndpointRuntime
 
-   client = BridgeClient(url="https://my-bridge:8000")
-   bridge = client.get_endpoint_client("bridge")   # iri_connect is bridge-hosted
-   iri    = bridge.get_plugin("iri_connect")
+   rt  = EndpointRuntime(broker_url="https://my-broker:8000").start()
+   iri = rt.get_plugin("broker", "iri_connect")   # iri_connect is broker-hosted
 
    # discover facilities, then connect (token from your facility login flow)
    print(iri.list_endpoints())
