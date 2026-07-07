@@ -796,7 +796,8 @@ class EndpointRuntime(PluginHostBase):
                           with_meta: bool = False) -> None:
         """Register an event callback and auto-``subscribe`` for its pattern.
 
-        Tuple semantics: ``None`` is a wildcard; filtering happens at the edge.
+        Tuple semantics: ``None`` is a wildcard; filtering happens at the
+        boundary.
 
         By default the callback is invoked as
         ``callback(endpoint, plugin, topic, data)``.  With *with_meta* it is

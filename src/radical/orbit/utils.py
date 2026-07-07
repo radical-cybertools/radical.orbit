@@ -32,10 +32,7 @@ from typing  import Any, Dict, List, Optional, Tuple
 #    ~/.radical/orbit/broker_cert.pem
 #    ~/.radical/orbit/broker_key.pem
 #
-#  Precedence (consumer side): CLI arg > env var > file > error.  Each env var
-#  and file also silently falls back to its ``BRIDGE`` predecessor when the
-#  ``BROKER`` name is unset/absent, so deployments configured before the rename
-#  keep working; only the ``BROKER`` names are ever written.
+#  Precedence (consumer side): CLI arg > env var > file > error.
 #
 #  The broker process itself does NOT consume a URL — it derives its
 #  advertised URL from its own (host, port).  ``broker.url`` is a write-
@@ -49,31 +46,16 @@ CERT_FILE    = DEFAULT_DIR / 'broker_cert.pem'
 KEY_FILE     = DEFAULT_DIR / 'broker_key.pem'
 TOKEN_FILE   = DEFAULT_DIR / 'broker.token'
 
-# Predecessor file names — read as a fallback when the broker-named file is
-# absent, so deployments configured before the rename keep working.
-URL_FILE_LEGACY   = DEFAULT_DIR / 'bridge.url'
-CERT_FILE_LEGACY  = DEFAULT_DIR / 'bridge_cert.pem'
-KEY_FILE_LEGACY   = DEFAULT_DIR / 'bridge_key.pem'
-TOKEN_FILE_LEGACY = DEFAULT_DIR / 'bridge.token'
-
 ENV_URL      = 'RADICAL_ORBIT_BROKER_URL'
 ENV_CERT     = 'RADICAL_ORBIT_BROKER_CERT'
 ENV_KEY      = 'RADICAL_ORBIT_BROKER_KEY'
 ENV_TOKEN    = 'RADICAL_ORBIT_BROKER_TOKEN'
 ENV_NO_AUTH  = 'RADICAL_ORBIT_BROKER_NO_AUTH'
 
-# Predecessor env vars — read as a silent fallback when the broker-named var
-# is unset.
-ENV_URL_LEGACY     = 'RADICAL_ORBIT_BRIDGE_URL'
-ENV_CERT_LEGACY    = 'RADICAL_ORBIT_BRIDGE_CERT'
-ENV_KEY_LEGACY     = 'RADICAL_ORBIT_BRIDGE_KEY'
-ENV_TOKEN_LEGACY   = 'RADICAL_ORBIT_BRIDGE_TOKEN'
-ENV_NO_AUTH_LEGACY = 'RADICAL_ORBIT_BRIDGE_NO_AUTH'
 
-
-def _env(new: str, legacy: str) -> str:
-    """Read env var *new*, falling back silently to its *legacy* predecessor."""
-    return (os.environ.get(new, '') or os.environ.get(legacy, '')).strip()
+def _env(name: str) -> str:
+    """Read env var *name*, stripped of surrounding whitespace."""
+    return os.environ.get(name, '').strip()
 
 
 # Cookie the browser/SSE path carries (set by the broker's POST /auth).  The
@@ -94,13 +76,7 @@ def _read_url_file(path: Optional[Path] = None) -> Optional[str]:
     try:
         text = path.read_text().strip()
     except FileNotFoundError:
-        if path == URL_FILE and URL_FILE_LEGACY.exists():
-            try:
-                text = URL_FILE_LEGACY.read_text().strip()
-            except FileNotFoundError:
-                return None
-        else:
-            return None
+        return None
     return text or None
 
 
@@ -199,7 +175,7 @@ def resolve_broker_url(cli: Optional[str] = None) -> Tuple[str, str]:
     """
     if cli:
         return cli.strip().rstrip('/'), 'cli'
-    env_url = _env(ENV_URL, ENV_URL_LEGACY)
+    env_url = _env(ENV_URL)
     if env_url:
         return env_url.rstrip('/'), 'env'
     file_url = _read_url_file()
@@ -210,28 +186,19 @@ def resolve_broker_url(cli: Optional[str] = None) -> Tuple[str, str]:
 
 
 def _resolve_path_value(cli: Optional[str], env_var: str,
-                        file_path: Path, *,
-                        env_legacy: Optional[str]  = None,
-                        file_legacy: Optional[Path] = None
-                        ) -> Tuple[Optional[Path], str]:
+                        file_path: Path) -> Tuple[Optional[Path], str]:
     """CLI > env > file precedence for a filesystem path.
 
     ``~`` is expanded: the shell does not expand it after ``--cert=`` /
-    ``--key=`` or inside env vars, so the tool must.  *env_legacy* /
-    *file_legacy* are the pre-rename predecessor names, consulted as a
-    silent fallback when the primary is unset/absent.
+    ``--key=`` or inside env vars, so the tool must.
     """
     if cli:
         return Path(cli).expanduser(), 'cli'
     env_val = os.environ.get(env_var, '').strip()
-    if not env_val and env_legacy:
-        env_val = os.environ.get(env_legacy, '').strip()
     if env_val:
         return Path(env_val).expanduser(), 'env'
     if file_path.exists():
         return file_path, 'file'
-    if file_legacy is not None and file_legacy.exists():
-        return file_legacy, 'file'
     return None, ''
 
 
@@ -251,12 +218,10 @@ def resolve_broker_cert(cli: Optional[str] = None) -> Tuple[Path, str]:
     yields a path, ``FileNotFoundError`` if the path does not exist,
     ``ssl.SSLError`` if the file is not a valid cert.
     """
-    path, source = _resolve_path_value(cli, ENV_CERT, CERT_FILE,
-                                       env_legacy=ENV_CERT_LEGACY,
-                                       file_legacy=CERT_FILE_LEGACY)
+    path, source = _resolve_path_value(cli, ENV_CERT, CERT_FILE)
     if path is None:
         raise ValueError(f"TLS cert required (no CLI arg, ${ENV_CERT} unset, "
-                         f"no file at {CERT_FILE} or {CERT_FILE_LEGACY})")
+                         f"no file at {CERT_FILE})")
     if not path.exists():
         raise FileNotFoundError(f"TLS cert not found: {path}")
     ctx = ssl.create_default_context()
@@ -277,13 +242,11 @@ def resolve_broker_key(cli: Optional[str] = None, *,
 
     Returns ``(path, source)``.
     """
-    path, source = _resolve_path_value(cli, ENV_KEY, KEY_FILE,
-                                       env_legacy=ENV_KEY_LEGACY,
-                                       file_legacy=KEY_FILE_LEGACY)
+    path, source = _resolve_path_value(cli, ENV_KEY, KEY_FILE)
     if path is None:
         raise ValueError(
             f"TLS key required for role='broker' (no CLI arg, "
-            f"${ENV_KEY} unset, no file at {KEY_FILE} or {KEY_FILE_LEGACY})")
+            f"${ENV_KEY} unset, no file at {KEY_FILE})")
     if not path.exists():
         raise FileNotFoundError(f"TLS key not found: {path}")
 
@@ -317,10 +280,7 @@ def resolve_broker_key(cli: Optional[str] = None, *,
 #  Consumer precedence (endpoint / client): CLI > env > file.  A missing token
 #  is *not* an error on the consumer side — the broker may run with auth off.
 #  The broker itself uses ``ensure_broker_token``, which generates and writes a
-#  token when none is configured.  Both the env var and the file fall back to
-#  their pre-rename ``BRIDGE`` predecessors when the ``BROKER`` name is
-#  unset/absent, so an existing token keeps authenticating; only the
-#  ``broker.token`` file is ever written.
+#  token when none is configured.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _read_token_file(path: Optional[Path] = None) -> Optional[str]:
@@ -336,13 +296,7 @@ def _read_token_file(path: Optional[Path] = None) -> Optional[str]:
     try:
         text = path.read_text().strip()
     except FileNotFoundError:
-        if path == TOKEN_FILE and TOKEN_FILE_LEGACY.exists():
-            try:
-                text = TOKEN_FILE_LEGACY.read_text().strip()
-            except FileNotFoundError:
-                return None
-        else:
-            return None
+        return None
     return text or None
 
 
@@ -373,7 +327,7 @@ def resolve_broker_token(cli: Optional[str] = None) -> Tuple[Optional[str], str]
     """
     if cli:
         return cli.strip(), 'cli'
-    env_tok = _env(ENV_TOKEN, ENV_TOKEN_LEGACY)
+    env_tok = _env(ENV_TOKEN)
     if env_tok:
         return env_tok, 'env'
     file_tok = _read_token_file()
@@ -390,7 +344,7 @@ def auth_disabled(cli_no_auth: bool = False) -> bool:
     """
     if cli_no_auth:
         return True
-    return _env(ENV_NO_AUTH, ENV_NO_AUTH_LEGACY).lower() in ('1', 'true', 'yes')
+    return _env(ENV_NO_AUTH).lower() in ('1', 'true', 'yes')
 
 
 def ensure_broker_token(cli: Optional[str] = None) -> Tuple[str, str]:
