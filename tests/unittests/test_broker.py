@@ -958,3 +958,23 @@ async def test_disconnect_sends_terminate_control(make_broker):
         assert broker.registry.get('e1') is None          # removed from routing
     finally:
         await broker.shutdown()
+
+
+def test_broker_url_announce_has_export_help_and_no_register():
+    from radical.orbit.broker import Broker
+    forms = ['https://host.example.org:8000', 'https://10.0.0.5:8000']
+    lines = Broker._url_announce_lines(forms, 'RADICAL_ORBIT_BROKER_URL')
+    text  = '\n'.join(lines)
+    # copy-paste help exports the env var with the canonical (first) form
+    assert 'export RADICAL_ORBIT_BROKER_URL=https://host.example.org:8000' in text
+    # advertised URLs carry no /register (the endpoint appends it itself)
+    assert '/register' not in text
+    # every advertised form is printed
+    assert 'https://host.example.org:8000' in text
+    assert 'https://10.0.0.5:8000'         in text
+
+
+def test_broker_url_announce_empty_forms_no_crash():
+    # Guard: an empty url_forms must not IndexError on url_forms[0].
+    from radical.orbit.broker import Broker
+    assert Broker._url_announce_lines([], 'RADICAL_ORBIT_BROKER_URL') == []
