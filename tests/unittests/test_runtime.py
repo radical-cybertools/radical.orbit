@@ -246,6 +246,10 @@ def test_register_ack_and_auto_named_consumer(harness):
     assert rt.resume_key                            # minted, non-empty
     assert rt._role() == 'consumer'
     assert _wait(lambda: rt.name in srv.broker.registry)
+    # plugin clients gate event-raced POSTs on their broker_client's
+    # wait_for_listener (e.g. RhapsodyClient.register_session); on the
+    # runtime that is registration
+    assert rt.wait_for_listener(timeout=5.0)
 
 
 # ---------------------------------------------------------------------------

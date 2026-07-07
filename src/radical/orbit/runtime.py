@@ -332,6 +332,16 @@ class EndpointRuntime(PluginHostBase):
         """Block until the first ``register_ack`` arrives; ``True`` on success."""
         return self._registered.wait(timeout=timeout)
 
+    def wait_for_listener(self, timeout: float = 30.0) -> bool:
+        """Block until event delivery is live; ``True`` on success.
+
+        Events flow over the registered WS, so "listener connected" is
+        registration.  Plugin clients call this on their ``broker_client``
+        before a POST whose response they must not race (e.g.
+        ``register_session`` waiting on a ``session_status`` notification).
+        """
+        return self.wait_registered(timeout=timeout)
+
     def stop(self) -> None:
         """Clean-close the WS (broker treats a clean close as immediate
         removal) and tear down loops + threads."""
