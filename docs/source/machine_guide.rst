@@ -69,7 +69,10 @@ No endpoint is required — the broker talks to the facility's IRI service direc
 2. Connect and use the per-endpoint instance client (see
    :ref:`Plugin: iri <plugin_iri>` for the full API)::
 
-      iri   = broker.get_plugin("iri_connect")
+      from radical.orbit import EndpointRuntime
+
+      rt    = EndpointRuntime(broker_url="https://my-broker:8000").start()
+      iri   = rt.get_plugin("broker", "iri_connect")
       nersc = iri.connect("nersc", token="<token>")
       print(nersc.list_resources("compute"))
 

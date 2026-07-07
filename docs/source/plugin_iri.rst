@@ -124,7 +124,7 @@ Usage
 
    from radical.orbit import EndpointRuntime
 
-   rt  = EndpointRuntime(broker_url="https://my-broker:8000")
+   rt  = EndpointRuntime(broker_url="https://my-broker:8000").start()
    iri = rt.get_plugin("broker", "iri_connect")   # iri_connect is broker-hosted
 
    # discover facilities, then connect (token from your facility login flow)
