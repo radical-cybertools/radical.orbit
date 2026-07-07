@@ -16,12 +16,12 @@ each provided by a plugin.  A given workflow may use one or several:
      - What it does
      - Plugin
    * - **PsiJ**
-     - Submit and monitor *batch jobs* on the machine, through an ORBIT edge
+     - Submit and monitor *batch jobs* on the machine, through an ORBIT endpoint
        running on that machine's login/compute node.
      - :ref:`psij <rest_api>`
    * - **IRI**
      - Drive the facility's *IRI REST API* (resources, jobs, incidents,
-       allocations) — no edge on the machine required.
+       allocations) — no endpoint on the machine required.
      - :ref:`iri <plugin_iri>`
    * - **Globus**
      - Move *data* between facility collections, out of band.
@@ -30,25 +30,25 @@ each provided by a plugin.  A given workflow may use one or several:
 This guide shows how to set each one up, then gives per-facility notes.
 
 
-PsiJ — batch jobs via an edge
-=============================
+PsiJ — batch jobs via an endpoint
+=================================
 
-1. Start the bridge somewhere reachable from the machine (see the
+1. Start the broker somewhere reachable from the machine (see the
    *Getting Started* guide), and copy its URL (and, for HTTPS, its
    certificate and auth token) to the machine.
-2. On the machine's login node, start an edge::
+2. On the machine's login node, start an endpoint::
 
-      radical-orbit-endpoint --url https://<bridge-host>:8000 \
-                             --cert bridge_cert.pem
+      radical-orbit-endpoint --url https://<broker-host>:8000 \
+                             --cert broker_cert.pem
 
-   The edge auto-detects the batch system (SLURM ``squeue`` / PBSPro
+   The endpoint auto-detects the batch system (SLURM ``squeue`` / PBSPro
    ``qstat``) and loads the ``psij`` and ``queue_info`` plugins.
 3. Submit jobs through the ``psij`` client
    (``submit_job`` / ``get_job_status`` / ``cancel_job``).
 
-**Firewalled compute nodes.**  When the edge must run on a compute node that
-cannot open a direct socket to the bridge, ``submit_tunneled`` launches a child
-edge with an SSH tunnel.  Pick the mode that matches the site's SSH policy:
+**Firewalled compute nodes.**  When the endpoint must run on a compute node that
+cannot open a direct socket to the broker, ``submit_tunneled`` launches a child
+endpoint with an SSH tunnel.  Pick the mode that matches the site's SSH policy:
 
 * ``forward`` — the child opens ``ssh -L`` from compute to the login host.
   Use where **compute → login SSH is allowed** and login → compute is blocked
@@ -62,18 +62,18 @@ edge with an SSH tunnel.  Pick the mode that matches the site's SSH policy:
 IRI — facility REST API
 =======================
 
-No edge is required — the bridge talks to the facility's IRI service directly.
+No endpoint is required — the broker talks to the facility's IRI service directly.
 
 1. Obtain a facility access token (NERSC uses Globus, OLCF uses S3M — see the
    per-facility notes below).
 2. Connect and use the per-endpoint instance client (see
    :ref:`Plugin: iri <plugin_iri>` for the full API)::
 
-      iri   = bridge.get_plugin("iri_connect")
+      iri   = broker.get_plugin("iri_connect")
       nersc = iri.connect("nersc", token="<token>")
       print(nersc.list_resources("compute"))
 
-The token lives only in bridge process memory and is dropped on
+The token lives only in broker process memory and is dropped on
 ``disconnect``.
 
 
