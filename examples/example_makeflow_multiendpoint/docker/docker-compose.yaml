@@ -5,7 +5,7 @@ x-endpoint-service: &endpoint-service
   <<: *common-image
   environment:
     - RADICAL_ORBIT_BROKER_URL=https://${RADICAL_ORBIT_BROKER_HOSTNAME:-broker}:8000
-  command: [ "bash", "-c", "radical-orbit-endpoint-wrapper.sh -n $$(hostname) --plugins psij,rhapsody,staging,task_dispatcher" ]
+  command: [ "bash", "-c", "radical-orbit-endpoint-wrapper.sh -n $$(hostname) --plugins psij,rhapsody,staging" ]
   volumes:
     - radical-orbit-volume:/app:ro
   networks:
@@ -37,7 +37,15 @@ services:
     <<: *common-image
     container_name: radical-orbit-broker
     hostname: ${RADICAL_ORBIT_BROKER_HOSTNAME:-broker}
-    command: [ "radical-orbit-broker.py" ]
+    command:
+      - "bash"
+      - "-c"
+      - |
+        echo "==============================================="
+        echo "ORBIT Broker Token:"
+        echo "    $(cat ~/.radical/orbit/broker.token)"
+        echo "==============================================="
+        exec radical-orbit-broker.py
     healthcheck:
       test:
         - CMD-SHELL
