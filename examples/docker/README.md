@@ -96,5 +96,5 @@ docker compose down
 
 - Full getting-started guide:
   [`docs/source/getting_started.md`](../../docs/source/getting_started.md)
-- Local and remote run instructions are covered in sections **3.1** and **3.3**
+- Local and remote test-run instructions are covered in sections **3.1** and **3.3**
   of the same document.

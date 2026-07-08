@@ -14,12 +14,9 @@ The build context is set to the parent directory (`..`), so `pools.json` and `wo
 
 ## Running the Example
 
-> [!WARNING]
-> TEMPORARY ENVIRONMENT VARIABLES FOR THE DEMO
-
 ```shell
 export RADICAL_ORBIT_TAG=makeflow
-export RADICAL_ORBIT_BRANCH=feature/task-dispatcher
+export RADICAL_ORBIT_BRANCH=devel
 ```
 
 1. **Start the containers:**
@@ -29,9 +26,9 @@ export RADICAL_ORBIT_BRANCH=feature/task-dispatcher
    docker compose up -d
    ```
 
-   *Note: On the first run, this will build the images. Alternatively, you can build them manually using the `./build.sh` script (see [Building the Image](#building-the-image) below).*
+   *Note: On the first run, this will build the image. Alternatively, you can build it manually using the `./build.sh` script (see [Building the Image](#building-the-image) below).*
 
-2. **Wait for services to be ready:**
+2. **Wait for endpoint services to be ready:**
    The endpoint services depend on the broker being healthy. You can monitor the startup process with:
 
    ```bash
@@ -81,7 +78,7 @@ docker compose down
 For more control over the build process (e.g., specifying a different branch or target platform), use the provided `build.sh` script:
 
 ```bash
-./build.sh -b master -t latest -p linux/amd64
+./build.sh -b devel -t test-tag -p linux/amd64
 ```
 
 **Available Options:**

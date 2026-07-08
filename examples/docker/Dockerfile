@@ -2,9 +2,6 @@ FROM python:3.10-slim
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONNOUSERSITE=True
-ENV PATH="/opt/ve_endpoint/bin:$PATH"
-ENV RADICAL_ORBIT_BROKER_CERT="/app/private/broker_cert.pem"
-ENV RADICAL_ORBIT_BROKER_KEY="/app/private/broker_key.pem"
 
 RUN apt-get update -y && \
     apt-get install -y --no-install-recommends \
@@ -14,19 +11,26 @@ RUN apt-get update -y && \
         gnupg \
         jq \
         openssl \
+        procps \
         python3-dev \
-        sudo && \
+        sudo \
+        vim && \
     rm -rf /var/lib/apt/lists/*
-
-RUN python3 -m venv /opt/ve_endpoint
 
 WORKDIR /app
 
-ARG RADICAL_ORBIT_BRANCH=master
-RUN git clone -b ${RADICAL_ORBIT_BRANCH} https://github.com/radical-cybertools/radical.orbit.git
+RUN python3 -m venv /opt/ve_endpoint
 
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+ENV PATH="/opt/ve_endpoint/bin:$PATH"
+
+ARG RADICAL_ORBIT_BRANCH=master
+RUN git clone --single-branch -b ${RADICAL_ORBIT_BRANCH} https://github.com/radical-cybertools/radical.orbit.git && \
+    . /opt/ve_endpoint/bin/activate && \
+    pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir /app/radical.orbit
+
+ENV RADICAL_ORBIT_BROKER_CERT="/app/private/broker_cert.pem"
+ENV RADICAL_ORBIT_BROKER_KEY="/app/private/broker_key.pem"
 
 ARG GENERATE_BROKER_CERT=false
 ARG BROKER_IP=127.0.0.1
@@ -39,6 +43,7 @@ RUN if [ "$GENERATE_BROKER_CERT" = "true" ]; then \
             -subj "/CN=${BROKER_IP}" \
             -addext "subjectAltName = IP:${BROKER_IP},DNS:${BROKER_HOSTNAME},IP:127.0.0.1,DNS:localhost"; \
         echo "Certificate generated for ${BROKER_HOSTNAME} and ${BROKER_IP}"; \
+        chmod 0600 "${RADICAL_ORBIT_BROKER_KEY}"; \
     else \
         echo "Skipping certificate generation (GENERATE_BROKER_CERT is not true)."; \
     fi

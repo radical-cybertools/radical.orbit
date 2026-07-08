@@ -43,6 +43,7 @@ RUN if [ "$GENERATE_BROKER_CERT" = "true" ]; then \
             -subj "/CN=${BROKER_IP}" \
             -addext "subjectAltName = IP:${BROKER_IP},DNS:${BROKER_HOSTNAME},IP:127.0.0.1,DNS:localhost"; \
         echo "Certificate generated for ${BROKER_HOSTNAME} and ${BROKER_IP}"; \
+        chmod 0600 "${RADICAL_ORBIT_BROKER_KEY}"; \
     else \
         echo "Skipping certificate generation (GENERATE_BROKER_CERT is not true)."; \
     fi
@@ -50,7 +51,7 @@ RUN if [ "$GENERATE_BROKER_CERT" = "true" ]; then \
 WORKDIR /home/$MAMBA_USER
 
 ARG RADICAL_ORBIT_BRANCH=master
-RUN git clone -b ${RADICAL_ORBIT_BRANCH} https://github.com/radical-cybertools/radical.orbit.git && \
+RUN git clone --single-branch -b ${RADICAL_ORBIT_BRANCH} https://github.com/radical-cybertools/radical.orbit.git && \
     pip install --no-cache-dir ./radical.orbit
 
 COPY --chown=$MAMBA_USER:$MAMBA_USER pools.json .radical/orbit/task_dispatcher/pools.json
