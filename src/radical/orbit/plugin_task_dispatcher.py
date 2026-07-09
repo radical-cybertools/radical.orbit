@@ -530,12 +530,11 @@ class PluginTaskDispatcher(Plugin):
                 try:
                     cfg = self._pool_config_from_dict(payload['config'])
                     self._materialise_pool(sid, cfg)
-                except (ValueError, KeyError, TypeError, AttributeError,
-                        PoolConfigError) as e:
-                    # A malformed ``config`` (corrupt file, hand-edit) or a
-                    # policy that fails to instantiate (unregistered strategy,
-                    # bad strategy_config) must not abort replay of every
-                    # other pool — skip this one.
+                except Exception as e:
+                    # Any failure to parse the config, instantiate the policy
+                    # (unregistered strategy, bad strategy_config), or
+                    # materialise the pool (e.g. OSError on mkdir) must not
+                    # abort replay of every other pool — skip this one.
                     log.warning('task_dispatcher: skipping unreplayable pool '
                                 '%s: %s', cfg_path, e)
                     continue

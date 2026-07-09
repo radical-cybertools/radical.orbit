@@ -180,10 +180,11 @@ def _parse_pool(d: Any, source: str) -> PoolConfig:
     # blowing up at pool materialisation.  Import is function-local because
     # the policy module imports this one.
     from .task_dispatcher_policy import known_policies
-    if strategy not in known_policies():
+    policies = known_policies()
+    if strategy not in policies:
         raise PoolConfigError(
             f"{source}: unknown 'strategy' {strategy!r} "
-            f"(known: {', '.join(known_policies())})")
+            f"(known: {', '.join(policies)})")
 
     strategy_config = d.get('strategy_config', {})
     if not isinstance(strategy_config, dict):
