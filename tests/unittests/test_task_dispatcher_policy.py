@@ -101,6 +101,13 @@ class TestRegistry:
         with pytest.raises(ValueError):
             register_policy('dummy', _DummyPolicy(_pool_cfg(), {}))
 
+        class NotAPolicy:
+            pass
+
+        with pytest.raises(ValueError,
+                           match='must inherit from DispatchPolicy'):
+            register_policy('dummy', NotAPolicy)
+
     def test_parse_pools_accepts_registered_strategy(self, clean_registry):
         register_policy('dummy', _DummyPolicy)
         raw = {'pools': [{
@@ -162,3 +169,19 @@ class TestDispatcherIntegration:
             state=TASK_QUEUED, arrival_ts=1.0)
         plugin._drain_pending(ps)
         assert ps.policy.picks == 1
+
+    def test_replay_skips_pool_with_unavailable_policy(self, tmp_path,
+                                                       clean_registry):
+        # A pool persisted with a runtime-registered policy must not crash
+        # broker startup when that policy is absent after a restart — replay
+        # skips it with a warning; other pools still come back.
+        register_policy('dummy', _DummyPolicy)
+        plugin = self._make_plugin(tmp_path)
+        plugin._materialise_pool(
+            's.1', _pool_cfg(strategy='dummy', endpoint_name='endpoint0'))
+        plugin._materialise_pool(
+            's.1', _pool_cfg(name='keep', endpoint_name='endpoint0'))
+
+        _REGISTRY.pop('dummy')
+        replayed = self._make_plugin(tmp_path)
+        assert set(replayed._pool_states.get('s.1', {})) == {'keep'}

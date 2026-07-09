@@ -28,13 +28,14 @@ from typing import TYPE_CHECKING, Callable
 from .task_dispatcher_config import PoolConfig, PoolConfigError
 
 if TYPE_CHECKING:
-    from .task_dispatcher_state import PilotRecord, TaskRecord
+    from .plugin_task_dispatcher import PoolState
+    from .task_dispatcher_state  import PilotRecord, TaskRecord
 
 # Builtin policies: name → lazy ``(module, attr)`` spec, resolved on first
 # use.  Lazy so this module never imports a policy implementation at import
 # time — implementations import :class:`DispatchPolicy` from here.
 _BUILTINS: dict[str, tuple[str, str]] = {
-    'conservative': ('.task_dispatcher_strategy_conservative',
+    'conservative': ('radical.orbit.task_dispatcher_strategy_conservative',
                      'ConservativePolicy'),
 }
 
@@ -76,12 +77,12 @@ class DispatchPolicy:
         '''Observe one pilot state transition.  Default: ignore it.'''
         return None
 
-    def on_tick(self, pool_state,
+    def on_tick(self, pool_state: 'PoolState',
                 submit_pilot: Callable[[str | None], str]) -> None:
         '''Housekeeping tick: maybe request pilots.  Default: never scale.'''
         return None
 
-    def pick_dispatch(self, pool_state) -> \
+    def pick_dispatch(self, pool_state: 'PoolState') -> \
             tuple['TaskRecord', 'PilotRecord'] | None:
         '''Return the next ``(task, pilot)`` pair.  Default: dispatch nothing.'''
         return None
@@ -102,6 +103,9 @@ def register_policy(name: str, cls: type) -> None:
         raise ValueError('policy name must be a non-empty string')
     if not isinstance(cls, type):
         raise ValueError(f'policy {name!r}: expected a class, got {cls!r}')
+    if not issubclass(cls, DispatchPolicy):
+        raise ValueError(f'policy {name!r}: class {cls.__name__} must '
+                         f'inherit from DispatchPolicy')
     _REGISTRY[name] = cls
 
 
@@ -118,7 +122,7 @@ def _resolve(name: str) -> type:
     spec = _BUILTINS.get(name)
     if spec is not None:
         module, attr = spec
-        return getattr(importlib.import_module(module, __package__), attr)
+        return getattr(importlib.import_module(module), attr)
     raise PoolConfigError(
         f"unknown dispatch strategy {name!r} "
         f"(known: {', '.join(known_policies())})")
