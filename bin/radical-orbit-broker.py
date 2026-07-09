@@ -10,13 +10,43 @@ for a headless broker).
 import argparse
 import logging
 import os
+import sys
 
 import radical.orbit.logging_config as _lc
 from radical.orbit.broker import Broker
 
 
+_TLS_HOWTO = '''\
+TLS setup
+---------
+The broker serves HTTPS/WSS and needs a certificate + private key.
+Resolution order for each:
+
+  cert:  --cert PATH  >  $RADICAL_ORBIT_BROKER_CERT  >  ~/.radical/orbit/broker_cert.pem
+  key:   --key  PATH  >  $RADICAL_ORBIT_BROKER_KEY   >  ~/.radical/orbit/broker_key.pem
+
+To create a self-signed pair at the default location:
+
+  mkdir -p ~/.radical/orbit
+  openssl req -x509 -newkey rsa:4096 -nodes \\
+      -keyout ~/.radical/orbit/broker_key.pem \\
+      -out    ~/.radical/orbit/broker_cert.pem \\
+      -days 365 -subj "/CN=$(hostname -f)"
+  chmod 600 ~/.radical/orbit/broker_key.pem
+
+The key must be mode 0600 or stricter — the broker refuses to start
+otherwise.  Endpoints and clients pin the *cert* (never the key): copy
+broker_cert.pem to ~/.radical/orbit/ on each connecting host, or point
+$RADICAL_ORBIT_BROKER_CERT at it there.  Hostname matching is disabled
+for pinned certs, so the CN does not need to match the broker host.
+'''
+
+
 def main():
-    parser = argparse.ArgumentParser(description='ORBIT Broker')
+    parser = argparse.ArgumentParser(
+        description='ORBIT Broker',
+        epilog=_TLS_HOWTO,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--cert', default=None,
                         help='TLS cert path.  CLI > $RADICAL_ORBIT_BROKER_CERT > '
                              '~/.radical/orbit/broker_cert.pem.')
@@ -62,14 +92,22 @@ def main():
     logging.getLogger('radical.orbit').info(
         "Log level: %s; log file: %s", log_level_name, log_file)
 
-    Broker(cert=args.cert,
-           key=args.key,
-           host=args.host,
-           port=args.port,
-           plugins=args.plugins,
-           token=args.token,
-           no_auth=args.no_auth,
-           gateway=not args.no_gateway).run()
+    try:
+        broker = Broker(cert=args.cert,
+                        key=args.key,
+                        host=args.host,
+                        port=args.port,
+                        plugins=args.plugins,
+                        token=args.token,
+                        no_auth=args.no_auth,
+                        gateway=not args.no_gateway)
+    except (ValueError, FileNotFoundError, PermissionError) as e:
+        # Cert/key resolution failures (missing, unreadable, key too
+        # permissive) — print the actionable how-to instead of a traceback.
+        print(f'\nERROR: {e}\n\n{_TLS_HOWTO}', file=sys.stderr)
+        sys.exit(1)
+
+    broker.run()
 
 
 if __name__ == "__main__":
