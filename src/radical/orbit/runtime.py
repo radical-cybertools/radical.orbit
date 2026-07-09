@@ -226,6 +226,10 @@ class EndpointRuntime(PluginHostBase):
         self._ws = None
         self._stopping = False
         self._fatal    = False
+        # Human-readable, actionable reason for a fatal transport failure —
+        # surfaced via the ``fatal_reason`` property and raised from
+        # ``start(wait=True)`` so callers never sit on a dead runtime.
+        self._fatal_reason: Optional[str] = None
         self._registered = threading.Event()
         # Set once the first topology frame lands (the broker sends it right
         # after register_ack) so start(wait=True) can also wait for it.
@@ -260,6 +264,23 @@ class EndpointRuntime(PluginHostBase):
     @property
     def broker_url(self) -> str:
         return self._broker_url
+
+    @property
+    def fatal(self) -> bool:
+        """True once the transport has failed unrecoverably (bad credential,
+        TLS pin mismatch, tunnel failure, protocol error).  The runtime will
+        not retry; check :attr:`fatal_reason` for the actionable cause."""
+        return self._fatal
+
+    @property
+    def fatal_reason(self) -> Optional[str]:
+        """Actionable description of the fatal failure, or ``None``."""
+        return self._fatal_reason
+
+    def _set_fatal(self, reason: str) -> None:
+        log.error("[Runtime] %s", reason)
+        self._fatal_reason = reason
+        self._fatal = True
 
     def _role(self) -> str:
         if self._role_override:
@@ -297,6 +318,12 @@ class EndpointRuntime(PluginHostBase):
         reflects the broker's snapshot at registration time and an immediate
         :meth:`get_plugin` will not race a not-yet-populated topology.  Either
         way calls block on the work loop via futures.
+
+        With *wait*, raises :class:`RuntimeError` (with the actionable
+        :attr:`fatal_reason`) if the transport fails unrecoverably during the
+        wait — bad credential, TLS pin mismatch, tunnel failure.  A plain
+        timeout (e.g. broker unreachable) still returns silently; check
+        :meth:`wait_registered`.
         """
         self._cb.start()
 
@@ -321,7 +348,15 @@ class EndpointRuntime(PluginHostBase):
 
         if wait:
             deadline = time.monotonic() + timeout
-            self._registered.wait(timeout=timeout)
+            # Poll in short slices so a fatal transport failure (bad
+            # credential, TLS pin mismatch, tunnel failure) surfaces
+            # immediately instead of burning the whole timeout.
+            while not self._registered.wait(timeout=0.25):
+                if self._fatal or time.monotonic() >= deadline:
+                    break
+            if self._fatal:
+                raise RuntimeError(self._fatal_reason
+                                   or 'broker connection failed fatally')
             # Also wait (within the same budget) for the first topology frame,
             # so topology() is populated before start() returns.
             remaining = max(0.0, deadline - time.monotonic())
@@ -443,8 +478,7 @@ class EndpointRuntime(PluginHostBase):
             elif self._tunnel == 'reverse':
                 await self._open_tunnel_reverse()
         except Exception as e:
-            log.error("[Runtime] tunnel setup failed: %s", e)
-            self._fatal = True
+            self._set_fatal(f"tunnel setup failed: {e}")
             return
 
         backoff = self._backoff_start
@@ -486,8 +520,13 @@ class EndpointRuntime(PluginHostBase):
                     await self._serve_ws(ws)
 
             except ssl.SSLCertVerificationError as e:
-                log.error("[Runtime] TLS verification failed: %s. Aborting.", e)
-                self._fatal = True
+                self._set_fatal(
+                    f"TLS verification failed for {self._broker_url} "
+                    f"(pinned cert: {self._cert}): {e} — the pinned "
+                    f"certificate does not match the broker's; refresh it "
+                    f"from the broker host (~/.radical/orbit/broker_cert.pem "
+                    f"there) or point $RADICAL_ORBIT_BROKER_CERT at the "
+                    f"current one")
                 break
             except (ws_exc.ConnectionClosed, OSError) as e:
                 if self._stopping:
@@ -553,20 +592,27 @@ class EndpointRuntime(PluginHostBase):
         try:
             ack = protocol.parse_message(first, cap=self._frame_cap)
         except protocol.ProtocolError as e:
-            log.error("[Runtime] bad register_ack frame: %s", e)
-            self._fatal = True
+            self._set_fatal(f"bad register_ack frame: {e}")
             return False
         if ack.kind != 'register_ack':
-            log.error("[Runtime] first frame is %r, not register_ack", ack.kind)
-            self._fatal = True
+            self._set_fatal(
+                f"first frame is {ack.kind!r}, not register_ack")
             return False
         if not ack.ok:
             if ack.reason == 'name-in-use':
                 log.warning("[Runtime] name %r in use; retrying with backoff",
                             self._name)
                 return False
-            log.error("[Runtime] register rejected: %s", ack.reason)
-            self._fatal = True
+            if ack.reason == 'invalid-credential':
+                self._set_fatal(
+                    f"registration rejected by broker at {self._broker_url}: "
+                    f"invalid credential — the token this endpoint sent "
+                    f"(from $RADICAL_ORBIT_BROKER_TOKEN or "
+                    f"~/.radical/orbit/broker.token) does not match the "
+                    f"broker's current token; refresh it from the broker "
+                    f"host (~/.radical/orbit/broker.token there)")
+            else:
+                self._set_fatal(f"register rejected: {ack.reason}")
             return False
         self._resume_key = ack.resume_key
         log.info("[Runtime] registered as %r (role=%s, plugins=%s)",
