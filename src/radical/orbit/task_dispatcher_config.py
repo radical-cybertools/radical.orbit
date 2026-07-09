@@ -68,7 +68,7 @@ class PoolConfig:
     min_pilots      : int  = 0
     max_pilots      : int  = 4
     scratch_base    : str | None = None  # None → default scratch tree
-    strategy        : str  = 'conservative'  # retained for config compat
+    strategy        : str  = 'conservative'  # policy name (see task_dispatcher_policy)
     strategy_config : dict[str, Any] = field(default_factory=dict)
 
 
@@ -174,6 +174,16 @@ def _parse_pool(d: Any, source: str) -> PoolConfig:
     if not isinstance(strategy, str) or not strategy:
         raise PoolConfigError(
             f"{source}: 'strategy' must be a non-empty string")
+
+    # Validate against the policy registry here so a bad name fails the
+    # declaration (register_session → 400, no dangling session) instead of
+    # blowing up at pool materialisation.  Import is function-local because
+    # the policy module imports this one.
+    from .task_dispatcher_policy import known_policies
+    if strategy not in known_policies():
+        raise PoolConfigError(
+            f"{source}: unknown 'strategy' {strategy!r} "
+            f"(known: {', '.join(known_policies())})")
 
     strategy_config = d.get('strategy_config', {})
     if not isinstance(strategy_config, dict):

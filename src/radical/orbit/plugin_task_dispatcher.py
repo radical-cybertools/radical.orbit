@@ -1,8 +1,9 @@
 '''
 Task dispatcher plugin — elastic multi-pool task routing for radical.orbit.
 
-Hosts one :class:`PoolState` per pool.  Each ``PoolState`` owns a
-:class:`~radical.orbit.task_dispatcher_strategy_conservative.ConservativePolicy`,
+Hosts one :class:`PoolState` per pool.  Each ``PoolState`` owns a dispatch
+policy (resolved from ``PoolConfig.strategy`` through the manual registry
+in :mod:`~radical.orbit.task_dispatcher_policy`; default ``conservative``),
 a pilot ledger + pending task queue (one atomic ``state.json``), and a
 shared-FS scratch area.
 
@@ -56,7 +57,7 @@ from .task_dispatcher_state             import (
     TASK_QUEUED, TASK_RUNNING, TASK_DONE, TASK_FAILED, TASK_CANCELED,
     TASK_TERMINAL_STATES,
 )
-from .task_dispatcher_strategy_conservative import ConservativePolicy
+from .task_dispatcher_policy               import make_policy
 
 log = logging.getLogger('radical.orbit')
 
@@ -161,8 +162,9 @@ class PoolState:
         self.tasks:  dict[str, TaskRecord]  = records_from(
             payload.get('tasks'), TaskRecord)
 
-        # The dispatcher's one policy (no ABC, no pluggable loader).
-        self.policy = ConservativePolicy(config, config.strategy_config)
+        # Policy resolved by name through the manual registry (see
+        # task_dispatcher_policy; default 'conservative').
+        self.policy = make_policy(config)
 
     def pending_queue(self) -> list[TaskRecord]:
         '''Return pending tasks for this pool, priority-ordered.
@@ -345,7 +347,7 @@ class TaskDispatcherClient(PluginClient):
 # ---------------------------------------------------------------------------
 
 class PluginTaskDispatcher(Plugin):
-    '''Broker-hosted task dispatcher: elastic pilot pools + conservative policy.'''
+    '''Broker-hosted task dispatcher: elastic pilot pools + per-pool policy.'''
 
     plugin_name   = 'task_dispatcher'
     session_class = TaskDispatcherSession
