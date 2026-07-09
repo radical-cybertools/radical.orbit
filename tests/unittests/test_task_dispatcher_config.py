@@ -108,6 +108,14 @@ class TestParsePools:
             parse_pools(_minimal_pool_dict(
                 strategy='my_module.pkg:MyStrategy'))
 
+    def test_invalid_strategy_config_rejected(self):
+        # The parser trial-instantiates the policy, so a strategy_config the
+        # policy constructor rejects fails the declaration (400) instead of
+        # raising later at pool materialisation (500 + dangling session).
+        with pytest.raises(PoolConfigError, match='router_preference'):
+            parse_pools(_minimal_pool_dict(
+                strategy_config={'router_preference': 'bogus'}))
+
     def test_endpoint_name_defaults_to_none(self):
         """Pools without explicit endpoint_name parse to endpoint_name=None."""
         pools = parse_pools(_minimal_pool_dict())

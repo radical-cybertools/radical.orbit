@@ -191,7 +191,7 @@ def _parse_pool(d: Any, source: str) -> PoolConfig:
         raise PoolConfigError(
             f"{source}: 'strategy_config' must be an object")
 
-    return PoolConfig(
+    cfg = PoolConfig(
         name            = name,
         queue           = queue,
         account         = account,
@@ -204,6 +204,23 @@ def _parse_pool(d: Any, source: str) -> PoolConfig:
         strategy        = strategy,
         strategy_config = strategy_config,
     )
+
+    # Trial-instantiate the policy so an invalid ``strategy_config`` (e.g. a
+    # bad ``router_preference``) also fails the declaration here — 400 at
+    # register_session, no dangling session — rather than raising later at
+    # pool materialisation.  Policy constructors are required to be cheap
+    # and side-effect-free (see DispatchPolicy).
+    from .task_dispatcher_policy import make_policy
+    try:
+        make_policy(cfg)
+    except PoolConfigError:
+        raise
+    except Exception as e:
+        raise PoolConfigError(
+            f"{source}: strategy {strategy!r} rejected its "
+            f"strategy_config: {e}") from e
+
+    return cfg
 
 
 def _parse_pilot_size(d: Any, source: str) -> PilotSize:

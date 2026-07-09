@@ -49,7 +49,10 @@ class DispatchPolicy:
     Contract — what a policy may rely on, and what it must not do:
 
     - One instance per pool, constructed as
-      ``PolicyClass(pool_config, strategy_config)``.
+      ``PolicyClass(pool_config, strategy_config)``.  Constructors must be
+      cheap and side-effect-free: the pool parser trial-instantiates the
+      policy to validate ``strategy_config`` at declaration time, and a
+      constructor raise there rejects the pool declaration.
     - Every method is invoked on the dispatcher plugin's event loop, so no
       in-policy locking is needed.
     - ``pool_state.pending_queue()`` returns QUEUED tasks already
