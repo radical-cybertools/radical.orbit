@@ -17,8 +17,9 @@ Usage:
   --tasks N                  Number of tasks (default 8192)
   --batch-window SEC         Client submit batch window (default 0.05)
   --batch-limit N            Client submit batch size limit (default 1024)
-  --notify-window SEC        Endpoint notification batch window (default 0.05)
-  --notify-limit N           Endpoint notification batch size (default 256)
+
+Endpoint-side notification batching is automatic (``task_status_batch``)
+and no longer has client-side knobs.
 """
 
 import argparse
@@ -43,8 +44,6 @@ def parse_args():
     p.add_argument('--tasks',         "-t", type=int,   default=8192)
     p.add_argument('--batch-window',  "-w", type=float, default=0.05)
     p.add_argument('--batch-limit',   "-l", type=int,   default=1024)
-    p.add_argument('--notify-window', "-W", type=float, default=0.05)
-    p.add_argument('--notify-limit',  "-L", type=int,   default=256)
     return p.parse_args()
 
 
@@ -63,18 +62,14 @@ async def main():
         backends=['noop'],
         batch_window=args.batch_window,
         batch_limit=args.batch_limit,
-        notify_batch_window=args.notify_window,
-        notify_batch_size=args.notify_limit,
     )
     backend = await backend
 
     print(f"Broker:         {backend._broker_url}")
-    print(f"Endpoint:           {backend._endpoint_name}")
+    print(f"Endpoint:       {backend._endpoint_name}")
     print(f"Tasks:          {args.tasks}")
     print(f"Batch window:   {args.batch_window}s")
     print(f"Batch limit:    {args.batch_limit}")
-    print(f"Notify window:  {args.notify_window}s")
-    print(f"Notify limit:   {args.notify_limit}")
 
     session = rhapsody.Session(backends=[backend])
 
