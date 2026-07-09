@@ -59,6 +59,7 @@ only — they are never written to disk on the broker side.
 """
 
 import asyncio
+import base64
 import logging
 import os
 import sys
@@ -529,6 +530,40 @@ def read_token(endpoint):
     return token
 
 
+def _credential_env(broker_url):
+    """Job-env broker credentials for a child endpoint.
+
+    Injects the broker's *current* token and (for https) cert so the
+    child never depends on possibly-stale ``~/.radical/orbit`` files on
+    the target — those drift whenever the broker regenerates either.
+    The cert is public pinning material and travels base64-encoded (a
+    single token survives unquoted ``export`` lines in API-composed
+    batch scripts, same trick as RADICAL_ORBIT_SETUP_B64); the token is
+    ``token_urlsafe`` and needs no encoding.  The token rides the same
+    trust boundary as the job spec itself.
+    """
+    from radical.orbit import utils as _orbit_utils
+
+    env = {'RADICAL_ORBIT_BROKER_URL': broker_url}
+
+    token, _ = _orbit_utils.resolve_broker_token()
+    if token:
+        env['RADICAL_ORBIT_BROKER_TOKEN'] = token
+
+    if broker_url.startswith(('https://', 'wss://')):
+        try:
+            cert_path, _ = _orbit_utils.resolve_broker_cert()
+            pem = Path(cert_path).read_bytes()
+            env['RADICAL_ORBIT_BROKER_CERT_B64'] = \
+                base64.b64encode(pem).decode('ascii')
+        except Exception as e:
+            print(f'  [warn] no broker cert to inject ({e}); the child '
+                  f'endpoint falls back to ~/.radical/orbit/broker_cert.pem '
+                  f'on the target')
+
+    return env
+
+
 def _endpoint_argv(endpoint_name, broker_url, tunnel, login_host):
     """Build the ``radical-orbit-endpoint.py`` argv for a child endpoint.
 
@@ -591,16 +626,19 @@ def launch_iri(bc, endpoint, cfg, broker_url):
     amsc    = (cfg.get('amsc_dir') or '.amsc').strip('/')
     wrapper = f'{home}/{amsc}/ve/bin/radical-orbit-endpoint-wrapper.sh'
 
-    # Cert resolution is delegated to the child endpoint: it falls back to
-    # ``~/.radical/orbit/broker_cert.pem`` (or $RADICAL_ORBIT_BROKER_CERT if
-    # set on the target side).  We only inject the broker URL — that
-    # changes per broker run and the file fallback would be stale.
-    env = {'RADICAL_ORBIT_BROKER_URL': broker_url}
+    # Broker URL, current token, and (https) cert all ride the job env —
+    # see _credential_env; ~/.radical/orbit files on the target are only
+    # a fallback and go stale whenever the broker regenerates either.
+    env = _credential_env(broker_url)
     env.update(cfg['environment'])
     # Site-specific shell snippet — module loads, env exports, etc.
     # The wrapper ``eval``s this *before* exec-ing dragon / python.
+    # Base64-encoded: job APIs may compose the batch script with
+    # unquoted ``export KEY=VALUE`` lines, which truncate multi-word
+    # values at the first space (seen with IRI at NERSC).
     if cfg.get('setup'):
-        env['RADICAL_ORBIT_SETUP'] = '; '.join(cfg['setup'])
+        env['RADICAL_ORBIT_SETUP_B64'] = base64.b64encode(
+            '; '.join(cfg['setup']).encode()).decode('ascii')
 
     job_spec = {
         'executable' : wrapper,
@@ -671,15 +709,18 @@ def launch_psij(bc, endpoint_name, cfg, broker_url):
         custom_attrs[f'{cfg["executor"]}.gpus-per-node'] = str(cfg['gpus_per_node'])
     if cfg.get('qos'):
         custom_attrs[f'{cfg["executor"]}.qos'] = cfg['qos']
-    # Cert is left to the child endpoint to resolve from
-    # ``~/.radical/orbit/broker_cert.pem`` on the target (or via
-    # $RADICAL_ORBIT_BROKER_CERT if explicitly set there).  Only the broker
-    # URL — which changes per broker run — is injected here.
-    env = {'RADICAL_ORBIT_BROKER_URL': broker_url}
+    # Broker URL, current token, and (https) cert all ride the job env —
+    # see _credential_env; ~/.radical/orbit files on the target are only
+    # a fallback and go stale whenever the broker regenerates either.
+    env = _credential_env(broker_url)
     # Site-specific shell snippet — module loads, env exports, etc.
     # The wrapper ``eval``s this *before* exec-ing dragon / python.
+    # Base64-encoded: job APIs may compose the batch script with
+    # unquoted ``export KEY=VALUE`` lines, which truncate multi-word
+    # values at the first space (seen with IRI at NERSC).
     if cfg.get('setup'):
-        env['RADICAL_ORBIT_SETUP'] = '; '.join(cfg['setup'])
+        env['RADICAL_ORBIT_SETUP_B64'] = base64.b64encode(
+            '; '.join(cfg['setup']).encode()).decode('ascii')
 
     job_spec = {
         'executable'        : wrapper,

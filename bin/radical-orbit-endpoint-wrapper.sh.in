@@ -12,12 +12,36 @@
 export PATH="@BINDIR@:${PATH}"
 export PYTHONPATH="@SITEPKGS@:${PYTHONPATH:-}"
 
+# Broker cert injected via the job environment (base64 — a single
+# token survives unquoted ``export`` lines in API-composed batch
+# scripts).  Materialize it and point the endpoint's cert resolution at
+# it, so the child never depends on a possibly-stale
+# ~/.radical/orbit/broker_cert.pem on this host.  It is public pinning
+# material, so a mktemp file is fine.  An explicitly-set
+# RADICAL_ORBIT_BROKER_CERT wins.
+if [ -n "${RADICAL_ORBIT_BROKER_CERT_B64:-}" ] && \
+   [ -z "${RADICAL_ORBIT_BROKER_CERT:-}" ]; then
+    _orbit_cert="$(mktemp "${TMPDIR:-/tmp}/orbit-broker-cert.XXXXXX")"
+    printf '%s' "$RADICAL_ORBIT_BROKER_CERT_B64" | base64 -d > "$_orbit_cert"
+    export RADICAL_ORBIT_BROKER_CERT="$_orbit_cert"
+    echo "[orbit] broker cert from job env -> $_orbit_cert" >&2
+fi
+
 # Site-specific setup hook.  Evaluated *before* dragon-vs-python is
 # decided so the chosen interpreter inherits any module loads / env
 # tweaks the snippet performs.  The trust boundary is the same as the
 # rest of the job submission: whoever can put strings into the job
 # spec's environment can already control the exec target, so eval'ing
 # the snippet adds no new attack surface.
+#
+# RADICAL_ORBIT_SETUP_B64 is the transport-safe form and takes
+# precedence: some job APIs (e.g. IRI at NERSC) compose the batch
+# script with unquoted ``export KEY=VALUE`` lines, truncating values at
+# the first space — a multi-word snippet must travel as one base64
+# token.
+if [ -n "${RADICAL_ORBIT_SETUP_B64:-}" ]; then
+    RADICAL_ORBIT_SETUP="$(printf '%s' "$RADICAL_ORBIT_SETUP_B64" | base64 -d)"
+fi
 if [ -n "${RADICAL_ORBIT_SETUP:-}" ]; then
     echo "[orbit] applying RADICAL_ORBIT_SETUP: $RADICAL_ORBIT_SETUP" >&2
     eval "$RADICAL_ORBIT_SETUP"
