@@ -17,7 +17,18 @@ import radical.orbit.logging_config as _lc
 from radical.orbit.broker import Broker
 
 
-_TLS_HOWTO = '''\
+_TLS_RECIPE = '''\
+To create a self-signed cert/key pair at the default location:
+
+  mkdir -p ~/.radical/orbit
+  openssl req -x509 -newkey rsa:4096 -nodes \\
+      -keyout ~/.radical/orbit/broker_key.pem \\
+      -out    ~/.radical/orbit/broker_cert.pem \\
+      -days 365 -subj "/CN=$(hostname -f)"
+  chmod 600 ~/.radical/orbit/broker_key.pem
+'''
+
+_TLS_HOWTO = f'''\
 TLS setup
 ---------
 The broker serves HTTPS/WSS and needs a certificate + private key.
@@ -26,15 +37,7 @@ Resolution order for each:
   cert:  --cert PATH  >  $RADICAL_ORBIT_BROKER_CERT  >  ~/.radical/orbit/broker_cert.pem
   key:   --key  PATH  >  $RADICAL_ORBIT_BROKER_KEY   >  ~/.radical/orbit/broker_key.pem
 
-To create a self-signed pair at the default location:
-
-  mkdir -p ~/.radical/orbit
-  openssl req -x509 -newkey rsa:4096 -nodes \\
-      -keyout ~/.radical/orbit/broker_key.pem \\
-      -out    ~/.radical/orbit/broker_cert.pem \\
-      -days 365 -subj "/CN=$(hostname -f)"
-  chmod 600 ~/.radical/orbit/broker_key.pem
-
+{_TLS_RECIPE}
 The key must be mode 0600 or stricter — the broker refuses to start
 otherwise.  Endpoints and clients pin the *cert* (never the key): copy
 broker_cert.pem to ~/.radical/orbit/ on each connecting host, or point
@@ -104,9 +107,9 @@ def main():
                         gateway=not args.no_gateway)
     except (ValueError, FileNotFoundError, PermissionError, ssl.SSLError) as e:
         # Cert/key resolution failures (missing, unreadable, malformed,
-        # key too permissive) — print the actionable how-to instead of a
-        # traceback.
-        print(f'\nERROR: {e}\n\n{_TLS_HOWTO}', file=sys.stderr)
+        # key too permissive) — short and actionable instead of a
+        # traceback; resolution details live in --help and DEPLOYMENT.md.
+        print(f'\nERROR: {e}\n\n{_TLS_RECIPE}', file=sys.stderr)
         sys.exit(1)
 
     broker.run()
