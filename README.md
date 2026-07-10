@@ -1,7 +1,7 @@
 
 # ORBIT
 
-ORBIT provides a decentralized architectural framework for seamlessly interacting with high-performance computing (HPC) nodes and executing remote computations across endpoint services.
+ORBIT stands for 'Orchestrated Resource Brokerage & Integration Toolkit'.  It provides a decentralized architectural framework for seamlessly interacting with high-performance computing (HPC) nodes and executing remote computations across endpoint services.
 
 ## Architecture
 
