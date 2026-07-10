@@ -30,8 +30,12 @@ export PYTHONPATH="@SITEPKGS@:${PYTHONPATH:-}"
 # script with unquoted ``export KEY=VALUE`` lines, truncating values at
 # the first space — a multi-word snippet must travel as one base64
 # token.
+# Decode with the venv's python — the ``base64`` CLI diverges across
+# systems (GNU ``-d`` vs BSD/macOS ``-D``) and may be absent entirely.
 if [ -n "${RADICAL_ORBIT_SETUP_B64:-}" ]; then
-    RADICAL_ORBIT_SETUP="$(printf '%s' "$RADICAL_ORBIT_SETUP_B64" | base64 -d)"
+    RADICAL_ORBIT_SETUP="$("@BINDIR@/python3" -c \
+        'import base64, os, sys
+sys.stdout.write(base64.b64decode(os.environ["RADICAL_ORBIT_SETUP_B64"]).decode())')"
 fi
 if [ -n "${RADICAL_ORBIT_SETUP:-}" ]; then
     echo "[orbit] applying RADICAL_ORBIT_SETUP: $RADICAL_ORBIT_SETUP" >&2

@@ -56,6 +56,7 @@ never the system CA store — so each host that connects needs a copy
 (the cert only; the private key never leaves the broker host):
 
 ```sh
+ssh <host> "mkdir -p ~/.radical/orbit"
 scp ~/.radical/orbit/broker_cert.pem <host>:.radical/orbit/
 ```
 

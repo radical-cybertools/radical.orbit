@@ -67,6 +67,7 @@ the one cert-distribution mechanism for every startup channel (by
 hand, ssh, PsiJ, IRI job submission):
 
 ```sh
+ssh <endpoint-host> "mkdir -p ~/.radical/orbit"
 scp ~/.radical/orbit/broker_cert.pem <endpoint-host>:.radical/orbit/
 ```
 
@@ -77,6 +78,7 @@ The **token** reaches the endpoint in one of two ways:
   re-copy it whenever the broker's token is regenerated:
 
   ```sh
+  ssh <endpoint-host> "mkdir -p ~/.radical/orbit"
   scp ~/.radical/orbit/broker.token <endpoint-host>:.radical/orbit/
   ```
 

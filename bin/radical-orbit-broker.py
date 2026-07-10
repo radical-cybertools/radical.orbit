@@ -10,6 +10,7 @@ for a headless broker).
 import argparse
 import logging
 import os
+import ssl
 import sys
 
 import radical.orbit.logging_config as _lc
@@ -101,9 +102,10 @@ def main():
                         token=args.token,
                         no_auth=args.no_auth,
                         gateway=not args.no_gateway)
-    except (ValueError, FileNotFoundError, PermissionError) as e:
-        # Cert/key resolution failures (missing, unreadable, key too
-        # permissive) — print the actionable how-to instead of a traceback.
+    except (ValueError, FileNotFoundError, PermissionError, ssl.SSLError) as e:
+        # Cert/key resolution failures (missing, unreadable, malformed,
+        # key too permissive) — print the actionable how-to instead of a
+        # traceback.
         print(f'\nERROR: {e}\n\n{_TLS_HOWTO}', file=sys.stderr)
         sys.exit(1)
 

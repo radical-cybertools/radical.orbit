@@ -623,8 +623,10 @@ class EndpointRuntime(PluginHostBase):
                     f"registration rejected by broker at {self._broker_url}: "
                     f"invalid credential — the token this endpoint sent "
                     f"({src}) does not match the broker's current token; "
-                    f"refresh it from the broker host "
-                    f"(~/.radical/orbit/broker.token there)")
+                    f"obtain the broker's currently configured token (its "
+                    f"--token / $RADICAL_ORBIT_BROKER_TOKEN, or "
+                    f"~/.radical/orbit/broker.token on the broker host when "
+                    f"neither is set)")
             else:
                 self._set_fatal(f"register rejected: {ack.reason}")
             return False

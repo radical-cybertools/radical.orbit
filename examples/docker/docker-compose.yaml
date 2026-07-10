@@ -31,7 +31,9 @@ services:
       retries: 15
       start_period: 30s
     ports:
-      - "8000:8000"
+      # Loopback only: the demo broker runs --no-auth, so the control
+      # API must not be reachable from the surrounding network.
+      - "127.0.0.1:8000:8000"
     volumes:
       - radical-orbit-volume:/app
     networks:

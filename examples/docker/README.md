@@ -65,8 +65,9 @@ python3 example_sysinfo.py
 
 ### 4. Browse the API
 
-The broker service exposes port `8000` to the host, so once the containers are
-running you can open the API documentation directly in a web browser:
+The broker service exposes port `8000` on the host's loopback interface
+(only — the demo runs without auth), so once the containers are running
+you can open the API documentation directly in a web browser:
 
 | URL | Description |
 |-----|-------------|
