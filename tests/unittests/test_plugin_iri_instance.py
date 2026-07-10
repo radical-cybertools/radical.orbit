@@ -6,14 +6,13 @@ import pytest
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 from radical.orbit.plugin_iri_instance import (
     PluginIRIInstance,
     IRIInstanceSession,
     _iri_raise,
 )
-from radical.orbit.iri_endpoints import IRI_ENDPOINTS
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +199,8 @@ def test_iri_raise_401():
     resp = MagicMock()
     resp.is_success   = False
     resp.status_code  = 401
+    resp.text         = ''
+    resp.json.side_effect = ValueError('no json')
     with pytest.raises(Exception, match='token expired'):
         _iri_raise(resp)
 
@@ -208,8 +209,70 @@ def test_iri_raise_404():
     resp = MagicMock()
     resp.is_success   = False
     resp.status_code  = 404
+    resp.text         = ''
+    resp.json.side_effect = ValueError('no json')
     with pytest.raises(Exception, match='not found'):
         _iri_raise(resp)
+
+
+def test_iri_raise_appends_json_detail():
+    '''The upstream JSON ``detail`` is appended to the generic message.'''
+    resp = MagicMock()
+    resp.is_success        = False
+    resp.status_code       = 404
+    resp.text              = '{"detail": "Unable to get sfapi data: 500"}'
+    resp.json.return_value = {'type'  : 'about:blank',
+                              'status': 404,
+                              'title' : 'Not Found',
+                              'detail': 'Unable to get sfapi data: 500'}
+    with pytest.raises(HTTPException) as exc_info:
+        _iri_raise(resp, 'submit_job')
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.detail == ('IRI submit_job: resource or job '
+                                     'not found — Unable to get sfapi '
+                                     'data: 500')
+
+
+def test_iri_raise_falls_back_to_title():
+    '''Without ``detail``, the JSON ``title`` is appended.'''
+    resp = MagicMock()
+    resp.is_success        = False
+    resp.status_code       = 403
+    resp.text              = '{"title": "insufficient scope"}'
+    resp.json.return_value = {'title': 'insufficient scope'}
+    with pytest.raises(HTTPException) as exc_info:
+        _iri_raise(resp, 'list_jobs')
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == \
+           'IRI list_jobs: forbidden — insufficient scope'
+
+
+def test_iri_raise_non_json_body_snippet():
+    '''A non-JSON body is appended as a newline-free, truncated snippet.'''
+    resp = MagicMock()
+    resp.is_success   = False
+    resp.status_code  = 404
+    resp.text         = '<html>\n  Bad gateway\n</html>\n' + 'x' * 300
+    resp.json.side_effect = ValueError('not json')
+    with pytest.raises(HTTPException) as exc_info:
+        _iri_raise(resp, 'submit_job')
+    detail = exc_info.value.detail
+    assert detail.startswith(
+        'IRI submit_job: resource or job not found — <html> Bad gateway')
+    assert '\n' not in detail
+    assert len(detail) <= 250
+
+
+def test_iri_raise_empty_body_plain_generic():
+    '''An empty body yields the plain generic message, no separator.'''
+    resp = MagicMock()
+    resp.is_success   = False
+    resp.status_code  = 404
+    resp.text         = ''
+    resp.json.side_effect = ValueError('no json')
+    with pytest.raises(HTTPException) as exc_info:
+        _iri_raise(resp, 'submit_job')
+    assert exc_info.value.detail == 'IRI submit_job: resource or job not found'
 
 
 def test_iri_raise_500():
