@@ -218,6 +218,12 @@ def _render_batch_script(job_spec: Dict[str, Any]) -> str:
     def sb(flag: str, val: Any) -> None:
         lines.append(f'#SBATCH {flag}={val}')
 
+    # Deterministic environment: do NOT inherit the submitter's (server-side
+    # captured) login environment — a polluted env silently wedges dragon's
+    # backend bring-up.  Everything the job needs is exported explicitly in
+    # the script body below.
+    sb('--export', 'NONE')
+
     name = spec.get('name')
     if name:
         sb('--job-name', name)

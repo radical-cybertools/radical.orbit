@@ -99,6 +99,7 @@ def test_render_batch_script_fields_and_order():
     assert lines[0] == '#!/bin/bash'
     sbatch = [l for l in lines if l.startswith('#SBATCH')]
     assert sbatch == [
+        '#SBATCH --export=NONE',
         '#SBATCH --job-name=job1',
         '#SBATCH --nodes=2',
         '#SBATCH --time=2',
@@ -126,6 +127,8 @@ def test_render_batch_script_omits_absent_fields():
                  '--constraint', '--qos', '--reservation',
                  '--gpus-per-node', '--exclusive', '--chdir'):
         assert flag not in script
+    # --export=NONE is unconditional: deterministic job env by design
+    assert '#SBATCH --export=NONE' in script
 
 
 def test_render_batch_script_env_quoting():

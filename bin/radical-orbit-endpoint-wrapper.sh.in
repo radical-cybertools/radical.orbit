@@ -18,6 +18,21 @@ export PYTHONPATH="@SITEPKGS@:${PYTHONPATH:-}"
 # many channels (IRI, PsiJ, ssh, by hand); one staging procedure for
 # all of them beats per-channel automation.
 
+# The venv's bin dir must be on PATH: dragon's launcher resolves its
+# helpers (``dragon-network-config-launch-helper``, ``dragon-backend``)
+# BY NAME through the workload manager, and the WLM-spawned task does a
+# PATH lookup on the target side.
+export PATH="@BINDIR@:$PATH"
+
+# Under Slurm, force inner job steps to inherit this environment.  A
+# submission made with ``--export=NONE`` (deliberate, or e.g. via a
+# facility API) stamps SLURM_EXPORT_ENV=NONE into the job, and every
+# inner ``srun`` — dragon's helper and backend launches — would scrub
+# its task env, losing the PATH above.
+if [ -n "${SLURM_JOB_ID:-}" ]; then
+    export SLURM_EXPORT_ENV=ALL
+fi
+
 # Site-specific setup hook.  Evaluated *before* dragon-vs-python is
 # decided so the chosen interpreter inherits any module loads / env
 # tweaks the snippet performs.  The trust boundary is the same as the
