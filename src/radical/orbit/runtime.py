@@ -351,9 +351,10 @@ class EndpointRuntime(PluginHostBase):
             # Poll in short slices so a fatal transport failure (bad
             # credential, TLS pin mismatch, tunnel failure) surfaces
             # immediately instead of burning the whole timeout.
-            while not self._registered.wait(timeout=0.25):
+            while not self._registered.is_set():
                 if self._fatal or time.monotonic() >= deadline:
                     break
+                self._registered.wait(timeout=0.25)
             if self._fatal:
                 raise RuntimeError(self._fatal_reason
                                    or 'broker connection failed fatally')

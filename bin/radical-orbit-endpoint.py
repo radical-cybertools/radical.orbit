@@ -112,8 +112,6 @@ def main():
                 sys.exit(1)
     except KeyboardInterrupt:
         pass
-    except SystemExit:
-        raise
     except Exception as e:
         log.exception("Endpoint crashed")
         print(f"[orbit] FATAL: {e}", file=sys.stderr)

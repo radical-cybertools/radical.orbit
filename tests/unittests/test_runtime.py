@@ -853,3 +853,4 @@ def test_tls_pin_mismatch_is_fatal_and_actionable(self_signed, tmp_path,
     finally:
         rt.stop()
         httpd.shutdown()
+        httpd.server_close()
