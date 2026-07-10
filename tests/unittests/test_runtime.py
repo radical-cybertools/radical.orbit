@@ -797,7 +797,10 @@ def test_invalid_credential_is_fatal_and_actionable(harness):
     rt = make_runtime(srv.url, token='wrong-token', wait=False)
     assert _wait(lambda: rt.fatal, timeout=10.0)
     assert 'invalid credential' in rt.fatal_reason
-    assert 'broker.token'       in rt.fatal_reason   # names the file to fix
+    # names the *configured* source (the token was passed explicitly here),
+    # plus the generic remediation
+    assert 'passed explicitly' in rt.fatal_reason
+    assert 'broker.token'      in rt.fatal_reason
     assert rt.wait_registered(timeout=0.1) is False
 
     # wait=True: start() raises instead of burning the whole timeout

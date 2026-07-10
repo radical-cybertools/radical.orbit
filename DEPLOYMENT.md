@@ -73,14 +73,22 @@ scp ~/.radical/orbit/broker_cert.pem <endpoint-host>:.radical/orbit/
 
 The **token** reaches the endpoint in one of two ways:
 
-- manually-started endpoints (by hand, ssh, cron) read
-  `~/.radical/orbit/broker.token` — copy it alongside the cert, and
-  re-copy it whenever the broker's token is regenerated:
+- manually-started endpoints (by hand, ssh, cron) resolve the token
+  from `$RADICAL_ORBIT_BROKER_TOKEN` or
+  `~/.radical/orbit/broker.token`.  Stage whichever matches the
+  broker's configuration: when the broker uses its token *file*
+  (the default — generated on first start), copy it, and re-copy it
+  whenever it is regenerated:
 
   ```sh
   ssh <endpoint-host> "mkdir -p ~/.radical/orbit"
   scp ~/.radical/orbit/broker.token <endpoint-host>:.radical/orbit/
   ```
+
+  When the broker was started with `--token` or
+  `$RADICAL_ORBIT_BROKER_TOKEN` (higher precedence; the file may be
+  absent or stale), install *that* value on the endpoint host instead
+  — export it, or write it to the token file (mode `0600`).
 
 - launcher-submitted endpoints (e.g. `examples/amsc.py` via PsiJ or
   IRI) receive the broker's *current* token via

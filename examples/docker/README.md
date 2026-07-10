@@ -38,8 +38,9 @@ endpoint.
 > The demo broker runs with `--no-auth`: its ingress token would be
 > generated under the broker container's own `$HOME`, which the other
 > containers cannot read.  In any real deployment the token gate stays
-> on, and you stage `broker_cert.pem` *and* `broker.token` to each
-> connecting host (see `DEPLOYMENT.md`).
+> on, and you stage `broker_cert.pem` plus the broker's *currently
+> configured* token — via `$RADICAL_ORBIT_BROKER_TOKEN` or a mode-0600
+> `broker.token` file — to each connecting host (see `DEPLOYMENT.md`).
 
 ```shell
 cd examples/docker
