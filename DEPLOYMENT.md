@@ -61,18 +61,30 @@ is `--token` > `$RADICAL_ORBIT_BROKER_TOKEN` >
 
 ### Credential staging to endpoint/client hosts
 
-Every host that connects needs **two** files from the broker host —
-the cert (endpoints *pin* it; the system CA store is never consulted)
-and the current token:
+The **cert** is staged manually to every host that connects —
+endpoints *pin* it (the system CA store is never consulted).  This is
+the one cert-distribution mechanism for every startup channel (by
+hand, ssh, PsiJ, IRI job submission):
 
 ```sh
-scp ~/.radical/orbit/broker_cert.pem \
-    ~/.radical/orbit/broker.token   <endpoint-host>:.radical/orbit/
+scp ~/.radical/orbit/broker_cert.pem <endpoint-host>:.radical/orbit/
 ```
 
-This manual staging is the one distribution mechanism for every
-endpoint startup channel (by hand, ssh, PsiJ, IRI job submission).
-Re-copy the token if the broker's token file is ever regenerated.
+The **token** reaches the endpoint in one of two ways:
+
+- manually-started endpoints (by hand, ssh, cron) read
+  `~/.radical/orbit/broker.token` — copy it alongside the cert, and
+  re-copy it whenever the broker's token is regenerated:
+
+  ```sh
+  scp ~/.radical/orbit/broker.token <endpoint-host>:.radical/orbit/
+  ```
+
+- launcher-submitted endpoints (e.g. `examples/amsc.py` via PsiJ or
+  IRI) receive the broker's *current* token via
+  `RADICAL_ORBIT_BROKER_TOKEN` in the job environment — no token file
+  is needed on the target, and it can never go stale.
+
 The private key is **not** copied — it stays on the broker host.
 
 ### systemd Unit File (Broker)

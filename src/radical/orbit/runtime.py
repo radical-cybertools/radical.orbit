@@ -159,7 +159,9 @@ class EndpointRuntime(PluginHostBase):
             self._cert: Optional[str] = str(resolved_cert)
         else:
             self._cert = None
-        self._token: Optional[str] = utils.resolve_broker_token(cli=token)[0]
+        # Keep the token's source ('cli' / 'env' / 'file' / '') so a
+        # credential rejection can name the exact place to fix.
+        self._token, self._token_source = utils.resolve_broker_token(cli=token)
 
         # ── Identity / role ───────────────────────────────────────────
         self._name: str = name or ('consumer.%s' % uuid.uuid4().hex[:8])
@@ -348,20 +350,27 @@ class EndpointRuntime(PluginHostBase):
 
         if wait:
             deadline = time.monotonic() + timeout
-            # Poll in short slices so a fatal transport failure (bad
-            # credential, TLS pin mismatch, tunnel failure) surfaces
-            # immediately instead of burning the whole timeout.
-            while not self._registered.is_set():
-                if self._fatal or time.monotonic() >= deadline:
-                    break
-                self._registered.wait(timeout=0.25)
-            if self._fatal:
-                raise RuntimeError(self._fatal_reason
-                                   or 'broker connection failed fatally')
-            # Also wait (within the same budget) for the first topology frame,
-            # so topology() is populated before start() returns.
-            remaining = max(0.0, deadline - time.monotonic())
-            self._topology_ready.wait(timeout=remaining)
+
+            # Deadline-bounded polling for both events — the wait slices
+            # never overshoot the deadline, and a fatal transport failure
+            # (bad credential, TLS pin mismatch, tunnel failure) surfaces
+            # immediately instead of burning the remaining budget, even
+            # when it strikes between registration and the first topology
+            # frame.
+            def _poll(event: threading.Event) -> None:
+                while not event.is_set():
+                    remaining = deadline - time.monotonic()
+                    if self._fatal or remaining <= 0:
+                        break
+                    event.wait(timeout=min(0.25, remaining))
+                if self._fatal:
+                    raise RuntimeError(self._fatal_reason
+                                       or 'broker connection failed fatally')
+
+            _poll(self._registered)
+            # Also wait (within the same budget) for the first topology
+            # frame, so topology() is populated before start() returns.
+            _poll(self._topology_ready)
         return self
 
     def wait_registered(self, timeout: float = 30.0) -> bool:
@@ -605,13 +614,17 @@ class EndpointRuntime(PluginHostBase):
                             self._name)
                 return False
             if ack.reason == 'invalid-credential':
+                src = {
+                    'cli':  'passed explicitly (--token / token=)',
+                    'env':  'from $RADICAL_ORBIT_BROKER_TOKEN',
+                    'file': f'from {utils.TOKEN_FILE}',
+                }.get(self._token_source, 'not configured at all')
                 self._set_fatal(
                     f"registration rejected by broker at {self._broker_url}: "
                     f"invalid credential — the token this endpoint sent "
-                    f"(from $RADICAL_ORBIT_BROKER_TOKEN or "
-                    f"~/.radical/orbit/broker.token) does not match the "
-                    f"broker's current token; refresh it from the broker "
-                    f"host (~/.radical/orbit/broker.token there)")
+                    f"({src}) does not match the broker's current token; "
+                    f"refresh it from the broker host "
+                    f"(~/.radical/orbit/broker.token there)")
             else:
                 self._set_fatal(f"register rejected: {ack.reason}")
             return False
