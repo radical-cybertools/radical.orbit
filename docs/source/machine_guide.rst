@@ -38,8 +38,8 @@ PsiJ — batch jobs via an endpoint
    certificate and auth token) to the machine.
 2. On the machine's login node, start an endpoint::
 
-      radical-orbit-endpoint --url https://<broker-host>:8000 \
-                             --cert broker_cert.pem
+      radical-orbit-endpoint.py --url https://<broker-host>:8000 \
+                                --cert broker_cert.pem
 
    The endpoint auto-detects the batch system (SLURM ``squeue`` / PBSPro
    ``qstat``) and loads the ``psij`` and ``queue_info`` plugins.

@@ -34,6 +34,14 @@ endpoint.
 > [!WARNING]
 > The self-signed certificate is for **development purposes only**.
 
+> [!NOTE]
+> The demo broker runs with `--no-auth`: its ingress token would be
+> generated under the broker container's own `$HOME`, which the other
+> containers cannot read.  In any real deployment the token gate stays
+> on, and you stage `broker_cert.pem` plus the broker's *currently
+> configured* token — via `$RADICAL_ORBIT_BROKER_TOKEN` or a mode-0600
+> `broker.token` file — to each connecting host (see `DEPLOYMENT.md`).
+
 ```shell
 cd examples/docker
 docker build --build-arg GENERATE_BROKER_CERT=true \
@@ -58,8 +66,9 @@ python3 example_sysinfo.py
 
 ### 4. Browse the API
 
-The broker service exposes port `8000` to the host, so once the containers are
-running you can open the API documentation directly in a web browser:
+The broker service exposes port `8000` on the host's loopback interface
+(only — the demo runs without auth), so once the containers are running
+you can open the API documentation directly in a web browser:
 
 | URL | Description |
 |-----|-------------|

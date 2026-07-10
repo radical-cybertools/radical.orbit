@@ -43,6 +43,60 @@ export RADICAL_ORBIT_BROKER_KEY=/path/to/key.pem
 
 Set the bind address/port with `--host` / `--port` (defaults `0.0.0.0:8000`).
 
+The cert/key pair is created by the operator (see the README's
+"Generating Certificates" section, or `radical-orbit-broker.py --help`
+for a copy-pasteable openssl recipe); the broker never generates them.
+The key file must be mode `0600` or stricter — the broker refuses to
+start otherwise — and never leaves the broker host.
+
+### Ingress token
+
+The broker gates its HTTP ingress *and* the endpoint `/register`
+handshake with a shared bearer token.  On first start it generates one
+and writes it to `~/.radical/orbit/broker.token` (mode `0600`; the
+token itself is never printed, only its path).  Precedence everywhere
+is `--token` > `$RADICAL_ORBIT_BROKER_TOKEN` >
+`~/.radical/orbit/broker.token`.  For local development only,
+`--no-auth` (or `$RADICAL_ORBIT_BROKER_NO_AUTH=1`) disables the gate.
+
+### Credential staging to endpoint/client hosts
+
+The **cert** is staged manually to every host that connects —
+endpoints *pin* it (the system CA store is never consulted).  This is
+the one cert-distribution mechanism for every startup channel (by
+hand, ssh, PsiJ, IRI job submission):
+
+```sh
+ssh <endpoint-host> "mkdir -p ~/.radical/orbit"
+scp ~/.radical/orbit/broker_cert.pem <endpoint-host>:.radical/orbit/
+```
+
+The **token** reaches the endpoint in one of two ways:
+
+- manually-started endpoints (by hand, ssh, cron) resolve the token
+  from `$RADICAL_ORBIT_BROKER_TOKEN` or
+  `~/.radical/orbit/broker.token`.  Stage whichever matches the
+  broker's configuration: when the broker uses its token *file*
+  (the default — generated on first start), copy it, and re-copy it
+  whenever it is regenerated:
+
+  ```sh
+  ssh <endpoint-host> "mkdir -p ~/.radical/orbit"
+  scp ~/.radical/orbit/broker.token <endpoint-host>:.radical/orbit/
+  ```
+
+  When the broker was started with `--token` or
+  `$RADICAL_ORBIT_BROKER_TOKEN` (higher precedence; the file may be
+  absent or stale), install *that* value on the endpoint host instead
+  — export it, or write it to the token file (mode `0600`).
+
+- launcher-submitted endpoints (e.g. `examples/amsc.py` via PsiJ or
+  IRI) receive the broker's *current* token via
+  `RADICAL_ORBIT_BROKER_TOKEN` in the job environment — no token file
+  is needed on the target, and it can never go stale.
+
+The private key is **not** copied — it stays on the broker host.
+
 ### systemd Unit File (Broker)
 
 ```ini
@@ -56,6 +110,9 @@ User=radical
 WorkingDirectory=/opt/orbit
 Environment=RADICAL_ORBIT_BROKER_CERT=/opt/orbit/certs/broker_cert.pem
 Environment=RADICAL_ORBIT_BROKER_KEY=/opt/orbit/certs/broker_key.pem
+# Token: resolved from ~radical/.radical/orbit/broker.token (generated
+# on first start), or pin one explicitly:
+# Environment=RADICAL_ORBIT_BROKER_TOKEN=<shared ingress token>
 ExecStart=/opt/orbit/bin/radical-orbit-broker.py
 Restart=on-failure
 RestartSec=5s
@@ -89,7 +146,11 @@ sbatch endpoint_job.sh
 #SBATCH --nodes=1
 #SBATCH --time=24:00:00
 
+# Both staged from the broker host (see "Credential staging" above).
+# With the files at ~/.radical/orbit/{broker_cert.pem,broker.token}
+# these two exports are unnecessary — shown here for explicitness.
 export RADICAL_ORBIT_BROKER_CERT=/path/to/broker_cert.pem
+export RADICAL_ORBIT_BROKER_TOKEN="$(cat /path/to/broker.token)"
 
 ./bin/radical-orbit-endpoint-wrapper.sh \
   --name "$SLURM_CLUSTER_NAME-endpoint" \

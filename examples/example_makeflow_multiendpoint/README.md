@@ -49,6 +49,15 @@ scp pools.json endpoint_b_host:~/.radical/orbit/task_dispatcher/pools.json
 # Start the broker on the client host
 radical-orbit-broker.py &
 
+# Stage the broker's cert (https; endpoints pin it) and current token
+# to each endpoint host — required for registration:
+ssh endpoint_a_host "mkdir -p ~/.radical/orbit"
+scp ~/.radical/orbit/broker_cert.pem ~/.radical/orbit/broker.token \
+    endpoint_a_host:.radical/orbit/
+ssh endpoint_b_host "mkdir -p ~/.radical/orbit"
+scp ~/.radical/orbit/broker_cert.pem ~/.radical/orbit/broker.token \
+    endpoint_b_host:.radical/orbit/
+
 # Start endpoint_a on its login node
 RADICAL_ORBIT_BROKER_URL=... radical-orbit-endpoint-wrapper.sh -n endpoint_a \
     --plugins task_dispatcher,rhapsody,staging,psij &
