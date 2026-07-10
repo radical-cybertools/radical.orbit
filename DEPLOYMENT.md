@@ -43,6 +43,38 @@ export RADICAL_ORBIT_BROKER_KEY=/path/to/key.pem
 
 Set the bind address/port with `--host` / `--port` (defaults `0.0.0.0:8000`).
 
+The cert/key pair is created by the operator (see the README's
+"Generating Certificates" section, or `radical-orbit-broker.py --help`
+for a copy-pasteable openssl recipe); the broker never generates them.
+The key file must be mode `0600` or stricter — the broker refuses to
+start otherwise — and never leaves the broker host.
+
+### Ingress token
+
+The broker gates its HTTP ingress *and* the endpoint `/register`
+handshake with a shared bearer token.  On first start it generates one
+and writes it to `~/.radical/orbit/broker.token` (mode `0600`; the
+token itself is never printed, only its path).  Precedence everywhere
+is `--token` > `$RADICAL_ORBIT_BROKER_TOKEN` >
+`~/.radical/orbit/broker.token`.  For local development only,
+`--no-auth` (or `$RADICAL_ORBIT_BROKER_NO_AUTH=1`) disables the gate.
+
+### Credential staging to endpoint/client hosts
+
+Every host that connects needs **two** files from the broker host —
+the cert (endpoints *pin* it; the system CA store is never consulted)
+and the current token:
+
+```sh
+scp ~/.radical/orbit/broker_cert.pem \
+    ~/.radical/orbit/broker.token   <endpoint-host>:.radical/orbit/
+```
+
+This manual staging is the one distribution mechanism for every
+endpoint startup channel (by hand, ssh, PsiJ, IRI job submission).
+Re-copy the token if the broker's token file is ever regenerated.
+The private key is **not** copied — it stays on the broker host.
+
 ### systemd Unit File (Broker)
 
 ```ini
@@ -56,6 +88,9 @@ User=radical
 WorkingDirectory=/opt/orbit
 Environment=RADICAL_ORBIT_BROKER_CERT=/opt/orbit/certs/broker_cert.pem
 Environment=RADICAL_ORBIT_BROKER_KEY=/opt/orbit/certs/broker_key.pem
+# Token: resolved from ~radical/.radical/orbit/broker.token (generated
+# on first start), or pin one explicitly:
+# Environment=RADICAL_ORBIT_BROKER_TOKEN=<shared ingress token>
 ExecStart=/opt/orbit/bin/radical-orbit-broker.py
 Restart=on-failure
 RestartSec=5s
@@ -89,7 +124,11 @@ sbatch endpoint_job.sh
 #SBATCH --nodes=1
 #SBATCH --time=24:00:00
 
+# Both staged from the broker host (see "Credential staging" above).
+# With the files at ~/.radical/orbit/{broker_cert.pem,broker.token}
+# these two exports are unnecessary — shown here for explicitness.
 export RADICAL_ORBIT_BROKER_CERT=/path/to/broker_cert.pem
+export RADICAL_ORBIT_BROKER_TOKEN="$(cat /path/to/broker.token)"
 
 ./bin/radical-orbit-endpoint-wrapper.sh \
   --name "$SLURM_CLUSTER_NAME-endpoint" \

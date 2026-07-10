@@ -16,7 +16,11 @@ services:
         BROKER_HOSTNAME: ${RADICAL_ORBIT_BROKER_HOSTNAME:-broker}
     container_name: radical-orbit-broker
     hostname: ${RADICAL_ORBIT_BROKER_HOSTNAME:-broker}
-    command: [ "radical-orbit-broker.py" ]
+    # --no-auth: the ingress token is generated under the broker
+    # container's $HOME, which the endpoint/client containers cannot
+    # read — a dev demo runs with the gate off (never do this in
+    # production; see DEPLOYMENT.md for token staging).
+    command: [ "radical-orbit-broker.py", "--no-auth" ]
     healthcheck:
       test:
         - CMD-SHELL

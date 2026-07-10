@@ -34,6 +34,13 @@ endpoint.
 > [!WARNING]
 > The self-signed certificate is for **development purposes only**.
 
+> [!NOTE]
+> The demo broker runs with `--no-auth`: its ingress token would be
+> generated under the broker container's own `$HOME`, which the other
+> containers cannot read.  In any real deployment the token gate stays
+> on, and you stage `broker_cert.pem` *and* `broker.token` to each
+> connecting host (see `DEPLOYMENT.md`).
+
 ```shell
 cd examples/docker
 docker build --build-arg GENERATE_BROKER_CERT=true \

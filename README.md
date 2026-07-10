@@ -50,6 +50,20 @@ chmod 0600 ~/.radical/orbit/broker_key.pem
 `chmod 0600` is mandatory: the broker refuses to start if the key
 file is more permissive.
 
+**Distribute the cert to every connecting host.**  Endpoints and
+clients *pin* the broker cert — they trust exactly that certificate,
+never the system CA store — so each host that connects needs a copy
+(the cert only; the private key never leaves the broker host):
+
+```sh
+scp ~/.radical/orbit/broker_cert.pem <host>:.radical/orbit/
+```
+
+This manual staging step is the one cert-distribution mechanism for
+*every* endpoint startup channel (by hand, ssh, PsiJ, IRI job
+submission).  Alternatively point `$RADICAL_ORBIT_BROKER_CERT` at the
+copy on the connecting host.
+
 To override the defaults (different paths, remote broker URL, etc.),
 set any of:
 
@@ -69,8 +83,9 @@ The broker requires a **shared bearer token** on its HTTP ingress and on the
 endpoint `/register` handshake — without it, anyone who can reach the broker
 could drive plugins (submit jobs, stage files). On first start the broker
 **generates a token** and writes it to `~/.radical/orbit/broker.token` (mode
-`0600`), printing it on stdout. Same-host endpoints and clients pick that file
-up automatically; for a remote broker, copy the token (like the cert) and set:
+`0600`); the token itself is never printed — only its source/path is.  Same-host
+endpoints and clients pick that file up automatically; for a remote broker,
+copy the token (like the cert) and set:
 
 ```sh
 export RADICAL_ORBIT_BROKER_TOKEN='<the token>'
