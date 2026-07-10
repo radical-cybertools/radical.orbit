@@ -531,16 +531,18 @@ def read_token(endpoint):
 
 
 def _credential_env(broker_url):
-    """Job-env broker credentials for a child endpoint.
+    """Job-env broker URL + token for a child endpoint.
 
-    Injects the broker's *current* token and (for https) cert so the
-    child never depends on possibly-stale ``~/.radical/orbit`` files on
-    the target — those drift whenever the broker regenerates either.
-    The cert is public pinning material and travels base64-encoded (a
-    single token survives unquoted ``export`` lines in API-composed
-    batch scripts, same trick as RADICAL_ORBIT_SETUP_B64); the token is
-    ``token_urlsafe`` and needs no encoding.  The token rides the same
-    trust boundary as the job spec itself.
+    Injects the broker's *current* token (``token_urlsafe`` — a single
+    word, needs no encoding) so the child does not depend on a
+    possibly-stale ``~/.radical/orbit/broker.token`` on the target; the
+    token rides the same trust boundary as the job spec itself.
+
+    The TLS cert is deliberately NOT injected: it is staged manually to
+    ``~/.radical/orbit/broker_cert.pem`` on every connecting host (see
+    DEPLOYMENT.md) — endpoints start through many channels (IRI, PsiJ,
+    ssh, by hand), and one staging procedure for all of them beats
+    per-channel automation.
     """
     from radical.orbit import utils as _orbit_utils
 
@@ -549,17 +551,6 @@ def _credential_env(broker_url):
     token, _ = _orbit_utils.resolve_broker_token()
     if token:
         env['RADICAL_ORBIT_BROKER_TOKEN'] = token
-
-    if broker_url.startswith(('https://', 'wss://')):
-        try:
-            cert_path, _ = _orbit_utils.resolve_broker_cert()
-            pem = Path(cert_path).read_bytes()
-            env['RADICAL_ORBIT_BROKER_CERT_B64'] = \
-                base64.b64encode(pem).decode('ascii')
-        except Exception as e:
-            print(f'  [warn] no broker cert to inject ({e}); the child '
-                  f'endpoint falls back to ~/.radical/orbit/broker_cert.pem '
-                  f'on the target')
 
     return env
 
@@ -626,9 +617,9 @@ def launch_iri(bc, endpoint, cfg, broker_url):
     amsc    = (cfg.get('amsc_dir') or '.amsc').strip('/')
     wrapper = f'{home}/{amsc}/ve/bin/radical-orbit-endpoint-wrapper.sh'
 
-    # Broker URL, current token, and (https) cert all ride the job env —
-    # see _credential_env; ~/.radical/orbit files on the target are only
-    # a fallback and go stale whenever the broker regenerates either.
+    # Broker URL and current token ride the job env (_credential_env).
+    # The TLS cert is staged manually on the target (DEPLOYMENT.md):
+    # ~/.radical/orbit/broker_cert.pem or $RADICAL_ORBIT_BROKER_CERT.
     env = _credential_env(broker_url)
     env.update(cfg['environment'])
     # Site-specific shell snippet — module loads, env exports, etc.
@@ -709,9 +700,9 @@ def launch_psij(bc, endpoint_name, cfg, broker_url):
         custom_attrs[f'{cfg["executor"]}.gpus-per-node'] = str(cfg['gpus_per_node'])
     if cfg.get('qos'):
         custom_attrs[f'{cfg["executor"]}.qos'] = cfg['qos']
-    # Broker URL, current token, and (https) cert all ride the job env —
-    # see _credential_env; ~/.radical/orbit files on the target are only
-    # a fallback and go stale whenever the broker regenerates either.
+    # Broker URL and current token ride the job env (_credential_env).
+    # The TLS cert is staged manually on the target (DEPLOYMENT.md):
+    # ~/.radical/orbit/broker_cert.pem or $RADICAL_ORBIT_BROKER_CERT.
     env = _credential_env(broker_url)
     # Site-specific shell snippet — module loads, env exports, etc.
     # The wrapper ``eval``s this *before* exec-ing dragon / python.

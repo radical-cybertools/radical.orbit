@@ -12,20 +12,11 @@
 export PATH="@BINDIR@:${PATH}"
 export PYTHONPATH="@SITEPKGS@:${PYTHONPATH:-}"
 
-# Broker cert injected via the job environment (base64 — a single
-# token survives unquoted ``export`` lines in API-composed batch
-# scripts).  Materialize it and point the endpoint's cert resolution at
-# it, so the child never depends on a possibly-stale
-# ~/.radical/orbit/broker_cert.pem on this host.  It is public pinning
-# material, so a mktemp file is fine.  An explicitly-set
-# RADICAL_ORBIT_BROKER_CERT wins.
-if [ -n "${RADICAL_ORBIT_BROKER_CERT_B64:-}" ] && \
-   [ -z "${RADICAL_ORBIT_BROKER_CERT:-}" ]; then
-    _orbit_cert="$(mktemp "${TMPDIR:-/tmp}/orbit-broker-cert.XXXXXX")"
-    printf '%s' "$RADICAL_ORBIT_BROKER_CERT_B64" | base64 -d > "$_orbit_cert"
-    export RADICAL_ORBIT_BROKER_CERT="$_orbit_cert"
-    echo "[orbit] broker cert from job env -> $_orbit_cert" >&2
-fi
+# NOTE: the broker TLS cert is staged manually — copy broker_cert.pem
+# from the broker host to ~/.radical/orbit/ on this host (or point
+# $RADICAL_ORBIT_BROKER_CERT at it).  Endpoint startups happen through
+# many channels (IRI, PsiJ, ssh, by hand); one staging procedure for
+# all of them beats per-channel automation.
 
 # Site-specific setup hook.  Evaluated *before* dragon-vs-python is
 # decided so the chosen interpreter inherits any module loads / env
