@@ -960,21 +960,80 @@ async def test_disconnect_sends_terminate_control(make_broker):
         await broker.shutdown()
 
 
-def test_broker_url_announce_has_export_help_and_no_register():
+def test_broker_startup_banner_token_file():
+    from radical.orbit        import utils
     from radical.orbit.broker import Broker
     forms = ['https://host.example.org:8000', 'https://10.0.0.5:8000']
-    lines = Broker._url_announce_lines(forms, 'RADICAL_ORBIT_BROKER_URL')
-    text  = '\n'.join(lines)
+    text  = Broker._startup_banner(forms, str(utils.CERT_FILE), 'file', True)
     # copy-paste help exports the env var with the canonical (first) form
-    assert 'export RADICAL_ORBIT_BROKER_URL=https://host.example.org:8000' in text
+    assert 'export RADICAL_ORBIT_BROKER_URL=https://host.example.org:8000' \
+           in text
     # advertised URLs carry no /register (the endpoint appends it itself)
     assert '/register' not in text
     # every advertised form is printed
     assert 'https://host.example.org:8000' in text
     assert 'https://10.0.0.5:8000'         in text
+    # client gets cert + token, endpoint gets the cert only
+    assert 'On Client:'   in text
+    assert 'On Endpoint:' in text
+    assert '{broker_cert.pem,broker.token}' in text
+    assert 'broker.token' not in text.split('On Endpoint:')[1]
+    # the scp host is the canonical form's hostname
+    assert 'scp host.example.org:' in text
 
 
-def test_broker_url_announce_empty_forms_no_crash():
-    # Guard: an empty url_forms must not IndexError on url_forms[0].
+def test_broker_startup_banner_generated_vs_loaded():
+    from radical.orbit        import utils
     from radical.orbit.broker import Broker
-    assert Broker._url_announce_lines([], 'RADICAL_ORBIT_BROKER_URL') == []
+    forms = ['https://h:8000']
+    gen   = Broker._startup_banner(forms, str(utils.CERT_FILE),
+                                   'generated', True)
+    lod   = Broker._startup_banner(forms, str(utils.CERT_FILE),
+                                   'file', True)
+    assert 'creating' in gen and 'creating' not in lod
+    # both bootstrap blocks are identical — the token is on disk either way
+    assert gen.split('\n\n', 1)[1] == lod.split('\n\n', 1)[1]
+
+
+def test_broker_startup_banner_no_auth():
+    from radical.orbit        import utils
+    from radical.orbit.broker import Broker
+    text = Broker._startup_banner(['https://h:8000'], str(utils.CERT_FILE),
+                                  'disabled', False)
+    assert 'DISABLED' in text
+    # client and endpoint collapse to one cert-only section
+    assert 'On Client and Endpoint:' in text
+    assert 'On Client:'   not in text
+    assert 'broker.token' not in text
+
+
+def test_broker_startup_banner_env_token():
+    # Token from --token / env: nothing on disk to scp — the client block
+    # carries an export placeholder, and no scp line mentions the token.
+    from radical.orbit        import utils
+    from radical.orbit.broker import Broker
+    text = Broker._startup_banner(['https://h:8000'], str(utils.CERT_FILE),
+                                  'env', True)
+    assert 'export RADICAL_ORBIT_BROKER_TOKEN=' in text
+    assert '{broker_cert.pem,broker.token}' not in text
+    assert '$RADICAL_ORBIT_BROKER_TOKEN' in text.split('\n\n')[0]
+
+
+def test_broker_startup_banner_custom_cert_path():
+    # A cert outside ~/.radical/orbit gets an explicit destination so the
+    # connecting host ends up with the default basename it resolves.
+    from radical.orbit.broker import Broker
+    text = Broker._startup_banner(['https://h:8000'], '/etc/pki/my_cert.pem',
+                                  'file', True)
+    assert 'scp h:/etc/pki/my_cert.pem ~/.radical/orbit/broker_cert.pem' \
+           in text
+
+
+def test_broker_startup_banner_empty_forms_no_crash():
+    # Guard: empty url_forms must not IndexError, and there is no URL to
+    # bootstrap against — status lines only.
+    from radical.orbit        import utils
+    from radical.orbit.broker import Broker
+    text = Broker._startup_banner([], str(utils.CERT_FILE), 'file', True)
+    assert 'On Client' not in text
+    assert 'listening' not in text

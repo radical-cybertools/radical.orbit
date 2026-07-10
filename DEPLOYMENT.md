@@ -61,6 +61,12 @@ is `--token` > `$RADICAL_ORBIT_BROKER_TOKEN` >
 
 ### Credential staging to endpoint/client hosts
 
+The broker's startup banner prints ready-to-paste *pull*-style
+one-liners for this section's steps (run on the connecting host,
+fetching from the broker host over ssh) — that is the canonical quick
+path.  The *push*-style commands below are the equivalent from the
+broker host, for when ssh only works in that direction.
+
 The **cert** is staged manually to every host that connects —
 endpoints *pin* it (the system CA store is never consulted).  This is
 the one cert-distribution mechanism for every startup channel (by
