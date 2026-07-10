@@ -59,6 +59,7 @@ only — they are never written to disk on the broker side.
 """
 
 import asyncio
+import base64
 import logging
 import os
 import sys
@@ -529,6 +530,31 @@ def read_token(endpoint):
     return token
 
 
+def _credential_env(broker_url):
+    """Job-env broker URL + token for a child endpoint.
+
+    Injects the broker's *current* token (``token_urlsafe`` — a single
+    word, needs no encoding) so the child does not depend on a
+    possibly-stale ``~/.radical/orbit/broker.token`` on the target; the
+    token rides the same trust boundary as the job spec itself.
+
+    The TLS cert is deliberately NOT injected: it is staged manually to
+    ``~/.radical/orbit/broker_cert.pem`` on every connecting host (see
+    DEPLOYMENT.md) — endpoints start through many channels (IRI, PsiJ,
+    ssh, by hand), and one staging procedure for all of them beats
+    per-channel automation.
+    """
+    from radical.orbit import utils as _orbit_utils
+
+    env = {'RADICAL_ORBIT_BROKER_URL': broker_url}
+
+    token, _ = _orbit_utils.resolve_broker_token()
+    if token:
+        env['RADICAL_ORBIT_BROKER_TOKEN'] = token
+
+    return env
+
+
 def _endpoint_argv(endpoint_name, broker_url, tunnel, login_host):
     """Build the ``radical-orbit-endpoint.py`` argv for a child endpoint.
 
@@ -591,16 +617,19 @@ def launch_iri(bc, endpoint, cfg, broker_url):
     amsc    = (cfg.get('amsc_dir') or '.amsc').strip('/')
     wrapper = f'{home}/{amsc}/ve/bin/radical-orbit-endpoint-wrapper.sh'
 
-    # Cert resolution is delegated to the child endpoint: it falls back to
-    # ``~/.radical/orbit/broker_cert.pem`` (or $RADICAL_ORBIT_BROKER_CERT if
-    # set on the target side).  We only inject the broker URL — that
-    # changes per broker run and the file fallback would be stale.
-    env = {'RADICAL_ORBIT_BROKER_URL': broker_url}
+    # Broker URL and current token ride the job env (_credential_env).
+    # The TLS cert is staged manually on the target (DEPLOYMENT.md):
+    # ~/.radical/orbit/broker_cert.pem or $RADICAL_ORBIT_BROKER_CERT.
+    env = _credential_env(broker_url)
     env.update(cfg['environment'])
     # Site-specific shell snippet — module loads, env exports, etc.
     # The wrapper ``eval``s this *before* exec-ing dragon / python.
+    # Base64-encoded: job APIs may compose the batch script with
+    # unquoted ``export KEY=VALUE`` lines, which truncate multi-word
+    # values at the first space (seen with IRI at NERSC).
     if cfg.get('setup'):
-        env['RADICAL_ORBIT_SETUP'] = '; '.join(cfg['setup'])
+        env['RADICAL_ORBIT_SETUP_B64'] = base64.b64encode(
+            '; '.join(cfg['setup']).encode()).decode('ascii')
 
     job_spec = {
         'executable' : wrapper,
@@ -671,15 +700,18 @@ def launch_psij(bc, endpoint_name, cfg, broker_url):
         custom_attrs[f'{cfg["executor"]}.gpus-per-node'] = str(cfg['gpus_per_node'])
     if cfg.get('qos'):
         custom_attrs[f'{cfg["executor"]}.qos'] = cfg['qos']
-    # Cert is left to the child endpoint to resolve from
-    # ``~/.radical/orbit/broker_cert.pem`` on the target (or via
-    # $RADICAL_ORBIT_BROKER_CERT if explicitly set there).  Only the broker
-    # URL — which changes per broker run — is injected here.
-    env = {'RADICAL_ORBIT_BROKER_URL': broker_url}
+    # Broker URL and current token ride the job env (_credential_env).
+    # The TLS cert is staged manually on the target (DEPLOYMENT.md):
+    # ~/.radical/orbit/broker_cert.pem or $RADICAL_ORBIT_BROKER_CERT.
+    env = _credential_env(broker_url)
     # Site-specific shell snippet — module loads, env exports, etc.
     # The wrapper ``eval``s this *before* exec-ing dragon / python.
+    # Base64-encoded: job APIs may compose the batch script with
+    # unquoted ``export KEY=VALUE`` lines, which truncate multi-word
+    # values at the first space (seen with IRI at NERSC).
     if cfg.get('setup'):
-        env['RADICAL_ORBIT_SETUP'] = '; '.join(cfg['setup'])
+        env['RADICAL_ORBIT_SETUP_B64'] = base64.b64encode(
+            '; '.join(cfg['setup']).encode()).decode('ascii')
 
     job_spec = {
         'executable'        : wrapper,

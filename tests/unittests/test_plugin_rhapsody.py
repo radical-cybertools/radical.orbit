@@ -688,6 +688,43 @@ async def test_function_task_cloudpickle_roundtrip():
     assert "_pickled_fields" not in td
 
 
+def test_serialize_task_pickles_unsafe_metadata():
+    """A callable nested in ``metadata`` (e.g. asyncflow dependency
+    descriptors) must be cloudpickled so the msgpack submit payload stays
+    packable; JSON-safe metadata must pass through untouched."""
+    import base64
+    import cloudpickle
+    import msgpack
+
+    from radical.orbit.plugin_rhapsody import RhapsodyClient
+
+    def dep_fn():
+        return 42
+
+    td = {
+        "uid": "task.md001",
+        "function": dep_fn,
+        "metadata": {"dependencies": [{"args": (), "function": dep_fn}]},
+    }
+    RhapsodyClient._serialize_task(td)
+
+    assert set(td["_pickled_fields"]) == {"function", "metadata"}
+    assert td["metadata"].startswith("cloudpickle::")
+    msgpack.packb({"tasks": [td]}, use_bin_type=True)   # must not raise
+
+    # the endpoint-side decode restores the original structure
+    meta = cloudpickle.loads(
+        base64.b64decode(td["metadata"][len("cloudpickle::"):]))
+    assert meta["dependencies"][0]["function"]() == 42
+
+    # JSON-safe metadata is left alone
+    td2 = {"uid": "task.md002", "executable": "/bin/true",
+           "metadata": {"note": "plain", "n": 3}}
+    RhapsodyClient._serialize_task(td2)
+    assert td2["metadata"] == {"note": "plain", "n": 3}
+    assert "_pickled_fields" not in td2
+
+
 @pytest.mark.asyncio
 async def test_function_task_import_path():
     """Import-path string 'module:func' must be resolved to a callable."""
