@@ -530,13 +530,23 @@ class EndpointRuntime(PluginHostBase):
                     await self._serve_ws(ws)
 
             except ssl.SSLCertVerificationError as e:
-                self._set_fatal(
-                    f"TLS verification failed for {self._broker_url} "
-                    f"(pinned cert: {self._cert}): {e} — the pinned "
-                    f"certificate does not match the broker's; refresh it "
-                    f"from the broker host (~/.radical/orbit/broker_cert.pem "
-                    f"there) or point $RADICAL_ORBIT_BROKER_CERT at the "
-                    f"current one")
+                if self._cert:
+                    reason = (
+                        f"TLS verification failed for {self._broker_url} "
+                        f"(pinned cert: {self._cert}): {e} — the pinned "
+                        f"certificate does not match the broker's; refresh "
+                        f"it from the broker host "
+                        f"(~/.radical/orbit/broker_cert.pem there) or point "
+                        f"$RADICAL_ORBIT_BROKER_CERT at the current one")
+                else:
+                    reason = (
+                        f"TLS verification failed for {self._broker_url} "
+                        f"using the system CA store: {e} — if the broker "
+                        f"uses a self-signed certificate, pin it: copy "
+                        f"broker_cert.pem from the broker host to "
+                        f"~/.radical/orbit/broker_cert.pem or point "
+                        f"$RADICAL_ORBIT_BROKER_CERT at it")
+                self._set_fatal(reason)
                 break
             except (ws_exc.ConnectionClosed, OSError) as e:
                 if self._stopping:
