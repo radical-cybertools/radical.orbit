@@ -18,6 +18,12 @@ IRI_ENDPOINTS = {
         'label': 'OLCF (Frontier/Odo)',
         'auth' : 's3m',
     },
+    'nersc-sfapi': {
+        'url'      : 'https://api.nersc.gov/api/v1.2',
+        'label'    : 'NERSC (SFAPI direct)',
+        'auth'     : 'sfapi',
+        'token_url': 'https://oidc.nersc.gov/c2id/token',
+    },
 }
 
 # Job states from the IRI compute API

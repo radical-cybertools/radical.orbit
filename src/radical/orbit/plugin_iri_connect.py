@@ -56,15 +56,27 @@ class IRIConnectClient(PluginClient):
         self._raise(resp, f'disconnect {name!r}')
         return resp.json()
 
-    def connect(self, endpoint: str, token: str) -> 'IRIInstanceClient':
+    def connect(self, endpoint: str, token: str = None,
+                client_id: str = None,
+                private_key: str = None) -> 'IRIInstanceClient':
         '''Connect to an IRI endpoint and return a client for the instance.
 
-        Idempotent: if the instance is already up, the broker refreshes the
-        token in place and returns ``status='token_updated'``.  Either way
-        we return a fresh client bound to the running instance.
+        Bearer endpoints (NERSC/IRI, OLCF/S3M) take ``token``; the direct
+        SFAPI endpoint takes ``client_id`` + ``private_key`` (PEM text)
+        instead.  Idempotent: if the instance is already up, the broker
+        refreshes the credential in place (``status='token_updated'`` /
+        ``'credentials_updated'``).  Either way we return a fresh client
+        bound to the running instance.
         '''
-        resp = self._http.post(self._url('connect'),
-                               json={'endpoint': endpoint, 'token': token})
+        body: Dict[str, Any] = {'endpoint': endpoint}
+        if token is not None:
+            body['token'] = token
+        if client_id is not None:
+            body['client_id'] = client_id
+        if private_key is not None:
+            body['private_key'] = private_key
+
+        resp = self._http.post(self._url('connect'), json=body)
         self._raise(resp, f'connect {endpoint!r}')
 
         iname     = _instance_key(endpoint)
@@ -150,8 +162,10 @@ class PluginIRIConnect(Plugin):
     async def connect(self, request: Request) -> dict:
         '''Connect to an IRI endpoint.
 
-        Expects JSON body: ``{"endpoint": "nersc", "token": "<bearer>"}``.
-        Creates a dynamic ``iri.<endpoint>`` plugin instance.
+        Bearer endpoints expect ``{"endpoint": ..., "token": "<bearer>"}``;
+        the direct SFAPI endpoint expects
+        ``{"endpoint": "nersc-sfapi", "client_id": ..., "private_key": ...}``.
+        Either way a dynamic ``iri.<endpoint>`` plugin instance is created.
         '''
         try:
             data = await request.json()
@@ -159,7 +173,6 @@ class PluginIRIConnect(Plugin):
             data = {}
 
         endpoint = data.get('endpoint', '')
-        token    = data.get('token', '')
 
         if endpoint not in IRI_ENDPOINTS:
             raise HTTPException(
@@ -167,13 +180,20 @@ class PluginIRIConnect(Plugin):
                 detail=f'Unknown endpoint {endpoint!r}. '
                        f'Valid: {list(IRI_ENDPOINTS.keys())}')
 
-        if not token or not token.strip():
-            raise HTTPException(status_code=400,
-                                detail='token must not be empty')
-
         iname    = _instance_key(endpoint)
         host     = self._host()
         instance = self._instance(host, iname)
+
+        # Direct-SFAPI endpoints authenticate with client id + private key and
+        # take their own connect path; everything else is the bearer path.
+        if IRI_ENDPOINTS[endpoint].get('auth') == 'sfapi':
+            return await self._connect_sfapi(host, endpoint, iname,
+                                             instance, data)
+
+        token = data.get('token', '')
+        if not token or not token.strip():
+            raise HTTPException(status_code=400,
+                                detail='token must not be empty')
 
         # Idempotent reconnect: if the instance is already up, refresh its
         # bearer token in place rather than refusing.  This lets clients
@@ -186,6 +206,73 @@ class PluginIRIConnect(Plugin):
         await host.register_dynamic_plugin(
             PluginIRIInstance, iname,
             endpoint=endpoint, token=token.strip())
+
+        log.info('[iri_connect] Connected %s', iname)
+        return {'instance': iname, 'status': 'connected'}
+
+    async def _connect_sfapi(self, host, endpoint: str, iname: str,
+                             instance, data: Dict[str, Any]) -> dict:
+        '''Connect (or rotate credentials on) a direct-SFAPI endpoint.
+
+        Requires ``client_id`` + ``private_key`` (PEM text).  An access token
+        is minted from the given credentials *before* the instance is
+        registered / rotated, so bad credentials fail fast with 401 and never
+        leave a half-registered instance behind (no deregister path, no
+        register/deregister race with a concurrent reconnect).
+        '''
+        client_id   = data.get('client_id', '')
+        private_key = data.get('private_key', '')
+
+        if not client_id or not client_id.strip():
+            raise HTTPException(status_code=400,
+                                detail='client_id must not be empty')
+        if not private_key or not private_key.strip():
+            raise HTTPException(status_code=400,
+                                detail='private_key must not be empty')
+
+        client_id   = client_id.strip()
+        private_key = private_key.strip()
+
+        try:
+            from .plugin_sfapi_instance import (PluginSFAPIInstance,
+                                                SFAPITokenManager)
+        except ImportError as exc:
+            raise HTTPException(
+                status_code=501,
+                detail="sfapi support requires 'authlib'") from exc
+
+        token_url = IRI_ENDPOINTS[endpoint]['token_url']
+
+        # Mint one token to verify the credentials before touching topology.
+        try:
+            mgr = SFAPITokenManager(client_id, private_key, token_url)
+        except ImportError as exc:
+            raise HTTPException(
+                status_code=501,
+                detail="sfapi support requires 'authlib'") from exc
+
+        try:
+            await mgr.mint()
+        except Exception:
+            await mgr.aclose()
+            raise
+
+        # Idempotent reconnect: verified new credentials — rotate in place.
+        if instance is not None:
+            await mgr.aclose()
+            instance.update_credentials(client_id, private_key)
+            log.info('[iri_connect] Updated credentials for %s', iname)
+            return {'instance': iname, 'status': 'credentials_updated'}
+
+        # Fresh connect: hand the pre-verified token manager to the instance.
+        try:
+            await host.register_dynamic_plugin(
+                PluginSFAPIInstance, iname,
+                endpoint=endpoint, client_id=client_id,
+                private_key=private_key, token_manager=mgr)
+        except Exception:
+            await mgr.aclose()
+            raise
 
         log.info('[iri_connect] Connected %s', iname)
         return {'instance': iname, 'status': 'connected'}
