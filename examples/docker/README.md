@@ -71,10 +71,11 @@ running you can open the API documentation directly in a web browser:
 > used. Click **Advanced → Proceed to localhost** (or equivalent) to continue.
 
 > [!NOTE]
-> The broker generates a random authentication token on startup, which is 
-> required to log into the Explorer UI. You can find this token printed at 
-> the very beginning of the broker's logs by running 
-> `docker compose logs broker | head -n 4`.
+> The broker generates a random authentication token on startup, which is
+> required to log into the Explorer UI. The token value is never written to
+> the logs — read it from the token file inside the broker container:
+> `docker compose exec broker cat ~/.radical/orbit/broker.token`
+> (see `DEPLOYMENT.md` for staging the token to other hosts).
 
 > [!TIP]
 > When registering a new endpoint service through the portal (e.g., via the

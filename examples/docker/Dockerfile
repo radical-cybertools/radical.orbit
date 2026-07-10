@@ -32,6 +32,10 @@ RUN git clone --single-branch -b ${RADICAL_ORBIT_BRANCH} https://github.com/radi
 ENV RADICAL_ORBIT_BROKER_CERT="/app/private/broker_cert.pem"
 ENV RADICAL_ORBIT_BROKER_KEY="/app/private/broker_key.pem"
 
+# WARNING: GENERATE_BROKER_CERT=true bakes the TLS private key AND the
+# ingress token into the image — anyone who can pull the image owns the
+# broker's credentials.  Never push such an image to a registry; it is
+# meant for local `docker compose` builds only.
 ARG GENERATE_BROKER_CERT=false
 ARG BROKER_IP=127.0.0.1
 ARG BROKER_HOSTNAME=localhost

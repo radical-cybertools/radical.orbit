@@ -22,15 +22,9 @@ services:
     <<: *common-image
     container_name: radical-orbit-broker
     hostname: ${RADICAL_ORBIT_BROKER_HOSTNAME:-broker}
-    command:
-      - "bash"
-      - "-c"
-      - |
-        echo "==============================================="
-        echo "ORBIT Broker Token:"
-        echo "    $(cat ~/.radical/orbit/broker.token)"
-        echo "==============================================="
-        exec radical-orbit-broker.py
+    # The token value is never printed to the logs (CWE-532) — retrieve
+    # it with:  docker compose exec broker cat ~/.radical/orbit/broker.token
+    command: [ "radical-orbit-broker.py" ]
     healthcheck:
       test:
         - CMD-SHELL
