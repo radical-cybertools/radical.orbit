@@ -384,15 +384,38 @@ async def test_submit_job_script_never_logged(caplog):
 
 @pytest.mark.asyncio
 async def test_get_job_status_uses_sacct_and_normalizes():
+    # MUST query the LIST route with a jobid filter and cached=false — the
+    # single-job route is cache-backed at NERSC and chronically returns an
+    # empty ``output`` (a poller reading it is blind; live-verified).
     session = _session()
     resp    = _resp(200, {'status': 'ok',
                           'output': [{'jobid': '9', 'state': 'RUNNING'}]})
     with patch.object(session._http, 'request', new_callable=AsyncMock,
                       return_value=resp) as req:
         out = await session.get_job_status('perlmutter', '9')
-    assert req.call_args.kwargs['params'] == {'sacct': 'true'}
+    method, url = req.call_args.args
+    assert url == '/compute/jobs/perlmutter'          # list route, NOT /9
+    assert req.call_args.kwargs['params'] == {
+        'sacct': 'true', 'cached': 'false', 'kwargs': ['jobid=9']}
     assert out['job_id'] == '9'
     assert out['status'] == {'state': 'running'}
+    await session._http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_get_job_status_prefers_parent_row_over_steps():
+    # sacct jobid filters can return step rows (.batch/.extern) alongside
+    # the parent — the parent row's state must win regardless of order
+    session = _session()
+    resp    = _resp(200, {'status': 'ok', 'output': [
+        {'jobid': '9.batch',  'state': 'CANCELLED'},
+        {'jobid': '9.extern', 'state': 'COMPLETED'},
+        {'jobid': '9',        'state': 'CANCELLED by 123'},
+    ]})
+    with patch.object(session._http, 'request', new_callable=AsyncMock,
+                      return_value=resp):
+        out = await session.get_job_status('perlmutter', '9')
+    assert out['status'] == {'state': 'cancelled'}
     await session._http.aclose()
 
 

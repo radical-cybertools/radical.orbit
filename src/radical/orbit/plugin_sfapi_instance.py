@@ -140,17 +140,36 @@ def _job_state(fields: Any) -> str:
     return parts[0].lower() if parts else ''
 
 
-def _job_fields(payload: Any) -> Dict[str, Any]:
+def _sacct_query(job_id: str) -> Dict[str, Any]:
+    '''Query params for a single-job sacct lookup on the LIST route.
+
+    The obvious single-job route (``GET /compute/jobs/{machine}/{jobid}``)
+    is cache-backed on NERSC's deployment and chronically returns an empty
+    ``output`` — a poller reading it is blind forever (live-verified
+    2026-07-11).  NERSC's own ``sfapi_client`` instead queries the *list*
+    route with a jobid filter and ``cached=false``; mirror that.
+    '''
+    return {'sacct': 'true', 'cached': 'false', 'kwargs': [f'jobid={job_id}']}
+
+
+def _job_fields(payload: Any, job_id: str = '') -> Dict[str, Any]:
     '''Extract the per-job field dict from an SFAPI status/list payload.
 
     A status reply is ``{status, output: [ {..fields..} ], error}``; a list
-    entry is a bare field dict.  Empty ``output`` (job not yet in sacct)
+    entry is a bare field dict.  With *job_id* given, the row whose
+    ``jobid`` matches is preferred (sacct may also return ``.batch`` /
+    ``.extern`` step rows).  Empty ``output`` (job not yet in sacct)
     yields ``{}``.
     '''
     if not isinstance(payload, dict):
         return {}
     output = payload.get('output')
     if isinstance(output, list):
+        if job_id:
+            for row in output:
+                if isinstance(row, dict) \
+                        and str(row.get('jobid', '')) == str(job_id):
+                    return row
         if output and isinstance(output[0], dict):
             return output[0]
         return {}
@@ -169,7 +188,7 @@ def _normalize_job(payload: Any, job_id: str = '') -> Dict[str, Any]:
         return {'job_id': job_id, 'status': {'state': ''}, 'raw': payload}
 
     result = dict(payload)
-    fields = _job_fields(payload)
+    fields = _job_fields(payload, job_id)
     jid    = job_id or fields.get('jobid') or fields.get('job_id') \
                     or result.get('jobid') or ''
     result['job_id'] = str(jid) if jid else job_id
@@ -523,8 +542,8 @@ class SFAPIInstanceSession(PluginSession):
         self._check_active()
         try:
             resp = await self._request(
-                'GET', f'/compute/jobs/{resource_id}/{job_id}',
-                params={'sacct': 'true'})
+                'GET', f'/compute/jobs/{resource_id}',
+                params=_sacct_query(job_id))
         except httpx.RequestError as exc:
             raise HTTPException(status_code=502,
                                 detail=f'SFAPI get_job_status: {exc}') from exc
@@ -534,7 +553,8 @@ class SFAPIInstanceSession(PluginSession):
     async def list_jobs(self, resource_id: str) -> Dict[str, Any]:
         self._check_active()
         try:
-            resp = await self._request('GET', f'/compute/jobs/{resource_id}')
+            resp = await self._request('GET', f'/compute/jobs/{resource_id}',
+                                       params={'cached': 'false'})
         except httpx.RequestError as exc:
             raise HTTPException(status_code=502,
                                 detail=f'SFAPI list_jobs: {exc}') from exc
@@ -667,19 +687,22 @@ class SFAPIInstanceSession(PluginSession):
                                 meta: Dict[str, Any]) -> Optional[Any]:
         '''Poll one job (sacct-backed); return the job fields on a state change.
 
-        Polling MUST use ``?sacct=true`` — the squeue-backed default makes a
-        finished job *disappear* instead of reporting its terminal state.
-        Empty ``output`` (job not yet in sacct right after submit) means "no
-        change".
+        Polling MUST use ``sacct`` — the squeue-backed default makes a
+        finished job *disappear* instead of reporting its terminal state —
+        and MUST go through the LIST route with a jobid filter and
+        ``cached=false`` (see :func:`_sacct_query`): the single-job route
+        chronically returns empty ``output``, which this poller would
+        misread as "no change" forever.  A genuinely empty ``output`` (job
+        not yet in sacct right after submit) still means "no change".
         '''
         resource_id = meta['resource_id']
         resp = await self._request(
-            'GET', f'/compute/jobs/{resource_id}/{job_id}',
-            params={'sacct': 'true'})
+            'GET', f'/compute/jobs/{resource_id}',
+            params=_sacct_query(job_id))
         if not resp.is_success:
             return None
 
-        fields = _job_fields(resp.json())
+        fields = _job_fields(resp.json(), job_id)
         if not fields:
             return None
 
