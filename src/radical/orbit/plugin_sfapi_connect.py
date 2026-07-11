@@ -215,6 +215,8 @@ class PluginSFAPIConnect(Plugin):
             data = await request.json()
         except Exception:
             data = {}
+        if not isinstance(data, dict):
+            data = {}
 
         endpoint = data.get('endpoint', '')
 

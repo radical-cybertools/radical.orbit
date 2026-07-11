@@ -435,7 +435,12 @@ class SFAPIInstanceSession(PluginSession):
 
         _sfapi_raise(resp, 'submit_job')
 
-        task          = resp.json()
+        task = resp.json()
+        if not isinstance(task, dict):
+            raise HTTPException(
+                status_code=502,
+                detail='SFAPI submit_job: unexpected non-object reply '
+                       'from the task endpoint')
         task_id       = str(task.get('id') or task.get('task_id') or '')
         outcome, task = await self._poll_task(resource_id, task_id, task)
 
@@ -567,9 +572,13 @@ class SFAPIInstanceSession(PluginSession):
             raise HTTPException(status_code=502,
                                 detail=f'SFAPI list_resources: {exc}') from exc
         _sfapi_raise(resp, 'list_resources')
-        data      = resp.json()
-        resources = data if isinstance(data, list) \
-                         else data.get('resources', data.get('systems', []))
+        data = resp.json()
+        if   isinstance(data, list):
+            resources = data
+        elif isinstance(data, dict):
+            resources = data.get('resources', data.get('systems', []))
+        else:
+            resources = []
         for r in resources:
             if isinstance(r, dict) and 'current_status' not in r:
                 r['current_status'] = r.get('status', '')
@@ -596,9 +605,13 @@ class SFAPIInstanceSession(PluginSession):
             raise HTTPException(status_code=502,
                                 detail=f'SFAPI list_incidents: {exc}') from exc
         _sfapi_raise(resp, 'list_incidents')
-        data      = resp.json()
-        incidents = data if isinstance(data, list) \
-                         else data.get('outages', data.get('incidents', data))
+        data = resp.json()
+        if   isinstance(data, list):
+            incidents = data
+        elif isinstance(data, dict):
+            incidents = data.get('outages', data.get('incidents', data))
+        else:
+            incidents = []
         return {'incidents': incidents}
 
     async def list_projects(self) -> Dict[str, Any]:
@@ -609,9 +622,13 @@ class SFAPIInstanceSession(PluginSession):
             raise HTTPException(status_code=502,
                                 detail=f'SFAPI list_projects: {exc}') from exc
         _sfapi_raise(resp, 'list_projects')
-        data     = resp.json()
-        projects = data if isinstance(data, list) \
-                        else data.get('projects', data)
+        data = resp.json()
+        if   isinstance(data, list):
+            projects = data
+        elif isinstance(data, dict):
+            projects = data.get('projects', data)
+        else:
+            projects = []
         return {'projects': projects}
 
     async def list_allocations(self, project_id: str) -> Dict[str, Any]:

@@ -282,6 +282,34 @@ async def test_submit_job_task_failed_raises_502_with_result():
 
 
 @pytest.mark.asyncio
+async def test_submit_job_non_object_reply_raises_502():
+    # a successful submit reply that is not a JSON object must map to a
+    # clean 502, not an AttributeError inside the handler
+    session = _session()
+    submit  = _resp(200, ['not', 'an', 'object'])
+    with patch.object(session._http, 'request', new_callable=AsyncMock,
+                      return_value=submit):
+        with pytest.raises(HTTPException) as ei:
+            await session.submit_job('perlmutter', {'executable': '/bin/true'})
+    assert ei.value.status_code == 502
+    assert 'non-object' in ei.value.detail
+    await session._http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_list_replies_tolerate_non_container_json():
+    # scalar JSON bodies (string / number) must yield empty lists, not raise
+    session = _session()
+    scalar  = _resp(200, 'maintenance')
+    with patch.object(session._http, 'request', new_callable=AsyncMock,
+                      return_value=scalar):
+        assert (await session.list_resources())['resources'] == []
+        assert (await session.list_incidents())['incidents'] == []
+        assert (await session.list_projects())['projects']   == []
+    await session._http.aclose()
+
+
+@pytest.mark.asyncio
 async def test_submit_job_completed_without_jobid_raises_502():
     session = _session()
     submit  = _resp(200, {'id': 'task-4', 'status': 'completed',
