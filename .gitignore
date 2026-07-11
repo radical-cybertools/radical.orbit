@@ -50,6 +50,6 @@ ve3b/
 *.pem
 69e13a9.patch
 
-# example-script credentials (examples/sfapi_test.py, examples/iri_test.py)
+# example-script credentials (examples/test_sfapi.py, examples/test_iri.py)
 examples/sfapi.id
 examples/token_*

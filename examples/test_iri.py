@@ -9,7 +9,7 @@ endpoint to register → ROSE loop of pure-stdlib function tasks → teardown.
 
 Usage::
 
-    python examples/iri_test.py [<max_iter>]
+    python examples/test_iri.py [<max_iter>]
 
 Prerequisites (see DEPLOYMENT.md):
 

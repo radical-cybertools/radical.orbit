@@ -11,7 +11,7 @@ tasks → teardown.
 
 Usage::
 
-    python examples/sfapi_test.py [<max_iter>]
+    python examples/test_sfapi.py [<max_iter>]
 
 Prerequisites (see DEPLOYMENT.md):
 
@@ -21,9 +21,28 @@ Prerequisites (see DEPLOYMENT.md):
 - The orbit ve exists on Perlmutter at ``ORBIT_VE`` below (with rhapsody
   and dragon; the test tasks need only the python stdlib).
 - SFAPI credentials sit next to this script: ``sfapi.id`` (OAuth2 client
-  id) and ``sfapi.pem`` (RSA private key).  Created at iris.nersc.gov;
-  they are read locally, sent to the broker once at ``connect()`` time,
-  and held there in process memory only.
+  id) and ``sfapi.pem`` (RSA private key).  They are read locally, sent
+  to the broker once at ``connect()`` time, and held there in process
+  memory only.  Both files are git-ignored.
+
+Getting the SFAPI credentials
+-----------------------------
+Create an SFAPI client at https://iris.nersc.gov — Profile →
+"Superfacility API Clients" → "+ New Client":
+
+- **IP ranges are fixed at creation** (to change them, delete the client
+  and create a new one).  Each range must be /24 or narrower.  Add the
+  public IP of the host the ORBIT *broker* runs on (the ``sfapi_connect``
+  plugin makes the API calls from there), e.g. ``203.0.113.7/32``, plus a
+  /32 for any host you use for direct testing.  How many ranges you may
+  add depends on the client's security level.
+- The **security level** sets the client lifetime: red 2 days (extendable
+  to 30 after review), orange 30, green 60.  An expired client surfaces
+  as 401s at ``connect()`` time — check the expiry date in iris first
+  when authentication suddenly fails.
+- On creation you are shown the **client id** and the **RSA private key
+  exactly once** — copy them immediately into ``sfapi.id`` and
+  ``sfapi.pem`` next to this script, and ``chmod 600`` both.
 
 Edit the configuration block below to match your account / paths.
 '''
