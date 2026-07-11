@@ -60,7 +60,7 @@ def _mock_tokens():
     return tokens
 
 
-def _session(endpoint='nersc-sfapi'):
+def _session(endpoint='nersc'):
     return SFAPIInstanceSession('s1', endpoint=endpoint, tokens=_mock_tokens())
 
 
@@ -526,10 +526,10 @@ async def test_token_manager_missing_authlib_raises_importerror():
 # ---------------------------------------------------------------------------
 
 def test_plugin_init_ok(broker_app, rsa_pem):
-    plugin = PluginSFAPIInstance(broker_app, 'iri.nersc-sfapi',
-                                 endpoint='nersc-sfapi',
+    plugin = PluginSFAPIInstance(broker_app, 'sfapi.nersc',
+                                 endpoint='nersc',
                                  client_id='cid', private_key=rsa_pem)
-    assert plugin._endpoint_key == 'nersc-sfapi'
+    assert plugin._endpoint_key == 'nersc'
     assert plugin._auto_sid in plugin._sessions
     assert plugin.session_ttl == 0
     assert 'SFAPI' in plugin.ui_config['title']
@@ -543,8 +543,8 @@ def test_plugin_bad_pem_raises_before_routes(broker_app):
     before = len(broker_app.state.direct_routes) \
              if hasattr(broker_app.state, 'direct_routes') else 0
     with pytest.raises(HTTPException) as ei:
-        PluginSFAPIInstance(broker_app, 'iri.nersc-sfapi',
-                            endpoint='nersc-sfapi',
+        PluginSFAPIInstance(broker_app, 'sfapi.nersc',
+                            endpoint='nersc',
                             client_id='cid', private_key='not-a-pem')
     assert ei.value.status_code == 400
     after = len(broker_app.state.direct_routes) \
@@ -554,24 +554,24 @@ def test_plugin_bad_pem_raises_before_routes(broker_app):
 
 def test_plugin_missing_client_id_raises(broker_app, rsa_pem):
     with pytest.raises(HTTPException) as ei:
-        PluginSFAPIInstance(broker_app, 'iri.nersc-sfapi',
-                            endpoint='nersc-sfapi',
+        PluginSFAPIInstance(broker_app, 'sfapi.nersc',
+                            endpoint='nersc',
                             client_id='', private_key=rsa_pem)
     assert ei.value.status_code == 400
 
 
-def test_plugin_non_sfapi_endpoint_rejected(broker_app, rsa_pem):
+def test_plugin_unknown_endpoint_rejected(broker_app, rsa_pem):
     with pytest.raises(HTTPException) as ei:
-        PluginSFAPIInstance(broker_app, 'iri.nersc',
-                            endpoint='nersc',
+        PluginSFAPIInstance(broker_app, 'sfapi.bogus',
+                            endpoint='bogus',
                             client_id='cid', private_key=rsa_pem)
     assert ei.value.status_code == 400
 
 
 @pytest.mark.asyncio
 async def test_plugin_update_credentials(broker_app, rsa_pem):
-    plugin = PluginSFAPIInstance(broker_app, 'iri.nersc-sfapi',
-                                 endpoint='nersc-sfapi',
+    plugin = PluginSFAPIInstance(broker_app, 'sfapi.nersc',
+                                 endpoint='nersc',
                                  client_id='cid', private_key=rsa_pem)
     sess = plugin._sessions[plugin._auto_sid]
     sess._tokens = MagicMock()
@@ -583,8 +583,8 @@ async def test_plugin_update_credentials(broker_app, rsa_pem):
 
 @pytest.mark.asyncio
 async def test_plugin_register_session_returns_auto_sid(broker_app, rsa_pem):
-    plugin = PluginSFAPIInstance(broker_app, 'iri.nersc-sfapi',
-                                 endpoint='nersc-sfapi',
+    plugin = PluginSFAPIInstance(broker_app, 'sfapi.nersc',
+                                 endpoint='nersc',
                                  client_id='cid', private_key=rsa_pem)
     result = await plugin.register_session(MagicMock())
     assert result['sid'] == plugin._auto_sid

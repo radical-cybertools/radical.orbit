@@ -121,6 +121,12 @@ def configure_logging(level: int = logging.INFO,
     # the radical.orbit channel above is now immune.
     logging.basicConfig(force=True, level=level, handlers=list(handlers))
 
+    # Silence per-request HTTP client noise: httpx/httpcore log every
+    # outbound request at INFO (the SFAPI token + poll loops drowned the
+    # broker log in "HTTP Request: GET ..." lines).  Pin them to WARNING.
+    for noisy in ('httpx', 'httpcore'):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
 
 # Auto-configure on import.  Honor ``RADICAL_ORBIT_LOG_LVL`` (falling
 # back to the generic ``RADICAL_LOG_LVL``) so that client scripts

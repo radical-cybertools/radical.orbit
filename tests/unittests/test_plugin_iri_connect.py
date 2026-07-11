@@ -4,13 +4,12 @@
 
 import pytest
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 
-from radical.orbit                     import plugin_sfapi_instance as psf
-from radical.orbit.plugin_base         import Plugin
-from radical.orbit.plugin_iri_connect  import PluginIRIConnect
+from radical.orbit.plugin_base        import Plugin
+from radical.orbit.plugin_iri_connect import PluginIRIConnect
 
 
 # ---------------------------------------------------------------------------
@@ -85,9 +84,7 @@ async def test_list_endpoints(broker_app):
     result = await plugin.list_endpoints(request)
     assert 'nersc' in result
     assert 'olcf'  in result
-    assert 'nersc-sfapi' in result
-    assert result['nersc']['connected']        is False
-    assert result['nersc-sfapi']['auth']       == 'sfapi'
+    assert result['nersc']['connected'] is False
 
 
 # ---------------------------------------------------------------------------
@@ -223,128 +220,3 @@ async def test_register_session_dummy(broker_app):
     request = MagicMock()
     result = await plugin.register_session(request)
     assert 'sid' in result
-
-
-# ---------------------------------------------------------------------------
-# SFAPI connect dispatch (auth == 'sfapi')
-# ---------------------------------------------------------------------------
-
-def _mock_token_manager():
-    '''Patch SFAPITokenManager with a stub whose mint() succeeds.'''
-    mgr = MagicMock()
-    mgr.mint   = AsyncMock(return_value='tok')
-    mgr.aclose = AsyncMock()
-    return mgr
-
-
-@pytest.mark.asyncio
-async def test_connect_sfapi_missing_credentials(broker_app):
-    app, _ = broker_app
-    plugin = PluginIRIConnect(app)
-
-    request = MagicMock()
-    request.json = AsyncMock(return_value={'endpoint': 'nersc-sfapi'})
-    with pytest.raises(HTTPException) as ei:
-        await plugin.connect(request)
-    assert ei.value.status_code == 400
-    assert 'client_id' in ei.value.detail
-
-
-@pytest.mark.asyncio
-async def test_connect_sfapi_success_registers_instance(broker_app):
-    app, host = broker_app
-    plugin = PluginIRIConnect(app)
-
-    mgr = _mock_token_manager()
-    request = MagicMock()
-    request.json = AsyncMock(return_value={
-        'endpoint': 'nersc-sfapi', 'client_id': 'cid',
-        'private_key': 'PEM'})
-
-    with patch.object(psf, 'SFAPITokenManager', return_value=mgr):
-        result = await plugin.connect(request)
-
-    assert result['status']   == 'connected'
-    assert result['instance'] == 'iri.nersc-sfapi'
-    assert 'iri.nersc-sfapi' in host._plugins
-    mgr.mint.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_connect_sfapi_eager_mint_failure_not_registered(broker_app):
-    app, host = broker_app
-    plugin = PluginIRIConnect(app)
-
-    mgr = MagicMock()
-    mgr.mint   = AsyncMock(side_effect=HTTPException(status_code=401,
-                                                     detail='bad creds'))
-    mgr.aclose = AsyncMock()
-    request = MagicMock()
-    request.json = AsyncMock(return_value={
-        'endpoint': 'nersc-sfapi', 'client_id': 'cid',
-        'private_key': 'PEM'})
-
-    with patch.object(psf, 'SFAPITokenManager', return_value=mgr):
-        with pytest.raises(HTTPException) as ei:
-            await plugin.connect(request)
-
-    assert ei.value.status_code == 401
-    # mint-before-register: nothing was registered, nothing to deregister
-    assert 'iri.nersc-sfapi' not in host._plugins
-    mgr.aclose.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_connect_sfapi_reconnect_rotates_credentials(broker_app):
-    app, host = broker_app
-    plugin = PluginIRIConnect(app)
-
-    request = MagicMock()
-    request.json = AsyncMock(return_value={
-        'endpoint': 'nersc-sfapi', 'client_id': 'cid',
-        'private_key': 'PEM'})
-    with patch.object(psf, 'SFAPITokenManager',
-                      return_value=_mock_token_manager()):
-        await plugin.connect(request)
-
-    # second connect with new creds -> credentials_updated
-    request.json = AsyncMock(return_value={
-        'endpoint': 'nersc-sfapi', 'client_id': 'cid2',
-        'private_key': 'PEM2'})
-    with patch.object(psf, 'SFAPITokenManager',
-                      return_value=_mock_token_manager()):
-        result = await plugin.connect(request)
-
-    assert result['status'] == 'credentials_updated'
-    host._plugins['iri.nersc-sfapi'].update_credentials \
-        .assert_called_once_with('cid2', 'PEM2')
-
-
-@pytest.mark.asyncio
-async def test_connect_sfapi_importerror_maps_to_501(broker_app):
-    app, _ = broker_app
-    plugin = PluginIRIConnect(app)
-
-    request = MagicMock()
-    request.json = AsyncMock(return_value={
-        'endpoint': 'nersc-sfapi', 'client_id': 'cid',
-        'private_key': 'PEM'})
-
-    # _HAVE_AUTHLIB False -> real SFAPITokenManager ctor raises ImportError
-    with patch.object(psf, '_HAVE_AUTHLIB', False):
-        with pytest.raises(HTTPException) as ei:
-            await plugin.connect(request)
-    assert ei.value.status_code == 501
-
-
-@pytest.mark.asyncio
-async def test_connect_bearer_endpoints_unaffected(broker_app):
-    '''globus / s3m endpoints still take the bearer path unchanged.'''
-    app, host = broker_app
-    plugin = PluginIRIConnect(app)
-
-    request = MagicMock()
-    request.json = AsyncMock(return_value={'endpoint': 'olcf', 'token': 't'})
-    result = await plugin.connect(request)
-    assert result['status'] == 'connected'
-    assert 'iri.olcf' in host._plugins

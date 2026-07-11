@@ -140,12 +140,6 @@ async function renderTable(page, api) {
     if (connected) {
       actionHtml = `<button class="btn btn-secondary btn-sm iri-disconnect-btn"
                       data-ep="${escHtml(key)}">Disconnect</button>`;
-    } else if (ep.auth === 'sfapi') {
-      // SFAPI uses a client id + private key, not a paste-able bearer token —
-      // suppress the token-paste connect affordance; connect programmatically.
-      actionHtml = `<span class="iri-connect-status-off"
-                      title="Connect programmatically with client_id + private key"
-                      >client credential</span>`;
     } else {
       actionHtml = `<button class="btn btn-primary btn-sm iri-do-connect-btn"
                       data-ep="${escHtml(key)}">${hasToken ? '🔑 Connect' : 'Connect'}</button>`;

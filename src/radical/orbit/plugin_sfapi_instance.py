@@ -1,8 +1,8 @@
 '''
 SFAPI Instance Plugin — per-endpoint direct-SFAPI integration for NERSC.
 
-Dynamically registered by ``PluginIRIConnect`` via
-``register_dynamic_plugin(PluginSFAPIInstance, 'iri.nersc-sfapi', ...)``.
+Dynamically registered by ``PluginSFAPIConnect`` via
+``register_dynamic_plugin(PluginSFAPIInstance, 'sfapi.nersc', ...)``.
 It is the direct-SFAPI sibling of ``PluginIRIInstance``: same route surface
 and Explorer page, but it launches jobs through NERSC's Superfacility API
 (``api.nersc.gov``) instead of the IRI facility API.
@@ -10,7 +10,7 @@ and Explorer page, but it launches jobs through NERSC's Superfacility API
 Credential lifecycle
 --------------------
 The OAuth2 client id and RSA private key (PEM) are passed at construction
-time by ``iri_connect`` and live in broker process memory only (inside the
+time by ``sfapi_connect`` and live in broker process memory only (inside the
 :class:`SFAPITokenManager`).  They are **never** written to disk.  Short-lived
 access tokens are minted / refreshed via ``authlib`` (client-credentials with
 ``private_key_jwt``) and also stay in memory only.
@@ -19,7 +19,7 @@ Design notes
 ------------
 * **No ``plugin_name`` class attribute** — the class is not auto-registered
   in the global ``Plugin._registry``.  Instances are created exclusively by
-  ``PluginIRIConnect``.
+  ``PluginSFAPIConnect``.
 * A single pre-created session is stored under a fixed SID; ``register_session``
   always returns it (routes omit ``{sid}``), so the Explorer's
   ``api.getSession()`` flow works unchanged.
@@ -46,14 +46,14 @@ from cryptography.hazmat.primitives.serialization import load_pem_private_key
 from .http_utils          import make_async_http_client
 from .plugin_session_base import PluginSession
 from .plugin_base         import Plugin
-from .iri_endpoints       import IRI_ENDPOINTS
+from .sfapi_endpoints     import SFAPI_ENDPOINTS
 from .plugin_iri_instance import IRIInstanceClient, _iri_extract_message
 
 log = logging.getLogger('radical.orbit')
 
 # authlib is an optional-but-guarded dependency (house pattern: it lives in
 # requirements.txt unconditionally, the import is ImportError-tolerant here,
-# and iri_connect maps a missing dependency to HTTP 501).
+# and sfapi_connect maps a missing dependency to HTTP 501).
 try:
     from authlib.integrations.httpx_client import AsyncOAuth2Client
     from authlib.oauth2.rfc7523            import PrivateKeyJWT
@@ -389,7 +389,7 @@ class SFAPIInstanceSession(PluginSession):
         super().__init__(sid)
 
         self._endpoint_key = endpoint
-        self._endpoint     = IRI_ENDPOINTS[endpoint]
+        self._endpoint     = SFAPI_ENDPOINTS[endpoint]
         self._tokens       = tokens
 
         self._http = make_async_http_client(
@@ -689,7 +689,7 @@ class SFAPIInstanceSession(PluginSession):
 # ---------------------------------------------------------------------------
 
 class PluginSFAPIInstance(Plugin):
-    '''Per-endpoint direct-SFAPI plugin, dynamically registered by iri_connect.
+    '''Per-endpoint direct-SFAPI plugin, dynamically registered by sfapi_connect.
 
     Shares the Explorer page and route surface with ``PluginIRIInstance`` and
     reuses ``IRIInstanceClient`` on the client side.
@@ -698,7 +698,7 @@ class PluginSFAPIInstance(Plugin):
     session_class = SFAPIInstanceSession
     client_class  = IRIInstanceClient
     version       = '0.0.1'
-    session_ttl   = 0  # no expiry — plugin lifecycle managed by iri_connect
+    session_ttl   = 0  # no expiry — plugin lifecycle managed by sfapi_connect
     ui_module     = os.path.join(os.path.dirname(__file__),
                                  'data', 'plugins', 'iri_instance.js')
 
@@ -710,16 +710,12 @@ class PluginSFAPIInstance(Plugin):
         # Validate everything (incl. parsing the PEM) BEFORE super().__init__()
         # so a failed construction leaves no orphaned routes in the shared
         # direct-routes table.
-        if endpoint not in IRI_ENDPOINTS:
+        if endpoint not in SFAPI_ENDPOINTS:
             raise HTTPException(
                 status_code=400,
                 detail=f'Unknown endpoint {endpoint!r}. '
-                       f'Valid: {list(IRI_ENDPOINTS.keys())}')
-        entry = IRI_ENDPOINTS[endpoint]
-        if entry.get('auth') != 'sfapi':
-            raise HTTPException(
-                status_code=400,
-                detail=f'endpoint {endpoint!r} is not an sfapi endpoint')
+                       f'Valid: {list(SFAPI_ENDPOINTS.keys())}')
+        entry = SFAPI_ENDPOINTS[endpoint]
         if not client_id or not client_id.strip():
             raise HTTPException(status_code=400,
                                 detail='client_id must not be empty')
@@ -770,7 +766,7 @@ class PluginSFAPIInstance(Plugin):
     def update_credentials(self, client_id: str, private_key: str) -> None:
         '''Swap the SFAPI credentials on the live session's token manager.
 
-        Called by ``iri_connect.connect`` on a re-connect for an already
+        Called by ``sfapi_connect.connect`` on a re-connect for an already
         registered instance (after the new credentials have been verified).
         '''
         self._client_id = client_id.strip()
