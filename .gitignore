@@ -49,3 +49,7 @@ ve3b/
 *.pkl
 *.pem
 69e13a9.patch
+
+# example-script credentials (examples/sfapi_test.py, examples/iri_test.py)
+examples/sfapi.id
+examples/token_*
