@@ -87,4 +87,4 @@ For more control over the build process (e.g., specifying a different branch or 
 - `-p <platform>`: The target build platform, e.g., `linux/amd64` or `linux/arm64` (default: `linux/amd64`).
 - `-c`: Build without cache (`--no-cache`).
 
-The script also passes broker configuration arguments (`GENERATE_BROKER_CERT`, `BROKER_IP`, `BROKER_HOSTNAME`) to the Docker build process.
+The script also passes broker configuration arguments (`BROKER_IP`, `BROKER_HOSTNAME`) to the Docker build process.

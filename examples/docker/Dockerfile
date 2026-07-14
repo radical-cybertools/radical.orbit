@@ -41,8 +41,7 @@ RUN mkdir -p ${HOME}/.radical/orbit && \
       echo "RADICAL_ORBIT_BROKER_KEY=${RADICAL_ORBIT_BROKER_KEY}"; \
     } > "${HOME}/.radical/orbit/init.env"
 
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["bash"]
