@@ -180,6 +180,72 @@ The wrapper script (`radical-orbit-endpoint-wrapper.sh`) sets up `PYTHONPATH` an
 Plan for endpoint restarts by wrapping your client loop with a reconnection
 strategy.
 
+## SFAPI (NERSC) launch path
+
+NERSC's IRI facility API is currently broken server-side for the `/compute/*`
+routes, so ORBIT reaches Perlmutter through NERSC's **Superfacility API
+(SFAPI)** directly. This is the `sfapi_connect` broker plugin (a standalone
+sibling of `iri_connect`); on `connect` it registers a dynamic
+`sfapi.<endpoint>` instance that submits and polls jobs via `api.nersc.gov`.
+
+### Creating the SFAPI client
+
+Create a client at <https://iris.nersc.gov> (Profile → *Superfacility API
+Clients*):
+
+- **IP ranges are fixed at client creation** and cannot be edited afterwards —
+  to change them you delete and recreate the client. Each range is **/24 max
+  width**. When the credential is held by the broker-side plugin, use the
+  **"Spin" preset** (NERSC's Spin/Rancher egress ranges the broker runs behind);
+  add a **`/32`** for any individual host you also use for direct testing.
+- **Clients expire by security level**: the higher the privilege, the shorter
+  the lifetime — **2 / 30 / 60 days**. The `red`/high level needed to submit
+  jobs is the short-lived one. **Expiry manifests as authentication failures**
+  (the connect call or a later poll returns `401`), not as an explicit
+  "expired" signal — if a previously-working endpoint suddenly 401s, check the
+  client's expiry date at iris.nersc.gov first.
+
+The client yields an **OAuth2 client id** and an **RSA private key (PEM)**.
+
+### Credential handling
+
+The client id and PEM are passed to the broker **at connect time**
+(`sfapi_connect.connect(endpoint='nersc', client_id=…, private_key=…)`) and
+held in **broker process memory only** — inside the `SFAPITokenManager`, which
+mints/refreshes short-lived access tokens via `authlib`
+(client-credentials + `private_key_jwt`). **Nothing is written to disk.** The
+plugin verifies the credentials by minting one token *before* registering the
+instance, so bad/expired credentials fail fast with `401` and leave no
+half-registered instance behind. A reconnect with fresh credentials rotates
+them in place. Because a private key must never be pasted into a browser, the
+Explorer page for this plugin is read-only (status + disconnect only) — connect
+programmatically through the client API.
+
+### Deterministic job environment
+
+SFAPI-submitted jobs otherwise inherit the submitter's full server-side-captured
+login environment (~300 vars), which silently wedges dragon's backend bring-up
+after `BEIsUp`. The launch contract is therefore deterministic by construction:
+
+- The sbatch renderer emits **`#SBATCH --export=NONE`** — the job starts from a
+  clean environment. Everything the endpoint needs travels as explicit
+  `export KEY=VALUE` lines in the script body.
+- The **endpoint wrapper** (`radical-orbit-endpoint-wrapper.sh`) owns the rest:
+  it prepends the venv's `@BINDIR@` to **`PATH`** (dragon resolves its
+  WLM helpers — `dragon-network-config-launch-helper`, `dragon-backend` — BY
+  NAME via `srun`, so they must be findable) and, under Slurm, forces
+  **`SLURM_EXPORT_ENV=ALL`** so that `--export=NONE` does not scrub the env from
+  the inner job steps.
+
+### Dragon-logging deadlock caveat
+
+Do **not** enable dragon's channel-based logging
+(`ARGS="-l dragon_file=DEBUG -l stderr=DEBUG"` in the wrapper) on a path you
+expect to succeed. Verified live on Perlmutter: dragon 0.14 routes those logs
+through its own communication channels, which can **deadlock backend bring-up
+right after `BEIsUp`/`FENodeIdxBE`** — the endpoint never comes up. Use it only
+for post-mortem debugging of an already-broken startup.
+
 ## Health Checks
 
 Every plugin exposes a health endpoint at `GET /{plugin}/health`:

@@ -82,8 +82,14 @@ else
     USE_DRAGON=yes
 fi
 
-# Uncomment to write a dragon.log next to the wrapper's CWD (WARNING level).
-# ARGS="-l dragon_file=WARNING"
+# WARNING: do NOT enable dragon's channel-based logging in production.
+# Passing e.g. ARGS="-l dragon_file=DEBUG -l stderr=DEBUG" routes dragon's
+# logs through its own communication channels, which — verified live on
+# Perlmutter with dragon 0.14 — can DEADLOCK backend bring-up right after
+# BEIsUp/FENodeIdxBE, so the endpoint never comes up at all.  Use this ONLY
+# for post-mortem debugging of an already-broken startup, never on a path you
+# expect to succeed.
+# ARGS="-l dragon_file=DEBUG -l stderr=DEBUG"
 
 if [ "$USE_DRAGON" = "yes" ]; then
     echo "[orbit] starting with dragon ($DRAGON_PATH)" >&2

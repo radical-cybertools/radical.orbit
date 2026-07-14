@@ -60,7 +60,7 @@ def _mock_tokens():
     return tokens
 
 
-def _session(endpoint='nersc-sfapi'):
+def _session(endpoint='nersc'):
     return SFAPIInstanceSession('s1', endpoint=endpoint, tokens=_mock_tokens())
 
 
@@ -282,6 +282,34 @@ async def test_submit_job_task_failed_raises_502_with_result():
 
 
 @pytest.mark.asyncio
+async def test_submit_job_non_object_reply_raises_502():
+    # a successful submit reply that is not a JSON object must map to a
+    # clean 502, not an AttributeError inside the handler
+    session = _session()
+    submit  = _resp(200, ['not', 'an', 'object'])
+    with patch.object(session._http, 'request', new_callable=AsyncMock,
+                      return_value=submit):
+        with pytest.raises(HTTPException) as ei:
+            await session.submit_job('perlmutter', {'executable': '/bin/true'})
+    assert ei.value.status_code == 502
+    assert 'non-object' in ei.value.detail
+    await session._http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_list_replies_tolerate_non_container_json():
+    # scalar JSON bodies (string / number) must yield empty lists, not raise
+    session = _session()
+    scalar  = _resp(200, 'maintenance')
+    with patch.object(session._http, 'request', new_callable=AsyncMock,
+                      return_value=scalar):
+        assert (await session.list_resources())['resources'] == []
+        assert (await session.list_incidents())['incidents'] == []
+        assert (await session.list_projects())['projects']   == []
+    await session._http.aclose()
+
+
+@pytest.mark.asyncio
 async def test_submit_job_completed_without_jobid_raises_502():
     session = _session()
     submit  = _resp(200, {'id': 'task-4', 'status': 'completed',
@@ -356,15 +384,38 @@ async def test_submit_job_script_never_logged(caplog):
 
 @pytest.mark.asyncio
 async def test_get_job_status_uses_sacct_and_normalizes():
+    # MUST query the LIST route with a jobid filter and cached=false — the
+    # single-job route is cache-backed at NERSC and chronically returns an
+    # empty ``output`` (a poller reading it is blind; live-verified).
     session = _session()
     resp    = _resp(200, {'status': 'ok',
                           'output': [{'jobid': '9', 'state': 'RUNNING'}]})
     with patch.object(session._http, 'request', new_callable=AsyncMock,
                       return_value=resp) as req:
         out = await session.get_job_status('perlmutter', '9')
-    assert req.call_args.kwargs['params'] == {'sacct': 'true'}
+    method, url = req.call_args.args
+    assert url == '/compute/jobs/perlmutter'          # list route, NOT /9
+    assert req.call_args.kwargs['params'] == {
+        'sacct': 'true', 'cached': 'false', 'kwargs': ['jobid=9']}
     assert out['job_id'] == '9'
     assert out['status'] == {'state': 'running'}
+    await session._http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_get_job_status_prefers_parent_row_over_steps():
+    # sacct jobid filters can return step rows (.batch/.extern) alongside
+    # the parent — the parent row's state must win regardless of order
+    session = _session()
+    resp    = _resp(200, {'status': 'ok', 'output': [
+        {'jobid': '9.batch',  'state': 'CANCELLED'},
+        {'jobid': '9.extern', 'state': 'COMPLETED'},
+        {'jobid': '9',        'state': 'CANCELLED by 123'},
+    ]})
+    with patch.object(session._http, 'request', new_callable=AsyncMock,
+                      return_value=resp):
+        out = await session.get_job_status('perlmutter', '9')
+    assert out['status'] == {'state': 'cancelled'}
     await session._http.aclose()
 
 
@@ -526,10 +577,10 @@ async def test_token_manager_missing_authlib_raises_importerror():
 # ---------------------------------------------------------------------------
 
 def test_plugin_init_ok(broker_app, rsa_pem):
-    plugin = PluginSFAPIInstance(broker_app, 'iri.nersc-sfapi',
-                                 endpoint='nersc-sfapi',
+    plugin = PluginSFAPIInstance(broker_app, 'sfapi.nersc',
+                                 endpoint='nersc',
                                  client_id='cid', private_key=rsa_pem)
-    assert plugin._endpoint_key == 'nersc-sfapi'
+    assert plugin._endpoint_key == 'nersc'
     assert plugin._auto_sid in plugin._sessions
     assert plugin.session_ttl == 0
     assert 'SFAPI' in plugin.ui_config['title']
@@ -543,8 +594,8 @@ def test_plugin_bad_pem_raises_before_routes(broker_app):
     before = len(broker_app.state.direct_routes) \
              if hasattr(broker_app.state, 'direct_routes') else 0
     with pytest.raises(HTTPException) as ei:
-        PluginSFAPIInstance(broker_app, 'iri.nersc-sfapi',
-                            endpoint='nersc-sfapi',
+        PluginSFAPIInstance(broker_app, 'sfapi.nersc',
+                            endpoint='nersc',
                             client_id='cid', private_key='not-a-pem')
     assert ei.value.status_code == 400
     after = len(broker_app.state.direct_routes) \
@@ -554,24 +605,24 @@ def test_plugin_bad_pem_raises_before_routes(broker_app):
 
 def test_plugin_missing_client_id_raises(broker_app, rsa_pem):
     with pytest.raises(HTTPException) as ei:
-        PluginSFAPIInstance(broker_app, 'iri.nersc-sfapi',
-                            endpoint='nersc-sfapi',
+        PluginSFAPIInstance(broker_app, 'sfapi.nersc',
+                            endpoint='nersc',
                             client_id='', private_key=rsa_pem)
     assert ei.value.status_code == 400
 
 
-def test_plugin_non_sfapi_endpoint_rejected(broker_app, rsa_pem):
+def test_plugin_unknown_endpoint_rejected(broker_app, rsa_pem):
     with pytest.raises(HTTPException) as ei:
-        PluginSFAPIInstance(broker_app, 'iri.nersc',
-                            endpoint='nersc',
+        PluginSFAPIInstance(broker_app, 'sfapi.bogus',
+                            endpoint='bogus',
                             client_id='cid', private_key=rsa_pem)
     assert ei.value.status_code == 400
 
 
 @pytest.mark.asyncio
 async def test_plugin_update_credentials(broker_app, rsa_pem):
-    plugin = PluginSFAPIInstance(broker_app, 'iri.nersc-sfapi',
-                                 endpoint='nersc-sfapi',
+    plugin = PluginSFAPIInstance(broker_app, 'sfapi.nersc',
+                                 endpoint='nersc',
                                  client_id='cid', private_key=rsa_pem)
     sess = plugin._sessions[plugin._auto_sid]
     sess._tokens = MagicMock()
@@ -583,8 +634,8 @@ async def test_plugin_update_credentials(broker_app, rsa_pem):
 
 @pytest.mark.asyncio
 async def test_plugin_register_session_returns_auto_sid(broker_app, rsa_pem):
-    plugin = PluginSFAPIInstance(broker_app, 'iri.nersc-sfapi',
-                                 endpoint='nersc-sfapi',
+    plugin = PluginSFAPIInstance(broker_app, 'sfapi.nersc',
+                                 endpoint='nersc',
                                  client_id='cid', private_key=rsa_pem)
     result = await plugin.register_session(MagicMock())
     assert result['sid'] == plugin._auto_sid
