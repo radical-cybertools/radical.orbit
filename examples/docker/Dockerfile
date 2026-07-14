@@ -32,28 +32,17 @@ RUN git clone --single-branch -b ${RADICAL_ORBIT_BRANCH} https://github.com/radi
 ENV RADICAL_ORBIT_BROKER_CERT="/app/private/broker_cert.pem"
 ENV RADICAL_ORBIT_BROKER_KEY="/app/private/broker_key.pem"
 
-# WARNING: GENERATE_BROKER_CERT=true bakes the TLS private key AND the
-# ingress token into the image — anyone who can pull the image owns the
-# broker's credentials.  Never push such an image to a registry; it is
-# meant for local `docker compose` builds only.
-ARG GENERATE_BROKER_CERT=false
 ARG BROKER_IP=127.0.0.1
 ARG BROKER_HOSTNAME=localhost
-RUN if [ "$GENERATE_BROKER_CERT" = "true" ]; then \
-        private_dir=$(dirname "$RADICAL_ORBIT_BROKER_CERT"); \
-        mkdir -p "${private_dir}" "${HOME}/.radical/orbit"; \
-        openssl req -x509 -nodes -days 3650 -newkey rsa:4096 \
-            -keyout "${RADICAL_ORBIT_BROKER_KEY}" \
-            -out "${RADICAL_ORBIT_BROKER_CERT}" \
-            -subj "/CN=${BROKER_IP}" \
-            -addext "subjectAltName = IP:${BROKER_IP},DNS:${BROKER_HOSTNAME},IP:127.0.0.1,DNS:localhost" && \
-        chmod 0600 "${RADICAL_ORBIT_BROKER_KEY}"; \
-        python3 -c "import secrets; print(secrets.token_urlsafe(32))" > token.tmp && \
-            chmod 600 token.tmp && mv token.tmp "${private_dir}/broker.token" && \
-            ln -s "${private_dir}/broker.token" "${HOME}/.radical/orbit/broker.token"; \
-        echo "Certificate & token generated (${BROKER_HOSTNAME}, ${BROKER_IP})."; \
-    else \
-        echo "Skipping certificate & token generation (GENERATE_BROKER_CERT is not true)."; \
-    fi
+RUN mkdir -p ${HOME}/.radical/orbit && \
+    { echo "BROKER_IP=${BROKER_IP}"; \
+      echo "BROKER_HOSTNAME=${BROKER_HOSTNAME}"; \
+      echo "RADICAL_ORBIT_BROKER_CERT=${RADICAL_ORBIT_BROKER_CERT}"; \
+      echo "RADICAL_ORBIT_BROKER_KEY=${RADICAL_ORBIT_BROKER_KEY}"; \
+    } > "${HOME}/.radical/orbit/init.env"
 
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["bash"]

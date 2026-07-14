@@ -11,7 +11,6 @@ services:
       dockerfile: Dockerfile
       args:
         RADICAL_ORBIT_BRANCH: ${RADICAL_ORBIT_BRANCH:-master}
-        GENERATE_BROKER_CERT: "true"
         BROKER_IP: "127.0.0.1"
         BROKER_HOSTNAME: ${RADICAL_ORBIT_BROKER_HOSTNAME:-broker}
     command: [ "echo", "Build complete" ]
@@ -22,9 +21,18 @@ services:
     <<: *common-image
     container_name: radical-orbit-broker
     hostname: ${RADICAL_ORBIT_BROKER_HOSTNAME:-broker}
-    # The token value is never printed to the logs (CWE-532) — retrieve
-    # it with:  docker compose exec broker cat ~/.radical/orbit/broker.token
-    command: [ "radical-orbit-broker.py" ]
+    environment:
+      - GENERATE_BROKER_CREDS=true
+    # In production, the token value is never printed to the logs (CWE-532).
+    command:
+      - "bash"
+      - "-c"
+      - |
+        echo "==============================================="
+        echo "ORBIT Broker Token:"
+        echo "    $(cat ~/.radical/orbit/broker.token)"
+        echo "==============================================="
+        exec radical-orbit-broker.py
     healthcheck:
       test:
         - CMD-SHELL
