@@ -68,6 +68,16 @@ cookie). This is the interim credential; a future per-participant identity
 
 ## Testing
 
+The verify loop — run this after every code change, before declaring work done:
+
+```sh
+PYTHONPATH=src ve3/bin/python -m pytest tests/unittests/ -q
+```
+
+`ve3/` is the project venv; `PYTHONPATH=src` runs from the source tree so no
+reinstall is needed between edits (never use editable installs). Plain
+`pytest` works too if the environment is already active:
+
 ```sh
 pytest tests/unittests/      # unit tests (867 tests)
 pytest tests/integration/    # integration tests (require running services)
