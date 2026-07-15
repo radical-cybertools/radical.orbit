@@ -2,6 +2,7 @@
   "pools": [
     {
       "name": "cpu",
+      "endpoint_name": "endpoint_a",
       "queue": "batch",
       "account": null,
       "default_size": "small",
@@ -30,6 +31,7 @@
     },
     {
       "name": "gpu",
+      "endpoint_name": "endpoint_b",
       "queue": "gpu",
       "account": null,
       "default_size": "single",

@@ -9,4 +9,5 @@ dependencies:
   - ndcctools
   - opentelemetry-sdk~=1.20.0
   - pip:
+      - psij-python
       - git+https://github.com/radical-cybertools/rhapsody.git@main

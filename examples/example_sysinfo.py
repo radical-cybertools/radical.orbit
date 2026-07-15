@@ -21,7 +21,8 @@ def main():
 
     rt = EndpointRuntime()
     rt.start(wait=True)
-    eids = [n for n in rt.topology() if n != 'broker']
+    eids = [e_name for e_name, e_info in rt.topology().items() 
+            if e_info and e_info.get('role') == 'endpoint']
     print(f"Found {len(eids)} Endpoint(s): {eids}")
 
     for eid in eids:
