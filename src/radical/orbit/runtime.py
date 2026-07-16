@@ -106,8 +106,16 @@ class EndpointRuntime(PluginHostBase):
     """A participant: serve and/or consume over one outbound WS to the broker.
 
     Args:
-        broker_url:  Broker URL.  CLI > env (``RADICAL_ORBIT_BROKER_URL``) >
-                     file — resolved via :func:`utils.resolve_broker_url`.
+        broker_url:  Broker URL.  CLI > env (``RADICAL_ORBIT_BROKER_URL``) —
+                     resolved via :func:`utils.resolve_broker_url`.  Mutually
+                     exclusive with ``embedded=True``.
+        embedded:    ``True`` runs a full broker inside this process (see
+                     :class:`~radical.orbit.embedded.EmbeddedBroker`: port
+                     8000 with ephemeral fallback, operator-placed
+                     cert/key/token, auth + gateway on) and connects to it;
+                     URL resolution — including an ambient env URL — is
+                     skipped.  Default ``False``: connect out to
+                     ``broker_url``.
         cert:        Broker TLS cert (only for ``https``/``wss``).
         name:        Stable participant name.  ``None`` → ``consumer.<uuid8>``
                      (auto-named consumers cannot recover sessions on restart).
@@ -136,6 +144,7 @@ class EndpointRuntime(PluginHostBase):
                  tunnel_via:  Optional[str]  = None,
                  token:       Optional[str]  = None,
                  resume_key:  Optional[str]  = None,
+                 embedded:    bool           = False,
                  app:         Optional[FastAPI] = None,
                  ping_interval:       float = _PING_INTERVAL,
                  ping_timeout:        float = _PING_TIMEOUT,
@@ -151,17 +160,33 @@ class EndpointRuntime(PluginHostBase):
                             % ', '.join(sorted(bad)))
 
         # ── URL / TLS / token resolution ──────────────────────────────
-        resolved_url, _ = utils.resolve_broker_url(cli=broker_url)
-        self._broker_url: str = resolved_url
-        scheme = urlparse(self._broker_url).scheme
-        if scheme in ('https', 'wss'):
-            resolved_cert, _ = utils.resolve_broker_cert(cli=cert)
-            self._cert: Optional[str] = str(resolved_cert)
+        # embedded=True hosts the broker in this process — URL resolution
+        # (including an ambient env URL) is skipped; the code is explicit.
+        self._embedded = None                    # EmbeddedBroker | None
+        if embedded:
+            if broker_url:
+                raise ValueError(
+                    "broker_url and embedded=True are mutually exclusive "
+                    "— the embedded broker provides the URL")
+            resolved_url = self._start_embedded(cert=cert, token=token)
         else:
-            self._cert = None
-        # Keep the token's source ('cli' / 'env' / 'file' / '') so a
-        # credential rejection can name the exact place to fix.
-        self._token, self._token_source = utils.resolve_broker_token(cli=token)
+            resolved_url, _ = utils.resolve_broker_url(cli=broker_url)
+        self._broker_url: str = resolved_url
+        try:
+            scheme = urlparse(self._broker_url).scheme
+            if scheme in ('https', 'wss'):
+                resolved_cert, _ = utils.resolve_broker_cert(cli=cert)
+                self._cert: Optional[str] = str(resolved_cert)
+            else:
+                self._cert = None
+            # Keep the token's source ('cli' / 'env' / 'file' / '') so a
+            # credential rejection can name the exact place to fix.
+            self._token, self._token_source = \
+                                          utils.resolve_broker_token(cli=token)
+        except Exception:
+            if self._embedded is not None:
+                self._embedded.stop()
+            raise
 
         # ── Identity / role ───────────────────────────────────────────
         self._name: str = name or ('consumer.%s' % uuid.uuid4().hex[:8])
@@ -266,6 +291,18 @@ class EndpointRuntime(PluginHostBase):
     @property
     def broker_url(self) -> str:
         return self._broker_url
+
+    @property
+    def embedded_broker(self):
+        """The in-process :class:`Broker` when ``embedded=True``, else None."""
+        return self._embedded.broker if self._embedded else None
+
+    def _start_embedded(self, cert: Optional[str],
+                        token: Optional[str]) -> str:
+        # Lazy import: uvicorn is only pulled in when embedding is requested.
+        from .embedded import EmbeddedBroker
+        self._embedded = EmbeddedBroker(cert=cert, token=token)
+        return self._embedded.start()
 
     @property
     def fatal(self) -> bool:
@@ -427,6 +464,11 @@ class EndpointRuntime(PluginHostBase):
             _tunnel.cleanup_tunnel(self._tunnel_proc, self._name)
             self._tunnel_proc = None
         self._prof.close()
+        # The embedded broker (if any) goes down last: the runtime above
+        # disconnected first, so the broker sees a clean close.
+        if self._embedded is not None:
+            embedded, self._embedded = self._embedded, None
+            embedded.stop()
 
     async def _graceful_close(self) -> None:
         self._stopping = True
