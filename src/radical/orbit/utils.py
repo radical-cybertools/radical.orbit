@@ -7,12 +7,10 @@ belongs in its own module.
 
 import hmac
 import os
-import secrets
 import socket
 import ssl
 import stat
 import sys
-import tempfile
 
 from pathlib import Path
 from typing  import Any, Dict, List, Optional, Tuple
@@ -27,21 +25,22 @@ from typing  import Any, Dict, List, Optional, Tuple
 #                          clients verify against it)
 #    RADICAL_ORBIT_BROKER_KEY  — TLS key path (broker only)
 #
-#  Fallback files (placed by the operator; never auto-written from env):
-#    ~/.radical/orbit/broker.url
+#  Fallback files (placed by the operator — the ``~/.radical/orbit`` config
+#  is read-only for the software; nothing below is ever auto-written):
 #    ~/.radical/orbit/broker_cert.pem
 #    ~/.radical/orbit/broker_key.pem
+#    ~/.radical/orbit/broker.token
 #
-#  Precedence (consumer side): CLI arg > env var > file > error.
+#  Precedence (cert / key / token): CLI arg > env var > file > error.
+#  The URL has *no* file fallback — it always comes explicitly, via API /
+#  CLI arg or $RADICAL_ORBIT_BROKER_URL (a stale on-disk URL was a recurring
+#  source of confusion; certs and tokens are stable material, URLs are not).
 #
 #  The broker process itself does NOT consume a URL — it derives its
-#  advertised URL from its own (host, port).  ``broker.url`` is a write-
-#  side artefact only: broker writes; endpoints / clients read.
-#  Cert / key files are never written by code — operator places them.
+#  advertised URL from its own (host, port).
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_DIR  = Path.home() / '.radical' / 'orbit'
-URL_FILE     = DEFAULT_DIR / 'broker.url'
 CERT_FILE    = DEFAULT_DIR / 'broker_cert.pem'
 KEY_FILE     = DEFAULT_DIR / 'broker_key.pem'
 TOKEN_FILE   = DEFAULT_DIR / 'broker.token'
@@ -50,7 +49,6 @@ ENV_URL      = 'RADICAL_ORBIT_BROKER_URL'
 ENV_CERT     = 'RADICAL_ORBIT_BROKER_CERT'
 ENV_KEY      = 'RADICAL_ORBIT_BROKER_KEY'
 ENV_TOKEN    = 'RADICAL_ORBIT_BROKER_TOKEN'
-ENV_NO_AUTH  = 'RADICAL_ORBIT_BROKER_NO_AUTH'
 
 
 def _env(name: str) -> str:
@@ -62,44 +60,6 @@ def _env(name: str) -> str:
 # token never lives in a query string, only this HttpOnly cookie or a
 # request header.
 AUTH_COOKIE  = 'orbit_broker_token'
-
-
-def _read_url_file(path: Optional[Path] = None) -> Optional[str]:
-    """Read a URL file, stripped of surrounding whitespace/newlines.
-
-    Resolves ``path`` from the module-level ``URL_FILE`` at call time
-    (not at def time) so tests that monkeypatch ``URL_FILE`` see the
-    redirected location.
-    """
-    if path is None:
-        path = URL_FILE
-    try:
-        text = path.read_text().strip()
-    except FileNotFoundError:
-        return None
-    return text or None
-
-
-def write_broker_url_file(url: str, path: Optional[Path] = None) -> None:
-    """Write *url* to *path* atomically (tmp + os.replace).
-
-    Creates parent directories as needed.  Mode 0644.  This is the only
-    auto-write of any of the three broker config files; cert and key are
-    always operator-placed.
-    """
-    if path is None:
-        path = URL_FILE
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix='.broker.url.', dir=str(path.parent))
-    try:
-        with os.fdopen(fd, 'w') as f:
-            f.write(url.rstrip() + '\n')
-        os.chmod(tmp, 0o644)
-        os.replace(tmp, path)
-    except Exception:
-        try:    os.unlink(tmp)
-        except FileNotFoundError: pass
-        raise
 
 
 def _outbound_ipv4() -> Optional[str]:
@@ -164,11 +124,12 @@ def public_url_forms(host: str, port: int, *,
 def resolve_broker_url(cli: Optional[str] = None) -> Tuple[str, str]:
     """Resolve the broker URL for a *consumer* (endpoint / client).
 
-    Precedence: CLI arg > ``$RADICAL_ORBIT_BROKER_URL`` > ``~/.radical/orbit/broker.url``.
+    Precedence: CLI arg > ``$RADICAL_ORBIT_BROKER_URL``.  There is
+    deliberately no file fallback — a URL is volatile (hosts and ports
+    change) and always passed explicitly.
 
-    Returns ``(url, source)`` with source one of
-    ``'cli'`` / ``'env'`` / ``'file'``.  Raises ``ValueError`` if no
-    source resolves.
+    Returns ``(url, source)`` with source one of ``'cli'`` / ``'env'``.
+    Raises ``ValueError`` if no source resolves.
 
     The broker process itself does *not* call this — it derives its
     advertised URL from its own ``(host, port)``.
@@ -178,11 +139,7 @@ def resolve_broker_url(cli: Optional[str] = None) -> Tuple[str, str]:
     env_url = _env(ENV_URL)
     if env_url:
         return env_url.rstrip('/'), 'env'
-    file_url = _read_url_file()
-    if file_url:
-        return file_url.rstrip('/'), 'file'
-    raise ValueError(f"Broker URL required (no CLI arg, ${ENV_URL} unset, "
-                     f"no file at {URL_FILE})")
+    raise ValueError(f"Broker URL required (no CLI arg, ${ENV_URL} unset)")
 
 
 def _resolve_path_value(cli: Optional[str], env_var: str,
@@ -200,6 +157,18 @@ def _resolve_path_value(cli: Optional[str], env_var: str,
     if file_path.exists():
         return file_path, 'file'
     return None, ''
+
+
+TLS_RECIPE = '''\
+To create a self-signed cert/key pair at the default location:
+
+  mkdir -p ~/.radical/orbit
+  openssl req -x509 -newkey rsa:4096 -nodes \\
+      -keyout ~/.radical/orbit/broker_key.pem \\
+      -out    ~/.radical/orbit/broker_cert.pem \\
+      -days 365 -subj "/CN=$(hostname -f)"
+  chmod 600 ~/.radical/orbit/broker_key.pem
+'''
 
 
 def resolve_broker_cert(cli: Optional[str] = None) -> Tuple[Path, str]:
@@ -274,22 +243,31 @@ def resolve_broker_key(cli: Optional[str] = None, *,
 #  model as the cert): clients/endpoints present it, the broker verifies it.
 #
 #    Env var:  RADICAL_ORBIT_BROKER_TOKEN
-#    File:     ~/.radical/orbit/broker.token   (mode 0600)
-#    Disable:  RADICAL_ORBIT_BROKER_NO_AUTH=1  (escape hatch for local dev)
+#    File:     ~/.radical/orbit/broker.token   (mode 0600, operator-placed)
 #
-#  Consumer precedence (endpoint / client): CLI > env > file.  A missing token
-#  is *not* an error on the consumer side — the broker may run with auth off.
-#  The broker itself uses ``ensure_broker_token``, which generates and writes a
-#  token when none is configured.
+#  Precedence (both sides): CLI > env > file.  A missing token is *not* an
+#  error on the consumer side — the broker may run with auth off.  The broker
+#  *requires* a token when auth is enabled (``auth=False`` / ``--no-auth`` is
+#  the explicit local-dev escape hatch); nothing is ever generated or written
+#  by code — ``TOKEN_RECIPE`` below is the one-time operator step.
 # ─────────────────────────────────────────────────────────────────────────────
+
+TOKEN_RECIPE = '''\
+To create a shared ingress token at the default location:
+
+  mkdir -p ~/.radical/orbit
+  python3 -c "import secrets; print(secrets.token_urlsafe(32))" \\
+      > ~/.radical/orbit/broker.token
+  chmod 600 ~/.radical/orbit/broker.token
+'''
+
 
 def _read_token_file(path: Optional[Path] = None) -> Optional[str]:
     """Read the token file, stripped.  ``None`` if absent/empty.
 
-    Only ``FileNotFoundError`` is swallowed (consistent with ``_read_url_file``):
-    a present-but-unreadable file (e.g. ``PermissionError``) is a real
-    misconfiguration that should surface loudly rather than be masked as
-    "no token" — which would otherwise trigger a regenerate-then-crash-on-write.
+    Only ``FileNotFoundError`` is swallowed: a present-but-unreadable file
+    (e.g. ``PermissionError``) is a real misconfiguration that should
+    surface loudly rather than be masked as "no token".
     """
     if path is None:
         path = TOKEN_FILE
@@ -298,23 +276,6 @@ def _read_token_file(path: Optional[Path] = None) -> Optional[str]:
     except FileNotFoundError:
         return None
     return text or None
-
-
-def write_broker_token_file(token: str, path: Optional[Path] = None) -> None:
-    """Write *token* to *path* atomically, mode 0600 (private — like the key)."""
-    if path is None:
-        path = TOKEN_FILE
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix='.broker.token.', dir=str(path.parent))
-    try:
-        with os.fdopen(fd, 'w') as f:
-            f.write(token.rstrip() + '\n')
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-    except Exception:
-        try:    os.unlink(tmp)
-        except FileNotFoundError: pass
-        raise
 
 
 def resolve_broker_token(cli: Optional[str] = None) -> Tuple[Optional[str], str]:
@@ -334,33 +295,6 @@ def resolve_broker_token(cli: Optional[str] = None) -> Tuple[Optional[str], str]
     if file_tok:
         return file_tok, 'file'
     return None, ''
-
-
-def auth_disabled(cli_no_auth: bool = False) -> bool:
-    """Whether broker ingress auth is disabled (the ``--no-auth`` escape hatch).
-
-    True when *cli_no_auth* is set or ``$RADICAL_ORBIT_BROKER_NO_AUTH`` is a
-    truthy value (``1`` / ``true`` / ``yes``).
-    """
-    if cli_no_auth:
-        return True
-    return _env(ENV_NO_AUTH).lower() in ('1', 'true', 'yes')
-
-
-def ensure_broker_token(cli: Optional[str] = None) -> Tuple[str, str]:
-    """Resolve the broker token for the *broker* itself, generating if absent.
-
-    Precedence: CLI > env > file; if none resolves, generate a fresh
-    URL-safe token, write it to ``~/.radical/orbit/broker.token`` (mode 0600),
-    and return it.  Returns ``(token, source)`` with source one of
-    ``'cli'`` / ``'env'`` / ``'file'`` / ``'generated'``.
-    """
-    token, source = resolve_broker_token(cli)
-    if token:
-        return token, source
-    token = secrets.token_urlsafe(32)
-    write_broker_token_file(token)
-    return token, 'generated'
 
 
 def tokens_match(provided: Any, expected: Any) -> bool:

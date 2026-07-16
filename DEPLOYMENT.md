@@ -52,12 +52,22 @@ start otherwise — and never leaves the broker host.
 ### Ingress token
 
 The broker gates its HTTP ingress *and* the endpoint `/register`
-handshake with a shared bearer token.  On first start it generates one
-and writes it to `~/.radical/orbit/broker.token` (mode `0600`; the
-token itself is never printed, only its path).  Precedence everywhere
-is `--token` > `$RADICAL_ORBIT_BROKER_TOKEN` >
-`~/.radical/orbit/broker.token`.  For local development only,
-`--no-auth` (or `$RADICAL_ORBIT_BROKER_NO_AUTH=1`) disables the gate.
+handshake with a shared bearer token.  Like the cert/key pair, the
+token is created by the operator — the broker never generates or
+writes it (`~/.radical/orbit` config is read-only for the software;
+`radical-orbit-broker.py --help` carries a copy-pasteable recipe):
+
+```sh
+mkdir -p ~/.radical/orbit
+python3 -c "import secrets; print(secrets.token_urlsafe(32))" \
+    > ~/.radical/orbit/broker.token
+chmod 600 ~/.radical/orbit/broker.token
+```
+
+Precedence everywhere is `--token` > `$RADICAL_ORBIT_BROKER_TOKEN` >
+`~/.radical/orbit/broker.token`; the broker refuses to start without a
+token.  For local development only, `--no-auth` (API: `auth=False`)
+disables the gate.
 
 ### Credential staging to endpoint/client hosts
 
@@ -83,8 +93,8 @@ The **token** reaches the endpoint in one of two ways:
   from `$RADICAL_ORBIT_BROKER_TOKEN` or
   `~/.radical/orbit/broker.token`.  Stage whichever matches the
   broker's configuration: when the broker uses its token *file*
-  (the default — generated on first start), copy it, and re-copy it
-  whenever it is regenerated:
+  (the default), copy it, and re-copy it whenever the operator
+  rotates it:
 
   ```sh
   ssh <endpoint-host> "mkdir -p ~/.radical/orbit"
@@ -116,8 +126,8 @@ User=radical
 WorkingDirectory=/opt/orbit
 Environment=RADICAL_ORBIT_BROKER_CERT=/opt/orbit/certs/broker_cert.pem
 Environment=RADICAL_ORBIT_BROKER_KEY=/opt/orbit/certs/broker_key.pem
-# Token: resolved from ~radical/.radical/orbit/broker.token (generated
-# on first start), or pin one explicitly:
+# Token: resolved from ~radical/.radical/orbit/broker.token (operator-
+# placed — see "Ingress token" above), or pin one explicitly:
 # Environment=RADICAL_ORBIT_BROKER_TOKEN=<shared ingress token>
 ExecStart=/opt/orbit/bin/radical-orbit-broker.py
 Restart=on-failure

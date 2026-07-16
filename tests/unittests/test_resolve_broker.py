@@ -28,7 +28,6 @@ def isolated_dir(tmp_path, monkeypatch):
     Yields the tmp directory so tests can drop files into it directly.
     """
     monkeypatch.setattr(utils, 'DEFAULT_DIR', tmp_path)
-    monkeypatch.setattr(utils, 'URL_FILE',  tmp_path / 'broker.url')
     monkeypatch.setattr(utils, 'CERT_FILE', tmp_path / 'broker_cert.pem')
     monkeypatch.setattr(utils, 'KEY_FILE',  tmp_path / 'broker_key.pem')
     for v in (utils.ENV_URL, utils.ENV_CERT, utils.ENV_KEY):
@@ -70,30 +69,27 @@ def _have_openssl() -> bool:
 # URL resolution
 # ---------------------------------------------------------------------------
 
-def test_url_cli_wins_over_env_and_file(isolated_dir, monkeypatch):
-    """CLI > env > file when all three are set."""
+def test_url_cli_wins_over_env(isolated_dir, monkeypatch):
+    """CLI > env when both are set."""
     monkeypatch.setenv(utils.ENV_URL, 'https://from-env:8000')
-    (isolated_dir / 'broker.url').write_text('https://from-file:8000\n')
     url, src = utils.resolve_broker_url(cli='https://from-cli:8000')
     assert url == 'https://from-cli:8000'
     assert src == 'cli'
 
 
-def test_url_env_wins_over_file(isolated_dir, monkeypatch):
-    """Env > file when CLI is absent."""
+def test_url_env_used_when_no_cli(isolated_dir, monkeypatch):
+    """Env is the lowest-precedence successful source (no file leg)."""
     monkeypatch.setenv(utils.ENV_URL, 'https://from-env:8000')
-    (isolated_dir / 'broker.url').write_text('https://from-file:8000\n')
     url, src = utils.resolve_broker_url()
     assert url == 'https://from-env:8000'
     assert src == 'env'
 
 
-def test_url_file_used_when_no_cli_no_env(isolated_dir):
-    """File is the lowest precedence successful source."""
+def test_url_has_no_file_fallback(isolated_dir):
+    """An on-disk broker.url is deliberately ignored — URL is API/env only."""
     (isolated_dir / 'broker.url').write_text('https://from-file:8000\n')
-    url, src = utils.resolve_broker_url()
-    assert url == 'https://from-file:8000'
-    assert src == 'file'
+    with pytest.raises(ValueError, match='Broker URL required'):
+        utils.resolve_broker_url()
 
 
 def test_url_trailing_slash_stripped(isolated_dir, monkeypatch):
@@ -107,26 +103,6 @@ def test_url_errors_when_unconfigured(isolated_dir):
     """Nothing set anywhere → ValueError."""
     with pytest.raises(ValueError, match='Broker URL required'):
         utils.resolve_broker_url()
-
-
-# ---------------------------------------------------------------------------
-# URL file write (atomic)
-# ---------------------------------------------------------------------------
-
-def test_write_broker_url_file_creates_parents(tmp_path):
-    """``write_broker_url_file`` mkdirs parent dirs and writes the file."""
-    target = tmp_path / 'fresh' / 'broker.url'
-    utils.write_broker_url_file('https://here:8000', path=target)
-    assert target.read_text().strip() == 'https://here:8000'
-    assert target.parent.is_dir()
-
-
-def test_write_broker_url_file_overwrites(tmp_path):
-    """Subsequent writes replace the file content (atomic via os.replace)."""
-    target = tmp_path / 'broker.url'
-    utils.write_broker_url_file('https://first:8000', path=target)
-    utils.write_broker_url_file('https://second:8000', path=target)
-    assert target.read_text().strip() == 'https://second:8000'
 
 
 # ---------------------------------------------------------------------------
