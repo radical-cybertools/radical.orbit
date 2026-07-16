@@ -159,6 +159,42 @@ def test_embedded_missing_token_fails_closed(isolated, monkeypatch):
     assert not (isolated / 'broker.token').exists()    # nothing written
 
 
+def test_embedded_server_setup_failure_closes_socket(isolated, monkeypatch):
+    # A failure *after* the Broker ctor (uvicorn Config/Server/thread setup)
+    # must also release the pre-bound socket, not just Broker-ctor failures.
+    import uvicorn
+    from radical.orbit.embedded import EmbeddedBroker
+
+    def _boom(*a, **kw):
+        raise RuntimeError('injected uvicorn setup failure')
+
+    monkeypatch.setattr(uvicorn, 'Config', _boom)
+    eb = EmbeddedBroker(host='127.0.0.1', port=0)
+    with pytest.raises(RuntimeError, match='injected uvicorn setup failure'):
+        eb.start()
+    assert eb._sock is None                            # socket released
+    assert not _embedded_threads()
+
+
+def test_embedded_binds_ipv6_literal(isolated):
+    from radical.orbit.embedded import EmbeddedBroker
+    probe = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    try:
+        probe.bind(('::1', 0))
+    except OSError:
+        pytest.skip("no IPv6 loopback available")
+    finally:
+        probe.close()
+
+    eb = EmbeddedBroker(host='::1', port=0)
+    sock = eb._bind()                                  # AF_INET6, no OSError
+    try:
+        assert sock.family == socket.AF_INET6
+        assert sock.getsockname()[1] > 0
+    finally:
+        sock.close()
+
+
 def test_embedded_missing_cert_fails_closed(isolated):
     from radical.orbit.embedded import EmbeddedBroker
     (isolated / 'broker_cert.pem').unlink()

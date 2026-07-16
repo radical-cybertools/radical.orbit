@@ -90,23 +90,24 @@ class EmbeddedBroker:
                                   plugins=self._plugins, token=self._token,
                                   auth=self._auth, gateway=self._gateway,
                                   tuning=self._tuning)
+
+            # Quieter than run(): an embedded broker must not spam the
+            # client's output (and the startup banner is skipped — run() is
+            # never called).
+            config = uvicorn.Config(self._broker.app,
+                                    host=self._host, port=port,
+                                    **{**self._broker._uvicorn_kwargs(),
+                                       'log_level': 'warning'})
+            self._server = uvicorn.Server(config)
+            self._thread = threading.Thread(target=self._server.run,
+                                            kwargs={'sockets': [self._sock]},
+                                            name='orbit-embedded-broker',
+                                            daemon=True)
+            self._thread.start()
         except Exception:
             self._sock.close()
             self._sock = None
             raise
-
-        # Quieter than run(): an embedded broker must not spam the client's
-        # output (and the startup banner is skipped — run() is never called).
-        config = uvicorn.Config(self._broker.app,
-                                host=self._host, port=port,
-                                **{**self._broker._uvicorn_kwargs(),
-                                   'log_level': 'warning'})
-        self._server = uvicorn.Server(config)
-        self._thread = threading.Thread(target=self._server.run,
-                                        kwargs={'sockets': [self._sock]},
-                                        name='orbit-embedded-broker',
-                                        daemon=True)
-        self._thread.start()
 
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -150,7 +151,9 @@ class EmbeddedBroker:
         port with a warning when it is taken.
         """
         def _try(port: int) -> socket.socket:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # IPv6 literals ('::', '::1', …) need AF_INET6.
+            family = socket.AF_INET6 if ':' in self._host else socket.AF_INET
+            sock = socket.socket(family, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 sock.bind((self._host, port))
