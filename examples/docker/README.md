@@ -28,24 +28,17 @@ export RADICAL_ORBIT_BROKER_HOSTNAME=broker
 
 ### 2. Build the image
 
-The build step also generates a self-signed TLS certificate used by the broker
-endpoint.
+The build step bakes the broker parameters (`BROKER_IP`, `BROKER_HOSTNAME`) into
+the image. The self-signed TLS certificate and ingress token are generated fresh
+on every container start by the entrypoint (broker role only).
 
 > [!WARNING]
-> The self-signed certificate is for **development purposes only**.
-
-> [!NOTE]
-> The demo broker runs with `--no-auth`: its ingress token would be
-> generated under the broker container's own `$HOME`, which the other
-> containers cannot read.  In any real deployment the token gate stays
-> on, and you stage `broker_cert.pem` plus the broker's *currently
-> configured* token — via `$RADICAL_ORBIT_BROKER_TOKEN` or a mode-0600
-> `broker.token` file — to each connecting host (see `DEPLOYMENT.md`).
+> The self-signed certificate is for **development and local testing only**;
+> never expose this setup to an untrusted network.
 
 ```shell
 cd examples/docker
-docker build --build-arg GENERATE_BROKER_CERT=true \
-             --build-arg BROKER_IP=127.0.0.1 \
+docker build --build-arg BROKER_IP=127.0.0.1 \
              --build-arg BROKER_HOSTNAME=${RADICAL_ORBIT_BROKER_HOSTNAME} \
              --build-arg RADICAL_ORBIT_BRANCH=${RADICAL_ORBIT_BRANCH} \
              -t ${RADICAL_ORBIT_IMAGE}:${RADICAL_ORBIT_TAG} .
@@ -66,9 +59,8 @@ python3 example_sysinfo.py
 
 ### 4. Browse the API
 
-The broker service exposes port `8000` on the host's loopback interface
-(only — the demo runs without auth), so once the containers are running
-you can open the API documentation directly in a web browser:
+The broker service exposes port `8000` to the host, so once the containers are
+running you can open the API documentation directly in a web browser:
 
 | URL | Description |
 |-----|-------------|
@@ -78,6 +70,14 @@ you can open the API documentation directly in a web browser:
 > [!NOTE]
 > Your browser will show a TLS warning because a self-signed certificate is
 > used. Click **Advanced → Proceed to localhost** (or equivalent) to continue.
+
+> [!NOTE]
+> The broker generates a random authentication token on startup, which is
+> required to log into the Explorer UI. You can find this token printed at
+> the very beginning of the broker's logs by running
+> `docker compose logs broker | head -n 5`.
+> **NEVER** print the broker token to the logs in production (see
+> `DEPLOYMENT.md` for production usage).
 
 > [!TIP]
 > When registering a new endpoint service through the portal (e.g., via the
@@ -105,5 +105,5 @@ docker compose down
 
 - Full getting-started guide:
   [`docs/source/getting_started.md`](../../docs/source/getting_started.md)
-- Local and remote run instructions are covered in sections **3.1** and **3.3**
+- Local and remote test-run instructions are covered in sections **3.1** and **3.3**
   of the same document.

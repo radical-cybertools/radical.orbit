@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ORBIT — design decisions, project grounding, pain points</title>
+<style>
+  :root {
+    --bg:      #ffffff;
+    --fg:      #1a2330;
+    --muted:   #5a6a7a;
+    --accent:  #0b5fa5;
+    --accent2: #b3541e;
+    --line:    #d8dee6;
+    --codebg:  #f3f6f9;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; background: var(--bg); color: var(--fg);
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif; overflow: hidden; }
+
+  .slide { display: none; height: 100vh; padding: 5vh 7vw;
+    flex-direction: column; justify-content: center; }
+  .slide.active { display: flex; }
+
+  h1 { font-size: 5vh; color: var(--accent); margin-bottom: 3vh;
+       border-bottom: 2px solid var(--line); padding-bottom: 1.5vh; }
+  .title h1 { font-size: 6.5vh; border: none; }
+  .title .sub  { font-size: 3vh; color: var(--muted); margin-top: 1vh; }
+  .title .tag  { font-size: 3.4vh; color: var(--accent2); margin-top: 6vh;
+                 font-style: italic; }
+
+  ul { list-style: none; }
+  li { font-size: 3vh; line-height: 1.4; margin-bottom: 2vh;
+       padding-left: 3vh; position: relative; }
+  li::before { content: "▸"; color: var(--accent); position: absolute; left: 0; }
+  li li { font-size: 2.6vh; margin: 0.7vh 0 0 0; }
+  li li::before { content: "–"; color: var(--muted); }
+  b, strong { color: var(--accent); }
+  em { color: var(--accent2); font-style: normal; font-weight: bold; }
+
+  pre { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 2.2vh;
+        line-height: 1.35; background: var(--codebg); border: 1px solid var(--line);
+        border-radius: 8px; padding: 2vh 2.5vw; margin: 1.5vh 0 2.5vh;
+        overflow-x: auto; }
+  pre .hi { color: var(--accent); font-weight: bold; }
+  pre .hi2 { color: var(--accent2); font-weight: bold; }
+
+  table { border-collapse: collapse; width: 100%; margin: 1vh 0 2vh; }
+  th, td { font-size: 2.4vh; line-height: 1.3; text-align: left;
+           padding: 1.1vh 1vw; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; font-size: 2vh;
+       text-transform: uppercase; letter-spacing: 0.05em; }
+  td:first-child { color: var(--accent); font-weight: 600; white-space: nowrap; }
+  td em { font-weight: bold; }
+  .mono td:first-child { font-family: Menlo, Consolas, monospace; font-size: 2.2vh; }
+
+  svg.arch { width: 100%; height: auto; max-height: 46vh; margin: 0.5vh 0 2vh;
+             display: block; }
+
+  .foot { position: absolute; bottom: 2.5vh; left: 7vw; right: 7vw;
+          font-size: 1.9vh; color: var(--muted); display: flex;
+          justify-content: space-between; }
+  .note { font-size: 2.1vh; color: var(--muted); margin-top: 2vh; }
+  .url  { font-family: Menlo, Consolas, monospace; color: var(--accent2); }
+  .kicker { font-size: 2.4vh; color: var(--accent2); font-weight: bold;
+            margin-bottom: 1.5vh; text-transform: uppercase; letter-spacing: 0.06em; }
+  ul.dense li { margin-bottom: 1.3vh; font-size: 2.8vh; }
+  ul.dense li li { font-size: 2.45vh; }
+</style>
+</head>
+<body>
+
+<!-- 1 ── title ─────────────────────────────────────────────────────── -->
+<section class="slide title active">
+  <h1>ORBIT — why it looks the way it does</h1>
+  <div class="sub">design decisions · project grounding · pain points</div>
+  <div class="sub">RADICAL group call &nbsp;·&nbsp; July 15, 2026 &nbsp;·&nbsp; Andre Merzky</div>
+  <div class="tag">Four projects pull on the same framework —<br>
+       this is what that did to the design.</div>
+</section>
+
+<!-- 2 ── recap ─────────────────────────────────────────────────────── -->
+<section class="slide">
+  <h1>ORBIT in one slide</h1>
+<svg class="arch" viewBox="0 0 1000 385" role="img"
+     aria-label="ORBIT star architecture: multiple clients and multiple endpoints all dial out to one broker">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#5a6a7a"/>
+    </marker>
+  </defs>
+
+  <!-- connection lines (drawn first, under the boxes) -->
+  <g stroke="#5a6a7a" stroke-width="2" fill="none" marker-end="url(#arr)">
+    <line x1="260" y1="95"  x2="391" y2="160"/>
+    <line x1="260" y1="200" x2="391" y2="205"/>
+    <line x1="260" y1="305" x2="406" y2="278"/>
+    <line x1="740" y1="95"  x2="609" y2="160"/>
+    <line x1="740" y1="200" x2="609" y2="205"/>
+    <line x1="740" y1="305" x2="609" y2="245"/>
+  </g>
+  <text x="322" y="52"  text-anchor="middle" font-size="16" font-weight="bold"
+        fill="#b3541e">outbound HTTPS / WSS</text>
+  <text x="678" y="52"  text-anchor="middle" font-size="16" font-weight="bold"
+        fill="#b3541e">outbound WebSocket</text>
+
+  <!-- clients (left) -->
+  <g>
+    <rect x="30" y="60"  width="230" height="70" rx="10"
+          fill="#f3f6f9" stroke="#0b5fa5" stroke-width="2"/>
+    <text x="145" y="89"  text-anchor="middle" font-size="19" font-weight="bold"
+          fill="#0b5fa5">client — driver script</text>
+    <text x="145" y="113" text-anchor="middle" font-size="15"
+          fill="#5a6a7a">laptop · consumer participant</text>
+
+    <rect x="30" y="165" width="230" height="70" rx="10"
+          fill="#f3f6f9" stroke="#0b5fa5" stroke-width="2"/>
+    <text x="145" y="194" text-anchor="middle" font-size="19" font-weight="bold"
+          fill="#0b5fa5">client — WFM / campaign</text>
+    <text x="145" y="218" text-anchor="middle" font-size="15"
+          fill="#5a6a7a">workstation · long-running</text>
+
+    <rect x="30" y="270" width="230" height="70" rx="10"
+          fill="#f3f6f9" stroke="#5a6a7a" stroke-width="2" stroke-dasharray="6 4"/>
+    <text x="145" y="299" text-anchor="middle" font-size="19" font-weight="bold"
+          fill="#0b5fa5">browser — Explorer</text>
+    <text x="145" y="323" text-anchor="middle" font-size="15"
+          fill="#5a6a7a">HTTP / SSE, via gateway</text>
+    <text x="145" y="372" text-anchor="middle" font-size="24"
+          fill="#5a6a7a">⋮</text>
+  </g>
+
+  <!-- broker + gateway (center) -->
+  <g>
+    <rect x="395" y="120" width="210" height="130" rx="12"
+          fill="#eaf2f9" stroke="#0b5fa5" stroke-width="3"/>
+    <text x="500" y="155" text-anchor="middle" font-size="26" font-weight="bold"
+          fill="#0b5fa5">BROKER</text>
+    <text x="500" y="184" text-anchor="middle" font-size="15"
+          fill="#1a2330">routes src/dst · corr_id</text>
+    <text x="500" y="206" text-anchor="middle" font-size="15"
+          fill="#1a2330">liveness · event fan-out</text>
+    <text x="500" y="228" text-anchor="middle" font-size="15"
+          fill="#1a2330">hosts plugins: iri.* · dispatcher</text>
+
+    <rect x="410" y="250" width="180" height="52" rx="10"
+          fill="#f3f6f9" stroke="#5a6a7a" stroke-width="2" stroke-dasharray="6 4"/>
+    <text x="500" y="272" text-anchor="middle" font-size="16" font-weight="bold"
+          fill="#b3541e">gateway</text>
+    <text x="500" y="293" text-anchor="middle" font-size="14"
+          fill="#5a6a7a">HTTP · SSE · Explorer</text>
+    <text x="500" y="335" text-anchor="middle" font-size="14"
+          fill="#5a6a7a">the only public component</text>
+  </g>
+
+  <!-- endpoints (right) -->
+  <g>
+    <rect x="740" y="60"  width="230" height="70" rx="10"
+          fill="#f3f6f9" stroke="#0b5fa5" stroke-width="2"/>
+    <text x="855" y="89"  text-anchor="middle" font-size="19" font-weight="bold"
+          fill="#0b5fa5">endpoint — Perlmutter</text>
+    <text x="855" y="113" text-anchor="middle" font-size="15"
+          fill="#5a6a7a">rhapsody · psij · queue_info · …</text>
+
+    <rect x="740" y="165" width="230" height="70" rx="10"
+          fill="#f3f6f9" stroke="#0b5fa5" stroke-width="2"/>
+    <text x="855" y="194" text-anchor="middle" font-size="19" font-weight="bold"
+          fill="#0b5fa5">endpoint — Odo</text>
+    <text x="855" y="218" text-anchor="middle" font-size="15"
+          fill="#5a6a7a">batch job · reverse tunnel</text>
+
+    <rect x="740" y="270" width="230" height="70" rx="10"
+          fill="#f3f6f9" stroke="#0b5fa5" stroke-width="2"/>
+    <text x="855" y="299" text-anchor="middle" font-size="19" font-weight="bold"
+          fill="#0b5fa5">endpoint — child</text>
+    <text x="855" y="323" text-anchor="middle" font-size="15"
+          fill="#5a6a7a">spawned via IRI / SFAPI / psij</text>
+    <text x="855" y="372" text-anchor="middle" font-size="24"
+          fill="#5a6a7a">⋮</text>
+  </g>
+</svg>
+  <ul>
+    <li><b>Star</b>: one broker hub, every participant dials <em>out</em> —
+        no inbound port at any site, no facility deployment</li>
+    <li>One symmetric <b>msgpack envelope</b> (request/response · events ·
+        topology · control), routed by <b>src/dst</b>, correlated by corr_id</li>
+    <li>State: broker rewrite + ticket backlog <b>merged to devel</b>
+        (PRs #64–#96) · ~900 unit tests · CI-gated (3.10–3.12)</li>
+  </ul>
+</section>
+
+<!-- 3 ── ecosystem ─────────────────────────────────────────────────── -->
+<section class="slide">
+  <h1>Where ORBIT sits — RCT integration</h1>
+<pre>
+  <span class="hi">ROSE</span>        learn      sim + surrogate training + model selection loops
+  <span class="hi">AsyncFlow</span>   compose    async workflows, dependencies, campaigns
+  <span class="hi">RHAPSODY</span>    execute    ComputeTask + AITask in one allocation (Dragon)
+  <span class="hi">ORBIT</span>       connect    HPC resources ⇄ one workflow / campaign
+</pre>
+  <ul>
+    <li><b>RHAPSODY</b> — both directions: ORBIT's <em>rhapsody plugin</em> runs
+        tasks on the endpoint; RHAPSODY's <em>OrbitExecutionBackend</em> uses
+        ORBIT as its execution transport</li>
+    <li><b>ROSE</b> — ROSE-aaS: the active-learning loop as a broker-reachable
+        service (SURGE races in the m3dc1 / heat recipes)</li>
+    <li><b>RADICAL Pilot</b> — the <em>lucid plugin</em> wraps pilot/task
+        submission for the LUCID pipeline</li>
+    <li><b>Makeflow</b> — xGFabric routes Makeflow task graphs off WorkQueue
+        onto ORBIT endpoints</li>
+  </ul>
+</section>
+
+<!-- 4 ── design decisions ──────────────────────────────────────────── -->
+<section class="slide">
+  <h1>Design decisions — and who forced them</h1>
+  <table>
+    <tr><th>decision</th><th>why</th><th>forced by</th></tr>
+    <tr><td>outbound-only star</td>
+        <td>three sites, zero inbound firewall exceptions</td>
+        <td>xGFabric</td></tr>
+    <tr><td>broker hosts plugins</td>
+        <td>facility APIs (IRI/SFAPI) need no HPC-side process at all</td>
+        <td>AmSC</td></tr>
+    <tr><td>3-thread endpoint, transport-only liveness</td>
+        <td>slow plugin init (Dragon ~minutes) must not read as death</td>
+        <td>RHAPSODY</td></tr>
+    <tr><td>msgpack + frame cap + size-aware batching</td>
+        <td>10k-task submissions vs bounded frames</td>
+        <td>RHAPSODY</td></tr>
+    <tr><td>BatchSystem abstraction, normalized states</td>
+        <td>SLURM and PBSPro disagree on everything</td>
+        <td>all facilities</td></tr>
+    <tr><td>tunnel modes none / forward / reverse</td>
+        <td>each site blocks a different SSH direction</td>
+        <td>Perlmutter · Aurora · Odo</td></tr>
+    <tr><td>bearer-token ingress gate (interim)</td>
+        <td>prepared for multi-tenancy and mTLS security</td>
+        <td>AmSC security</td></tr>
+  </table>
+  <div class="note">Pattern: every structural feature traces to a concrete project
+       requirement — nothing speculative survived the rewrite.</div>
+</section>
+
+<!-- 5 ── AmSC ──────────────────────────────────────────────────────── -->
+<section class="slide">
+  <div class="kicker">project grounding · 1/4</div>
+  <h1>AmSC — laptop-driven AI at facility scale</h1>
+  <ul>
+    <li><b>Needs</b>: user-instantiated, user-configured AI backends on
+        Perlmutter / Odo / Frontier — driven from a laptop, nothing but an
+        allocation</li>
+    <li><b>Drove</b>: IRI plugins (iri_connect / per-endpoint instances),
+        the direct-SFAPI launch path, tunneled child endpoints, the
+        stellar-ai recipes as the packaging format</li>
+    <li><b>Runs</b>: fine-tuning/MATEY 16 nodes × 4 GPUs → <em>192 tasks</em> ·
+        m3dc1 SURGE race, MLflow-tracked ·
+        containerized heat via podman-hpc</li>
+    <li><b>Pain</b>: the NERSC IRI facade broke under us (slide 10) —
+        and broker deployment is an adoption hurdle (slide 11)</li>
+  </ul>
+  <div class="note">4 recipes live at
+       <span class="url">gitlab.com/amsc2/partner-integration/stellar-ai</span> ·
+       presented to the At-Scale Services WG yesterday</div>
+</section>
+
+<!-- 6 ── xGFabric ──────────────────────────────────────────────────── -->
+<section class="slide">
+  <div class="kicker">project grounding · 2/4</div>
+  <h1>xGFabric — three sites, one closed loop</h1>
+<pre>
+  UCSB (CSPOT wind sensors) ──▶ Notre Dame (OpenFOAM CFD, Makeflow)
+                                      │ 72 sims × 32 cores
+                                      ▼
+                     Perlmutter (PCR / PINN / FNO surrogate training)
+</pre>
+  <ul>
+    <li><b>Needs</b>: a pipeline that migrates onto whatever HPC is available,
+        the moment an allocation opens — across three administrative domains</li>
+    <li><b>Drove</b>: the outbound-only star itself; the xgfabric plugin
+        (pools endpoints <em>immediate</em> vs <em>allocate</em>, tracks
+        topology live); the Task Dispatcher as a placement-research vehicle</li>
+    <li><b>Status</b>: Makeflow→ORBIT routing works on a toy graph; real
+        OpenFOAM tasks mid-integration; XLOOP25 paper out (arXiv 2509.20340)</li>
+    <li><b>Pain</b>: three sites = three network policies and VPNs (slide 9)</li>
+  </ul>
+</section>
+
+<!-- 7 ── LUCID ─────────────────────────────────────────────────────── -->
+<section class="slide">
+  <div class="kicker">project grounding · 3/4</div>
+  <h1>LUCID — model serving meets HPC workflows</h1>
+  <ul>
+    <li><b>Needs</b>: couple ML/LLM model serving with imaging workflows
+        across <em>ALCF / NERSC / BNL</em> — DNA strand-break rates from
+        cell-painting fluorescence images</li>
+    <li><b>Drove</b>: portal integration, the Explorer; the "REST service
+        in front of a facility" pattern the gateway serves</li>
+    <li><b>Status</b>: self-paying perimeter functionality works; end-to-end
+        run against the provided Globus-drive data due this week</li>
+    <li><b>Pain</b>: general integration with the portal and with site
+        AAA — no common user identity exists across facilities</li>
+  </ul>
+</section>
+
+<!-- 8 ── ATOMIC ────────────────────────────────────────────────────── -->
+<section class="slide">
+  <div class="kicker">project grounding · 4/4</div>
+  <h1>ATOMIC — an iterative campaign as the consumer</h1>
+  <ul>
+    <li><b>Needs</b>: the ATOMIC Workflow Manager runs a temperature-ramp
+        loop — MD sim → label → train classifier → next temperature —
+        driven from a user-facing tool (OVITO integration)</li>
+    <li><b>The shape of the demand</b>:
+      <ul>
+        <li>long-lived iterative campaigns, not single jobs</li>
+        <li>launched by scientists who will never deploy a service —
+            the embedded-broker argument again (slide 11)</li>
+        <li>a community portal drawing on dynamically contributed
+            community resources</li>
+        <li>train + simulate concurrently → RHAPSODY over ORBIT</li>
+      </ul>
+    </li>
+    <li><b>Status</b>: requirements/WFM-architecture stage — ORBIT is the
+        planned connect layer, so ATOMIC's requirements doc is a <em>design
+        input now</em>, cheap to accommodate, expensive to retrofit</li>
+  </ul>
+</section>
+
+<!-- 9 ── pain: network policies ────────────────────────────────────── -->
+<section class="slide">
+  <div class="kicker">pain point · 1/3</div>
+  <h1>Every facility blocks a different direction</h1>
+  <table class="mono">
+    <tr><th>site</th><th>policy</th><th>what we do</th></tr>
+    <tr><td>Perlmutter</td>
+        <td>compute→login SSH allowed; arbitrary outbound ports OK</td>
+        <td><em>forward</em> tunnel: child opens ssh -L via login node</td></tr>
+    <tr><td>Aurora</td>
+        <td>same direction as Perlmutter</td>
+        <td><em>forward</em> tunnel</td></tr>
+    <tr><td>Odo</td>
+        <td>compute→login <em>blocked</em>; login→compute allowed</td>
+        <td><em>reverse</em> tunnel: parent-side watcher spawns ssh -R,
+            rendezvous file on shared FS</td></tr>
+    <tr><td>OLCF / ALCF egress</td>
+        <td>unverified for non-443 ports</td>
+        <td>to check — decides the transport question (slide 12)</td></tr>
+  </table>
+  <ul>
+    <li>Tunnel failures surface as job <b>FAILED with recorded reason</b> —
+        clients bail early instead of polling a dead allocation</li>
+    <li><b>IRI-launched jobs give no login-node foothold</b> — that inhibits
+        reverse tunnels (ticket open; direct SFAPI does allow it)</li>
+  </ul>
+</section>
+
+<!-- 10 ── pain: IRI/SFAPI ──────────────────────────────────────────── -->
+<section class="slide">
+  <div class="kicker">pain point · 2/3</div>
+  <h1>Facility APIs are moving targets</h1>
+  <ul>
+    <li><b>NERSC IRI facade broken server-side</b> since ~June 17:
+        all /compute/* → 404 wrapping "Unable to get sfapi data: 500" —
+        ticket open with operators</li>
+    <li><b>SFAPI single-job status route is blind</b> for finished jobs —
+        we poll via the LIST route instead (second ticket open)</li>
+    <li><b>Workaround shipped</b>: direct-SFAPI launch path, validated
+        end-to-end on Perlmutter — PR #102 (feature/sfapi), pending merge</li>
+    <li><b>Design lesson</b>: never depend on a single launch path —
+        IRI, direct SFAPI, and direct scheduler (psij) stay
+        <em>interchangeable per resource</em>; tokens live in process
+        memory only, so swapping paths never touches disk</li>
+  </ul>
+</section>
+
+<!-- 11 ── pain: deployment burden ──────────────────────────────────── -->
+<section class="slide">
+  <div class="kicker">pain point · 3/3</div>
+  <h1>Broker deployment is challenging for end users</h1>
+  <ul>
+    <li>Today a user needs: a <b>public host</b> + TLS cert + token
+        distribution to every participant — <em>before hello-world runs</em></li>
+    <li>That is a significant adoption blocker reported from AmSC uptake</li>
+    <li>Root cause — the broker implements <b>two roles</b>:
+      <ul>
+        <li><b>smart edge</b>: plugin host, session owner, topology view</li>
+        <li><b>dumb middle</b>: route by src/dst, correlate, fan out events</li>
+      </ul>
+    </li>
+    <li>The smart half doesn't need a public IP at all —
+        only the dumb half does → next slide</li>
+  </ul>
+</section>
+
+<!-- 12 ── direction ────────────────────────────────────────────────── -->
+<section class="slide">
+  <div class="kicker">design direction — for discussion</div>
+  <h1>Embedded broker + a dumb shared middle</h1>
+<svg width="1000" height="215" viewBox="0 20 1000 215"
+     style="display: block; width: auto; height: 28vh; margin: 0.5vh auto 1.5vh; flex: 0 0 auto"
+     role="img"
+     aria-label="Embedded-broker direction: clients with in-process broker plugins and HPC endpoints all dial out to one shared rendezvous that sees ciphertext only">
+  <defs>
+    <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#5a6a7a"/>
+    </marker>
+  </defs>
+
+  <g stroke="#5a6a7a" stroke-width="2" fill="none" marker-end="url(#arr2)">
+    <line x1="290" y1="65"  x2="376" y2="95"/>
+    <line x1="290" y1="160" x2="376" y2="128"/>
+    <line x1="730" y1="65"  x2="644" y2="95"/>
+    <line x1="730" y1="160" x2="644" y2="128"/>
+  </g>
+  <text x="335" y="35" text-anchor="middle" font-size="15" font-weight="bold"
+        fill="#b3541e">outbound WSS</text>
+  <text x="665" y="35" text-anchor="middle" font-size="15" font-weight="bold"
+        fill="#b3541e">outbound WSS</text>
+
+  <!-- clients (left) -->
+  <rect x="30" y="35" width="260" height="60" rx="10"
+        fill="#f3f6f9" stroke="#0b5fa5" stroke-width="2"/>
+  <text x="160" y="61" text-anchor="middle" font-size="18" font-weight="bold"
+        fill="#0b5fa5">client A — embedded broker</text>
+  <text x="160" y="83" text-anchor="middle" font-size="14"
+        fill="#5a6a7a">plugins in-process · no public IP</text>
+
+  <rect x="30" y="130" width="260" height="60" rx="10"
+        fill="#f3f6f9" stroke="#0b5fa5" stroke-width="2"/>
+  <text x="160" y="156" text-anchor="middle" font-size="18" font-weight="bold"
+        fill="#0b5fa5">client B — embedded broker</text>
+  <text x="160" y="178" text-anchor="middle" font-size="14"
+        fill="#5a6a7a">another user, same middle</text>
+  <text x="160" y="222" text-anchor="middle" font-size="22"
+        fill="#5a6a7a">⋮</text>
+
+  <!-- shared rendezvous (center) -->
+  <rect x="380" y="55" width="260" height="105" rx="12"
+        fill="#eaf2f9" stroke="#b3541e" stroke-width="3"/>
+  <text x="510" y="88" text-anchor="middle" font-size="21" font-weight="bold"
+        fill="#b3541e">shared rendezvous</text>
+  <text x="510" y="114" text-anchor="middle" font-size="14"
+        fill="#1a2330">relay / pubsub — ciphertext only</text>
+  <text x="510" y="138" text-anchor="middle" font-size="14"
+        fill="#1a2330">one instance · many users</text>
+  <text x="510" y="188" text-anchor="middle" font-size="14"
+        fill="#5a6a7a">zero trust required in the middle</text>
+
+  <!-- endpoints (right) -->
+  <rect x="730" y="35" width="240" height="60" rx="10"
+        fill="#f3f6f9" stroke="#0b5fa5" stroke-width="2"/>
+  <text x="850" y="61" text-anchor="middle" font-size="18" font-weight="bold"
+        fill="#0b5fa5">endpoints — user A</text>
+  <text x="850" y="83" text-anchor="middle" font-size="14"
+        fill="#5a6a7a">HPC batch jobs, as today</text>
+
+  <rect x="730" y="130" width="240" height="60" rx="10"
+        fill="#f3f6f9" stroke="#0b5fa5" stroke-width="2"/>
+  <text x="850" y="156" text-anchor="middle" font-size="18" font-weight="bold"
+        fill="#0b5fa5">endpoints — user B</text>
+  <text x="850" y="178" text-anchor="middle" font-size="14"
+        fill="#5a6a7a">isolated by session key</text>
+  <text x="850" y="222" text-anchor="middle" font-size="22"
+        fill="#5a6a7a">⋮</text>
+</svg>
+  <ul class="dense">
+    <li><b>Embed the smart half in the client</b> — mostly packaging: the
+        broker is already "just a participant" hosting plugins</li>
+    <li><b>The middle becomes immediately multi-tenant</b> once envelope
+        bodies are E2E-encrypted (key shared like today's token): zero
+        trust in the relay → <em>one</em> instance serves everyone →
+        deployment burden reduced</li>
+    <li><b>Two candidate middles — current analysis: relay-first</b>
+      <ul>
+        <li><em>dumb WSS relay</em>: keeps envelope, framing, transport-level
+            liveness intact; works wherever today's broker works —
+            pubsub instead forces app-level heartbeats + reinventing
+            suspect/lost, and raw Redis on 6379 is exactly what strict
+            egress filters catch</li>
+        <li><em>managed pubsub</em> earns its rewrite only if replay /
+            persistence becomes a requirement — then Redis
+            <em>Streams</em>, not plain pub/sub</li>
+        <li>relay-first also decouples the steps: embed plugins in the
+            client <em>now</em> (cheap), swap the transport <em>later,
+            if ever</em> (expensive)</li>
+      </ul>
+    </li>
+    <li><b>Deciding datum</b>: OLCF/ALCF egress — Perlmutter verified open;
+        if OLCF is 443/proxy-only, the relay wins outright</li>
+    <li><b>Open</b>: broker lifetime = client lifetime; multi-client
+        endpoint sharing; where the Explorer lives</li>
+  </ul>
+</section>
+
+<!-- 13 ── wrap ─────────────────────────────────────────────────────── -->
+<section class="slide">
+  <h1>Status &amp; next steps</h1>
+  <ul>
+    <li><b>Done</b>: broker rewrite + ticket backlog merged to devel
+        (PRs #64–#96) · ~900 tests, CI-gated · AmSC recipes live ·
+        WG presentation delivered</li>
+    <li><b>In flight</b>:
+      <ul>
+        <li>PR #102 — direct-SFAPI path (validated; pending from-scratch
+            re-test + merge)</li>
+        <li>xGFabric: real OpenFOAM tasks onto ORBIT</li>
+        <li>LUCID: end-to-end run against drive data this week</li>
+      </ul>
+    </li>
+    <li><b>Next</b>:
+      <ul>
+        <li>issue #93 — finish job-state-vocab normalization</li>
+        <li>OLCF / ALCF egress checks → transport decision</li>
+        <li>ticket: broker-embedded-on-client as the default deployment</li>
+        <li>track the two NERSC tickets (IRI facade · status route)</li>
+      </ul>
+    </li>
+    <li><em>Discussion: does the embedded-broker + shared-relay direction
+        hold up against your project's constraints?</em></li>
+  </ul>
+</section>
+
+<div class="foot">
+  <span>ORBIT · RADICAL group call · 2026-07-15</span>
+  <span id="pagenum"></span>
+</div>
+
+<script>
+  const slides = [...document.querySelectorAll('.slide')];
+  let cur = 0;
+  function show(i) {
+    cur = Math.max(0, Math.min(slides.length - 1, i));
+    slides.forEach((s, k) => s.classList.toggle('active', k === cur));
+    document.getElementById('pagenum').textContent = (cur + 1) + ' / ' + slides.length;
+  }
+  document.addEventListener('keydown', e => {
+    if (['ArrowRight', 'PageDown', ' '].includes(e.key)) show(cur + 1);
+    else if (['ArrowLeft', 'PageUp'].includes(e.key))    show(cur - 1);
+    else if (e.key === 'Home') show(0);
+    else if (e.key === 'End')  show(slides.length - 1);
+    else if (e.key === 'f')    document.documentElement.requestFullscreen?.();
+  });
+  document.addEventListener('click', () => show(cur + 1));
+  show(0);
+</script>
+</body>
+</html>
