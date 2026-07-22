@@ -55,10 +55,15 @@ def main():
 
     rt = EndpointRuntime()
     rt.start(wait=True)
-    eids = [n for n in rt.topology() if n != 'broker']
+
+    # topology() also lists the broker and this script's own consumer
+    # participant (role='consumer'); keep only real endpoints hosting 'psij'.
+    eids = [n for n, info in rt.topology().items()
+            if info.get('role') == 'endpoint'
+            and 'psij' in (info.get('plugins') or {})]
 
     if not eids:
-        print("No endpoints found.")
+        print("No endpoint with the 'psij' plugin found.")
         return
 
     eid = None

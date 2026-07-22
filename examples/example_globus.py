@@ -61,14 +61,20 @@ def main():
 
     rt   = EndpointRuntime()
     rt.start(wait=True)
-    eids = [n for n in rt.topology() if n != 'broker']
 
-    if not eids:
-        print('No endpoints connected - start an endpoint service first')
+    # topology() also lists the broker and this script's own consumer
+    # participant (role='consumer'); pick a real endpoint hosting 'globus'.
+    eid = next((n for n, info in rt.topology().items()
+                if info.get('role') == 'endpoint'
+                and 'globus' in (info.get('plugins') or {})), None)
+
+    if not eid:
+        print('No endpoint with the "globus" plugin found - '
+              'start an endpoint service first')
         rt.stop()
         return
 
-    globus = rt.get_plugin(eids[0], 'globus')
+    globus = rt.get_plugin(eid, 'globus')
 
     # Register a session carrying the Globus token.
     globus.register_session(**_auth_kwargs())

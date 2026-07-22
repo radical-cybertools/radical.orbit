@@ -27,13 +27,22 @@ def main():
     # ---- connect to the broker ----
     rt  = EndpointRuntime()
     rt.start(wait=True)
-    eids = [n for n in rt.topology() if n != 'broker']
 
-    if not eids:
-        print("No endpoints found.")
+    # The topology lists every participant, including the broker and this
+    # script's own consumer participant (rt.name).  Find every endpoint that
+    # actually hosts the rhapsody plugin, rather than indexing blindly.
+    topo = rt.topology()
+    rh_eids = [n for n, info in topo.items()
+               if n not in ('broker', rt.name)
+               and 'rhapsody' in (info.get('plugins') or {})]
+
+    if not rh_eids:
+        print("No endpoint with the 'rhapsody' plugin found.")
         return
 
-    eid = eids[1]
+    print(f"Endpoints exposing the 'rhapsody' plugin: {rh_eids}")
+
+    eid = rh_eids[0]
     print(f"Using endpoint: {eid}")
 
     rh = rt.get_plugin(eid, 'rhapsody')
