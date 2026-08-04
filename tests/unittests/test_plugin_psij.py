@@ -31,6 +31,13 @@ def mock_psij():
         yield mock
 
 
+def test_plugin_psij_enabled_on_broker():
+    # psij must load on a broker too (embedded broker on a login node)
+    app = FastAPI()
+    app.state.is_broker = True
+    assert PluginPSIJ.is_enabled(app)
+
+
 def test_plugin_psij_init():
     app = FastAPI()
     plugin = PluginPSIJ(app)
