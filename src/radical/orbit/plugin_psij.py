@@ -681,8 +681,9 @@ class PluginPSIJ(Plugin):
 
     @classmethod
     def is_enabled(cls, app: FastAPI) -> bool:
-        """PsiJ loads on endpoint nodes (login or compute) — not on the broker."""
-        return not getattr(app.state, 'is_broker', False)
+        """PsiJ loads on any host, including a broker embedded on a login
+        node — batch system access matters, not the participant role."""
+        return True
 
     def __init__(self, app: FastAPI, instance_name: str = "psij"):
         super().__init__(app, instance_name)
