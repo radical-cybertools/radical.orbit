@@ -778,6 +778,8 @@ class RhapsodyClient(PluginClient):
 
         - Encodes callable ``function``, ``args``, ``kwargs`` via
           cloudpickle + base64.
+        - Encodes ``metadata`` the same way when it is not JSON-safe
+          (e.g. asyncflow dependency descriptors carry raw callables).
         - Strips non-serializable internal fields (``future``,
           ``_future``, ``backend``).
         """
@@ -791,8 +793,8 @@ class RhapsodyClient(PluginClient):
             if 'function' not in pickled_fields:
                 pickled_fields.append('function')
 
-        # Serialize args/kwargs if not JSON-safe
-        for field in ('args', 'kwargs'):
+        # Serialize args/kwargs/metadata if not JSON-safe
+        for field in ('args', 'kwargs', 'metadata'):
             val = td.get(field)
             if val is None:
                 continue

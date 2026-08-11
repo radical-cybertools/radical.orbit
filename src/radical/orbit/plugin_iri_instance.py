@@ -53,9 +53,11 @@ IRI_POLL_INTERVAL = 10.0
 def _iri_extract_message(resp: httpx.Response) -> str:
     '''Extract a human-readable error message from an IRI error response.'''
     import json as _json
+    snippet = ' '.join(resp.text.split())[:200]
     try:
         body = resp.json()
-        msg  = body.get('detail', body.get('title', resp.text[:200]))
+        msg  = body.get('detail') or body.get('title') \
+                                  or body.get('message') or snippet
         # detail may itself embed JSON (e.g. S3M wraps inner errors)
         if isinstance(msg, str) and '{' in msg:
             try:
@@ -67,27 +69,34 @@ def _iri_extract_message(resp: httpx.Response) -> str:
                 pass
         return str(msg)
     except Exception:
-        return resp.text[:200]
+        return snippet
 
 
 def _iri_raise(resp: httpx.Response, context: str = '') -> None:
-    '''Map IRI API HTTP errors to HTTPExceptions.'''
+    '''Map IRI API HTTP errors to HTTPExceptions.
+
+    The upstream diagnostic (JSON ``detail``/``title``/``message``, or a raw
+    body snippet) is appended to the generic message so the real cause is
+    not swallowed — e.g. a NERSC 404 whose body carries
+    ``detail: Unable to get sfapi data: 500``.
+    '''
     if resp.is_success:
         return
 
     prefix = f'IRI {context}: ' if context else 'IRI: '
     sc     = resp.status_code
+    msg    = _iri_extract_message(resp)
+    suffix = f' — {msg}' if msg else ''
 
     if   sc == 401:
-        raise HTTPException(status_code=401, detail=f'{prefix}token expired or invalid')
+        raise HTTPException(status_code=401, detail=f'{prefix}token expired or invalid{suffix}')
     elif sc == 403:
-        raise HTTPException(status_code=403, detail=f'{prefix}forbidden')
+        raise HTTPException(status_code=403, detail=f'{prefix}forbidden{suffix}')
     elif sc == 404:
-        raise HTTPException(status_code=404, detail=f'{prefix}resource or job not found')
+        raise HTTPException(status_code=404, detail=f'{prefix}resource or job not found{suffix}')
     elif sc == 429:
-        raise HTTPException(status_code=429, detail=f'{prefix}rate limited by IRI endpoint')
+        raise HTTPException(status_code=429, detail=f'{prefix}rate limited by IRI endpoint{suffix}')
     else:
-        msg = _iri_extract_message(resp)
         raise HTTPException(status_code=502, detail=f'{prefix}{msg}')
 
 

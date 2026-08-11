@@ -20,8 +20,9 @@
 #  dispatcher's staging pass-through without a shared filesystem.
 # ============================================================================
 
+POOLS = "pools.json"
+
 # -- Pool 1: CPU pool on endpoint_a -----------------------------------------------
-ENDPOINT = "endpoint_a"
 POOL = "cpu"
 PRIORITY = 0
 
@@ -32,7 +33,6 @@ clean.txt: raw.txt
 	tr -cd 'A-Za-z0-9\n' < raw.txt > clean.txt
 
 # -- Pool 2: GPU pool on endpoint_b -----------------------------------------------
-ENDPOINT = "endpoint_b"
 POOL = "gpu"
 PRIORITY = 10
 
@@ -42,7 +42,6 @@ counts.txt: clean.txt
 	wc -c < clean.txt > counts.txt
 
 # -- Back to endpoint_a for final aggregation -------------------------------------
-ENDPOINT = "endpoint_a"
 POOL = "cpu"
 PRIORITY = 20
 

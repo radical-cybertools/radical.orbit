@@ -47,24 +47,47 @@ For HTTPS, generate a self-signed cert first:
 openssl req -x509 -newkey rsa:4096 -nodes -keyout key.pem -out cert.pem -days 365 -subj "/CN=localhost"
 ```
 
+### Embedded broker
+
+A consumer client can host the full broker (routing + hosted plugins +
+gateway) inside its own process instead of connecting out:
+`EndpointRuntime(embedded=True)` (implementation: `embedded.py`,
+`EmbeddedBroker`). The embedded broker binds port 8000 (falls back to an
+ephemeral port with a warning when taken), uses the same operator-placed
+cert/key/token as a standalone broker, and never writes under
+`~/.radical/orbit`. Remote endpoints connect to `rt.broker_url` exactly as
+they would to a standalone broker; `submit_tunneled` children inherit that
+URL automatically. `embedded=True` skips URL resolution entirely (an ambient
+`$RADICAL_ORBIT_BROKER_URL` is ignored); combining it with an explicit
+`broker_url` raises. For host/port/auth/plugin control, construct
+`EmbeddedBroker` directly and pass `broker_url=eb.url`. The standalone
+`radical-orbit-broker.py` remains the deployment for shared, multi-client
+brokers.
+
 ### Ingress auth token
 
 The broker gates its HTTP ingress and the endpoint `/register` handshake with a
-**shared bearer token**. On first start it generates one and writes it to
-`~/.radical/orbit/broker.token` (0600); the token value is **never** printed to
-stdout (only its source/path), so it can't leak into captured logs (CWE-532) —
-read it from the file. Resolution
-(client/endpoint side): `--token` > `$RADICAL_ORBIT_BROKER_TOKEN` >
+**shared bearer token**. Like the cert/key pair, the token is operator-placed —
+the software never generates or writes it (`~/.radical/orbit` config is
+read-only for the code; `utils.TOKEN_RECIPE` / `radical-orbit-broker.py --help`
+carry the one-time creation recipe). The token value is **never** printed to
+stdout (only its source/path), so it can't leak into captured logs (CWE-532).
+Resolution (both sides): `--token` > `$RADICAL_ORBIT_BROKER_TOKEN` >
 `~/.radical/orbit/broker.token` — so same-host clients/endpoints pick it up with
-no config; for a remote broker, copy the token or set the env var. The Explorer
-prompts for it and then rides an HttpOnly cookie minted by `POST /auth`. Disable
-the gate for local dev with `--no-auth` (or `RADICAL_ORBIT_BROKER_NO_AUTH=1`).
-Helpers live in `utils.py`
-(`resolve_broker_token`, `ensure_broker_token`, `auth_disabled`, `tokens_match`);
+no config; for a remote broker, copy the token or set the env var. The broker
+refuses to start without a token unless auth is disabled explicitly:
+`auth=False` on the `Broker` ctor / `--no-auth` on the bin (local dev only; no
+env-var escape hatch). The Explorer prompts for the token and then rides an
+HttpOnly cookie minted by `POST /auth`. Helpers live in `utils.py`
+(`resolve_broker_token`, `tokens_match`, `TOKEN_RECIPE`, `TLS_RECIPE`);
 the broker core gates the WS `/register` handshake (`Broker._auth_dispatch`) and
 the gateway gates HTTP ingress (`Gateway._auth_dispatch`, minting the `/auth`
 cookie). This is the interim credential; a future per-participant identity
 (mTLS) generalizes it.
+
+The broker URL similarly has **no file fallback**: clients/endpoints resolve it
+from the API/CLI arg > `$RADICAL_ORBIT_BROKER_URL` only (a stale on-disk URL
+was a recurring source of confusion).
 
 ## Testing
 

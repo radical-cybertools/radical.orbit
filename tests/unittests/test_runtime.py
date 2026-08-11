@@ -168,7 +168,6 @@ class _RunningBroker:
 def harness(self_signed, tmp_path, monkeypatch):
     """Factory yielding (make_broker, make_runtime); tears everything down."""
     from radical.orbit import utils
-    monkeypatch.setattr(utils, 'URL_FILE',   tmp_path / 'broker.url')
     monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'broker.token')
     monkeypatch.delenv('RADICAL_ORBIT_BROKER_TOKEN', raising=False)
     monkeypatch.delenv('RADICAL_ORBIT_BROKER_URL',   raising=False)
@@ -183,7 +182,7 @@ def harness(self_signed, tmp_path, monkeypatch):
         for _k in list(kw):
             if hasattr(tuning, _k):
                 setattr(tuning, _k, kw.pop(_k))
-        defaults = dict(cert=str(cert), key=str(key), no_auth=True, tuning=tuning)
+        defaults = dict(cert=str(cert), key=str(key), auth=False, tuning=tuning)
         defaults.update(kw)
         broker = Broker(**defaults)
         srv = _RunningBroker(broker, ws_ping_interval, ws_ping_timeout).start()
@@ -783,3 +782,77 @@ def test_runtime_response_headers_case_insensitive():
     assert r.headers.get('Content-Type') == 'application/json'
     assert r.headers.get('content-type') == 'application/json'
     assert r.json() == {}
+
+
+# ---------------------------------------------------------------------------
+# fatal-error surfacing: bad credential and TLS pin mismatch fail fast
+# ---------------------------------------------------------------------------
+
+def test_invalid_credential_is_fatal_and_actionable(harness):
+    make_broker, make_runtime = harness
+    srv = make_broker(auth=True, token='sekret-token')
+
+    # wait=False: the fatal flag + actionable reason are observable
+    rt = make_runtime(srv.url, token='wrong-token', wait=False)
+    assert _wait(lambda: rt.fatal, timeout=10.0)
+    assert 'invalid credential' in rt.fatal_reason
+    # names the *configured* source (the token was passed explicitly here),
+    # plus the generic remediation
+    assert 'passed explicitly' in rt.fatal_reason
+    assert 'broker.token'      in rt.fatal_reason
+    assert rt.wait_registered(timeout=0.1) is False
+
+    # wait=True: start() raises instead of burning the whole timeout
+    from radical.orbit.runtime import EndpointRuntime
+    rt2 = EndpointRuntime(broker_url=srv.url, token='also-wrong',
+                          backoff_start=0.05, backoff_max=0.2)
+    try:
+        with pytest.raises(RuntimeError, match='invalid credential'):
+            rt2.start(wait=True, timeout=10.0)
+    finally:
+        rt2.stop()
+
+
+def test_tls_pin_mismatch_is_fatal_and_actionable(self_signed, tmp_path,
+                                                  monkeypatch):
+    # The shared harness serves plain HTTP; the pin-mismatch path needs a
+    # real TLS listener.  Any TLS server will do — the handshake fails
+    # before a single protocol frame is exchanged.
+    import http.server
+    import ssl as _ssl
+
+    from radical.orbit import utils
+    monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'broker.token')
+    monkeypatch.delenv('RADICAL_ORBIT_BROKER_TOKEN', raising=False)
+
+    srv_cert, srv_key = self_signed
+    httpd = http.server.HTTPServer(
+        ('127.0.0.1', 0), http.server.BaseHTTPRequestHandler)
+    sctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+    sctx.load_cert_chain(str(srv_cert), str(srv_key))
+    httpd.socket = sctx.wrap_socket(httpd.socket, server_side=True)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+    # a *different* self-signed cert — the pin cannot match the server's
+    other_cert = tmp_path / 'other_cert.pem'
+    other_key  = tmp_path / 'other_key.pem'
+    subprocess.run(
+        ['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+         '-keyout', str(other_key), '-out', str(other_cert),
+         '-days', '1', '-subj', '/CN=localhost'],
+        check=True, capture_output=True)
+
+    from radical.orbit.runtime import EndpointRuntime
+    rt = EndpointRuntime(broker_url=f'https://127.0.0.1:{port}',
+                         cert=str(other_cert), token=None,
+                         backoff_start=0.05, backoff_max=0.2)
+    try:
+        with pytest.raises(RuntimeError, match='refresh it from the broker'):
+            rt.start(wait=True, timeout=10.0)
+        assert rt.fatal
+        assert 'broker_cert.pem' in rt.fatal_reason
+    finally:
+        rt.stop()
+        httpd.shutdown()
+        httpd.server_close()

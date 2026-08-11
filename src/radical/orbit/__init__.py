@@ -24,11 +24,13 @@ Endpoint = EndpointRuntime
 
 # ── Plugins ──────────────────────────────────────────────────────────────────
 
-from .plugin_xgfabric    import PluginXGFabric    # noqa: F401
-from .plugin_iri_connect import PluginIRIConnect  # noqa: F401
-from .plugin_queue_info  import PluginQueueInfo   # noqa: F401
+from .plugin_xgfabric      import PluginXGFabric      # noqa: F401
+from .plugin_iri_connect   import PluginIRIConnect    # noqa: F401
+from .plugin_sfapi_connect import PluginSFAPIConnect  # noqa: F401
+from .plugin_queue_info    import PluginQueueInfo     # noqa: F401
 from .plugin_sysinfo    import PluginSysInfo  # noqa: F401
 from .plugin_staging    import PluginStaging  # noqa: F401
+from .plugin_math       import PluginMath     # noqa: F401
 from .plugin_task_dispatcher import PluginTaskDispatcher  # noqa: F401
 from .plugin_replay      import PluginReplay  # noqa: F401
 

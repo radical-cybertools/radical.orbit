@@ -49,9 +49,11 @@ import os
 import signal
 import threading
 
-from contextlib  import asynccontextmanager
-from dataclasses import dataclass
-from typing      import Any, Callable, Dict, List, Optional, Tuple
+from contextlib   import asynccontextmanager
+from dataclasses  import dataclass
+from pathlib      import Path
+from typing       import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import msgpack
 
@@ -207,7 +209,7 @@ class Broker:
     """The active broker — lean routing loop + own-thread plugin host.
 
     The constructor takes the handful of things an operator sets — ``app``,
-    ``cert``/``key``, ``host``/``port``, ``plugins``, ``token``/``no_auth`` and
+    ``cert``/``key``, ``host``/``port``, ``plugins``, ``token``/``auth`` and
     ``gateway``.  The liveness/backpressure knobs are grouped in an optional
     :class:`BrokerTuning` object (unit tests pass one with tiny timeouts, or
     mutate the resulting ``self._*`` attributes, so no test sleeps for real).
@@ -221,7 +223,7 @@ class Broker:
                  port:     int = 8000,
                  plugins:  str = '',
                  token:    Optional[str]     = None,
-                 no_auth:  bool              = False,
+                 auth:     bool              = True,
                  gateway:  bool              = True,
                  tuning:   Optional[BrokerTuning] = None):
 
@@ -232,11 +234,22 @@ class Broker:
         self._key : str = str(key_path)
 
         # ── Ingress auth token ────────────────────────────────────────
-        self._auth_enabled: bool          = not utils.auth_disabled(no_auth)
+        # Auth is on by default and requires an operator-placed token;
+        # nothing is ever generated or written (``~/.radical/orbit`` config
+        # is read-only for the software).  ``auth=False`` (``--no-auth``)
+        # is the explicit local-dev escape hatch.
+        self._auth_enabled: bool          = auth
         self._token:        Optional[str] = None
         self._token_source: str           = 'disabled'
         if self._auth_enabled:
-            self._token, self._token_source = utils.ensure_broker_token(cli=token)
+            self._token, self._token_source = \
+                                        utils.resolve_broker_token(cli=token)
+            if not self._token:
+                raise ValueError(
+                    f'ingress auth token required (no --token, '
+                    f'${utils.ENV_TOKEN} unset, no file at '
+                    f'{utils.TOKEN_FILE}).  Pass auth=False (--no-auth) '
+                    f'for local dev, or create one:\n\n{utils.TOKEN_RECIPE}')
 
         # ── Advertised URL ───────────────────────────────────────────
         self._host = host
@@ -516,42 +529,94 @@ class Broker:
     # ── run (uvicorn) ─────────────────────────────────────────────────
 
     @staticmethod
-    def _url_announce_lines(url_forms: List[str], env_var: str) -> List[str]:
-        """Startup URL banner + a copy-paste help line.
+    def _tilde(path: Any) -> str:
+        """Contract the ``$HOME`` prefix to ``~`` for display."""
+        s    = str(path)
+        home = str(Path.home())
+        if s == home or s.startswith(home + os.sep):
+            return '~' + s[len(home):]
+        return s
+
+    @staticmethod
+    def _scp_src(path: Any) -> str:
+        """Remote-side scp source path: home-relative when under ``$HOME``
+        (scp resolves relative remote paths against the remote home),
+        absolute otherwise.  Composed on the broker host, so the local
+        home IS the remote home of the scp lines we print."""
+        s    = str(path)
+        home = str(Path.home())
+        if s.startswith(home + os.sep):
+            return s[len(home) + 1:]
+        return s
+
+    @staticmethod
+    def _startup_banner(url_forms: List[str], cert_path: str,
+                        token_source: str, auth_enabled: bool) -> str:
+        """One-print startup banner: credential status, listen URLs, and
+        copy-paste bootstrap blocks for clients and endpoints.
 
         Each advertised URL is the canonical FQDN/IP form and carries no
-        ``/register`` (the endpoint appends that); the help line exports the
-        env var endpoints and clients resolve the broker URL from.
+        ``/register`` (the endpoint appends that).  The scp lines point at
+        the broker host's on-disk cert / token; when the token came from
+        ``--token`` / ``$RADICAL_ORBIT_BROKER_TOKEN`` there is nothing on
+        disk to copy, so the client block carries an export placeholder
+        instead.  The token value itself is never echoed (CWE-532) — the
+        banner only names paths and sources.
         """
-        lines = [f'[Broker] URL: {form}' for form in url_forms]
-        if url_forms:
-            lines.append('[Broker] to connect an endpoint or client, run first:')
-            lines.append(f'    export {env_var}={url_forms[0]}')
-        return lines
+        lines = [f'[Broker] {"using":<10}{"cert":<6}at '
+                 f'{Broker._tilde(cert_path)}']
+        if not auth_enabled:
+            lines.append('[Broker] WARNING: ingress authentication DISABLED '
+                         '(--no-auth)')
+        elif token_source == 'file':
+            lines.append(f'[Broker] {"using":<10}{"token":<6}at '
+                         f'{Broker._tilde(utils.TOKEN_FILE)}')
+        else:  # 'cli' / 'env' — configured, but not at the default file path
+            src = '--token' if token_source == 'cli' else f'${utils.ENV_TOKEN}'
+            lines.append(f'[Broker] {"using":<10}{"token":<6}from {src}')
+        lines += [f'[Broker] {"listening":<10}{"":<6}on {form}'
+                  for form in url_forms]
 
-    def run(self) -> None:
-        """Start uvicorn.  Blocks until shutdown."""
-        import uvicorn
+        if not url_forms:
+            return '\n'.join(lines)
 
-        for line in self._url_announce_lines(self._url_forms, utils.ENV_URL):
-            print(line, flush=True)
-        # Lifespan (startup/shutdown) is attached at FastAPI construction.
-        # Never echo the token (CWE-532); report only its source/path.
-        if not self._auth_enabled:
-            log.warning("[Broker] ingress authentication DISABLED (--no-auth)")
-            print('[Broker] WARNING: ingress authentication DISABLED '
-                  '(--no-auth)', flush=True)
-        elif self._token_source in ('generated', 'file'):
-            verb = ('generated and written to' if self._token_source
-                    == 'generated' else 'loaded from')
-            print(f'[Broker] auth token {verb}: {utils.TOKEN_FILE}', flush=True)
+        host       = urlparse(url_forms[0]).hostname or url_forms[0]
+        export_url = f'    export {utils.ENV_URL}={url_forms[0]}'
+        mkdir      = 'mkdir -p ~/.radical/orbit'
+
+        # Cert copy: when the cert sits at its default path it keeps its
+        # basename; a custom path gets an explicit destination, because
+        # connecting hosts resolve ~/.radical/orbit/broker_cert.pem.
+        if Path(cert_path) == utils.CERT_FILE:
+            cp_cert = (f'    {mkdir} && scp {host}:'
+                       f'{Broker._scp_src(cert_path)} ~/.radical/orbit/')
+            cp_both = (f'    {mkdir} && scp {host}:'
+                       f'{Broker._scp_src(utils.DEFAULT_DIR)}'
+                       f'/{{broker_cert.pem,broker.token}} ~/.radical/orbit/')
         else:
-            print(f'[Broker] auth token source: {self._token_source}', flush=True)
+            cp_cert = (f'    {mkdir} && scp {host}:'
+                       f'{Broker._scp_src(cert_path)} '
+                       f'~/.radical/orbit/broker_cert.pem')
+            cp_both = (cp_cert + f' && scp {host}:'
+                       f'{Broker._scp_src(utils.TOKEN_FILE)}'
+                       f' ~/.radical/orbit/')
 
-        uvicorn.run(self._app,
-                    host=self._host,
-                    port=self._port,
-                    reload=False,
+        if not auth_enabled:
+            lines += ['', '  On Client and Endpoint:', export_url, cp_cert]
+        elif token_source == 'file':
+            lines += ['', '  On Client:',   export_url, cp_both,
+                      '', '  On Endpoint:', export_url, cp_cert]
+        else:  # cli / env — the client needs the token via env, not a file
+            lines += ['', '  On Client:',   export_url,
+                      f'    export {utils.ENV_TOKEN}=<the configured token>',
+                      cp_cert,
+                      '', '  On Endpoint:', export_url, cp_cert]
+        lines.append('')
+        return '\n'.join(lines)
+
+    def _uvicorn_kwargs(self) -> dict:
+        """Server kwargs shared by ``run()`` and the embedded-broker server."""
+        return dict(reload=False,
                     ssl_certfile=self._cert,
                     ssl_keyfile=self._key,
                     log_level="info",
@@ -563,6 +628,25 @@ class Broker:
                     ws_ping_interval=self._ping_interval,
                     ws_ping_timeout=self._ping_timeout,
                     timeout_graceful_shutdown=3)
+
+    def run(self) -> None:
+        """Start uvicorn.  Blocks until shutdown."""
+        import uvicorn
+
+        # Lifespan (startup/shutdown) is attached at FastAPI construction.
+        # Single print for the whole banner; the token value is never
+        # echoed (CWE-532) — only its path / source.
+        print(self._startup_banner(self._url_forms, self._cert,
+                                   self._token_source, self._auth_enabled),
+              flush=True)
+        if not self._auth_enabled:
+            log.warning("[Broker] ingress authentication DISABLED "
+                        "(auth=False / --no-auth)")
+
+        uvicorn.run(self._app,
+                    host=self._host,
+                    port=self._port,
+                    **self._uvicorn_kwargs())
 
     @asynccontextmanager
     async def _lifespan(self, app: FastAPI):

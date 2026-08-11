@@ -1,27 +1,42 @@
-x-common-build: &common-build
+x-common-image: &common-image
   image: ${RADICAL_ORBIT_IMAGE:-radicalcybertools/radical.orbit}:${RADICAL_ORBIT_TAG:-latest}
-  build:
-    context: .
-    dockerfile: Dockerfile
-    args:
-      RADICAL_ORBIT_BRANCH: ${RADICAL_ORBIT_BRANCH:-master}
 
 services:
-  broker:
-    <<: *common-build
+
+  image-builder:
+    <<: *common-image
+    container_name: radical-orbit-image-builder
     build:
+      context: .
+      dockerfile: Dockerfile
       args:
-        GENERATE_BROKER_CERT: "true"
+        RADICAL_ORBIT_BRANCH: ${RADICAL_ORBIT_BRANCH:-master}
         BROKER_IP: "127.0.0.1"
         BROKER_HOSTNAME: ${RADICAL_ORBIT_BROKER_HOSTNAME:-broker}
+    command: [ "echo", "Build complete" ]
+    networks:
+      - radical-orbit-network
+
+  broker:
+    <<: *common-image
     container_name: radical-orbit-broker
     hostname: ${RADICAL_ORBIT_BROKER_HOSTNAME:-broker}
-    command: [ "radical-orbit-broker.py" ]
+    environment:
+      - GENERATE_BROKER_CREDS=true
+    # In production, the token value is never printed to the logs (CWE-532).
+    command:
+      - "bash"
+      - "-c"
+      - |
+        echo "==============================================="
+        echo "ORBIT Broker Token:"
+        echo "    $(cat ~/.radical/orbit/broker.token)"
+        echo "==============================================="
+        exec radical-orbit-broker.py
     healthcheck:
       test:
         - CMD-SHELL
-        - >-
-          python3 -c 'import socket; s=socket.socket(); s.settimeout(5); s.connect(("localhost", 8000)); s.close()'
+        - "timeout 1 bash -c '</dev/tcp/localhost/8000'"
       interval: 5s
       timeout: 10s
       retries: 15
@@ -32,30 +47,29 @@ services:
       - radical-orbit-volume:/app
     networks:
       - radical-orbit-network
+    depends_on:
+      image-builder:
+        condition: service_completed_successfully
 
   endpoint:
-    <<: *common-build
-    build:
-      args:
-        GENERATE_BROKER_CERT: "false"
+    <<: *common-image
     container_name: radical-orbit-endpoint
     hostname: endpoint
     environment:
       - RADICAL_ORBIT_BROKER_URL=https://${RADICAL_ORBIT_BROKER_HOSTNAME:-broker}:8000
-    command: [ "radical-orbit-endpoint.py" ]
+    command: [ "bash", "-c", "radical-orbit-endpoint-wrapper.sh -n $$(hostname)" ]
     volumes:
       - radical-orbit-volume:/app:ro
     networks:
       - radical-orbit-network
     depends_on:
+      image-builder:
+        condition: service_completed_successfully
       broker:
         condition: service_healthy
 
   client:
-    <<: *common-build
-    build:
-      args:
-        GENERATE_BROKER_CERT: "false"
+    <<: *common-image
     container_name: radical-orbit-client
     hostname: client
     environment:
@@ -66,6 +80,8 @@ services:
     networks:
       - radical-orbit-network
     depends_on:
+      image-builder:
+        condition: service_completed_successfully
       broker:
         condition: service_healthy
       endpoint:

@@ -27,8 +27,8 @@ def main():
     parser = argparse.ArgumentParser(description="ORBIT Service")
     parser.add_argument("--name",      "-n", nargs="?", help="Endpoint name")
     parser.add_argument("--url",       "-u", nargs="?",
-                        help="Broker URL.  CLI > $RADICAL_ORBIT_BROKER_URL > "
-                             "~/.radical/orbit/broker.url.")
+                        help="Broker URL.  CLI > $RADICAL_ORBIT_BROKER_URL "
+                             "(no file fallback).")
     parser.add_argument("--cert",      "-c", nargs="?",
                         help="Broker TLS cert path.  CLI > "
                              "$RADICAL_ORBIT_BROKER_CERT > "
@@ -101,11 +101,20 @@ def main():
 
     try:
         runtime.start(wait=True)
-        stop.wait()
+        # Exit (non-zero) if the transport goes fatal while we serve —
+        # e.g. the broker restarted with a new token and the reconnect is
+        # rejected.  Sitting silently would burn the job's walltime.
+        while not stop.wait(timeout=5):
+            if runtime.fatal:
+                reason = runtime.fatal_reason or 'transport failed fatally'
+                log.error("Endpoint giving up: %s", reason)
+                print(f"[orbit] FATAL: {reason}", file=sys.stderr)
+                sys.exit(1)
     except KeyboardInterrupt:
         pass
-    except Exception:
+    except Exception as e:
         log.exception("Endpoint crashed")
+        print(f"[orbit] FATAL: {e}", file=sys.stderr)
         sys.exit(1)
     finally:
         log.info("Endpoint stopping")

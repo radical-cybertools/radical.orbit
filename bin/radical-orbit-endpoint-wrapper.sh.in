@@ -12,12 +12,46 @@
 export PATH="@BINDIR@:${PATH}"
 export PYTHONPATH="@SITEPKGS@:${PYTHONPATH:-}"
 
+# NOTE: the broker TLS cert is staged manually — copy broker_cert.pem
+# from the broker host to ~/.radical/orbit/ on this host (or point
+# $RADICAL_ORBIT_BROKER_CERT at it).  Endpoint startups happen through
+# many channels (IRI, PsiJ, ssh, by hand); one staging procedure for
+# all of them beats per-channel automation.
+
+# The venv's bin dir must be on PATH: dragon's launcher resolves its
+# helpers (``dragon-network-config-launch-helper``, ``dragon-backend``)
+# BY NAME through the workload manager, and the WLM-spawned task does a
+# PATH lookup on the target side.
+export PATH="@BINDIR@:$PATH"
+
+# Under Slurm, force inner job steps to inherit this environment.  A
+# submission made with ``--export=NONE`` (deliberate, or e.g. via a
+# facility API) stamps SLURM_EXPORT_ENV=NONE into the job, and every
+# inner ``srun`` — dragon's helper and backend launches — would scrub
+# its task env, losing the PATH above.
+if [ -n "${SLURM_JOB_ID:-}" ]; then
+    export SLURM_EXPORT_ENV=ALL
+fi
+
 # Site-specific setup hook.  Evaluated *before* dragon-vs-python is
 # decided so the chosen interpreter inherits any module loads / env
 # tweaks the snippet performs.  The trust boundary is the same as the
 # rest of the job submission: whoever can put strings into the job
 # spec's environment can already control the exec target, so eval'ing
 # the snippet adds no new attack surface.
+#
+# RADICAL_ORBIT_SETUP_B64 is the transport-safe form and takes
+# precedence: some job APIs (e.g. IRI at NERSC) compose the batch
+# script with unquoted ``export KEY=VALUE`` lines, truncating values at
+# the first space — a multi-word snippet must travel as one base64
+# token.
+# Decode with the venv's python — the ``base64`` CLI diverges across
+# systems (GNU ``-d`` vs BSD/macOS ``-D``) and may be absent entirely.
+if [ -n "${RADICAL_ORBIT_SETUP_B64:-}" ]; then
+    RADICAL_ORBIT_SETUP="$("@BINDIR@/python3" -c \
+        'import base64, os, sys
+sys.stdout.write(base64.b64decode(os.environ["RADICAL_ORBIT_SETUP_B64"]).decode())')"
+fi
 if [ -n "${RADICAL_ORBIT_SETUP:-}" ]; then
     echo "[orbit] applying RADICAL_ORBIT_SETUP: $RADICAL_ORBIT_SETUP" >&2
     eval "$RADICAL_ORBIT_SETUP"
@@ -48,8 +82,14 @@ else
     USE_DRAGON=yes
 fi
 
-# Uncomment to write a dragon.log next to the wrapper's CWD (WARNING level).
-# ARGS="-l dragon_file=WARNING"
+# WARNING: do NOT enable dragon's channel-based logging in production.
+# Passing e.g. ARGS="-l dragon_file=DEBUG -l stderr=DEBUG" routes dragon's
+# logs through its own communication channels, which — verified live on
+# Perlmutter with dragon 0.14 — can DEADLOCK backend bring-up right after
+# BEIsUp/FENodeIdxBE, so the endpoint never comes up at all.  Use this ONLY
+# for post-mortem debugging of an already-broken startup, never on a path you
+# expect to succeed.
+# ARGS="-l dragon_file=DEBUG -l stderr=DEBUG"
 
 if [ "$USE_DRAGON" = "yes" ]; then
     echo "[orbit] starting with dragon ($DRAGON_PATH)" >&2

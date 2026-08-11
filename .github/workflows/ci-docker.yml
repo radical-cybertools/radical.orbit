@@ -15,9 +15,9 @@ jobs:
 
     env:
       RADICAL_ORBIT_IMAGE: radicalcybertools/radical.orbit
-      RADICAL_ORBIT_TAG: dev
+      RADICAL_ORBIT_TAG: ci-test
       RADICAL_ORBIT_BRANCH: ${{ github.base_ref || 'devel' }}
-      RADICAL_ORBIT_BRIDGE_HOSTNAME: bridge
+      RADICAL_ORBIT_BROKER_HOSTNAME: broker
 
     defaults:
       run:
@@ -38,8 +38,7 @@ jobs:
           load: true
           tags: ${{ env.RADICAL_ORBIT_IMAGE }}:${{ env.RADICAL_ORBIT_TAG }}
           build-args: |
-            GENERATE_BRIDGE_CERT=true
-            BRIDGE_HOSTNAME=${{ env.RADICAL_ORBIT_BRIDGE_HOSTNAME }}
+            BROKER_HOSTNAME=${{ env.RADICAL_ORBIT_BROKER_HOSTNAME }}
             RADICAL_ORBIT_BRANCH=${{ env.RADICAL_ORBIT_BRANCH }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -47,11 +46,11 @@ jobs:
       - name: Start containers
         run: docker compose up -d --no-build --wait
 
-      - name: Wait for endpoint service to connect
+      - name: Wait for endpoint to register with broker
         run: |
           timeout 60 bash -c \
             'until docker compose logs endpoint 2>&1 | \
-             grep -q "Connected"; do sleep 2; done'
+             grep -q "\[Runtime\] registered"; do sleep 2; done'
 
       - name: Run example (sysinfo)
         run: |

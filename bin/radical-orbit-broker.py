@@ -10,13 +10,49 @@ for a headless broker).
 import argparse
 import logging
 import os
+import ssl
+import sys
 
 import radical.orbit.logging_config as _lc
+from radical.orbit        import utils
 from radical.orbit.broker import Broker
 
 
+_SETUP_HOWTO = f'''\
+TLS setup
+---------
+The broker serves HTTPS/WSS and needs a certificate + private key.
+Resolution order for each:
+
+  cert:  --cert PATH  >  $RADICAL_ORBIT_BROKER_CERT  >  ~/.radical/orbit/broker_cert.pem
+  key:   --key  PATH  >  $RADICAL_ORBIT_BROKER_KEY   >  ~/.radical/orbit/broker_key.pem
+
+{utils.TLS_RECIPE}
+The key must be mode 0600 or stricter — the broker refuses to start
+otherwise.  Endpoints and clients pin the *cert* (never the key): copy
+broker_cert.pem to ~/.radical/orbit/ on each connecting host, or point
+$RADICAL_ORBIT_BROKER_CERT at it there.  Hostname matching is disabled
+for pinned certs, so the CN does not need to match the broker host.
+
+Ingress token
+-------------
+Auth is on by default and needs an operator-placed shared token
+(never auto-generated; config under ~/.radical/orbit is read-only
+for the software).  Resolution:
+
+  token: --token T    >  $RADICAL_ORBIT_BROKER_TOKEN >  ~/.radical/orbit/broker.token
+
+{utils.TOKEN_RECIPE}
+Copy the token file (or export the env var) on each connecting host.
+--no-auth disables the gate for local dev.
+'''
+
+
 def main():
-    parser = argparse.ArgumentParser(description='ORBIT Broker')
+    parser = argparse.ArgumentParser(
+        description='ORBIT Broker',
+        epilog=_SETUP_HOWTO,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--cert', default=None,
                         help='TLS cert path.  CLI > $RADICAL_ORBIT_BROKER_CERT > '
                              '~/.radical/orbit/broker_cert.pem.')
@@ -41,12 +77,12 @@ def main():
     parser.add_argument('--token', default=None,
                         help='Shared ingress auth token.  CLI > '
                              '$RADICAL_ORBIT_BROKER_TOKEN > '
-                             '~/.radical/orbit/broker.token.  If none is set, '
-                             'one is generated and written to that file '
-                             '(mode 0600) at startup.')
+                             '~/.radical/orbit/broker.token.  Required unless '
+                             '--no-auth; never auto-generated (see the recipe '
+                             'below).')
     parser.add_argument('--no-auth', action='store_true',
-                        help='Disable ingress authentication (local dev only). '
-                             'Also via $RADICAL_ORBIT_BROKER_NO_AUTH=1.')
+                        help='Disable ingress authentication (local dev '
+                             'only).')
     parser.add_argument('--no-gateway', action='store_true',
                         help='Run a headless broker: only the token-gated '
                              'WebSocket /register ingress, no HTTP/SSE/Explorer '
@@ -62,14 +98,25 @@ def main():
     logging.getLogger('radical.orbit').info(
         "Log level: %s; log file: %s", log_level_name, log_file)
 
-    Broker(cert=args.cert,
-           key=args.key,
-           host=args.host,
-           port=args.port,
-           plugins=args.plugins,
-           token=args.token,
-           no_auth=args.no_auth,
-           gateway=not args.no_gateway).run()
+    try:
+        broker = Broker(cert=args.cert,
+                        key=args.key,
+                        host=args.host,
+                        port=args.port,
+                        plugins=args.plugins,
+                        token=args.token,
+                        auth=not args.no_auth,
+                        gateway=not args.no_gateway)
+    except (ValueError, FileNotFoundError, PermissionError, ssl.SSLError) as e:
+        # Cert/key/token resolution failures (missing, unreadable, malformed,
+        # key too permissive) — short and actionable instead of a traceback;
+        # resolution details live in --help and DEPLOYMENT.md.  The token
+        # error carries its own recipe; append the TLS one otherwise.
+        recipe = '' if 'token' in str(e) else f'\n\n{utils.TLS_RECIPE}'
+        print(f'\nERROR: {e}{recipe}', file=sys.stderr)
+        sys.exit(1)
+
+    broker.run()
 
 
 if __name__ == "__main__":
