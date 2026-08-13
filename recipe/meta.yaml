@@ -1,0 +1,65 @@
+{% set name = "radical.orbit" %}
+{% set version = "0.3.0" %}
+{% set python_min = python_min | default("3.10") %}
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  url: https://pypi.org/packages/source/r/{{ name }}/radical_orbit-{{ version }}.tar.gz
+  sha256: 78ca1352344e312773cba643905c436d358e9fb6a2b7cd1edb6be2a01d2dc073
+
+build:
+  noarch: python
+  script: {{ PYTHON }} -m pip install . -vv --no-deps --no-build-isolation
+  number: 0
+
+requirements:
+  host:
+    - python {{ python_min }}
+    - setuptools
+    - pip
+  run:
+    - python >={{ python_min }}
+    - httpx
+    - msgpack-python
+    - cloudpickle
+    - requests
+    - websockets
+    - websocket-client
+    - fastapi
+    - uvicorn
+    - psutil
+    - rich
+    - psij-python
+    - rhapsody-py
+    - globus-sdk
+    - authlib
+
+test:
+  imports:
+    - radical.orbit
+  commands:
+    - pip check
+  requires:
+    - python {{ python_min }}
+    - pip
+
+about:
+  home: https://github.com/radical-cybertools/radical.orbit
+  summary: Broker-based distributed framework connecting RADICAL-Cybertools applications with HPC resources
+  description: |
+    ORBIT connects external RADICAL-Cybertools applications with HPC
+    resources through a star topology: one active broker hub routes
+    between endpoint participants, each dialing in over a single
+    outbound WebSocket. A broker-hosted gateway serves an
+    HTTP/SSE/Explorer compatibility surface.
+  license: MIT
+  license_file: LICENSE.md
+  doc_url: https://radical-orbit.readthedocs.io/
+  dev_url: https://github.com/radical-cybertools/radical.orbit
+
+extra:
+  recipe-maintainers:
+    - andre-merzky
