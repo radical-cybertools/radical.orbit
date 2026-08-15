@@ -1051,5 +1051,97 @@ async def test_initialize_without_start_telemetry(monkeypatch):
     assert sess._init_ready.is_set()
 
 
+# ---------------------------------------------------------------------------
+# Notification coalescing window ($RADICAL_ORBIT_RHAPSODY_NOTIFY_WINDOW)
+# ---------------------------------------------------------------------------
+
+def test_notify_window_default(monkeypatch):
+    '''Unset env var: plugin and its sessions keep the 0.25s default.'''
+    from radical.orbit import plugin_rhapsody as prh
+
+    monkeypatch.delenv(prh.ENV_NOTIFY_WINDOW, raising=False)
+    _, plugin, client = _make_plugin()
+    sid = _register(client, plugin)
+
+    assert plugin._notify_window == prh.NOTIFY_BATCH_WINDOW
+    assert plugin._sessions[sid]._notify_window == prh.NOTIFY_BATCH_WINDOW
+
+
+def test_notify_window_from_env(monkeypatch):
+    '''The endpoint operator's window reaches every session of the plugin.'''
+    from radical.orbit import plugin_rhapsody as prh
+
+    monkeypatch.setenv(prh.ENV_NOTIFY_WINDOW, '0.05')
+    _, plugin, client = _make_plugin()
+    sid = _register(client, plugin)
+
+    assert plugin._notify_window == 0.05
+    assert plugin._sessions[sid]._notify_window == 0.05
+
+
+@pytest.mark.parametrize('raw', ['abc', '-1', '0.1s', 'nan', 'inf', '-inf'])
+def test_notify_window_invalid_falls_back(monkeypatch, caplog, raw):
+    '''A non-numeric, negative or non-finite window warns and keeps the
+    default — ``nan`` in particular must not sneak past as a ~0 window.'''
+    import logging as _logging
+    from radical.orbit import plugin_rhapsody as prh
+
+    monkeypatch.setenv(prh.ENV_NOTIFY_WINDOW, raw)
+    # The radical.orbit logger has propagate=False, so caplog's handler
+    # must be attached to it explicitly (see test_plugin_psij.py).
+    re_log = _logging.getLogger('radical.orbit')
+    re_log.addHandler(caplog.handler)
+    try:
+        caplog.set_level(_logging.WARNING, logger='radical.orbit')
+        _, plugin, _ = _make_plugin()
+    finally:
+        re_log.removeHandler(caplog.handler)
+
+    assert plugin._notify_window == prh.NOTIFY_BATCH_WINDOW
+    assert prh.ENV_NOTIFY_WINDOW in caplog.text
+
+
+def test_notify_window_zero_flushes_immediately(monkeypatch):
+    '''A window of 0 delivers each completion inline — no delayed flush.'''
+    from radical.orbit import plugin_rhapsody as prh
+
+    monkeypatch.setenv(prh.ENV_NOTIFY_WINDOW, '0')
+    _, plugin, client = _make_plugin()
+    sid = _register(client, plugin)
+
+    session = plugin._sessions[sid]
+    assert session._notify_window == 0
+
+    plugin._dispatch_notify = MagicMock()
+    payload = {'uid': 'task.nw001', 'state': 'DONE'}
+    session._queue_notification(payload)
+
+    plugin._dispatch_notify.assert_called_once_with('task_status', payload)
+    assert session._notify_buf == []
+    assert not session._flush_scheduled
+
+
+def test_notify_window_defers_flush(monkeypatch):
+    '''A non-zero window buffers the completion and schedules the delayed
+    flush with exactly that window — not with the module default.'''
+    from radical.orbit import plugin_rhapsody as prh
+
+    monkeypatch.setenv(prh.ENV_NOTIFY_WINDOW, '0.05')
+    _, plugin, client = _make_plugin()
+    sid = _register(client, plugin)
+
+    session = plugin._sessions[sid]
+    plugin._dispatch_notify = MagicMock()
+    # _schedule_flush is stubbed: it would post the delayed flush onto the
+    # TestClient's event loop, which is already closed by now.
+    with patch.object(session, '_schedule_flush') as sched:
+        session._queue_notification({'uid': 'task.nw002', 'state': 'DONE'})
+
+    sched.assert_called_once_with(delay=0.05)
+    plugin._dispatch_notify.assert_not_called()
+    assert len(session._notify_buf) == 1
+    assert session._flush_scheduled
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
