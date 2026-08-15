@@ -563,7 +563,7 @@ async def test_sanitize_callable_function():
 
 @pytest.mark.asyncio
 async def test_sanitize_non_serializable_return_value():
-    """Non-JSON-serializable return_value must be stringified."""
+    """Non-JSON-serializable return_value must be cloudpickled, not str()'d."""
     session = RhapsodySession("test.san2")
     session._rh_session = MagicMock()
 
@@ -578,8 +578,9 @@ async def test_sanitize_non_serializable_return_value():
                             "return_value": DragonRef()}
 
     d = session._sanitize_task(task)
-    assert isinstance(d["return_value"], str)
-    assert "DataReference" in d["return_value"]
+    assert d["_return_value_encoding"] == "cloudpickle"
+    assert d["return_value"].startswith("cloudpickle::")
+    json.dumps(d)                                    # still wire-safe
 
 
 @pytest.mark.asyncio
@@ -635,6 +636,169 @@ async def test_sanitize_preserves_normal_values():
     assert d["return_value"] == {"count": 42}
     assert d["stdout"] == "normal output"
     assert d["function"] is None
+    assert "_return_value_encoding" not in d       # unchanged wire form
+
+
+# ---------------------------------------------------------------------------
+# Return-value fidelity — encode (endpoint) / decode (client) round trip
+# ---------------------------------------------------------------------------
+
+def _done_task(uid, return_value):
+    """Build a completed task whose to_dict() carries *return_value*."""
+    task = MagicMock()
+    task.uid = uid
+    task.state = "DONE"
+    task.to_dict = lambda: {"uid": uid, "state": "DONE",
+                            "return_value": return_value}
+    return task
+
+
+@pytest.mark.asyncio
+async def test_return_value_roundtrip_numpy():
+    """A numpy result survives encode -> notification -> client decode."""
+    np = pytest.importorskip("numpy")
+
+    session = RhapsodySession("test.rv.np")
+    session._rh_session = MagicMock()
+
+    arr = np.arange(6, dtype=np.float64).reshape(2, 3)
+    payload = session._notification_payload(_done_task("task.np001", arr))
+
+    # what actually goes on the wire
+    json.dumps(payload)
+    assert payload["_return_value_encoding"] == "cloudpickle"
+
+    client = _make_rhapsody_client()
+    client._on_task_done(None, None, "task_status", payload)
+
+    got = client._completed["task.np001"]["return_value"]
+    assert isinstance(got, np.ndarray)
+    assert np.array_equal(got, arr)
+    assert "_return_value_encoding" not in client._completed["task.np001"]
+
+
+@pytest.mark.asyncio
+async def test_return_value_roundtrip_custom_class():
+    """A rich Python object comes back as the object, not as its str()."""
+
+    class Weights:
+        def __init__(self, layers):
+            self.layers = layers
+
+        def __repr__(self):
+            return "<Weights>"
+
+    session = RhapsodySession("test.rv.obj")
+    session._rh_session = MagicMock()
+
+    payload = session._notification_payload(
+        _done_task("task.obj001", Weights([1, 2, 3])))
+
+    client = _make_rhapsody_client()
+    client._on_task_done(None, None, "task_status_batch",
+                         {"tasks": [payload]})
+
+    got = client._completed["task.obj001"]["return_value"]
+    assert got.layers == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_return_value_bytes_stay_base64():
+    """bytes results keep the established plain-base64 convention."""
+    session = RhapsodySession("test.rv.bytes")
+    session._rh_session = MagicMock()
+
+    payload = session._notification_payload(
+        _done_task("task.by001", b"\x00\xff"))
+    assert payload["_return_value_encoding"] == "base64"
+    assert not payload["return_value"].startswith("cloudpickle::")
+
+    client = _make_rhapsody_client()
+    client._on_task_done(None, None, "task_status", payload)
+    assert client._completed["task.by001"]["return_value"] == b"\x00\xff"
+
+
+@pytest.mark.asyncio
+async def test_return_value_json_safe_not_encoded():
+    """JSON-safe results are passed through verbatim (backward compatible)."""
+    session = RhapsodySession("test.rv.json")
+    session._rh_session = MagicMock()
+
+    payload = session._notification_payload(
+        _done_task("task.js001", {"loss": 0.5, "epochs": [1, 2]}))
+    assert payload["return_value"] == {"loss": 0.5, "epochs": [1, 2]}
+    assert "_return_value_encoding" not in payload
+
+    client = _make_rhapsody_client()
+    client._on_task_done(None, None, "task_status", payload)
+    assert client._completed["task.js001"]["return_value"] == {
+        "loss": 0.5, "epochs": [1, 2]}
+
+
+@pytest.mark.asyncio
+async def test_return_value_oversized_reports_error(monkeypatch, caplog):
+    """An oversized result errors loudly instead of being truncated."""
+    import radical.orbit.plugin_rhapsody as prh
+
+    monkeypatch.setattr(prh, 'RETURN_VALUE_LIMIT', 64)
+
+    session = RhapsodySession("test.rv.big")
+    session._rh_session = MagicMock()
+
+    with caplog.at_level('ERROR'):
+        payload = session._notification_payload(
+            _done_task("task.big001", set(range(1000))))
+
+    assert payload["return_value"] is None
+    assert "_return_value_encoding" not in payload
+    assert "too large" in payload["error"]
+    assert "too large" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_return_value_unpicklable_falls_back_to_str():
+    """An unpicklable result degrades to str() rather than losing the task."""
+    import threading as _threading
+
+    session = RhapsodySession("test.rv.nopickle")
+    session._rh_session = MagicMock()
+
+    payload = session._notification_payload(
+        _done_task("task.np002", _threading.Lock()))
+
+    assert isinstance(payload["return_value"], str)
+    assert "_return_value_encoding" not in payload
+
+
+def test_decode_return_value_undecodable_keeps_wire_form(caplog):
+    """A result the client cannot decode is kept, not raised on."""
+    t = {"uid": "task.bad", "state": "DONE",
+         "return_value": "cloudpickle::not-base64!!",
+         "_return_value_encoding": "cloudpickle"}
+
+    with caplog.at_level('WARNING'):
+        RhapsodyClient._decode_return_value(t)
+
+    assert t["return_value"] == "cloudpickle::not-base64!!"
+    assert t["_return_value_encoding"] == "cloudpickle"
+    assert "cannot decode" in caplog.text
+
+
+def test_wait_tasks_poll_decodes_return_value():
+    """The no-SSE poll fallback decodes exactly like the SSE path."""
+    np = pytest.importorskip("numpy")
+
+    session = RhapsodySession("test.rv.poll")
+    session._rh_session = MagicMock()
+
+    arr  = np.array([1, 2, 3])
+    wire = session._sanitize_task(_done_task("t.poll", arr))
+
+    client = _make_rhapsody_client([wire])
+    client._submitted.add("t.poll")
+    result = client.wait_tasks(["t.poll"])
+
+    assert np.array_equal(result[0]["return_value"], arr)
 
 
 # ---------------------------------------------------------------------------

@@ -21,6 +21,7 @@ from fastapi import FastAPI, HTTPException, Request
 from .plugin_session_base import PluginSession
 from .plugin_base import Plugin, DEFAULT_SID
 from .client import PluginClient
+from .protocol import FRAME_CAP
 
 log = logging.getLogger("radical.orbit")
 
@@ -42,6 +43,14 @@ TERMINAL_STATES     = {'DONE', 'FAILED', 'CANCELED', 'COMPLETED'}
 WS_PAYLOAD_LIMIT    = 8 * 1024 * 1024  # target max per batch (conservative)
 NOTIFY_BATCH_SIZE   = 1024             # max tasks per bulk notification
 NOTIFY_BATCH_WINDOW = 0.25             # seconds to accumulate before flush
+
+# Size bound for one encoded ``return_value``.  The protocol frame cap
+# (:data:`protocol.FRAME_CAP`) bounds the *whole* notification / response
+# frame, so a single result may claim at most a fraction of it.  A larger
+# result is reported as a task error instead of being encoded: an oversized
+# frame is dropped by the transport, which would leave the client waiting
+# forever, and truncating would hand back a corrupt object.
+RETURN_VALUE_LIMIT  = FRAME_CAP // 2
 
 # Endpoint-level override for the coalescing window above (seconds).  The
 # default trades ~250 ms of completion latency for fewer WS frames; a
@@ -543,19 +552,61 @@ class RhapsodySession(PluginSession):
             elif isinstance(val, list):
                 d[key] = '\n'.join(str(v) for v in val)
 
-        # Ensure return_value is JSON-serializable
+        # Ensure return_value is JSON-serializable (see _encode_return_value:
+        # rich results keep full fidelity, they are not stringified)
         rv = d.get('return_value')
         if rv is not None:
-            if isinstance(rv, bytes):
-                d['return_value'] = base64.b64encode(rv).decode('ascii')
-                d['_return_value_encoding'] = 'base64'
-            else:
-                try:
-                    json.dumps(rv)
-                except (TypeError, ValueError):
-                    d['return_value'] = str(rv)
+            try:
+                json.dumps(rv)
+            except (TypeError, ValueError):
+                self._encode_return_value(d, rv)
 
         return {k: _json_safe(v) for k, v in d.items()}
+
+    def _encode_return_value(self, d: dict, rv) -> None:
+        """Encode a non-JSON-safe ``return_value`` in place.
+
+        ``bytes`` keep the established plain-base64 form; any other object
+        (numpy array, dataclass, model weights, ...) is cloudpickled with the
+        very same ``cloudpickle::<base64>`` convention that carries function
+        arguments the other way — so a function task keeps full fidelity in
+        both directions instead of coming back as its ``str()``.  The
+        ``_return_value_encoding`` field names the encoding for the client
+        (:meth:`RhapsodyClient._decode_return_value`).
+
+        Two failure modes are reported rather than silently degraded:
+        an unpicklable result falls back to ``str(rv)`` (all the wire can
+        carry), and a result whose encoding exceeds
+        :data:`RETURN_VALUE_LIMIT` is dropped in favour of an ``error`` —
+        the oversized frame would otherwise be discarded by the transport.
+        """
+        if isinstance(rv, bytes):
+            encoding = 'base64'
+            encoded  = base64.b64encode(rv).decode('ascii')
+        else:
+            try:
+                encoding = 'cloudpickle'
+                encoded  = 'cloudpickle::' \
+                         + base64.b64encode(_cp.dumps(rv)).decode('ascii')
+            except Exception as e:
+                log.warning("[%s] return_value is not picklable (%s) — "
+                            "falling back to str()", self._sid, e)
+                d['return_value'] = str(rv)
+                return
+
+        if len(encoded) > RETURN_VALUE_LIMIT:
+            msg = (f"return_value too large: {len(encoded)} encoded bytes "
+                   f"exceed the {RETURN_VALUE_LIMIT} byte limit — stage the "
+                   f"result to a file instead")
+            log.error("[%s] %s", self._sid, msg)
+            d['return_value'] = None
+            d.pop('_return_value_encoding', None)
+            if not d.get('error'):
+                d['error'] = msg
+            return
+
+        d['return_value']           = encoded
+        d['_return_value_encoding'] = encoding
 
     _NOTIFICATION_KEYS = {'uid', 'state', 'exit_code',
                           'return_value', '_return_value_encoding',
@@ -690,10 +741,7 @@ class RhapsodyClient(PluginClient):
         with self._cond:
             changed = False
             for t in tasks:
-                # Decode base64-encoded return values
-                if t.get('_return_value_encoding') == 'base64':
-                    t['return_value'] = base64.b64decode(t['return_value'])
-                    del t['_return_value_encoding']
+                self._decode_return_value(t)
 
                 uid   = t.get('uid')
                 state = str(t.get('state', '')).upper()
@@ -703,6 +751,39 @@ class RhapsodyClient(PluginClient):
 
             if changed:
                 self._cond.notify_all()
+
+    @staticmethod
+    def _decode_return_value(t: dict) -> None:
+        """Reverse :meth:`RhapsodySession._encode_return_value` in place.
+
+        ``base64`` yields the original ``bytes``, ``cloudpickle`` the original
+        Python object; the marker is dropped once decoded so the task dict
+        looks exactly like a locally executed one.  A value the client cannot
+        decode (e.g. the result's class is not importable here) is left on the
+        wire form with a warning — better a visible blob than an exception
+        that would take down the notification dispatch for every other task.
+        """
+        if not isinstance(t, dict):
+            return
+
+        enc = t.get('_return_value_encoding')
+        raw = t.get('return_value')
+        if enc not in ('base64', 'cloudpickle') or not isinstance(raw, str):
+            return
+
+        try:
+            if enc == 'base64':
+                t['return_value'] = base64.b64decode(raw)
+            else:
+                if raw.startswith('cloudpickle::'):
+                    raw = raw[len('cloudpickle::'):]
+                t['return_value'] = _cp.loads(base64.b64decode(raw))
+        except Exception as e:
+            log.warning("cannot decode %s return_value of %s: %s",
+                        enc, t.get('uid'), e)
+            return
+
+        del t['_return_value_encoding']
 
     def register_session(self, backends: list[str] | None = None,
                          init_timeout: float = 120):
@@ -1010,7 +1091,11 @@ class RhapsodyClient(PluginClient):
 
     def _wait_tasks_poll(self, uids: list[str],
                          timeout: float | None = None) -> list[dict]:
-        """Fallback wait via periodic polling (no SSE available)."""
+        """Fallback wait via periodic polling (no SSE available).
+
+        Decodes encoded return values just like the SSE path, so a caller
+        sees the same objects no matter which transport served the wait.
+        """
 
         url     = self._url(ROUTE_WAIT.format(sid=self.sid))
         payload: dict = {"uids": uids}
@@ -1023,6 +1108,9 @@ class RhapsodyClient(PluginClient):
             resp = self._http.post(url, json=payload)
             self._raise(resp, f"wait {len(uids)} task(s)")
             tasks = resp.json()
+
+            for t in tasks:
+                self._decode_return_value(t)
 
             # Check if all are terminal
             all_done = all(
