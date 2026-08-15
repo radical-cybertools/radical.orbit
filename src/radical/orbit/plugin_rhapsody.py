@@ -44,6 +44,14 @@ WS_PAYLOAD_LIMIT    = 8 * 1024 * 1024  # target max per batch (conservative)
 NOTIFY_BATCH_SIZE   = 1024             # max tasks per bulk notification
 NOTIFY_BATCH_WINDOW = 0.25             # seconds to accumulate before flush
 
+# Cumulative payload budget for one notification frame.  ``NOTIFY_BATCH_SIZE``
+# alone cannot bound a batch: a single completion may carry an encoded
+# ``return_value`` of up to ``RETURN_VALUE_LIMIT``, so a handful of them
+# exceeds the frame cap, the transport drops the frame, and every waiter
+# hangs.  Flushes therefore split on bytes as well as on count — the same
+# size-aware batching the client applies to submission (WS_PAYLOAD_LIMIT).
+NOTIFY_BATCH_BYTES  = FRAME_CAP // 2
+
 # Size bound for one encoded ``return_value``.  The protocol frame cap
 # (:data:`protocol.FRAME_CAP`) bounds the *whole* notification / response
 # frame, so a single result may claim at most a fraction of it.  A larger
@@ -91,6 +99,21 @@ def _json_safe(v):
         if isinstance(v, (list, tuple, set)):
             return [_json_safe(x) for x in v]
         return str(v)
+
+
+def _payload_size(payload: dict) -> int:
+    """Estimate the wire size (bytes) of one notification payload.
+
+    A notification payload is flat (see ``_NOTIFICATION_KEYS``), so summing
+    key and value lengths bounds the frame accurately enough — and, unlike
+    ``len(str(payload))``, it does not copy a multi-MiB encoded return value
+    just to measure it.  Non-string values are small scalars; 16 bytes each
+    covers them with room to spare.
+    """
+    size = 2
+    for k, v in payload.items():
+        size += len(str(k)) + (len(v) if isinstance(v, str) else 16)
+    return size
 
 
 def _resolve_notify_window() -> float:
@@ -157,11 +180,12 @@ class RhapsodySession(PluginSession):
         self._init_error: str | None = None
 
         # Notification batcher: accumulate completions and flush in bulk.
-        # Batch size is the module constant; the coalescing window defaults
-        # to the module constant and is overridden per endpoint by
-        # PluginRhapsody._create_session.  A single pending flush task
-        # drains the buffer (see _queue_notification).
+        # Batch size and byte budget are the module constants; the coalescing
+        # window defaults to the module constant and is overridden per
+        # endpoint by PluginRhapsody._create_session.  A single pending flush
+        # task drains the buffer (see _queue_notification).
         self._notify_buf: list[dict] = []
+        self._notify_bytes           = 0
         self._notify_lock            = threading.Lock()
         self._flush_scheduled        = False
         self._notify_window          = NOTIFY_BATCH_WINDOW
@@ -369,16 +393,19 @@ class RhapsodySession(PluginSession):
         """Add a task notification to the batch buffer and ensure a
         flush is scheduled.
 
-        Thread-safe — called from watcher coroutines.  A full buffer — or a
-        zero coalescing window (latency-sensitive endpoint) — flushes
-        immediately; otherwise a single delayed flush is scheduled (and only
-        one is ever pending at a time).
+        Thread-safe — called from watcher coroutines.  A buffer full by count
+        or by bytes — or a zero coalescing window (latency-sensitive
+        endpoint) — flushes immediately; otherwise a single delayed flush is
+        scheduled (and only one is ever pending at a time).
         """
+        size = _payload_size(payload)
         with self._notify_lock:
             self._notify_buf.append(payload)
+            self._notify_bytes += size
             window   = self._notify_window
             now      = window <= 0 \
-                       or len(self._notify_buf) >= NOTIFY_BATCH_SIZE
+                       or len(self._notify_buf) >= NOTIFY_BATCH_SIZE \
+                       or self._notify_bytes >= NOTIFY_BATCH_BYTES
             schedule = not now and not self._flush_scheduled
             if schedule:
                 self._flush_scheduled = True
@@ -408,18 +435,50 @@ class RhapsodySession(PluginSession):
                     _do_flush(), self._plugin._main_loop)
 
     def _flush_notifications(self) -> None:
-        """Flush the notification buffer as a bulk message."""
+        """Flush the notification buffer as one or more bulk messages.
+
+        The drained buffer is split so that no single frame exceeds
+        :data:`NOTIFY_BATCH_BYTES` — completions carrying encoded return
+        values would otherwise pack a frame past the protocol cap, and the
+        dropped frame would strand every waiter on those tasks.
+        """
         with self._notify_lock:
             self._flush_scheduled = False
             if not self._notify_buf:
                 return
             batch = list(self._notify_buf)
             self._notify_buf.clear()
+            self._notify_bytes = 0
 
-        if len(batch) == 1:
-            self.notify("task_status", batch[0])
-        else:
-            self.notify("task_status_batch", {"tasks": batch})
+        for frame in self._split_frames(batch):
+            if len(frame) == 1:
+                self.notify("task_status", frame[0])
+            else:
+                self.notify("task_status_batch", {"tasks": frame})
+
+    @staticmethod
+    def _split_frames(batch: list[dict]) -> list[list[dict]]:
+        """Split notifications into frames under :data:`NOTIFY_BATCH_BYTES`.
+
+        A single payload larger than the budget still ships alone — it is
+        bounded by ``RETURN_VALUE_LIMIT``, which leaves frame-cap headroom.
+        """
+        frames: list[list[dict]] = []
+        frame:  list[dict]       = []
+        nbytes                   = 0
+
+        for payload in batch:
+            size = _payload_size(payload)
+            if frame and nbytes + size > NOTIFY_BATCH_BYTES:
+                frames.append(frame)
+                frame  = []
+                nbytes = 0
+            frame.append(payload)
+            nbytes += size
+
+        if frame:
+            frames.append(frame)
+        return frames
 
     def _task_future(self, uid_str: str, task) -> "asyncio.Future":
         """Return the rhapsody wait-future for a single task.
@@ -553,13 +612,18 @@ class RhapsodySession(PluginSession):
                 d[key] = '\n'.join(str(v) for v in val)
 
         # Ensure return_value is JSON-serializable (see _encode_return_value:
-        # rich results keep full fidelity, they are not stringified)
+        # rich results keep full fidelity, they are not stringified).  A
+        # JSON-safe result keeps its wire form but is size-checked all the
+        # same — a 10 MiB plain list overruns the frame just as a pickle does.
         rv = d.get('return_value')
         if rv is not None:
             try:
-                json.dumps(rv)
+                as_json = json.dumps(rv)
             except (TypeError, ValueError):
                 self._encode_return_value(d, rv)
+            else:
+                if len(as_json) > RETURN_VALUE_LIMIT:
+                    self._oversized_return_value(d, len(as_json))
 
         return {k: _json_safe(v) for k, v in d.items()}
 
@@ -595,18 +659,27 @@ class RhapsodySession(PluginSession):
                 return
 
         if len(encoded) > RETURN_VALUE_LIMIT:
-            msg = (f"return_value too large: {len(encoded)} encoded bytes "
-                   f"exceed the {RETURN_VALUE_LIMIT} byte limit — stage the "
-                   f"result to a file instead")
-            log.error("[%s] %s", self._sid, msg)
-            d['return_value'] = None
-            d.pop('_return_value_encoding', None)
-            if not d.get('error'):
-                d['error'] = msg
+            self._oversized_return_value(d, len(encoded))
             return
 
         d['return_value']           = encoded
         d['_return_value_encoding'] = encoding
+
+    def _oversized_return_value(self, d: dict, size: int) -> None:
+        """Replace an over-budget ``return_value`` with a task error.
+
+        Applies to both wire forms (encoded and plain JSON): a frame past
+        the protocol cap is dropped by the transport, so the client would
+        wait forever — and truncating would hand back a corrupt result.
+        """
+        msg = (f"return_value too large: {size} wire bytes exceed the "
+               f"{RETURN_VALUE_LIMIT} byte limit — stage the result to a "
+               f"file instead")
+        log.error("[%s] %s", self._sid, msg)
+        d['return_value'] = None
+        d.pop('_return_value_encoding', None)
+        if not d.get('error'):
+            d['error'] = msg
 
     _NOTIFICATION_KEYS = {'uid', 'state', 'exit_code',
                           'return_value', '_return_value_encoding',

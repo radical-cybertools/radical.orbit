@@ -756,6 +756,120 @@ async def test_return_value_oversized_reports_error(monkeypatch, caplog):
 
 
 @pytest.mark.asyncio
+async def test_json_safe_return_value_oversized_reports_error(monkeypatch,
+                                                              caplog):
+    """A JSON-safe result is size-checked too — a huge plain list would
+    otherwise overrun the frame exactly like a huge pickle."""
+    import radical.orbit.plugin_rhapsody as prh
+
+    monkeypatch.setattr(prh, 'RETURN_VALUE_LIMIT', 64)
+
+    session = RhapsodySession("test.rv.bigjson")
+    session._rh_session = MagicMock()
+
+    with caplog.at_level('ERROR'):
+        payload = session._notification_payload(
+            _done_task("task.big002", list(range(1000))))
+
+    assert payload["return_value"] is None
+    assert "_return_value_encoding" not in payload
+    assert "too large" in payload["error"]
+    assert "too large" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_literal_cloudpickle_string_return_untouched():
+    """A result that *is* the string 'cloudpickle::x' is JSON-safe: it gets
+    no marker, and the client must not mistake it for an encoded blob."""
+    session = RhapsodySession("test.rv.lit")
+    session._rh_session = MagicMock()
+
+    payload = session._notification_payload(
+        _done_task("task.lit001", "cloudpickle::x"))
+    assert payload["return_value"] == "cloudpickle::x"
+    assert "_return_value_encoding" not in payload
+
+    client = _make_rhapsody_client()
+    client._on_task_done(None, None, "task_status", payload)
+    assert client._completed["task.lit001"]["return_value"] \
+        == "cloudpickle::x"
+
+
+def test_get_task_and_list_tasks_return_wire_form():
+    """get_task()/list_tasks() must NOT decode.
+
+    Their dicts are proxied verbatim as JSON (see
+    ``plugin_task_dispatcher._route_get_task``), so a decoded object would
+    break the proxy.  Pinned so the asymmetry with wait_tasks() is not
+    'fixed' by accident.
+    """
+    wire = {"uid": "t.wire", "state": "DONE",
+            "return_value": "cloudpickle::QUFB",
+            "_return_value_encoding": "cloudpickle"}
+
+    client = _make_rhapsody_client(dict(wire))
+    assert client.get_task("t.wire") == wire
+
+    client = _make_rhapsody_client({"tasks": [dict(wire)]})
+    got = client.list_tasks()
+    assert got["tasks"][0] == wire
+    json.dumps(got)                                  # still proxyable
+
+
+def test_notification_callbacks_fire_in_registration_order():
+    """Cross-repo contract behind the client-side decode.
+
+    rhapsody's ``OrbitExecutionBackend`` registers its own ``task_status``
+    callback *after* ``RhapsodyClient._on_task_done`` and reads the very
+    same dict object, relying on the decode having already happened.  That
+    only holds because the runtime hands one payload to every callback and
+    runs them in registration order on a single dispatcher thread.
+    """
+    import threading as _threading
+
+    from radical.orbit import protocol
+    from radical.orbit.runtime import EndpointRuntime
+
+    # A bare registry — no transport, no dispatcher thread needed.
+    rt = EndpointRuntime.__new__(EndpointRuntime)
+    rt._callbacks = {}
+    rt._cb_lock   = _threading.Lock()
+    rt._name      = 'test-consumer'
+    rt._emit      = MagicMock()
+
+    queued: list = []
+    rt._cb = MagicMock()
+    rt._cb.submit = lambda fn, *args: queued.append((fn, args))
+
+    order: list = []
+    seen:  list = []
+
+    def _client_cb(endpoint, plugin, topic, data):        # RhapsodyClient
+        order.append('client')
+        data['return_value'] = 'decoded'
+
+    def _backend_cb(endpoint, plugin, topic, data):       # rhapsody backend
+        order.append('backend')
+        seen.append(data['return_value'])
+
+    for cb in (_client_cb, _backend_cb):
+        rt.register_callback(endpoint_id='ep', plugin_name='rhapsody',
+                             topic='task_status', callback=cb)
+
+    rt._on_event(protocol.Event(src='ep', plugin='rhapsody',
+                                topic='task_status',
+                                data={'uid': 't.1',
+                                      'return_value': 'wire'}))
+
+    # single-threaded FIFO dispatcher — run the queue in submission order
+    for fn, args in queued:
+        fn(*args)
+
+    assert order == ['client', 'backend']
+    assert seen  == ['decoded']      # same dict object reached the backend
+
+
+@pytest.mark.asyncio
 async def test_return_value_unpicklable_falls_back_to_str():
     """An unpicklable result degrades to str() rather than losing the task."""
     import threading as _threading
@@ -1305,6 +1419,68 @@ def test_notify_window_defers_flush(monkeypatch):
     plugin._dispatch_notify.assert_not_called()
     assert len(session._notify_buf) == 1
     assert session._flush_scheduled
+
+
+def _big_payload(uid, nbytes=200):
+    """A completion carrying an encoded return value of roughly *nbytes*."""
+    return {'uid': uid, 'state': 'DONE',
+            'return_value': 'cloudpickle::' + 'x' * nbytes,
+            '_return_value_encoding': 'cloudpickle'}
+
+
+def test_notification_flush_splits_on_byte_budget(monkeypatch):
+    '''Completions carrying encoded return values must be split across
+    frames — one frame past the protocol cap is dropped by the transport
+    and would strand every waiter on those tasks.'''
+    from radical.orbit import plugin_rhapsody as prh
+
+    monkeypatch.setattr(prh, 'NOTIFY_BATCH_BYTES', 512)
+
+    _, plugin, client = _make_plugin()
+    sid = _register(client, plugin)
+    session = plugin._sessions[sid]
+    plugin._dispatch_notify = MagicMock()
+
+    payloads = [_big_payload(f'task.split{i}') for i in range(5)]
+    session._notify_buf   = list(payloads)
+    session._notify_bytes = sum(prh._payload_size(p) for p in payloads)
+
+    session._flush_notifications()
+
+    calls = plugin._dispatch_notify.call_args_list
+    assert len(calls) > 1                        # actually split
+
+    delivered = []
+    for topic, data in (c[0] for c in calls):
+        tasks = data['tasks'] if topic == 'task_status_batch' else [data]
+        assert sum(prh._payload_size(t) for t in tasks) <= 512
+        delivered.extend(tasks)
+
+    # every completion is delivered exactly once, in order
+    assert [t['uid'] for t in delivered] == [p['uid'] for p in payloads]
+    assert session._notify_buf   == []
+    assert session._notify_bytes == 0
+
+
+def test_queue_notification_flushes_on_byte_budget(monkeypatch):
+    '''The byte budget also bounds the *buffer*: a big completion flushes
+    at once instead of waiting out the coalescing window.'''
+    from radical.orbit import plugin_rhapsody as prh
+
+    monkeypatch.setattr(prh, 'NOTIFY_BATCH_BYTES', 256)
+
+    _, plugin, client = _make_plugin()
+    sid = _register(client, plugin)
+    session = plugin._sessions[sid]
+    session._notify_window = 10             # would otherwise defer for 10s
+    plugin._dispatch_notify = MagicMock()
+
+    session._queue_notification(_big_payload('task.budget'))
+
+    plugin._dispatch_notify.assert_called_once()
+    assert session._notify_buf   == []
+    assert session._notify_bytes == 0
+    assert not session._flush_scheduled
 
 
 if __name__ == '__main__':
