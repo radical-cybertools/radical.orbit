@@ -10,6 +10,7 @@ import base64
 import importlib
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -41,6 +42,12 @@ TERMINAL_STATES     = {'DONE', 'FAILED', 'CANCELED', 'COMPLETED'}
 WS_PAYLOAD_LIMIT    = 8 * 1024 * 1024  # target max per batch (conservative)
 NOTIFY_BATCH_SIZE   = 1024             # max tasks per bulk notification
 NOTIFY_BATCH_WINDOW = 0.25             # seconds to accumulate before flush
+
+# Endpoint-level override for the coalescing window above (seconds).  The
+# default trades ~250 ms of completion latency for fewer WS frames; a
+# latency-sensitive endpoint (co-located service, sequential task round
+# trips) sets `0` to flush every completion immediately.
+ENV_NOTIFY_WINDOW   = 'RADICAL_ORBIT_RHAPSODY_NOTIFY_WINDOW'
 
 # Guard optional dependencies
 try:
@@ -75,6 +82,30 @@ def _json_safe(v):
         if isinstance(v, (list, tuple, set)):
             return [_json_safe(x) for x in v]
         return str(v)
+
+
+def _resolve_notify_window() -> float:
+    """Resolve the notification coalescing window (seconds).
+
+    Honours ``$RADICAL_ORBIT_RHAPSODY_NOTIFY_WINDOW`` so the endpoint
+    operator can pick the latency / frame-count trade-off at service launch
+    (``0`` flushes every completion immediately).  Read once per plugin, not
+    per flush.  A non-numeric, negative or non-finite value warns and falls
+    back to ``NOTIFY_BATCH_WINDOW`` — ``nan`` would otherwise pass every
+    comparison and silently act as a zero window.
+    """
+    raw = os.environ.get(ENV_NOTIFY_WINDOW, '').strip()
+    if not raw:
+        return NOTIFY_BATCH_WINDOW
+    try:
+        window = float(raw)
+        if window < 0 or not math.isfinite(window):
+            raise ValueError('must be finite and non-negative')
+    except ValueError:
+        log.warning("[rhapsody] invalid %s=%r — using %ss",
+                    ENV_NOTIFY_WINDOW, raw, NOTIFY_BATCH_WINDOW)
+        return NOTIFY_BATCH_WINDOW
+    return window
 
 
 # ---------------------------------------------------------------------------
@@ -117,11 +148,14 @@ class RhapsodySession(PluginSession):
         self._init_error: str | None = None
 
         # Notification batcher: accumulate completions and flush in bulk.
-        # Coalescing window/size are the module constants; a single pending
-        # flush task drains the buffer (see _queue_notification).
+        # Batch size is the module constant; the coalescing window defaults
+        # to the module constant and is overridden per endpoint by
+        # PluginRhapsody._create_session.  A single pending flush task
+        # drains the buffer (see _queue_notification).
         self._notify_buf: list[dict] = []
         self._notify_lock            = threading.Lock()
         self._flush_scheduled        = False
+        self._notify_window          = NOTIFY_BATCH_WINDOW
 
         # Cache for deserialized cloudpickle payloads — avoids decoding the
         # same encoded string N times when a batch repeats identical blobs.
@@ -326,21 +360,24 @@ class RhapsodySession(PluginSession):
         """Add a task notification to the batch buffer and ensure a
         flush is scheduled.
 
-        Thread-safe — called from watcher coroutines.  A full buffer flushes
+        Thread-safe — called from watcher coroutines.  A full buffer — or a
+        zero coalescing window (latency-sensitive endpoint) — flushes
         immediately; otherwise a single delayed flush is scheduled (and only
         one is ever pending at a time).
         """
         with self._notify_lock:
             self._notify_buf.append(payload)
-            full     = len(self._notify_buf) >= NOTIFY_BATCH_SIZE
-            schedule = not full and not self._flush_scheduled
+            window   = self._notify_window
+            now      = window <= 0 \
+                       or len(self._notify_buf) >= NOTIFY_BATCH_SIZE
+            schedule = not now and not self._flush_scheduled
             if schedule:
                 self._flush_scheduled = True
 
-        if full:
+        if now:
             self._flush_notifications()
         elif schedule:
-            self._schedule_flush(delay=NOTIFY_BATCH_WINDOW)
+            self._schedule_flush(delay=window)
 
     def _schedule_flush(self, delay: float = 0) -> None:
         """Schedule a notification flush on the event loop."""
@@ -1122,6 +1159,10 @@ class PluginRhapsody(Plugin):
     def __init__(self, app: FastAPI, instance_name: str = "rhapsody"):
         super().__init__(app, instance_name)
 
+        # Endpoint-wide notification coalescing window — resolved once here
+        # (not per flush) and handed to every session this plugin creates.
+        self._notify_window = _resolve_notify_window()
+
         self.add_route_post(ROUTE_SUBMIT,     self.submit_tasks)
         self.add_route_post(ROUTE_WAIT,       self.wait_tasks)
         self.add_route_get (ROUTE_LIST_TASKS, self.list_tasks)
@@ -1214,16 +1255,19 @@ class PluginRhapsody(Plugin):
         return [env_backend] if env_backend else None
 
     def _create_session(self, sid: str, **kwargs) -> RhapsodySession:
-        """Build a session and inject the endpoint's shared profiler.
+        """Build a session and inject the endpoint's shared profiler and
+        notification window.
 
         Extends the base factory (which injects ``_plugin``) so every
         rhapsody session profiles against the one endpoint-runtime profiler
-        instead of digging it out of app state on first use.
+        instead of digging it out of app state on first use, and coalesces
+        notifications over the endpoint-configured window.
         """
         session = super()._create_session(sid, **kwargs)
         svc = getattr(self._app.state, 'endpoint_service', None)
         session._prof = getattr(svc, '_prof', None) or \
                         rprof.Profiler('rhapsody', ns='radical.orbit')
+        session._notify_window = self._notify_window
         return session
 
     @staticmethod
