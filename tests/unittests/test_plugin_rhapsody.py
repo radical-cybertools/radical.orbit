@@ -736,14 +736,11 @@ async def test_return_value_json_safe_not_encoded():
 
 
 @pytest.mark.asyncio
-async def test_return_value_oversized_reports_error(monkeypatch, caplog):
+async def test_return_value_oversized_reports_error(caplog):
     """An oversized result errors loudly instead of being truncated."""
-    import radical.orbit.plugin_rhapsody as prh
-
-    monkeypatch.setattr(prh, 'RETURN_VALUE_LIMIT', 64)
-
     session = RhapsodySession("test.rv.big")
     session._rh_session = MagicMock()
+    session._return_value_limit = 64
 
     with caplog.at_level('ERROR'):
         payload = session._notification_payload(
@@ -756,16 +753,12 @@ async def test_return_value_oversized_reports_error(monkeypatch, caplog):
 
 
 @pytest.mark.asyncio
-async def test_json_safe_return_value_oversized_reports_error(monkeypatch,
-                                                              caplog):
+async def test_json_safe_return_value_oversized_reports_error(caplog):
     """A JSON-safe result is size-checked too — a huge plain list would
     otherwise overrun the frame exactly like a huge pickle."""
-    import radical.orbit.plugin_rhapsody as prh
-
-    monkeypatch.setattr(prh, 'RETURN_VALUE_LIMIT', 64)
-
     session = RhapsodySession("test.rv.bigjson")
     session._rh_session = MagicMock()
+    session._return_value_limit = 64
 
     with caplog.at_level('ERROR'):
         payload = session._notification_payload(
@@ -1428,17 +1421,16 @@ def _big_payload(uid, nbytes=200):
             '_return_value_encoding': 'cloudpickle'}
 
 
-def test_notification_flush_splits_on_byte_budget(monkeypatch):
+def test_notification_flush_splits_on_byte_budget():
     '''Completions carrying encoded return values must be split across
-    frames — one frame past the protocol cap is dropped by the transport
-    and would strand every waiter on those tasks.'''
+    frames — one frame past the transport cap is dropped and would strand
+    every waiter on those tasks.'''
     from radical.orbit import plugin_rhapsody as prh
-
-    monkeypatch.setattr(prh, 'NOTIFY_BATCH_BYTES', 512)
 
     _, plugin, client = _make_plugin()
     sid = _register(client, plugin)
     session = plugin._sessions[sid]
+    session._notify_batch_bytes = 512
     plugin._dispatch_notify = MagicMock()
 
     payloads = [_big_payload(f'task.split{i}') for i in range(5)]
@@ -1462,17 +1454,14 @@ def test_notification_flush_splits_on_byte_budget(monkeypatch):
     assert session._notify_bytes == 0
 
 
-def test_queue_notification_flushes_on_byte_budget(monkeypatch):
+def test_queue_notification_flushes_on_byte_budget():
     '''The byte budget also bounds the *buffer*: a big completion flushes
     at once instead of waiting out the coalescing window.'''
-    from radical.orbit import plugin_rhapsody as prh
-
-    monkeypatch.setattr(prh, 'NOTIFY_BATCH_BYTES', 256)
-
     _, plugin, client = _make_plugin()
     sid = _register(client, plugin)
     session = plugin._sessions[sid]
-    session._notify_window = 10             # would otherwise defer for 10s
+    session._notify_window      = 10        # would otherwise defer for 10s
+    session._notify_batch_bytes = 256
     plugin._dispatch_notify = MagicMock()
 
     session._queue_notification(_big_payload('task.budget'))
@@ -1481,6 +1470,42 @@ def test_queue_notification_flushes_on_byte_budget(monkeypatch):
     assert session._notify_buf   == []
     assert session._notify_bytes == 0
     assert not session._flush_scheduled
+
+
+def test_frame_budgets_follow_host_runtime_cap():
+    '''The budgets track the *serving runtime's* frame cap, not the protocol
+    default: a runtime tuned below FRAME_CAP must shrink both, else the
+    transport drops frames the plugin considers legal.'''
+    from radical.orbit import plugin_rhapsody as prh
+
+    app = FastAPI()
+    app.state.endpoint_service = MagicMock(_frame_cap=64 * 1024)
+    plugin = PluginRhapsody(app)
+
+    assert plugin._frame_cap          == 64 * 1024
+    assert plugin._return_value_limit == 32 * 1024
+    assert plugin._notify_batch_bytes == 32 * 1024
+
+    # every session it creates inherits them
+    session = plugin._create_session('sid.cap')
+    assert session._return_value_limit == 32 * 1024
+    assert session._notify_batch_bytes == 32 * 1024
+
+    # a directly built session keeps the module defaults
+    assert RhapsodySession('sid.plain')._return_value_limit \
+        == prh.RETURN_VALUE_LIMIT
+
+
+def test_frame_budgets_fall_back_to_protocol_cap():
+    '''Hosted without a runtime handle (broker plugin host, tests), the
+    budgets fall back to the protocol default.'''
+    from radical.orbit import plugin_rhapsody as prh
+
+    _, plugin, _ = _make_plugin()             # no endpoint_service in state
+
+    assert plugin._frame_cap          == prh.FRAME_CAP
+    assert plugin._return_value_limit == prh.RETURN_VALUE_LIMIT
+    assert plugin._notify_batch_bytes == prh.NOTIFY_BATCH_BYTES
 
 
 if __name__ == '__main__':
