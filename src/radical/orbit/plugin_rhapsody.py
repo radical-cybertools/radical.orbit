@@ -21,6 +21,7 @@ from fastapi import FastAPI, HTTPException, Request
 from .plugin_session_base import PluginSession
 from .plugin_base import Plugin, DEFAULT_SID
 from .client import PluginClient
+from .protocol import FRAME_CAP
 
 log = logging.getLogger("radical.orbit")
 
@@ -42,6 +43,29 @@ TERMINAL_STATES     = {'DONE', 'FAILED', 'CANCELED', 'COMPLETED'}
 WS_PAYLOAD_LIMIT    = 8 * 1024 * 1024  # target max per batch (conservative)
 NOTIFY_BATCH_SIZE   = 1024             # max tasks per bulk notification
 NOTIFY_BATCH_WINDOW = 0.25             # seconds to accumulate before flush
+
+# Both budgets below are halves of the transport frame cap.  The *effective*
+# cap is resolved per plugin from the hosting runtime (see
+# ``_resolve_frame_cap``) because it is tunable; these module constants are
+# the protocol-default fallback, and the default for a session built without
+# a plugin (direct construction, tests).
+BUDGET_RATIO        = 2
+
+# Cumulative payload budget for one notification frame.  ``NOTIFY_BATCH_SIZE``
+# alone cannot bound a batch: a single completion may carry an encoded
+# ``return_value`` of up to the return-value limit, so a handful of them
+# exceeds the frame cap, the transport drops the frame, and every waiter
+# hangs.  Flushes therefore split on bytes as well as on count — the same
+# size-aware batching the client applies to submission (WS_PAYLOAD_LIMIT).
+NOTIFY_BATCH_BYTES  = FRAME_CAP // BUDGET_RATIO
+
+# Size bound for one encoded ``return_value``.  The frame cap bounds the
+# *whole* notification / response frame, so a single result may claim at most
+# a fraction of it.  A larger result is reported as a task error instead of
+# being encoded: an oversized frame is dropped by the transport, which would
+# leave the client waiting forever, and truncating would hand back a corrupt
+# object.
+RETURN_VALUE_LIMIT  = FRAME_CAP // BUDGET_RATIO
 
 # Endpoint-level override for the coalescing window above (seconds).  The
 # default trades ~250 ms of completion latency for fewer WS frames; a
@@ -82,6 +106,45 @@ def _json_safe(v):
         if isinstance(v, (list, tuple, set)):
             return [_json_safe(x) for x in v]
         return str(v)
+
+
+def _payload_size(payload: dict) -> int:
+    """Estimate the wire size (bytes) of one notification payload.
+
+    A notification payload is flat (see ``_NOTIFICATION_KEYS``), so summing
+    key and value lengths bounds the frame accurately enough — and, unlike
+    ``len(str(payload))``, it does not copy a multi-MiB encoded return value
+    just to measure it.  Non-string values are small scalars; 16 bytes each
+    covers them with room to spare.
+    """
+    size = 2
+    for k, v in payload.items():
+        size += len(str(k)) + (len(v) if isinstance(v, str) else 16)
+    return size
+
+
+def _resolve_frame_cap(app) -> int:
+    """Resolve the effective transport frame cap for this plugin host.
+
+    ``protocol.FRAME_CAP`` is only the default: the serving runtime packs
+    with its own ``frame_cap`` tunable (``EndpointRuntime._frame_cap``), so a
+    lower configured cap must shrink the plugin's budgets too — otherwise an
+    "allowed" result or batch still overruns the real transport limit and the
+    frame is dropped.  The runtime is reached through the established
+    ``app.state.endpoint_service`` handle (same one ``_create_session`` uses
+    for the profiler); hosts without one (broker plugin host, tests) fall
+    back to the protocol default.
+
+    Known limitation: only the *local* cap is discoverable.  The broker's cap
+    is configurable as well and is not advertised in the handshake
+    (``RegisterAck`` carries no tuning), so a broker configured below its
+    endpoints can still reject a frame this budget allows.
+    """
+    svc = getattr(getattr(app, 'state', None), 'endpoint_service', None)
+    cap = getattr(svc, '_frame_cap', None)
+    if isinstance(cap, int) and cap > 0:
+        return cap
+    return FRAME_CAP
 
 
 def _resolve_notify_window() -> float:
@@ -148,14 +211,18 @@ class RhapsodySession(PluginSession):
         self._init_error: str | None = None
 
         # Notification batcher: accumulate completions and flush in bulk.
-        # Batch size is the module constant; the coalescing window defaults
-        # to the module constant and is overridden per endpoint by
-        # PluginRhapsody._create_session.  A single pending flush task
-        # drains the buffer (see _queue_notification).
+        # Batch size is the module constant; the coalescing window and the
+        # two frame-cap-derived byte budgets default to the module constants
+        # and are overridden per endpoint by PluginRhapsody._create_session
+        # (which knows the host runtime's effective cap).  A single pending
+        # flush task drains the buffer (see _queue_notification).
         self._notify_buf: list[dict] = []
+        self._notify_bytes           = 0
         self._notify_lock            = threading.Lock()
         self._flush_scheduled        = False
         self._notify_window          = NOTIFY_BATCH_WINDOW
+        self._notify_batch_bytes     = NOTIFY_BATCH_BYTES
+        self._return_value_limit     = RETURN_VALUE_LIMIT
 
         # Cache for deserialized cloudpickle payloads — avoids decoding the
         # same encoded string N times when a batch repeats identical blobs.
@@ -360,16 +427,19 @@ class RhapsodySession(PluginSession):
         """Add a task notification to the batch buffer and ensure a
         flush is scheduled.
 
-        Thread-safe — called from watcher coroutines.  A full buffer — or a
-        zero coalescing window (latency-sensitive endpoint) — flushes
-        immediately; otherwise a single delayed flush is scheduled (and only
-        one is ever pending at a time).
+        Thread-safe — called from watcher coroutines.  A buffer full by count
+        or by bytes — or a zero coalescing window (latency-sensitive
+        endpoint) — flushes immediately; otherwise a single delayed flush is
+        scheduled (and only one is ever pending at a time).
         """
+        size = _payload_size(payload)
         with self._notify_lock:
             self._notify_buf.append(payload)
+            self._notify_bytes += size
             window   = self._notify_window
             now      = window <= 0 \
-                       or len(self._notify_buf) >= NOTIFY_BATCH_SIZE
+                       or len(self._notify_buf) >= NOTIFY_BATCH_SIZE \
+                       or self._notify_bytes >= self._notify_batch_bytes
             schedule = not now and not self._flush_scheduled
             if schedule:
                 self._flush_scheduled = True
@@ -399,18 +469,49 @@ class RhapsodySession(PluginSession):
                     _do_flush(), self._plugin._main_loop)
 
     def _flush_notifications(self) -> None:
-        """Flush the notification buffer as a bulk message."""
+        """Flush the notification buffer as one or more bulk messages.
+
+        The drained buffer is split so that no single frame exceeds this
+        session's notification byte budget — completions carrying encoded
+        return values would otherwise pack a frame past the transport cap,
+        and the dropped frame would strand every waiter on those tasks.
+        """
         with self._notify_lock:
             self._flush_scheduled = False
             if not self._notify_buf:
                 return
             batch = list(self._notify_buf)
             self._notify_buf.clear()
+            self._notify_bytes = 0
 
-        if len(batch) == 1:
-            self.notify("task_status", batch[0])
-        else:
-            self.notify("task_status_batch", {"tasks": batch})
+        for frame in self._split_frames(batch):
+            if len(frame) == 1:
+                self.notify("task_status", frame[0])
+            else:
+                self.notify("task_status_batch", {"tasks": frame})
+
+    def _split_frames(self, batch: list[dict]) -> list[list[dict]]:
+        """Split notifications into frames under ``_notify_batch_bytes``.
+
+        A single payload larger than the budget still ships alone — it is
+        bounded by ``_return_value_limit``, which leaves frame-cap headroom.
+        """
+        frames: list[list[dict]] = []
+        frame:  list[dict]       = []
+        nbytes                   = 0
+
+        for payload in batch:
+            size = _payload_size(payload)
+            if frame and nbytes + size > self._notify_batch_bytes:
+                frames.append(frame)
+                frame  = []
+                nbytes = 0
+            frame.append(payload)
+            nbytes += size
+
+        if frame:
+            frames.append(frame)
+        return frames
 
     def _task_future(self, uid_str: str, task) -> "asyncio.Future":
         """Return the rhapsody wait-future for a single task.
@@ -543,19 +644,75 @@ class RhapsodySession(PluginSession):
             elif isinstance(val, list):
                 d[key] = '\n'.join(str(v) for v in val)
 
-        # Ensure return_value is JSON-serializable
+        # Ensure return_value is JSON-serializable (see _encode_return_value:
+        # rich results keep full fidelity, they are not stringified).  A
+        # JSON-safe result keeps its wire form but is size-checked all the
+        # same — a 10 MiB plain list overruns the frame just as a pickle does.
         rv = d.get('return_value')
         if rv is not None:
-            if isinstance(rv, bytes):
-                d['return_value'] = base64.b64encode(rv).decode('ascii')
-                d['_return_value_encoding'] = 'base64'
+            try:
+                as_json = json.dumps(rv)
+            except (TypeError, ValueError):
+                self._encode_return_value(d, rv)
             else:
-                try:
-                    json.dumps(rv)
-                except (TypeError, ValueError):
-                    d['return_value'] = str(rv)
+                if len(as_json) > self._return_value_limit:
+                    self._oversized_return_value(d, len(as_json))
 
         return {k: _json_safe(v) for k, v in d.items()}
+
+    def _encode_return_value(self, d: dict, rv) -> None:
+        """Encode a non-JSON-safe ``return_value`` in place.
+
+        ``bytes`` keep the established plain-base64 form; any other object
+        (numpy array, dataclass, model weights, ...) is cloudpickled with the
+        very same ``cloudpickle::<base64>`` convention that carries function
+        arguments the other way — so a function task keeps full fidelity in
+        both directions instead of coming back as its ``str()``.  The
+        ``_return_value_encoding`` field names the encoding for the client
+        (:meth:`RhapsodyClient._decode_return_value`).
+
+        Two failure modes are reported rather than silently degraded: an
+        unpicklable result falls back to ``str(rv)`` (all the wire can
+        carry), and a result whose encoding exceeds this session's
+        return-value limit is dropped in favour of an ``error`` — the
+        oversized frame would otherwise be discarded by the transport.
+        """
+        if isinstance(rv, bytes):
+            encoding = 'base64'
+            encoded  = base64.b64encode(rv).decode('ascii')
+        else:
+            try:
+                encoding = 'cloudpickle'
+                encoded  = 'cloudpickle::' \
+                         + base64.b64encode(_cp.dumps(rv)).decode('ascii')
+            except Exception as e:
+                log.warning("[%s] return_value is not picklable (%s) — "
+                            "falling back to str()", self._sid, e)
+                d['return_value'] = str(rv)
+                return
+
+        if len(encoded) > self._return_value_limit:
+            self._oversized_return_value(d, len(encoded))
+            return
+
+        d['return_value']           = encoded
+        d['_return_value_encoding'] = encoding
+
+    def _oversized_return_value(self, d: dict, size: int) -> None:
+        """Replace an over-budget ``return_value`` with a task error.
+
+        Applies to both wire forms (encoded and plain JSON): a frame past
+        the transport cap is dropped, so the client would wait forever —
+        and truncating would hand back a corrupt result.
+        """
+        msg = (f"return_value too large: {size} wire bytes exceed the "
+               f"{self._return_value_limit} byte limit — stage the result "
+               f"to a file instead")
+        log.error("[%s] %s", self._sid, msg)
+        d['return_value'] = None
+        d.pop('_return_value_encoding', None)
+        if not d.get('error'):
+            d['error'] = msg
 
     _NOTIFICATION_KEYS = {'uid', 'state', 'exit_code',
                           'return_value', '_return_value_encoding',
@@ -690,10 +847,7 @@ class RhapsodyClient(PluginClient):
         with self._cond:
             changed = False
             for t in tasks:
-                # Decode base64-encoded return values
-                if t.get('_return_value_encoding') == 'base64':
-                    t['return_value'] = base64.b64decode(t['return_value'])
-                    del t['_return_value_encoding']
+                self._decode_return_value(t)
 
                 uid   = t.get('uid')
                 state = str(t.get('state', '')).upper()
@@ -703,6 +857,39 @@ class RhapsodyClient(PluginClient):
 
             if changed:
                 self._cond.notify_all()
+
+    @staticmethod
+    def _decode_return_value(t: dict) -> None:
+        """Reverse :meth:`RhapsodySession._encode_return_value` in place.
+
+        ``base64`` yields the original ``bytes``, ``cloudpickle`` the original
+        Python object; the marker is dropped once decoded so the task dict
+        looks exactly like a locally executed one.  A value the client cannot
+        decode (e.g. the result's class is not importable here) is left on the
+        wire form with a warning — better a visible blob than an exception
+        that would take down the notification dispatch for every other task.
+        """
+        if not isinstance(t, dict):
+            return
+
+        enc = t.get('_return_value_encoding')
+        raw = t.get('return_value')
+        if enc not in ('base64', 'cloudpickle') or not isinstance(raw, str):
+            return
+
+        try:
+            if enc == 'base64':
+                t['return_value'] = base64.b64decode(raw)
+            else:
+                if raw.startswith('cloudpickle::'):
+                    raw = raw[len('cloudpickle::'):]
+                t['return_value'] = _cp.loads(base64.b64decode(raw))
+        except Exception as e:
+            log.warning("cannot decode %s return_value of %s: %s",
+                        enc, t.get('uid'), e)
+            return
+
+        del t['_return_value_encoding']
 
     def register_session(self, backends: list[str] | None = None,
                          init_timeout: float = 120):
@@ -1010,7 +1197,11 @@ class RhapsodyClient(PluginClient):
 
     def _wait_tasks_poll(self, uids: list[str],
                          timeout: float | None = None) -> list[dict]:
-        """Fallback wait via periodic polling (no SSE available)."""
+        """Fallback wait via periodic polling (no SSE available).
+
+        Decodes encoded return values just like the SSE path, so a caller
+        sees the same objects no matter which transport served the wait.
+        """
 
         url     = self._url(ROUTE_WAIT.format(sid=self.sid))
         payload: dict = {"uids": uids}
@@ -1023,6 +1214,9 @@ class RhapsodyClient(PluginClient):
             resp = self._http.post(url, json=payload)
             self._raise(resp, f"wait {len(uids)} task(s)")
             tasks = resp.json()
+
+            for t in tasks:
+                self._decode_return_value(t)
 
             # Check if all are terminal
             all_done = all(
@@ -1163,6 +1357,14 @@ class PluginRhapsody(Plugin):
         # (not per flush) and handed to every session this plugin creates.
         self._notify_window = _resolve_notify_window()
 
+        # Endpoint-wide frame budgets — likewise resolved once, from the
+        # hosting runtime's *effective* frame cap rather than the protocol
+        # default, so a runtime tuned below FRAME_CAP shrinks both budgets
+        # instead of letting the transport drop the frames they permit.
+        self._frame_cap          = _resolve_frame_cap(app)
+        self._notify_batch_bytes = self._frame_cap // BUDGET_RATIO
+        self._return_value_limit = self._frame_cap // BUDGET_RATIO
+
         self.add_route_post(ROUTE_SUBMIT,     self.submit_tasks)
         self.add_route_post(ROUTE_WAIT,       self.wait_tasks)
         self.add_route_get (ROUTE_LIST_TASKS, self.list_tasks)
@@ -1255,19 +1457,23 @@ class PluginRhapsody(Plugin):
         return [env_backend] if env_backend else None
 
     def _create_session(self, sid: str, **kwargs) -> RhapsodySession:
-        """Build a session and inject the endpoint's shared profiler and
-        notification window.
+        """Build a session and inject the endpoint's shared profiler,
+        notification window and frame budgets.
 
         Extends the base factory (which injects ``_plugin``) so every
         rhapsody session profiles against the one endpoint-runtime profiler
-        instead of digging it out of app state on first use, and coalesces
-        notifications over the endpoint-configured window.
+        instead of digging it out of app state on first use, coalesces
+        notifications over the endpoint-configured window, and sizes its
+        return values / notification frames against the host runtime's
+        effective frame cap.
         """
         session = super()._create_session(sid, **kwargs)
         svc = getattr(self._app.state, 'endpoint_service', None)
         session._prof = getattr(svc, '_prof', None) or \
                         rprof.Profiler('rhapsody', ns='radical.orbit')
-        session._notify_window = self._notify_window
+        session._notify_window      = self._notify_window
+        session._notify_batch_bytes = self._notify_batch_bytes
+        session._return_value_limit = self._return_value_limit
         return session
 
     @staticmethod
