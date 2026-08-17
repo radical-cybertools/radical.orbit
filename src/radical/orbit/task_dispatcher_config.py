@@ -68,7 +68,7 @@ class PoolConfig:
     min_pilots      : int  = 0
     max_pilots      : int  = 4
     scratch_base    : str | None = None  # None → default scratch tree
-    strategy        : str  = 'conservative'  # retained for config compat
+    strategy        : str  = 'conservative'  # policy name (see task_dispatcher_policy)
     strategy_config : dict[str, Any] = field(default_factory=dict)
 
 
@@ -175,12 +175,23 @@ def _parse_pool(d: Any, source: str) -> PoolConfig:
         raise PoolConfigError(
             f"{source}: 'strategy' must be a non-empty string")
 
+    # Validate against the policy registry here so a bad name fails the
+    # declaration (register_session → 400, no dangling session) instead of
+    # blowing up at pool materialisation.  Import is function-local because
+    # the policy module imports this one.
+    from .task_dispatcher_policy import known_policies
+    policies = known_policies()
+    if strategy not in policies:
+        raise PoolConfigError(
+            f"{source}: unknown 'strategy' {strategy!r} "
+            f"(known: {', '.join(policies)})")
+
     strategy_config = d.get('strategy_config', {})
     if not isinstance(strategy_config, dict):
         raise PoolConfigError(
             f"{source}: 'strategy_config' must be an object")
 
-    return PoolConfig(
+    cfg = PoolConfig(
         name            = name,
         queue           = queue,
         account         = account,
@@ -193,6 +204,23 @@ def _parse_pool(d: Any, source: str) -> PoolConfig:
         strategy        = strategy,
         strategy_config = strategy_config,
     )
+
+    # Trial-instantiate the policy so an invalid ``strategy_config`` (e.g. a
+    # bad ``router_preference``) also fails the declaration here — 400 at
+    # register_session, no dangling session — rather than raising later at
+    # pool materialisation.  Policy constructors are required to be cheap
+    # and side-effect-free (see DispatchPolicy).
+    from .task_dispatcher_policy import make_policy
+    try:
+        make_policy(cfg)
+    except PoolConfigError:
+        raise
+    except Exception as e:
+        raise PoolConfigError(
+            f"{source}: strategy {strategy!r} rejected its "
+            f"strategy_config: {e}") from e
+
+    return cfg
 
 
 def _parse_pilot_size(d: Any, source: str) -> PilotSize:

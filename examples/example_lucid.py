@@ -7,13 +7,17 @@ def main():
 
     rt = EndpointRuntime()
     rt.start(wait=True)
-    eids = [n for n in rt.topology() if n != 'broker']
 
-    if not eids:
-        print("No endpoints found.")
+    # topology() also lists the broker and this script's own consumer
+    # participant (role='consumer'); pick a real endpoint hosting 'lucid'.
+    eid = next((n for n, info in rt.topology().items()
+                if info.get('role') == 'endpoint'
+                and 'lucid' in (info.get('plugins') or {})), None)
+
+    if not eid:
+        print("No endpoint with the 'lucid' plugin found.")
         return
 
-    eid = eids[0]
     print(f"Using endpoint: {eid}")
 
     lucid = rt.get_plugin(eid, 'lucid')

@@ -27,8 +27,8 @@ def main():
     parser = argparse.ArgumentParser(description="ORBIT Service")
     parser.add_argument("--name",      "-n", nargs="?", help="Endpoint name")
     parser.add_argument("--url",       "-u", nargs="?",
-                        help="Broker URL.  CLI > $RADICAL_ORBIT_BROKER_URL > "
-                             "~/.radical/orbit/broker.url.")
+                        help="Broker URL.  CLI > $RADICAL_ORBIT_BROKER_URL "
+                             "(no file fallback).")
     parser.add_argument("--cert",      "-c", nargs="?",
                         help="Broker TLS cert path.  CLI > "
                              "$RADICAL_ORBIT_BROKER_CERT > "

@@ -15,14 +15,20 @@ def main():
 
     rt   = EndpointRuntime()
     rt.start(wait=True)
-    eids = [n for n in rt.topology() if n != 'broker']
 
-    if not eids:
-        print("No endpoints connected - start an endpoint service first")
+    # topology() also lists the broker and this script's own consumer
+    # participant (role='consumer'); pick a real endpoint hosting 'staging'.
+    eid = next((n for n, info in rt.topology().items()
+                if info.get('role') == 'endpoint'
+                and 'staging' in (info.get('plugins') or {})), None)
+
+    if not eid:
+        print("No endpoint with the 'staging' plugin found - "
+              "start an endpoint service first")
         rt.stop()
         return
 
-    staging = rt.get_plugin(eids[0], 'staging')
+    staging = rt.get_plugin(eid, 'staging')
 
     # Create a local test file
     with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as f:

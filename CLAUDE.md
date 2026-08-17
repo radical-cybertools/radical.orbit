@@ -47,24 +47,47 @@ For HTTPS, generate a self-signed cert first:
 openssl req -x509 -newkey rsa:4096 -nodes -keyout key.pem -out cert.pem -days 365 -subj "/CN=localhost"
 ```
 
+### Embedded broker
+
+A consumer client can host the full broker (routing + hosted plugins +
+gateway) inside its own process instead of connecting out:
+`EndpointRuntime(embedded=True)` (implementation: `embedded.py`,
+`EmbeddedBroker`). The embedded broker binds port 8000 (falls back to an
+ephemeral port with a warning when taken), uses the same operator-placed
+cert/key/token as a standalone broker, and never writes under
+`~/.radical/orbit`. Remote endpoints connect to `rt.broker_url` exactly as
+they would to a standalone broker; `submit_tunneled` children inherit that
+URL automatically. `embedded=True` skips URL resolution entirely (an ambient
+`$RADICAL_ORBIT_BROKER_URL` is ignored); combining it with an explicit
+`broker_url` raises. For host/port/auth/plugin control, construct
+`EmbeddedBroker` directly and pass `broker_url=eb.url`. The standalone
+`radical-orbit-broker.py` remains the deployment for shared, multi-client
+brokers.
+
 ### Ingress auth token
 
 The broker gates its HTTP ingress and the endpoint `/register` handshake with a
-**shared bearer token**. On first start it generates one and writes it to
-`~/.radical/orbit/broker.token` (0600); the token value is **never** printed to
-stdout (only its source/path), so it can't leak into captured logs (CWE-532) —
-read it from the file. Resolution
-(client/endpoint side): `--token` > `$RADICAL_ORBIT_BROKER_TOKEN` >
+**shared bearer token**. Like the cert/key pair, the token is operator-placed —
+the software never generates or writes it (`~/.radical/orbit` config is
+read-only for the code; `utils.TOKEN_RECIPE` / `radical-orbit-broker.py --help`
+carry the one-time creation recipe). The token value is **never** printed to
+stdout (only its source/path), so it can't leak into captured logs (CWE-532).
+Resolution (both sides): `--token` > `$RADICAL_ORBIT_BROKER_TOKEN` >
 `~/.radical/orbit/broker.token` — so same-host clients/endpoints pick it up with
-no config; for a remote broker, copy the token or set the env var. The Explorer
-prompts for it and then rides an HttpOnly cookie minted by `POST /auth`. Disable
-the gate for local dev with `--no-auth` (or `RADICAL_ORBIT_BROKER_NO_AUTH=1`).
-Helpers live in `utils.py`
-(`resolve_broker_token`, `ensure_broker_token`, `auth_disabled`, `tokens_match`);
+no config; for a remote broker, copy the token or set the env var. The broker
+refuses to start without a token unless auth is disabled explicitly:
+`auth=False` on the `Broker` ctor / `--no-auth` on the bin (local dev only; no
+env-var escape hatch). The Explorer prompts for the token and then rides an
+HttpOnly cookie minted by `POST /auth`. Helpers live in `utils.py`
+(`resolve_broker_token`, `tokens_match`, `TOKEN_RECIPE`, `TLS_RECIPE`);
 the broker core gates the WS `/register` handshake (`Broker._auth_dispatch`) and
 the gateway gates HTTP ingress (`Gateway._auth_dispatch`, minting the `/auth`
 cookie). This is the interim credential; a future per-participant identity
 (mTLS) generalizes it.
+
+The broker URL similarly has **no file fallback**: clients/endpoints resolve it
+from the API/CLI arg > `$RADICAL_ORBIT_BROKER_URL` only (a stale on-disk URL
+was a recurring source of confusion).
 
 ## Testing
 
@@ -130,7 +153,7 @@ The gateway preserves these HTTP paths for the Explorer and other HTTP clients:
 - **Node discovery**: `BatchSystem.job_nodes(native_id)` returns allocated node hostnames; SLURM uses `squeue`/`scontrol show hostnames`, PBSPro parses `qstat -f exec_host`. Used by the tunnel watcher.
 - **BatchSystem abstraction** (`batch_system.py`, `batch_system_slurm.py`, `batch_system_pbs.py`) – isolates scheduler-specific behaviour. `detect_batch_system()` returns the active backend (`SlurmBatchSystem`, `PBSProBatchSystem`, or `NullBatchSystem`). All schedulers expose a normalized state vocabulary (`PENDING`/`RUNNING`/`DONE`/`FAILED`/`CANCELLED`/`HELD`/`UNKNOWN`); callers compare against constants from `batch_system`, never raw scheduler strings. To add a new backend (e.g. LSF, Cobalt): subclass `BatchSystem`, implement the abstract methods, and call `register_backend(YourBackend)` at module load.
 - **queue_info** (`plugin_queue_info.py`) – Batch queue/partition info, job listings, and allocations. Backend selected automatically via `make_queue_info()` factory: SLURM (`queue_info_slurm.py`, sinfo/squeue/sacctmgr), PBSPro (`queue_info_pbs.py`, qstat/pbsnodes; allocations not available — PBSPro has no native sacctmgr equivalent), or no-op (`queue_info_none.py`). Shared backend with caching. Background prefetch on startup. Client API: `backend()` (session-less, returns `'slurm'`/`'pbs'`/`'none'`), `job_allocation()` (session-less, returns `{job_id, partition, n_nodes, nodelist, cpus_per_node, gpus_per_node, account, job_name, runtime}` or None), `get_info(user, force)`, `list_jobs(queue, user, force)`, `list_all_jobs(user, force)`, `cancel_job(job_id)`, `list_allocations(user, force)`.
-- **rhapsody** (`plugin_rhapsody.py`) – Task execution via Rhapsody backends (default: Dragon V3). Registers backend callbacks for intermediate state notifications (e.g. RUNNING). Client API: `submit_tasks(tasks)`, `wait_tasks(uids, timeout)`, `list_tasks()`, `get_task(uid)`, `cancel_task(uid)`, `cancel_all_tasks()`. Function tasks supported via cloudpickle (``"function": "cloudpickle::<base64>"``, ``"_pickled_fields": [...]``) or import path (``"function": "module:func"``). Resource specs via ``task_backend_specific_kwargs`` (timeout, ranks, type, process_template). Session accepts optional `backends` list. Notification topics: `session_status` → `{sid, status}` on session init ready/failed; `task_status` → `{uid, state}` on RUNNING, `{uid, state, exit_code, return_value, error, exception}` on terminal states; `task_status_batch` → `{tasks: [...]}` for bulk terminal notifications. Client-side optimizations: template compression for homogeneous batches, size-aware pipelined submission, SSE-based wait with event wakeup.
+- **rhapsody** (`plugin_rhapsody.py`) – Task execution via Rhapsody backends (default: Dragon V3). Registers backend callbacks for intermediate state notifications (e.g. RUNNING). Client API: `submit_tasks(tasks)`, `wait_tasks(uids, timeout)`, `list_tasks()`, `get_task(uid)`, `cancel_task(uid)`, `cancel_all_tasks()`. Function tasks supported via cloudpickle (``"function": "cloudpickle::<base64>"``, ``"_pickled_fields": [...]``) or import path (``"function": "module:func"``). **Return values** keep the same fidelity in the other direction: a non-JSON-safe result travels as ``"return_value": "cloudpickle::<base64>"`` with ``"_return_value_encoding": "cloudpickle"`` (``bytes`` keep the plain-base64 form, marker ``"base64"``) and is decoded back into the original object by `RhapsodyClient` on both wait paths (SSE and poll); JSON-safe results are unchanged. `get_task()` / `list_tasks()` deliberately return the wire form (they are proxied verbatim as JSON, e.g. by the task dispatcher). A result above the per-session return-value limit is reported as a task `error` rather than truncated or dropped as an oversized frame — the JSON-safe wire form is size-checked too — and terminal notifications flush in frames bounded by a notification byte budget, so a batch of large results cannot pack one frame past the cap. Both budgets are half of the **effective** transport frame cap, resolved once at plugin init from the hosting runtime (`app.state.endpoint_service._frame_cap`, which is tunable) and injected into every session; `RETURN_VALUE_LIMIT` / `NOTIFY_BATCH_BYTES` (half `protocol.FRAME_CAP`) are only the fallback for a host without that handle (broker plugin host, tests). Known limitation: only the local cap is discoverable — the broker's `frame_cap` is configurable too and is not advertised in the handshake (`RegisterAck` carries no tuning), so a broker configured below its endpoints can still reject a frame these budgets allow. Note the trust direction this adds: the **client unpickles endpoint-produced results**, where previously only the endpoint unpickled client-produced arguments (gated there by `allow_pickled_tasks`); there is no client-side gate, so a consumer must trust the endpoints it submits to. Resource specs via ``task_backend_specific_kwargs`` (timeout, ranks, type, process_template). Session accepts optional `backends` list. Notification topics: `session_status` → `{sid, status}` on session init ready/failed; `task_status` → `{uid, state}` on RUNNING, `{uid, state, exit_code, return_value, error, exception}` on terminal states; `task_status_batch` → `{tasks: [...]}` for bulk terminal notifications. Client-side optimizations: template compression for homogeneous batches, size-aware pipelined submission, SSE-based wait with event wakeup.
 - **lucid** (`plugin_lucid.py`) – RADICAL Pilot integration. Client API: `pilot_submit(description)`, `task_submit(description)`, `task_wait(tid)`.
 - **xgfabric** (`plugin_xgfabric.py`) – ExaGraph fabric operations. Classifies connected endpoints as `immediate_clusters` (direct execution) or `allocate_clusters` (batch submission via SLURM). An endpoint is classified as `allocate` only if it has the `queue_info` plugin **and** `is_enabled` returns `true`; otherwise it is `immediate`. Cluster lists updated in real-time via `on_topology_change`. Client API: `get_workdir()`, `set_workdir(path)`, `list_configs()`, `load_config(name)` (also accepts `'default'`/`'test'` builtins), `save_config(cfg)`, `delete_config(name)`, `get_status()`, `start_workflow(workflow, resource)`, `stop_workflow()`. Notification topic: `workflow_status` → full workflow state dict.
 - **staging** (`plugin_staging.py`) – File transfer between client and endpoint. Paths must be absolute (or use `~/...`) and within `$HOME` or `/tmp`. Never overwrites existing files. Client API: `put(local_src, remote_dst, overwrite=False)`, `get(remote_src, local_dst)`, `list(remote_path)` → `{path, entries: [{name, type, size}]}`.

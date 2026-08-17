@@ -24,7 +24,10 @@ except ImportError:
 
 def select_endpoint(rt):
     """List endpoints and let user pick one."""
-    endpoints = [n for n in rt.topology() if n != 'broker']
+    # topology() also lists the broker and this script's own consumer
+    # participant (role='consumer'); offer only real endpoints.
+    endpoints = [n for n, info in rt.topology().items()
+                 if info.get('role') == 'endpoint']
     if not endpoints:
         raise RuntimeError("No endpoints available")
     for i, eid in enumerate(endpoints):

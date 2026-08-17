@@ -61,7 +61,7 @@ def test_broker_entrypoint_constructs_broker(monkeypatch, tmp_path):
                          '--port', '9123', '--plugins', 'sysinfo'])
     mod.main()
 
-    assert captured['no_auth'] is True
+    assert captured['auth']    is False          # --no-auth -> auth=False
     assert captured['gateway'] is False          # --no-gateway -> gateway=False
     assert captured['port']    == 9123
     assert captured['plugins'] == 'sysinfo'
@@ -119,7 +119,6 @@ def broker_client(tmp_path, monkeypatch):
     from radical.orbit import utils
     from radical.orbit.broker import Broker, BrokerTuning
 
-    monkeypatch.setattr(utils, 'URL_FILE',   tmp_path / 'broker.url')
     monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'broker.token')
 
     cert = tmp_path / 'cert.pem'
@@ -130,7 +129,7 @@ def broker_client(tmp_path, monkeypatch):
          '-days', '1', '-subj', '/CN=localhost'],
         check=True, capture_output=True)
 
-    broker = Broker(cert=str(cert), key=str(key), no_auth=True,
+    broker = Broker(cert=str(cert), key=str(key), auth=False,
                     tuning=BrokerTuning(grace=0.05, ping_timeout=0.05))
     return broker
 
@@ -177,7 +176,6 @@ async def test_gateway_auth_dispatch_normalizes_traversal(tmp_path, monkeypatch)
     from radical.orbit import utils
     from radical.orbit.broker import Broker
 
-    monkeypatch.setattr(utils, 'URL_FILE',   tmp_path / 'broker.url')
     monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'broker.token')
     cert = tmp_path / 'cert.pem'
     key  = tmp_path / 'key.pem'
@@ -187,7 +185,7 @@ async def test_gateway_auth_dispatch_normalizes_traversal(tmp_path, monkeypatch)
          '-days', '1', '-subj', '/CN=localhost'],
         check=True, capture_output=True)
 
-    broker = Broker(cert=str(cert), key=str(key), token='s3cret', no_auth=False)
+    broker = Broker(cert=str(cert), key=str(key), token='s3cret', auth=True)
     gateway = broker._gateway
 
     async def _passed(_req):
