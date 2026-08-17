@@ -209,7 +209,7 @@ class Broker:
     """The active broker — lean routing loop + own-thread plugin host.
 
     The constructor takes the handful of things an operator sets — ``app``,
-    ``cert``/``key``, ``host``/``port``, ``plugins``, ``token``/``no_auth`` and
+    ``cert``/``key``, ``host``/``port``, ``plugins``, ``token``/``auth`` and
     ``gateway``.  The liveness/backpressure knobs are grouped in an optional
     :class:`BrokerTuning` object (unit tests pass one with tiny timeouts, or
     mutate the resulting ``self._*`` attributes, so no test sleeps for real).
@@ -223,7 +223,7 @@ class Broker:
                  port:     int = 8000,
                  plugins:  str = '',
                  token:    Optional[str]     = None,
-                 no_auth:  bool              = False,
+                 auth:     bool              = True,
                  gateway:  bool              = True,
                  tuning:   Optional[BrokerTuning] = None):
 
@@ -234,11 +234,22 @@ class Broker:
         self._key : str = str(key_path)
 
         # ── Ingress auth token ────────────────────────────────────────
-        self._auth_enabled: bool          = not utils.auth_disabled(no_auth)
+        # Auth is on by default and requires an operator-placed token;
+        # nothing is ever generated or written (``~/.radical/orbit`` config
+        # is read-only for the software).  ``auth=False`` (``--no-auth``)
+        # is the explicit local-dev escape hatch.
+        self._auth_enabled: bool          = auth
         self._token:        Optional[str] = None
         self._token_source: str           = 'disabled'
         if self._auth_enabled:
-            self._token, self._token_source = utils.ensure_broker_token(cli=token)
+            self._token, self._token_source = \
+                                        utils.resolve_broker_token(cli=token)
+            if not self._token:
+                raise ValueError(
+                    f'ingress auth token required (no --token, '
+                    f'${utils.ENV_TOKEN} unset, no file at '
+                    f'{utils.TOKEN_FILE}).  Pass auth=False (--no-auth) '
+                    f'for local dev, or create one:\n\n{utils.TOKEN_RECIPE}')
 
         # ── Advertised URL ───────────────────────────────────────────
         self._host = host
@@ -557,9 +568,8 @@ class Broker:
         if not auth_enabled:
             lines.append('[Broker] WARNING: ingress authentication DISABLED '
                          '(--no-auth)')
-        elif token_source in ('generated', 'file'):
-            verb = 'creating' if token_source == 'generated' else 'using'
-            lines.append(f'[Broker] {verb:<10}{"token":<6}at '
+        elif token_source == 'file':
+            lines.append(f'[Broker] {"using":<10}{"token":<6}at '
                          f'{Broker._tilde(utils.TOKEN_FILE)}')
         else:  # 'cli' / 'env' — configured, but not at the default file path
             src = '--token' if token_source == 'cli' else f'${utils.ENV_TOKEN}'
@@ -593,7 +603,7 @@ class Broker:
 
         if not auth_enabled:
             lines += ['', '  On Client and Endpoint:', export_url, cp_cert]
-        elif token_source in ('generated', 'file'):
+        elif token_source == 'file':
             lines += ['', '  On Client:',   export_url, cp_both,
                       '', '  On Endpoint:', export_url, cp_cert]
         else:  # cli / env — the client needs the token via env, not a file
@@ -603,6 +613,21 @@ class Broker:
                       '', '  On Endpoint:', export_url, cp_cert]
         lines.append('')
         return '\n'.join(lines)
+
+    def _uvicorn_kwargs(self) -> dict:
+        """Server kwargs shared by ``run()`` and the embedded-broker server."""
+        return dict(reload=False,
+                    ssl_certfile=self._cert,
+                    ssl_keyfile=self._key,
+                    log_level="info",
+                    # Transport enforces the frame cap on inbound frames.
+                    ws_max_size=self._frame_cap,
+                    ws_per_message_deflate=True,
+                    # Server-wide WS keepalive disconnects a silent client at
+                    # ping_interval + ping_timeout.
+                    ws_ping_interval=self._ping_interval,
+                    ws_ping_timeout=self._ping_timeout,
+                    timeout_graceful_shutdown=3)
 
     def run(self) -> None:
         """Start uvicorn.  Blocks until shutdown."""
@@ -615,23 +640,13 @@ class Broker:
                                    self._token_source, self._auth_enabled),
               flush=True)
         if not self._auth_enabled:
-            log.warning("[Broker] ingress authentication DISABLED (--no-auth)")
+            log.warning("[Broker] ingress authentication DISABLED "
+                        "(auth=False / --no-auth)")
 
         uvicorn.run(self._app,
                     host=self._host,
                     port=self._port,
-                    reload=False,
-                    ssl_certfile=self._cert,
-                    ssl_keyfile=self._key,
-                    log_level="info",
-                    # Transport enforces the frame cap on inbound frames.
-                    ws_max_size=self._frame_cap,
-                    ws_per_message_deflate=True,
-                    # Server-wide WS keepalive disconnects a silent client at
-                    # ping_interval + ping_timeout.
-                    ws_ping_interval=self._ping_interval,
-                    ws_ping_timeout=self._ping_timeout,
-                    timeout_graceful_shutdown=3)
+                    **self._uvicorn_kwargs())
 
     @asynccontextmanager
     async def _lifespan(self, app: FastAPI):

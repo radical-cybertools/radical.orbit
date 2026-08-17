@@ -96,10 +96,25 @@ class TestParsePools:
         assert pools['cpu'].strategy_config == {
             'min_dwell_sec': 15, 'custom_key': 'x'}
 
-    def test_dotted_strategy_spec_accepted(self):
-        pools = parse_pools(_minimal_pool_dict(
-            strategy='my_module.pkg:MyStrategy'))
-        assert pools['cpu'].strategy == 'my_module.pkg:MyStrategy'
+    def test_known_strategy_accepted(self):
+        pools = parse_pools(_minimal_pool_dict(strategy='conservative'))
+        assert pools['cpu'].strategy == 'conservative'
+
+    def test_unknown_strategy_rejected(self):
+        # 'strategy' must name a registered policy (task_dispatcher_policy);
+        # arbitrary/dotted specs are rejected at parse time so a bad name
+        # 400s at register_session instead of failing at materialisation.
+        with pytest.raises(PoolConfigError, match="unknown 'strategy'"):
+            parse_pools(_minimal_pool_dict(
+                strategy='my_module.pkg:MyStrategy'))
+
+    def test_invalid_strategy_config_rejected(self):
+        # The parser trial-instantiates the policy, so a strategy_config the
+        # policy constructor rejects fails the declaration (400) instead of
+        # raising later at pool materialisation (500 + dangling session).
+        with pytest.raises(PoolConfigError, match='router_preference'):
+            parse_pools(_minimal_pool_dict(
+                strategy_config={'router_preference': 'bogus'}))
 
     def test_endpoint_name_defaults_to_none(self):
         """Pools without explicit endpoint_name parse to endpoint_name=None."""
