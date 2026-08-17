@@ -1,10 +1,10 @@
 '''
 Task dispatcher — the conservative dispatch policy.
 
-This is the dispatcher's one policy: a plain class (no ABC, no context
-indirection).  It reads live pool state directly off the :class:`PoolState`
-handed to it and requests pilot submissions through a callable the dispatcher
-supplies.
+This is the dispatcher's default policy, registered as ``'conservative'``
+in the manual registry in :mod:`~radical.orbit.task_dispatcher_policy`.
+It reads live pool state directly off the :class:`PoolState` handed to it
+and requests pilot submissions through a callable the dispatcher supplies.
 
 Policy
 ------
@@ -38,6 +38,7 @@ import time
 from typing import TYPE_CHECKING, Callable
 
 from .task_dispatcher_config import PoolConfig
+from .task_dispatcher_policy import DispatchPolicy
 from .task_dispatcher_state  import (
     PILOT_ACTIVE, PILOT_FAILED, PILOT_PENDING, PILOT_STARTING,
     PILOT_LIVE_STATES, TASK_QUEUED,
@@ -53,7 +54,7 @@ log = logging.getLogger('radical.orbit')
 _PRE_ACTIVE = {PILOT_PENDING, PILOT_STARTING}
 
 
-class ConservativePolicy:
+class ConservativePolicy(DispatchPolicy):
     '''Conservative scale-up + priority dispatch for one pool.
 
     One instance per :class:`PoolState`.  Reads live state off the pool
@@ -63,8 +64,7 @@ class ConservativePolicy:
 
     def __init__(self, pool: PoolConfig, cfg: dict,
                  now: Callable[[], float] = time.time) -> None:
-        self._pool = pool
-        self._now  = now
+        super().__init__(pool, cfg, now)
 
         self._last_submit_ts      : float = 0.0
         self._min_dwell_sec       : float = float(

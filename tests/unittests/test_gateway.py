@@ -131,7 +131,6 @@ class _RunningBroker:
 def harness(self_signed, tmp_path, monkeypatch):
     """Factory yielding (make_broker, make_runtime); tears everything down."""
     from radical.orbit import utils
-    monkeypatch.setattr(utils, 'URL_FILE',   tmp_path / 'broker.url')
     monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'broker.token')
     monkeypatch.delenv('RADICAL_ORBIT_BROKER_TOKEN', raising=False)
     monkeypatch.delenv('RADICAL_ORBIT_BROKER_URL',   raising=False)
@@ -146,7 +145,7 @@ def harness(self_signed, tmp_path, monkeypatch):
         for _k in list(kw):
             if hasattr(tuning, _k):
                 setattr(tuning, _k, kw.pop(_k))
-        defaults = dict(cert=str(cert), key=str(key), no_auth=True, tuning=tuning)
+        defaults = dict(cert=str(cert), key=str(key), auth=False, tuning=tuning)
         defaults.update(kw)
         broker = Broker(**defaults)
         srv = _RunningBroker(broker).start()
@@ -232,7 +231,7 @@ class _SSEReader:
 
 def test_auth_gate_401_without_token_and_cookie_flow(harness):
     make_broker, _ = harness
-    srv = make_broker(no_auth=False, token='sekret')
+    srv = make_broker(auth=True, token='sekret')
 
     # No token -> 401 on a capability route.
     r = httpx.post(srv.url + '/endpoint/list')
@@ -258,7 +257,7 @@ def test_auth_gate_401_without_token_and_cookie_flow(harness):
 
 def test_auth_exempt_paths(harness):
     make_broker, _ = harness
-    srv = make_broker(no_auth=False, token='sekret')
+    srv = make_broker(auth=True, token='sekret')
 
     # UI shell + static plugin JS load without a token (Explorer must prompt).
     assert httpx.get(srv.url + '/').status_code in (200, 404)  # served or absent
@@ -269,7 +268,7 @@ def test_auth_exempt_paths(harness):
 
 def test_auth_disabled_passthrough(harness):
     make_broker, _ = harness
-    srv = make_broker(no_auth=True)
+    srv = make_broker(auth=False)
     r = httpx.post(srv.url + '/endpoint/list')
     assert r.status_code == 200
 

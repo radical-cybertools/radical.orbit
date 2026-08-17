@@ -458,7 +458,6 @@ def harness(tmp_path, monkeypatch):
         pytest.skip("openssl not available")
     import os
     from radical.orbit import utils
-    monkeypatch.setattr(utils, 'URL_FILE',   tmp_path / 'broker.url')
     monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'broker.token')
     monkeypatch.delenv('RADICAL_ORBIT_BROKER_TOKEN', raising=False)
     cert = tmp_path / 'cert.pem'
@@ -478,7 +477,7 @@ def harness(tmp_path, monkeypatch):
         for _k in list(kw):
             if hasattr(tuning, _k):
                 setattr(tuning, _k, kw.pop(_k))
-        defaults = dict(cert=str(cert), key=str(key), no_auth=True, tuning=tuning)
+        defaults = dict(cert=str(cert), key=str(key), auth=False, tuning=tuning)
         defaults.update(kw)
         srv = _RunningBroker(Broker(**defaults)).start()
         servers.append(srv)

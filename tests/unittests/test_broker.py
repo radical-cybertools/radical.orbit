@@ -63,7 +63,6 @@ def make_broker(self_signed, tmp_path, monkeypatch):
     they own the loop; TestClient tests let the app lifespan do it.
     """
     from radical.orbit import utils
-    monkeypatch.setattr(utils, 'URL_FILE',   tmp_path / 'broker.url')
     monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'broker.token')
 
     cert, key = self_signed
@@ -78,7 +77,7 @@ def make_broker(self_signed, tmp_path, monkeypatch):
         for _k in list(kwargs):
             if _k in _TUNING_KEYS:
                 setattr(tuning, _k, kwargs.pop(_k))
-        defaults = dict(cert=str(cert), key=str(key), no_auth=True, tuning=tuning)
+        defaults = dict(cert=str(cert), key=str(key), auth=False, tuning=tuning)
         defaults.update(kwargs)
         return Broker(**defaults)
 
@@ -166,7 +165,7 @@ def test_first_frame_not_register_is_rejected(make_broker):
 
 @pytest.mark.asyncio
 async def test_token_gate_rejects_bad_and_missing(make_broker):
-    broker = make_broker(no_auth=False, token='sekret')
+    broker = make_broker(auth=True, token='sekret')
     await broker.startup()
     try:
         ws_bad = FakeWS()
@@ -188,7 +187,7 @@ async def test_token_gate_rejects_bad_and_missing(make_broker):
 
 @pytest.mark.asyncio
 async def test_auth_disabled_accepts_no_credential(make_broker):
-    broker = make_broker(no_auth=True)
+    broker = make_broker(auth=False)
     await broker.startup()
     try:
         ws = FakeWS()
@@ -818,7 +817,7 @@ async def test_gateway_seam_surface(make_broker):
         snap = broker.topology_snapshot()
         assert 'e1' in snap and 'broker' in snap
         assert snap['e1']['liveness'] == 'present'
-        assert broker.auth_enabled is False              # no_auth=True
+        assert broker.auth_enabled is False              # auth=False
     finally:
         await broker.shutdown()
 
@@ -982,17 +981,15 @@ def test_broker_startup_banner_token_file():
     assert 'scp host.example.org:' in text
 
 
-def test_broker_startup_banner_generated_vs_loaded():
-    from radical.orbit        import utils
-    from radical.orbit.broker import Broker
-    forms = ['https://h:8000']
-    gen   = Broker._startup_banner(forms, str(utils.CERT_FILE),
-                                   'generated', True)
-    lod   = Broker._startup_banner(forms, str(utils.CERT_FILE),
-                                   'file', True)
-    assert 'creating' in gen and 'creating' not in lod
-    # both bootstrap blocks are identical — the token is on disk either way
-    assert gen.split('\n\n', 1)[1] == lod.split('\n\n', 1)[1]
+def test_broker_ctor_requires_token_when_auth_on(make_broker, monkeypatch):
+    # Auth on + no token anywhere → refuse to start with the recipe in the
+    # message; nothing is ever generated or written (read-only config dir).
+    from radical.orbit import utils
+    monkeypatch.delenv(utils.ENV_TOKEN, raising=False)
+    with pytest.raises(ValueError, match='ingress auth token required') as ei:
+        make_broker(auth=True)
+    assert 'token_urlsafe' in str(ei.value)          # carries TOKEN_RECIPE
+    assert not utils.TOKEN_FILE.exists()             # no write-on-start
 
 
 def test_broker_startup_banner_no_auth():

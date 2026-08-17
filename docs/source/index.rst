@@ -67,6 +67,7 @@ Contents:
    getting_started.md
    module_radical.orbit.rst
    runtime_embedding.rst
+   tutorial_plugin.rst
    plugin_development.rst
    plugin_api.rst
    plugin_globus.rst

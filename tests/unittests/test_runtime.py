@@ -168,7 +168,6 @@ class _RunningBroker:
 def harness(self_signed, tmp_path, monkeypatch):
     """Factory yielding (make_broker, make_runtime); tears everything down."""
     from radical.orbit import utils
-    monkeypatch.setattr(utils, 'URL_FILE',   tmp_path / 'broker.url')
     monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'broker.token')
     monkeypatch.delenv('RADICAL_ORBIT_BROKER_TOKEN', raising=False)
     monkeypatch.delenv('RADICAL_ORBIT_BROKER_URL',   raising=False)
@@ -183,7 +182,7 @@ def harness(self_signed, tmp_path, monkeypatch):
         for _k in list(kw):
             if hasattr(tuning, _k):
                 setattr(tuning, _k, kw.pop(_k))
-        defaults = dict(cert=str(cert), key=str(key), no_auth=True, tuning=tuning)
+        defaults = dict(cert=str(cert), key=str(key), auth=False, tuning=tuning)
         defaults.update(kw)
         broker = Broker(**defaults)
         srv = _RunningBroker(broker, ws_ping_interval, ws_ping_timeout).start()
@@ -791,7 +790,7 @@ def test_runtime_response_headers_case_insensitive():
 
 def test_invalid_credential_is_fatal_and_actionable(harness):
     make_broker, make_runtime = harness
-    srv = make_broker(no_auth=False, token='sekret-token')
+    srv = make_broker(auth=True, token='sekret-token')
 
     # wait=False: the fatal flag + actionable reason are observable
     rt = make_runtime(srv.url, token='wrong-token', wait=False)
