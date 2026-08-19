@@ -1,6 +1,5 @@
 {% set name = "radical.orbit" %}
 {% set version = "0.3.0" %}
-{% set python_min = python_min | default("3.10") %}
 
 package:
   name: {{ name|lower }}
@@ -11,17 +10,20 @@ source:
   sha256: 78ca1352344e312773cba643905c436d358e9fb6a2b7cd1edb6be2a01d2dc073
 
 build:
-  noarch: python
+  # not noarch: setup.py templates the build interpreter's purelib path
+  # (lib/pythonX.Y/site-packages) into bin/radical-orbit-endpoint-wrapper.sh
+  skip: true  # [py<310]
   script: {{ PYTHON }} -m pip install . -vv --no-deps --no-build-isolation
   number: 0
 
 requirements:
   host:
-    - python {{ python_min }}
+    - python
     - setuptools
+    - wheel
     - pip
   run:
-    - python >={{ python_min }}
+    - python
     - httpx
     - msgpack-python
     - cloudpickle
@@ -43,7 +45,6 @@ test:
   commands:
     - pip check
   requires:
-    - python {{ python_min }}
     - pip
 
 about:
@@ -57,7 +58,7 @@ about:
     HTTP/SSE/Explorer compatibility surface.
   license: MIT
   license_file: LICENSE.md
-  doc_url: https://radical-orbit.readthedocs.io/
+  doc_url: https://radicalorbit.readthedocs.io/
   dev_url: https://github.com/radical-cybertools/radical.orbit
 
 extra:
