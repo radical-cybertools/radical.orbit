@@ -5,10 +5,17 @@
   https://github.com/radical-cybertools/radical.orbit/issues?q=is%3Aissue+is%3Aopen+
 
 
+Version 0.4.0 release                                                 2026-08-19
+--------------------------------------------------------------------------------
+
+  - fix license file
+  - add conda recipe
+
+
 Version 0.3.0 release                                                 2026-08-17
 --------------------------------------------------------------------------------
 
-  - switch to prper star topology
+  - switch to proper star topology
 
 
 Version 0.0.1 release                                                 2026-03-11
