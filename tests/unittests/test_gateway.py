@@ -455,6 +455,25 @@ def test_sse_topology_on_connect_and_disconnect(harness):
         sse.close()
 
 
+def test_sse_frame_survives_non_json_payloads():
+    # The tap forwards plugin payloads verbatim, and those are not
+    # required to be JSON: a bytes payload (a raw stream event, say) used
+    # to raise TypeError inside json.dumps and silently drop the frame.
+    # The SSE feed is monitoring -- it must render every event.
+    import json as _json
+    from radical.orbit.gateway import Gateway
+
+    frame = Gateway._sse_frame('notification', {'data': b'\x80\x05binary'})
+    assert frame.startswith('data: ') and frame.endswith('\n\n')
+    parsed = _json.loads(frame[len('data: '):])
+    assert parsed['topic'] == 'notification'
+    assert 'binary' in parsed['data']['data']             # str() fallback
+
+    # JSON-clean payloads are untouched by the fallback
+    frame = Gateway._sse_frame('notification', {'data': {'hello': 'world'}})
+    assert _json.loads(frame[len('data: '):])['data'] == {'data': {'hello': 'world'}}
+
+
 def test_sse_queue_drop_oldest_counter():
     # The gateway now uses the shared bounded, drop-oldest queue.
     from radical.orbit.queues import BoundedDropOldestQueue

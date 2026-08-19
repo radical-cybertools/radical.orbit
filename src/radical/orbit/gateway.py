@@ -255,8 +255,17 @@ class Gateway:
     def _sse_frame(topic: str, data: Any) -> str:
         """Format one SSE frame as HTTP clients expect it:
         ``data: {"topic": <topic>, "data": <data>}\\n\\n`` (no keepalive
-        comments)."""
-        return "data: %s\n\n" % json.dumps({"topic": topic, "data": data})
+        comments).
+
+        The tap forwards whatever a plugin published, and plugin payloads
+        are not required to be JSON -- a ``bytes`` payload (e.g. a raw
+        stream event) used to kill the frame with a ``TypeError``, one
+        dropped notification per event.  The SSE feed is a monitoring
+        tier: it must render every event, so anything JSON cannot encode
+        falls back to ``str()`` rather than raising.
+        """
+        return "data: %s\n\n" % json.dumps({"topic": topic, "data": data},
+                                            default=str)
 
     def _on_event(self, event: Dict[str, Any]) -> None:
         """Raw event tap callback — runs on the **plugin-host loop**.
