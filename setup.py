@@ -170,9 +170,14 @@ with open('%s/requirements.txt' % root, encoding='utf-8') as freq:
     requirements = freq.readlines()
 
 # docs/requirements.txt is also consumed by ReadTheDocs directly; mirror it
-# here so `pip install .[docs]` / `.[dev]` stay in sync with it.
-with open('%s/docs/requirements.txt' % root, encoding='utf-8') as fdoc:
-    doc_requirements = fdoc.readlines()
+# here so `pip install .[docs]` / `.[dev]` stay in sync with it.  Source
+# trees without the file (stripped sdists) get an empty docs extra instead
+# of a failed metadata build.
+doc_requirements = list()
+_doc_reqs = '%s/docs/requirements.txt' % root
+if os.path.exists(_doc_reqs):
+    with open(_doc_reqs, encoding='utf-8') as fdoc:
+        doc_requirements = fdoc.readlines()
 
 test_requirements = ['pytest', 'pytest-asyncio', 'quickjs']
 lint_requirements = ['flake8', 'pylint']
