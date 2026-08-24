@@ -246,6 +246,9 @@ class TaskDispatcherClient(PluginClient):
     '''Application-side client for the task dispatcher plugin.'''
 
     def register_session(self, pools: list | dict | None = None,
+                         sid: str | None = None,
+                         lifetime: str | None = None,
+                         ttl: float | None = None,
                          **_kwargs: Any) -> None:
         '''Register a session, optionally declaring per-workflow pools.
 
@@ -253,10 +256,21 @@ class TaskDispatcherClient(PluginClient):
         ``pools`` key.  ``None`` registers without declaring pools, which
         causes the dispatcher to auto-materialise this session's built-in
         ``default`` pool (idempotent across sessions).
+
+        *sid* reconnects to (or names) an existing session -- pools are
+        keyed per session, so a second client that should see a session's
+        pools has to join it by sid rather than mint its own.  *lifetime* /
+        *ttl* are the base session-policy fields.
         '''
         body: dict = {}
         if pools is not None:
             body['pools'] = pools
+        if sid is not None:
+            body['sid'] = sid
+        if lifetime is not None:
+            body['lifetime'] = lifetime
+        if ttl is not None:
+            body['ttl'] = ttl
         resp = self._http.post(self._url('register_session'), json=body)
         self._raise(resp)
         self._sid = resp.json()['sid']
@@ -271,6 +285,13 @@ class TaskDispatcherClient(PluginClient):
         '''Return a snapshot of the fleet across all pools (requires session).'''
         self._require_session()
         resp = self._http.get(self._url(f'fleet/{self.sid}'))
+        self._raise(resp)
+        return resp.json()
+
+    def pool_detail(self, name: str) -> dict:
+        '''Return detailed state for one of this session's pools.'''
+        self._require_session()
+        resp = self._http.get(self._url(f'pool/{self.sid}/{name}'))
         self._raise(resp)
         return resp.json()
 
@@ -2028,6 +2049,7 @@ class PluginTaskDispatcher(Plugin):
         pending = [t for t in ps.tasks.values() if t.state == TASK_QUEUED]
         summary = {
             'name'        : ps.config.name,
+            'endpoint_name': ps.config.endpoint_name,
             'queue'       : ps.config.queue,
             'account'     : ps.config.account,
             'default_size': ps.config.default_size,
