@@ -33,8 +33,11 @@ import base64
 import logging
 import os
 import shutil
+import threading
 import time
 import uuid
+
+import msgpack
 
 from dataclasses import asdict
 from pathlib import Path
@@ -45,6 +48,10 @@ from fastapi import FastAPI, HTTPException, Request
 from .client                            import PluginClient
 from .plugin_base                       import Plugin
 from .plugin_session_base               import PluginSession
+from .plugin_rhapsody                   import (
+    RhapsodyClient, WS_PAYLOAD_LIMIT, NOTIFY_BATCH_SIZE,
+    _payload_size, _resolve_notify_window, _resolve_frame_cap, BUDGET_RATIO,
+)
 from .task_dispatcher_config            import (
     PoolConfig, PilotSize, PoolConfigError,
     default_pool_config, parse_pools,
@@ -82,6 +89,18 @@ _TICK_INTERVAL_SEC = 5.0
 # Handshake timeout — a pilot that hasn't handshaken in this long is
 # reconciled against psij job state.
 _HANDSHAKE_TIMEOUT_SEC = 300.0
+
+# Rhapsody-dialect bulk submit (see ``_route_submit_rh``): task dicts in
+# rhapsody's own wire format, a ``pool`` key per task.  Route template shared
+# with :meth:`TaskDispatcherClient.submit_tasks` so the two cannot drift.
+ROUTE_SUBMIT_RH = 'submit_rh/{sid}'
+
+# Keys a rhapsody child notification carries that are worth forwarding to
+# the dispatcher's own subscribers (mirrors plugin_rhapsody's
+# ``_NOTIFICATION_KEYS``): the uid/state pair plus result and error data.
+_RH_FORWARD_KEYS = {'uid', 'state', 'exit_code',
+                    'return_value', '_return_value_encoding',
+                    'error', 'exception', 'traceback'}
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +307,52 @@ class TaskDispatcherClient(PluginClient):
         self._raise(resp, f'submit task {task_id!r}')
         return resp.json()
 
+    def submit_tasks(self, task_dicts: list[dict]) -> list[dict]:
+        '''Bulk submit in the rhapsody execution dialect (pool mode).
+
+        Same wire contract as :meth:`RhapsodyClient.submit_tasks` --
+        cloudpickle serialization, client-assigned uids, frame-bounded
+        batches -- plus a ``pool`` key per task naming its target pool.
+        Mixed-pool batches are grouped by the dispatcher.  This is the
+        verb rhapsody's ``OrbitExecutionBackend`` calls, which is what
+        lets it point at the dispatcher unchanged.
+        '''
+        self._require_session()
+
+        for td in task_dicts:
+            if not td.get('pool'):
+                raise ValueError("each task dict requires a 'pool' key")
+            RhapsodyClient._serialize_task(td)
+            if 'uid' not in td:
+                td['uid'] = f'task.{uuid.uuid4().hex[:8]}'
+
+        url = self._url(ROUTE_SUBMIT_RH.format(sid=self.sid))
+
+        # frame-size-bounded batches, same split as the rhapsody client
+        batches: list[list[dict]] = []
+        batch: list[dict]         = []
+        batch_bytes               = 0
+        for td in task_dicts:
+            td_size = len(str(td)) + 2
+            if batch and batch_bytes + td_size > WS_PAYLOAD_LIMIT:
+                batches.append(batch)
+                batch       = []
+                batch_bytes = 0
+            batch.append(td)
+            batch_bytes += td_size
+        if batch:
+            batches.append(batch)
+
+        results: list[dict] = []
+        for b in batches:
+            resp = self._http.post(
+                url,
+                data=msgpack.packb({'tasks': b}, use_bin_type=True),
+                headers={'Content-Type': 'application/msgpack'})
+            self._raise(resp, f'submit {len(b)} task(s)')
+            results.extend(resp.json())
+        return results
+
     def get_task(self, task_id: str) -> dict:
         '''Fetch the current :class:`TaskRecord` for *task_id*.'''
         self._require_session()
@@ -409,6 +474,19 @@ class PluginTaskDispatcher(Plugin):
         # can find the right TaskRecord when a pilot reports completion.
         self._uid_to_task: dict[str, tuple[str, str, str]] = {}
 
+        # Rhapsody-dialect batching (same NOTIFY_WINDOW semantics as
+        # plugin_rhapsody): terminal notifications coalesce into
+        # ``task_status_batch`` frames, and ledger persists coalesce into one
+        # write per dirty pool per flush -- the per-task fsync is the
+        # dominant latency cost of pool mode.
+        self._notify_window       = _resolve_notify_window()
+        self._notify_batch_bytes  = _resolve_frame_cap(app) // BUDGET_RATIO
+        self._rh_notify_buf: list[dict]           = []
+        self._rh_notify_bytes                     = 0
+        self._rh_notify_lock                      = threading.Lock()
+        self._rh_flush_scheduled                  = False
+        self._dirty_pools: set[tuple[str, str]]   = set()
+
         # Single housekeeping loop; started once a running loop exists.
         self._started = False
         self._housekeeping_task: asyncio.Task | None = None
@@ -430,6 +508,7 @@ class PluginTaskDispatcher(Plugin):
         self.add_route_get  ('pool/{sid}/{name}',             self._route_pool_detail)
         self.add_route_get  ('fleet/{sid}',                   self._route_fleet)
         self.add_route_post ('submit/{sid}',                  self._route_submit)
+        self.add_route_post (ROUTE_SUBMIT_RH,                 self._route_submit_rh)
         self.add_route_get  ('task/{sid}/{task_id}',          self._route_get_task)
         self.add_route_post ('cancel/{sid}/{task_id}',        self._route_cancel_task)
         self.add_route_post ('cancel_all/{sid}',              self._route_cancel_all)
@@ -607,6 +686,8 @@ class PluginTaskDispatcher(Plugin):
 
     async def shutdown(self) -> None:
         '''Cancel the housekeeping loop and drop the event tap, then base close.'''
+        # anything still coalescing gets its persist and its notification now
+        self._flush_rh()
         if self._housekeeping_task is not None \
                 and not self._housekeeping_task.done():
             self._housekeeping_task.cancel()
@@ -977,6 +1058,81 @@ class PluginTaskDispatcher(Plugin):
             'cwd'     : str(cwd),
             'result'  : result[0] if result else None,
         }
+
+    async def _route_submit_rh(self, request: Request) -> list[dict]:
+        '''Bulk submit in the rhapsody execution dialect.
+
+        Body: ``{"tasks": [<task dict>, ...]}`` — rhapsody's own wire format
+        (cloudpickled fields as base64 strings, client-assigned ``uid``),
+        plus a ``pool`` key per task.  A mixed-pool batch is grouped here;
+        the dicts are forwarded verbatim to pilot rhapsody sessions, so the
+        dispatcher never deserializes a function body.
+
+        One ledger persist per touched pool, however many tasks the batch
+        carries.  The response is rhapsody-shaped acks (``{uid, state}``),
+        and completions arrive as ``task_status`` / ``task_status_batch``
+        notifications under this plugin's namespace — the same consumer
+        contract as plugin_rhapsody.
+        '''
+        sid = request.path_params['sid']
+        self._require_known_session(sid)
+        data       = await request.json()
+        task_dicts = data.get('tasks', [])
+
+        # validate the whole batch before touching any state
+        grouped: dict[str, list[dict]] = {}
+        for td in task_dicts:
+            uid       = td.get('uid')
+            pool_name = td.get('pool')
+            if not uid or not pool_name:
+                raise HTTPException(
+                    status_code=400,
+                    detail="each task requires 'uid' and 'pool'")
+            if self._find_pool(sid, pool_name) is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f'unknown pool: {pool_name}')
+            grouped.setdefault(pool_name, []).append(td)
+
+        now  = time.time()
+        acks = []
+        for pool_name, tds in grouped.items():
+            pool_state = self._find_pool(sid, pool_name)
+            if pool_state is None:       # validated above; mollify the checker
+                continue
+            fresh = False
+            for td in tds:
+                uid = str(td['uid'])
+
+                # same resubmit semantics as exec-mode submit: DONE is
+                # cached, live attaches, FAILED/CANCELED re-executes
+                existing = pool_state.tasks.get(uid)
+                if existing is not None and existing.state in (
+                        TASK_DONE, TASK_RUNNING, TASK_QUEUED):
+                    acks.append({'uid': uid, 'state': existing.state})
+                    continue
+
+                td = dict(td)
+                td.pop('pool', None)
+                pool_state.tasks[uid] = TaskRecord(
+                    task_id      = uid,
+                    pool         = pool_name,
+                    owning_sid   = sid,
+                    cmd          = [],
+                    cwd          = '',
+                    task_dict    = td,
+                    state        = TASK_QUEUED,
+                    submitted_at = now,
+                    arrival_ts   = now,
+                )
+                acks.append({'uid': uid, 'state': TASK_QUEUED})
+                fresh = True
+
+            if fresh:
+                pool_state.persist()          # once per pool, not per task
+                self._drain_pending(pool_state)
+
+        return acks
 
     async def _route_get_task(self, request: Request) -> dict:
         '''Return one task's record (pool mode) or rhapsody info (endpoint mode).'''
@@ -1515,7 +1671,9 @@ class PluginTaskDispatcher(Plugin):
         non-QUEUED (stale) task is logged and breaks the drain — a broken
         policy is visible rather than silently rate-limited.
         '''
-        budget = len(pool_state.pending_queue())
+        budget   = len(pool_state.pending_queue())
+        assigned : dict[str, list[TaskRecord]] = {}
+        pilots   : dict[str, PilotRecord]      = {}
         while budget > 0:
             budget -= 1
             try:
@@ -1523,74 +1681,97 @@ class PluginTaskDispatcher(Plugin):
             except Exception as e:
                 log.exception('[%s] pick_dispatch raised: %s',
                               self.instance_name, e)
-                return
+                break
             if pair is None:
-                return
+                break
             task, pilot = pair
             if task.state != TASK_QUEUED:
                 log.warning('[%s] pool %r: pick_dispatch returned non-QUEUED '
                             'task %s (%s); stopping drain',
                             self.instance_name, pool_state.config.name,
                             task.task_id, task.state)
-                return
-            self._assign(pool_state, task, pilot)
+                break
+            self._claim(pool_state, task, pilot)
+            assigned.setdefault(pilot.pid, []).append(task)
+            pilots[pilot.pid] = pilot
 
-    def _assign(self, pool_state: PoolState,
-                task: TaskRecord, pilot: PilotRecord) -> None:
-        '''Claim the task for this pilot and schedule the rhapsody submit.'''
+        if not assigned:
+            return
+
+        # one ledger write for the whole drain, however many tasks it claimed
+        pool_state.persist()
+
+        for pid, tasks in assigned.items():
+            for task in tasks:
+                self._notify_task(pool_state, task)
+            asyncio.create_task(
+                self._do_rhapsody_submit(pool_state, tasks, pilots[pid]))
+
+    def _claim(self, pool_state: PoolState,
+               task: TaskRecord, pilot: PilotRecord) -> None:
+        '''Claim the task for this pilot (state only; no I/O).'''
         task.state      = TASK_RUNNING
         task.pilot_id   = pilot.pid
         task.started_at = time.time()
         pilot.in_flight     += 1
         pilot.started_tasks += 1
-        pool_state.persist()
-
-        self._dispatch_notify('task_status', self._task_dict(task))
-
-        asyncio.create_task(
-            self._do_rhapsody_submit(pool_state, task, pilot))
 
     async def _do_rhapsody_submit(self, pool_state: PoolState,
-                                  task: TaskRecord,
+                                  tasks: list[TaskRecord],
                                   pilot: PilotRecord) -> None:
-        '''Post the task to the pilot's rhapsody session over the caller.'''
+        '''Post claimed tasks to the pilot's rhapsody session, one call.'''
         if not pilot.child_endpoint_name:
-            self._mark_task_failed(pool_state, task,
-                                   'child endpoint unavailable')
+            for task in tasks:
+                self._mark_task_failed(pool_state, task,
+                                       'child endpoint unavailable')
             return
 
         rh = await self._get_rhapsody_client(
             pilot.child_endpoint_name, pilot.rhapsody_backend)
         if rh is None:
-            self._mark_task_failed(pool_state, task,
-                                   'rhapsody client unavailable')
+            for task in tasks:
+                self._mark_task_failed(pool_state, task,
+                                       'rhapsody client unavailable')
             return
 
-        task_dict = {
-            'uid'       : task.task_id,
-            'executable': task.cmd[0] if task.cmd else '',
-            'arguments' : task.cmd[1:] if len(task.cmd) > 1 else [],
-            'cwd'       : task.cwd,
-            # rhapsody's concurrent backend reads cwd from
-            # task_backend_specific_kwargs (BaseTask's top-level cwd is
-            # ignored); mirror it here so the task runs in its scratch dir.
-            'task_backend_specific_kwargs': {'cwd': task.cwd},
-        }
+        fwds = []
+        for task in tasks:
+            if task.task_dict is not None:
+                # rhapsody dialect: the client's dict, forwarded verbatim.
+                # The uid is namespaced by the owning session, because the
+                # pilot's rhapsody session is shared across sessions and
+                # client-side uid counters (asyncflow's `task.NNNNNN`) are
+                # only unique per client process.
+                fwd = dict(task.task_dict)
+                fwd['uid'] = f'{task.task_id}.{task.owning_sid}'
+            else:
+                fwd = {
+                    'uid'       : task.task_id,
+                    'executable': task.cmd[0] if task.cmd else '',
+                    'arguments' : task.cmd[1:] if len(task.cmd) > 1 else [],
+                    'cwd'       : task.cwd,
+                    # rhapsody's concurrent backend reads cwd from
+                    # task_backend_specific_kwargs (BaseTask's top-level cwd
+                    # is ignored); mirror it here so the task runs in its
+                    # scratch dir.
+                    'task_backend_specific_kwargs': {'cwd': task.cwd},
+                }
+            fwds.append((task, fwd))
+
         try:
-            result = await asyncio.to_thread(rh.submit_tasks, [task_dict])
-            if result:
-                rh_uid = result[0].get('uid')
-                if rh_uid:
-                    task.rhapsody_uid = rh_uid
-                    self._uid_to_task[rh_uid] = (pool_state.owning_sid,
+            await asyncio.to_thread(rh.submit_tasks, [f for _, f in fwds])
+            for task, fwd in fwds:
+                task.rhapsody_uid = fwd['uid']
+                self._uid_to_task[fwd['uid']] = (pool_state.owning_sid,
                                                  pool_state.config.name,
                                                  task.task_id)
-                    pool_state.persist()
+            self._mark_dirty(pool_state)
         except Exception as e:
-            log.exception('[%s] rhapsody submit failed for %s: %s',
-                          self.instance_name, task.task_id, e)
-            self._mark_task_failed(pool_state, task,
-                                   f'rhapsody submit error: {e}')
+            log.exception('[%s] rhapsody submit failed for %d task(s): %s',
+                          self.instance_name, len(tasks), e)
+            for task, _ in fwds:
+                self._mark_task_failed(pool_state, task,
+                                       f'rhapsody submit error: {e}')
 
     def _on_event(self, event: dict) -> None:
         '''Broker raw-tap callback: a child rhapsody reported a transition.
@@ -1654,10 +1835,125 @@ class PluginTaskDispatcher(Plugin):
         pilot = pool_state.pilots.get(task.pilot_id or '')
         if pilot is not None:
             pilot.in_flight = max(0, pilot.in_flight - 1)
-        pool_state.persist()
+        self._mark_dirty(pool_state)
 
-        self._dispatch_notify('task_status', self._task_dict(task))
+        self._notify_task(pool_state, task, child_data=data)
         self._drain_pending(pool_state)
+
+    # -- rhapsody-dialect batching: notifications + ledger persists -----
+    #
+    # Same trade as plugin_rhapsody's NOTIFY window: up to `_notify_window`
+    # seconds of latency buys one WS frame per batch instead of one per
+    # task, and one `state.json` fsync per dirty pool per flush instead of
+    # one per completion -- the dominant latency cost of pool mode.  A
+    # zero window (latency-sensitive broker) flushes inline, which is also
+    # the exec-mode behavior of old.
+
+    def _notify_task(self, pool_state: PoolState, task: TaskRecord,
+                     child_data: dict | None = None) -> None:
+        '''Emit one task's status: dialect-shaped and batched for a
+        rhapsody-dialect task, the classic immediate frame for an
+        exec-style one (its consumers -- the Explorer page among them --
+        read the exec shape).'''
+        if task.task_dict is None:
+            self._dispatch_notify('task_status', self._task_dict(task))
+            return
+
+        # rhapsody consumer contract: `uid`, not `task_id`, plus whatever
+        # result/error fields the pilot's rhapsody reported
+        payload = {k: v for k, v in (child_data or {}).items()
+                   if k in _RH_FORWARD_KEYS}
+        payload['uid']   = task.task_id
+        payload['state'] = task.state
+        if task.error is not None:
+            payload.setdefault('error', task.error)
+        if task.exit_code is not None:
+            payload.setdefault('exit_code', task.exit_code)
+        self._queue_rh_notification(payload)
+
+    def _queue_rh_notification(self, payload: dict) -> None:
+        '''Buffer one dialect notification; flush by window, count or bytes.'''
+        size = _payload_size(payload)
+        with self._rh_notify_lock:
+            self._rh_notify_buf.append(payload)
+            self._rh_notify_bytes += size
+            now      = self._notify_window <= 0 \
+                       or len(self._rh_notify_buf) >= NOTIFY_BATCH_SIZE \
+                       or self._rh_notify_bytes >= self._notify_batch_bytes
+            schedule = not now and not self._rh_flush_scheduled
+            if schedule:
+                self._rh_flush_scheduled = True
+
+        if now:
+            self._flush_rh()
+        elif schedule:
+            self._schedule_rh_flush(self._notify_window)
+
+    def _mark_dirty(self, pool_state: PoolState) -> None:
+        '''Coalesce this pool's next ledger persist into the flush window.'''
+        if self._notify_window <= 0:
+            pool_state.persist()
+            return
+        with self._rh_notify_lock:
+            self._dirty_pools.add((pool_state.owning_sid,
+                                   pool_state.config.name))
+            schedule = not self._rh_flush_scheduled
+            if schedule:
+                self._rh_flush_scheduled = True
+        if schedule:
+            self._schedule_rh_flush(self._notify_window)
+
+    def _schedule_rh_flush(self, delay: float) -> None:
+        '''Arm one delayed flush on the host loop.'''
+        async def _do_flush():
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._flush_rh()
+
+        try:
+            asyncio.get_running_loop().create_task(_do_flush())
+        except RuntimeError:
+            # no running loop (direct-call tests): flush inline
+            self._flush_rh()
+
+    def _flush_rh(self) -> None:
+        '''Flush buffered notifications and persist every dirty pool.'''
+        with self._rh_notify_lock:
+            self._rh_flush_scheduled = False
+            batch = list(self._rh_notify_buf)
+            self._rh_notify_buf.clear()
+            self._rh_notify_bytes = 0
+            dirty = list(self._dirty_pools)
+            self._dirty_pools.clear()
+
+        for sid, name in dirty:
+            ps = self._find_pool(sid, name)
+            if ps is not None:            # a torn-down pool needs no persist
+                ps.persist()
+
+        if not batch:
+            return
+
+        # frame-budget splitting, same shape plugin_rhapsody emits
+        frame:  list[dict] = []
+        nbytes             = 0
+        frames             = [frame]
+        for payload in batch:
+            size = _payload_size(payload)
+            if frame and nbytes + size > self._notify_batch_bytes:
+                frame  = []
+                nbytes = 0
+                frames.append(frame)
+            frame.append(payload)
+            nbytes += size
+
+        for frame in frames:
+            if not frame:
+                continue
+            if len(frame) == 1:
+                self._dispatch_notify('task_status', frame[0])
+            else:
+                self._dispatch_notify('task_status_batch', {'tasks': frame})
 
     def _mark_task_failed(self, pool_state: PoolState,
                           task: TaskRecord, reason: str) -> None:
@@ -1668,8 +1964,8 @@ class PluginTaskDispatcher(Plugin):
         pilot = pool_state.pilots.get(task.pilot_id or '')
         if pilot is not None:
             pilot.in_flight = max(0, pilot.in_flight - 1)
-        pool_state.persist()
-        self._dispatch_notify('task_status', self._task_dict(task))
+        self._mark_dirty(pool_state)
+        self._notify_task(pool_state, task)
 
     async def _cancel_task(self, pool_state: PoolState,
                            task: TaskRecord) -> dict:
@@ -1679,8 +1975,8 @@ class PluginTaskDispatcher(Plugin):
         if task.state == TASK_QUEUED:
             task.state       = TASK_CANCELED
             task.finished_at = time.time()
-            pool_state.persist()
-            self._dispatch_notify('task_status', self._task_dict(task))
+            self._mark_dirty(pool_state)
+            self._notify_task(pool_state, task)
             return self._task_dict(task)
 
         # RUNNING — best-effort cancel on the pilot
@@ -1697,8 +1993,8 @@ class PluginTaskDispatcher(Plugin):
         task.finished_at = time.time()
         if pilot is not None:
             pilot.in_flight = max(0, pilot.in_flight - 1)
-        pool_state.persist()
-        self._dispatch_notify('task_status', self._task_dict(task))
+        self._mark_dirty(pool_state)
+        self._notify_task(pool_state, task)
         return self._task_dict(task)
 
     # -- helpers -------------------------------------------------------
