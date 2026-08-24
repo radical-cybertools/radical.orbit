@@ -2045,6 +2045,9 @@
 
         // Open SSE event stream for push notifications
         setupEventSource();
+
+        // a #plugin/<endpoint>/<name> deep link can now be honoured
+        applyDeepLink();
       } catch (e) {
         setConnectionStatus('disconnected');
 
@@ -2603,7 +2606,25 @@
       if (entry && page && entry.module.onShow) {
         entry.module.onShow(page, entry.api);
       }
+
+      // the page is addressable: keep the URL in step (replaceState does
+      // not retrigger the hashchange listener)
+      history.replaceState(null, '',
+        `#plugin/${encodeURIComponent(endpointName)}`
+        + `/${encodeURIComponent(pluginName)}`);
     }
+
+    // ── URL deep links ───────────────────────────────────────────
+    //  #plugin/<endpoint>/<name> opens that plugin's page once the
+    //  Explorer is connected; external pages (the DT dashboard's pool
+    //  titles, say) can link straight to a plugin this way.
+    function applyDeepLink() {
+      const m = location.hash.match(/^#plugin\/([^/]+)\/([^/]+)$/);
+      if (m && isConnected) {
+        showPluginPage(decodeURIComponent(m[1]), decodeURIComponent(m[2]));
+      }
+    }
+    window.addEventListener('hashchange', applyDeepLink);
 
     // ─────────────────────────────────────────────────────────────
     //  SSE Notification handler
