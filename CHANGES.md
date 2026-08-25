@@ -5,6 +5,12 @@
   https://github.com/radical-cybertools/radical.orbit/issues?q=is%3Aissue+is%3Aopen+
 
 
+Version 0.7.0 release                                                 2026-08-25
+--------------------------------------------------------------------------------
+
+  - First release of digital twin plugin
+
+
 Version 0.6.0 release                                                 2026-08-24
 --------------------------------------------------------------------------------
 
