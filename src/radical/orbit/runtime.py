@@ -126,7 +126,8 @@ class EndpointRuntime(PluginHostBase):
                      plugins) or ``'endpoint'``.
         tunnel:      ``'none'`` / ``'forward'`` / ``'reverse'`` (boolean is not
                      accepted).
-        ping_interval/ping_timeout: ``websockets`` client keepalive cadence.
+        ping_interval: ``websockets`` client keepalive ping cadence (s).
+        ping_timeout: ``websockets`` client keepalive pong deadline (s).
 
     The numeric backpressure/backoff/frame-cap tunables are module-level
     constants (``_REQUEST_CAP``, ``_BACKOFF_*`` …), not per-instance knobs; they

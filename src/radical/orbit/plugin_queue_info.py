@@ -65,7 +65,7 @@ class QueueInfoSession(PluginSession):
         """
         return await super().close()
 
-    async def get_info(self, user=None, force=False):
+    async def get_info(self, user=None, force=False) -> dict:
         """
         Return queue/partition info.
 
@@ -82,7 +82,7 @@ class QueueInfoSession(PluginSession):
         return await asyncio.to_thread(self._backend.get_info,
                                        user=user, force=force)
 
-    async def list_jobs(self, queue, user=None, force=False):
+    async def list_jobs(self, queue, user=None, force=False) -> dict:
         """
         List jobs in a queue.
 
@@ -100,7 +100,7 @@ class QueueInfoSession(PluginSession):
         return await asyncio.to_thread(self._backend.list_jobs,
                                       queue, user, force)
 
-    async def list_all_jobs(self, user=None, force=False):
+    async def list_all_jobs(self, user=None, force=False) -> dict:
         """
         List all jobs for the user across all partitions.
 
@@ -127,7 +127,7 @@ class QueueInfoSession(PluginSession):
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         return {'job_id': job_id, 'status': 'canceled'}
 
-    async def list_allocations(self, user=None, force=False):
+    async def list_allocations(self, user=None, force=False) -> dict:
         """
         List allocations/projects.
 

@@ -53,3 +53,4 @@ ve3b/
 # example-script credentials (examples/test_sfapi.py, examples/test_iri.py)
 examples/sfapi.id
 examples/token_*
+site/

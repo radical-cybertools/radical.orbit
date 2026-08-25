@@ -94,7 +94,7 @@ class QueueInfo(ABC):
         return result
 
 
-    def get_info(self, user=None, force=False):
+    def get_info(self, user=None, force=False) -> dict:
         """
         Return queue/partition info. force=True bypasses cache.
 
@@ -112,7 +112,7 @@ class QueueInfo(ABC):
         return self._get_cached(key, force, self._collect_info_filtered, user)
 
 
-    def list_jobs(self, queue, user=None, force=False):
+    def list_jobs(self, queue, user=None, force=False) -> dict:
         """
         List jobs in a queue.
 
@@ -131,7 +131,7 @@ class QueueInfo(ABC):
         return self._get_cached(key, force, self._collect_jobs, queue, user)
 
 
-    def list_all_jobs(self, user=None, force=False):
+    def list_all_jobs(self, user=None, force=False) -> dict:
         """
         List all jobs for a user across all partitions.
 
@@ -222,9 +222,9 @@ def make_queue_info(batch=None, conf_path=None) -> 'QueueInfo':
     """Factory: return a QueueInfo subclass matching the active scheduler.
 
     Args:
-        batch:     Optional pre-detected BatchSystem instance. If None, calls
+        batch (BatchSystem, optional): Pre-detected instance. If None, calls
                    :func:`batch_system.detect_batch_system`.
-        conf_path: Optional path to the scheduler's configuration file
+        conf_path (str, optional): Path to the scheduler's configuration file
                    (forwarded to the backend; only SLURM uses it today).
 
     Returns:

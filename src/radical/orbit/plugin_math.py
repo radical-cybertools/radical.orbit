@@ -1,7 +1,7 @@
 """Tutorial plugin: a four-function calculator.
 
 This module is the worked example for the Plugin Writer's Tutorial
-(``docs/source/tutorial_plugin.rst``).  It is intentionally small: the
+(``docs/tutorial_plugin.md``).  It is intentionally small: the
 arithmetic is trivial so that every line of ORBIT machinery — session,
 routes, error mapping, notifications, client helper — stays in focus.
 
@@ -31,6 +31,7 @@ log = logging.getLogger("radical.orbit")
 
 # ------------------------------------------------------------------------
 #
+# --8<-- [start:MathSession]
 class MathSession(PluginSession):
     """
     Math session (service side).
@@ -88,10 +89,12 @@ class MathSession(PluginSession):
         """Release per-session state."""
         self._history = []
         return await super().close()
+# --8<-- [end:MathSession]
 
 
 # ------------------------------------------------------------------------
 #
+# --8<-- [start:MathClient]
 class MathClient(PluginClient):
     """
     Client-side interface for the Math plugin.
@@ -134,10 +137,12 @@ class MathClient(PluginClient):
                              json={"a": a, "b": b})
         self._raise(resp, f'{op}({a}, {b})')
         return resp.json()['result']
+# --8<-- [end:MathClient]
 
 
 # ------------------------------------------------------------------------
 #
+# --8<-- [start:PluginMath]
 class PluginMath(Plugin):
     """
     Math plugin for ORBIT — the Plugin Writer's Tutorial example.
@@ -217,3 +222,4 @@ class PluginMath(Plugin):
             raise http_exception(ValueError("division by zero"))
 
         return await self._forward(sid, MathSession.compute, op=op, a=a, b=b)
+# --8<-- [end:PluginMath]

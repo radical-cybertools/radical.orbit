@@ -607,7 +607,7 @@ class PSIJClient(PluginClient):
 
             - ``endpoint_name`` — echoed back.
             - ``status`` — one of ``"pending"``, ``"active"``, ``"failed"``,
-              ``"done"``, or ``"no_tunnel"``.
+                ``"done"``, or ``"no_tunnel"``.
             - ``port`` — assigned tunnel port (int) once active, else null.
             - ``pid`` — SSH process PID, once spawned, else null.
         """
@@ -791,9 +791,10 @@ class PluginPSIJ(Plugin):
             JSON with ``job_id``, ``native_id``, and ``endpoint_name``.
 
         Raises:
-            400 if ``tunnel`` is not one of the three string values.
-            422 if ``-n``/``--name`` is missing from ``job_spec.arguments``.
-            409 if a tunnel watcher for the same endpoint name is already active.
+            HTTPException: 400 if ``tunnel`` is not one of the three string
+                values; 422 if ``-n``/``--name`` is missing from
+                ``job_spec.arguments``; 409 if a tunnel watcher for the same
+                endpoint name is already active.
         """
         sid  = request.path_params['sid']
         data = await request.json()
