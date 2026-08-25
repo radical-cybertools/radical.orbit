@@ -126,6 +126,11 @@ class TaskRecord:
     exit_code    : int | None  = None
     arrival_ts   : float       = 0.0            # tie-break for queue ordering
     error        : str | None  = None
+    # Rhapsody-dialect tasks: the serialized task dict as submitted
+    # (JSON-safe -- cloudpickled fields ride as base64 strings), forwarded
+    # verbatim to the pilot's rhapsody session.  ``None`` marks an
+    # exec-style task, which runs off ``cmd``/``cwd`` as before.
+    task_dict    : dict | None = None
 
     def is_terminal(self) -> bool:
         '''Return whether this task is in a terminal state.'''

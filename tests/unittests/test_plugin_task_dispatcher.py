@@ -662,3 +662,170 @@ class TestEndpointMode:
         plugin._on_event({'plugin': 'psij', 'topic': 'task_status',
                           'data': {'uid': 'x', 'state': 'DONE'}})
         assert called == []
+
+
+# ---------------------------------------------------------------------------
+# Rhapsody-dialect bulk submit (pool mode for function tasks)
+# ---------------------------------------------------------------------------
+
+def _dialect_td(uid, pool='cpu', **extra):
+    """A rhapsody-style task dict as the client ships it: cloudpickled
+    fields ride as base64 strings the dispatcher never decodes."""
+    td = {'uid': uid, 'pool': pool,
+          'function': 'cloudpickle::AAAA',
+          '_pickled_fields': ['function']}
+    td.update(extra)
+    return td
+
+
+class TestRhapsodyDialect:
+
+    def _two_pool_session(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        body = {'pools': [_pool_dict(), _pool_dict(name='gpu')],
+                'sid': 'A', 'lifetime': 'persistent'}
+        sid = _register(client, plugin, body=body)
+        return plugin, client, sid
+
+    def test_bulk_submit_groups_and_persists_once_per_pool(self, tmp_path):
+        plugin, client, sid = self._two_pool_session(tmp_path)
+        cpu, gpu = _pool(plugin, sid, 'cpu'), _pool(plugin, sid, 'gpu')
+        with patch.object(cpu, 'persist') as p_cpu, \
+             patch.object(gpu, 'persist') as p_gpu, \
+             patch.object(cpu.policy, 'pick_dispatch', return_value=None), \
+             patch.object(gpu.policy, 'pick_dispatch', return_value=None):
+            r = client.post(f'{plugin.namespace}/submit_rh/{sid}', json={
+                'tasks': [_dialect_td('t.1'), _dialect_td('t.2'),
+                          _dialect_td('t.3', pool='gpu')]})
+            assert r.status_code == 200, r.text
+            assert [a['state'] for a in r.json()] == [TASK_QUEUED] * 3
+            # one ledger write per touched pool, not per task
+            assert p_cpu.call_count == 1
+            assert p_gpu.call_count == 1
+
+        # the pool key came off; the rest of the dict is held verbatim
+        rec = cpu.tasks['t.1']
+        assert rec.task_dict['function'] == 'cloudpickle::AAAA'
+        assert 'pool' not in rec.task_dict
+        assert rec.owning_sid == sid
+
+    def test_bulk_submit_unknown_pool_is_atomic(self, tmp_path):
+        plugin, client, sid = self._two_pool_session(tmp_path)
+        r = client.post(f'{plugin.namespace}/submit_rh/{sid}', json={
+            'tasks': [_dialect_td('t.1'), _dialect_td('t.2', pool='nope')]})
+        assert r.status_code == 404
+        # validation ran before any state was touched
+        assert 't.1' not in _pool(plugin, sid, 'cpu').tasks
+
+    def test_bulk_submit_requires_uid_and_pool(self, tmp_path):
+        plugin, client, sid = self._two_pool_session(tmp_path)
+        r = client.post(f'{plugin.namespace}/submit_rh/{sid}', json={
+            'tasks': [{'pool': 'cpu'}]})
+        assert r.status_code == 400
+        r = client.post(f'{plugin.namespace}/submit_rh/{sid}', json={
+            'tasks': [{'uid': 't.1'}]})
+        assert r.status_code == 400
+
+    def test_resubmit_done_is_cached(self, tmp_path):
+        plugin, client, sid = self._two_pool_session(tmp_path)
+        ps = _pool(plugin, sid, 'cpu')
+        ps.tasks['t.done'] = TaskRecord(
+            task_id='t.done', pool='cpu', owning_sid=sid, cmd=[], cwd='',
+            task_dict={'function': 'cloudpickle::AAAA'},
+            state=TASK_DONE, exit_code=0)
+        with patch.object(ps.policy, 'pick_dispatch') as spy:
+            r = client.post(f'{plugin.namespace}/submit_rh/{sid}', json={
+                'tasks': [_dialect_td('t.done')]})
+            assert r.json() == [{'uid': 't.done', 'state': TASK_DONE}]
+            spy.assert_not_called()
+
+    def test_drain_forwards_bulk_with_namespaced_uids(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        plugin._materialise_pool('A', _make_pool_cfg())
+        ps = _pool(plugin, 'A', 'cpu')
+        pilot = PilotRecord(
+            pid='p.1', pool='cpu', owning_sid='A', size_key='s',
+            rhapsody_backend='concurrent', state=PILOT_ACTIVE,
+            child_endpoint_name='endpoint0_p.1', capacity=4)
+        ps.pilots['p.1'] = pilot
+        for uid in ('t.1', 't.2'):
+            td = _dialect_td(uid)
+            td.pop('pool')
+            ps.tasks[uid] = TaskRecord(
+                task_id=uid, pool='cpu', owning_sid='A', cmd=[], cwd='',
+                task_dict=td, state=TASK_QUEUED)
+
+        rh_mock = MagicMock()
+        rh_mock.submit_tasks = MagicMock(return_value=[])
+        picks = [(ps.tasks['t.1'], pilot), (ps.tasks['t.2'], pilot), None]
+
+        async def drive():
+            with patch.object(ps.policy, 'pick_dispatch',
+                              side_effect=picks), \
+                 patch.object(plugin, '_get_rhapsody_client',
+                              new=AsyncMock(return_value=rh_mock)), \
+                 patch.object(ps, 'persist') as persist:
+                plugin._drain_pending(ps)
+                await asyncio.sleep(0.05)
+                return persist.call_count
+
+        persists = asyncio.run(drive())
+
+        # both claims rode ONE ledger write and ONE bulk submit
+        assert persists == 1
+        rh_mock.submit_tasks.assert_called_once()
+        sent = rh_mock.submit_tasks.call_args.args[0]
+        # uids are namespaced by the owning session: the pilot's rhapsody
+        # session is shared, client-side counters are not unique across
+        # sessions
+        assert [d['uid'] for d in sent] == ['t.1.A', 't.2.A']
+        assert plugin._uid_to_task['t.1.A'] == ('A', 'cpu', 't.1')
+        assert ps.tasks['t.1'].rhapsody_uid == 't.1.A'
+        assert ps.tasks['t.1'].state == TASK_RUNNING
+
+    def test_terminal_notifications_batch_and_forward_results(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        plugin._materialise_pool('A', _make_pool_cfg())
+        ps = _pool(plugin, 'A', 'cpu')
+        for uid in ('t.1', 't.2'):
+            ps.tasks[uid] = TaskRecord(
+                task_id=uid, pool='cpu', owning_sid='A', cmd=[], cwd='',
+                task_dict={'function': 'cloudpickle::AAAA'},
+                state=TASK_RUNNING, rhapsody_uid=f'{uid}.A')
+            plugin._uid_to_task[f'{uid}.A'] = ('A', 'cpu', uid)
+
+        notified = []
+        plugin._dispatch_notify = lambda t, d: notified.append((t, d))
+
+        async def drive():
+            with patch.object(ps, 'persist') as persist:
+                plugin._handle_task_terminal('t.1.A', TASK_DONE, {
+                    'uid': 't.1.A', 'state': 'DONE', 'exit_code': 0,
+                    'return_value': 'cloudpickle::QUJD',
+                    '_return_value_encoding': 'cloudpickle'})
+                plugin._handle_task_terminal('t.2.A', TASK_DONE, {
+                    'uid': 't.2.A', 'state': 'DONE', 'exit_code': 0})
+                plugin._flush_rh()
+                await asyncio.sleep(0)
+                return persist.call_count
+
+        persists = asyncio.run(drive())
+
+        # both completions coalesced: one frame, one ledger write
+        assert persists == 1
+        assert len(notified) == 1
+        topic, frame = notified[0]
+        assert topic == 'task_status_batch'
+        payloads = frame['tasks']
+        # the dispatcher's OWN uid, not the namespaced child uid
+        assert [p['uid'] for p in payloads] == ['t.1', 't.2']
+        assert payloads[0]['return_value'] == 'cloudpickle::QUJD'
+        assert payloads[0]['state'] == TASK_DONE
+
+    def test_client_requires_pool_key(self, tmp_path):
+        from radical.orbit.plugin_task_dispatcher import TaskDispatcherClient
+        c = TaskDispatcherClient.__new__(TaskDispatcherClient)
+        c._sid = 'A'
+        with pytest.raises(ValueError, match="pool"):
+            c.submit_tasks([{'uid': 't.1'}])
