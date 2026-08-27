@@ -24,8 +24,9 @@ Prepare an isolated Python environment (virtualenv, conda, or similar) for each
 role.  For a local demo the broker, endpoint, and consumer can share one
 environment; in production each machine has its own.
 
-> [!NOTE]
-> Python requirement: **3.10** or newer.
+!!! note
+
+    Python requirement: **3.10** or newer.
 
 ### 1.1. Create a virtual environment
 
@@ -37,9 +38,10 @@ source ve_orbit/bin/activate
 
 ### 1.2. Install packages
 
-> [!NOTE]
-> This demo tracks the `devel` branch, which carries the latest changes and
-> should be treated as an unstable release.
+!!! note
+
+    This demo tracks the `devel` branch, which carries the latest changes and
+    should be treated as an unstable release.
 
 ```shell
 pip install git+https://github.com/radical-cybertools/radical.orbit.git@devel
@@ -78,8 +80,9 @@ them into the default config dir lets the broker, endpoints, and consumers find
 them with **no env vars set**.  Run this on the machine that will host the
 broker, and replace `95.217.193.116` with the broker's public IP.
 
-> [!WARNING]
-> A self-signed certificate is for **development** only.
+!!! warning
+
+    A self-signed certificate is for **development** only.
 
 ```shell
 mkdir -p ~/.radical/orbit

@@ -128,7 +128,7 @@ class Gateway:
     """The compat-tier HTTP/SSE/UI ingress attached onto :attr:`Broker.app`.
 
     Args:
-      broker:          the :class:`~radical.orbit.broker.Broker` whose seam this
+      broker (Broker): the :class:`~radical.orbit.broker.Broker` whose seam this
                        gateway consumes (see the module docstring).
       request_timeout: the proxy 504 deadline in seconds (default
                        :data:`REQUEST_TIMEOUT`).

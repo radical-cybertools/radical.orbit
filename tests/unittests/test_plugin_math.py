@@ -48,6 +48,7 @@ def test_math_session_compute_and_history():
     assert h['ops'][1]['op'] == 'div'
 
 
+# --8<-- [start:test_math_session_notifies]
 def test_math_session_notifies():
     """Every compute emits a 'result' notification via the parent plugin."""
     session = MathSession('sid.test')
@@ -75,10 +76,12 @@ def test_math_session_closed_raises():
     asyncio.run(session.close())
     with pytest.raises(RuntimeError):
         asyncio.run(session.compute('add', 1.0, 2.0))
+# --8<-- [end:test_math_session_notifies]
 
 
 # ── HTTP round trips (TestClient over the ASGI routes) ──────────────────────
 
+# --8<-- [start:test_math_http_roundtrip]
 def test_math_http_roundtrip():
     """Register a session, compute, read history, unregister."""
     _, plugin, client = _mk()
@@ -101,6 +104,7 @@ def test_math_http_roundtrip():
 
     resp = client.post(f'/math/unregister_session/{sid}')
     assert resp.status_code == 200
+# --8<-- [end:test_math_http_roundtrip]
 
 
 def test_math_http_div_by_zero_is_400():

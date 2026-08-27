@@ -40,7 +40,7 @@ class EventRouter:
     Args:
       registry:   the broker's live ``name -> transport`` dict (shared ref).
       spawn:      the broker's supervised-task creator.
-      prof:       the broker's profiler (``broker_event_*`` sites).
+      prof (Any): the broker's profiler (``broker_event_*`` sites).
       event_queue: per-subscriber delivery queue depth.
       host_loop_getter: returns the plugin-host loop (taps run there).
     """
