@@ -113,6 +113,16 @@ class BrokerPluginHost(PluginHostBase):
             raise HTTPException(status_code=404,
                                 detail=f'No route: {method} {path}')
 
+        # HTTP headers are case-insensitive, but only the gateway path goes
+        # through starlette's normalisation -- an in-process caller
+        # (BrokerCaller) hands its dict over verbatim, so 'Content-Type'
+        # would miss the lookup below and a msgpack body would be parsed
+        # as JSON.
+        headers = {k.lower(): v for k, v in (headers or {}).items()}
+
+        # NOTE: headers are deliberately NOT passed into the shim -- this
+        # path serves gateway and in-process callers, where a client-supplied
+        # `x-orbit-src` must not surface as a trusted owner (see RequestShim).
         content_type = headers.get('content-type', 'application/json')
         shim = RequestShim(path_params, query_params, body_bytes, content_type)
 
