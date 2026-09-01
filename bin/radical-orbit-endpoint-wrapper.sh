@@ -1,16 +1,32 @@
 #!/bin/sh
-# Auto-generated at install time — do not edit.
-# Runs the ORBIT service using the Python interpreter and site-packages
-# captured when this package was installed.  When ``dragon`` is co-installed
+# Runs the ORBIT service using the Python interpreter and site-packages of
+# the venv this wrapper is installed into.  When ``dragon`` is co-installed
 # in the same venv, the service is launched via ``dragon`` so plugins that
 # require the Dragon runtime (Rhapsody) initialise correctly.
+#
+# Everything resolves at RUNTIME from this script's own location: a wheel
+# is built once and installed anywhere, so nothing about the installing
+# venv may be captured at build time (issue #121 -- the old template baked
+# the wheel builder's paths into every installation).
 #
 # Log level is controlled by RADICAL_ORBIT_LOG_LVL (default: INFO).
 # Set to DEBUG before submitting to get verbose output in the job log:
 #   export RADICAL_ORBIT_LOG_LVL=DEBUG
 
-export PATH="@BINDIR@:${PATH}"
-export PYTHONPATH="@SITEPKGS@:${PYTHONPATH:-}"
+# The venv bin dir is wherever this script really lives, symlinks resolved.
+SELF="$0"
+while [ -L "$SELF" ]; do
+    DIR="$(cd "$(dirname "$SELF")" && pwd)"
+    SELF="$(readlink "$SELF")"
+    case "$SELF" in /*) ;; *) SELF="$DIR/$SELF" ;; esac
+done
+BINDIR="$(cd "$(dirname "$SELF")" && pwd)"
+
+# Belt for launch channels that scrub or replace the interpreter: the
+# service must import from this venv even if a site hook swaps `python`.
+SITEPKGS="$("$BINDIR/python3" -c \
+    'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+export PYTHONPATH="$SITEPKGS:${PYTHONPATH:-}"
 
 # NOTE: the broker TLS cert is staged manually — copy broker_cert.pem
 # from the broker host to ~/.radical/orbit/ on this host (or point
@@ -22,7 +38,7 @@ export PYTHONPATH="@SITEPKGS@:${PYTHONPATH:-}"
 # helpers (``dragon-network-config-launch-helper``, ``dragon-backend``)
 # BY NAME through the workload manager, and the WLM-spawned task does a
 # PATH lookup on the target side.
-export PATH="@BINDIR@:$PATH"
+export PATH="$BINDIR:$PATH"
 
 # Under Slurm, force inner job steps to inherit this environment.  A
 # submission made with ``--export=NONE`` (deliberate, or e.g. via a
@@ -48,7 +64,7 @@ fi
 # Decode with the venv's python — the ``base64`` CLI diverges across
 # systems (GNU ``-d`` vs BSD/macOS ``-D``) and may be absent entirely.
 if [ -n "${RADICAL_ORBIT_SETUP_B64:-}" ]; then
-    RADICAL_ORBIT_SETUP="$("@BINDIR@/python3" -c \
+    RADICAL_ORBIT_SETUP="$("$BINDIR/python3" -c \
         'import base64, os, sys
 sys.stdout.write(base64.b64decode(os.environ["RADICAL_ORBIT_SETUP_B64"]).decode())')"
 fi
@@ -57,14 +73,14 @@ if [ -n "${RADICAL_ORBIT_SETUP:-}" ]; then
     eval "$RADICAL_ORBIT_SETUP"
 fi
 
-# Anchor the dragon/python lookup to ``@BINDIR@`` (= the venv this
+# Anchor the dragon/python lookup to ``$BINDIR`` (= the venv this
 # wrapper was installed into), NOT a PATH search.  RADICAL_ORBIT_SETUP
 # may legitimately ``module load`` a different python (e.g. cray-python
 # for headers / linking) and prepend it to PATH; that's for runtime
 # libraries (LD_LIBRARY_PATH), not for picking the interpreter.  We
 # always want the venv's own dragon + python.
-DRAGON_PATH="@BINDIR@/dragon"
-PYTHON_PATH="@BINDIR@/python3"
+DRAGON_PATH="$BINDIR/dragon"
+PYTHON_PATH="$BINDIR/python3"
 
 # Decide whether to launch via dragon.  Use it only when:
 #   * dragon is installed in this venv,
@@ -93,8 +109,8 @@ fi
 
 if [ "$USE_DRAGON" = "yes" ]; then
     echo "[orbit] starting with dragon ($DRAGON_PATH)" >&2
-    exec "$DRAGON_PATH" $ARGS "@BINDIR@/radical-orbit-endpoint.py" "$@"
+    exec "$DRAGON_PATH" $ARGS "$BINDIR/radical-orbit-endpoint.py" "$@"
 else
     echo "[orbit] starting with python ($PYTHON_PATH) — $REASON" >&2
-    exec "$PYTHON_PATH" "@BINDIR@/radical-orbit-endpoint.py" "$@"
+    exec "$PYTHON_PATH" "$BINDIR/radical-orbit-endpoint.py" "$@"
 fi
