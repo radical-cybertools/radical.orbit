@@ -16,17 +16,27 @@
 # The venv bin dir is wherever this script really lives, symlinks resolved.
 SELF="$0"
 while [ -L "$SELF" ]; do
-    DIR="$(cd "$(dirname "$SELF")" && pwd)"
+    DIR="$(CDPATH= cd -- "$(dirname "$SELF")" && pwd)"
     SELF="$(readlink "$SELF")"
     case "$SELF" in /*) ;; *) SELF="$DIR/$SELF" ;; esac
 done
-BINDIR="$(cd "$(dirname "$SELF")" && pwd)"
+BINDIR="$(CDPATH= cd -- "$(dirname "$SELF")" && pwd)"
 
 # Belt for launch channels that scrub or replace the interpreter: the
 # service must import from this venv even if a site hook swaps `python`.
-SITEPKGS="$("$BINDIR/python3" -c \
-    'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
-export PYTHONPATH="$SITEPKGS:${PYTHONPATH:-}"
+# purelib and platlib both, where they differ (lib64 layouts) -- compiled
+# packages live in the latter.  A wrapper without a usable python next to
+# it is not installed into a venv: say so and stop, instead of exporting
+# a broken environment and dying much later at the exec.
+SITEPKGS="$("$BINDIR/python3" -c 'import sysconfig
+p = sysconfig.get_paths()
+out = p["purelib"] if p["purelib"] == p["platlib"] else \
+    p["purelib"] + ":" + p["platlib"]
+print(out)')" || {
+    echo "[orbit] FATAL: no usable python3 in $BINDIR" >&2
+    exit 1
+}
+export PYTHONPATH="$SITEPKGS${PYTHONPATH:+:$PYTHONPATH}"
 
 # NOTE: the broker TLS cert is staged manually — copy broker_cert.pem
 # from the broker host to ~/.radical/orbit/ on this host (or point
