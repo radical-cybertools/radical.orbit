@@ -9,16 +9,13 @@ __license__   = 'MIT'
 ''' Setup script, only usable via pip. '''
 
 import os
-import stat
 import sys
-import sysconfig
 
 import subprocess as sp
 
 from glob       import glob
 from setuptools import setup, find_namespace_packages
 
-from distutils.command.build_scripts import build_scripts as _build_scripts
 
 
 base     = 'orbit'
@@ -116,56 +113,6 @@ def get_version(_mod_root):
 version, version_path = get_version(mod_root)
 
 
-class BuildScripts(_build_scripts):
-    """Generate wrapper scripts from .sh.in templates at install time.
-
-    Substitutes @PYTHON@, @SITEPKGS@, and @BINDIR@ with the values captured
-    from the active Python environment at install time, then delegates to the
-    standard build_scripts for all other scripts.
-    """
-
-    def run(self):
-        # Determine install-time Python paths.
-        # If a virtualenv is active (VIRTUAL_ENV env var is set), use it.
-        # This handles pip build-isolation where sys.executable points to the
-        # isolated build venv rather than the user's venv.
-        venv = os.environ.get('VIRTUAL_ENV')
-        if venv:
-            py_ver  = '%d.%d' % sys.version_info[:2]
-            python   = os.path.join(venv, 'bin', 'python3')
-            bindir   = os.path.join(venv, 'bin')
-            sitepkgs = os.path.join(venv, 'lib', 'python' + py_ver,
-                                    'site-packages')
-        else:
-            python   = sys.executable
-            sitepkgs = sysconfig.get_path('purelib')
-            bindir   = os.path.dirname(python)
-
-        self.mkpath(self.build_dir)
-
-        remaining = []
-        for src in self.scripts:
-            if src.endswith('.sh.in'):
-                dst_name = os.path.basename(src)[:-3]  # strip .in
-                dst      = os.path.join(self.build_dir, dst_name)
-                with open(src, 'r', encoding='utf-8') as fh:
-                    content = fh.read()
-                content = (content
-                           .replace('@PYTHON@',   python)
-                           .replace('@SITEPKGS@', sitepkgs)
-                           .replace('@BINDIR@',   bindir))
-                with open(dst, 'w', encoding='utf-8') as fh:
-                    fh.write(content)
-                os.chmod(dst, (stat.S_IRWXU |
-                               stat.S_IRGRP | stat.S_IXGRP |
-                               stat.S_IROTH | stat.S_IXOTH))
-            else:
-                remaining.append(src)
-
-        self.scripts = remaining
-        _build_scripts.run(self)
-
-
 with open('%s/requirements.txt' % root, encoding='utf-8') as freq:
     requirements = freq.readlines()
 
@@ -236,7 +183,6 @@ setup_args = {
     },
     'zip_safe'           : False,
     'data_files'         : data,
-    'cmdclass'           : {'build_scripts' : BuildScripts},
 }
 
 

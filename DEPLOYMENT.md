@@ -241,7 +241,7 @@ after `BEIsUp`. The launch contract is therefore deterministic by construction:
   clean environment. Everything the endpoint needs travels as explicit
   `export KEY=VALUE` lines in the script body.
 - The **endpoint wrapper** (`radical-orbit-endpoint-wrapper.sh`) owns the rest:
-  it prepends the venv's `@BINDIR@` to **`PATH`** (dragon resolves its
+  it prepends the venv's bin dir (resolved at runtime from the wrapper's own location) to **`PATH`** (dragon resolves its
   WLM helpers — `dragon-network-config-launch-helper`, `dragon-backend` — BY
   NAME via `srun`, so they must be findable) and, under Slurm, forces
   **`SLURM_EXPORT_ENV=ALL`** so that `--export=NONE` does not scrub the env from
