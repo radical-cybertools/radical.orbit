@@ -32,7 +32,7 @@ from radical.orbit.task_dispatcher_config import PoolConfig, PilotSize
 from radical.orbit.task_dispatcher_state   import (
     PilotRecord, TaskRecord,
     PILOT_PENDING, PILOT_ACTIVE, PILOT_FAILED, PILOT_DONE,
-    TASK_QUEUED, TASK_RUNNING, TASK_DONE, TASK_CANCELED,
+    TASK_QUEUED, TASK_RUNNING, TASK_DONE, TASK_CANCELED, TASK_FAILED,
 )
 
 
@@ -654,6 +654,24 @@ class TestEndpointMode:
                                    'exit_code': 0}})
         assert 't.1' not in plugin._endpoint_mode_tasks
         assert notified and notified[0][1]['state'] == TASK_DONE
+
+    def test_terminal_batch_event_is_handled(self, tmp_path):
+        '''Rhapsody coalesces completions: a frame carrying more than one
+        ships as ``task_status_batch``.  Ignoring that topic strands every
+        task that shared a flush window with another one.'''
+        _, plugin = _make_plugin(tmp_path)
+        seen = []
+        plugin._handle_task_terminal = \
+            lambda uid, state, data: seen.append((uid, state))
+        plugin._on_event({'plugin': 'rhapsody',
+                          'topic' : 'task_status_batch',
+                          'data'  : {'tasks': [
+                              {'uid': 't.1', 'state': 'DONE',
+                               'exit_code': 0},
+                              {'uid': 't.2', 'state': 'FAILED',
+                               'exit_code': 1},
+                              {'uid': 't.3', 'state': 'RUNNING'}]}})
+        assert seen == [('t.1', TASK_DONE), ('t.2', TASK_FAILED)]
 
     def test_on_event_ignores_other_plugins(self, tmp_path):
         _, plugin = _make_plugin(tmp_path)

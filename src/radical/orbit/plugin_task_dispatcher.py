@@ -1800,12 +1800,37 @@ class PluginTaskDispatcher(Plugin):
         The tap fires on the plugin-host loop — the dispatcher's own loop — so
         terminal handling runs inline.  The tap is unfiltered, so filter here
         on plugin/topic; the rhapsody uid → pool mapping is ``_uid_to_task``.
+
+        Both notification shapes have to be handled: rhapsody coalesces
+        terminal states and ships a frame carrying a single completion as
+        ``task_status`` but a frame carrying several as ``task_status_batch``
+        with the payloads under ``tasks``
+        (``plugin_rhapsody._flush_notifications``).  Listening only to
+        ``task_status`` silently loses every completion that shared a flush
+        window with another one — the tasks then sit in RUNNING forever.
+        ``RhapsodyClient._on_task_done`` subscribes to both for the same
+        reason.
         '''
         if event.get('plugin') != 'rhapsody':
             return
-        if event.get('topic') != 'task_status':
+
+        topic = event.get('topic')
+        if topic not in ('task_status', 'task_status_batch'):
             return
-        data  = event.get('data') or {}
+
+        data = event.get('data') or {}
+
+        if topic == 'task_status_batch':
+            items = data.get('tasks') or []
+        else:
+            items = [data]
+
+        for item in items:
+            if isinstance(item, dict):
+                self._on_task_status(item)
+
+    def _on_task_status(self, data: dict) -> None:
+        '''One rhapsody task-status payload from the tap.'''
         uid   = data.get('uid')
         state = str(data.get('state', '')).upper()
         if not uid or state not in ('DONE', 'FAILED', 'CANCELED', 'COMPLETED'):
