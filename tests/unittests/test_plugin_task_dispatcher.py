@@ -656,9 +656,7 @@ class TestEndpointMode:
         assert notified and notified[0][1]['state'] == TASK_DONE
 
     def test_terminal_batch_event_is_handled(self, tmp_path):
-        '''Rhapsody coalesces completions: a frame carrying more than one
-        ships as ``task_status_batch``.  Ignoring that topic strands every
-        task that shared a flush window with another one.'''
+        '''Several completions in one frame arrive as task_status_batch.'''
         _, plugin = _make_plugin(tmp_path)
         seen = []
         plugin._handle_task_terminal = \
@@ -801,6 +799,45 @@ class TestRhapsodyDialect:
         assert plugin._uid_to_task['t.1.A'] == ('A', 'cpu', 't.1')
         assert ps.tasks['t.1'].rhapsody_uid == 't.1.A'
         assert ps.tasks['t.1'].state == TASK_RUNNING
+
+    def test_terminal_during_submit_is_not_lost(self, tmp_path):
+        '''A task finishing before submit_tasks returns still ends DONE.'''
+        _, plugin = _make_plugin(tmp_path)
+        plugin._materialise_pool('A', _make_pool_cfg())
+        ps = _pool(plugin, 'A', 'cpu')
+        pilot = PilotRecord(
+            pid='p.1', pool='cpu', owning_sid='A', size_key='s',
+            rhapsody_backend='concurrent', state=PILOT_ACTIVE,
+            child_endpoint_name='endpoint0_p.1', capacity=4)
+        ps.pilots['p.1'] = pilot
+        td = _dialect_td('t.1')
+        td.pop('pool')
+        ps.tasks['t.1'] = TaskRecord(
+            task_id='t.1', pool='cpu', owning_sid='A', cmd=[], cwd='',
+            task_dict=td, state=TASK_QUEUED)
+
+        async def drive():
+            loop = asyncio.get_running_loop()
+
+            def submit(dicts):
+                # the pilot reports DONE while the submit call is in flight
+                loop.call_soon_threadsafe(plugin._on_event, {
+                    'plugin': 'rhapsody', 'topic': 'task_status',
+                    'data'  : {'uid': 't.1.A', 'state': 'DONE',
+                               'exit_code': 0}})
+                return []
+
+            rh_mock = MagicMock()
+            rh_mock.submit_tasks = MagicMock(side_effect=submit)
+            with patch.object(ps.policy, 'pick_dispatch',
+                              side_effect=[(ps.tasks['t.1'], pilot), None]), \
+                 patch.object(plugin, '_get_rhapsody_client',
+                              new=AsyncMock(return_value=rh_mock)):
+                plugin._drain_pending(ps)
+                await asyncio.sleep(0.05)
+
+        asyncio.run(drive())
+        assert ps.tasks['t.1'].state == TASK_DONE
 
     def test_terminal_notifications_batch_and_forward_results(self, tmp_path):
         _, plugin = _make_plugin(tmp_path)
