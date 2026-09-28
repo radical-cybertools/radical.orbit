@@ -61,8 +61,8 @@ class DispatchPolicy:
     - A pool is a **capability class** with one or more members
       (:class:`~radical.orbit.task_dispatcher_config.PoolMember`).  A policy
       reads them through the pool handle — ``members()``, ``member(mid)``,
-      ``live_pilots_for(mid)``, ``member_node_hours(mid)``,
-      ``member_budget_left(mid)``, ``size_of(pilot)`` — never off
+      ``live_pilots_for(mid)``, ``member_budget_left(mid)``,
+      ``size_of(pilot)`` — never off
       ``config.members`` directly.  A legacy single-site pool has exactly
       one (implicit) member, so a member-unaware policy still works.
     - :meth:`pick_dispatch` is called in a loop until it returns ``None``,

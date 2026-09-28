@@ -155,6 +155,8 @@ class TaskRecord:
     # -- capability-class fields ------------------------------------------
     # The member this task is currently placed on -- set at dispatch beside
     # ``pilot_id`` and cleared with it when a pilot loss re-queues the task.
+    # Redundant with ``pilots[pilot_id].member_id`` by construction; kept
+    # because it is on the wire, so a consumer need not join on the pilot.
     member_id    : str | None  = None
     # Times a pilot loss re-queued this task; capped by the pool policy's
     # ``max_requeues``.
@@ -184,7 +186,6 @@ class TaskRecord:
 # ---------------------------------------------------------------------------
 
 def node_hours(history: list[dict] | None,
-               pilot_sizes: dict | None = None,
                now: float | None = None) -> float:
     '''Return the node-hours consumed by a list of pilot dicts.
 
@@ -192,22 +193,14 @@ def node_hours(history: list[dict] | None,
     member-level ``pilot_history`` of a verbose summary).  A pilot that has
     not finished yet is charged up to *now*.
 
-    The node count resolves in this order:
-
-    1. ``entry['nodes']`` — the size snapshot taken at submit time.  This
-       is the only source that is correct for a **mixed-node-count** pool
-       and the only one that still works once the pilot's member has been
-       removed (its size menu is gone with it).
-    2. ``pilot_sizes[entry['size_key']]['nodes']`` — a pre-121 history,
-       whose records carry no snapshot.
-    3. zero (the entry is skipped).
+    The node count is ``entry['nodes']`` — the size snapshot taken at
+    submit time.  It is the only source that is correct for a
+    **mixed-node-count** pool and the only one that still works once the
+    pilot's member has been removed (its size menu is gone with it).  An
+    entry without one (a pre-121 record) is skipped.
 
     An entry with no ``active_at`` is skipped entirely: a pilot that never
     reached ACTIVE consumed no allocation, and queue time is not charged.
-
-    *pilot_sizes* accepts either ``{key: PilotSize}`` or the plain-dict
-    form a summary carries, and is optional precisely because the snapshot
-    makes it unnecessary for anything written by this version.
 
     This lives here, not in the federation, because the dispatcher needs it
     for its own per-member summary and must not import a federation module.
@@ -220,12 +213,6 @@ def node_hours(history: list[dict] | None,
     total = 0.0
     for entry in history:
         nodes = entry.get('nodes') or 0
-        if not nodes and pilot_sizes:
-            size = pilot_sizes.get(entry.get('size_key') or '')
-            if isinstance(size, dict):
-                nodes = size.get('nodes') or 0
-            elif size is not None:
-                nodes = getattr(size, 'nodes', 0) or 0
         if not nodes:
             continue
 

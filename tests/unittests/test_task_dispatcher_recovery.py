@@ -317,19 +317,19 @@ class TestClassPoolReplay:
 class TestLegacyReplayUnchanged:
 
     def test_persist_replay_persist_is_stable(self, tmp_path):
-        """The synthesised implicit member must never be persisted, or the
-        second replay would read it as a class pool and reject '_'."""
+        """The explicit ``multi_member: false`` wins on replay, so the
+        persisted implicit member never turns a legacy pool into a class
+        pool."""
         plugin = _make_plugin(tmp_path)
         ps = _pool(plugin)
         ps.persist()
         first = json.loads((ps.state_dir / 'state.json').read_text())
-        assert 'members' not in first['config']
         assert first['config']['multi_member'] is False
 
         plugin2 = _make_plugin(tmp_path, with_pool=False)
         ps2 = _pool(plugin2)
         assert ps2.config.multi_member is False
-        assert list(ps2.config.members) == ['_']
+        assert list(ps2.config.members) == ['']
         ps2.persist()
         assert json.loads(
             (ps2.state_dir / 'state.json').read_text())['config'] == \
@@ -363,8 +363,8 @@ class TestLegacyReplayUnchanged:
         plugin = _make_plugin(tmp_path, with_pool=False)
         ps = plugin._pool_states[_SID]['cpu']
         assert ps.config.multi_member is False
-        assert list(ps.config.members) == ['_']
-        assert ps.config.members['_'].endpoint_name == 'endpoint0'
+        assert list(ps.config.members) == ['']
+        assert ps.config.members[''].endpoint_name == 'endpoint0'
         pilot = ps.pilots['p.1']
         assert pilot.member_id == ''          # -> the implicit member
         assert pilot.nodes     == 0           # no snapshot yet

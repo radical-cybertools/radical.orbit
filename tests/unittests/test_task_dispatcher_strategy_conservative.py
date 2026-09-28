@@ -15,7 +15,7 @@ below stands in for a real ``PoolState``.
 import pytest
 
 from radical.orbit.task_dispatcher_config import (
-    PoolConfig, PilotSize, PoolMember, IMPLICIT_MEMBER,
+    PoolConfig, PilotSize, PoolMember,
 )
 from radical.orbit.task_dispatcher_state import (
     PilotRecord, TaskRecord,
@@ -82,19 +82,14 @@ class _Harness:
         return self.pool.member(mid)
 
     def live_pilots_for(self, mid) -> list[PilotRecord]:
-        want = mid or IMPLICIT_MEMBER
-        return [p for p in self.live_pilots()
-                if (p.member_id or IMPLICIT_MEMBER) == want]
-
-    def member_node_hours(self, mid, now=None) -> float:
-        return self.node_hours.get(mid or IMPLICIT_MEMBER, 0.0)
+        return [p for p in self.live_pilots() if p.member_id == mid]
 
     def member_budget_left(self, mid, now=None) -> float | None:
         m     = self.member(mid)
         total = (m.budget or {}).get('node_hours') if m else None
         if not total:
             return None
-        return total - self.member_node_hours(mid, now)
+        return total - self.node_hours.get(mid, 0.0)
 
     def size_of(self, pilot) -> PilotSize | None:
         if pilot.cpus_per_node:

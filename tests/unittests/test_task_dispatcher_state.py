@@ -358,26 +358,19 @@ class TestNodeHours:
         assert node_hours([{'nodes': 4, 'submitted_at': 1000.0,
                             'active_at': None}], now=8200.0) == 0.0
 
-    def test_pre_121_history_uses_pilot_sizes(self):
-        hist  = [{'size_key': 's', 'active_at': 1000.0,
-                  'finished_at': 4600.0}]
-        sizes = {'s': {'nodes': 4}}
-        assert node_hours(hist, pilot_sizes=sizes) == 4.0
-        # ...and without the menu there is nothing to size it with
+    def test_entry_without_snapshot_is_skipped(self):
+        hist = [{'size_key': 's', 'active_at': 1000.0,
+                 'finished_at': 4600.0}]
         assert node_hours(hist) == 0.0
 
-    def test_mixed_node_counts_snapshot_beats_the_flat_menu(self):
+    def test_mixed_node_counts_are_summed_per_snapshot(self):
         """The reason the snapshot exists: a mixed-node-count pool sized
-        off one flat menu gives a different -- wrong -- total."""
+        off one flat menu would give a different -- wrong -- total."""
         hist = [{'nodes': 1, 'size_key': 's', 'active_at': 1000.0,
                  'finished_at': 4600.0},
                 {'nodes': 8, 'size_key': 's', 'active_at': 1000.0,
                  'finished_at': 4600.0}]
-        sizes = {'s': {'nodes': 1}}
-        assert node_hours(hist, pilot_sizes=sizes) == 9.0     # snapshots
-        stripped = [{k: v for k, v in e.items() if k != 'nodes'}
-                    for e in hist]
-        assert node_hours(stripped, pilot_sizes=sizes) == 2.0  # menu only
+        assert node_hours(hist) == 9.0
 
     def test_negative_interval_is_clamped(self):
         hist = [{'nodes': 1, 'active_at': 100.0, 'finished_at': 50.0}]

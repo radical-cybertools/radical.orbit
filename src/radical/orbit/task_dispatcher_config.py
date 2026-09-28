@@ -35,16 +35,20 @@ import re
 from dataclasses import dataclass, field, asdict
 from typing import Any
 
+from .task_dispatcher_match import satisfies
+
 
 # Reserved pool name auto-materialised by the dispatcher when a session
 # registers without declaring any pools.
 DEFAULT_POOL_NAME: str = 'default'
 
 # The member id a legacy (single-site) pool's synthesised member carries.
-# It is deliberately not matchable by ``MEMBER_RE`` so it can never collide
-# with a declared member, and it never appears in a child endpoint name
-# (a legacy pool is never promoted to a class pool -- see plan 121 §4.1).
-IMPLICIT_MEMBER: str = '_'
+# It is the same ``''`` every legacy pilot record carries, so no lookup has
+# to normalise between the two.  ``MEMBER_RE`` cannot match it, so it can
+# never collide with a declared member, and it never appears in a child
+# endpoint name (a legacy pool is never promoted to a class pool -- see
+# plan 121 §4.1).
+IMPLICIT_MEMBER: str = ''
 
 # Charset for a declared member id: endpoint names are built from it.
 MEMBER_RE = re.compile(r'^[a-z0-9][a-z0-9_.-]*$')
@@ -112,6 +116,15 @@ class PoolMember:
     attributes    : dict[str, Any] = field(default_factory=dict)
     budget        : dict[str, float] = field(default_factory=dict)
 
+    def reject_reason(self, req: dict | None) -> str | None:
+        '''Return why this member cannot run a task with *req*, or ``None``.
+
+        Judged against the declared attributes and the **default** pilot
+        size -- the pilot this member would be grown with.
+        '''
+        return satisfies(req, self.attributes,
+                         self.pilot_sizes.get(self.default_size))
+
 
 @dataclass
 class PoolConfig:
@@ -152,19 +165,23 @@ class PoolConfig:
     multi_member    : bool = False       # the declaration carried 'members'
 
     def __post_init__(self) -> None:
-        '''Synthesise the implicit member for a legacy pool.
+        '''Synthesise the implicit member, or project the primary member.
 
         This is the **single construction site** of the implicit member:
         :class:`PoolConfig` is instantiated directly in several places that
         never touch the parser (``default_pool_config``, tests, embedders),
-        so the synthesis cannot live in ``_parse_pool``.
+        so the synthesis cannot live in ``_parse_pool``.  For the same
+        reason a class pool's scalar projection is computed here, via
+        :meth:`reproject`, and not in the parser.
 
         ``pilot_sizes`` is shared *by reference* with the member so the
         legacy projection and the member can never drift; ``endpoint_name``
         is a plain string, so it is instead written through both by
         :meth:`bind_endpoint`.
         '''
-        if not self.members and not self.multi_member:
+        if self.multi_member:
+            self.reproject()
+        elif not self.members:
             self.members = {IMPLICIT_MEMBER: PoolMember(
                 member_id     = IMPLICIT_MEMBER,
                 endpoint_name = self.endpoint_name or '',
@@ -192,7 +209,7 @@ class PoolConfig:
     def reproject(self) -> None:
         '''Recompute the legacy scalar projection from the primary member.
 
-        The parser does this on every parse; a live class pool needs it
+        Construction does this once; a live class pool needs it
         again whenever its member set changes (a member added to an
         emptied pool, or the primary member removed), so the summary and
         every legacy consumer keep seeing a coherent projection.  A no-op
@@ -201,9 +218,9 @@ class PoolConfig:
         if not self.multi_member:
             return
         if not self.members:
-            # Exactly the placeholders ``_parse_pool`` projects for an
-            # empty class pool, so an emptied pool persists and replays to
-            # an identical config.
+            # Harmless placeholders for an emptied class pool (replay
+            # only); deterministic, so it persists and replays to an
+            # identical config.
             self.queue         = DEFAULT_POOL_NAME
             self.account       = None
             self.endpoint_name = None
@@ -234,24 +251,18 @@ class PoolConfig:
         raise KeyError(f'pool {self.name!r} has no members')
 
     def member(self, mid: str | None) -> 'PoolMember | None':
-        '''Return the member with id *mid*; ``''``/``None`` → the implicit one.'''
-        if not mid:
-            mid = IMPLICIT_MEMBER
+        '''Return the member with id *mid* (``''`` is the implicit one).'''
         return self.members.get(mid)
 
     def to_dict(self) -> dict:
         '''Return the persistence view of this config.
 
-        A legacy pool must **not** persist its synthesised member: replay
-        re-parses through :func:`parse_pools`, which reads a ``members`` key
-        as "this is a class pool" — a legacy pool would then fail its own
-        replay.  ``multi_member`` is always written (as ``false`` for a
-        legacy pool), so replay never has to guess.
+        ``multi_member`` is always written, and an explicit flag wins at
+        parse time (see :func:`_parse_pool`), so a legacy pool's persisted
+        implicit member is ignored on replay and re-synthesised — replay
+        never has to guess the shape.
         '''
-        d = asdict(self)
-        if not self.multi_member:
-            d.pop('members', None)
-        return d
+        return asdict(self)
 
 
 # ---------------------------------------------------------------------------
@@ -333,80 +344,14 @@ def _parse_pool(d: Any, source: str, *,
 
     members: dict[str, PoolMember] = {}
     if multi_member:
-        members = _parse_members(d['members'], source, name,
-                                 allow_empty=allow_empty_members)
-
-    if multi_member:
-        # Every scalar below is a read-only projection of the primary
-        # member, recomputed here on every parse.  A member-less class pool
-        # (replay only) projects harmless placeholders.
-        if members:
-            primary = next(iter(members.values()))
-            queue         = primary.queue
-            account       = primary.account
-            endpoint_name = primary.endpoint_name
-            pilot_sizes   = primary.pilot_sizes
-            default_size  = primary.default_size
-            min_pilots    = primary.min_pilots
-            max_pilots    = primary.max_pilots
-            scratch_base  = primary.scratch_base
-        else:
-            queue         = DEFAULT_POOL_NAME
-            account       = None
-            endpoint_name = None
-            pilot_sizes   = {}
-            default_size  = ''
-            min_pilots    = 0
-            max_pilots    = 4
-            scratch_base  = None
+        members  = _parse_members(d['members'], source, name,
+                                  allow_empty=allow_empty_members)
+        # Placeholders only: ``PoolConfig.__post_init__`` overwrites every
+        # scalar with the primary member's projection.
+        resource = {'queue': DEFAULT_POOL_NAME, 'account': None,
+                    'pilot_sizes': {}, 'default_size': ''}
     else:
-        queue = d['queue']
-        if not isinstance(queue, str) or not queue:
-            raise PoolConfigError(
-                f"{source}: 'queue' must be a non-empty string")
-
-        account = d.get('account')
-        if account is not None and not isinstance(account, str):
-            raise PoolConfigError(
-                f"{source}: 'account' must be a string or null")
-
-        endpoint_name = d.get('endpoint_name')
-        if endpoint_name is not None:
-            if not isinstance(endpoint_name, str) or not endpoint_name:
-                raise PoolConfigError(
-                    f"{source}: 'endpoint_name' must be a non-empty string "
-                    f"or null")
-
-        # pilot_sizes: dict[str, PilotSize]
-        sizes_raw = d['pilot_sizes']
-        if not isinstance(sizes_raw, dict) or not sizes_raw:
-            raise PoolConfigError(
-                f"{source}: 'pilot_sizes' must be a non-empty object")
-
-        pilot_sizes = {}
-        for size_name, size_dict in sizes_raw.items():
-            pilot_sizes[size_name] = _parse_pilot_size(
-                size_dict, source=f"{source}: pilot_sizes[{size_name!r}]")
-
-        default_size = d['default_size']
-        if default_size not in pilot_sizes:
-            raise PoolConfigError(
-                f"{source}: 'default_size' {default_size!r} not found in "
-                f"pilot_sizes (available: {sorted(pilot_sizes)})")
-
-        min_pilots = _parse_int(d.get('min_pilots', 0), 'min_pilots', source,
-                                min_value=0)
-        max_pilots = _parse_int(d.get('max_pilots', 4), 'max_pilots', source,
-                                min_value=1)
-        if min_pilots > max_pilots:
-            raise PoolConfigError(
-                f"{source}: min_pilots ({min_pilots}) > "
-                f"max_pilots ({max_pilots})")
-
-        scratch_base = d.get('scratch_base')
-        if scratch_base is not None and not isinstance(scratch_base, str):
-            raise PoolConfigError(
-                f"{source}: 'scratch_base' must be a string or null")
+        resource = _parse_resource(d, source, endpoint_required=False)
 
     pool_class = d.get('pool_class', '')
     if not isinstance(pool_class, str) or not POOL_CLASS_RE.match(pool_class):
@@ -437,14 +382,7 @@ def _parse_pool(d: Any, source: str, *,
 
     cfg = PoolConfig(
         name            = name,
-        queue           = queue,
-        account         = account,
-        pilot_sizes     = pilot_sizes,
-        default_size    = default_size,
-        endpoint_name       = endpoint_name,
-        min_pilots      = min_pilots,
-        max_pilots      = max_pilots,
-        scratch_base    = scratch_base,
+        **resource,
         strategy        = strategy,
         strategy_config = strategy_config,
         pool_class      = pool_class,
@@ -496,8 +434,8 @@ def _parse_members(raw: Any, source: str, pool_name: str, *,
 
     members: dict[str, PoolMember] = {}
     for i, entry in enumerate(entries):
-        member = _parse_member(entry, source=f"{source}: members[{i}]",
-                               pool_name=pool_name)
+        member = parse_member(entry, source=f"{source}: members[{i}]",
+                              pool_name=pool_name)
         if member.member_id in members:
             raise PoolConfigError(
                 f"{source}: duplicate member_id {member.member_id!r}")
@@ -505,44 +443,29 @@ def _parse_members(raw: Any, source: str, pool_name: str, *,
     return members
 
 
-def _parse_member(d: Any, source: str, *, pool_name: str) -> PoolMember:
-    '''Build a single :class:`PoolMember` from a dict, validating fields.'''
-    if not isinstance(d, dict):
-        raise PoolConfigError(
-            f"{source}: must be an object, got {type(d).__name__}")
+def _parse_resource(d: dict, source: str, *,
+                    endpoint_required: bool) -> dict:
+    '''Validate the eight resource fields a legacy pool and a member share.
 
-    for key in ('member_id', 'endpoint_name', 'queue', 'default_size',
-                'pilot_sizes'):
-        if key not in d:
-            raise PoolConfigError(f"{source}: missing required field '{key}'")
-
-    member_id = d['member_id']
-    # IMPLICIT_MEMBER is explicitly exempt from MEMBER_RE: it never appears
-    # in a class-pool declaration, but the exemption keeps a hand-written or
-    # round-tripped '_' from being a parse error.
-    if not isinstance(member_id, str) or (
-            member_id != IMPLICIT_MEMBER and not MEMBER_RE.match(member_id)):
-        raise PoolConfigError(
-            f"{source}: 'member_id' must match {MEMBER_RE.pattern} "
-            f"(got {member_id!r})")
-    if len(pool_name) + len(member_id) > MAX_POOL_MEMBER_NAME_LEN:
-        raise PoolConfigError(
-            f"{source}: pool name plus 'member_id' must be at most "
-            f"{MAX_POOL_MEMBER_NAME_LEN} characters "
-            f"(got {len(pool_name) + len(member_id)})")
-
-    endpoint_name = d['endpoint_name']
-    if not isinstance(endpoint_name, str) or not endpoint_name:
-        raise PoolConfigError(
-            f"{source}: 'endpoint_name' must be a non-empty string")
+    Returns them as keyword arguments for :class:`PoolConfig` or
+    :class:`PoolMember`.  Only ``endpoint_name`` differs: a member must
+    name one, a legacy pool may leave it ``None`` for the auto-pick.  The
+    caller has already checked the required keys.
+    '''
+    endpoint_name = d.get('endpoint_name')
+    if endpoint_required:
+        if not isinstance(endpoint_name, str) or not endpoint_name:
+            raise PoolConfigError(
+                f"{source}: 'endpoint_name' must be a non-empty string")
+    elif endpoint_name is not None:
+        if not isinstance(endpoint_name, str) or not endpoint_name:
+            raise PoolConfigError(
+                f"{source}: 'endpoint_name' must be a non-empty string "
+                f"or null")
 
     queue = d['queue']
     if not isinstance(queue, str) or not queue:
         raise PoolConfigError(f"{source}: 'queue' must be a non-empty string")
-    if queue == DEFAULT_POOL_NAME:
-        raise PoolConfigError(
-            f"{source}: 'queue' must be a real batch queue, not the "
-            f"{DEFAULT_POOL_NAME!r} sentinel")
 
     account = d.get('account')
     if account is not None and not isinstance(account, str):
@@ -575,6 +498,48 @@ def _parse_member(d: Any, source: str, *, pool_name: str) -> PoolMember:
     if scratch_base is not None and not isinstance(scratch_base, str):
         raise PoolConfigError(
             f"{source}: 'scratch_base' must be a string or null")
+
+    return {'endpoint_name': endpoint_name,
+            'queue'        : queue,
+            'account'      : account,
+            'pilot_sizes'  : pilot_sizes,
+            'default_size' : default_size,
+            'min_pilots'   : min_pilots,
+            'max_pilots'   : max_pilots,
+            'scratch_base' : scratch_base}
+
+
+def parse_member(d: Any, source: str, *, pool_name: str) -> PoolMember:
+    '''Build a single :class:`PoolMember` from a dict, validating fields.
+
+    Also the public entry point for one member declaration (the
+    add-member route).
+    '''
+    if not isinstance(d, dict):
+        raise PoolConfigError(
+            f"{source}: must be an object, got {type(d).__name__}")
+
+    for key in ('member_id', 'endpoint_name', 'queue', 'default_size',
+                'pilot_sizes'):
+        if key not in d:
+            raise PoolConfigError(f"{source}: missing required field '{key}'")
+
+    member_id = d['member_id']
+    if not isinstance(member_id, str) or not MEMBER_RE.match(member_id):
+        raise PoolConfigError(
+            f"{source}: 'member_id' must match {MEMBER_RE.pattern} "
+            f"(got {member_id!r})")
+    if len(pool_name) + len(member_id) > MAX_POOL_MEMBER_NAME_LEN:
+        raise PoolConfigError(
+            f"{source}: pool name plus 'member_id' must be at most "
+            f"{MAX_POOL_MEMBER_NAME_LEN} characters "
+            f"(got {len(pool_name) + len(member_id)})")
+
+    resource = _parse_resource(d, source, endpoint_required=True)
+    if resource['queue'] == DEFAULT_POOL_NAME:
+        raise PoolConfigError(
+            f"{source}: 'queue' must be a real batch queue, not the "
+            f"{DEFAULT_POOL_NAME!r} sentinel")
 
     shared_fs = d.get('shared_fs', True)
     if not isinstance(shared_fs, bool):
@@ -614,23 +579,11 @@ def _parse_member(d: Any, source: str, *, pool_name: str) -> PoolMember:
 
     return PoolMember(
         member_id     = member_id,
-        endpoint_name = endpoint_name,
-        queue         = queue,
-        account       = account,
-        pilot_sizes   = pilot_sizes,
-        default_size  = default_size,
-        min_pilots    = min_pilots,
-        max_pilots    = max_pilots,
-        scratch_base  = scratch_base,
+        **resource,
         shared_fs     = shared_fs,
         attributes    = dict(attributes),
         budget        = {k: float(v) for k, v in budget.items()},
     )
-
-
-def parse_member(d: Any, source: str, pool_name: str) -> PoolMember:
-    '''Public entry point for one member declaration (the add-member route).'''
-    return _parse_member(d, source, pool_name=pool_name)
 
 
 def _parse_pilot_size(d: Any, source: str) -> PilotSize:

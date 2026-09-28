@@ -312,12 +312,6 @@ class TestMemberParsing:
             parse_pools(_class_pool_dict(
                 members=[_member_dict(member_id=bad)]))
 
-    def test_implicit_member_id_accepted(self):
-        """'_' never appears in a declaration but must round-trip."""
-        cfg = parse_pools(_class_pool_dict(
-            members=[_member_dict(member_id='_')]))['fed-gpu']
-        assert list(cfg.members) == ['_']
-
     def test_default_queue_sentinel_rejected(self):
         with pytest.raises(PoolConfigError, match='sentinel'):
             parse_pools(_class_pool_dict(
@@ -381,8 +375,8 @@ class TestShapeSwitch:
     def test_legacy_declaration_has_one_implicit_member(self):
         cfg = parse_pools(_minimal_pool_dict())['cpu']
         assert cfg.multi_member is False
-        assert list(cfg.members) == ['_']
-        assert cfg.members['_'].queue == 'batch'
+        assert list(cfg.members) == ['']
+        assert cfg.members[''].queue == 'batch'
 
     def test_explicit_false_beside_members_parses_legacy(self):
         """Defence in depth for an old or hand-edited state file."""
@@ -391,7 +385,7 @@ class TestShapeSwitch:
         raw['pools'][0]['members'] = [_member_dict()]
         cfg = parse_pools(raw)['cpu']
         assert cfg.multi_member is False
-        assert list(cfg.members) == ['_']
+        assert list(cfg.members) == ['']
         assert cfg.queue == 'batch'
 
     def test_empty_members_rejected_on_the_declaration_path(self):
@@ -441,7 +435,7 @@ class TestProjection:
         cfg = parse_pools(_minimal_pool_dict(endpoint_name=None))['cpu']
         cfg.bind_endpoint('picked')
         assert cfg.endpoint_name              == 'picked'
-        assert cfg.members['_'].endpoint_name == 'picked'
+        assert cfg.members[''].endpoint_name == 'picked'
 
 
 class TestPoolClass:
@@ -458,11 +452,13 @@ class TestPoolClass:
 class TestRoundTrip:
     """``parse_pools({'pools': [cfg.to_dict()]})`` is exactly the replay path."""
 
-    def test_legacy_to_dict_has_no_members_key(self):
+    def test_legacy_to_dict_flags_the_shape(self):
+        """The persisted implicit member is ignored on replay because the
+        explicit ``multi_member: false`` wins."""
         cfg = parse_pools(_minimal_pool_dict())['cpu']
         d   = cfg.to_dict()
-        assert 'members' not in d
         assert d['multi_member'] is False
+        assert list(d['members']) == ['']
 
     def test_legacy_round_trip(self):
         cfg = parse_pools(_minimal_pool_dict())['cpu']
@@ -502,15 +498,15 @@ class TestDirectConstruction:
             pilot_sizes={'s': PilotSize(nodes=1, cpus_per_node=4,
                                         rhapsody_backend='concurrent')},
             default_size='s')
-        assert list(cfg.members) == ['_']
-        assert cfg.members['_'].default_size == 's'
+        assert list(cfg.members) == ['']
+        assert cfg.members[''].default_size == 's'
 
     def test_default_pool_config_has_its_implicit_member(self):
         cfg = default_pool_config()
-        assert list(cfg.members) == ['_']
-        assert cfg.members['_'].queue == DEFAULT_POOL_NAME
+        assert list(cfg.members) == ['']
+        assert cfg.members[''].queue == DEFAULT_POOL_NAME
 
     def test_pilot_sizes_are_shared_by_reference(self):
         """The legacy projection and the member can never drift."""
         cfg = default_pool_config()
-        assert cfg.members['_'].pilot_sizes is cfg.pilot_sizes
+        assert cfg.members[''].pilot_sizes is cfg.pilot_sizes

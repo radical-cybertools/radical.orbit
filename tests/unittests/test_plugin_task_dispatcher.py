@@ -551,11 +551,13 @@ class TestPilotSubmitTransport:
         _, plugin = _make_plugin(tmp_path)
         plugin._materialise_pool('A', _make_pool_cfg())
         ps = _pool(plugin, 'A', 'cpu')
-        size = ps.config.pilot_sizes[ps.config.default_size]
+        member = ps.config.primary_member()
+        size = member.pilot_sizes[member.default_size]
         record = PilotRecord(
             pid='p.a', pool='cpu', owning_sid='A',
-            size_key=ps.config.default_size,
-            rhapsody_backend=size.rhapsody_backend, state=PILOT_PENDING)
+            size_key=member.default_size,
+            rhapsody_backend=size.rhapsody_backend, state=PILOT_PENDING,
+            endpoint_name=member.endpoint_name)
         ps.pilots[record.pid] = record
 
         # The dispatcher drives child clients' SYNC methods via
@@ -567,11 +569,44 @@ class TestPilotSubmitTransport:
                           new=AsyncMock(return_value=psij_mock)), \
              patch('radical.orbit.batch_system.detect_batch_system') as bs:
             bs.return_value.psij_executor = 'local'
-            asyncio.run(plugin._do_pilot_submit(ps, record, size))
+            asyncio.run(plugin._do_pilot_submit(ps, record, size, member))
 
         psij_mock.submit_tunneled.assert_called_once()
         assert psij_mock.submit_tunneled.call_args.args[2] == 'none'
         assert record.psij_job_id == 'jid'
+
+    def test_cancel_during_submit_cancels_the_new_job(self, tmp_path):
+        """A pilot cancelled while submit_tunneled is in flight (no job id
+        yet, so it is only marked FAILED) must not be resurrected when the
+        submit returns: the just-created job is cancelled instead."""
+        _, plugin = _make_plugin(tmp_path)
+        plugin._materialise_pool('A', _make_pool_cfg())
+        ps = _pool(plugin, 'A', 'cpu')
+        member = ps.config.primary_member()
+        size = member.pilot_sizes[member.default_size]
+        record = PilotRecord(
+            pid='p.a', pool='cpu', owning_sid='A',
+            size_key=member.default_size,
+            rhapsody_backend=size.rhapsody_backend, state=PILOT_PENDING,
+            endpoint_name=member.endpoint_name)
+        ps.pilots[record.pid] = record
+
+        def _submit(*_args):
+            # The member-removal cancel lands while psij is submitting.
+            plugin._mark_pilot_failed(ps, record, 'cancel requested')
+            return {'job_id': 'jid'}
+
+        psij_mock = MagicMock()
+        psij_mock.submit_tunneled = MagicMock(side_effect=_submit)
+        with patch.object(plugin, '_get_psij_client',
+                          new=AsyncMock(return_value=psij_mock)), \
+             patch('radical.orbit.batch_system.detect_batch_system') as bs:
+            bs.return_value.psij_executor = 'local'
+            asyncio.run(plugin._do_pilot_submit(ps, record, size, member))
+
+        psij_mock.cancel_job.assert_called_once_with('jid')
+        assert record.state       == PILOT_FAILED
+        assert record.psij_job_id is None
 
     def test_refuses_without_broker_caller(self, tmp_path):
         """Old-stack construction (no caller) → the child-client factory
@@ -1595,14 +1630,6 @@ class TestMemberRemoval:
             json={})
         assert r.status_code == 404
 
-    def test_post_remove_fallback_is_equivalent(self, tmp_path):
-        plugin, client, sid = self._two_members(tmp_path)
-        r = client.post(
-            f'{plugin.namespace}/pool/{sid}/fed/members/m_y/remove',
-            json={})
-        assert r.status_code == 200, r.text
-        assert list(_pool(plugin, sid, 'fed').config.members) == ['m_x']
-
     def _pilot_with_task(self, plugin, sid, mid, req=None):
         ps = _pool(plugin, sid, 'fed')
         pilot = PilotRecord(
@@ -2484,7 +2511,7 @@ class TestAddMemberFingerprint:
 class TestLegacyPilotMemberId:
 
     def test_a_legacy_pilot_carries_an_empty_member_id(self, tmp_path):
-        """The implicit member's sentinel never reaches the wire."""
+        """A legacy pilot carries '' -- the implicit member's own id."""
         _, plugin = _make_plugin(tmp_path)
         client = TestClient(plugin._app)
         sid = _session_with_cpu(client, plugin, sid='A',
@@ -2499,5 +2526,5 @@ class TestLegacyPilotMemberId:
         pid = asyncio.run(drive())
         assert ps.pilots[pid].member_id == ''
         # ...and it still resolves to the implicit member
-        assert ps.member(ps.pilots[pid].member_id).member_id == '_'
-        assert ps.live_pilots_for('_') == [ps.pilots[pid]]
+        assert ps.member(ps.pilots[pid].member_id).member_id == ''
+        assert ps.live_pilots_for('') == [ps.pilots[pid]]
