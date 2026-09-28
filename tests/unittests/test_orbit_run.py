@@ -26,6 +26,7 @@ _loader.exec_module(_run)
 compute_task_id = _run.compute_task_id
 _split_argv     = _run._split_argv
 _flatten        = _run._flatten
+_requirements_from_args = _run._requirements_from_args
 
 
 # ---------------------------------------------------------------------------
@@ -170,3 +171,76 @@ class TestGetTaskDispatcher:
         assert calls['started'] is True
         assert calls['get_plugin'] == ('broker', 'task_dispatcher', {})
         assert td is not None
+
+
+# ---------------------------------------------------------------------------
+# Per-task resource requirements (plan 120)
+# ---------------------------------------------------------------------------
+
+class TestRequirementsFromArgs:
+
+    def _args(self, *extra):
+        return _run._parse_opts(['--pool', 'p', '--run-id', 'r', *extra])
+
+    def test_all_default_yields_none(self):
+        # ... so submit_task omits the key and the wire body is unchanged
+        assert _requirements_from_args(self._args()) is None
+
+    def test_explicitly_typed_defaults_are_sent(self):
+        args = self._args('--cores', '1', '--gpus', '0', '--mem', '0',
+                          '--ranks', '1')
+        assert _requirements_from_args(args) == {
+            'cores': 1, 'gpus': 0, 'mem_gb': 0.0, 'ranks': 1}
+
+    def test_only_non_default_keys_are_emitted(self):
+        args = self._args('--cores', '4')
+        assert _requirements_from_args(args) == {'cores': 4}
+
+    def test_full_set(self):
+        args = self._args('--cores', '8', '--gpus', '2', '--mem', '1.5',
+                          '--ranks', '2', '--mpi',
+                          '--software', 'gromacs', '--software', 'cuda',
+                          '--label', 'zone=a', '--label', 'tier=gold')
+        assert _requirements_from_args(args) == {
+            'cores': 8, 'gpus': 2, 'mem_gb': 1.5, 'ranks': 2, 'mpi': True,
+            'software': ['gromacs', 'cuda'],
+            'labels': {'zone': 'a', 'tier': 'gold'}}
+
+    def test_software_accepts_space_separated_form(self):
+        args = self._args('--software', 'gromacs cuda')
+        assert _requirements_from_args(args) == {
+            'software': ['gromacs', 'cuda']}
+
+    def test_label_value_may_contain_equals(self):
+        args = self._args('--label', 'k=a=b')
+        assert _requirements_from_args(args) == {'labels': {'k': 'a=b'}}
+
+    def test_malformed_label_exits(self):
+        with pytest.raises(SystemExit):
+            self._args('--label', 'novalue')
+
+    def test_empty_label_key_exits(self):
+        with pytest.raises(SystemExit):
+            self._args('--label', '=v')
+
+    def test_empty_label_value_is_allowed(self):
+        args = self._args('--label', 'k=')
+        assert _requirements_from_args(args) == {'labels': {'k': ''}}
+
+
+class TestTaskIdIgnoresRequirements:
+    """Resources are placement, not identity: re-running the same rule with
+    more cores must attach to the SAME task record (and the dispatcher
+    would ignore the change anyway, per the resubmit semantics).
+    """
+
+    def test_same_id_across_resource_flags(self):
+        base = _run._parse_opts(['--pool', 'p', '--run-id', 'r'])
+        rich = _run._parse_opts(['--pool', 'p', '--run-id', 'r',
+                                 '--cores', '8', '--gpus', '4',
+                                 '--mem', '32', '--ranks', '4', '--mpi'])
+        t1 = compute_task_id(['echo', 'hi'], base.inputs, base.outputs,
+                             base.run_id)
+        t2 = compute_task_id(['echo', 'hi'], rich.inputs, rich.outputs,
+                             rich.run_id)
+        assert t1 == t2

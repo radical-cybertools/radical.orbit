@@ -27,7 +27,7 @@ from fastapi import FastAPI
 from starlette.testclient import TestClient
 
 from radical.orbit.plugin_task_dispatcher import (
-    PluginTaskDispatcher, PoolState,
+    PluginTaskDispatcher, PoolState, backend_kwargs,
 )
 from radical.orbit.task_dispatcher_config import PoolConfig, PilotSize
 from radical.orbit.task_dispatcher_state   import (
@@ -632,10 +632,18 @@ class TestEndpointMode:
                           new=AsyncMock(return_value=rh_mock)):
             r = client.post(f'{plugin.namespace}/submit/{sid}', json={
                 'endpoint': 'ep', 'task_id': 't.1',
-                'cmd': ['/bin/sleep', '0'], 'cwd': '/tmp'})
+                'cmd': ['/bin/sleep', '0'], 'cwd': '/tmp',
+                # accepted and shape-validated, but advisory only: with no
+                # pool there is no known backend to map onto
+                'requirements': {'cores': 4, 'gpus': 2}})
             assert r.status_code == 200, r.text
             assert plugin._endpoint_mode_tasks.get('t.1') == 'ep'
             rh_mock.submit_tasks.assert_called_once()
+            # the forwarded dict is UNCHANGED from a submit without the
+            # key, and the response body grows no 'requirements'
+            fwd = rh_mock.submit_tasks.call_args.args[0][0]
+            assert fwd['task_backend_specific_kwargs'] == {'cwd': '/tmp'}
+            assert 'requirements' not in r.json()
 
             r = client.get(f'{plugin.namespace}/task/{sid}/t.1')
             assert r.json()['result']['state'] == 'RUNNING'
@@ -643,6 +651,67 @@ class TestEndpointMode:
             r = client.post(f'{plugin.namespace}/cancel/{sid}/t.1')
             assert r.status_code == 200
             rh_mock.cancel_task.assert_called_once_with('t.1')
+
+    def test_endpoint_mode_shape_400_still_fires(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _register(client, plugin, body={'sid': 'A',
+                                              'lifetime': 'persistent'})
+        self._seed_topology(plugin, {'ep': ['rhapsody']})
+        rh_mock = MagicMock()
+        rh_mock.submit_tasks = MagicMock(return_value=[])
+        with patch.object(plugin, '_get_rhapsody_client',
+                          new=AsyncMock(return_value=rh_mock)):
+            r = client.post(f'{plugin.namespace}/submit/{sid}', json={
+                'endpoint': 'ep', 'task_id': 't.1',
+                'cmd': ['/bin/true'], 'cwd': '/tmp',
+                'requirements': {'gpu': 1}})
+        assert r.status_code == 400
+        assert r.json()['detail'] == "requirements: unknown key 'gpu'"
+        rh_mock.submit_tasks.assert_not_called()
+
+    def test_endpoint_mode_skips_the_pool_gates(self, tmp_path):
+        # No pool ⇒ no fit check and no backend gate: 8 cores would be a
+        # 400 on the 4-cpu 'cpu' pool, and mpi would be a 400 on a
+        # dragon_v1 pool.  Endpoint mode accepts both.
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _register(client, plugin, body={'sid': 'A',
+                                              'lifetime': 'persistent'})
+        self._seed_topology(plugin, {'ep': ['rhapsody']})
+        rh_mock = MagicMock()
+        rh_mock.submit_tasks = MagicMock(return_value=[])
+        with patch.object(plugin, '_get_rhapsody_client',
+                          new=AsyncMock(return_value=rh_mock)):
+            r = client.post(f'{plugin.namespace}/submit/{sid}', json={
+                'endpoint': 'ep', 'task_id': 't.1',
+                'cmd': ['/bin/true'], 'cwd': '/tmp',
+                'requirements': {'cores': 8, 'gpus': 4, 'mpi': True}})
+        assert r.status_code == 200, r.text
+        fwd = rh_mock.submit_tasks.call_args.args[0][0]
+        assert fwd['task_backend_specific_kwargs'] == {'cwd': '/tmp'}
+
+    def test_endpoint_mode_advisory_log(self, tmp_path, caplog):
+        # exactly one advisory line for a submit that declared something
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _register(client, plugin, body={'sid': 'A',
+                                              'lifetime': 'persistent'})
+        self._seed_topology(plugin, {'ep': ['rhapsody']})
+        rh_mock = MagicMock()
+        rh_mock.submit_tasks = MagicMock(return_value=[])
+        body = {'endpoint': 'ep', 'task_id': 't.1',
+                'cmd': ['/bin/true'], 'cwd': '/tmp',
+                'requirements': {'cores': 4}}
+        with caplog.at_level('INFO', logger='radical.orbit'), \
+             patch.object(plugin, '_get_rhapsody_client',
+                          new=AsyncMock(return_value=rh_mock)):
+            r = client.post(f'{plugin.namespace}/submit/{sid}', json=body)
+        assert r.status_code == 200, r.text
+        lines = [rec.getMessage() for rec in caplog.records
+                 if 'requirements are advisory' in rec.getMessage()]
+        assert len(lines) == 1
+        assert 't.1' in lines[0]
 
     def test_terminal_event_clears_endpoint_mode(self, tmp_path):
         _, plugin = _make_plugin(tmp_path)
@@ -938,3 +1007,573 @@ class TestRhapsodyDialect:
         c._sid = 'A'
         with pytest.raises(ValueError, match="pool"):
             c.submit_tasks([{'uid': 't.1'}])
+
+
+# ---------------------------------------------------------------------------
+# Per-task resource requirements (plan 120)
+# ---------------------------------------------------------------------------
+
+_ORACLE_REQ = {'cores': 4, 'gpus': 2, 'mem_gb': 8, 'ranks': 2,
+               'mpi': True, 'software': ['gromacs'], 'labels': {'zone': 'a'}}
+
+
+class TestBackendKwargs:
+    """``backend_kwargs`` is the mapping oracle: the table in its docstring
+    is the contract, and rhapsody reads NOTHING outside
+    ``task_backend_specific_kwargs``, so a wrong key name is invisible at
+    runtime.  These assertions are the only thing that catches that.
+    """
+
+    @pytest.mark.parametrize('backend,expected', [
+        ('dragon_v2',     {'ranks': 2, 'gpus_per_rank': 1}),
+        ('radical_pilot', {'ranks': 2, 'cores_per_rank': 2,
+                           'gpus_per_rank': 1, 'mem_per_rank': 4096}),
+        ('dragon_v3',     {'type': 'mpi', 'ranks': 2}),
+        ('dragon_v1',     {'ranks': 2}),
+        ('dask',          {'resources': {'GPU': 2}}),
+        ('concurrent',    {}),
+    ])
+    def test_mapping_oracle(self, backend, expected):
+        assert backend_kwargs(_ORACLE_REQ, backend) == expected
+
+    @pytest.mark.parametrize('backend', [
+        'dragon_v1', 'dragon_v2', 'dragon_v3', 'dask', 'concurrent',
+        'radical_pilot', 'something_new'])
+    def test_empty_requirements_emit_nothing(self, backend):
+        # every key equal to the backend's own default is omitted, so an
+        # existing task forwards byte-identically
+        assert backend_kwargs({}, backend) == {}
+        assert backend_kwargs({'cores': 1, 'gpus': 0, 'mem_gb': 0,
+                               'ranks': 1, 'mpi': False}, backend) == {}
+
+    def test_software_and_labels_never_reach_rhapsody(self):
+        req = {'software': ['gromacs', 'cuda'],
+               'labels': {'zone': 'a', 'tier': 2}}
+        for backend in ('dragon_v1', 'dragon_v2', 'dragon_v3', 'dask',
+                        'concurrent', 'radical_pilot'):
+            out = backend_kwargs(req, backend)
+            assert 'software' not in out
+            assert 'labels' not in out
+            assert out == {}
+
+    def test_dragon_v3_ignores_ranks_without_mpi(self):
+        # dragon_v3 reads `ranks` ONLY under type == 'mpi'
+        assert backend_kwargs({'cores': 4, 'ranks': 4}, 'dragon_v3') == {}
+
+    def test_dragon_v3_mpi_alone_emits_only_the_type(self):
+        # ranks == 1 is the backend's own default and is omitted; 'type'
+        # is not a default, so mpi alone still selects the MPI path
+        assert backend_kwargs({'mpi': True}, 'dragon_v3') == {'type': 'mpi'}
+
+    def test_radical_pilot_single_rank_still_carries_cores(self):
+        # ranks == 1 is omitted, but cores_per_rank == 4 is not a default
+        assert backend_kwargs({'cores': 4, 'ranks': 1}, 'radical_pilot') \
+            == {'cores_per_rank': 4}
+
+
+class TestRequirementsValidation:
+    """Exact 400 detail strings — a typo must not vanish silently."""
+
+    def _submit(self, client, plugin, sid, requirements, pool='cpu'):
+        return client.post(f'{plugin.namespace}/submit/{sid}', json={
+            'pool': pool, 'task_id': 't.1',
+            'cmd': ['/bin/echo'], 'cwd': '/tmp',
+            'requirements': requirements})
+
+    def _session(self, tmp_path, pools=None):
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        body = {'sid': 'A', 'lifetime': 'persistent',
+                'pools': pools if pools is not None else [_pool_dict()]}
+        sid = _register(client, plugin, body=body)
+        return plugin, client, sid
+
+    # -- shape ---------------------------------------------------------
+
+    @pytest.mark.parametrize('requirements,detail', [
+        ({'gpu': 1},
+         "requirements: unknown key 'gpu'"),
+        ({'cores': 0},
+         "requirements: 'cores' must be a positive integer, got 0"),
+        ({'cores': True},
+         "requirements: 'cores' must be a positive integer, got True"),
+        ({'ranks': 0},
+         "requirements: 'ranks' must be a positive integer, got 0"),
+        ({'gpus': 'two'},
+         "requirements: 'gpus' must be a non-negative integer, got 'two'"),
+        ({'gpus': -1},
+         "requirements: 'gpus' must be a non-negative integer, got -1"),
+        ({'gpus': False},
+         "requirements: 'gpus' must be a non-negative integer, got False"),
+        ({'mem_gb': 'x'},
+         "requirements: 'mem_gb' must be a non-negative number, got 'x'"),
+        ({'mem_gb': -0.5},
+         "requirements: 'mem_gb' must be a non-negative number, got -0.5"),
+        ({'mem_gb': True},
+         "requirements: 'mem_gb' must be a non-negative number, got True"),
+        ({'mpi': 'yes'},
+         "requirements: 'mpi' must be a boolean"),
+        ({'mpi': 1},
+         "requirements: 'mpi' must be a boolean"),
+        ({'software': 'gromacs'},
+         "requirements: 'software' must be a list of strings"),
+        ({'software': ['ok', 3]},
+         "requirements: 'software' must be a list of strings"),
+        ({'labels': ['a']},
+         "requirements: 'labels' must be a mapping of string to "
+         "string|number"),
+        ({'labels': {'a': ['b']}},
+         "requirements: 'labels' must be a mapping of string to "
+         "string|number"),
+        ({'cores': 2, 'ranks': 4},
+         "requirements: 'cores' (2) must be >= 'ranks' (4)"),
+        ({'cores': 4, 'gpus': 3, 'ranks': 2},
+         "requirements: 'gpus' (3) must be divisible by 'ranks' (2)"),
+    ])
+    def test_shape_400s(self, tmp_path, requirements, detail):
+        plugin, client, sid = self._session(tmp_path)
+        r = self._submit(client, plugin, sid, requirements)
+        assert r.status_code == 400, r.text
+        assert r.json()['detail'] == detail
+        assert 't.1' not in _pool(plugin, sid, 'cpu').tasks
+
+    def test_non_mapping_400(self, tmp_path):
+        plugin, client, sid = self._session(tmp_path)
+        r = self._submit(client, plugin, sid, 'cores=4')
+        assert r.status_code == 400
+        assert r.json()['detail'] == 'requirements: must be a mapping'
+
+    def test_labels_accept_numbers(self, tmp_path):
+        plugin, client, sid = self._session(tmp_path)
+        with patch.object(_pool(plugin, sid, 'cpu').policy, 'pick_dispatch',
+                          return_value=None):
+            r = self._submit(client, plugin, sid,
+                             {'labels': {'a': 'b', 'n': 2, 'f': 1.5}})
+        assert r.status_code == 200, r.text
+
+    @pytest.mark.parametrize('bad', [float('nan'), float('inf'),
+                                     float('-inf')])
+    def test_mem_gb_rejects_non_finite(self, tmp_path, bad):
+        # NaN would sail past a bare `>= 0`; inf is meaningless as a size
+        from radical.orbit.plugin_task_dispatcher import (
+            parse_requirements, RequirementsError)
+        with pytest.raises(RequirementsError) as e:
+            parse_requirements({'mem_gb': bad})
+        assert str(e.value).startswith(
+            "requirements: 'mem_gb' must be a non-negative number")
+
+    # -- cores derived from ranks --------------------------------------
+
+    def test_ranks_alone_derives_cores(self, tmp_path):
+        # {'ranks': 4} means "four processes" -- it must NOT 400 against
+        # the cores default of 1
+        plugin, client, sid = self._session(tmp_path)
+        ps = _pool(plugin, sid, 'cpu')
+        with patch.object(ps.policy, 'pick_dispatch', return_value=None):
+            r = self._submit(client, plugin, sid, {'ranks': 4})
+        assert r.status_code == 200, r.text
+        # the derived value is what gets persisted and forwarded
+        assert r.json()['requirements'] == {'ranks': 4, 'cores': 4}
+        assert ps.tasks['t.1'].requirements == {'ranks': 4, 'cores': 4}
+
+    def test_derived_cores_still_face_the_fit_check(self, tmp_path):
+        plugin, client, sid = self._session(tmp_path)
+        r = self._submit(client, plugin, sid, {'ranks': 8})
+        assert r.status_code == 400
+        assert r.json()['detail'] == (
+            "requirements: 8 cores exceed every pilot_size "
+            "(largest: 's', 4 cpus/node)")
+
+    def test_explicit_cores_below_ranks_is_still_400(self, tmp_path):
+        # an omission is derived; a contradiction is refused
+        plugin, client, sid = self._session(tmp_path)
+        r = self._submit(client, plugin, sid, {'cores': 2, 'ranks': 4})
+        assert r.status_code == 400
+        assert r.json()['detail'] == (
+            "requirements: 'cores' (2) must be >= 'ranks' (4)")
+
+    def test_no_gratuitous_cores_key(self, tmp_path):
+        # ranks == 1 derives cores == 1, which is the default: don't stamp
+        # a key the caller never sent onto the record
+        plugin, client, sid = self._session(tmp_path)
+        ps = _pool(plugin, sid, 'cpu')
+        with patch.object(ps.policy, 'pick_dispatch', return_value=None):
+            r = self._submit(client, plugin, sid, {'gpus': 0, 'ranks': 1})
+        assert r.status_code == 200, r.text
+        assert r.json()['requirements'] == {'gpus': 0, 'ranks': 1}
+
+    # -- fit -----------------------------------------------------------
+
+    def test_cores_exceed_every_pilot_size(self, tmp_path):
+        plugin, client, sid = self._session(tmp_path)
+        r = self._submit(client, plugin, sid, {'cores': 8})
+        assert r.status_code == 400
+        assert r.json()['detail'] == (
+            "requirements: 8 cores exceed every pilot_size "
+            "(largest: 's', 4 cpus/node)")
+
+    def test_gpus_exceed_every_pilot_size(self, tmp_path):
+        plugin, client, sid = self._session(tmp_path)
+        r = self._submit(client, plugin, sid, {'cores': 2, 'gpus': 2})
+        assert r.status_code == 400
+        assert r.json()['detail'] == (
+            "requirements: 2 gpus exceed every pilot_size "
+            "(largest: 's', 0 gpus/node)")
+
+    def test_fit_passes_when_any_size_hosts_and_names_the_largest(
+            self, tmp_path):
+        # mixed pool: 'big' hosts 8 cores, so 8 fits; 16 does not, and the
+        # message names the max over the FAILING dimension
+        pools = [_pool_dict(pilot_sizes={
+            's'  : {'nodes': 1, 'cpus_per_node': 4,
+                    'rhapsody_backend': 'concurrent'},
+            'big': {'nodes': 1, 'cpus_per_node': 8, 'gpus_per_node': 2,
+                    'rhapsody_backend': 'dragon_v2'}})]
+        plugin, client, sid = self._session(tmp_path, pools=pools)
+        with patch.object(_pool(plugin, sid, 'cpu').policy, 'pick_dispatch',
+                          return_value=None):
+            r = self._submit(client, plugin, sid, {'cores': 8, 'gpus': 2})
+        assert r.status_code == 200, r.text
+
+        r = self._submit(client, plugin, sid, {'cores': 16})
+        assert r.status_code == 400
+        assert r.json()['detail'] == (
+            "requirements: 16 cores exceed every pilot_size "
+            "(largest: 'big', 8 cpus/node)")
+
+    def test_largest_is_per_dimension_not_the_biggest_size(self, tmp_path):
+        # 'big' is the largest by cpus but has NO gpus; a gpu overflow must
+        # name 's', the largest along the failing dimension
+        pools = [_pool_dict(pilot_sizes={
+            's'  : {'nodes': 1, 'cpus_per_node': 4, 'gpus_per_node': 4,
+                    'rhapsody_backend': 'dragon_v2'},
+            'big': {'nodes': 1, 'cpus_per_node': 8, 'gpus_per_node': 0,
+                    'rhapsody_backend': 'concurrent'}})]
+        plugin, client, sid = self._session(tmp_path, pools=pools)
+        r = self._submit(client, plugin, sid, {'cores': 8, 'gpus': 8})
+        assert r.status_code == 400
+        assert r.json()['detail'] == (
+            "requirements: 8 gpus exceed every pilot_size "
+            "(largest: 's', 4 gpus/node)")
+
+    def test_mem_gb_has_no_fit_check(self, tmp_path):
+        # PilotSize carries no memory field, so mem_gb is never a fit 400
+        plugin, client, sid = self._session(tmp_path)
+        with patch.object(_pool(plugin, sid, 'cpu').policy, 'pick_dispatch',
+                          return_value=None):
+            r = self._submit(client, plugin, sid, {'mem_gb': 1024})
+        assert r.status_code == 200, r.text
+
+    def test_default_pool_refuses_two_cores(self, tmp_path):
+        # the built-in 'default' pool is one node of ONE cpu
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _register(client, plugin, body={'sid': 'A',
+                                              'lifetime': 'persistent'})
+        r = self._submit(client, plugin, sid, {'cores': 2}, pool='default')
+        assert r.status_code == 400
+        assert r.json()['detail'] == (
+            "requirements: 2 cores exceed every pilot_size "
+            "(largest: 'node', 1 cpus/node)")
+
+    # -- backend gate --------------------------------------------------
+
+    def test_mpi_on_dragon_v1_pool_400(self, tmp_path):
+        pools = [_pool_dict(name='x', pilot_sizes={
+            's': {'nodes': 1, 'cpus_per_node': 4,
+                  'rhapsody_backend': 'dragon_v1'}})]
+        plugin, client, sid = self._session(tmp_path, pools=pools)
+        r = self._submit(client, plugin, sid, {'mpi': True}, pool='x')
+        assert r.status_code == 400
+        assert r.json()['detail'] == (
+            "requirements: 'mpi' is unsupported on dragon_v1 "
+            "(pool 'x', size 's')")
+
+    def test_mpi_passes_on_a_mixed_pool(self, tmp_path):
+        # only ALL-dragon_v1 pools refuse mpi; one hostable size is enough
+        pools = [_pool_dict(name='x', default_size='a', pilot_sizes={
+            'a': {'nodes': 1, 'cpus_per_node': 4,
+                  'rhapsody_backend': 'dragon_v1'},
+            'b': {'nodes': 1, 'cpus_per_node': 4,
+                  'rhapsody_backend': 'dragon_v3'}})]
+        plugin, client, sid = self._session(tmp_path, pools=pools)
+        with patch.object(_pool(plugin, sid, 'x').policy, 'pick_dispatch',
+                          return_value=None):
+            r = self._submit(client, plugin, sid, {'mpi': True}, pool='x')
+        assert r.status_code == 200, r.text
+
+    # -- validation precedes the resubmit cache ladder ------------------
+
+    def test_bad_requirements_400_even_on_cached_done(self, tmp_path):
+        plugin, client, sid = self._session(tmp_path)
+        ps = _pool(plugin, sid, 'cpu')
+        ps.tasks['t.1'] = TaskRecord(
+            task_id='t.1', pool='cpu', owning_sid=sid, cmd=['/bin/echo'],
+            cwd='/tmp', state=TASK_DONE, exit_code=0)
+        r = self._submit(client, plugin, sid, {'gpu': 1})
+        assert r.status_code == 400
+        assert ps.tasks['t.1'].state == TASK_DONE
+
+    def test_changed_requirements_on_resubmit_are_ignored(self, tmp_path):
+        plugin, client, sid = self._session(tmp_path)
+        ps = _pool(plugin, sid, 'cpu')
+        ps.tasks['t.1'] = TaskRecord(
+            task_id='t.1', pool='cpu', owning_sid=sid, cmd=['/bin/echo'],
+            cwd='/tmp', state=TASK_DONE, exit_code=0,
+            requirements={'cores': 1})
+        r = self._submit(client, plugin, sid, {'cores': 4})
+        assert r.status_code == 200
+        assert r.json()['requirements'] == {'cores': 1}
+        assert ps.tasks['t.1'].requirements == {'cores': 1}
+
+
+class TestRequirementsRoundTrip:
+
+    def _session(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _register(client, plugin, body={
+            'sid': 'A', 'lifetime': 'persistent', 'pools': [_pool_dict()]})
+        return plugin, client, sid
+
+    def test_requirements_round_trip_through_get_task(self, tmp_path):
+        plugin, client, sid = self._session(tmp_path)
+        ps = _pool(plugin, sid, 'cpu')
+        req = {'cores': 4, 'gpus': 0, 'mem_gb': 1.5, 'ranks': 2,
+               'mpi': False, 'software': ['gromacs'],
+               'labels': {'zone': 'a'}}
+        with patch.object(ps.policy, 'pick_dispatch', return_value=None):
+            r = client.post(f'{plugin.namespace}/submit/{sid}', json={
+                'pool': 'cpu', 'task_id': 't.1',
+                'cmd': ['/bin/echo'], 'cwd': '/tmp',
+                'requirements': req})
+        assert r.status_code == 200, r.text
+        assert r.json()['requirements'] == req
+        assert ps.tasks['t.1'].requirements == req
+
+        got = client.get(f'{plugin.namespace}/task/{sid}/t.1')
+        assert got.json()['requirements'] == req
+
+    @pytest.mark.parametrize('body_extra', [{}, {'requirements': None}])
+    def test_absent_or_null_yields_empty_dict(self, tmp_path, body_extra):
+        plugin, client, sid = self._session(tmp_path)
+        ps = _pool(plugin, sid, 'cpu')
+        body = {'pool': 'cpu', 'task_id': 't.1',
+                'cmd': ['/bin/echo'], 'cwd': '/tmp'}
+        body.update(body_extra)
+        with patch.object(ps.policy, 'pick_dispatch', return_value=None):
+            r = client.post(f'{plugin.namespace}/submit/{sid}', json=body)
+        assert r.status_code == 200, r.text
+        assert r.json()['requirements'] == {}
+        assert ps.tasks['t.1'].requirements == {}
+
+    def test_dialect_submit_promotes_and_pops_requirements(self, tmp_path):
+        plugin, client, sid = self._session(tmp_path)
+        ps = _pool(plugin, sid, 'cpu')
+        td = _dialect_td('t.1')
+        td['requirements'] = {'cores': 2, 'ranks': 2}
+        with patch.object(ps.policy, 'pick_dispatch', return_value=None):
+            r = client.post(f'{plugin.namespace}/submit_rh/{sid}',
+                            json={'tasks': [td]})
+        assert r.status_code == 200, r.text
+        rec = ps.tasks['t.1']
+        assert rec.requirements == {'cores': 2, 'ranks': 2}
+        # never reaches BaseTask.from_dict
+        assert 'requirements' not in rec.task_dict
+
+    def test_dialect_submit_persists_the_validated_block(self, tmp_path):
+        # the record carries the derived 'cores', not the raw block
+        plugin, client, sid = self._session(tmp_path)
+        ps = _pool(plugin, sid, 'cpu')
+        td = _dialect_td('t.1')
+        td['requirements'] = {'ranks': 4}
+        with patch.object(ps.policy, 'pick_dispatch', return_value=None):
+            r = client.post(f'{plugin.namespace}/submit_rh/{sid}',
+                            json={'tasks': [td]})
+        assert r.status_code == 200, r.text
+        rec = ps.tasks['t.1']
+        assert rec.requirements == {'ranks': 4, 'cores': 4}
+        assert 'requirements' not in rec.task_dict
+
+    def test_dialect_resubmit_ignores_changed_requirements(self, tmp_path):
+        plugin, client, sid = self._session(tmp_path)
+        ps = _pool(plugin, sid, 'cpu')
+        td = _dialect_td('t.1')
+        td.pop('pool')
+        ps.tasks['t.1'] = TaskRecord(
+            task_id='t.1', pool='cpu', owning_sid=sid, cmd=[], cwd='',
+            task_dict=td, state=TASK_DONE, exit_code=0,
+            requirements={'cores': 1})
+        td = _dialect_td('t.1')
+        td['requirements'] = {'cores': 4}
+        r = client.post(f'{plugin.namespace}/submit_rh/{sid}',
+                        json={'tasks': [td]})
+        assert r.status_code == 200, r.text
+        assert ps.tasks['t.1'].requirements == {'cores': 1}
+
+    def test_dialect_submit_rejects_the_batch_on_a_bad_block(self, tmp_path):
+        plugin, client, sid = self._session(tmp_path)
+        ps = _pool(plugin, sid, 'cpu')
+        good = _dialect_td('t.1')
+        bad  = _dialect_td('t.2')
+        bad['requirements'] = {'cores': 99}
+        r = client.post(f'{plugin.namespace}/submit_rh/{sid}',
+                        json={'tasks': [good, bad]})
+        assert r.status_code == 400
+        assert r.json()['detail'] == (
+            "requirements: 99 cores exceed every pilot_size "
+            "(largest: 's', 4 cpus/node)")
+        # whole-batch validation ran before any state was touched
+        assert ps.tasks == {}
+
+
+class TestRequirementsForwarding:
+
+    def _dragon_v2_pilot(self, ps):
+        pilot = PilotRecord(
+            pid='p.1', pool='cpu', owning_sid='A', size_key='s',
+            rhapsody_backend='dragon_v2', state=PILOT_ACTIVE,
+            child_endpoint_name='endpoint0_p.1', capacity=4)
+        ps.pilots['p.1'] = pilot
+        return pilot
+
+    @staticmethod
+    def _drain(plugin, ps, picks, rh_mock):
+        async def drive():
+            with patch.object(ps.policy, 'pick_dispatch', side_effect=picks), \
+                 patch.object(plugin, '_get_rhapsody_client',
+                              new=AsyncMock(return_value=rh_mock)), \
+                 patch.object(ps, 'persist'):
+                plugin._drain_pending(ps)
+                await asyncio.sleep(0.05)
+        asyncio.run(drive())
+
+    def test_exec_style_merges_mapping_onto_cwd(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        plugin._materialise_pool('A', _make_pool_cfg())
+        ps = _pool(plugin, 'A', 'cpu')
+        pilot = self._dragon_v2_pilot(ps)
+        ps.tasks['t.1'] = TaskRecord(
+            task_id='t.1', pool='cpu', owning_sid='A',
+            cmd=['/bin/echo', 'hi'], cwd='/scratch/t.1', task_dict=None,
+            requirements={'cores': 2, 'gpus': 2, 'ranks': 2},
+            state=TASK_QUEUED)
+
+        rh_mock = MagicMock()
+        rh_mock.submit_tasks = MagicMock(return_value=[])
+        self._drain(plugin, ps, [(ps.tasks['t.1'], pilot), None], rh_mock)
+
+        sent = rh_mock.submit_tasks.call_args.args[0]
+        # merged ONTO cwd, not replacing it
+        assert sent[0]['task_backend_specific_kwargs'] == {
+            'cwd': '/scratch/t.1', 'ranks': 2, 'gpus_per_rank': 1}
+
+    def test_exec_style_without_requirements_is_unchanged(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        plugin._materialise_pool('A', _make_pool_cfg())
+        ps = _pool(plugin, 'A', 'cpu')
+        pilot = self._dragon_v2_pilot(ps)
+        ps.tasks['t.1'] = TaskRecord(
+            task_id='t.1', pool='cpu', owning_sid='A',
+            cmd=['/bin/echo'], cwd='/scratch/t.1', task_dict=None,
+            state=TASK_QUEUED)
+
+        rh_mock = MagicMock()
+        rh_mock.submit_tasks = MagicMock(return_value=[])
+        self._drain(plugin, ps, [(ps.tasks['t.1'], pilot), None], rh_mock)
+
+        sent = rh_mock.submit_tasks.call_args.args[0]
+        assert sent[0]['task_backend_specific_kwargs'] == {
+            'cwd': '/scratch/t.1'}
+
+    def test_dialect_caller_kwargs_win_per_key(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        plugin._materialise_pool('A', _make_pool_cfg())
+        ps = _pool(plugin, 'A', 'cpu')
+        pilot = self._dragon_v2_pilot(ps)
+        td = _dialect_td('t.1')
+        td.pop('pool')
+        # the caller knows its backend: its own 'ranks' overrides the
+        # derived one, while 'gpus_per_rank' (which it did not set) still
+        # comes from the mapping
+        td['task_backend_specific_kwargs'] = {'ranks': 8}
+        ps.tasks['t.1'] = TaskRecord(
+            task_id='t.1', pool='cpu', owning_sid='A', cmd=[], cwd='',
+            task_dict=td, requirements={'ranks': 2, 'gpus': 2, 'cores': 2},
+            state=TASK_QUEUED)
+
+        rh_mock = MagicMock()
+        rh_mock.submit_tasks = MagicMock(return_value=[])
+        self._drain(plugin, ps, [(ps.tasks['t.1'], pilot), None], rh_mock)
+
+        sent = rh_mock.submit_tasks.call_args.args[0]
+        assert sent[0]['task_backend_specific_kwargs'] == {
+            'ranks': 8, 'gpus_per_rank': 1}
+
+    def test_dialect_without_requirements_forwards_verbatim(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        plugin._materialise_pool('A', _make_pool_cfg())
+        ps = _pool(plugin, 'A', 'cpu')
+        pilot = self._dragon_v2_pilot(ps)
+        td = _dialect_td('t.1')
+        td.pop('pool')
+        ps.tasks['t.1'] = TaskRecord(
+            task_id='t.1', pool='cpu', owning_sid='A', cmd=[], cwd='',
+            task_dict=td, state=TASK_QUEUED)
+
+        rh_mock = MagicMock()
+        rh_mock.submit_tasks = MagicMock(return_value=[])
+        self._drain(plugin, ps, [(ps.tasks['t.1'], pilot), None], rh_mock)
+
+        sent = rh_mock.submit_tasks.call_args.args[0]
+        # no requirements ⇒ no derived keys ⇒ the key stays absent
+        assert 'task_backend_specific_kwargs' not in sent[0]
+
+    def test_concurrent_backend_forwards_only_cwd(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        plugin._materialise_pool('A', _make_pool_cfg())
+        ps = _pool(plugin, 'A', 'cpu')
+        pilot = PilotRecord(
+            pid='p.1', pool='cpu', owning_sid='A', size_key='s',
+            rhapsody_backend='concurrent', state=PILOT_ACTIVE,
+            child_endpoint_name='endpoint0_p.1', capacity=4)
+        ps.pilots['p.1'] = pilot
+        ps.tasks['t.1'] = TaskRecord(
+            task_id='t.1', pool='cpu', owning_sid='A',
+            cmd=['/bin/echo'], cwd='/scratch/t.1', task_dict=None,
+            requirements={'cores': 4, 'gpus': 0}, state=TASK_QUEUED)
+
+        rh_mock = MagicMock()
+        rh_mock.submit_tasks = MagicMock(return_value=[])
+        self._drain(plugin, ps, [(ps.tasks['t.1'], pilot), None], rh_mock)
+
+        sent = rh_mock.submit_tasks.call_args.args[0]
+        assert sent[0]['task_backend_specific_kwargs'] == {
+            'cwd': '/scratch/t.1'}
+
+
+class TestSubmitTaskClientPayload:
+
+    def _client(self):
+        from radical.orbit.plugin_task_dispatcher import TaskDispatcherClient
+        c = TaskDispatcherClient.__new__(TaskDispatcherClient)
+        c._sid  = 'A'
+        c._http = MagicMock()
+        c._http.post = MagicMock(return_value=MagicMock(
+            status_code=200, json=MagicMock(return_value={})))
+        c._url   = lambda p: f'/td/{p}'
+        c._raise = lambda *a, **k: None
+        return c
+
+    def test_requirements_omitted_when_none(self):
+        c = self._client()
+        c.submit_task('t.1', ['/bin/echo'], '/tmp', pool='cpu')
+        payload = c._http.post.call_args.kwargs['json']
+        assert 'requirements' not in payload
+
+    def test_requirements_present_when_given(self):
+        c = self._client()
+        c.submit_task('t.1', ['/bin/echo'], '/tmp', pool='cpu',
+                      requirements={'cores': 4})
+        payload = c._http.post.call_args.kwargs['json']
+        assert payload['requirements'] == {'cores': 4}

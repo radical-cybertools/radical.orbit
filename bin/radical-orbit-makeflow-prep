@@ -3,14 +3,37 @@
 
 Reads a user-authored Makeflow file and rewrites every rule's command
 to route through ``radical-orbit-run``.  Directives ``ENDPOINT``, ``POOL``,
-and ``PRIORITY`` are scoped like Makeflow's existing ``CATEGORY``:
-an assignment applies to all subsequent rules until overridden.
+``PRIORITY``, ``CORES``, ``GPUS`` and ``MEM`` are scoped like Makeflow's
+existing ``CATEGORY``: an assignment applies to all subsequent rules until
+overridden.
+
+``CORES`` / ``GPUS`` / ``MEM`` carry the per-task resource requirements
+through to ``radical-orbit-run``.  Unlike ``--priority`` (emitted always,
+including ``--priority=0``), their flags are emitted **only** when a value
+was actually resolved, so a makeflow that declares none of them rewrites
+exactly as it did before these directives existed.
+
+**Deliberate behaviour change for ``CORES`` and ``GPUS``.**  Those two are
+*Makeflow-native* per-rule resource variables, and this preprocessor now
+**captures and consumes** them instead of passing them through: a file
+that already set ``CORES`` for Makeflow's own scheduler will see that
+value routed to the dispatcher and the assignment line removed from the
+output.  That is the intent — one declaration should mean one thing — but
+it means such a file's prepped output is no longer byte-identical, and
+Makeflow no longer sees its own ``CORES``/``GPUS``.  Rename the variable
+in the input if you need Makeflow to keep seeing it.
+
+Makeflow's own ``MEMORY`` variable is deliberately **not** captured and
+still passes through untouched: it carries Makeflow's MB semantics, while
+our ``MEM`` directive is explicitly in GB — silently reinterpreting one as
+the other would be worse than requiring the extra line.
 
 Usage:
     radical-orbit-makeflow-prep INPUT.makeflow \\
         [--output OUTPUT.makeflow] \\
         [--default-endpoint NAME] [--default-pool NAME] \\
-        [--default-priority N]
+        [--default-priority N] \\
+        [--default-cores N] [--default-gpus N] [--default-mem GB]
 
 Input example (before prep):
 
@@ -92,6 +115,11 @@ class Rule:
     pool    : str | None
     priority: int | None
     pools   : str | None = None   # path to pools.json (workflow-level)
+    # Per-task resource requirements.  ``None`` means "not declared" and
+    # emits no flag at all, so existing outputs stay byte-identical.
+    cores   : int | None   = None
+    gpus    : int | None   = None
+    mem     : float | None = None
 
 
 @dataclass
@@ -109,6 +137,12 @@ class PrepOptions:
     # this, the dispatcher uses the built-in 'default' pool — which
     # is rarely what a real workflow wants.
     pools_file      : str | None = None
+    # Per-task resource requirement defaults.  ``None`` (not 0/1) means
+    # "not declared": no flag is emitted and radical-orbit-run's own
+    # defaults apply, keeping the wire body unchanged.
+    default_cores   : int | None   = None
+    default_gpus    : int | None   = None
+    default_mem     : float | None = None
 
     def __post_init__(self) -> None:
         if self.default_endpoint and self.default_pool:
@@ -120,8 +154,9 @@ class PrepOptions:
 # Parser + rewriter
 # ---------------------------------------------------------------------------
 
-# We only care about three directives; everything else passes through.
-_SCOPED_DIRECTIVES = ('ENDPOINT', 'POOL', 'PRIORITY', 'POOLS')
+# We only care about these directives; everything else passes through.
+_SCOPED_DIRECTIVES = ('ENDPOINT', 'POOL', 'PRIORITY', 'POOLS',
+                      'CORES', 'GPUS', 'MEM')
 
 
 def prep_stream(lines: list[str], run_id: str,
@@ -140,6 +175,11 @@ def prep_stream(lines: list[str], run_id: str,
     # scope walk for simplicity but only one final value reaches the
     # rule emitter.
     scope_pools   : str | None = opts.pools_file
+    # Per-task resource requirements, scoped like PRIORITY but emitted
+    # only when not None (see _build_wrapper_cmd).
+    scope_cores   : int | None   = opts.default_cores
+    scope_gpus    : int | None   = opts.default_gpus
+    scope_mem     : float | None = opts.default_mem
     # Captured ``VAR=value`` assignments to substitute at prep time
     # into wrapped rule commands (see _expand_vars).
     scope_vars    : dict[str, str] = {}
@@ -170,9 +210,15 @@ def prep_stream(lines: list[str], run_id: str,
                 scope_pool = _expect_string(value, name, i + 1)
                 scope_endpoint = None
             elif name == 'PRIORITY':
-                scope_priority = _expect_int(value, name, i + 1)
+                scope_priority = _expect_number(value, name, i + 1)
             elif name == 'POOLS':
                 scope_pools = _expect_string(value, name, i + 1)
+            elif name == 'CORES':
+                scope_cores = _expect_number(value, name, i + 1)
+            elif name == 'GPUS':
+                scope_gpus = _expect_number(value, name, i + 1)
+            elif name == 'MEM':
+                scope_mem = _expect_number(value, name, i + 1, float)
             # Our directives are consumed — don't emit to output.
             i += 1
             continue
@@ -207,7 +253,8 @@ def prep_stream(lines: list[str], run_id: str,
                 commands = commands, header_line = rule_header,
                 endpoint = scope_endpoint, pool = scope_pool,
                 priority = scope_priority,
-                pools = scope_pools)
+                pools = scope_pools,
+                cores = scope_cores, gpus = scope_gpus, mem = scope_mem)
 
             if not commands:
                 raise PrepError(
@@ -227,8 +274,9 @@ def prep_stream(lines: list[str], run_id: str,
 
 
 def _parse_scoped_directive(stripped: str) -> tuple[str, str] | None:
-    '''Return (NAME, value) if *stripped* is an ``ENDPOINT``/``POOL``/
-    ``PRIORITY`` assignment, else None.
+    '''Return (NAME, value) if *stripped* is one of the scoped directive
+    assignments (``ENDPOINT``/``POOL``/``PRIORITY``/``POOLS``/``CORES``/
+    ``GPUS``/``MEM``), else None.
     '''
     for name in _SCOPED_DIRECTIVES:
         if stripped.startswith(name):
@@ -266,13 +314,15 @@ def _expect_string(value: str, name: str, line_no: int) -> str:
     return value
 
 
-def _expect_int(value: str, name: str, line_no: int) -> int:
+def _expect_number(value: str, name: str, line_no: int, conv=int):
+    '''Parse a directive value with *conv* (``int``, or ``float`` for MEM).'''
     value = value.strip('"\'')
     try:
-        return int(value)
+        return conv(value)
     except ValueError as e:
+        kind = 'an integer' if conv is int else 'a number'
         raise PrepError(
-            f'line {line_no}: {name} must be an integer, got {value!r}'
+            f'line {line_no}: {name} must be {kind}, got {value!r}'
         ) from e
 
 
@@ -367,6 +417,16 @@ def _build_wrapper_cmd(rule: Rule, run_id: str, original: str,
     parts.append(f'--run-id={_q(run_id)}')
     if rule.pools:
         parts.append(f'--pools={_q(rule.pools)}')
+    # Resource flags are emitted iff the resolved value is not None —
+    # unlike --priority, which is emitted unconditionally (including 0).
+    # An input that declares none of them therefore rewrites exactly as it
+    # did before these directives existed.
+    if rule.cores is not None:
+        parts.append(f'--cores={rule.cores}')
+    if rule.gpus is not None:
+        parts.append(f'--gpus={rule.gpus}')
+    if rule.mem is not None:
+        parts.append(f'--mem={rule.mem}')
     # Endpoint mode doesn't (yet) support input/output staging, so skip
     # the --in/--out flags entirely — radical-orbit-run would reject
     # them at argparse time otherwise.
@@ -450,6 +510,20 @@ def main(argv: list[str] | None = None) -> int:
                          '--default-endpoint.')
     ap.add_argument('--default-priority', dest='default_priority',
                     type=int, default=0)
+    # Resource defaults intentionally default to None, not 0/1: "not
+    # declared" emits no flag, so existing outputs stay byte-identical.
+    ap.add_argument('--default-cores', dest='default_cores',
+                    type=int, default=None,
+                    help='Default --cores for each rule.  Can also be set '
+                         'via CORES = N in the makeflow file.')
+    ap.add_argument('--default-gpus', dest='default_gpus',
+                    type=int, default=None,
+                    help='Default --gpus for each rule.  Can also be set '
+                         'via GPUS = N in the makeflow file.')
+    ap.add_argument('--default-mem', dest='default_mem',
+                    type=float, default=None,
+                    help='Default --mem (GB) for each rule.  Can also be '
+                         'set via MEM = N in the makeflow file.')
     ap.add_argument('--pools',            dest='pools_file',
                     help='Path to a pools.json declaring the workflow\'s '
                          'pools.  Forwarded to radical-orbit-run on every '
@@ -479,6 +553,9 @@ def main(argv: list[str] | None = None) -> int:
         default_pool     = args.default_pool,
         default_priority = args.default_priority,
         pools_file       = pools_file,
+        default_cores    = args.default_cores,
+        default_gpus     = args.default_gpus,
+        default_mem      = args.default_mem,
     )
     run_id = args.run_id or compute_run_id(args.input)
 

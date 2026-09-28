@@ -184,9 +184,38 @@ stable across retries of the same Makeflow invocation.
 - Identified by: `task_id = sha1(cmd + inputs + outputs + run_id)[:16]`.
 - Visible to users: indirectly — the wrapper binds task_id to one rule.
 
+A task may additionally carry an optional **resource shape** — every key
+optional, absent or `null` meaning "no declaration":
+
+```json
+"requirements": {"cores": 1, "gpus": 0, "mem_gb": 0, "ranks": 1,
+                 "mpi": false, "software": [], "labels": {}}
+```
+
+`cores`/`gpus`/`ranks` are integers (`bool` is refused), `mem_gb` an int
+or a float, `mpi` a bool, `software` a list of strings, `labels` a
+mapping of string to string/int/float. An unknown key is a 400. Beyond
+the types the dispatcher enforces `cores >= ranks` and
+`gpus % ranks == 0`, rejects a shape that no `PilotSize` in the target
+pool could host (compared per node; `mem_gb` is exempt — `PilotSize`
+carries no memory field), and rejects `mpi: true` on a pool whose every
+size runs `dragon_v1`.
+
+The shape is **forwarded, not enforced**: it is persisted on the record
+and mapped onto the pilot's rhapsody backend inside
+`task_backend_specific_kwargs`, while oversubscription control stays with
+rhapsody. `software` and `labels` never reach rhapsody at all — they are
+dispatcher-side placement attributes for multi-member class pools.
+`task_id` deliberately does **not** hash the requirements: resources are
+placement, not identity.
+
 Re-submission semantics by cached state: `DONE` → return cached (crash
 recovery); `FAILED`/`CANCELED` → re-execute (Makeflow retry); `RUNNING`
-→ attach to existing wait (wrapper reconnect).
+→ attach to existing wait (wrapper reconnect). A resubmit with *changed*
+`requirements` is therefore **silently ignored**, exactly as a changed
+`priority` is — there is no mutation path for an already-submitted task.
+Validation runs before that ladder, so a *malformed* `requirements` is a
+400 even on a resubmit of a cached `DONE` task.
 
 ### 3.4 Cardinality summary
 
@@ -668,11 +697,35 @@ Explicitly out of scope for v1; flagged as extension points or future PRs.
   SSE wait loop marks the insertion site.
 - **Per-task rhapsody backend selection.** Backend is fixed per pilot at
   submit time via `PilotSize.rhapsody_backend`. Per-task override is a
-  natural strategy extension; paired `FIXME(per-task-backend)` markers
-  in the dispatcher's `_assign` and the strategy ABC cross-reference
-  each other.
+  natural policy extension; the insertion sites are the dispatcher's
+  `_claim` / `_drain_pending` (which is also where `backend_kwargs()`
+  keys on `pilot.rhapsody_backend`) and `DispatchPolicy` in
+  `task_dispatcher_policy.py`.
 - **Direct pilot addressability from users.** Users target pools; the
   dispatcher's strategy decides pilots. No user-facing pilot handle.
+- **Dispatcher-side core/GPU reservation.** Per-task `requirements` are
+  validated, persisted and forwarded to the pilot's rhapsody backend, but
+  pilot capacity remains a **task count** (`nodes * cpus_per_node`) and
+  `pick_dispatch` filters on `free_capacity() > 0` alone. A 4-GPU pilot
+  will accept a fifth 1-GPU task. Deriving a `reserved(pid) -> (cores,
+  gpus)` from the `RUNNING` records and filtering on both dimensions is
+  the natural next step.
+- **In-pilot pinning.** Neither `concurrent` nor `dragon_v3` sets
+  `CUDA_VISIBLE_DEVICES`, so even bounded concurrency would not stop
+  every GPU task landing on device 0. Assigning concrete slots at claim
+  time and translating them inside the pilot (where Dragon is importable
+  and a `Policy` object can be constructed — it cannot cross msgpack) is
+  deferred; `examples/amsc.py` does this by hand today.
+- **Attribute-aware placement on `software` / `labels`.** Both are
+  persisted by the dispatcher but matched against nothing; multi-member
+  class pools are a separate plan.
+- **Core/GPU-aware scale-up.** `on_tick` sizes the backlog in tasks; a
+  queue of 2-GPU tasks should ask for a *bigger* pilot, not more pilots.
+- **Memory as an enforced dimension** and **multi-node tasks.**
+  `PilotSize` has no memory field, and none of the shipped backends
+  spreads one task across nodes here.
+- **Mutating the requirements of an already-submitted task.** A resubmit
+  returns the cached record; changed requirements are ignored by design.
 
 ---
 

@@ -126,6 +126,17 @@ class TaskRecord:
     exit_code    : int | None  = None
     arrival_ts   : float       = 0.0            # tie-break for queue ordering
     error        : str | None  = None
+    # Per-task resource shape as submitted, validated at submit by
+    # ``plugin_task_dispatcher.parse_requirements`` (shape -- which may
+    # also derive an omitted ``cores`` from ``ranks``) and
+    # ``check_requirements_against_pool`` (fit + backend gate).
+    # ``{}`` means "no declaration" and forwards byte-identically to
+    # pre-requirements behaviour.  An older ``state.json`` without the key
+    # loads as ``{}`` because ``record_from_dict`` drops unknown keys and
+    # this field defaults.  ``software``/``labels`` are persisted but not
+    # acted on in this round (dispatcher-side placement attributes; plan
+    # 121).
+    requirements : dict        = field(default_factory=dict)
     # Rhapsody-dialect tasks: the serialized task dict as submitted
     # (JSON-safe -- cloudpickled fields ride as base64 strings), forwarded
     # verbatim to the pilot's rhapsody session.  ``None`` marks an

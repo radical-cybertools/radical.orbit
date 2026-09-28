@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import math
 import os
 import shutil
 import threading
@@ -101,6 +102,299 @@ ROUTE_SUBMIT_RH = 'submit_rh/{sid}'
 _RH_FORWARD_KEYS = {'uid', 'state', 'exit_code',
                     'return_value', '_return_value_encoding',
                     'error', 'exception', 'traceback'}
+
+
+# ---------------------------------------------------------------------------
+# Per-task resource requirements
+# ---------------------------------------------------------------------------
+#
+# Wire shape (every key optional; absent or ``null`` ⇒ ``{}`` ⇒ today's
+# behaviour byte-for-byte):
+#
+#     {"cores": 1, "gpus": 0, "mem_gb": 0, "ranks": 1,
+#      "mpi": false, "software": [], "labels": {}}
+#
+# ``software`` / ``labels`` are dispatcher-side placement attributes: they
+# are validated and persisted here but never reach rhapsody (plan 121 is
+# their consumer).  Anything not in the table is a 400 — a typo that
+# silently drops a field is worse than a refused request.
+
+_REQ_DEFAULTS: dict = {
+    'cores'   : 1,
+    'gpus'    : 0,
+    'mem_gb'  : 0,
+    'ranks'   : 1,
+    'mpi'     : False,
+    'software': [],
+    'labels'  : {},
+}
+
+# Backends whose group launch needs a ``pmi`` value the dispatcher cannot
+# infer (rhapsody dragon v1, ``TaskLauncherV1._launch_group_task``).
+# ``mpi: true`` on a pool where *every* pilot size names one of these is
+# refused at submit.
+_NO_MPI_BACKENDS = frozenset(['dragon_v1'])
+
+
+class RequirementsError(ValueError):
+    '''Raised when a ``requirements`` block violates the schema.
+
+    Carries the exact user-facing detail string; the submit routes turn it
+    into an HTTP 400 verbatim.
+    '''
+    pass
+
+
+def _is_int(value: Any) -> bool:
+    '''Return whether *value* is a real int.
+
+    ``bool`` is excluded: ``isinstance(True, int)`` is ``True``, and
+    ``True`` as a core count is a typo, not a request for one core.
+    '''
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_number(value: Any) -> bool:
+    '''Return whether *value* is an int or float, ``bool`` excluded.'''
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def parse_requirements(raw: Any) -> dict:
+    '''Validate a raw ``requirements`` block, returning a validated shallow copy.
+
+    Absent or ``null`` yields ``{}`` — the "no declaration" marker that
+    forwards byte-identically to pre-requirements behaviour.  This is the
+    pool-independent *shape* layer only; the pool-dependent *fit* and
+    *backend* gates live in :func:`check_requirements_against_pool`.
+
+    One value is **derived** rather than merely checked: when ``ranks`` is
+    given without ``cores``, the copy gets ``cores = max(1, ranks)``.
+    ``{"ranks": 4}`` alone means "four processes", and refusing it against
+    a ``cores`` default of 1 would be a trap.  An *explicit* ``cores``
+    below ``ranks`` is still a 400 — that is a contradiction, not an
+    omission.  The derived value is what gets persisted and forwarded.
+
+    Raises :class:`RequirementsError` carrying the exact 400 detail string.
+    '''
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise RequirementsError('requirements: must be a mapping')
+
+    unknown = sorted(set(raw) - set(_REQ_DEFAULTS))
+    if unknown:
+        raise RequirementsError(f"requirements: unknown key {unknown[0]!r}")
+
+    req = dict(raw)
+
+    for key in ('cores', 'ranks'):
+        if key in req and not (_is_int(req[key]) and req[key] >= 1):
+            raise RequirementsError(
+                f"requirements: {key!r} must be a positive integer, "
+                f"got {req[key]!r}")
+
+    if 'gpus' in req and not (_is_int(req['gpus']) and req['gpus'] >= 0):
+        raise RequirementsError(
+            f"requirements: 'gpus' must be a non-negative integer, "
+            f"got {req['gpus']!r}")
+
+    # math.isfinite() also rejects NaN and +/-inf: both survive JSON via
+    # Python's non-standard literals, and NaN would pass a bare `>= 0`.
+    if 'mem_gb' in req and not (_is_number(req['mem_gb'])
+                                and math.isfinite(req['mem_gb'])
+                                and req['mem_gb'] >= 0):
+        raise RequirementsError(
+            f"requirements: 'mem_gb' must be a non-negative number, "
+            f"got {req['mem_gb']!r}")
+
+    if 'mpi' in req and not isinstance(req['mpi'], bool):
+        raise RequirementsError("requirements: 'mpi' must be a boolean")
+
+    if 'software' in req:
+        sw = req['software']
+        if not isinstance(sw, list) or not all(isinstance(s, str) for s in sw):
+            raise RequirementsError(
+                "requirements: 'software' must be a list of strings")
+
+    if 'labels' in req:
+        lb = req['labels']
+        if not isinstance(lb, dict) or not all(
+                isinstance(k, str) and (isinstance(v, str) or _is_number(v))
+                for k, v in lb.items()):
+            raise RequirementsError(
+                "requirements: 'labels' must be a mapping of string to "
+                "string|number")
+
+    # 'ranks' without 'cores' means "N processes": derive the core count.
+    if 'cores' not in req and req.get('ranks', 1) > 1:
+        req['cores'] = req['ranks']
+
+    r     = {**_REQ_DEFAULTS, **req}
+    cores = r['cores']
+    gpus  = r['gpus']
+    ranks = r['ranks']
+
+    # ``cores >= ranks`` keeps ``cores_per_rank = cores // ranks`` from ever
+    # being 0; ``gpus % ranks == 0`` keeps ``gpus_per_rank`` an exact integer
+    # for every backend (no float-vs-ceil divergence).
+    if cores < ranks:
+        raise RequirementsError(
+            f"requirements: 'cores' ({cores}) must be >= 'ranks' ({ranks})")
+    if gpus % ranks:
+        raise RequirementsError(
+            f"requirements: 'gpus' ({gpus}) must be divisible by "
+            f"'ranks' ({ranks})")
+
+    return req
+
+
+def check_requirements_against_pool(req: dict, pool: PoolConfig) -> None:
+    '''Reject a shape-valid *req* that no pilot size in *pool* can ever host.
+
+    Two pool-dependent gates:
+
+    *Fit* — compared **per node** (``cores <= size.cpus_per_node``,
+    ``gpus <= size.gpus_per_node``), because none of the shipped backends
+    spreads one task across nodes here.  A pool passes when **any** size
+    fits, so a mixed pool is judged on its best member, and ``largest`` in
+    the message is the max over the *failing* dimension.  ``ranks`` needs
+    no check of its own: ``cores >= ranks`` (shape) together with
+    ``cores <= cpus_per_node`` (here) already implies
+    ``ranks <= cpus_per_node``.  ``mem_gb`` has no fit check at all —
+    :class:`PilotSize` carries no memory field.  Note the ``ranks`` bound
+    is only *approximate* for ``dragon_v1``, whose real hang condition is
+    ``ranks`` above the **free** slot count at that instant
+    (``DragonExecutionBackendV1._submit_task``); only enforcement
+    (deferred) can bound that.
+
+    Beware the built-in ``default`` pool: its single size has
+    ``cpus_per_node = 1``, so any ``cores >= 2`` is a 400 there.
+
+    *Backend* — ``mpi: true`` is refused only when **no** pilot size can
+    host it, i.e. every size names a backend in :data:`_NO_MPI_BACKENDS`.
+
+    Raises :class:`RequirementsError` carrying the exact 400 detail string.
+    '''
+    sizes = pool.pilot_sizes
+    r     = {**_REQ_DEFAULTS, **req}
+    cores = r['cores']
+    gpus  = r['gpus']
+
+    def _largest(attr: str) -> tuple:
+        '''Return the ``(size_key, value)`` maximising *attr* (name breaks ties).'''
+        key = max(sorted(sizes), key=lambda k: getattr(sizes[k], attr))
+        return key, getattr(sizes[key], attr)
+
+    if not any(cores <= s.cpus_per_node for s in sizes.values()):
+        key, val = _largest('cpus_per_node')
+        raise RequirementsError(
+            f"requirements: {cores} cores exceed every pilot_size "
+            f"(largest: {key!r}, {val} cpus/node)")
+
+    if not any(gpus <= s.gpus_per_node for s in sizes.values()):
+        key, val = _largest('gpus_per_node')
+        raise RequirementsError(
+            f"requirements: {gpus} gpus exceed every pilot_size "
+            f"(largest: {key!r}, {val} gpus/node)")
+
+    if r['mpi'] and all(s.rhapsody_backend in _NO_MPI_BACKENDS
+                        for s in sizes.values()):
+        key = sorted(sizes)[0]
+        raise RequirementsError(
+            f"requirements: 'mpi' is unsupported on "
+            f"{sizes[key].rhapsody_backend} (pool {pool.name!r}, "
+            f"size {key!r})")
+
+
+def _validated_requirements(raw: Any, pool: PoolConfig | None = None) -> dict:
+    '''Validate *raw* (and fit it to *pool*, if given), or raise a 400.'''
+    try:
+        req = parse_requirements(raw)
+        if pool is not None:
+            check_requirements_against_pool(req, pool)
+    except RequirementsError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return req
+
+
+def backend_kwargs(req: dict, backend: str) -> dict:
+    '''Map validated *req* onto one backend's ``task_backend_specific_kwargs``.
+
+    Pure — no state, no I/O.  It lives in the dispatcher because the
+    dispatcher is the only place that knows a task's backend
+    (``PilotRecord.rhapsody_backend``, resolved from the chosen
+    :class:`PilotSize` in ``_submit_pilot``).
+
+    With ``R = ranks``, ``C = cores``, ``G = gpus`` (shape-validated so
+    ``C >= R`` and ``G % R == 0``).  Checked against rhapsody-py 0.4.0,
+    ``rhapsody.backends.execution``; re-check the cited symbols when the
+    rhapsody pin moves:
+
+    | backend        | emitted                                        | effect today |
+    |----------------|------------------------------------------------|--------------|
+    | `dragon_v2`    | `{'ranks': R, 'gpus_per_rank': G // R}`         | honoured natively (`DragonExecutionBackendV2._schedule_tasks`); spawns R replicas, MPI or not |
+    | `radical_pilot`| `{'ranks': R, 'cores_per_rank': C // R, 'gpus_per_rank': G // R, 'mem_per_rank': int(mem_gb * 1024 / R)}` (MB per rank) | honoured natively — the dict feeds `rp.TaskDescription(from_dict=…)` (`RadicalExecutionBackend.build_task`) |
+    | `dragon_v3`    | `{'type': 'mpi', 'ranks': R}` **only if** `mpi` | `ranks` is read ONLY under `type == 'mpi'` (`DragonExecutionBackendV3.build_task`); ignored otherwise |
+    | `dragon_v1`    | `{'ranks': R}`                                 | spawns R replicas via a non-MPI ProcessGroup (`TaskLauncherV1._determine_task_type`) AND busy-waits on a global slot counter (`DragonExecutionBackendV1._submit_task`); `mpi` refused at submit |
+    | `dask`         | `{'resources': {'GPU': G}}` when `G > 0`       | pre-checked; fails the task if unsatisfiable (`DaskExecutionBackend._submit_to_dask`) |
+    | `concurrent`   | *(nothing)*                                    | reads only `shell`/`cwd`/`env` (`ConcurrentExecutionBackend._execute_command`) |
+
+    ``ranks`` means "process replicas" and only incidentally "MPI ranks":
+    ``dragon_v1`` and ``dragon_v2`` spawn R replicas either way, while
+    ``dragon_v3`` spawns them only under ``type: 'mpi'``.
+
+    ``software`` and ``labels`` are never emitted — they are
+    dispatcher-side placement attributes.  Any value equal to the
+    backend's own default (``ranks == 1``, ``cores_per_rank == 1``,
+    ``gpus_per_rank == 0``, ``mem_per_rank == 0``, dask ``G == 0``) is
+    omitted, so ``backend_kwargs({}, <any backend>) == {}`` and existing
+    tasks forward byte-identically.
+
+    Everything emitted is msgpack-primitive (int / str / dict) — the
+    forwarded dict is msgpack-packed on the way to the pilot.
+    '''
+    r      = {**_REQ_DEFAULTS, **req}
+    ranks  = r['ranks']
+    cores  = r['cores']
+    gpus   = r['gpus']
+    mem_gb = r['mem_gb']
+    mpi    = r['mpi']
+
+    out: dict = {}
+
+    if backend == 'dragon_v2':
+        if ranks != 1:
+            out['ranks'] = ranks
+        if gpus:
+            out['gpus_per_rank'] = gpus // ranks
+
+    elif backend == 'radical_pilot':
+        if ranks != 1:
+            out['ranks'] = ranks
+        if cores // ranks != 1:
+            out['cores_per_rank'] = cores // ranks
+        if gpus:
+            out['gpus_per_rank'] = gpus // ranks
+        mem_per_rank = int(mem_gb * 1024 / ranks)
+        if mem_per_rank:
+            out['mem_per_rank'] = mem_per_rank
+
+    elif backend == 'dragon_v3':
+        if mpi:
+            out['type'] = 'mpi'
+            if ranks != 1:
+                out['ranks'] = ranks
+
+    elif backend == 'dragon_v1':
+        if ranks != 1:
+            out['ranks'] = ranks
+
+    elif backend == 'dask':
+        if gpus:
+            out['resources'] = {'GPU': gpus}
+
+    # 'concurrent' — and any backend name we do not know — gets nothing.
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +593,8 @@ class TaskDispatcherClient(PluginClient):
                     pool: str | None = None, endpoint: str | None = None,
                     priority: int = 0,
                     inputs: list[str] | None = None,
-                    outputs: list[str] | None = None) -> dict:
+                    outputs: list[str] | None = None,
+                    requirements: dict | None = None) -> dict:
         '''Submit one task to the dispatcher.
 
         Exactly one of *pool* or *endpoint* must be given:
@@ -307,6 +602,17 @@ class TaskDispatcherClient(PluginClient):
             - *endpoint*: bypass pool management and run directly on the
               target endpoint's rhapsody plugin.  Inputs/outputs are not
               supported in this mode (yet).
+
+        *requirements* is the optional per-task resource shape
+        (``cores``/``gpus``/``mem_gb``/``ranks``/``mpi``/``software``/
+        ``labels``; see :func:`parse_requirements`).  It is added to the
+        payload **only when not None**, so the wire body of a caller that
+        does not use it stays byte-identical.  In endpoint mode it is
+        shape-validated and then advisory only — the target's backend is
+        not known to the dispatcher, so nothing is forwarded.  Note that a
+        resubmit of a cached ``DONE``/``RUNNING``/``QUEUED`` task_id
+        returns the cached record: changed *requirements* are ignored,
+        exactly as a changed *priority* is.
         '''
         self._require_session()
         if bool(pool) == bool(endpoint):
@@ -320,6 +626,8 @@ class TaskDispatcherClient(PluginClient):
             'inputs'  : inputs or [],
             'outputs' : outputs or [],
         }
+        if requirements is not None:
+            payload['requirements'] = requirements
         if pool is not None:
             payload['pool'] = pool
         else:
@@ -337,6 +645,12 @@ class TaskDispatcherClient(PluginClient):
         Mixed-pool batches are grouped by the dispatcher.  This is the
         verb rhapsody's ``OrbitExecutionBackend`` calls, which is what
         lets it point at the dispatcher unchanged.
+
+        No signature change for per-task ``requirements``: the key rides in
+        each task dict beside ``pool``, and the dispatcher pops both before
+        the dict reaches ``BaseTask.from_dict``.  A caller-supplied
+        ``task_backend_specific_kwargs`` wins per key over the mapping
+        derived from ``requirements`` — the caller knows its backend.
         '''
         self._require_session()
 
@@ -981,6 +1295,12 @@ class PluginTaskDispatcher(Plugin):
         inputs   = list(body.get('inputs',  []) or [])
         outputs  = list(body.get('outputs', []) or [])
 
+        # Validation runs BEFORE the resubmit cache ladder below, so a
+        # malformed 'requirements' is a 400 even when the task_id is a
+        # cached DONE — a bad request stays a bad request.
+        requirements = _validated_requirements(body.get('requirements'),
+                                               pool_state.config)
+
         # Cached-state behaviour on resubmit:
         #   DONE            → return cached (crash-recovery)
         #   RUNNING/QUEUED  → attach to existing wait (wrapper reconnect)
@@ -992,6 +1312,9 @@ class PluginTaskDispatcher(Plugin):
                          're-execution', self.instance_name, task_id)
                 return self._task_dict(existing)
             if existing.state in (TASK_RUNNING, TASK_QUEUED):
+                # NOTE: the cached record wins — a resubmit with *changed*
+                # requirements is silently ignored, exactly as a changed
+                # priority is.  There is deliberately no mutation path.
                 log.info('[%s] task %s already %s; attaching',
                          self.instance_name, task_id, existing.state)
                 return self._task_dict(existing)
@@ -1007,6 +1330,7 @@ class PluginTaskDispatcher(Plugin):
             priority     = priority,
             inputs       = inputs,
             outputs      = outputs,
+            requirements = requirements,
             state        = TASK_QUEUED,
             submitted_at = now,
             arrival_ts   = now,
@@ -1030,6 +1354,14 @@ class PluginTaskDispatcher(Plugin):
         task to the target endpoint's rhapsody session and records
         ``task_id -> target_endpoint`` so subsequent get/cancel can route back.
         The mapping is cleared when the task hits a terminal state.
+
+        ``requirements`` here is **advisory only**: it is shape-validated
+        (so a typo is still a 400) and then dropped.  ``_get_rhapsody_client``
+        is called with no backend argument, so the endpoint picks its own
+        default and never reports it back — there is no backend name for
+        :func:`backend_kwargs` to key on.  Nothing is stored, nothing is
+        forwarded, and the forwarded task dict and the response body are
+        unchanged from a submit without the key.
         '''
         plugins = self._connected_endpoints.get(target_endpoint)
         if plugins is None:
@@ -1045,6 +1377,14 @@ class PluginTaskDispatcher(Plugin):
                 status_code=400,
                 detail='stage_in/stage_out not supported for '
                        'endpoint-mode tasks (yet)')
+
+        # Shape validation only — no pool, hence no fit check and no
+        # backend gate.  A non-empty block earns one advisory log line.
+        requirements = _validated_requirements(body.get('requirements'))
+        if requirements:
+            log.info('[%s] endpoint-mode task %s: requirements are advisory '
+                     '(target backend unknown); nothing forwarded',
+                     self.instance_name, task_id)
 
         rh = await self._get_rhapsody_client(target_endpoint)
         if rh is None:
@@ -1105,7 +1445,7 @@ class PluginTaskDispatcher(Plugin):
         task_dicts = data.get('tasks', [])
 
         # validate the whole batch before touching any state
-        grouped: dict[str, list[dict]] = {}
+        grouped: dict[str, list[tuple]] = {}
         for td in task_dicts:
             uid       = td.get('uid')
             pool_name = td.get('pool')
@@ -1113,11 +1453,15 @@ class PluginTaskDispatcher(Plugin):
                 raise HTTPException(
                     status_code=400,
                     detail="each task requires 'uid' and 'pool'")
-            if self._find_pool(sid, pool_name) is None:
+            ps = self._find_pool(sid, pool_name)
+            if ps is None:
                 raise HTTPException(
                     status_code=404,
                     detail=f'unknown pool: {pool_name}')
-            grouped.setdefault(pool_name, []).append(td)
+            # Validate requirements inside the whole-batch loop, so one bad
+            # task rejects the batch before any state is touched.
+            req = _validated_requirements(td.get('requirements'), ps.config)
+            grouped.setdefault(pool_name, []).append((td, req))
 
         now  = time.time()
         acks = []
@@ -1126,7 +1470,7 @@ class PluginTaskDispatcher(Plugin):
             if pool_state is None:       # validated above; mollify the checker
                 continue
             fresh = False
-            for td in tds:
+            for td, req in tds:
                 uid = str(td['uid'])
 
                 # same resubmit semantics as exec-mode submit: DONE is
@@ -1139,6 +1483,12 @@ class PluginTaskDispatcher(Plugin):
 
                 td = dict(td)
                 td.pop('pool', None)
+                # Promote 'requirements' to the record field and drop it from
+                # the forwarded dict: BaseTask.from_dict keeps unknown keys
+                # verbatim and nobody reads them, so a stray block would be a
+                # silent no-op riding the wire.  The record gets the
+                # validated block (with any derived 'cores'), not the raw one.
+                td.pop('requirements', None)
                 pool_state.tasks[uid] = TaskRecord(
                     task_id      = uid,
                     pool         = pool_name,
@@ -1146,6 +1496,7 @@ class PluginTaskDispatcher(Plugin):
                     cmd          = [],
                     cwd          = '',
                     task_dict    = td,
+                    requirements = req,
                     state        = TASK_QUEUED,
                     submitted_at = now,
                     arrival_ts   = now,
@@ -1769,6 +2120,21 @@ class PluginTaskDispatcher(Plugin):
                 # only unique per client process.
                 fwd = dict(task.task_dict)
                 fwd['uid'] = f'{task.task_id}.{task.owning_sid}'
+                # Per-key merge: the caller's own
+                # task_backend_specific_kwargs override the keys derived
+                # from `requirements` (the caller knows its backend), but
+                # keys it did not set still come from the mapping.  Left
+                # untouched when nothing is derived, so a task without
+                # requirements forwards byte-identically.
+                derived = backend_kwargs(task.requirements,
+                                         pilot.rhapsody_backend)
+                if derived:
+                    fwd['task_backend_specific_kwargs'] = {
+                        **derived,
+                        # `or {}` -- the key may be present and null
+                        **(task.task_dict.get(
+                            'task_backend_specific_kwargs') or {}),
+                    }
             else:
                 fwd = {
                     'uid'       : task.task_id,
@@ -1778,8 +2144,14 @@ class PluginTaskDispatcher(Plugin):
                     # rhapsody's concurrent backend reads cwd from
                     # task_backend_specific_kwargs (BaseTask's top-level cwd
                     # is ignored); mirror it here so the task runs in its
-                    # scratch dir.
-                    'task_backend_specific_kwargs': {'cwd': task.cwd},
+                    # scratch dir.  The requirements mapping merges onto
+                    # that dict — it never replaces it, and it never emits
+                    # a 'cwd' of its own.
+                    'task_backend_specific_kwargs': {
+                        'cwd': task.cwd,
+                        **backend_kwargs(task.requirements,
+                                         pilot.rhapsody_backend),
+                    },
                 }
             fwds.append((task, fwd))
 

@@ -225,6 +225,152 @@ Namespace: `xgfabric`
 | `POST` | `start/{sid}` | Start workflow. Body: `{"workflow": "default", "resource": "default"}` |
 | `POST` | `stop/{sid}` | Cancel a running workflow |
 
+## Task Dispatcher Plugin
+
+Namespace: `task_dispatcher`. Hosted on the **broker**, so its routes are
+reached under `/broker/task_dispatcher/…`.
+
+`register_session` accepts an optional `{"pools": [...]}` declaration; a
+session that declares none gets the built-in `default` pool (one node, one
+CPU, `concurrent` backend).
+
+| Method | Path | Description |
+|----|----|----|
+| `GET`  | `pools` | All pools visible to the caller |
+| `GET`  | `pool/{sid}/{name}` | Detailed state for one of this session's pools |
+| `GET`  | `fleet/{sid}` | Fleet snapshot across this session's pools |
+| `POST` | `submit/{sid}` | Submit one task (exec dialect). Body below |
+| `POST` | `submit_rh/{sid}` | Bulk submit in the rhapsody dialect. Body: `{"tasks": [{...}, ...]}`, each task dict carrying a `pool` key |
+| `GET`  | `task/{sid}/{task_id}` | One task's record (pool mode) or the target's rhapsody info (endpoint mode) |
+| `POST` | `cancel/{sid}/{task_id}` | Cancel one task |
+| `POST` | `cancel_all/{sid}` | Cancel every task in the session and tear its pools down |
+| `POST` | `stage_in/{sid}/{task_id}` | Upload an input file into the task's scratch dir |
+| `GET`  | `stage_out/{sid}/{task_id}/{filename}` | Download an output file |
+
+### `submit/{sid}` body
+
+```json
+{"pool": "cpu", "task_id": "t.abc", "cmd": ["/bin/echo", "hi"],
+ "cwd": "/scratch/t.abc", "priority": 0, "inputs": [], "outputs": [],
+ "requirements": {"cores": 1, "gpus": 0, "mem_gb": 0, "ranks": 1,
+                  "mpi": false, "software": [], "labels": {}}}
+```
+
+Exactly one of `pool` or `endpoint` is required — `pool` routes through a
+dispatcher-managed pilot fleet, `endpoint` is a transparent proxy to that
+endpoint's rhapsody plugin (no pool, no staging).
+
+### The `requirements` object
+
+Optional on both `submit/{sid}` and each task dict of `submit_rh/{sid}`.
+Every key is optional; absent or `null` means "no declaration" and behaves
+byte-for-byte as before the field existed.
+
+| key | type | rule |
+|---|---|---|
+| `cores` | int | ≥ 1; **total** CPU cores for the task. Omitted ⇒ `max(1, ranks)` |
+| `gpus` | int | ≥ 0; **total** GPUs for the task |
+| `mem_gb` | int **or** float | ≥ 0 |
+| `ranks` | int | ≥ 1; **process replicas** — MPI ranks when `mpi` is true |
+| `mpi` | bool | selects the backend's MPI launch path |
+| `software` | list[str] | placement attribute; never reaches rhapsody |
+| `labels` | dict[str, str \| int \| float] | placement attribute; never reaches rhapsody |
+
+`bool` is never accepted where an integer is expected (`"cores": true` is a
+400). Anything not in the table is a **400** — a typo that silently drops a
+field is worse than a refused request. Beyond the per-key types the
+dispatcher enforces `cores >= ranks` (so `cores_per_rank` is never 0) and
+`gpus % ranks == 0` (so `gpus_per_rank` is an exact integer), then rejects a
+task no `pilot_size` in the target pool could ever host — compared **per
+node**, since none of the shipped backends spreads one task across nodes.
+A mixed pool is judged on its best member; `mem_gb` has no such check
+because `PilotSize` carries no memory field. Note the built-in `default`
+pool has `cpus_per_node = 1`, so any `cores >= 2` is a 400 there.
+
+**`ranks` without `cores`.** When `cores` is omitted the dispatcher derives
+`cores = max(1, ranks)`, so `{"ranks": 4}` alone means "four processes on
+four cores" rather than a `cores` (1) `>= ranks` (4) rejection. The derived
+value is what gets persisted and forwarded. An *explicit* `cores` below
+`ranks` is a contradiction and stays a 400.
+
+Example detail strings:
+
+```
+requirements: unknown key 'gpu'
+requirements: 'cores' must be a positive integer, got 0
+requirements: 'gpus' must be a non-negative integer, got 'two'
+requirements: 'mem_gb' must be a non-negative number, got 'x'
+requirements: 'mpi' must be a boolean
+requirements: 'software' must be a list of strings
+requirements: 'labels' must be a mapping of string to string|number
+requirements: 'cores' (2) must be >= 'ranks' (4)
+requirements: 'gpus' (3) must be divisible by 'ranks' (2)
+requirements: 8 cores exceed every pilot_size (largest: 's', 4 cpus/node)
+requirements: 2 gpus exceed every pilot_size (largest: 's', 0 gpus/node)
+requirements: 'mpi' is unsupported on dragon_v1 (pool 'x', size 's')
+```
+
+`software` and `labels` are carried and persisted but **not acted on** yet:
+they are dispatcher-side placement attributes for multi-member class pools,
+and they never reach rhapsody.
+
+The validated block is stored on the task record, so `requirements` appears
+in every task-shaped response — `submit/{sid}`, `task/{sid}/{task_id}`, pool
+summaries and `task_status` notifications — carrying `{}` for a task that
+declared none.
+
+### Forwarding: what each backend does with it
+
+Requirements are **forwarded, not enforced**. The dispatcher maps them onto
+the pilot's rhapsody backend (fixed per pilot by
+`PilotSize.rhapsody_backend`) and merges the result into the task's
+`task_backend_specific_kwargs` — the only place rhapsody reads resource
+keys from; a top-level `cores`/`gpus`/`ranks` would be kept verbatim and
+read by nobody. Oversubscription control stays with rhapsody.
+
+| backend | forwarded | effect |
+|---|---|---|
+| `dragon_v2` | `ranks`, `gpus_per_rank` | honoured natively; spawns `ranks` replicas |
+| `radical_pilot` | `ranks`, `cores_per_rank`, `gpus_per_rank`, `mem_per_rank` (MB) | honoured natively; note the exec-mode `cwd` also rides into the same `TaskDescription` (pre-existing) |
+| `dragon_v3` | `type: "mpi"` + `ranks`, **only** when `mpi` is true | `ranks` is read only under `type: "mpi"` |
+| `dragon_v1` | `ranks` | spawns `ranks` replicas and queues on a global slot counter; `mpi` is refused at submit |
+| `dask` | `resources: {"GPU": gpus}` when `gpus > 0` | pre-checked; the task fails if unsatisfiable |
+| `concurrent` | *(nothing)* | the backend reads only `shell`/`cwd`/`env` |
+
+Any value equal to the backend's own default is omitted, so a task without
+`requirements` forwards byte-identically. `ranks` means "process replicas"
+and only incidentally "MPI ranks": `dragon_v1` and `dragon_v2` spawn
+`ranks` replicas either way, while `dragon_v3` spawns them only under
+`type: "mpi"` — a caller who sets `ranks: 4` expecting four processes gets
+one on a `dragon_v3` pool. On `concurrent` and non-MPI `dragon_v3` — the
+two defaults — the declaration is a persisted record and nothing more.
+
+In the rhapsody dialect a caller-supplied `task_backend_specific_kwargs`
+**wins per key** over the derived mapping: the caller knows its backend.
+Keys it did not set still come from `requirements`.
+
+### Endpoint mode: advisory only
+
+An endpoint-mode submit (`"endpoint": "..."` instead of `"pool"`) accepts
+`requirements`, applies the **same shape validation** (so a typo is still a
+400), and then drops it: there is no pool, hence no fit check and no
+backend gate, and the dispatcher never learns which backend the target
+endpoint chose. Nothing is stored and nothing is forwarded: the task dict
+sent on to the target's rhapsody plugin is exactly what it would have been
+without the key, and the endpoint-mode response carries no `requirements`
+of its own — there is no task record behind it. One advisory line is
+logged per submit, and only when the block is non-empty.
+
+### Resubmit ignores changed requirements
+
+Both submit routes return the **cached record** for a task_id already in
+`DONE`, `RUNNING` or `QUEUED` state — crash recovery, wrapper reconnect.
+A resubmit with *changed* `requirements` is therefore silently ignored,
+exactly as a changed `priority` is; only `FAILED`/`CANCELED` re-executes.
+There is deliberately no mutation path. Validation runs **before** that
+cache ladder, so a malformed `requirements` is a 400 even on a resubmit of
+a cached `DONE` task.
+
 ## Error Responses
 
 All plugin endpoints return standard HTTP status codes:

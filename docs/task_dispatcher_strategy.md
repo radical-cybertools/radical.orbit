@@ -109,6 +109,18 @@ Accessors return snapshots — they're safe to iterate but shouldn't be
 cached across strategy calls.  Action hooks are non-blocking; the
 actual psij submission / broker call happens on a worker.
 
+A ``TaskRecord`` may carry a ``requirements`` dict
+(``cores``/``gpus``/``mem_gb``/``ranks``/``mpi``/``software``/``labels``),
+validated at submit time.  It is **forwarded, not enforced**: the
+dispatcher maps it onto the pilot's rhapsody backend and leaves
+oversubscription control there.  Capacity in this document is still a
+**task count** — ``pilot.capacity = nodes * cpus_per_node``,
+``free_capacity() = capacity - in_flight`` — and
+``PilotSize.gpus_per_node`` never reaches the dispatch decision.  A
+strategy may read ``task.requirements`` today, but nothing reserves cores
+or GPUs against it; enforcement is deferred (see
+``plans/120-task-requirements-passthrough.md``, "Deferred").
+
 ## Shipped strategies
 
 ### ``conservative`` (default)
@@ -126,6 +138,10 @@ Favors efficient utilization over low latency.
 - ``should_terminate_pilot`` always returns False — pilots expire at
   walltime.
 - Routing: configurable ``least_loaded`` (default) or ``youngest``.
+- ``pick_dispatch`` filters pilots on ``free_capacity() > 0`` only — pure
+  task counting.  A task's ``requirements`` are forwarded to the pilot's
+  rhapsody backend, not enforced here: a 4-GPU pilot will happily accept a
+  fifth 1-GPU task.  Resource-aware filtering is deferred.
 
 Config knobs:
 
@@ -233,14 +249,19 @@ under a burst, conservative never terminates pilots, etc.).
 
 ## Future extension points
 
-Marked with ``FIXME(per-task-backend)`` in code:
+The insertion sites for per-task backend selection (formerly carried as
+paired ``FIXME(per-task-backend)`` markers, since removed):
 
-- ``src/radical/orbit/plugin_task_dispatcher.py::PluginTaskDispatcher._assign``
-- ``src/radical/orbit/task_dispatcher_strategy.py::DispatchStrategy``
+- ``src/radical/orbit/plugin_task_dispatcher.py`` —
+  ``PluginTaskDispatcher._claim`` and its caller ``_drain_pending``
+  (the old ``_assign`` no longer exists)
+- ``src/radical/orbit/task_dispatcher_policy.py`` — ``DispatchPolicy``
+  (the ABC moved out of the removed ``task_dispatcher_strategy.py``)
 
 A natural next hook would be
 ``strategy.pick_backend(ctx, task, pilot) -> str | None``, letting a
 strategy override the rhapsody backend on a per-task basis rather
-than inheriting ``pilot.rhapsody_backend``.  Not part of the v1 ABC;
-the paired FIXMEs exist so the insertion sites stay in sync when the
-extension lands.
+than inheriting ``pilot.rhapsody_backend``.  Not part of the v1 ABC.
+Note that ``backend_kwargs()`` in ``plugin_task_dispatcher.py`` keys on
+``pilot.rhapsody_backend`` today, so a per-task backend override would
+have to move that call to the same hook.

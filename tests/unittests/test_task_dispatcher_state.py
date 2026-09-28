@@ -153,6 +153,38 @@ class TestRecordSerialisation:
         assert p.pool == 'cpu'
         assert not hasattr(p, 'future_field')
 
+    def test_old_task_record_without_requirements_loads_as_empty(self):
+        """A pre-plan-120 state.json has no 'requirements' key at all."""
+        t = record_from_dict(TaskRecord, {
+            'task_id': 't.1', 'pool': 'cpu', 'cmd': ['/bin/echo'],
+            'cwd': '/tmp', 'priority': 3, 'state': TASK_RUNNING,
+        })
+        assert t.requirements == {}
+        assert t.priority == 3
+
+    def test_task_record_requirements_round_trip(self):
+        req = {'cores': 4, 'gpus': 2, 'mem_gb': 1.5, 'ranks': 2,
+               'mpi': True, 'software': ['gromacs'],
+               'labels': {'zone': 'a', 'tier': 2}}
+        tasks = {'t.1': TaskRecord(task_id='t.1', pool='cpu',
+                                   cmd=['/bin/echo'], cwd='/tmp',
+                                   requirements=req)}
+        plain = records_to(tasks)
+        assert plain['t.1']['requirements'] == req
+
+        restored = records_from(plain, TaskRecord)
+        assert restored['t.1'].requirements == req
+        # software/labels survive verbatim -- plan 121 consumes them
+        assert restored['t.1'].requirements['software'] == ['gromacs']
+        assert restored['t.1'].requirements['labels'] == {'zone': 'a',
+                                                          'tier': 2}
+
+    def test_task_records_do_not_share_the_default_requirements_dict(self):
+        a = TaskRecord(task_id='t.1', pool='p', cmd=[], cwd='')
+        b = TaskRecord(task_id='t.2', pool='p', cmd=[], cwd='')
+        a.requirements['cores'] = 4
+        assert b.requirements == {}
+
     def test_records_from_empty_or_none(self):
         assert records_from(None, PilotRecord) == {}
         assert records_from({}, PilotRecord) == {}

@@ -405,3 +405,94 @@ class TestRunId:
         os.utime(p, None)   # bumps mtime
         r2 = _prep.compute_run_id(p)
         assert r1 != r2
+
+
+# ---------------------------------------------------------------------------
+# Per-task resource directives (plan 120)
+# ---------------------------------------------------------------------------
+
+class TestResourceDirectives:
+
+    def test_cores_and_gpus_are_captured_not_passed_through(self):
+        # deliberate: CORES/GPUS are Makeflow-native per-rule variables and
+        # this preprocessor now consumes them, so Makeflow no longer sees
+        # its own copy (documented in the module docstring)
+        out = _run('POOL = "p"\nCORES = 4\nGPUS = 1\no: i\n\tcmd\n')
+        assert 'CORES' not in out
+        assert 'GPUS'  not in out
+        assert '--cores=4' in out
+        assert '--gpus=1'  in out
+
+    def test_makeflow_memory_still_passes_through(self):
+        # MEMORY is Makeflow's own (MB) variable; our MEM directive is
+        # explicit GB, so MEMORY is deliberately left alone
+        out = _run('POOL = "p"\nMEMORY = 2048\no: i\n\tcmd\n')
+        assert 'MEMORY = 2048' in out
+        assert '--mem=' not in out
+
+    def test_defaults_emit_no_flags(self):
+        # unlike --priority (always emitted, including 0), the resource
+        # flags appear only when a value was resolved -- so every existing
+        # golden output stays byte-identical
+        out = _run('POOL = "p"\no: i\n\tcmd\n')
+        assert '--cores=' not in out
+        assert '--gpus='  not in out
+        assert '--mem='   not in out
+        assert '--priority=0' in out
+
+    def test_directives_are_emitted_and_consumed(self):
+        out = _run(
+            'POOL = "p"\nCORES = 8\nGPUS = 2\nMEM = "1.5"\n'
+            'o: i\n\tcmd\n')
+        assert '--cores=8' in out
+        assert '--gpus=2'  in out
+        assert '--mem=1.5' in out
+        # the directive lines themselves never reach the output
+        assert 'CORES' not in out
+        assert 'GPUS'  not in out
+        assert 'MEM'   not in out
+
+    def test_scope_applies_to_subsequent_rules(self):
+        out = _run(
+            'POOL = "p"\n'
+            'a: i1\n\tc1\n'
+            'CORES = 4\n'
+            'b: i2\n\tc2\n'
+            'CORES = 8\n'
+            'c: i3\n\tc3\n')
+        lines = [l for l in out.split('\n') if 'radical-orbit-run' in l]
+        assert len(lines) == 3
+        assert '--cores=' not in lines[0]
+        assert '--cores=4' in lines[1]
+        assert '--cores=8' in lines[2]
+
+    def test_cli_defaults(self):
+        out = _run('o: i\n\tcmd\n', default_pool='p', default_cores=2,
+                   default_gpus=1, default_mem=0.5)
+        assert '--cores=2' in out
+        assert '--gpus=1'  in out
+        assert '--mem=0.5' in out
+
+    def test_zero_is_a_declared_value_and_is_emitted(self):
+        # 0 is not None: an explicit "GPUS = 0" is a declaration
+        out = _run('POOL = "p"\nGPUS = 0\no: i\n\tcmd\n')
+        assert '--gpus=0' in out
+
+    def test_mem_parses_floats(self):
+        out = _run('POOL = "p"\nMEM = 2\no: i\n\tcmd\n')
+        assert '--mem=2.0' in out
+
+    def test_mem_rejects_non_numbers(self):
+        with pytest.raises(PrepError, match='MEM'):
+            _run('POOL = "p"\nMEM = "x"\no: i\n\tcmd\n')
+
+    def test_cores_rejects_non_integers(self):
+        with pytest.raises(PrepError, match='CORES'):
+            _run('POOL = "p"\nCORES = "x"\no: i\n\tcmd\n')
+
+    def test_expect_number_helper_float(self):
+        assert _prep._expect_number('"1.5"', 'MEM', 1, float) == 1.5
+        assert _prep._expect_number('2', 'MEM', 1, float) == 2.0
+        with pytest.raises(PrepError,
+                           match="line 7: MEM must be a number, got 'x'"):
+            _prep._expect_number('x', 'MEM', 7, float)
