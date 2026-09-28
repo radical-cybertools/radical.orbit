@@ -130,8 +130,9 @@ _REQ_DEFAULTS: dict = {
 }
 
 # Backends whose group launch needs a ``pmi`` value the dispatcher cannot
-# infer (rhapsody dragon v1, dragon.py:484-486).  ``mpi: true`` on a pool
-# where *every* pilot size names one of these is refused at submit.
+# infer (rhapsody dragon v1, ``TaskLauncherV1._launch_group_task``).
+# ``mpi: true`` on a pool where *every* pilot size names one of these is
+# refused at submit.
 _NO_MPI_BACKENDS = frozenset(['dragon_v1'])
 
 
@@ -224,17 +225,14 @@ def parse_requirements(raw: Any) -> dict:
                 "requirements: 'labels' must be a mapping of string to "
                 "string|number")
 
-    gpus  = req.get('gpus',  _REQ_DEFAULTS['gpus'])
-    ranks = req.get('ranks', _REQ_DEFAULTS['ranks'])
+    # 'ranks' without 'cores' means "N processes": derive the core count.
+    if 'cores' not in req and req.get('ranks', 1) > 1:
+        req['cores'] = req['ranks']
 
-    # 'ranks' without 'cores' means "N processes" -- derive the core count
-    # instead of refusing it against the cores default of 1.  Only an
-    # OMITTED cores is filled in, and only when the derived value differs
-    # from the default, so a block declaring neither stays untouched.  An
-    # explicit cores below ranks is a contradiction, and still a 400.
-    cores = req.get('cores', max(_REQ_DEFAULTS['cores'], ranks))
-    if 'cores' not in req and cores != _REQ_DEFAULTS['cores']:
-        req['cores'] = cores
+    r     = {**_REQ_DEFAULTS, **req}
+    cores = r['cores']
+    gpus  = r['gpus']
+    ranks = r['ranks']
 
     # ``cores >= ranks`` keeps ``cores_per_rank = cores // ranks`` from ever
     # being 0; ``gpus % ranks == 0`` keeps ``gpus_per_rank`` an exact integer
@@ -266,7 +264,8 @@ def check_requirements_against_pool(req: dict, pool: PoolConfig) -> None:
     :class:`PilotSize` carries no memory field.  Note the ``ranks`` bound
     is only *approximate* for ``dragon_v1``, whose real hang condition is
     ``ranks`` above the **free** slot count at that instant
-    (dragon.py:1899-1904); only enforcement (deferred) can bound that.
+    (``DragonExecutionBackendV1._submit_task``); only enforcement
+    (deferred) can bound that.
 
     Beware the built-in ``default`` pool: its single size has
     ``cpus_per_node = 1``, so any ``cores >= 2`` is a 400 there.
@@ -276,20 +275,15 @@ def check_requirements_against_pool(req: dict, pool: PoolConfig) -> None:
 
     Raises :class:`RequirementsError` carrying the exact 400 detail string.
     '''
-    if not req:
-        return
-
     sizes = pool.pilot_sizes
-    if not sizes:
-        return
-
-    cores = req.get('cores', _REQ_DEFAULTS['cores'])
-    gpus  = req.get('gpus',  _REQ_DEFAULTS['gpus'])
+    r     = {**_REQ_DEFAULTS, **req}
+    cores = r['cores']
+    gpus  = r['gpus']
 
     def _largest(attr: str) -> tuple:
         '''Return the ``(size_key, value)`` maximising *attr* (name breaks ties).'''
-        return max(((k, getattr(s, attr)) for k, s in sorted(sizes.items())),
-                   key=lambda kv: kv[1])
+        key = max(sorted(sizes), key=lambda k: getattr(sizes[k], attr))
+        return key, getattr(sizes[key], attr)
 
     if not any(cores <= s.cpus_per_node for s in sizes.values()):
         key, val = _largest('cpus_per_node')
@@ -303,13 +297,24 @@ def check_requirements_against_pool(req: dict, pool: PoolConfig) -> None:
             f"requirements: {gpus} gpus exceed every pilot_size "
             f"(largest: {key!r}, {val} gpus/node)")
 
-    if req.get('mpi') and all(s.rhapsody_backend in _NO_MPI_BACKENDS
-                              for s in sizes.values()):
+    if r['mpi'] and all(s.rhapsody_backend in _NO_MPI_BACKENDS
+                        for s in sizes.values()):
         key = sorted(sizes)[0]
         raise RequirementsError(
             f"requirements: 'mpi' is unsupported on "
             f"{sizes[key].rhapsody_backend} (pool {pool.name!r}, "
             f"size {key!r})")
+
+
+def _validated_requirements(raw: Any, pool: PoolConfig | None = None) -> dict:
+    '''Validate *raw* (and fit it to *pool*, if given), or raise a 400.'''
+    try:
+        req = parse_requirements(raw)
+        if pool is not None:
+            check_requirements_against_pool(req, pool)
+    except RequirementsError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return req
 
 
 def backend_kwargs(req: dict, backend: str) -> dict:
@@ -322,17 +327,17 @@ def backend_kwargs(req: dict, backend: str) -> dict:
 
     With ``R = ranks``, ``C = cores``, ``G = gpus`` (shape-validated so
     ``C >= R`` and ``G % R == 0``).  Checked against rhapsody-py 0.4.0,
-    ``rhapsody/backends/execution/``; keep these citations current or the
-    table rots the next time rhapsody moves:
+    ``rhapsody.backends.execution``; re-check the cited symbols when the
+    rhapsody pin moves:
 
     | backend        | emitted                                        | effect today |
     |----------------|------------------------------------------------|--------------|
-    | `dragon_v2`    | `{'ranks': R, 'gpus_per_rank': G // R}`         | honoured natively (dragon.py:2508-2509); spawns R replicas, MPI or not |
-    | `radical_pilot`| `{'ranks': R, 'cores_per_rank': C // R, 'gpus_per_rank': G // R, 'mem_per_rank': int(mem_gb * 1024 / R)}` (MB per rank) | honoured natively — the dict feeds `rp.TaskDescription(from_dict=…)` (radical_pilot.py:510) |
-    | `dragon_v3`    | `{'type': 'mpi', 'ranks': R}` **only if** `mpi` | `ranks` is read ONLY under `type == 'mpi'` (dragon.py:3432-3437); ignored otherwise |
-    | `dragon_v1`    | `{'ranks': R}`                                 | spawns R replicas via a non-MPI ProcessGroup (dragon.py:456-460) AND busy-waits on a global slot counter (dragon.py:1899); `mpi` refused at submit |
-    | `dask`         | `{'resources': {'GPU': G}}` when `G > 0`       | pre-checked; fails the task if unsatisfiable (dask_parallel.py:313) |
-    | `concurrent`   | *(nothing)*                                    | reads only `shell`/`cwd`/`env` (concurrent.py:169-172) |
+    | `dragon_v2`    | `{'ranks': R, 'gpus_per_rank': G // R}`         | honoured natively (`DragonExecutionBackendV2._schedule_tasks`); spawns R replicas, MPI or not |
+    | `radical_pilot`| `{'ranks': R, 'cores_per_rank': C // R, 'gpus_per_rank': G // R, 'mem_per_rank': int(mem_gb * 1024 / R)}` (MB per rank) | honoured natively — the dict feeds `rp.TaskDescription(from_dict=…)` (`RadicalExecutionBackend.build_task`) |
+    | `dragon_v3`    | `{'type': 'mpi', 'ranks': R}` **only if** `mpi` | `ranks` is read ONLY under `type == 'mpi'` (`DragonExecutionBackendV3.build_task`); ignored otherwise |
+    | `dragon_v1`    | `{'ranks': R}`                                 | spawns R replicas via a non-MPI ProcessGroup (`TaskLauncherV1._determine_task_type`) AND busy-waits on a global slot counter (`DragonExecutionBackendV1._submit_task`); `mpi` refused at submit |
+    | `dask`         | `{'resources': {'GPU': G}}` when `G > 0`       | pre-checked; fails the task if unsatisfiable (`DaskExecutionBackend._submit_to_dask`) |
+    | `concurrent`   | *(nothing)*                                    | reads only `shell`/`cwd`/`env` (`ConcurrentExecutionBackend._execute_command`) |
 
     ``ranks`` means "process replicas" and only incidentally "MPI ranks":
     ``dragon_v1`` and ``dragon_v2`` spawn R replicas either way, while
@@ -351,11 +356,12 @@ def backend_kwargs(req: dict, backend: str) -> dict:
     if not req:
         return {}
 
-    ranks  = req.get('ranks',  _REQ_DEFAULTS['ranks'])
-    cores  = req.get('cores',  _REQ_DEFAULTS['cores'])
-    gpus   = req.get('gpus',   _REQ_DEFAULTS['gpus'])
-    mem_gb = req.get('mem_gb', _REQ_DEFAULTS['mem_gb'])
-    mpi    = bool(req.get('mpi', _REQ_DEFAULTS['mpi']))
+    r      = {**_REQ_DEFAULTS, **req}
+    ranks  = r['ranks']
+    cores  = r['cores']
+    gpus   = r['gpus']
+    mem_gb = r['mem_gb']
+    mpi    = r['mpi']
 
     out: dict = {}
 
@@ -1295,11 +1301,8 @@ class PluginTaskDispatcher(Plugin):
         # Validation runs BEFORE the resubmit cache ladder below, so a
         # malformed 'requirements' is a 400 even when the task_id is a
         # cached DONE — a bad request stays a bad request.
-        try:
-            requirements = parse_requirements(body.get('requirements'))
-            check_requirements_against_pool(requirements, pool_state.config)
-        except RequirementsError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
+        requirements = _validated_requirements(body.get('requirements'),
+                                               pool_state.config)
 
         # Cached-state behaviour on resubmit:
         #   DONE            → return cached (crash-recovery)
@@ -1380,10 +1383,7 @@ class PluginTaskDispatcher(Plugin):
 
         # Shape validation only — no pool, hence no fit check and no
         # backend gate.  A non-empty block earns one advisory log line.
-        try:
-            requirements = parse_requirements(body.get('requirements'))
-        except RequirementsError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
+        requirements = _validated_requirements(body.get('requirements'))
         if requirements:
             log.info('[%s] endpoint-mode task %s: requirements are advisory '
                      '(target backend unknown); nothing forwarded',
@@ -1444,7 +1444,7 @@ class PluginTaskDispatcher(Plugin):
         task_dicts = data.get('tasks', [])
 
         # validate the whole batch before touching any state
-        grouped: dict[str, list[dict]] = {}
+        grouped: dict[str, list[tuple]] = {}
         for td in task_dicts:
             uid       = td.get('uid')
             pool_name = td.get('pool')
@@ -1459,12 +1459,8 @@ class PluginTaskDispatcher(Plugin):
                     detail=f'unknown pool: {pool_name}')
             # Validate requirements inside the whole-batch loop, so one bad
             # task rejects the batch before any state is touched.
-            try:
-                req = parse_requirements(td.get('requirements'))
-                check_requirements_against_pool(req, ps.config)
-            except RequirementsError as e:
-                raise HTTPException(status_code=400, detail=str(e)) from e
-            grouped.setdefault(pool_name, []).append(td)
+            req = _validated_requirements(td.get('requirements'), ps.config)
+            grouped.setdefault(pool_name, []).append((td, req))
 
         now  = time.time()
         acks = []
@@ -1473,7 +1469,7 @@ class PluginTaskDispatcher(Plugin):
             if pool_state is None:       # validated above; mollify the checker
                 continue
             fresh = False
-            for td in tds:
+            for td, req in tds:
                 uid = str(td['uid'])
 
                 # same resubmit semantics as exec-mode submit: DONE is
@@ -1489,8 +1485,9 @@ class PluginTaskDispatcher(Plugin):
                 # Promote 'requirements' to the record field and drop it from
                 # the forwarded dict: BaseTask.from_dict keeps unknown keys
                 # verbatim and nobody reads them, so a stray block would be a
-                # silent no-op riding the wire.  Already validated above.
-                requirements = td.pop('requirements', None) or {}
+                # silent no-op riding the wire.  The record gets the
+                # validated block (with any derived 'cores'), not the raw one.
+                td.pop('requirements', None)
                 pool_state.tasks[uid] = TaskRecord(
                     task_id      = uid,
                     pool         = pool_name,
@@ -1498,7 +1495,7 @@ class PluginTaskDispatcher(Plugin):
                     cmd          = [],
                     cwd          = '',
                     task_dict    = td,
-                    requirements = requirements,
+                    requirements = req,
                     state        = TASK_QUEUED,
                     submitted_at = now,
                     arrival_ts   = now,

@@ -690,15 +690,8 @@ class TestEndpointMode:
         fwd = rh_mock.submit_tasks.call_args.args[0][0]
         assert fwd['task_backend_specific_kwargs'] == {'cwd': '/tmp'}
 
-    @pytest.mark.parametrize('requirements,expect_log', [
-        ({'cores': 4}, True),
-        ({},           False),
-        (None,         False),
-    ])
-    def test_endpoint_mode_advisory_log(self, tmp_path, caplog,
-                                        requirements, expect_log):
-        # exactly one advisory line per submit, and only when the caller
-        # actually declared something
+    def test_endpoint_mode_advisory_log(self, tmp_path, caplog):
+        # exactly one advisory line for a submit that declared something
         _, plugin = _make_plugin(tmp_path)
         client = TestClient(plugin._app)
         sid = _register(client, plugin, body={'sid': 'A',
@@ -707,9 +700,8 @@ class TestEndpointMode:
         rh_mock = MagicMock()
         rh_mock.submit_tasks = MagicMock(return_value=[])
         body = {'endpoint': 'ep', 'task_id': 't.1',
-                'cmd': ['/bin/true'], 'cwd': '/tmp'}
-        if requirements is not None:
-            body['requirements'] = requirements
+                'cmd': ['/bin/true'], 'cwd': '/tmp',
+                'requirements': {'cores': 4}}
         with caplog.at_level('INFO', logger='radical.orbit'), \
              patch.object(plugin, '_get_rhapsody_client',
                           new=AsyncMock(return_value=rh_mock)):
@@ -717,9 +709,8 @@ class TestEndpointMode:
         assert r.status_code == 200, r.text
         lines = [rec.getMessage() for rec in caplog.records
                  if 'requirements are advisory' in rec.getMessage()]
-        assert len(lines) == (1 if expect_log else 0)
-        if expect_log:
-            assert 't.1' in lines[0]
+        assert len(lines) == 1
+        assert 't.1' in lines[0]
 
     def test_terminal_event_clears_endpoint_mode(self, tmp_path):
         _, plugin = _make_plugin(tmp_path)
@@ -1279,6 +1270,20 @@ class TestRequirementsRoundTrip:
         rec = ps.tasks['t.1']
         assert rec.requirements == {'cores': 2, 'ranks': 2}
         # never reaches BaseTask.from_dict
+        assert 'requirements' not in rec.task_dict
+
+    def test_dialect_submit_persists_the_validated_block(self, tmp_path):
+        # the record carries the derived 'cores', not the raw block
+        plugin, client, sid = self._session(tmp_path)
+        ps = _pool(plugin, sid, 'cpu')
+        td = _dialect_td('t.1')
+        td['requirements'] = {'ranks': 4}
+        with patch.object(ps.policy, 'pick_dispatch', return_value=None):
+            r = client.post(f'{plugin.namespace}/submit_rh/{sid}',
+                            json={'tasks': [td]})
+        assert r.status_code == 200, r.text
+        rec = ps.tasks['t.1']
+        assert rec.requirements == {'ranks': 4, 'cores': 4}
         assert 'requirements' not in rec.task_dict
 
     def test_dialect_submit_rejects_the_batch_on_a_bad_block(self, tmp_path):

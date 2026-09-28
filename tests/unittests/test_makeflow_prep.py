@@ -490,9 +490,9 @@ class TestResourceDirectives:
         with pytest.raises(PrepError, match='CORES'):
             _run('POOL = "p"\nCORES = "x"\no: i\n\tcmd\n')
 
-    def test_expect_float_helper(self):
-        assert _prep._expect_float('"1.5"', 'MEM', 1) == 1.5
-        assert _prep._expect_float('2', 'MEM', 1) == 2.0
+    def test_expect_number_helper_float(self):
+        assert _prep._expect_number('"1.5"', 'MEM', 1, float) == 1.5
+        assert _prep._expect_number('2', 'MEM', 1, float) == 2.0
         with pytest.raises(PrepError,
                            match="line 7: MEM must be a number, got 'x'"):
-            _prep._expect_float('x', 'MEM', 7)
+            _prep._expect_number('x', 'MEM', 7, float)
