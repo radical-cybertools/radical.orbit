@@ -145,6 +145,14 @@ _NO_MPI_BACKENDS = NO_MPI_BACKENDS
 # rest of the submit body, so the true ceiling is
 # ``FRAME_CAP * 3 // 4 - 64 KiB`` ~ 2.9 MiB; 2 MiB is that rounded down to
 # a number an operator can remember.
+#
+# The per-submit total only bites past the default cap: the gateway reads
+# at most ``protocol.FRAME_CAP`` of HTTP body, and a WS submit is bounded by
+# the broker's ``BrokerTuning.frame_cap`` (default ``FRAME_CAP``), so with
+# stock settings no path can deliver 8 MiB of decoded inputs.  It is the
+# backstop for a broker tuned to a ``frame_cap`` above ~10.7 MiB (8 MiB
+# decoded, base64-inflated), whose one submit could otherwise spool as much
+# as that cap allows.
 _MAX_INPUT_BYTES  = 2 * 1024 * 1024      # per file
 _MAX_INPUTS_BYTES = 8 * 1024 * 1024      # per submit
 
@@ -334,8 +342,7 @@ def check_requirements_against_pool(req: dict, pool: PoolConfig) -> None:
     if pool.multi_member:
         reason = _no_member_reason(members, req)
         if reason:
-            raise RequirementsError(
-                f'no member satisfies the task requirements: {reason}')
+            raise RequirementsError(f'{_NO_MEMBER_SATISFIES}: {reason}')
         return
 
     sizes = members[0].pilot_sizes
@@ -369,6 +376,11 @@ def check_requirements_against_pool(req: dict, pool: PoolConfig) -> None:
             f"size {key!r})")
 
 
+# The one prefix of "no member can run this task", whether the submit gate
+# refuses it (400) or the member-removal sweep fails it.
+_NO_MEMBER_SATISFIES = 'no member satisfies the task requirements'
+
+
 def _no_member_reason(members: list[PoolMember],
                       req: dict | None) -> str | None:
     '''Return why no member in *members* can run *req*, or ``None``.
@@ -378,10 +390,13 @@ def _no_member_reason(members: list[PoolMember],
     '''
     if not members:
         return 'no members remain'
-    reasons = [m.reject_reason(req) for m in members]
-    if any(r is None for r in reasons):
-        return None
-    return reasons[0]
+    first = None
+    for m in members:
+        reason = m.reject_reason(req)
+        if reason is None:
+            return None
+        first = first or reason
+    return first
 
 
 def _validated_requirements(raw: Any, pool: PoolConfig | None = None) -> dict:
@@ -600,7 +615,7 @@ class PoolState:
 
     def member(self, mid: str | None) -> PoolMember | None:
         '''Return one member by id (``''`` is the implicit one).'''
-        return self.config.members.get(mid)
+        return self.config.member(mid)
 
     def live_pilots_for(self, mid: str) -> list[PilotRecord]:
         '''Return this member's live pilots.
@@ -610,8 +625,8 @@ class PoolState:
         '''
         return [p for p in self.live_pilots() if p.member_id == mid]
 
-    def pilot_history(self, mid: str | None = None) -> list[dict]:
-        '''Return ``asdict`` views of this pool's pilots, oldest first.
+    def pilot_history(self, mid: str | None = None) -> list[PilotRecord]:
+        '''Return this pool's pilot records, oldest first.
 
         With *mid*, only that member's pilots.  Without it, **all** of
         them — including pilots whose member has since been removed, which
@@ -620,8 +635,7 @@ class PoolState:
         '''
         pilots = self.pilots.values() if mid is None \
             else [p for p in self.pilots.values() if p.member_id == mid]
-        return [asdict(p)
-                for p in sorted(pilots, key=lambda p: p.submitted_at)]
+        return sorted(pilots, key=lambda p: p.submitted_at)
 
     def member_budget_left(self, mid: str,
                            now: float | None = None) -> float | None:
@@ -1384,89 +1398,64 @@ class PluginTaskDispatcher(Plugin):
         return client_cls(http, f'/{plugin}',
                           endpoint_id=dst, plugin_name=plugin)
 
-    async def _get_psij_client(self, endpoint_name: str):
-        '''Return a caller-backed :class:`PSIJClient` for *endpoint_name*.
+    async def _get_child_client(self, dst: str, plugin: str, cls, key,
+                                **register_kwargs):
+        '''Return a caller-backed *cls* client for *plugin* on *dst*.
 
-        Registers (once) a psij session over the caller and caches the client
-        per ``(dst, 'psij', None)``.  Returns ``None`` when no caller is wired
-        or the endpoint / psij plugin is unreachable.
+        Registers (once) a *plugin* session over the caller, passing
+        *register_kwargs* to ``register_session``, and caches the client
+        under *key*.  Returns ``None`` when no caller is wired or *dst* /
+        its *plugin* is unreachable.
         '''
+        if self._broker_caller is None:
+            return None
+        client = self._child_clients.get(key)
+        if client is not None:
+            return client
+        client = self._make_child_client(cls, plugin, dst)
+        try:
+            await asyncio.to_thread(client.register_session,
+                                    **register_kwargs)
+        except Exception as e:
+            log.warning('[%s] %s session unavailable on %s: %s',
+                        self.instance_name, plugin, dst, e)
+            return None
+        self._child_clients[key] = client
+        return client
+
+    async def _get_psij_client(self, endpoint_name: str):
+        '''Return a caller-backed :class:`PSIJClient` for *endpoint_name*.'''
         if not endpoint_name:
             log.warning('[%s] _get_psij_client called with empty endpoint_name',
                         self.instance_name)
             return None
-        if self._broker_caller is None:
-            return None
-        key    = (endpoint_name, 'psij', None)
-        client = self._child_clients.get(key)
-        if client is not None:
-            return client
         from .plugin_psij import PSIJClient
-        client = self._make_child_client(PSIJClient, 'psij', endpoint_name)
-        try:
-            await asyncio.to_thread(client.register_session)
-        except Exception as e:
-            log.warning('[%s] psij session unavailable on %s: %s',
-                        self.instance_name, endpoint_name, e)
-            return None
-        self._child_clients[key] = client
-        return client
+        return await self._get_child_client(
+            endpoint_name, 'psij', PSIJClient, (endpoint_name, 'psij', None))
 
     async def _get_rhapsody_client(self, child_endpoint: str,
                                    backend: str | None = None):
         '''Return a caller-backed :class:`RhapsodyClient` for a child.
 
-        Registers the rhapsody session (with *backend* when given), caches the
-        client per ``(dst, 'rhapsody', backend)``.  Returns ``None`` when no
-        caller is wired or the child / rhapsody plugin is unreachable.
+        The session is registered with *backend* when given, and cached per
+        ``(dst, 'rhapsody', backend)``.
         '''
-        if self._broker_caller is None:
-            return None
-        key    = (child_endpoint, 'rhapsody', backend)
-        client = self._child_clients.get(key)
-        if client is not None:
-            return client
         from .plugin_rhapsody import RhapsodyClient
-        client = self._make_child_client(RhapsodyClient, 'rhapsody',
-                                         child_endpoint)
-        try:
-            await asyncio.to_thread(
-                client.register_session,
-                backends=[backend] if backend else None)
-        except Exception as e:
-            log.warning('[%s] rhapsody session unavailable on %s: %s',
-                        self.instance_name, child_endpoint, e)
-            return None
-        self._child_clients[key] = client
-        return client
+        return await self._get_child_client(
+            child_endpoint, 'rhapsody', RhapsodyClient,
+            (child_endpoint, 'rhapsody', backend),
+            backends=[backend] if backend else None)
 
     async def _get_staging_client(self, child_endpoint: str):
         '''Return a caller-backed :class:`StagingClient` for a child.
 
-        Mirrors :meth:`_get_rhapsody_client` exactly — same caller-backed
-        ``_make_child_client``, same lazy ``register_session``, same
-        ``(dst, plugin, None)`` cache key, ``None`` when the child is
-        unreachable.  It is how a task's inputs (and, for an input-less
-        task, its cwd) reach a member whose filesystem the broker does not
-        share.
+        It is how a task's inputs (and, for an input-less task, its cwd)
+        reach a member whose filesystem the broker does not share.
         '''
-        if self._broker_caller is None:
-            return None
-        key    = (child_endpoint, 'staging', None)
-        client = self._child_clients.get(key)
-        if client is not None:
-            return client
         from .plugin_staging import StagingClient
-        client = self._make_child_client(StagingClient, 'staging',
-                                         child_endpoint)
-        try:
-            await asyncio.to_thread(client.register_session)
-        except Exception as e:
-            log.warning('[%s] staging session unavailable on %s: %s',
-                        self.instance_name, child_endpoint, e)
-            return None
-        self._child_clients[key] = client
-        return client
+        return await self._get_child_client(
+            child_endpoint, 'staging', StagingClient,
+            (child_endpoint, 'staging', None))
 
     # -- routes --------------------------------------------------------
 
@@ -1697,6 +1686,11 @@ class PluginTaskDispatcher(Plugin):
                 detail='cannot remove the last member of a pool without '
                        "'force'")
 
+        # The reported counts are read off the task states at the end, not
+        # tallied along the way: a task can also fail inside
+        # ``_do_pilot_cancel`` (``_finalize_pilot``: re-queued too often).
+        live = {tid for tid, t in ps.tasks.items() if not t.is_terminal()}
+
         # -- 1. synchronous, before the first await ----------------------
         doomed = ps.live_pilots_for(mid)
         for pilot in doomed:
@@ -1721,14 +1715,12 @@ class PluginTaskDispatcher(Plugin):
         # afterwards would kill a task that is already running elsewhere.
         # Terminal tasks are skipped by the re-queue branch, so this also
         # keeps `tasks_requeued` honest.
-        failed = 0
         if cancel_tasks:
             for tid in sorted(touched):
                 task = ps.tasks.get(tid)
                 if task is not None and not task.is_terminal():
                     self._mark_task_failed(
                         ps, task, 'member removed with cancel_tasks')
-                    failed += 1
 
         # -- 3. cancel the member's pilots (re-queues their tasks) -------
         cancelled = 0
@@ -1754,13 +1746,15 @@ class PluginTaskDispatcher(Plugin):
                 if reason is None:
                     continue
                 self._mark_task_failed(
-                    ps, task,
-                    f'no member satisfies task requirements: {reason}')
-                failed += 1
+                    ps, task, f'{_NO_MEMBER_SATISFIES}: {reason}')
 
-        requeued = sum(1 for tid in touched
+        def _count(tids, state):
+            return sum(1 for tid in tids
                        if (ps.tasks.get(tid) is not None
-                           and ps.tasks[tid].state == TASK_QUEUED))
+                           and ps.tasks[tid].state == state))
+
+        failed   = _count(live,    TASK_FAILED)
+        requeued = _count(touched, TASK_QUEUED)
         ps.persist()
 
         self._dispatch_notify('pool_members', {
@@ -1819,6 +1813,10 @@ class PluginTaskDispatcher(Plugin):
         # Resolve the pool before the cwd check: a class pool may place the
         # task itself, so 'cwd' is optional there (plan 121 §8 rule 2).
         pool_state = self._find_pool(sid, pool_name) if pool_name else None
+        if pool_name and not pool_state:
+            raise HTTPException(
+                status_code=404,
+                detail=f'unknown pool: {pool_name}')
         cwd_optional = (pool_state is not None
                         and pool_state.config.multi_member)
 
@@ -1833,11 +1831,6 @@ class PluginTaskDispatcher(Plugin):
                 target_endpoint, task_id, cmd, cwd, body)
 
         # ---------- pool mode: dispatcher-managed pilot fleet ------------
-        if not pool_state:
-            raise HTTPException(
-                status_code=404,
-                detail=f'unknown pool: {pool_name}')
-
         priority = int(body.get('priority', 0))
         inputs   = list(body.get('inputs',  []) or [])
         outputs  = list(body.get('outputs', []) or [])
@@ -3432,17 +3425,24 @@ class PluginTaskDispatcher(Plugin):
             # removed (they are in no member's list) -- which is exactly
             # why the pool total is reported rather than summed from the
             # member figures.
+            # The wire needs dicts: ``asdict`` each record exactly once
+            # here and let the member blocks share the views.
             history = ps.pilot_history()
-            summary['pilot_history']  = history
+            views   = {p.pid: asdict(p) for p in history}
+            summary['pilot_history']  = list(views.values())
             summary['node_hours_used'] = node_hours(history, now=now)
             summary['members'] = [
-                self._member_dict(ps, m, now) for m in ps.members()
+                self._member_dict(ps, m, now, views) for m in ps.members()
             ] if cfg.multi_member else []
         return summary
 
     def _member_dict(self, ps: PoolState, m: PoolMember,
-                     now: float) -> dict:
-        '''Return the verbose per-member block (frozen contract, §9).'''
+                     now: float, views: dict[str, dict]) -> dict:
+        '''Return the verbose per-member block (frozen contract, §9).
+
+        *views* maps pid to the ``asdict`` view :meth:`_summarize_pool`
+        already built for the pool-level history.
+        '''
         mine    = ps.live_pilots_for(m.member_id)
         history = ps.pilot_history(m.member_id)
         used    = node_hours(history, now=now)
@@ -3463,7 +3463,7 @@ class PluginTaskDispatcher(Plugin):
                                         if p.state == PILOT_ACTIVE),
             'node_hours_used'     : used,
             'node_hours_remaining': ps.member_budget_left(m.member_id, now),
-            'pilot_history'       : history,
+            'pilot_history'       : [views[p.pid] for p in history],
         }
 
     # -- session-close teardown (owner lost / ttl / cancel_all) ---------

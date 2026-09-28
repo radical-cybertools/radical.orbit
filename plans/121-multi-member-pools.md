@@ -832,7 +832,7 @@ floor, and submit a *replacement* pilot for the member being removed. So:
    tasks whose only capable member just left. For every QUEUED task, if no
    *remaining* member can ever serve it (`satisfies(req, m.attributes,
    default size)` fails for all `m`), fail it with
-   `error = 'no member satisfies task requirements: <reason>'`
+   `error = 'no member satisfies the task requirements: <reason>'`
    (`_mark_task_failed`, `:2040-2050`) — otherwise a task whose only
    `software` provider just left would sit QUEUED forever. With
    `fail_unsatisfiable: false` those tasks stay QUEUED and wait for the

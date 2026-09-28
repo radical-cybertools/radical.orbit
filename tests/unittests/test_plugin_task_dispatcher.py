@@ -1818,6 +1818,23 @@ class TestMemberRemoval:
         assert task.member_id is None       # cleared with the pilot_id
         assert 'm_x' not in ps.config.members
 
+    def test_requeue_cap_failure_is_counted(self, tmp_path):
+        """A task the pilot cancel fails (``_finalize_pilot``: re-queued
+        too often) is in ``tasks_failed``, not ``tasks_requeued``."""
+        plugin, client, sid = self._two_members(tmp_path)
+        ps, _, task = self._pilot_with_task(plugin, sid, 'm_x')
+        task.requeues = ps.policy.max_requeues
+        with patch.object(plugin, '_get_psij_client',
+                          new=AsyncMock(return_value=None)):
+            r = client.request(
+                'DELETE', f'{plugin.namespace}/pool/{sid}/fed/members/m_x',
+                json={})
+        assert r.status_code == 200, r.text
+        assert task.state == TASK_FAILED
+        assert 'requeued too often' in task.error
+        assert r.json()['tasks_failed']   == 1
+        assert r.json()['tasks_requeued'] == 0
+
     def test_pilots_are_paused_before_the_member_is_dropped(self, tmp_path):
         """No other path may dispatch onto a pilot that is about to die."""
         plugin, client, sid = self._two_members(tmp_path)
@@ -1845,7 +1862,7 @@ class TestMemberRemoval:
                 json={})
         assert task.state == TASK_FAILED
         assert task.error == \
-            'no member satisfies task requirements: software missing: x'
+            'no member satisfies the task requirements: software missing: x'
         assert r.json()['tasks_failed'] == 1
 
     def test_fail_unsatisfiable_false_keeps_them_queued(self, tmp_path):
@@ -2102,6 +2119,25 @@ class TestCwdAtDispatch:
         assert task.cwd == str(tmp_path / 'member_x' / 't.1')
         assert Path(task.cwd).is_dir()      # shared_fs → broker mkdirs it
         assert task.member_id == 'm_x'
+
+    def test_unwritable_scratch_fails_the_task(self, tmp_path):
+        """A shared member whose scratch_base cannot be created (here: a
+        path through a regular file, which fails even as root) fails the
+        task at claim time instead of launching it into a missing cwd."""
+        (tmp_path / 'blocker').write_text('')
+        plugin, client, sid = _class_session(tmp_path, members=[
+            _member('m_x', scratch_base=str(tmp_path / 'blocker' / 's'))])
+        ps    = _pool(plugin, sid, 'fed')
+        pilot = self._active(ps, sid)
+        with patch.object(ps.policy, 'pick_dispatch', return_value=None):
+            client.post(f'{plugin.namespace}/submit/{sid}', json={
+                'pool': 'fed', 'task_id': 't.1', 'cmd': ['/bin/echo']})
+        self._dispatch(plugin, ps, ps.tasks['t.1'], pilot)
+        task = ps.tasks['t.1']
+        assert task.state == TASK_FAILED
+        assert task.error.startswith(
+            f"could not create task cwd {tmp_path / 'blocker' / 's' / 't.1'}")
+        assert pilot.in_flight == 0
 
     def test_nothing_created_locally_for_a_non_shared_member(self, tmp_path):
         plugin, client, sid = _class_session(tmp_path, members=[

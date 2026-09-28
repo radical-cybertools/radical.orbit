@@ -327,6 +327,13 @@ class TestTaskRecordMemberFields:
         assert t.spooled == ['held.txt']
 
 
+def _recs(hist):
+    """Build pilot records from field dicts (``node_hours`` input)."""
+    return [PilotRecord(**{'pid': f'p.{i}', 'pool': 'x', 'size_key': 's',
+                           'rhapsody_backend': 'b', **d})
+            for i, d in enumerate(hist)]
+
+
 class TestNodeHours:
 
     def test_empty_history(self):
@@ -335,33 +342,33 @@ class TestNodeHours:
 
     def test_from_the_snapshot(self):
         hist = [{'nodes': 2, 'active_at': 1000.0, 'finished_at': 4600.0}]
-        assert node_hours(hist) == 2.0
+        assert node_hours(_recs(hist)) == 2.0
 
     def test_queue_time_is_never_charged(self):
         """No ``active_at`` -> the pilot never ran; charge nothing.  Queue
         time is not allocation time."""
         hist = [{'nodes': 1, 'submitted_at': 1000.0, 'finished_at': 2800.0}]
-        assert node_hours(hist) == 0.0
+        assert node_hours(_recs(hist)) == 0.0
 
     def test_charged_from_active_at_not_submitted_at(self):
         hist = [{'nodes': 1, 'submitted_at': 0.0, 'active_at': 1000.0,
                  'finished_at': 2800.0}]
-        assert node_hours(hist) == 0.5
+        assert node_hours(_recs(hist)) == 0.5
 
     def test_live_pilot_charged_up_to_now(self):
         hist = [{'nodes': 1, 'active_at': 1000.0, 'finished_at': None}]
-        assert node_hours(hist, now=8200.0) == 2.0
+        assert node_hours(_recs(hist), now=8200.0) == 2.0
 
     def test_unstarted_pilot_is_not_charged(self):
         """A record that never reached ACTIVE must not be charged from the
         epoch to now."""
-        assert node_hours([{'nodes': 4, 'submitted_at': 1000.0,
-                            'active_at': None}], now=8200.0) == 0.0
+        assert node_hours(_recs([{'nodes': 4, 'submitted_at': 1000.0,
+                                  'active_at': None}]), now=8200.0) == 0.0
 
     def test_entry_without_snapshot_is_skipped(self):
         hist = [{'size_key': 's', 'active_at': 1000.0,
                  'finished_at': 4600.0}]
-        assert node_hours(hist) == 0.0
+        assert node_hours(_recs(hist)) == 0.0
 
     def test_mixed_node_counts_are_summed_per_snapshot(self):
         """The reason the snapshot exists: a mixed-node-count pool sized
@@ -370,12 +377,12 @@ class TestNodeHours:
                  'finished_at': 4600.0},
                 {'nodes': 8, 'size_key': 's', 'active_at': 1000.0,
                  'finished_at': 4600.0}]
-        assert node_hours(hist) == 9.0
+        assert node_hours(_recs(hist)) == 9.0
 
     def test_negative_interval_is_clamped(self):
         hist = [{'nodes': 1, 'active_at': 100.0, 'finished_at': 50.0}]
-        assert node_hours(hist) == 0.0
+        assert node_hours(_recs(hist)) == 0.0
 
     def test_zero_node_entry_skipped(self):
-        assert node_hours([{'nodes': 0, 'active_at': 1000.0,
-                            'finished_at': 4600.0}]) == 0.0
+        assert node_hours(_recs([{'nodes': 0, 'active_at': 1000.0,
+                                  'finished_at': 4600.0}])) == 0.0

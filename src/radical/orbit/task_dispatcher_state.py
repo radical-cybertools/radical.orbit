@@ -34,7 +34,7 @@ import time
 
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 log = logging.getLogger('radical.orbit')
 
@@ -185,34 +185,32 @@ class TaskRecord:
 # Node-hour accounting
 # ---------------------------------------------------------------------------
 
-def node_hours(history: list[dict] | None,
+def node_hours(pilots: Iterable[PilotRecord] | None,
                now: float | None = None) -> float:
-    '''Return the node-hours consumed by a list of pilot dicts.
+    '''Return the node-hours consumed by *pilots*, a list of :class:`PilotRecord`.
 
-    *history* is a list of ``asdict(PilotRecord)`` views (the pool- or
-    member-level ``pilot_history`` of a verbose summary).  A pilot that has
-    not finished yet is charged up to *now*.
+    Records, not ``asdict`` views: budget reads run per member per policy
+    tick, and a deep copy per pilot per read is pure waste.  A pilot that
+    has not finished yet is charged up to *now*.
 
-    The node count is ``entry['nodes']`` — the size snapshot taken at
+    The node count is ``PilotRecord.nodes`` — the size snapshot taken at
     submit time.  It is the only source that is correct for a
     **mixed-node-count** pool and the only one that still works once the
-    pilot's member has been removed (its size menu is gone with it).  An
-    entry without one (a pre-121 record) is skipped.
+    pilot's member has been removed (its size menu is gone with it).  A
+    record without one (a pre-121 record) is skipped.
 
-    An entry with no ``active_at`` is skipped entirely: a pilot that never
+    A record with no ``active_at`` is skipped entirely: a pilot that never
     reached ACTIVE consumed no allocation, and queue time is not charged.
 
     This lives here, not in the federation, because the dispatcher needs it
     for its own per-member summary and must not import a federation module.
     '''
-    if not history:
-        return 0.0
     if now is None:
         now = time.time()
 
     total = 0.0
-    for entry in history:
-        nodes = entry.get('nodes') or 0
+    for pilot in pilots or ():
+        nodes = pilot.nodes or 0
         if not nodes:
             continue
 
@@ -221,10 +219,10 @@ def node_hours(history: list[dict] | None,
         # nothing.  (Falling back to ``submitted_at`` would both bill queue
         # time and charge a never-started record from the epoch to `now`.)
         # This matches the federation's node_hours_from_history semantics.
-        start = entry.get('active_at')
+        start = pilot.active_at
         if not start:
             continue
-        end = entry.get('finished_at') or now
+        end = pilot.finished_at or now
         total += nodes * max(0.0, float(end) - float(start)) / 3600.0
 
     return total

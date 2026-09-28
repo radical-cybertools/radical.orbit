@@ -343,7 +343,7 @@ than waiting a tick.
 
 - `fail_unsatisfiable` (default `true`) fails a QUEUED task no *remaining*
   member could ever serve, with
-  `no member satisfies task requirements: <reason>`, instead of leaving it
+  `no member satisfies the task requirements: <reason>`, instead of leaving it
   QUEUED forever.  Pass `false` when the member may come back (an endpoint
   blip) and those tasks should wait for it.
 - `cancel_tasks` fails every task the member was running, satisfiable or

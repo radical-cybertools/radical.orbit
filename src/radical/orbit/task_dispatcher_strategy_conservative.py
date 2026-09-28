@@ -370,10 +370,10 @@ class ConservativePolicy(DispatchPolicy):
             if self._router_preference == 'youngest':
                 # Most remaining walltime = largest walltime_deadline
                 cands.sort(key=lambda p: (-p.walltime_deadline,
-                                          p.member_id or ''))
+                                          p.member_id))
             else:  # 'least_loaded'
                 cands.sort(key=lambda p: (p.in_flight, -p.walltime_deadline,
-                                          p.member_id or ''))
+                                          p.member_id))
 
             return task, cands[0]
 
