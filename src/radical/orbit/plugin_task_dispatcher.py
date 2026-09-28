@@ -1399,18 +1399,22 @@ class PluginTaskDispatcher(Plugin):
             'cwd'       : cwd,
             'task_backend_specific_kwargs': {'cwd': cwd},
         }
+        # map before submitting, as in pool mode: the task can finish before
+        # the threaded submit call returns
+        self._endpoint_mode_tasks[task_id] = target_endpoint
+        self._persist_endpoint_mode()
         try:
             result = await asyncio.to_thread(rh.submit_tasks, [task_dict])
         except Exception as e:
             log.exception('[%s] endpoint-mode submit to %s failed: %s',
                           self.instance_name, target_endpoint, e)
+            if self._endpoint_mode_tasks.pop(task_id, None):
+                self._persist_endpoint_mode()
             raise HTTPException(
                 status_code=502,
                 detail=f'rhapsody submit failed on '
                        f'{target_endpoint}: {e}') from e
 
-        self._endpoint_mode_tasks[task_id] = target_endpoint
-        self._persist_endpoint_mode()
         return {
             'task_id' : task_id,
             'endpoint': target_endpoint,
@@ -2151,20 +2155,28 @@ class PluginTaskDispatcher(Plugin):
                 }
             fwds.append((task, fwd))
 
+        # Map uids before submitting: a sub-second task can report terminal
+        # before the threaded submit call returns, and an unmapped terminal
+        # event is dropped.
+        for task, fwd in fwds:
+            task.rhapsody_uid = fwd['uid']
+            self._uid_to_task[fwd['uid']] = (pool_state.owning_sid,
+                                             pool_state.config.name,
+                                             task.task_id)
+
         try:
             await asyncio.to_thread(rh.submit_tasks, [f for _, f in fwds])
-            for task, fwd in fwds:
-                task.rhapsody_uid = fwd['uid']
-                self._uid_to_task[fwd['uid']] = (pool_state.owning_sid,
-                                                 pool_state.config.name,
-                                                 task.task_id)
             self._mark_dirty(pool_state)
         except Exception as e:
             log.exception('[%s] rhapsody submit failed for %d task(s): %s',
                           self.instance_name, len(tasks), e)
-            for task, _ in fwds:
-                self._mark_task_failed(pool_state, task,
-                                       f'rhapsody submit error: {e}')
+            for task, fwd in fwds:
+                self._uid_to_task.pop(fwd['uid'], None)
+                # a task the pilot already finished keeps that outcome
+                if task.state not in TASK_TERMINAL_STATES:
+                    task.rhapsody_uid = None
+                    self._mark_task_failed(pool_state, task,
+                                           f'rhapsody submit error: {e}')
 
     def _on_event(self, event: dict) -> None:
         '''Broker raw-tap callback: a child rhapsody reported a transition.
@@ -2172,12 +2184,26 @@ class PluginTaskDispatcher(Plugin):
         The tap fires on the plugin-host loop — the dispatcher's own loop — so
         terminal handling runs inline.  The tap is unfiltered, so filter here
         on plugin/topic; the rhapsody uid → pool mapping is ``_uid_to_task``.
+
+        Rhapsody ships one completion as ``task_status`` and several as
+        ``task_status_batch`` under ``tasks``
+        (``plugin_rhapsody._flush_notifications``); both are handled, as in
+        ``RhapsodyClient._on_task_done``.
         '''
         if event.get('plugin') != 'rhapsody':
             return
-        if event.get('topic') != 'task_status':
-            return
+
         data  = event.get('data') or {}
+        topic = event.get('topic')
+        if   topic == 'task_status'      : items = [data]
+        elif topic == 'task_status_batch': items = data.get('tasks') or []
+        else                             : return
+
+        for item in items:
+            self._on_task_status(item)
+
+    def _on_task_status(self, data: dict) -> None:
+        '''One rhapsody task-status payload from the tap.'''
         uid   = data.get('uid')
         state = str(data.get('state', '')).upper()
         if not uid or state not in ('DONE', 'FAILED', 'CANCELED', 'COMPLETED'):
