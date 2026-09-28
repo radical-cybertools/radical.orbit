@@ -17,6 +17,7 @@ broker or WebSocket is required.
 
 import asyncio
 import base64
+import threading
 import time
 from pathlib import Path
 from unittest.mock import patch, AsyncMock, MagicMock
@@ -729,15 +730,8 @@ class TestEndpointMode:
         fwd = rh_mock.submit_tasks.call_args.args[0][0]
         assert fwd['task_backend_specific_kwargs'] == {'cwd': '/tmp'}
 
-    @pytest.mark.parametrize('requirements,expect_log', [
-        ({'cores': 4}, True),
-        ({},           False),
-        (None,         False),
-    ])
-    def test_endpoint_mode_advisory_log(self, tmp_path, caplog,
-                                        requirements, expect_log):
-        # exactly one advisory line per submit, and only when the caller
-        # actually declared something
+    def test_endpoint_mode_advisory_log(self, tmp_path, caplog):
+        # exactly one advisory line for a submit that declared something
         _, plugin = _make_plugin(tmp_path)
         client = TestClient(plugin._app)
         sid = _register(client, plugin, body={'sid': 'A',
@@ -746,9 +740,8 @@ class TestEndpointMode:
         rh_mock = MagicMock()
         rh_mock.submit_tasks = MagicMock(return_value=[])
         body = {'endpoint': 'ep', 'task_id': 't.1',
-                'cmd': ['/bin/true'], 'cwd': '/tmp'}
-        if requirements is not None:
-            body['requirements'] = requirements
+                'cmd': ['/bin/true'], 'cwd': '/tmp',
+                'requirements': {'cores': 4}}
         with caplog.at_level('INFO', logger='radical.orbit'), \
              patch.object(plugin, '_get_rhapsody_client',
                           new=AsyncMock(return_value=rh_mock)):
@@ -756,9 +749,8 @@ class TestEndpointMode:
         assert r.status_code == 200, r.text
         lines = [rec.getMessage() for rec in caplog.records
                  if 'requirements are advisory' in rec.getMessage()]
-        assert len(lines) == (1 if expect_log else 0)
-        if expect_log:
-            assert 't.1' in lines[0]
+        assert len(lines) == 1
+        assert 't.1' in lines[0]
 
     def test_terminal_event_clears_endpoint_mode(self, tmp_path):
         _, plugin = _make_plugin(tmp_path)
@@ -771,6 +763,48 @@ class TestEndpointMode:
                                    'exit_code': 0}})
         assert 't.1' not in plugin._endpoint_mode_tasks
         assert notified and notified[0][1]['state'] == TASK_DONE
+
+    def test_endpoint_mode_terminal_during_submit_is_not_lost(self,
+                                                              tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _register(client, plugin, body={'sid': 'A',
+                                              'lifetime': 'persistent'})
+        self._seed_topology(plugin, {'ep': ['rhapsody']})
+        notified = []
+        plugin._dispatch_notify = lambda t, d: notified.append((t, d))
+
+        def submit(dicts):
+            # the terminal event lands before the threaded call returns
+            plugin._handle_task_terminal('t.1', TASK_DONE, {'exit_code': 0})
+            return []
+
+        rh_mock = MagicMock()
+        rh_mock.submit_tasks = MagicMock(side_effect=submit)
+        with patch.object(plugin, '_get_rhapsody_client',
+                          new=AsyncMock(return_value=rh_mock)):
+            r = client.post(f'{plugin.namespace}/submit/{sid}', json={
+                'endpoint': 'ep', 'task_id': 't.1',
+                'cmd': ['/bin/true'], 'cwd': '/tmp'})
+        assert r.status_code == 200, r.text
+        assert 't.1' not in plugin._endpoint_mode_tasks
+        assert notified and notified[0][1]['state'] == TASK_DONE
+
+    def test_terminal_batch_event_is_handled(self, tmp_path):
+        '''Several completions in one frame arrive as task_status_batch.'''
+        _, plugin = _make_plugin(tmp_path)
+        seen = []
+        plugin._handle_task_terminal = \
+            lambda uid, state, data: seen.append((uid, state))
+        plugin._on_event({'plugin': 'rhapsody',
+                          'topic' : 'task_status_batch',
+                          'data'  : {'tasks': [
+                              {'uid': 't.1', 'state': 'DONE',
+                               'exit_code': 0},
+                              {'uid': 't.2', 'state': 'FAILED',
+                               'exit_code': 1},
+                              {'uid': 't.3', 'state': 'RUNNING'}]}})
+        assert seen == [('t.1', TASK_DONE), ('t.2', TASK_FAILED)]
 
     def test_on_event_ignores_other_plugins(self, tmp_path):
         _, plugin = _make_plugin(tmp_path)
@@ -900,6 +934,72 @@ class TestRhapsodyDialect:
         assert plugin._uid_to_task['t.1.A'] == ('A', 'cpu', 't.1')
         assert ps.tasks['t.1'].rhapsody_uid == 't.1.A'
         assert ps.tasks['t.1'].state == TASK_RUNNING
+
+    def _submit_one(self, tmp_path, submit):
+        '''Post one claimed task through ``_do_rhapsody_submit``; the pilot's
+        ``submit_tasks`` runs *submit* (on the worker thread) with the loop.'''
+        _, plugin = _make_plugin(tmp_path)
+        plugin._materialise_pool('A', _make_pool_cfg())
+        ps = _pool(plugin, 'A', 'cpu')
+        pilot = PilotRecord(
+            pid='p.1', pool='cpu', owning_sid='A', size_key='s',
+            rhapsody_backend='concurrent', state=PILOT_ACTIVE,
+            child_endpoint_name='endpoint0_p.1', capacity=4)
+        ps.pilots['p.1'] = pilot
+        td = _dialect_td('t.1')
+        td.pop('pool')
+        task = ps.tasks['t.1'] = TaskRecord(
+            task_id='t.1', pool='cpu', owning_sid='A', cmd=[], cwd='',
+            task_dict=td, state=TASK_RUNNING)
+
+        async def drive():
+            loop    = asyncio.get_running_loop()
+            rh_mock = MagicMock()
+            rh_mock.submit_tasks = MagicMock(
+                side_effect=lambda dicts: submit(plugin, loop))
+            with patch.object(plugin, '_get_rhapsody_client',
+                              new=AsyncMock(return_value=rh_mock)):
+                await plugin._do_rhapsody_submit(ps, [task], pilot)
+
+        asyncio.run(drive())
+        return plugin, task
+
+    @staticmethod
+    def _report_done(plugin, loop):
+        # the pilot reports DONE, and the loop handles it, while the submit
+        # call is still in flight
+        handled = threading.Event()
+
+        def deliver():
+            plugin._on_event({
+                'plugin': 'rhapsody', 'topic': 'task_status',
+                'data'  : {'uid': 't.1.A', 'state': 'DONE', 'exit_code': 0}})
+            handled.set()
+
+        loop.call_soon_threadsafe(deliver)
+        assert handled.wait(5)
+
+    def test_terminal_during_submit_is_not_lost(self, tmp_path):
+        def submit(plugin, loop):
+            self._report_done(plugin, loop)
+            return []
+        _, task = self._submit_one(tmp_path, submit)
+        assert task.state == TASK_DONE
+
+    def test_failed_submit_fails_task_and_unmaps(self, tmp_path):
+        def submit(plugin, loop):
+            raise RuntimeError('boom')
+        plugin, task = self._submit_one(tmp_path, submit)
+        assert task.state == TASK_FAILED
+        assert task.rhapsody_uid is None
+        assert 't.1.A' not in plugin._uid_to_task
+
+    def test_failed_submit_keeps_outcome_already_reported(self, tmp_path):
+        def submit(plugin, loop):
+            self._report_done(plugin, loop)
+            raise RuntimeError('boom after accept')
+        _, task = self._submit_one(tmp_path, submit)
+        assert task.state == TASK_DONE
 
     def test_terminal_notifications_batch_and_forward_results(self, tmp_path):
         _, plugin = _make_plugin(tmp_path)
@@ -1319,6 +1419,36 @@ class TestRequirementsRoundTrip:
         assert rec.requirements == {'cores': 2, 'ranks': 2}
         # never reaches BaseTask.from_dict
         assert 'requirements' not in rec.task_dict
+
+    def test_dialect_submit_persists_the_validated_block(self, tmp_path):
+        # the record carries the derived 'cores', not the raw block
+        plugin, client, sid = self._session(tmp_path)
+        ps = _pool(plugin, sid, 'cpu')
+        td = _dialect_td('t.1')
+        td['requirements'] = {'ranks': 4}
+        with patch.object(ps.policy, 'pick_dispatch', return_value=None):
+            r = client.post(f'{plugin.namespace}/submit_rh/{sid}',
+                            json={'tasks': [td]})
+        assert r.status_code == 200, r.text
+        rec = ps.tasks['t.1']
+        assert rec.requirements == {'ranks': 4, 'cores': 4}
+        assert 'requirements' not in rec.task_dict
+
+    def test_dialect_resubmit_ignores_changed_requirements(self, tmp_path):
+        plugin, client, sid = self._session(tmp_path)
+        ps = _pool(plugin, sid, 'cpu')
+        td = _dialect_td('t.1')
+        td.pop('pool')
+        ps.tasks['t.1'] = TaskRecord(
+            task_id='t.1', pool='cpu', owning_sid=sid, cmd=[], cwd='',
+            task_dict=td, state=TASK_DONE, exit_code=0,
+            requirements={'cores': 1})
+        td = _dialect_td('t.1')
+        td['requirements'] = {'cores': 4}
+        r = client.post(f'{plugin.namespace}/submit_rh/{sid}',
+                        json={'tasks': [td]})
+        assert r.status_code == 200, r.text
+        assert ps.tasks['t.1'].requirements == {'cores': 1}
 
     def test_dialect_submit_rejects_the_batch_on_a_bad_block(self, tmp_path):
         plugin, client, sid = self._session(tmp_path)

@@ -30,8 +30,8 @@ Options:
     --pools FILE  pools.json declaring the workflow's pools; forwarded
                   to the dispatcher on register_session
 
-Per-task resource requirements (all optional; every one left at its
-default means no ``requirements`` key on the wire at all):
+Per-task resource requirements (all optional; only the flags actually
+given are sent, and none given means no ``requirements`` key on the wire):
     --cores N     total CPU cores for the task; default 1
     --gpus N      total GPUs for the task; default 0
     --mem GB      memory in GB (float); default 0
@@ -40,7 +40,7 @@ default means no ``requirements`` key on the wire at all):
     --software NAME  required software attribute (repeatable)
     --label K=V   placement label (repeatable; K must be non-empty)
 
-``--ranks N`` alone is enough: when --cores is left at its default the
+``--ranks N`` alone is enough: when --cores is not given the
 dispatcher derives ``cores = max(1, ranks)``, so ``--ranks 4`` means four
 processes on four cores.  Passing an explicit ``--cores`` *below*
 ``--ranks`` is a contradiction and is refused with a 400.
@@ -112,14 +112,14 @@ def _parse_opts(opts: list[str]) -> argparse.Namespace:
     ap.add_argument('--priority', type=int, default=0)
     ap.add_argument('--in',  dest='inputs',  action='append', default=[])
     ap.add_argument('--out', dest='outputs', action='append', default=[])
-    # Per-task resource requirements.  All optional; every flag left at its
-    # default yields requirements=None, so the wire body of an existing
-    # caller is byte-identical (see _requirements_from_args).
-    ap.add_argument('--cores', type=int,   default=1)
-    ap.add_argument('--gpus',  type=int,   default=0)
-    ap.add_argument('--mem',   type=float, default=0.0)
-    ap.add_argument('--ranks', type=int,   default=1)
-    ap.add_argument('--mpi',   action='store_true')
+    # Per-task resource requirements.  All optional; only what the user
+    # typed is sent, so the wire body of a caller using none of these flags
+    # is byte-identical (see _requirements_from_args).
+    ap.add_argument('--cores', type=int,   default=None)
+    ap.add_argument('--gpus',  type=int,   default=None)
+    ap.add_argument('--mem',   type=float, default=None)
+    ap.add_argument('--ranks', type=int,   default=None)
+    ap.add_argument('--mpi',   action='store_true', default=None)
     ap.add_argument('--software', dest='software', action='append',
                     default=[])
     ap.add_argument('--label',    dest='labels',   action='append',
@@ -141,11 +141,15 @@ def _parse_opts(opts: list[str]) -> argparse.Namespace:
     args.inputs   = _flatten(args.inputs)
     args.outputs  = _flatten(args.outputs)
     args.software = _flatten(args.software)
+    labels = {}
     for label in args.labels:
-        if '=' not in label or not label.partition('=')[0]:
+        key, sep, value = label.partition('=')
+        if not sep or not key:
             print(f'radical-orbit-run: --label expects K=V with a non-empty '
                   f'key, got {label!r}', file=sys.stderr)
             sys.exit(2)
+        labels[key] = value
+    args.labels = labels
     # Endpoint mode does not support file staging yet.
     if args.endpoint and (args.inputs or args.outputs):
         print('radical-orbit-run: --in/--out are not supported with --endpoint; '
@@ -164,35 +168,21 @@ def _flatten(items: list[str]) -> list[str]:
 
 
 def _requirements_from_args(args) -> dict | None:
-    '''Assemble the ``requirements`` block, or ``None`` when all-default.
+    '''Assemble the ``requirements`` block from what the user typed.
 
-    Only non-default values are emitted, and an entirely default set
-    yields ``None`` so ``submit_task`` omits the key altogether — the
-    request body of a caller that uses none of these flags stays
-    byte-identical to what it sent before the flags existed.
-
-    Labels are ``K=V`` strings, split on the first ``=`` (validated in
-    :func:`_parse_opts`), and their values stay strings.
+    Nothing typed yields ``None`` so ``submit_task`` omits the key
+    altogether — the request body of a caller that uses none of these
+    flags stays byte-identical to what it sent before the flags existed.
+    Labels arrive already split into a dict by :func:`_parse_opts`.
     '''
-    req: dict = {}
-    if args.cores != 1:
-        req['cores'] = args.cores
-    if args.gpus:
-        req['gpus'] = args.gpus
-    if args.mem:
-        req['mem_gb'] = args.mem
-    if args.ranks != 1:
-        req['ranks'] = args.ranks
-    if args.mpi:
-        req['mpi'] = True
-    if args.software:
-        req['software'] = list(args.software)
-    if args.labels:
-        labels = {}
-        for label in args.labels:
-            key, _, value = label.partition('=')
-            labels[key] = value
-        req['labels'] = labels
+    req = {'cores'   : args.cores,
+           'gpus'    : args.gpus,
+           'mem_gb'  : args.mem,
+           'ranks'   : args.ranks,
+           'mpi'     : args.mpi,
+           'software': args.software,
+           'labels'  : args.labels}
+    req = {k: v for k, v in req.items() if v not in (None, [], {})}
     return req or None
 
 

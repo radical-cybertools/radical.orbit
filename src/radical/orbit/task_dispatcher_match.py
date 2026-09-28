@@ -26,9 +26,9 @@ from typing import Any
 
 
 # Backends whose group launch needs a ``pmi`` value the dispatcher cannot
-# infer (rhapsody dragon v1, dragon.py:484-486): they slot-queue rather
-# than place ranks.  Kept here so the matcher and the submit-time gate in
-# ``plugin_task_dispatcher`` share one list.
+# infer (rhapsody dragon v1, ``TaskLauncherV1._launch_group_task``): they
+# slot-queue rather than place ranks.  Kept here so the matcher and the
+# submit-time gate in ``plugin_task_dispatcher`` share one list.
 NO_MPI_BACKENDS = frozenset(['dragon_v1'])
 
 

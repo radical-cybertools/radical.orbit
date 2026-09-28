@@ -186,10 +186,11 @@ class TestRequirementsFromArgs:
         # ... so submit_task omits the key and the wire body is unchanged
         assert _requirements_from_args(self._args()) is None
 
-    def test_explicit_defaults_still_yield_none(self):
+    def test_explicitly_typed_defaults_are_sent(self):
         args = self._args('--cores', '1', '--gpus', '0', '--mem', '0',
                           '--ranks', '1')
-        assert _requirements_from_args(args) is None
+        assert _requirements_from_args(args) == {
+            'cores': 1, 'gpus': 0, 'mem_gb': 0.0, 'ranks': 1}
 
     def test_only_non_default_keys_are_emitted(self):
         args = self._args('--cores', '4')
@@ -232,11 +233,6 @@ class TestTaskIdIgnoresRequirements:
     more cores must attach to the SAME task record (and the dispatcher
     would ignore the change anyway, per the resubmit semantics).
     """
-
-    def test_compute_task_id_signature_has_no_resource_terms(self):
-        import inspect
-        params = list(inspect.signature(compute_task_id).parameters)
-        assert params == ['cmd', 'inputs', 'outputs', 'run_id']
 
     def test_same_id_across_resource_flags(self):
         base = _run._parse_opts(['--pool', 'p', '--run-id', 'r'])

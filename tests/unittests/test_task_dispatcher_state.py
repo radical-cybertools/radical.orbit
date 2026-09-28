@@ -218,7 +218,7 @@ class TestPoolStore:
 
     def test_save_creates_parent_dirs(self, tmp_path: Path):
         nested = tmp_path / 'a' / 'b' / 'state.json'
-        store = PoolStore(nested)
+        PoolStore(nested)
         assert nested.parent.is_dir()
 
     def test_path_property(self, tmp_path: Path):
