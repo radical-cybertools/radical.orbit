@@ -1059,18 +1059,22 @@ class PluginTaskDispatcher(Plugin):
             'cwd'       : cwd,
             'task_backend_specific_kwargs': {'cwd': cwd},
         }
+        # map before submitting, as in pool mode: the task can finish before
+        # the threaded submit call returns
+        self._endpoint_mode_tasks[task_id] = target_endpoint
+        self._persist_endpoint_mode()
         try:
             result = await asyncio.to_thread(rh.submit_tasks, [task_dict])
         except Exception as e:
             log.exception('[%s] endpoint-mode submit to %s failed: %s',
                           self.instance_name, target_endpoint, e)
+            if self._endpoint_mode_tasks.pop(task_id, None):
+                self._persist_endpoint_mode()
             raise HTTPException(
                 status_code=502,
                 detail=f'rhapsody submit failed on '
                        f'{target_endpoint}: {e}') from e
 
-        self._endpoint_mode_tasks[task_id] = target_endpoint
-        self._persist_endpoint_mode()
         return {
             'task_id' : task_id,
             'endpoint': target_endpoint,
