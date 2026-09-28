@@ -667,8 +667,7 @@ class TestEndpointMode:
         plugin._dispatch_notify = lambda t, d: notified.append((t, d))
 
         def submit(dicts):
-            # the tap runs on the loop; the terminal event can precede the
-            # return of the threaded call
+            # the terminal event lands before the threaded call returns
             plugin._handle_task_terminal('t.1', TASK_DONE, {'exit_code': 0})
             return []
 
