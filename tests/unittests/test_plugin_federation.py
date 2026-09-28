@@ -2634,12 +2634,6 @@ class TestAllocationSizing:
         assert 'no time left' in r.json()['detail']
         assert plugin._state.resources == {}
 
-    def test_a_garbage_end_time_falls_back_to_the_limit(self, tmp_path):
-        m = self._join_with_alloc(tmp_path, {'n_nodes': 1, 'runtime': 600,
-                                             'end_time': 'soon'})
-        assert m.walltime_sec == 600
-        assert m.end_time is None
-
     def test_without_an_end_time_nothing_changes(self, tmp_path):
         m = self._join_with_alloc(tmp_path, {'n_nodes': 1, 'runtime': 600})
         assert (m.walltime_sec, m.end_time) == (600, None)
@@ -2770,8 +2764,11 @@ class TestDeclaredPilotMode:
         member = plugin._state.resources['local_b'].members['cpu']
         assert (member.pilot, member.endpoint) == ('endpoint', 'ep1')
         assert member.end_time is None       # only an allocation knows it
+        # declared 0/2, but the federation reports what the dispatcher holds
+        assert (member.min_pilots, member.max_pilots) == (1, 1)
         decl = _member_decl(fake, 'fed-cpu', 'local_b.cpu')
         assert decl['pilot'] == 'endpoint'
+        assert (decl['min_pilots'], decl['max_pilots']) == (1, 1)
         # the dispatcher's parser forces the floor that drives adoption
         assert parse_member(decl, 'test', pool_name='fed-cpu').min_pilots == 1
 

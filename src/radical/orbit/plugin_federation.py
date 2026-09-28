@@ -885,6 +885,11 @@ class PluginFederation(Plugin):
                                                    label=label),
             budget           = budget,
         )
+        if pilot == PILOT_ENDPOINT:
+            # mirrors ``PoolMember.__post_init__``: the dispatcher holds
+            # exactly one adopted pilot, so report the bounds it enforces
+            member.min_pilots = 1
+            member.max_pilots = 1
         declared   = decl.get('class')
         member.cls = (validate_class(declared, label=label) if declared
                       else member.default_class())
@@ -977,7 +982,7 @@ class PluginFederation(Plugin):
         return decls
 
     @staticmethod
-    def _allocation_walltime(alloc: dict, end: float | None) -> int:
+    def _allocation_walltime(runtime: Any, end: float | None) -> int:
         '''Return the pilot walltime for an allocation-mode resource.
 
         ``queue_info``'s ``runtime`` is the job's **time limit**, not the
@@ -996,8 +1001,9 @@ class PluginFederation(Plugin):
         at least 1 and a pilot that cannot outlive its own submission is not
         a resource.
 
-        *end* is :meth:`_alloc_end_time` of *alloc*.  Without one the limit
-        is all there is, exactly as before.
+        *runtime* is the allocation's ``runtime`` and *end* its ``end_time``
+        (a float or ``None`` -- ``batch_system`` never reports anything
+        else).  Without an end the limit is all there is, exactly as before.
         '''
         if end is not None:
             remaining = int(end - time.time())
@@ -1006,26 +1012,7 @@ class PluginFederation(Plugin):
                     f'the allocation has no time left (ended {-remaining}s '
                     'ago): join a live allocation, or use mode login')
             return remaining
-        return max(1, int(alloc.get('runtime') or _DEFAULT_WALLTIME))
-
-    @staticmethod
-    def _alloc_end_time(alloc: dict) -> float | None:
-        '''Return the allocation's end as an epoch, or ``None``.
-
-        The single parse site for the endpoint's ``end_time``, so the
-        walltime and the member's stored deadline can never disagree about
-        whether there is one.  An unparseable value is *absent*, not fatal:
-        the time limit still describes the allocation well enough to run in.
-        '''
-        end = alloc.get('end_time')
-        if not end:
-            return None
-        try:
-            return float(end)
-        except (TypeError, ValueError):
-            log.warning('federation: ignoring unparseable allocation '
-                        'end_time %r', end)
-            return None
+        return max(1, int(runtime or _DEFAULT_WALLTIME))
 
     @staticmethod
     def _allocation_pool(rec: ResourceRecord, alloc: dict) -> dict:
@@ -1056,7 +1043,7 @@ class PluginFederation(Plugin):
             all_gpus = rec.capability('gpus')
             gpus     = (int(all_gpus) // nodes) if all_gpus else 0
 
-        end_time = PluginFederation._alloc_end_time(alloc)
+        end_time = alloc.get('end_time') or None
         return {
             'queue'      : 'allocation',
             'account'    : None,
@@ -1069,7 +1056,7 @@ class PluginFederation(Plugin):
                 'cpus_per_node'   : max(1, int(cpus)),
                 'gpus_per_node'   : max(0, int(gpus)),
                 'walltime_sec'    : PluginFederation._allocation_walltime(
-                    alloc, end_time),
+                    alloc.get('runtime'), end_time),
                 'rhapsody_backend': _DEFAULT_BACKEND,
             }},
         }

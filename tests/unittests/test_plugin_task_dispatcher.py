@@ -2884,38 +2884,27 @@ class TestAddMemberFingerprint:
         """The upgrade path: a member replayed off a pre-122 state dir says
         `submit` while the federation re-POSTs it as `endpoint`.  A 409 there
         would leave the member detached until the state dir was wiped."""
-        end = time.time() + 900
         plugin, client, sid = _class_session(tmp_path, members=[
             _member('m_x', endpoint_name='alloc_ep')])
+        seen = []
+        plugin._dispatch_notify = lambda t, d: seen.append((t, d))
         r = client.post(f'{plugin.namespace}/pool/{sid}/fed/members',
                         json=_member('m_x', endpoint_name='alloc_ep',
-                                     pilot='endpoint', end_time=end))
+                                     pilot='endpoint'))
         assert r.status_code == 200, r.text
         assert (r.json()['created'], r.json()['updated']) == (False, True)
+        # the Explorer learns of an update the way it learns of an add
+        assert [(t, d['action']) for t, d in seen] == \
+            [('pool_members', 'update')]
 
         member = _pool(plugin, sid, 'fed').config.members['m_x']
         assert member.pilot    == 'endpoint'
-        assert member.end_time == end
         # ... and the new mode brings its own pilot bounds with it
         assert (member.min_pilots, member.max_pilots) == (1, 1)
         # the update is durable: a reload sees the new declaration
         _, plugin2 = _make_plugin(tmp_path)
         assert _pool(plugin2, sid, 'fed').config.members['m_x'].pilot \
             == 'endpoint'
-
-    def test_a_moved_end_time_alone_updates_in_place(self, tmp_path):
-        """A re-join reports a new allocation end; that is a fact about the
-        resource, not a redeclaration of it."""
-        plugin, client, sid = _class_session(tmp_path, members=[
-            _member('m_x', pilot='endpoint', end_time=time.time() + 60)])
-        later = time.time() + 3600
-        r = client.post(f'{plugin.namespace}/pool/{sid}/fed/members',
-                        json=_member('m_x', pilot='endpoint',
-                                     end_time=later))
-        assert r.status_code == 200, r.text
-        assert r.json()['updated'] is True
-        assert _pool(plugin, sid, 'fed').config.members['m_x'].end_time \
-            == later
 
     def test_a_mode_switch_that_changes_a_bound_is_409(self, tmp_path):
         """endpoint -> submit keeps the forced 1/1 bounds: a declaration
@@ -2961,7 +2950,7 @@ class TestEndpointAdoption:
             tmp_path, members=[_adopted_member(**mkw)])
         plugin._dispatch_notify = lambda t, d: None
         if connected:
-            plugin._connected_endpoints = {_ALLOC_EP: {'rhapsody'}}
+            asyncio.run(plugin.on_topology_change(_child_topo(_ALLOC_EP)))
         return plugin, client, sid, _pool(plugin, sid, 'fed')
 
     def _adopt(self, plugin, ps):
@@ -3032,21 +3021,24 @@ class TestEndpointAdoption:
         """It is still in the topology but on its way out, so the record
         waits for the delivery that says `present` -- exactly as a submitted
         pilot's child does."""
-        plugin, _, _, ps = self._session(tmp_path)
-        plugin._suspect_endpoints = {_ALLOC_EP}
+        plugin, _, _, ps = self._session(tmp_path, connected=False)
+        asyncio.run(plugin.on_topology_change(
+            _child_topo(_ALLOC_EP, 'suspect')))
         _, rec = self._adopt(plugin, ps)
         assert rec.state == PILOT_PENDING
 
         asyncio.run(plugin.on_topology_change(_child_topo(_ALLOC_EP)))
         assert rec.state == PILOT_ACTIVE
 
-    def test_topology_tracks_which_endpoints_are_suspect(self, tmp_path):
-        plugin, _, _, _ = self._session(tmp_path)
-        asyncio.run(plugin.on_topology_change(
-            _child_topo(_ALLOC_EP, 'suspect')))
-        assert plugin._suspect_endpoints == {_ALLOC_EP}
-        asyncio.run(plugin.on_topology_change(_child_topo(_ALLOC_EP)))
-        assert plugin._suspect_endpoints == set()
+    def test_an_endpoint_without_rhapsody_fails_at_once(self, tmp_path):
+        """Every task dispatched to it would fail; say why, up front."""
+        plugin, _, _, ps = self._session(tmp_path, connected=False)
+        topo = _child_topo(_ALLOC_EP)
+        topo[_ALLOC_EP]['plugins'] = {'sysinfo': {'namespace': '/sysinfo'}}
+        asyncio.run(plugin.on_topology_change(topo))
+        _, rec = self._adopt(plugin, ps)
+        assert rec.state == PILOT_FAILED
+        assert rec.error == f'endpoint {_ALLOC_EP} serves no rhapsody'
 
     def test_a_second_adoption_is_a_no_op(self, tmp_path):
         """There is one endpoint to adopt; a second record would bind a

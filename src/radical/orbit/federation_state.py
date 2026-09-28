@@ -547,11 +547,6 @@ def _derive_member(rec: ResourceRecord) -> MemberRecord:
         member           = DEFAULT_MEMBER,
         member_id        = f'{rec.name}.{DEFAULT_MEMBER}',
         endpoint         = rec.endpoint,
-        # A pre-122 allocation record is upgraded in place: its endpoint is
-        # inside the allocation, so it is the pilot -- the very thing the
-        # second, submitted one was standing in for.
-        pilot            = (PILOT_ENDPOINT if rec.mode == MODE_ALLOCATION
-                            else PILOT_SUBMIT),
         queue            = str(decl.get('queue') or pool.get('queue') or ''),
         account          = decl.get('account', pool.get('account')),
         nodes            = int(size.get('nodes') or 1),
@@ -614,18 +609,20 @@ def record_from_dict(data: dict) -> ResourceRecord:
             # gets the resource's -- which is the one they were always
             # served by, since a resource has exactly one.
             m.endpoint = m.endpoint or rec.endpoint
-            # ... and one written before ``pilot`` existed defaults to
-            # ``submit``, which for an allocation-mode resource means "start
-            # a batch job on the compute node you are already sitting on" --
-            # precisely the second endpoint plan 122 removed, re-POSTed on
-            # the first restart after the upgrade.  The mode says what it
-            # is, so migrate it here, on load.
-            if rec.mode == MODE_ALLOCATION and 'pilot' not in entry:
-                m.pilot = PILOT_ENDPOINT
             rec.members[m.member] = m
     else:
         m = _derive_member(rec)
         rec.members[m.member] = m
+
+    # A record written before ``pilot`` existed defaults to ``submit``, which
+    # for an allocation-mode resource means "start a batch job on the compute
+    # node you are already sitting on" -- precisely the second endpoint plan
+    # 122 removed, re-POSTed on the first restart after the upgrade.  The
+    # mode says what it is: the endpoint is inside the allocation, so it is
+    # the pilot, whichever shape the record was loaded from.
+    if rec.mode == MODE_ALLOCATION:
+        for m in rec.members.values():
+            m.pilot = PILOT_ENDPOINT
     return rec
 
 

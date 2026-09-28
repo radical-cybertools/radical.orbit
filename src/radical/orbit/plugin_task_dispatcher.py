@@ -1066,11 +1066,11 @@ class PluginTaskDispatcher(Plugin):
         # validate the target of an endpoint-mode task submission.
         self._connected_endpoints: dict[str, set[str]] = {}
 
-        # The subset of the above the broker currently calls ``suspect``:
-        # still in the topology, but inside the grace window.  Kept so
-        # adopting an endpoint (plan 122) can decline to activate a pilot on
-        # one -- the topology delivery that says ``present`` will.
-        self._suspect_endpoints: set[str] = set()
+        # The last rich topology, minus ``lost`` entries (a one-delivery
+        # event, not a state).  Adopting an endpoint (plan 122) replays it
+        # through ``_reconcile_pilots_for``, so a new record is activated
+        # by exactly the rule the topology hook applies.
+        self._participants: dict[str, dict] = {}
 
         # Endpoint-mode task tracking: task_id → target_endpoint_name.
         # Endpoint mode bypasses pool state — the dispatcher is a transparent
@@ -1650,26 +1650,25 @@ class PluginTaskDispatcher(Plugin):
         Body is one member declaration.  An **identical** re-POST is a
         ``200 {"created": false}`` no-op, which is what makes the
         federation's restart replay idempotent; one that differs **only** in
-        ``pilot`` / ``end_time`` updates those two in place and answers
+        ``pilot`` updates it in place and answers
         ``200 {"created": false, "updated": true}``; any other difference is
         a 409.  There is no other partial update: a member is replaced by
         removing and re-adding it.
 
-        Those two may change in place (plan 122) because they are *facts
-        about the resource*, not a redeclaration of it: an allocation's end
-        moves with every re-join, and an upgraded federation re-POSTs its
-        allocation members as ``endpoint`` against a pool this dispatcher
-        replayed as ``submit``.  The comparison applies them to the existing
-        member and re-runs its ``__post_init__``, so the ``min_pilots`` /
-        ``max_pilots`` an ``endpoint`` member is forced to are what the new
-        declaration must carry -- and a switch that *also* changes a bound
-        is a 409 like any other change.
+        ``pilot`` may change in place (plan 122) because an upgraded
+        federation re-POSTs its allocation members as ``endpoint`` against a
+        pool this dispatcher replayed as ``submit``.  The comparison applies
+        it to the existing member and re-runs its ``__post_init__``, so the
+        bound check on a mode switch bites for ``endpoint`` -> ``submit``
+        only: the existing member's forced 1/1 is what the new declaration
+        must carry, and a switch that *also* changes a bound is a 409 like
+        any other change.  For ``submit`` -> ``endpoint`` ``parse_member``
+        has already forced the new declaration's bounds to 1/1 before the
+        comparison, so whatever bounds it declared never differ.
 
         No pilot is submitted here — the next housekeeping tick applies
         the new member's ``min_pilots`` floor.  A member switched to
-        ``pilot: endpoint`` therefore adopts its endpoint on that tick, and
-        an updated ``end_time`` caps the *next* pilot's deadline; a pilot
-        already live keeps the deadline it was given.
+        ``pilot: endpoint`` therefore adopts its endpoint on that tick.
         '''
         sid  = request.path_params['sid']
         name = request.path_params['name']
@@ -1690,47 +1689,47 @@ class PluginTaskDispatcher(Plugin):
             raise HTTPException(status_code=400, detail=str(e)) from e
 
         existing = ps.config.members.get(member.member_id)
-        updated  = False
         if existing is not None:
-            candidate = replace(existing, pilot=member.pilot,
-                                end_time=member.end_time)
-            if self._member_fingerprint(candidate) != \
-                    self._member_fingerprint(member):
+            if self._member_fingerprint(replace(existing, pilot=member.pilot)) \
+                    != self._member_fingerprint(member):
                 raise HTTPException(
                     status_code=409,
                     detail='member exists with a different declaration')
-            updated = self._member_fingerprint(existing) != \
-                self._member_fingerprint(member)
-            if updated:
-                # Only ``pilot`` / ``end_time`` differ: replace the member
-                # so the new facts hold from the next tick on.
-                ps.config.members[member.member_id] = member
-                ps.config.reproject()
-                ps.persist()
-                log.info('[%s] pool %r (sid=%s): updated member %r '
-                         '(pilot=%s, end_time=%s)', self.instance_name, name,
-                         sid, member.member_id, member.pilot, member.end_time)
-        else:
-            ps.config.members[member.member_id] = member
-            ps.config.reproject()
-            ps.persist()
+            if existing.pilot == member.pilot:
+                # everything else matched above: an identical re-POST
+                return {'pool'   : name,
+                        'member' : asdict(existing),
+                        'members': list(ps.config.members),
+                        'created': False,
+                        'updated': False}
 
-            self._dispatch_notify('pool_members', {
-                'pool'      : name,
-                'sid'       : sid,
-                'action'    : 'add',
-                'member_id' : member.member_id,
-                'member_ids': list(ps.config.members),
-            })
+        # a new member, or only ``pilot`` differs: the new one holds from
+        # the next tick on
+        ps.config.members[member.member_id] = member
+        ps.config.reproject()
+        ps.persist()
+
+        self._dispatch_notify('pool_members', {
+            'pool'      : name,
+            'sid'       : sid,
+            'action'    : 'add' if existing is None else 'update',
+            'member_id' : member.member_id,
+            'member_ids': list(ps.config.members),
+        })
+        if existing is None:
             log.info('[%s] pool %r (sid=%s): added member %r on endpoint %r',
                      self.instance_name, name, sid, member.member_id,
                      member.endpoint_name)
+        else:
+            log.info('[%s] pool %r (sid=%s): updated member %r (pilot=%s)',
+                     self.instance_name, name, sid, member.member_id,
+                     member.pilot)
 
         return {'pool'   : name,
-                'member' : asdict(ps.config.members[member.member_id]),
+                'member' : asdict(member),
                 'members': list(ps.config.members),
                 'created': existing is None,
-                'updated': updated}
+                'updated': existing is not None}
 
     async def _route_remove_member(self, request: Request) -> dict:
         '''Remove one member from a class pool, draining its pilots.
@@ -2474,21 +2473,19 @@ class PluginTaskDispatcher(Plugin):
           reclaim-drain for a *session owner* declared ``lost``; the drain then
           closes the session, which tears down its pools.
 
-        Also refreshes the cached per-endpoint plugin set from the non-lost
-        participants, and the set of endpoints currently ``suspect``.
+        Also refreshes the cached per-endpoint plugin set and the cached
+        topology from the non-lost participants.
         '''
         participants = participants or {}
 
         # Refresh {endpoint_name: set(plugin_names)} from the non-lost,
         # non-self participants.
         self_name = getattr(self._app.state, 'endpoint_name', None)
-        new: dict[str, set[str]] = {}
-        suspect: set[str] = set()
+        new:  dict[str, set[str]] = {}
+        live: dict[str, dict]     = {}
         for name, info in participants.items():
             if name == self_name:
                 continue
-            if (info or {}).get('liveness') == 'suspect':
-                suspect.add(name)
             if (info or {}).get('liveness') == 'lost':
                 # Drop cached plugin-clients on a lost endpoint so a
                 # reconnecting one re-registers fresh.
@@ -2498,9 +2495,10 @@ class PluginTaskDispatcher(Plugin):
             plugins = (info or {}).get('plugins', {})
             if isinstance(plugins, dict):
                 plugins = list(plugins.keys())
-            new[name] = set(plugins)
+            new[name]  = set(plugins)
+            live[name] = info
         self._connected_endpoints = new
-        self._suspect_endpoints   = suspect
+        self._participants        = live
 
         for ps in self._all_pools():
             self._reconcile_pilots_for(ps, participants)
@@ -2569,6 +2567,15 @@ class PluginTaskDispatcher(Plugin):
                     ps, pilot, f'pilot size {pilot.size_key!r} has zero '
                                f'capacity')
             return
+        if pilot.adopted and 'rhapsody' not in \
+                self._connected_endpoints.get(pilot.child_endpoint_name, ()):
+            # A submitted pilot's child is our own wrapper; an adopted
+            # endpoint is whatever joined, and without rhapsody every task
+            # dispatched to it would fail.
+            self._mark_pilot_failed(
+                ps, pilot, f'endpoint {pilot.child_endpoint_name} serves '
+                           f'no rhapsody')
+            return
 
         old_state = pilot.state
         pilot.capacity  = capacity
@@ -2632,10 +2639,10 @@ class PluginTaskDispatcher(Plugin):
         A ``pilot: endpoint`` member is **adopted**, not submitted (plan
         122): its endpoint already runs inside the allocation, so the
         record is created PENDING with the endpoint as its own child, no
-        psij job is asked for, and the record is activated through the very
-        same :meth:`_activate_pilot` the topology hook uses — immediately
-        when the endpoint is connected right now, otherwise on the next
-        topology delivery.
+        psij job is asked for, and the last topology is replayed through
+        :meth:`_reconcile_pilots_for` — so it is activated at once when the
+        endpoint is ``present``, and otherwise (``suspect`` or absent) by
+        the next delivery, exactly as a submitted pilot's child is.
         '''
         cfg    = pool_state.config
         member = cfg.member(member_id) if member_id else None
@@ -2699,13 +2706,7 @@ class PluginTaskDispatcher(Plugin):
             log.info('[%s] pool %r: adopting endpoint %r as pilot %s for '
                      'member %r', self.instance_name, cfg.name,
                      member.endpoint_name, pid, member.member_id)
-            # A suspect endpoint is reachable-ish but on the way out, and
-            # `_activate_pilot` would start dispatching to it: leave the
-            # record PENDING and let the next topology delivery decide, the
-            # same way a submitted pilot's child waits for `present`.
-            if member.endpoint_name in self._connected_endpoints \
-                    and member.endpoint_name not in self._suspect_endpoints:
-                self._activate_pilot(pool_state, record)
+            self._reconcile_pilots_for(pool_state, self._participants)
         else:
             asyncio.create_task(
                 self._do_pilot_submit(pool_state, record, size, member))
@@ -3208,9 +3209,7 @@ class PluginTaskDispatcher(Plugin):
                 elif task.task_dict is None:
                     marker = spool / _CWD_MARKER
                     marker.parent.mkdir(parents=True, exist_ok=True)
-                    # one byte, not zero: a staging plugin older than the
-                    # empty-put fix answers 400 "Missing 'content'" to an
-                    # empty file (seen on Perlmutter, 2026-09-09)
+                    # 1 byte, not 0: older endpoints' staging 400s an empty put
                     marker.write_bytes(b'\n')
                     await asyncio.to_thread(
                         stg.put, str(marker),
@@ -3669,12 +3668,10 @@ class PluginTaskDispatcher(Plugin):
         member: an older failure that *does* say why is the better answer.
         '''
         for entry in reversed(history or []):
-            if not isinstance(entry, dict):
-                continue
             if entry.get('active_at'):
                 return None
             if entry.get('state') == PILOT_FAILED and entry.get('error'):
-                return str(entry['error'])[:PILOT_ERROR_MAX]
+                return entry['error']
         return None
 
     def _member_dict(self, ps: PoolState, m: PoolMember,

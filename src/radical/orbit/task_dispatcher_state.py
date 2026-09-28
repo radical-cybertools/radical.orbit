@@ -21,7 +21,7 @@ Pilot:  ``PENDING → STARTING → ACTIVE → (DONE | FAILED)``
         skipping ``STARTING`` if the pilot came up faster than expected.)
         Three timestamps bracket that walk — ``submitted_at``, ``active_at``
         and ``finished_at`` — so a terminal pilot still carries the interval
-        it actually held the allocation (see :meth:`PilotRecord.uptime`).
+        it actually held the allocation (see :func:`node_hours`).
 
 Task:   ``QUEUED → RUNNING → (DONE | FAILED | CANCELED)``
 '''
@@ -132,18 +132,6 @@ class PilotRecord:
         if self.active_at is None:
             return None
         return self.active_at - self.submitted_at
-
-    def uptime(self, now: float) -> float:
-        '''Return the ACTIVE duration in seconds (0 for a pilot never ACTIVE).
-
-        A pilot still live is measured against *now*; a finalised one against
-        its ``finished_at``.  The accounting primitive behind node-hour usage:
-        a consumer multiplies this by the pilot's node count.
-        '''
-        if self.active_at is None:
-            return 0.0
-        end = self.finished_at if self.finished_at is not None else now
-        return max(0.0, end - self.active_at)
 
     def is_terminal(self) -> bool:
         '''Return whether this pilot is in a terminal (DONE/FAILED) state.'''

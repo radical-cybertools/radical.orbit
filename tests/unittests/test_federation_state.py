@@ -534,11 +534,11 @@ class TestPilotModeMigration:
         m = record_from_dict(self._raw(MODE_LOGIN)).members['default']
         assert m.pilot == 'submit'
 
-    def test_an_explicit_pilot_is_never_overridden(self):
-        """Only a *missing* key is migrated: an operator who wrote `submit`
-        on an allocation member said what they meant."""
+    def test_an_allocation_member_is_always_the_endpoint(self):
+        """The mode says what it is: even a stored `submit` is migrated --
+        a join never writes one for an allocation."""
         raw = self._raw(MODE_ALLOCATION, pilot='submit')
-        assert record_from_dict(raw).members['default'].pilot == 'submit'
+        assert record_from_dict(raw).members['default'].pilot == 'endpoint'
 
     def test_the_migration_survives_a_save_and_reload(self, tmp_path):
         p  = tmp_path / 'state.json'
@@ -662,7 +662,7 @@ class TestSingleMemberDerivation:
     def test_members_survive_persistence(self, tmp_path):
         p   = tmp_path / 'state.json'
         st  = FederationState(p)
-        rec = _rec(name='beta')
+        rec = _rec(name='beta', mode=MODE_LOGIN)
         rec.members['gpu'] = _member()
         st.resources['beta'] = rec
         st.save()

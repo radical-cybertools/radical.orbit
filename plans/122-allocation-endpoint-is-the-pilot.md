@@ -145,7 +145,9 @@ since 9d69484): `lost`, `failing`, `stale`, `idle` (ok, `pilots_active ==
 0`, no recorded failure), `ok`. An adopted member is `failing` only on a
 recorded failure (`pilot_error` set), never merely because no pilot is
 ACTIVE yet -- the join→first-tick window and `_activate_pilot`'s
-zero-capacity return would otherwise flash `failing`. `MemberRecord` gains
+zero-capacity return would otherwise flash `failing`. A member with a
+recorded failure still below the failure threshold reads `ok` -- neither
+`idle` nor `failing`. `MemberRecord` gains
 `pilot`, `endpoint` and `end_time` (touch `member_from_dict`,
 `_derive_member`, `_implicit_member`, `_declared_member`, `_member_decl`,
 `to_wire`). Resource state: the worst of its members' with `idle` ranked *below*
