@@ -1286,6 +1286,22 @@ class TestRequirementsRoundTrip:
         assert rec.requirements == {'ranks': 4, 'cores': 4}
         assert 'requirements' not in rec.task_dict
 
+    def test_dialect_resubmit_ignores_changed_requirements(self, tmp_path):
+        plugin, client, sid = self._session(tmp_path)
+        ps = _pool(plugin, sid, 'cpu')
+        td = _dialect_td('t.1')
+        td.pop('pool')
+        ps.tasks['t.1'] = TaskRecord(
+            task_id='t.1', pool='cpu', owning_sid=sid, cmd=[], cwd='',
+            task_dict=td, state=TASK_DONE, exit_code=0,
+            requirements={'cores': 1})
+        td = _dialect_td('t.1')
+        td['requirements'] = {'cores': 4}
+        r = client.post(f'{plugin.namespace}/submit_rh/{sid}',
+                        json={'tasks': [td]})
+        assert r.status_code == 200, r.text
+        assert ps.tasks['t.1'].requirements == {'cores': 1}
+
     def test_dialect_submit_rejects_the_batch_on_a_bad_block(self, tmp_path):
         plugin, client, sid = self._session(tmp_path)
         ps = _pool(plugin, sid, 'cpu')

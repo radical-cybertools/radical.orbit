@@ -353,9 +353,6 @@ def backend_kwargs(req: dict, backend: str) -> dict:
     Everything emitted is msgpack-primitive (int / str / dict) — the
     forwarded dict is msgpack-packed on the way to the pilot.
     '''
-    if not req:
-        return {}
-
     r      = {**_REQ_DEFAULTS, **req}
     ranks  = r['ranks']
     cores  = r['cores']
