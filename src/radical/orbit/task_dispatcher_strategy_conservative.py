@@ -77,7 +77,7 @@ import time
 
 from typing import TYPE_CHECKING, Callable
 
-from .task_dispatcher_config import PoolConfig, IMPLICIT_MEMBER
+from .task_dispatcher_config import PoolConfig
 from .task_dispatcher_match  import satisfies
 from .task_dispatcher_policy import DispatchPolicy
 from .task_dispatcher_state  import (
@@ -136,10 +136,9 @@ class ConservativePolicy(DispatchPolicy):
                 f"{self._member_preference!r}; expected 'budget' "
                 f"or 'least_loaded'")
 
-        # Per-member bookkeeping, keyed on the member id.  A pilot
-        # record carries '' for a legacy pool's implicit member, which
-        # normalises to IMPLICIT_MEMBER -- the id its PoolMember has, so
-        # the two sides of every lookup agree.
+        # Per-member bookkeeping, keyed on the member id (``''`` for a
+        # legacy pool's implicit member, on the pilot record and the
+        # PoolMember alike).
         self._last_submit_ts      : dict[str, float] = {}
         # Failure-backoff guard: pause submissions for a member when N of
         # its pilots fail consecutively without ever reaching ACTIVE.  Any
@@ -166,7 +165,7 @@ class ConservativePolicy(DispatchPolicy):
         reaching ACTIVE resets its counter — a member whose endpoint is down
         must not silence a healthy sibling.
         '''
-        mid = pilot.member_id or IMPLICIT_MEMBER
+        mid = pilot.member_id
 
         if new_state == PILOT_ACTIVE:
             self._consecutive_failures[mid] = 0
@@ -197,7 +196,7 @@ class ConservativePolicy(DispatchPolicy):
         deadline already in the past is not a pause any more, and reading
         it as one would leave a healthy member marked forever.
         '''
-        mid   = member_id or IMPLICIT_MEMBER
+        mid   = member_id
         until = self._backoff_until.get(mid, 0.0)
         return {'consecutive_pilot_failures':
                     int(self._consecutive_failures.get(mid, 0)),
@@ -341,9 +340,7 @@ class ConservativePolicy(DispatchPolicy):
             # backlog -- the oldest unservable one when there is one.
             head = unservable[0] if unservable else pending[0]
             candidates = [m for m in members
-                          if satisfies(head.requirements, m.attributes,
-                                       m.pilot_sizes.get(m.default_size))
-                          is None]
+                          if m.reject_reason(head.requirements) is None]
             eligible = self._pass_guards(pool_state, candidates, now_ts)
 
         if not eligible:
@@ -372,7 +369,7 @@ class ConservativePolicy(DispatchPolicy):
             eligible.sort(key=_key)
         chosen = eligible[0]
 
-        # -- 5. submit ---------------------------------------------------
+        # -- 4. submit ---------------------------------------------------
         try:
             pid = submit_pilot(None, member_id=chosen.member_id)
             self._last_submit_ts[chosen.member_id] = now_ts

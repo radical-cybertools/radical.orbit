@@ -254,7 +254,6 @@ CPU, `concurrent` backend).
 | `GET`  | `stage_out/{sid}/{task_id}/{filename}` | Download an output file (**broker-local only**) |
 | `POST` | `pool/{sid}/{name}/members` | Add one member to a class pool |
 | `DELETE` | `pool/{sid}/{name}/members/{member_id}` | Remove one member, draining its pilots |
-| `POST` | `pool/{sid}/{name}/members/{member_id}/remove` | Same, for callers without a DELETE verb |
 
 There is deliberately **no add-pool route**: `register_session` already
 adds pools to a live session — it reconnects the sid and then materialises

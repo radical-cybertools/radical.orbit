@@ -210,15 +210,15 @@ def prep_stream(lines: list[str], run_id: str,
                 scope_pool = _expect_string(value, name, i + 1)
                 scope_endpoint = None
             elif name == 'PRIORITY':
-                scope_priority = _expect_int(value, name, i + 1)
+                scope_priority = _expect_number(value, name, i + 1)
             elif name == 'POOLS':
                 scope_pools = _expect_string(value, name, i + 1)
             elif name == 'CORES':
-                scope_cores = _expect_int(value, name, i + 1)
+                scope_cores = _expect_number(value, name, i + 1)
             elif name == 'GPUS':
-                scope_gpus = _expect_int(value, name, i + 1)
+                scope_gpus = _expect_number(value, name, i + 1)
             elif name == 'MEM':
-                scope_mem = _expect_float(value, name, i + 1)
+                scope_mem = _expect_number(value, name, i + 1, float)
             # Our directives are consumed — don't emit to output.
             i += 1
             continue
@@ -314,24 +314,15 @@ def _expect_string(value: str, name: str, line_no: int) -> str:
     return value
 
 
-def _expect_int(value: str, name: str, line_no: int) -> int:
+def _expect_number(value: str, name: str, line_no: int, conv=int):
+    '''Parse a directive value with *conv* (``int``, or ``float`` for MEM).'''
     value = value.strip('"\'')
     try:
-        return int(value)
+        return conv(value)
     except ValueError as e:
+        kind = 'an integer' if conv is int else 'a number'
         raise PrepError(
-            f'line {line_no}: {name} must be an integer, got {value!r}'
-        ) from e
-
-
-def _expect_float(value: str, name: str, line_no: int) -> float:
-    '''Parse a directive value as a float (``MEM = "1.5"``).'''
-    value = value.strip('"\'')
-    try:
-        return float(value)
-    except ValueError as e:
-        raise PrepError(
-            f'line {line_no}: {name} must be a number, got {value!r}'
+            f'line {line_no}: {name} must be {kind}, got {value!r}'
         ) from e
 
 

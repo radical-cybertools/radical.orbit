@@ -122,9 +122,8 @@ ps.pending_queue()               # [TaskRecord] QUEUED, priority-ordered
 ps.live_pilots()                 # [PilotRecord] non-terminal
 
 ps.members()                     # [PoolMember] in declaration order
-ps.member(mid)                   # PoolMember | None  ('' -> implicit)
+ps.member(mid)                   # PoolMember | None  ('' = implicit)
 ps.live_pilots_for(mid)          # [PilotRecord] for one member
-ps.member_node_hours(mid, now)   # float
 ps.member_budget_left(mid, now)  # float | None  (None = no budget)
 ps.size_of(pilot)                # PilotSize | None (snapshot first)
 ```

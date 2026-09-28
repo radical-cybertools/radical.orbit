@@ -2055,7 +2055,7 @@ class TestMemberDeclarationParses:
     def _parse_all(self, plugin):
         parsed = {}
         for pool, decl in self._decls(plugin):
-            member = parse_member(decl, f'test: {pool}', pool)
+            member = parse_member(decl, f'test: {pool}', pool_name=pool)
             parsed[member.member_id] = member
         assert parsed
         return parsed
@@ -2122,7 +2122,7 @@ class TestMemberDeclarationParses:
         decl = dict(decl)
         decl['member_id'] = 'a' * (MAX_POOL_MEMBER_NAME_LEN - len(pool) + 1)
         with pytest.raises(Exception) as ei:
-            parse_member(decl, 'test', pool)
+            parse_member(decl, 'test', pool_name=pool)
         assert str(MAX_POOL_MEMBER_NAME_LEN) in str(ei.value)
 
 
@@ -2747,7 +2747,7 @@ class TestPilotPayload:
         assert decl['pilot']    == 'endpoint'
         assert decl['end_time'] == end
         # and it survives the parser the real dispatcher runs it through
-        member = parse_member(decl, 'test', 'fed-cpu')
+        member = parse_member(decl, 'test', pool_name='fed-cpu')
         assert member.pilot    == 'endpoint'
         assert member.end_time == end
         assert (member.min_pilots, member.max_pilots) == (1, 1)
@@ -2773,7 +2773,7 @@ class TestDeclaredPilotMode:
         decl = _member_decl(fake, 'fed-cpu', 'local_b.cpu')
         assert decl['pilot'] == 'endpoint'
         # the dispatcher's parser forces the floor that drives adoption
-        assert parse_member(decl, 'test', 'fed-cpu').min_pilots == 1
+        assert parse_member(decl, 'test', pool_name='fed-cpu').min_pilots == 1
 
     def test_an_unknown_pilot_mode_is_a_400(self, tmp_path):
         client, plugin, _ = _joinable(tmp_path)

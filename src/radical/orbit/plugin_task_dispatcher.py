@@ -60,10 +60,10 @@ from .plugin_rhapsody                   import (
     _payload_size, _resolve_notify_window, _resolve_frame_cap, BUDGET_RATIO,
 )
 from .task_dispatcher_config            import (
-    PoolConfig, PoolMember, PilotSize, PoolConfigError, IMPLICIT_MEMBER,
+    PoolConfig, PoolMember, PilotSize, PoolConfigError,
     PILOT_ENDPOINT, default_pool_config, parse_pools, parse_member,
 )
-from .task_dispatcher_match             import satisfies, NO_MPI_BACKENDS
+from .task_dispatcher_match             import NO_MPI_BACKENDS
 from .task_dispatcher_state             import (
     PilotRecord, TaskRecord, PoolStore, node_hours,
     records_from, read_json, write_json_atomic,
@@ -137,11 +137,12 @@ _REQ_DEFAULTS: dict = {
 }
 
 # Backends whose group launch needs a ``pmi`` value the dispatcher cannot
-# infer (rhapsody dragon v1, dragon.py:484-486).  ``mpi: true`` on a pool
-# where *every* size of *every* member names one of these is refused at
-# submit; where some members can, the task is accepted and the policy
-# simply never offers it a dragon_v1 pilot.  Defined once in
-# ``task_dispatcher_match`` so the gate and the matcher cannot drift.
+# infer (rhapsody dragon v1, ``TaskLauncherV1._launch_group_task``).
+# ``mpi: true`` on a pool where *every* size of *every* member names one
+# of these is refused at submit; where some members can, the task is
+# accepted and the policy simply never offers it a dragon_v1 pilot.
+# Defined once in ``task_dispatcher_match`` so the gate and the matcher
+# cannot drift.
 _NO_MPI_BACKENDS = NO_MPI_BACKENDS
 
 # Task inputs carried inline on a pool-mode submit (``inputs_b64``),
@@ -171,7 +172,7 @@ def child_endpoint_name(pool: str, member_id: str | None, pid: str) -> str:
     Exported so the federation and the campaign runner can reproduce the
     name as a fallback rather than re-deriving the rule.
     '''
-    if not member_id or member_id == IMPLICIT_MEMBER:
+    if not member_id:
         return f'{pool}_{pid}'
     return f'{pool}_{member_id}_{pid}'
 
@@ -265,17 +266,14 @@ def parse_requirements(raw: Any) -> dict:
                 "requirements: 'labels' must be a mapping of string to "
                 "string|number")
 
-    gpus  = req.get('gpus',  _REQ_DEFAULTS['gpus'])
-    ranks = req.get('ranks', _REQ_DEFAULTS['ranks'])
+    # 'ranks' without 'cores' means "N processes": derive the core count.
+    if 'cores' not in req and req.get('ranks', 1) > 1:
+        req['cores'] = req['ranks']
 
-    # 'ranks' without 'cores' means "N processes" -- derive the core count
-    # instead of refusing it against the cores default of 1.  Only an
-    # OMITTED cores is filled in, and only when the derived value differs
-    # from the default, so a block declaring neither stays untouched.  An
-    # explicit cores below ranks is a contradiction, and still a 400.
-    cores = req.get('cores', max(_REQ_DEFAULTS['cores'], ranks))
-    if 'cores' not in req and cores != _REQ_DEFAULTS['cores']:
-        req['cores'] = cores
+    r     = {**_REQ_DEFAULTS, **req}
+    cores = r['cores']
+    gpus  = r['gpus']
+    ranks = r['ranks']
 
     # ``cores >= ranks`` keeps ``cores_per_rank = cores // ranks`` from ever
     # being 0; ``gpus % ranks == 0`` keeps ``gpus_per_rank`` an exact integer
@@ -313,7 +311,8 @@ def check_requirements_against_pool(req: dict, pool: PoolConfig) -> None:
     :class:`PilotSize` carries no memory field.  Note the ``ranks`` bound
     is only *approximate* for ``dragon_v1``, whose real hang condition is
     ``ranks`` above the **free** slot count at that instant
-    (dragon.py:1899-1904); only enforcement (deferred) can bound that.
+    (``DragonExecutionBackendV1._submit_task``); only enforcement
+    (deferred) can bound that.
 
     Beware the built-in ``default`` pool: its single size has
     ``cpus_per_node = 1``, so any ``cores >= 2`` is a 400 there.
@@ -340,15 +339,10 @@ def check_requirements_against_pool(req: dict, pool: PoolConfig) -> None:
     if not members:
         # An emptied class pool (its last member removed with ``force``)
         # can run nothing.  Say so rather than queue a task forever --
-        # this is the only path that can observe a member-less pool, and
-        # it holds whether or not the task declared requirements.
-        if pool.multi_member:
-            raise RequirementsError(
-                f'pool {pool.name!r} has no members')
-        return
-
-    if not req:
-        return
+        # this is the only path that can observe a member-less pool (a
+        # legacy pool always has its implicit member), and it holds
+        # whether or not the task declared requirements.
+        raise RequirementsError(f'pool {pool.name!r} has no members')
 
     # (display_name, PilotSize) across every member, ordered by the name
     # the message would print, so `max` breaks ties lexically exactly as
@@ -361,8 +355,9 @@ def check_requirements_against_pool(req: dict, pool: PoolConfig) -> None:
     if not entries:
         return
 
-    cores = req.get('cores', _REQ_DEFAULTS['cores'])
-    gpus  = req.get('gpus',  _REQ_DEFAULTS['gpus'])
+    r     = {**_REQ_DEFAULTS, **req}
+    cores = r['cores']
+    gpus  = r['gpus']
 
     def _largest(attr: str) -> tuple:
         '''Return the ``(name, value)`` maximising *attr* (name breaks ties).'''
@@ -381,17 +376,17 @@ def check_requirements_against_pool(req: dict, pool: PoolConfig) -> None:
             f"requirements: {gpus} gpus exceed every pilot_size "
             f"(largest: {key!r}, {val} gpus/node)")
 
-    if req.get('mpi') and all(s.rhapsody_backend in _NO_MPI_BACKENDS
-                              for _, s in entries):
+    if r['mpi'] and all(s.rhapsody_backend in _NO_MPI_BACKENDS
+                        for _, s in entries):
         if qualify:
             backends = sorted({s.rhapsody_backend for _, s in entries})
             raise RequirementsError(
                 f"an mpi task cannot run on this pool: every member's "
                 f"backend is {', '.join(backends)}")
-        key = entries[0][0]
+        key, size = entries[0]
         raise RequirementsError(
             f"requirements: 'mpi' is unsupported on "
-            f"{dict(entries)[key].rhapsody_backend} (pool {pool.name!r}, "
+            f"{size.rhapsody_backend} (pool {pool.name!r}, "
             f"size {key!r})")
 
     if qualify:
@@ -401,13 +396,37 @@ def check_requirements_against_pool(req: dict, pool: PoolConfig) -> None:
         attrs_req = {k: v for k, v in req.items()
                      if k in ('software', 'labels')}
         if attrs_req:
-            reasons = [satisfies(attrs_req, m.attributes,
-                                 m.pilot_sizes.get(m.default_size))
-                       for m in members]
-            if all(r is not None for r in reasons):
+            reason = _no_member_reason(members, attrs_req)
+            if reason is not None:
                 raise RequirementsError(
                     f'no member satisfies the task requirements: '
-                    f'{reasons[0]}')
+                    f'{reason}')
+
+
+def _no_member_reason(members: list[PoolMember],
+                      req: dict | None) -> str | None:
+    '''Return why no member in *members* can run *req*, or ``None``.
+
+    The reason is the first member's (declaration order), or ``'no
+    members remain'`` for an empty list.
+    '''
+    if not members:
+        return 'no members remain'
+    reasons = [m.reject_reason(req) for m in members]
+    if any(r is None for r in reasons):
+        return None
+    return reasons[0]
+
+
+def _validated_requirements(raw: Any, pool: PoolConfig | None = None) -> dict:
+    '''Validate *raw* (and fit it to *pool*, if given), or raise a 400.'''
+    try:
+        req = parse_requirements(raw)
+        if pool is not None:
+            check_requirements_against_pool(req, pool)
+    except RequirementsError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return req
 
 
 def backend_kwargs(req: dict, backend: str) -> dict:
@@ -420,17 +439,17 @@ def backend_kwargs(req: dict, backend: str) -> dict:
 
     With ``R = ranks``, ``C = cores``, ``G = gpus`` (shape-validated so
     ``C >= R`` and ``G % R == 0``).  Checked against rhapsody-py 0.4.0,
-    ``rhapsody/backends/execution/``; keep these citations current or the
-    table rots the next time rhapsody moves:
+    ``rhapsody.backends.execution``; re-check the cited symbols when the
+    rhapsody pin moves:
 
     | backend        | emitted                                        | effect today |
     |----------------|------------------------------------------------|--------------|
-    | `dragon_v2`    | `{'ranks': R, 'gpus_per_rank': G // R}`         | honoured natively (dragon.py:2508-2509); spawns R replicas, MPI or not |
-    | `radical_pilot`| `{'ranks': R, 'cores_per_rank': C // R, 'gpus_per_rank': G // R, 'mem_per_rank': int(mem_gb * 1024 / R)}` (MB per rank) | honoured natively — the dict feeds `rp.TaskDescription(from_dict=…)` (radical_pilot.py:510) |
-    | `dragon_v3`    | `{'type': 'mpi', 'ranks': R}` **only if** `mpi` | `ranks` is read ONLY under `type == 'mpi'` (dragon.py:3432-3437); ignored otherwise |
-    | `dragon_v1`    | `{'ranks': R}`                                 | spawns R replicas via a non-MPI ProcessGroup (dragon.py:456-460) AND busy-waits on a global slot counter (dragon.py:1899); `mpi` refused at submit |
-    | `dask`         | `{'resources': {'GPU': G}}` when `G > 0`       | pre-checked; fails the task if unsatisfiable (dask_parallel.py:313) |
-    | `concurrent`   | *(nothing)*                                    | reads only `shell`/`cwd`/`env` (concurrent.py:169-172) |
+    | `dragon_v2`    | `{'ranks': R, 'gpus_per_rank': G // R}`         | honoured natively (`DragonExecutionBackendV2._schedule_tasks`); spawns R replicas, MPI or not |
+    | `radical_pilot`| `{'ranks': R, 'cores_per_rank': C // R, 'gpus_per_rank': G // R, 'mem_per_rank': int(mem_gb * 1024 / R)}` (MB per rank) | honoured natively — the dict feeds `rp.TaskDescription(from_dict=…)` (`RadicalExecutionBackend.build_task`) |
+    | `dragon_v3`    | `{'type': 'mpi', 'ranks': R}` **only if** `mpi` | `ranks` is read ONLY under `type == 'mpi'` (`DragonExecutionBackendV3.build_task`); ignored otherwise |
+    | `dragon_v1`    | `{'ranks': R}`                                 | spawns R replicas via a non-MPI ProcessGroup (`TaskLauncherV1._determine_task_type`) AND busy-waits on a global slot counter (`DragonExecutionBackendV1._submit_task`); `mpi` refused at submit |
+    | `dask`         | `{'resources': {'GPU': G}}` when `G > 0`       | pre-checked; fails the task if unsatisfiable (`DaskExecutionBackend._submit_to_dask`) |
+    | `concurrent`   | *(nothing)*                                    | reads only `shell`/`cwd`/`env` (`ConcurrentExecutionBackend._execute_command`) |
 
     ``ranks`` means "process replicas" and only incidentally "MPI ranks":
     ``dragon_v1`` and ``dragon_v2`` spawn R replicas either way, while
@@ -446,14 +465,12 @@ def backend_kwargs(req: dict, backend: str) -> dict:
     Everything emitted is msgpack-primitive (int / str / dict) — the
     forwarded dict is msgpack-packed on the way to the pilot.
     '''
-    if not req:
-        return {}
-
-    ranks  = req.get('ranks',  _REQ_DEFAULTS['ranks'])
-    cores  = req.get('cores',  _REQ_DEFAULTS['cores'])
-    gpus   = req.get('gpus',   _REQ_DEFAULTS['gpus'])
-    mem_gb = req.get('mem_gb', _REQ_DEFAULTS['mem_gb'])
-    mpi    = bool(req.get('mpi', _REQ_DEFAULTS['mpi']))
+    r      = {**_REQ_DEFAULTS, **req}
+    ranks  = r['ranks']
+    cores  = r['cores']
+    gpus   = r['gpus']
+    mem_gb = r['mem_gb']
+    mpi    = r['mpi']
 
     out: dict = {}
 
@@ -601,18 +618,16 @@ class PoolState:
         return list(self.config.members.values())
 
     def member(self, mid: str | None) -> PoolMember | None:
-        '''Return one member by id; ``''``/``None`` → the implicit one.'''
+        '''Return one member by id (``''`` is the implicit one).'''
         return self.config.member(mid)
 
-    def live_pilots_for(self, mid: str | None) -> list[PilotRecord]:
+    def live_pilots_for(self, mid: str) -> list[PilotRecord]:
         '''Return this member's live pilots.
 
-        A pre-121 :class:`PilotRecord` carries ``member_id = ''``, which
-        normalises to :data:`IMPLICIT_MEMBER` — the id its member has.
+        A legacy (and pre-121) :class:`PilotRecord` carries
+        ``member_id = ''`` -- the id its implicit member has.
         '''
-        want = mid or IMPLICIT_MEMBER
-        return [p for p in self.live_pilots()
-                if (p.member_id or IMPLICIT_MEMBER) == want]
+        return [p for p in self.live_pilots() if p.member_id == mid]
 
     def pilot_history(self, mid: str | None = None) -> list[dict]:
         '''Return ``asdict`` views of this pool's pilots, oldest first.
@@ -623,27 +638,23 @@ class PoolState:
         from the member figures.
         '''
         pilots = self.pilots.values() if mid is None \
-            else [p for p in self.pilots.values()
-                  if (p.member_id or IMPLICIT_MEMBER)
-                  == (mid or IMPLICIT_MEMBER)]
+            else [p for p in self.pilots.values() if p.member_id == mid]
         return [asdict(p)
                 for p in sorted(pilots, key=lambda p: p.submitted_at)]
 
-    def member_node_hours(self, mid: str | None,
-                          now: float | None = None) -> float:
-        '''Return node-hours consumed by one member's pilots, live included.'''
-        return node_hours(self.pilot_history(mid), now=now)
-
-    def member_budget_left(self, mid: str | None,
+    def member_budget_left(self, mid: str,
                            now: float | None = None) -> float | None:
-        '''Return the member's remaining node-hours, or ``None`` if unbounded.'''
+        '''Return the member's remaining node-hours, or ``None`` if unbounded.
+
+        Consumption counts every one of the member's pilots, live included.
+        '''
         member = self.member(mid)
         if member is None:
             return None
         total = (member.budget or {}).get('node_hours')
         if not total:
             return None
-        return total - self.member_node_hours(mid, now)
+        return total - node_hours(self.pilot_history(mid), now=now)
 
     def size_of(self, pilot: PilotRecord) -> PilotSize | None:
         '''Return the pilot's shape, preferring its own submit-time snapshot.
@@ -700,12 +711,7 @@ class PoolState:
                         task_id, e)
 
     def persist(self) -> None:
-        '''Rewrite this pool's ``state.json`` atomically.
-
-        ``config.to_dict()``, not ``asdict(config)``: a legacy pool must
-        not persist its synthesised implicit member, or replay would read
-        the ``members`` key and treat it as a class pool.
-        '''
+        '''Rewrite this pool's ``state.json`` atomically.'''
         self.store.save(self.owning_sid, self.config.to_dict(),
                         self.pilots, self.tasks)
 
@@ -1112,10 +1118,6 @@ class PluginTaskDispatcher(Plugin):
         self.add_route_get  ('pool/{sid}/{name}',             self._route_pool_detail)
         self.add_route_post ('pool/{sid}/{name}/members',     self._route_add_member)
         self.add_route_delete('pool/{sid}/{name}/members/{member_id}',
-                             self._route_remove_member)
-        # POST fallback for callers/transports without a DELETE verb; same
-        # body, same semantics.
-        self.add_route_post ('pool/{sid}/{name}/members/{member_id}/remove',
                              self._route_remove_member)
         self.add_route_get  ('fleet/{sid}',                   self._route_fleet)
         self.add_route_post ('submit/{sid}',                  self._route_submit)
@@ -1682,7 +1684,8 @@ class PluginTaskDispatcher(Plugin):
                                 detail='member declaration must be an object')
 
         try:
-            member = parse_member(body, f'pool {name}: member', name)
+            member = parse_member(body, f'pool {name}: member',
+                                  pool_name=name)
         except PoolConfigError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -1777,12 +1780,13 @@ class PluginTaskDispatcher(Plugin):
         doomed = ps.live_pilots_for(mid)
         for pilot in doomed:
             pilot.accepting_new_tasks = False
-        ps.config.members.pop(mid, None)
+        ps.config.members.pop(mid)
         ps.config.reproject()
         ps.persist()
 
-        touched = {t.task_id for t in ps.tasks.values()
-                   if t.pilot_id in {p.pid for p in doomed}}
+        doomed_pids = {p.pid for p in doomed}
+        touched     = {t.task_id for t in ps.tasks.values()
+                       if t.pilot_id in doomed_pids}
 
         # -- 2. cancel_tasks, still before the first await ---------------
         # These tasks must reach a terminal state now: the moment the
@@ -1820,12 +1824,9 @@ class PluginTaskDispatcher(Plugin):
             for task in list(ps.tasks.values()):
                 if task.state != TASK_QUEUED:
                     continue
-                reasons = [satisfies(task.requirements, m.attributes,
-                                     m.pilot_sizes.get(m.default_size))
-                           for m in members]
-                if members and not all(r is not None for r in reasons):
+                reason = _no_member_reason(members, task.requirements)
+                if reason is None:
                     continue
-                reason = reasons[0] if reasons else 'no members remain'
                 self._mark_task_failed(
                     ps, task,
                     f'no member satisfies task requirements: {reason}')
@@ -1927,11 +1928,8 @@ class PluginTaskDispatcher(Plugin):
         # malformed 'requirements' (or a bad 'inputs_b64') is a 400 even
         # when the task_id is a cached DONE — a bad request stays a bad
         # request.
-        try:
-            requirements = parse_requirements(body.get('requirements'))
-            check_requirements_against_pool(requirements, pool_state.config)
-        except RequirementsError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
+        requirements = _validated_requirements(body.get('requirements'),
+                                               pool_state.config)
 
         decoded = self._decode_inputs_b64(body.get('inputs_b64'))
 
@@ -2025,10 +2023,7 @@ class PluginTaskDispatcher(Plugin):
 
         # Shape validation only — no pool, hence no fit check and no
         # backend gate.  A non-empty block earns one advisory log line.
-        try:
-            requirements = parse_requirements(body.get('requirements'))
-        except RequirementsError as e:
-            raise HTTPException(status_code=400, detail=str(e)) from e
+        requirements = _validated_requirements(body.get('requirements'))
         if requirements:
             log.info('[%s] endpoint-mode task %s: requirements are advisory '
                      '(target backend unknown); nothing forwarded',
@@ -2047,18 +2042,22 @@ class PluginTaskDispatcher(Plugin):
             'cwd'       : cwd,
             'task_backend_specific_kwargs': {'cwd': cwd},
         }
+        # map before submitting, as in pool mode: the task can finish before
+        # the threaded submit call returns
+        self._endpoint_mode_tasks[task_id] = target_endpoint
+        self._persist_endpoint_mode()
         try:
             result = await asyncio.to_thread(rh.submit_tasks, [task_dict])
         except Exception as e:
             log.exception('[%s] endpoint-mode submit to %s failed: %s',
                           self.instance_name, target_endpoint, e)
+            if self._endpoint_mode_tasks.pop(task_id, None):
+                self._persist_endpoint_mode()
             raise HTTPException(
                 status_code=502,
                 detail=f'rhapsody submit failed on '
                        f'{target_endpoint}: {e}') from e
 
-        self._endpoint_mode_tasks[task_id] = target_endpoint
-        self._persist_endpoint_mode()
         return {
             'task_id' : task_id,
             'endpoint': target_endpoint,
@@ -2089,7 +2088,7 @@ class PluginTaskDispatcher(Plugin):
         task_dicts = data.get('tasks', [])
 
         # validate the whole batch before touching any state
-        grouped: dict[str, list[dict]] = {}
+        grouped: dict[str, list[tuple]] = {}
         for td in task_dicts:
             uid       = td.get('uid')
             pool_name = td.get('pool')
@@ -2104,11 +2103,7 @@ class PluginTaskDispatcher(Plugin):
                     detail=f'unknown pool: {pool_name}')
             # Validate requirements inside the whole-batch loop, so one bad
             # task rejects the batch before any state is touched.
-            try:
-                req = parse_requirements(td.get('requirements'))
-                check_requirements_against_pool(req, ps.config)
-            except RequirementsError as e:
-                raise HTTPException(status_code=400, detail=str(e)) from e
+            req = _validated_requirements(td.get('requirements'), ps.config)
             if td.get('inputs_b64'):
                 # A rhapsody task's cwd is opaque to the dispatcher, so it
                 # has nowhere to place them.
@@ -2125,7 +2120,7 @@ class PluginTaskDispatcher(Plugin):
                     detail="rhapsody-dialect tasks must carry an explicit "
                            "'cwd'; the dispatcher assigns one only for "
                            "exec-style tasks")
-            grouped.setdefault(pool_name, []).append(td)
+            grouped.setdefault(pool_name, []).append((td, req))
 
         now  = time.time()
         acks = []
@@ -2134,7 +2129,7 @@ class PluginTaskDispatcher(Plugin):
             if pool_state is None:       # validated above; mollify the checker
                 continue
             fresh = False
-            for td in tds:
+            for td, req in tds:
                 uid = str(td['uid'])
 
                 # same resubmit semantics as exec-mode submit: DONE is
@@ -2150,8 +2145,9 @@ class PluginTaskDispatcher(Plugin):
                 # Promote 'requirements' to the record field and drop it from
                 # the forwarded dict: BaseTask.from_dict keeps unknown keys
                 # verbatim and nobody reads them, so a stray block would be a
-                # silent no-op riding the wire.  Already validated above.
-                requirements = td.pop('requirements', None) or {}
+                # silent no-op riding the wire.  The record gets the
+                # validated block (with any derived 'cores'), not the raw one.
+                td.pop('requirements', None)
                 pool_state.tasks[uid] = TaskRecord(
                     task_id      = uid,
                     pool         = pool_name,
@@ -2159,7 +2155,7 @@ class PluginTaskDispatcher(Plugin):
                     cmd          = [],
                     cwd          = '',
                     task_dict    = td,
-                    requirements = requirements,
+                    requirements = req,
                     state        = TASK_QUEUED,
                     submitted_at = now,
                     arrival_ts   = now,
@@ -2246,7 +2242,8 @@ class PluginTaskDispatcher(Plugin):
         n = await self._teardown_session_pools(sid)
         return {'sid': sid, 'pools_reclaimed': n}
 
-    def _decode_inputs_b64(self, raw: Any) -> dict[str, bytes]:
+    @staticmethod
+    def _decode_inputs_b64(raw: Any) -> dict[str, bytes]:
         '''Validate and decode an ``inputs_b64`` block from a submit body.
 
         ``{"<filename>": "<base64>"}``.  Filenames go through the same
@@ -2266,7 +2263,8 @@ class PluginTaskDispatcher(Plugin):
         out: dict[str, bytes] = {}
         total = 0
         for name, value in raw.items():
-            self._check_filename(name if isinstance(name, str) else '')
+            PluginTaskDispatcher._check_filename(
+                name if isinstance(name, str) else '')
             try:
                 content = base64.b64decode(value, validate=True)
             except (ValueError, TypeError) as e:
@@ -2551,18 +2549,14 @@ class PluginTaskDispatcher(Plugin):
 
     def _activate_pilot(self, ps: PoolState, pilot: PilotRecord) -> None:
         '''Transition a PENDING/STARTING pilot to ACTIVE on child handshake.'''
-        # Prefer the pilot's own submit-time size snapshot; fall back to
-        # the member menu for a pre-121 record and repair the record in
-        # place so every later consumer gets the snapshot.
-        if pilot.cpus_per_node:
-            capacity = pilot.nodes * pilot.cpus_per_node
-        else:
-            size = ps.size_of(pilot)
-            capacity = (size.nodes * size.cpus_per_node) if size else 0
-            if size is not None:
-                pilot.nodes         = size.nodes
-                pilot.cpus_per_node = size.cpus_per_node
-                pilot.gpus_per_node = size.gpus_per_node
+        # ``size_of`` prefers the pilot's own submit-time snapshot; repair
+        # a pre-121 record in place so every later consumer gets one.
+        size     = ps.size_of(pilot)
+        capacity = (size.nodes * size.cpus_per_node) if size else 0
+        if size is not None and not pilot.cpus_per_node:
+            pilot.nodes         = size.nodes
+            pilot.cpus_per_node = size.cpus_per_node
+            pilot.gpus_per_node = size.gpus_per_node
         if capacity <= 0:
             log.warning('[%s] cannot bind pilot %s: pool size %r has zero '
                         'capacity', self.instance_name, pilot.pid,
@@ -2683,11 +2677,7 @@ class PluginTaskDispatcher(Plugin):
             state            = PILOT_PENDING,
             submitted_at     = time.time(),
             walltime_deadline= self._pilot_deadline(member, size),
-            # A legacy pool's implicit member is an internal construct:
-            # its pilots carry '' on the wire, exactly as every pre-121
-            # record does, so nothing downstream ever sees the sentinel.
-            member_id        = ('' if member.member_id == IMPLICIT_MEMBER
-                                else member.member_id),
+            member_id        = member.member_id,
             attributes       = dict(member.attributes),
             endpoint_name    = member.endpoint_name or '',
             nodes            = size.nodes,
@@ -2746,7 +2736,7 @@ class PluginTaskDispatcher(Plugin):
 
     def _build_pilot_env(self, pool_state: PoolState,
                          record: PilotRecord,
-                         member: PoolMember | None = None) -> dict[str, str]:
+                         member: PoolMember) -> dict[str, str]:
         '''Build bootstrap env vars for the pilot's child endpoint service.
 
         ``RADICAL_ORBIT_SCRATCH_BASE`` comes from **the member's** own
@@ -2756,8 +2746,7 @@ class PluginTaskDispatcher(Plugin):
         ``mkdir``s it.
         '''
         broker_url = getattr(self._app.state, 'broker_url', '') or ''
-        scratch = str((member.scratch_base if member else None)
-                      or pool_state.scratch_base)
+        scratch = str(member.scratch_base or pool_state.scratch_base)
         env: dict[str, str] = {
             'RADICAL_ORBIT_BROKER_URL'      : str(broker_url),
             'RADICAL_ORBIT_POOL'            : pool_state.config.name,
@@ -2773,7 +2762,7 @@ class PluginTaskDispatcher(Plugin):
         # fail TLS silently.  Such a pilot inherits its endpoint's own
         # RADICAL_ORBIT_BROKER_CERT, or falls back to the endpoint's
         # default ~/.radical/orbit/broker_cert.pem on its host.
-        shared = member is None or member.shared_fs
+        shared = member.shared_fs
         cert   = os.environ.get('RADICAL_ORBIT_BROKER_CERT')
         if cert and shared:
             env['RADICAL_ORBIT_BROKER_CERT'] = cert
@@ -2783,7 +2772,7 @@ class PluginTaskDispatcher(Plugin):
                         size: PilotSize,
                         child_endpoint: str,
                         env: dict[str, str],
-                        member: PoolMember | None = None) -> dict:
+                        member: PoolMember) -> dict:
         '''Build a psij-compatible JobSpec for the pilot.
 
         ``queue_name`` and ``project`` come from **the member**, which for
@@ -2796,15 +2785,12 @@ class PluginTaskDispatcher(Plugin):
         if size.gpus_per_node:
             resources['gpu_cores_per_process'] = size.gpus_per_node
 
-        queue   = member.queue   if member else pool_state.config.queue
-        account = member.account if member else pool_state.config.account
-
         attributes: dict[str, Any] = {
-            'queue_name': queue,
+            'queue_name': member.queue,
             'duration'  : size.walltime_sec,
         }
-        if account:
-            attributes['project'] = account
+        if member.account:
+            attributes['project'] = member.account
 
         return {
             'executable' : 'radical-orbit-endpoint-wrapper.sh',
@@ -2817,13 +2803,16 @@ class PluginTaskDispatcher(Plugin):
     async def _do_pilot_submit(self, pool_state: PoolState,
                                record: PilotRecord,
                                size: PilotSize,
-                               member: PoolMember | None = None) -> None:
-        '''Call psij on the member's target endpoint to submit the pilot job.'''
-        if member is None:
-            member = pool_state.member(record.member_id)
+                               member: PoolMember) -> None:
+        '''Call psij on the member's target endpoint to submit the pilot job.
 
-        endpoint_name = (member.endpoint_name if member else None) \
-            or record.endpoint_name or pool_state.config.endpoint_name
+        The pilot may be cancelled while ``submit_tunneled`` is in flight
+        (member removal, session teardown): it then has no psij job id to
+        cancel yet and is simply marked FAILED.  So a submit that returns
+        onto a terminal record must cancel the job it just created rather
+        than resurrect the pilot around an orphaned allocation.
+        '''
+        endpoint_name = record.endpoint_name
         if not endpoint_name:
             self._mark_pilot_failed(
                 pool_state, record,
@@ -2832,8 +2821,7 @@ class PluginTaskDispatcher(Plugin):
 
         # Fail fast on the unconfigured default-pool queue sentinel rather than
         # submit a pilot to a batch queue literally named 'default'.
-        queue = member.queue if member else pool_state.config.queue
-        if queue == 'default':
+        if member.queue == 'default':
             self._mark_pilot_failed(
                 pool_state, record,
                 "pool queue is the 'default' sentinel; re-declare the pool "
@@ -2850,7 +2838,6 @@ class PluginTaskDispatcher(Plugin):
             pool_state.config.name, record.member_id, record.pid)
         # Pre-bind so on_topology_change can match the registering child.
         record.child_endpoint_name = child_endpoint
-        record.endpoint_name       = endpoint_name
         env      = self._build_pilot_env(pool_state, record, member)
         job_spec = self._build_job_spec(pool_state, size, child_endpoint,
                                         env, member)
@@ -3043,10 +3030,7 @@ class PluginTaskDispatcher(Plugin):
             'member_id': record.member_id,
         })
 
-        try:
-            cap = int(pool_state.policy.max_requeues)
-        except Exception:
-            cap = 1
+        cap = pool_state.policy.max_requeues
 
         for t in list(pool_state.tasks.values()):
             if t.pilot_id == record.pid and \
@@ -3311,15 +3295,9 @@ class PluginTaskDispatcher(Plugin):
                 }
             fwds.append((task, fwd))
 
-        # Register the uid → task mapping BEFORE handing the batch to
-        # rhapsody.  ``submit_tasks`` is parked in a worker thread, so this
-        # loop stays free to run ``_on_event`` — and a short task (the demo's
-        # synthetic ones finish in well under a second) reports DONE before
-        # the submit call returns.  Registering afterwards loses that race:
-        # ``_handle_task_terminal`` finds no mapping, drops the terminal
-        # event, and the task hangs in RUNNING forever.  The record is
-        # already RUNNING here (``_claim`` ran before us), so an early
-        # notification lands on a consistent task.
+        # Map uids before submitting: a sub-second task can report terminal
+        # before the threaded submit call returns, and an unmapped terminal
+        # event is dropped.
         for task, fwd in fwds:
             task.rhapsody_uid = fwd['uid']
             self._uid_to_task[fwd['uid']] = (pool_state.owning_sid,
@@ -3334,9 +3312,7 @@ class PluginTaskDispatcher(Plugin):
                           self.instance_name, len(tasks), e)
             for task, fwd in fwds:
                 self._uid_to_task.pop(fwd['uid'], None)
-                # a task that already reported terminal (submit_tasks can
-                # fail *after* the pilot accepted part of the batch) keeps
-                # the outcome the pilot gave it, uid included
+                # a task the pilot already finished keeps that outcome
                 if task.state not in TASK_TERMINAL_STATES:
                     task.rhapsody_uid = None
                     self._mark_task_failed(pool_state, task,
@@ -3349,33 +3325,22 @@ class PluginTaskDispatcher(Plugin):
         terminal handling runs inline.  The tap is unfiltered, so filter here
         on plugin/topic; the rhapsody uid → pool mapping is ``_uid_to_task``.
 
-        Both notification shapes have to be handled: rhapsody coalesces
-        terminal states and ships a frame carrying a single completion as
-        ``task_status`` but a frame carrying several as ``task_status_batch``
-        with the payloads under ``tasks``
-        (``plugin_rhapsody._flush_notifications``).  Listening only to
-        ``task_status`` silently loses every completion that shared a flush
-        window with another one — the tasks then sit in RUNNING forever.
-        ``RhapsodyClient._on_task_done`` subscribes to both for the same
-        reason.
+        Rhapsody ships one completion as ``task_status`` and several as
+        ``task_status_batch`` under ``tasks``
+        (``plugin_rhapsody._flush_notifications``); both are handled, as in
+        ``RhapsodyClient._on_task_done``.
         '''
         if event.get('plugin') != 'rhapsody':
             return
 
+        data  = event.get('data') or {}
         topic = event.get('topic')
-        if topic not in ('task_status', 'task_status_batch'):
-            return
-
-        data = event.get('data') or {}
-
-        if topic == 'task_status_batch':
-            items = data.get('tasks') or []
-        else:
-            items = [data]
+        if   topic == 'task_status'      : items = [data]
+        elif topic == 'task_status_batch': items = data.get('tasks') or []
+        else                             : return
 
         for item in items:
-            if isinstance(item, dict):
-                self._on_task_status(item)
+            self._on_task_status(item)
 
     def _on_task_status(self, data: dict) -> None:
         '''One rhapsody task-status payload from the tap.'''
@@ -3733,7 +3698,6 @@ class PluginTaskDispatcher(Plugin):
         mine    = ps.live_pilots_for(m.member_id)
         history = ps.pilot_history(m.member_id)
         used    = node_hours(history, now=now)
-        total   = (m.budget or {}).get('node_hours')
         health  = ps.policy.member_health(m.member_id)
         left    = [max(0.0, p.walltime_deadline - now) for p in mine
                    if p.walltime_deadline]
@@ -3756,7 +3720,7 @@ class PluginTaskDispatcher(Plugin):
             'pilots_active'       : sum(1 for p in mine
                                         if p.state == PILOT_ACTIVE),
             'node_hours_used'     : used,
-            'node_hours_remaining': (total - used) if total else None,
+            'node_hours_remaining': ps.member_budget_left(m.member_id, now),
             'pilot_history'       : history,
             # -- why this member is not producing pilots ------------------
             # The reason the most recent pilot of this member died, plus

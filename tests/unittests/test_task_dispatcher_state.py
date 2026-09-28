@@ -407,26 +407,19 @@ class TestNodeHours:
         assert node_hours([{'nodes': 4, 'submitted_at': 1000.0,
                             'active_at': None}], now=8200.0) == 0.0
 
-    def test_pre_121_history_uses_pilot_sizes(self):
-        hist  = [{'size_key': 's', 'active_at': 1000.0,
-                  'finished_at': 4600.0}]
-        sizes = {'s': {'nodes': 4}}
-        assert node_hours(hist, pilot_sizes=sizes) == 4.0
-        # ...and without the menu there is nothing to size it with
+    def test_entry_without_snapshot_is_skipped(self):
+        hist = [{'size_key': 's', 'active_at': 1000.0,
+                 'finished_at': 4600.0}]
         assert node_hours(hist) == 0.0
 
-    def test_mixed_node_counts_snapshot_beats_the_flat_menu(self):
+    def test_mixed_node_counts_are_summed_per_snapshot(self):
         """The reason the snapshot exists: a mixed-node-count pool sized
-        off one flat menu gives a different -- wrong -- total."""
+        off one flat menu would give a different -- wrong -- total."""
         hist = [{'nodes': 1, 'size_key': 's', 'active_at': 1000.0,
                  'finished_at': 4600.0},
                 {'nodes': 8, 'size_key': 's', 'active_at': 1000.0,
                  'finished_at': 4600.0}]
-        sizes = {'s': {'nodes': 1}}
-        assert node_hours(hist, pilot_sizes=sizes) == 9.0     # snapshots
-        stripped = [{k: v for k, v in e.items() if k != 'nodes'}
-                    for e in hist]
-        assert node_hours(stripped, pilot_sizes=sizes) == 2.0  # menu only
+        assert node_hours(hist) == 9.0
 
     def test_negative_interval_is_clamped(self):
         hist = [{'nodes': 1, 'active_at': 100.0, 'finished_at': 50.0}]
@@ -437,15 +430,10 @@ class TestNodeHours:
                             'finished_at': 4600.0}]) == 0.0
 
     def test_sums_over_several_pilots_and_sizes(self):
-        sizes = {'default': {'nodes': 2}, 'big': {'nodes': 10}}
-        hist  = [{'size_key': 'default', 'active_at': 0.0,
+        hist  = [{'nodes':  2, 'size_key': 'default', 'active_at': 0.0,
                   'finished_at': 3600.0},                      # 2 nh
-                 {'size_key': 'big',     'active_at': 0.0,
+                 {'nodes': 10, 'size_key': 'big',     'active_at': 0.0,
                   'finished_at': 1800.0},                      # 5 nh
-                 {'size_key': 'default', 'active_at': None}]   # 0
-        assert node_hours(hist, pilot_sizes=sizes, now=1e9) == 7.0
-
-    def test_unknown_size_key_contributes_zero(self):
-        hist = [{'size_key': 'nope', 'active_at': 0.0,
-                 'finished_at': 3600.0}]
-        assert node_hours(hist, pilot_sizes={'s': {'nodes': 2}}) == 0.0
+                 {'nodes':  2, 'size_key': 'default',
+                  'active_at': None}]                          # 0
+        assert node_hours(hist, now=1e9) == 7.0
