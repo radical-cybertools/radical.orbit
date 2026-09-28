@@ -267,7 +267,7 @@ class TestPoolStore:
 
     def test_save_creates_parent_dirs(self, tmp_path: Path):
         nested = tmp_path / 'a' / 'b' / 'state.json'
-        store = PoolStore(nested)
+        PoolStore(nested)
         assert nested.parent.is_dir()
 
     def test_path_property(self, tmp_path: Path):
@@ -435,3 +435,17 @@ class TestNodeHours:
     def test_zero_node_entry_skipped(self):
         assert node_hours([{'nodes': 0, 'active_at': 1000.0,
                             'finished_at': 4600.0}]) == 0.0
+
+    def test_sums_over_several_pilots_and_sizes(self):
+        sizes = {'default': {'nodes': 2}, 'big': {'nodes': 10}}
+        hist  = [{'size_key': 'default', 'active_at': 0.0,
+                  'finished_at': 3600.0},                      # 2 nh
+                 {'size_key': 'big',     'active_at': 0.0,
+                  'finished_at': 1800.0},                      # 5 nh
+                 {'size_key': 'default', 'active_at': None}]   # 0
+        assert node_hours(hist, pilot_sizes=sizes, now=1e9) == 7.0
+
+    def test_unknown_size_key_contributes_zero(self):
+        hist = [{'size_key': 'nope', 'active_at': 0.0,
+                 'finished_at': 3600.0}]
+        assert node_hours(hist, pilot_sizes={'s': {'nodes': 2}}) == 0.0

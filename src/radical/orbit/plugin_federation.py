@@ -61,8 +61,8 @@ Why it is built this way
   pool's ``pilots`` list carry live pilots only, and ``PilotRecord`` had no
   end timestamp.  Node-hour accounting needs both, so the dispatcher gained
   ``PilotRecord.finished_at`` and a ``pilot_history`` block in the verbose
-  pool summary; :func:`~radical.orbit.federation_state.node_hours_from_history`
-  reads them.  Task counts come from this plugin's own ledger, because the
+  pool summary, from which it derives each member's node-hours
+  (:func:`~radical.orbit.task_dispatcher_state.node_hours`).  Task counts come from this plugin's own ledger, because the
   dispatcher's ``recent_tasks`` is capped at 50 per pool.
 - **``min_pilots`` was parsed but never honoured** by the conservative
   policy (``on_tick`` returned early on an empty queue).  An allocation-mode
@@ -108,14 +108,14 @@ from .client                import PluginClient
 from .plugin_base           import Plugin
 from .plugin_session_base   import PluginSession
 from .federation_policy     import make_policy
-from .task_dispatcher_config import MAX_POOL_MEMBER_NAME_LEN
+from .task_dispatcher_config import (MAX_POOL_MEMBER_NAME_LEN, PILOT_ENDPOINT,
+                                     PILOT_MODES, PILOT_SUBMIT)
 from .federation_state      import (
     FederationState, FederationStateError, MemberRecord, ResourceRecord,
     SubmitLedgerEntry,
     DEFAULT_MEMBER, LIVENESS_OK, LIVENESS_SUSPECT, LIVENESS_LOST,
-    MODE_ALLOCATION, MODE_LOGIN, MODES, PILOT_ENDPOINT, PILOT_MODES,
-    PILOT_SUBMIT,
-    node_hours_from_history, resource_attributes, validate_attributes,
+    MODE_ALLOCATION, MODE_LOGIN, MODES,
+    resource_attributes, validate_attributes,
     validate_budget, validate_capabilities, validate_class,
     validate_member_name, validate_name, validate_pool_int,
     validate_scratch_for_host, validate_software,
@@ -198,7 +198,6 @@ _FEDERATION_ONLY_REQUIREMENTS = ('node_hours',)
 # Checking it here -- against that same constant, never a copy of it --
 # turns "the join half-succeeded and then a member 400'd" into a plain
 # declaration error, before the dispatcher is touched at all.
-_MAX_POOL_MEMBER_NAME_LEN = MAX_POOL_MEMBER_NAME_LEN
 
 _MAX_PILOTS_CAP   = 1024
 _MAX_NODES_CAP    = 100000
@@ -231,11 +230,6 @@ class _DispatcherAPI:
                  instance: str = _DISPATCHER_INSTANCE) -> None:
         self._app      = app
         self._instance = instance
-
-    @property
-    def instance(self) -> str:
-        '''Return the dispatcher instance name this API drives.'''
-        return self._instance
 
     def _host(self):
         '''Return the plugin host, or raise 503 if the dispatcher is absent.'''
@@ -312,25 +306,12 @@ class _DispatcherAPI:
         The flags travel in the **body**, not the query string: the plugin
         host's ``handle_request`` takes no query string, so ``?force=true``
         would end up in the path and match no route.
-
-        ``DELETE`` is the primary form; a host that does not route it falls
-        back to the ``POST …/members/{id}/remove`` twin with the identical
-        body.  A failure of the fallback re-raises the *original* error, so
-        a genuine 404 still reads as a 404.
         '''
         body = {'cancel_tasks'      : bool(cancel_tasks),
                 'force'             : bool(force),
                 'fail_unsatisfiable': bool(fail_unsatisfiable)}
-        route = f'pool/{sid}/{pool}/members/{member_id}'
-        try:
-            return await self._call('DELETE', route, body)
-        except HTTPException as e:
-            if e.status_code not in (404, 405):
-                raise
-            try:
-                return await self._call('POST', f'{route}/remove', body)
-            except HTTPException:
-                raise e from None
+        return await self._call('DELETE',
+                                f'pool/{sid}/{pool}/members/{member_id}', body)
 
     async def submit(self, sid: str, payload: dict) -> dict:
         '''Submit one task into a pool.'''
@@ -996,7 +977,7 @@ class PluginFederation(Plugin):
         return decls
 
     @staticmethod
-    def _allocation_walltime(alloc: dict) -> int:
+    def _allocation_walltime(alloc: dict, end: float | None) -> int:
         '''Return the pilot walltime for an allocation-mode resource.
 
         ``queue_info``'s ``runtime`` is the job's **time limit**, not the
@@ -1015,9 +996,9 @@ class PluginFederation(Plugin):
         at least 1 and a pilot that cannot outlive its own submission is not
         a resource.
 
-        Without an ``end_time`` the limit is all there is, exactly as before.
+        *end* is :meth:`_alloc_end_time` of *alloc*.  Without one the limit
+        is all there is, exactly as before.
         '''
-        end = PluginFederation._alloc_end_time(alloc)
         if end is not None:
             remaining = int(end - time.time())
             if remaining <= 0:
@@ -1075,19 +1056,20 @@ class PluginFederation(Plugin):
             all_gpus = rec.capability('gpus')
             gpus     = (int(all_gpus) // nodes) if all_gpus else 0
 
+        end_time = PluginFederation._alloc_end_time(alloc)
         return {
             'queue'      : 'allocation',
             'account'    : None,
             'min_pilots' : 1,
             'max_pilots' : 1,
             'pilot'      : PILOT_ENDPOINT,
-            'end_time'   : PluginFederation._alloc_end_time(alloc),
+            'end_time'   : end_time,
             'pilot_sizes': {_SIZE_KEY: {
                 'nodes'           : nodes,
                 'cpus_per_node'   : max(1, int(cpus)),
                 'gpus_per_node'   : max(0, int(gpus)),
                 'walltime_sec'    : PluginFederation._allocation_walltime(
-                    alloc),
+                    alloc, end_time),
                 'rhapsody_backend': _DEFAULT_BACKEND,
             }},
         }
@@ -1259,11 +1241,11 @@ class PluginFederation(Plugin):
             # refuses a declaration past its cap; say so here, before any
             # member has been POSTed, rather than half way through the join
             length = len(member.pool_name) + len(member.member_id)
-            if length > _MAX_POOL_MEMBER_NAME_LEN:
+            if length > MAX_POOL_MEMBER_NAME_LEN:
                 raise HTTPException(
                     status_code=400,
                     detail=f'pool name plus member id must be at most '
-                           f'{_MAX_POOL_MEMBER_NAME_LEN} characters, got '
+                           f'{MAX_POOL_MEMBER_NAME_LEN} characters, got '
                            f'{length} for {member.pool_name}/'
                            f'{member.member_id}')
             rec.members[member.member] = member
@@ -1822,11 +1804,9 @@ class PluginFederation(Plugin):
 
         Node-hours and live pilots come straight off the dispatcher's
         per-member block — no arithmetic here, so the Explorer, the CLI and
-        the federation cannot disagree about the same number.  A dispatcher
-        that reports no such block (or no entry for this member) falls back
-        to this member's own slice of the pool history.  Task counts come
-        from the federation's own ledger, because the dispatcher keeps only
-        the 50 most recent tasks per pool.
+        the federation cannot disagree about the same number.  Task counts
+        come from the federation's own ledger, because the dispatcher keeps
+        only the 50 most recent tasks per pool.
 
         The pilot-failure fields (``pilot_error``, ``pilot_failures``,
         ``paused_until``) come from the same per-member block and are
@@ -1837,47 +1817,30 @@ class PluginFederation(Plugin):
         of its own answers from that instead (see
         :meth:`MemberRecord.remaining_sec`).
         '''
-        usage = member.usage
-        if detail is None:
+        usage   = member.usage
+        summary = None
+        if detail is not None:
+            summary = next((e for e in (detail.get('members') or [])
+                            if e.get('member_id') == member.member_id),
+                           None)
+        if summary is None:
             # a failed refresh keeps the previous numbers: a member must not
-            # blink to zero because one poll timed out
+            # blink to zero because one poll timed out.  The dispatcher is
+            # hosted in this process, so a class pool summary always
+            # carries the per-member block; a missing entry is a member the
+            # summary predates, and reads the same as a failed refresh.
             usage.stale = True
         else:
             usage.stale = False
-            summary = None
-            for entry in (detail.get('members') or []):
-                if isinstance(entry, dict) and \
-                        entry.get('member_id') == member.member_id:
-                    summary = entry
-                    break
-
-            if summary is not None:
-                usage.node_hours_used = float(
-                    summary.get('node_hours_used') or 0.0)
-                usage.pilots_active = int(summary.get('pilots_active') or 0)
-                remaining = summary.get('node_hours_remaining')
-                usage.pilot_error    = summary.get('last_pilot_error') or None
-                usage.pilot_failures = int(
-                    summary.get('consecutive_pilot_failures') or 0)
-                usage.paused_until   = summary.get('paused_until') or None
-                usage.remaining_sec  = summary.get('remaining_sec')
-            else:
-                history = [e for e in (detail.get('pilot_history') or [])
-                           if isinstance(e, dict)
-                           and e.get('member_id') == member.member_id]
-                usage.node_hours_used = node_hours_from_history(
-                    history, detail.get('pilot_sizes'), now)
-                usage.pilots_active = len(
-                    [p for p in (detail.get('pilots') or [])
-                     if isinstance(p, dict)
-                     and p.get('member_id') == member.member_id])
-                remaining = None
-                # no per-member block: nothing is known about failures,
-                # and "unknown" must read as "nothing held against it"
-                usage.pilot_error    = None
-                usage.pilot_failures = 0
-                usage.paused_until   = None
-                usage.remaining_sec  = None
+            usage.node_hours_used = float(
+                summary.get('node_hours_used') or 0.0)
+            usage.pilots_active  = int(summary.get('pilots_active') or 0)
+            remaining            = summary.get('node_hours_remaining')
+            usage.pilot_error    = summary.get('last_pilot_error') or None
+            usage.pilot_failures = int(
+                summary.get('consecutive_pilot_failures') or 0)
+            usage.paused_until   = summary.get('paused_until') or None
+            usage.remaining_sec  = summary.get('remaining_sec')
 
             budget = member.budget_node_hours()
             if remaining is None:

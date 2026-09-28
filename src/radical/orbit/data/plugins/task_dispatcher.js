@@ -139,18 +139,12 @@ async function loadPools(page, api) {
 
 // `GET /pools` groups pools by owning session: the top level maps a sid to
 // that session's pools.  Flatten it into `{sid, pool}` entries so one card
-// is rendered per *pool* (not per session).  An older broker answered a flat
-// `{name: summary}` listing -- a value that already looks like a pool
-// summary (it carries a `name`) is taken as such, with no session tag.
+// is rendered per *pool* (not per session).
 function flattenPools(pools) {
   const entries = [];
   Object.keys(pools || {}).forEach(key => {
     const v = pools[key];
     if (!v || typeof v !== 'object') return;
-    if (typeof v.name === 'string') {
-      entries.push({sid: null, pool: v});                // legacy flat listing
-      return;
-    }
     Object.keys(v).forEach(name => {
       const p = v[name];
       if (!p || typeof p !== 'object') return;

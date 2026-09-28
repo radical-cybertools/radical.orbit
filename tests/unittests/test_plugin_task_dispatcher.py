@@ -2524,12 +2524,13 @@ class TestPilotFailureIsVisible:
         m = plugin._summarize_pool(ps, verbose=True)['members'][0]
         assert 'Disk quota exceeded' in m['last_pilot_error']
 
-    def test_a_policy_without_member_health_does_not_break_a_summary(
+    def test_a_policy_without_member_health_reports_a_healthy_member(
             self, tmp_path):
+        from radical.orbit.task_dispatcher_policy import DispatchPolicy
         plugin, _client, sid = _class_session(tmp_path)
         ps = _pool(plugin, sid, 'fed')
         with patch.object(type(ps.policy), 'member_health',
-                          side_effect=RuntimeError('boom')):
+                          DispatchPolicy.member_health):
             m = plugin._summarize_pool(ps, verbose=True)['members'][0]
         assert m['consecutive_pilot_failures'] == 0
         assert m['paused_until'] is None
@@ -2775,6 +2776,19 @@ class TestAddMemberFingerprint:
         assert _pool(plugin, sid, 'fed').config.members['m_x'].end_time \
             == later
 
+    def test_a_mode_switch_that_changes_a_bound_is_409(self, tmp_path):
+        """endpoint -> submit keeps the forced 1/1 bounds: a declaration
+        that also moves them is a redeclaration, not a mode switch."""
+        plugin, client, sid = _class_session(tmp_path, members=[
+            _member('m_x', pilot='endpoint')])
+        r = client.post(f'{plugin.namespace}/pool/{sid}/fed/members',
+                        json=_member('m_x', min_pilots=0, max_pilots=4))
+        assert r.status_code == 409
+        r = client.post(f'{plugin.namespace}/pool/{sid}/fed/members',
+                        json=_member('m_x', min_pilots=1, max_pilots=1))
+        assert r.status_code == 200, r.text
+        assert r.json()['updated'] is True
+
     def test_a_pilot_mode_change_plus_a_real_change_is_still_409(self,
                                                                 tmp_path):
         plugin, client, sid = _class_session(tmp_path, members=[
@@ -2855,6 +2869,16 @@ class TestEndpointAdoption:
         asyncio.run(plugin._reconcile_overdue_pilots(time.time()))
         assert rec.state == PILOT_FAILED
         assert rec.error == f'endpoint {_ALLOC_EP} not connected'
+
+    def test_a_zero_capacity_adoption_fails_with_that_reason(self, tmp_path):
+        """Nothing will ever bind it; the sweeper's "not connected" would
+        be the wrong reason, and later."""
+        plugin, _, _, ps = self._session(tmp_path)
+        member = ps.config.members['m_a']
+        member.pilot_sizes[member.default_size].cpus_per_node = 0
+        _, rec = self._adopt(plugin, ps)
+        assert rec.state == PILOT_FAILED
+        assert 'zero capacity' in rec.error
 
     def test_a_pending_adoption_is_left_alone_before_the_timeout(self,
                                                                 tmp_path):
@@ -3087,9 +3111,8 @@ class TestInFlightSubmitIsNotAdoption:
 
     def test_a_pre_bound_record_without_a_job_id_is_not_adopted(self,
                                                                tmp_path):
-        plugin, _, rec = self._pending(tmp_path)
+        _, _, rec = self._pending(tmp_path)
         assert rec.adopted is False
-        assert plugin._is_adopted(rec) is False
 
     def test_the_handshake_sweep_does_not_fail_an_in_flight_submit(self,
                                                                   tmp_path):

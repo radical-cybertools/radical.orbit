@@ -244,13 +244,8 @@ def node_hours(history: list[dict] | None,
     form a summary carries, and is optional precisely because the snapshot
     makes it unnecessary for anything written by this version.
 
-    A malformed entry — not a dict, or carrying an unparseable timestamp —
-    is skipped rather than raising: the history is read back off a wire
-    summary, and one bad record must not zero the whole usage figure.
-
     This lives here, not in the federation, because the dispatcher needs it
-    for its own per-member summary and must not import a federation module;
-    ``federation_state.node_hours_from_history`` is an alias for it.
+    for its own per-member summary and must not import a federation module.
     '''
     if not history:
         return 0.0
@@ -259,8 +254,6 @@ def node_hours(history: list[dict] | None,
 
     total = 0.0
     for entry in history:
-        if not isinstance(entry, dict):
-            continue
         nodes = entry.get('nodes') or 0
         if not nodes and pilot_sizes:
             size = pilot_sizes.get(entry.get('size_key') or '')
@@ -275,7 +268,6 @@ def node_hours(history: list[dict] | None,
         # allocation time, and a pilot that never reached ACTIVE consumed
         # nothing.  (Falling back to ``submitted_at`` would both bill queue
         # time and charge a never-started record from the epoch to `now`.)
-        # This matches the federation's node_hours_from_history semantics.
         # Both timestamps are tested against ``None``, not truthiness: a
         # ``0.0`` is the epoch, which is a legitimate (if odd) instant and
         # must not read as "absent".
@@ -285,11 +277,7 @@ def node_hours(history: list[dict] | None,
         end = entry.get('finished_at')
         if end is None:
             end = now
-        try:
-            total += (float(nodes) * max(0.0, float(end) - float(start))
-                      / 3600.0)
-        except (TypeError, ValueError):
-            continue
+        total += nodes * max(0.0, end - start) / 3600.0
 
     return total
 

@@ -46,7 +46,7 @@ import uuid
 
 import msgpack
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -1623,16 +1623,6 @@ class PluginTaskDispatcher(Plugin):
                        f"'members'")
         return ps
 
-    # The two fields a re-POST may change in place (plan 122): where this
-    # member's pilots come from, and when its allocation ends.  Everything
-    # else is immutable -- a member is replaced by removing and re-adding it
-    # -- but these two are *facts about the resource*, not a redeclaration of
-    # it: an allocation's end moves with every re-join, and an upgraded
-    # federation re-POSTs its allocation members as ``endpoint`` against a
-    # pool this dispatcher replayed as ``submit``.  Rejecting that would
-    # leave the member detached until its state dir was wiped by hand.
-    _MUTABLE_MEMBER_FIELDS = ('pilot', 'end_time')
-
     @staticmethod
     def _member_fingerprint(member: PoolMember) -> dict:
         '''Return a declaration-equality view of a member.
@@ -1652,25 +1642,6 @@ class PluginTaskDispatcher(Plugin):
         }
         return d
 
-    @classmethod
-    def _member_core(cls, member: PoolMember, *,
-                     ignore_bounds: bool = False) -> dict:
-        '''Return the fingerprint without the fields a re-POST may update.
-
-        ``ignore_bounds`` drops ``min_pilots`` / ``max_pilots`` as well, and
-        is used when the two declarations disagree about ``pilot``: those two
-        are a *consequence* of the pilot mode (``PoolMember.__post_init__``
-        forces both to 1 for an adopted member), so across a mode switch they
-        say nothing about whether the declaration otherwise changed.
-        '''
-        d = cls._member_fingerprint(member)
-        for key in cls._MUTABLE_MEMBER_FIELDS:
-            d.pop(key, None)
-        if ignore_bounds:
-            d.pop('min_pilots', None)
-            d.pop('max_pilots', None)
-        return d
-
     async def _route_add_member(self, request: Request) -> dict:
         '''Add one member to a class pool.
 
@@ -1680,8 +1651,17 @@ class PluginTaskDispatcher(Plugin):
         ``pilot`` / ``end_time`` updates those two in place and answers
         ``200 {"created": false, "updated": true}``; any other difference is
         a 409.  There is no other partial update: a member is replaced by
-        removing and re-adding it.  (``min_pilots`` / ``max_pilots`` ride
-        along on a ``pilot`` switch, because the pilot mode decides them.)
+        removing and re-adding it.
+
+        Those two may change in place (plan 122) because they are *facts
+        about the resource*, not a redeclaration of it: an allocation's end
+        moves with every re-join, and an upgraded federation re-POSTs its
+        allocation members as ``endpoint`` against a pool this dispatcher
+        replayed as ``submit``.  The comparison applies them to the existing
+        member and re-runs its ``__post_init__``, so the ``min_pilots`` /
+        ``max_pilots`` an ``endpoint`` member is forced to are what the new
+        declaration must carry -- and a switch that *also* changes a bound
+        is a 409 like any other change.
 
         No pilot is submitted here — the next housekeeping tick applies
         the new member's ``min_pilots`` floor.  A member switched to
@@ -1707,56 +1687,47 @@ class PluginTaskDispatcher(Plugin):
             raise HTTPException(status_code=400, detail=str(e)) from e
 
         existing = ps.config.members.get(member.member_id)
+        updated  = False
         if existing is not None:
-            if self._member_fingerprint(existing) == \
+            candidate = replace(existing, pilot=member.pilot,
+                                end_time=member.end_time)
+            if self._member_fingerprint(candidate) != \
                     self._member_fingerprint(member):
-                return {'pool'   : name,
-                        'member' : asdict(existing),
-                        'members': list(ps.config.members),
-                        'created': False,
-                        'updated': False}
-            switch = existing.pilot != member.pilot
-            if self._member_core(existing, ignore_bounds=switch) != \
-                    self._member_core(member, ignore_bounds=switch):
                 raise HTTPException(
                     status_code=409,
                     detail='member exists with a different declaration')
-            # Only ``pilot`` / ``end_time`` differ: replace the member so the
-            # new facts hold from the next tick on.  The member object is
-            # replaced rather than mutated, so ``min_pilots``/``max_pilots``
-            # come out of the parser's own rule for the new pilot mode.
+            updated = self._member_fingerprint(existing) != \
+                self._member_fingerprint(member)
+            if updated:
+                # Only ``pilot`` / ``end_time`` differ: replace the member
+                # so the new facts hold from the next tick on.
+                ps.config.members[member.member_id] = member
+                ps.config.reproject()
+                ps.persist()
+                log.info('[%s] pool %r (sid=%s): updated member %r '
+                         '(pilot=%s, end_time=%s)', self.instance_name, name,
+                         sid, member.member_id, member.pilot, member.end_time)
+        else:
             ps.config.members[member.member_id] = member
             ps.config.reproject()
             ps.persist()
-            log.info('[%s] pool %r (sid=%s): updated member %r '
-                     '(pilot=%s, end_time=%s)', self.instance_name, name,
-                     sid, member.member_id, member.pilot, member.end_time)
-            return {'pool'   : name,
-                    'member' : asdict(member),
-                    'members': list(ps.config.members),
-                    'created': False,
-                    'updated': True}
 
-        ps.config.members[member.member_id] = member
-        ps.config.reproject()
-        ps.persist()
-
-        self._dispatch_notify('pool_members', {
-            'pool'      : name,
-            'sid'       : sid,
-            'action'    : 'add',
-            'member_id' : member.member_id,
-            'member_ids': list(ps.config.members),
-        })
-        log.info('[%s] pool %r (sid=%s): added member %r on endpoint %r',
-                 self.instance_name, name, sid, member.member_id,
-                 member.endpoint_name)
+            self._dispatch_notify('pool_members', {
+                'pool'      : name,
+                'sid'       : sid,
+                'action'    : 'add',
+                'member_id' : member.member_id,
+                'member_ids': list(ps.config.members),
+            })
+            log.info('[%s] pool %r (sid=%s): added member %r on endpoint %r',
+                     self.instance_name, name, sid, member.member_id,
+                     member.endpoint_name)
 
         return {'pool'   : name,
-                'member' : asdict(member),
+                'member' : asdict(ps.config.members[member.member_id]),
                 'members': list(ps.config.members),
-                'created': True,
-                'updated': False}
+                'created': existing is None,
+                'updated': updated}
 
     async def _route_remove_member(self, request: Request) -> dict:
         '''Remove one member from a class pool, draining its pilots.
@@ -2566,7 +2537,7 @@ class PluginTaskDispatcher(Plugin):
                     ps.persist()
 
             elif liveness == 'lost':
-                if self._is_adopted(pilot):
+                if pilot.adopted:
                     # An adopted endpoint that goes away has left, or its
                     # allocation ended -- neither is a pilot failure,
                     # whatever the deadline says.
@@ -2596,6 +2567,13 @@ class PluginTaskDispatcher(Plugin):
             log.warning('[%s] cannot bind pilot %s: pool size %r has zero '
                         'capacity', self.instance_name, pilot.pid,
                         pilot.size_key)
+            if pilot.adopted:
+                # Nothing will ever change that for an adopted endpoint;
+                # left PENDING, the sweeper would later fail it with a
+                # misleading "endpoint not connected".
+                self._mark_pilot_failed(
+                    ps, pilot, f'pilot size {pilot.size_key!r} has zero '
+                               f'capacity')
             return
 
         old_state = pilot.state
@@ -2715,7 +2693,7 @@ class PluginTaskDispatcher(Plugin):
             nodes            = size.nodes,
             cpus_per_node    = size.cpus_per_node,
             gpus_per_node    = size.gpus_per_node,
-            # the stamp every later rule reads (see :meth:`_is_adopted`)
+            # the stamp every later rule reads (see ``PilotRecord.adopted``)
             adopted          = adopt,
         )
         if adopt:
@@ -2765,26 +2743,6 @@ class PluginTaskDispatcher(Plugin):
         if member.end_time:
             return min(deadline, float(member.end_time))
         return deadline
-
-    @staticmethod
-    def _is_adopted(record: PilotRecord) -> bool:
-        '''Return whether *record* is an **adopted** endpoint, not a job.
-
-        Reads the record's own ``adopted`` stamp, written once at creation
-        and persisted.  It is deliberately **not** inferred from a missing
-        ``psij_job_id``: a *submitted* pilot has none either, in the window
-        between ``_do_pilot_submit`` pre-binding its child endpoint name and
-        psij answering — and in exactly that window both rules below would
-        be wrong, failing an in-flight submission and leaving a real batch
-        job running after a cancel had reported success.
-
-        The two rules (plan 122): an adopted record times out of PENDING
-        with "endpoint not connected" rather than against a psij job state,
-        and it ends **DONE, never FAILED** — an allocation ending or a
-        resource leaving is not a pilot failure and must not feed the
-        member's failure counter.
-        '''
-        return bool(record.adopted)
 
     def _build_pilot_env(self, pool_state: PoolState,
                          record: PilotRecord,
@@ -2977,7 +2935,7 @@ class PluginTaskDispatcher(Plugin):
         '''
         if record.is_terminal():
             return
-        if self._is_adopted(record):
+        if record.adopted:
             self._mark_pilot_done(pool_state, record, 'endpoint released')
             return
         endpoint_name = self._pilot_endpoint(pool_state, record)
@@ -3007,7 +2965,7 @@ class PluginTaskDispatcher(Plugin):
         '''
         if record.is_terminal():
             return
-        if self._is_adopted(record):
+        if record.adopted:
             self._mark_pilot_failed(
                 pool_state, record,
                 f'endpoint {record.child_endpoint_name} not connected')
@@ -3754,41 +3712,29 @@ class PluginTaskDispatcher(Plugin):
                 return str(entry['error'])[:PILOT_ERROR_MAX]
         return None
 
-    def _member_health(self, ps: PoolState, mid: str) -> dict:
-        '''Return the policy's health view of one member, defensively.
-
-        The count and the pause live in the policy (the conservative one
-        tracks both); a policy that does not implement ``member_health``,
-        or raises, must not break a summary route.
-        '''
-        try:
-            health = ps.policy.member_health(mid) or {}
-        except Exception as e:
-            log.warning('[%s] member_health(%s) raised: %s',
-                        self.instance_name, mid, e)
-            return {'consecutive_pilot_failures': 0, 'paused_until': None}
-        return {
-            'consecutive_pilot_failures':
-                int(health.get('consecutive_pilot_failures') or 0),
-            'paused_until': health.get('paused_until') or None,
-        }
-
     def _member_dict(self, ps: PoolState, m: PoolMember,
                      now: float) -> dict:
         '''Return the verbose per-member block (frozen contract, §9).
 
         ``pilot`` / ``end_time`` are the member's declaration; the derived
         ``remaining_sec`` is the most walltime any of its **live** pilots
-        still has (``None`` when it holds none), which is the only place
-        that number exists — a pilot's deadline is dispatcher state, and
-        the federation must not re-derive it.  Never negative: a pilot past
-        a mis-estimated deadline has no time left, it does not owe any.
+        still has (``None`` when it holds none) -- a pilot's deadline is
+        dispatcher state.  A consumer that knows the member's ``end_time``
+        prefers that and falls back to this live figure (see the
+        federation's ``MemberRecord.remaining_sec``).  Never negative: a
+        pilot past a mis-estimated deadline has no time left, it does not
+        owe any.
+
+        The failure count and pause come from the policy's
+        ``member_health``; ``register_policy`` admits only
+        :class:`DispatchPolicy` subclasses, whose base answers a healthy
+        member.
         '''
         mine    = ps.live_pilots_for(m.member_id)
         history = ps.pilot_history(m.member_id)
         used    = node_hours(history, now=now)
         total   = (m.budget or {}).get('node_hours')
-        health  = self._member_health(ps, m.member_id)
+        health  = ps.policy.member_health(m.member_id)
         left    = [max(0.0, p.walltime_deadline - now) for p in mine
                    if p.walltime_deadline]
         return {

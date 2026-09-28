@@ -18,14 +18,11 @@
  * A GPU in a pilot's size is what the operator **declared**, not a device
  * reserved for a task: pilot capacity is task-count based.
  *
- * A record without `members` (a broker that predates class pools) still
- * renders its one resource row and no sub-rows.
- *
  * The state column shows the record's derived `state` (`ok` / `idle` /
- * `stale` / `suspect` / `lost` / `failing`), falling back to `liveness` for
- * an older broker; the resource row carries the worst of its pilot rows'.  A
- * `failing` row — reachable, but its pilots die at submit — gets a red badge
- * and one monospace line underneath carrying what psij said.
+ * `stale` / `suspect` / `lost` / `failing`); the resource row carries the
+ * worst of its pilot rows'.  A `failing` row — reachable, but its pilots
+ * die at submit — gets a red badge and one monospace line underneath
+ * carrying what psij said.
  *
  * Node-hours moved into the pilot row's tooltip: the table answers "how long
  * has this got left", the tooltip answers "what has it spent".
@@ -183,9 +180,8 @@ function renderTable(resources, api) {
     return `<div class="card fed-empty">No resources joined.</div>`;
   }
   const rows = resources.map(r => {
-    const members = Array.isArray(r.members) ? r.members : [];
-    return renderResourceRow(r, members, api)
-         + members.map(m => renderPilotRow(r, m, api)
+    return renderResourceRow(r, r.members, api)
+         + r.members.map(m => renderPilotRow(r, m, api)
                           + renderPilotError(m, api)).join('');
   }).join('');
   return `
@@ -210,13 +206,12 @@ function renderTable(resources, api) {
  * The task counts are the **record's own**, never a sum over the pilot
  * rows: a task the dispatcher has not placed yet belongs to no shape and
  * would vanish from that sum.  `state` is the derived word the server
- * already folded (worst of the pilot rows); an older broker sends only
- * `liveness`, which is exactly what this column used to show. */
+ * already folded (worst of the pilot rows). */
 function renderResourceRow(r, members, api) {
   const caps  = r.capabilities || {};
   const usage = r.usage || {};
   const soft  = (caps.software || []).map(s => api.escHtml(s)).join(', ');
-  const live  = r.state || r.liveness || 'lost';
+  const live  = r.state;
   const cls   = [...new Set(members.map(m => m.pool_name).filter(Boolean))]
                 .map(p => `<span class="fed-badge">${api.escHtml(p)}</span>`)
                 .join(' ');
@@ -239,13 +234,13 @@ function renderResourceRow(r, members, api) {
  * row is `<endpoint>/<shape>`.
  *
  * `left` is what this shape has until its allocation ends — `-` when the
- * broker cannot know (no live pilot, or a broker without `remaining_sec`).
+ * broker cannot know (no live pilot, no allocation end).
  * Node-hours ride in the row tooltip. */
 function renderPilotRow(r, m, api) {
   const usage = m.usage || {};
   const attrs = m.attributes || {};
   const caps  = r.capabilities || {};
-  const live  = m.state || m.liveness || r.liveness || 'lost';
+  const live  = m.state;
   const alloc = (r.mode || '') === 'allocation';
   const ep    = m.endpoint || r.endpoint || '?';
   const name  = alloc ? ep : `${ep}/${m.member || '?'}`;

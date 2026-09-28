@@ -153,8 +153,10 @@ class _FakeDispatcher:
     async def pool_detail(self, sid, name):
         self.calls.append(('pool_detail', sid, name))
         self._maybe_fail('pool_detail')
-        return self.details.get(name, {'pilots': [], 'pilot_history': [],
-                                       'pilot_sizes': {}, 'members': []})
+        if name in self.details:
+            return self.details[name]
+        return _pool_summary([_member_block(mid)
+                              for mid in self.members_of(name)])
 
     async def submit(self, sid, payload):
         self.calls.append(('submit', sid, payload.get('task_id')))
@@ -311,6 +313,14 @@ def _join(client, plugin, body):
 def _member_decl(fake, pool, member_id):
     """The declaration the dispatcher holds for one member."""
     return (fake.pools.get(pool) or {})[member_id]
+
+
+def _member_block(member_id, **usage):
+    """One member's block of a 121 verbose pool summary: an idle member
+    unless *usage* says otherwise.  The co-hosted dispatcher always reports
+    one per member, so a canned summary should too."""
+    return {'member_id': member_id, 'node_hours_used': 0.0,
+            'node_hours_remaining': None, 'pilots_active': 0, **usage}
 
 
 def _pool_summary(members, pilots=None, history=None):
@@ -916,17 +926,13 @@ class TestResources:
         assert rec['members'][0]['usage']['node_hours_remaining'] == 0.0
         assert rec['usage']['node_hours_remaining'] == 6.0
 
-    def test_an_overspent_member_without_a_summary_clamps_too(self, tmp_path):
-        # the fallback branch computes budget - used itself
+    def test_an_overspent_member_without_a_remaining_figure_clamps_too(
+            self, tmp_path):
+        # no dispatcher-side remaining: budget - used is computed here
         client, plugin, fake = _joinable(tmp_path)
         _join(client, plugin, _members_body())
-        now = time.time()
-        fake.details['fed-cpu'] = _pool_summary(
-            [],
-            history=[{'member_id': 'local_b.cpu', 'size_key': 'default',
-                      'active_at': now - 3600 * 100, 'finished_at': now}],
-            pilots=[])
-        fake.details['fed-cpu']['pilot_sizes'] = {'default': {'nodes': 1}}
+        fake.details['fed-cpu'] = _pool_summary([
+            _member_block('local_b.cpu', node_hours_used=25.0)])
         plugin._state.resources['local_b'].usage.updated_at = 0.0
         plugin._detail_cache.clear()
 
@@ -947,36 +953,17 @@ class TestResources:
         pools = [c[2] for c in fake.calls if c[0] == 'pool_detail']
         assert sorted(pools) == ['fed-cpu', 'fed-gpu']   # 2, not 3
 
-    def test_usage_falls_back_to_the_pool_history(self, tmp_path):
-        # a summary without a per-member block (or without *this* member):
-        # the member's own slice of the pool history still accounts
-        client, plugin, fake = _joinable(tmp_path)
+    def test_a_member_missing_from_the_summary_reads_stale(self, tmp_path):
+        # no block for this member: keep the previous numbers, flag stale
+        client, plugin, _ = _joinable(tmp_path)
         _join(client, plugin, _alloc_body(budget={'node_hours': 4.0}))
-        now = time.time()
-        fake.details['fed-cpu'] = {
-            'pilots': [{'pid': 'p.1', 'member_id': 'alpha.default'},
-                       {'pid': 'p.9', 'member_id': 'other.default'}],
-            'pilot_sizes': {'default': {'nodes': 2, 'cpus_per_node': 4}},
-            'pilot_history': [
-                {'pid': 'p.0', 'member_id': 'alpha.default',
-                 'size_key': 'default', 'active_at': now - 7200,
-                 'finished_at': now - 3600},
-                {'pid': 'p.1', 'member_id': 'alpha.default',
-                 'size_key': 'default', 'active_at': now - 1800,
-                 'finished_at': None},
-                {'pid': 'p.9', 'member_id': 'other.default',
-                 'size_key': 'default', 'active_at': now - 36000,
-                 'finished_at': None}],
-        }
-        plugin._state.resources['alpha'].usage.updated_at = 0.0
-        plugin._detail_cache.clear()
-        body = client.get(f'{plugin.namespace}/resource/default/alpha').json()
-        # p.0: 2 nodes x 1 h = 2.0; p.1: 2 nodes x 0.5 h = 1.0; p.9 not mine
-        assert body['usage']['node_hours_used'] == pytest.approx(3.0,
-                                                                 abs=0.01)
-        assert body['usage']['node_hours_remaining'] == \
-            pytest.approx(1.0, abs=0.01)
-        assert body['usage']['pilots_active'] == 1
+        member = plugin._state.resources['alpha'].members['default']
+        member.usage.node_hours_used = 2.5
+        plugin._apply_member_usage(
+            member, _pool_summary([_member_block('other.default')]),
+            time.time())
+        assert member.usage.stale is True
+        assert member.usage.node_hours_used == 2.5
 
     def test_usage_is_cached_for_two_seconds(self, tmp_path):
         client, plugin, fake = _joinable(tmp_path)
@@ -2127,15 +2114,16 @@ class TestMemberDeclarationParses:
     def test_the_length_rule_this_plugin_pre_checks_is_the_parsers(self,
                                                                    tmp_path):
         # the join-time 400 must line up with what parse_member enforces
-        from radical.orbit.plugin_federation import _MAX_POOL_MEMBER_NAME_LEN
+        from radical.orbit.task_dispatcher_config import \
+            MAX_POOL_MEMBER_NAME_LEN
         client, plugin, _ = _joinable(tmp_path)
         _join(client, plugin, _alloc_body())
         pool, decl = self._decls(plugin)[0]
         decl = dict(decl)
-        decl['member_id'] = 'a' * (_MAX_POOL_MEMBER_NAME_LEN - len(pool) + 1)
+        decl['member_id'] = 'a' * (MAX_POOL_MEMBER_NAME_LEN - len(pool) + 1)
         with pytest.raises(Exception) as ei:
             parse_member(decl, 'test', pool)
-        assert str(_MAX_POOL_MEMBER_NAME_LEN) in str(ei.value)
+        assert str(MAX_POOL_MEMBER_NAME_LEN) in str(ei.value)
 
 
 # ---------------------------------------------------------------------------
@@ -2227,14 +2215,7 @@ class TestDispatcherMemberVerbs:
         assert host.calls[0][2] == {'cancel_tasks': False, 'force': False,
                                     'fail_unsatisfiable': True}
 
-    def test_del_member_falls_back_to_the_post_twin(self):
-        route = '/task_dispatcher/pool/fed/fed-gpu/members/a.gpu'
-        api, host = self._api({('DELETE', route): (405, {'detail': 'nope'})})
-        _run(api.del_member('fed', 'fed-gpu', 'a.gpu'))
-        assert [c[0] for c in host.calls] == ['DELETE', 'POST']
-        assert host.calls[1][1] == route + '/remove'
-
-    def test_a_non_routing_error_is_not_retried(self):
+    def test_del_member_error_is_mapped_through(self):
         route = '/task_dispatcher/pool/fed/fed-gpu/members/a.gpu'
         api, host = self._api({('DELETE', route): (409, {'detail': 'last'})})
         with pytest.raises(HTTPException) as ei:
@@ -3049,7 +3030,8 @@ class TestRefreshAll:
         async def _half(sid, name):
             if name == 'fed-cpu':
                 raise RuntimeError('boom')
-            return _pool_summary([])
+            return _pool_summary([_member_block(mid)
+                                  for mid in fake.members_of(name)])
 
         fake.pool_detail = _half
         for rec in plugin._state.resources.values():

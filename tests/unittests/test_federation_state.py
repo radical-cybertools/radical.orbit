@@ -17,7 +17,7 @@ from radical.orbit.federation_state import (
     FederationState, FederationStateError, MemberRecord, ResourceRecord,
     ResourceUsage, SubmitLedgerEntry,
     LIVENESS_LOST, LIVENESS_SUSPECT, MODE_ALLOCATION, MODE_LOGIN,
-    allowed_bases, member_from_dict, node_hours_from_history,
+    allowed_bases, member_from_dict,
     record_from_dict, ledger_from_dict, resource_attributes,
     validate_attributes, validate_budget,
     validate_capabilities, validate_class, validate_member_name,
@@ -178,71 +178,6 @@ class TestFederationState:
         st.drop_resource('a')
         assert 'a' not in st.resources
         assert set(st.ledger) == {'t.2'}
-
-
-# ---------------------------------------------------------------------------
-# Node-hour arithmetic
-# ---------------------------------------------------------------------------
-
-_SIZES = {'default': {'nodes': 2, 'cpus_per_node': 4},
-          'big'    : {'nodes': 10, 'cpus_per_node': 4}}
-
-
-class TestNodeHours:
-
-    def test_empty_history_is_zero(self):
-        assert node_hours_from_history([], _SIZES, now=1000.0) == 0.0
-        assert node_hours_from_history(None, _SIZES, now=1000.0) == 0.0
-
-    def test_pilot_that_never_became_active_counts_zero(self):
-        hist = [{'pid': 'p.1', 'size_key': 'default', 'state': 'FAILED',
-                 'submitted_at': 0.0, 'active_at': None,
-                 'finished_at': 3600.0}]
-        assert node_hours_from_history(hist, _SIZES, now=7200.0) == 0.0
-
-    def test_live_pilot_is_measured_against_now(self):
-        hist = [{'pid': 'p.1', 'size_key': 'default', 'state': 'ACTIVE',
-                 'active_at': 0.0, 'finished_at': None}]
-        # 2 nodes x 1 h
-        assert node_hours_from_history(hist, _SIZES, now=3600.0) == \
-            pytest.approx(2.0)
-        # ... and it keeps ticking
-        assert node_hours_from_history(hist, _SIZES, now=7200.0) == \
-            pytest.approx(4.0)
-
-    def test_finished_pilot_stops_at_finished_at(self):
-        hist = [{'pid': 'p.1', 'size_key': 'default', 'state': 'DONE',
-                 'active_at': 0.0, 'finished_at': 1800.0}]
-        assert node_hours_from_history(hist, _SIZES, now=1e9) == \
-            pytest.approx(1.0)
-
-    def test_sums_over_several_pilots_and_sizes(self):
-        hist = [{'size_key': 'default', 'active_at': 0.0,
-                 'finished_at': 3600.0},                       # 2 nh
-                {'size_key': 'big',     'active_at': 0.0,
-                 'finished_at': 1800.0},                       # 5 nh
-                {'size_key': 'default', 'active_at': None}]     # 0
-        assert node_hours_from_history(hist, _SIZES, now=1e9) == \
-            pytest.approx(7.0)
-
-    def test_never_negative(self):
-        hist = [{'size_key': 'default', 'active_at': 1000.0,
-                 'finished_at': None}]
-        assert node_hours_from_history(hist, _SIZES, now=0.0) == 0.0
-
-    def test_unknown_size_key_contributes_zero(self):
-        hist = [{'size_key': 'nope', 'active_at': 0.0,
-                 'finished_at': 3600.0}]
-        assert node_hours_from_history(hist, _SIZES, now=1e9) == 0.0
-
-    def test_garbage_entries_are_skipped(self):
-        hist = ['not-a-dict',
-                {'size_key': 'default', 'active_at': 'x',
-                 'finished_at': 1.0},
-                {'size_key': 'default', 'active_at': 0.0,
-                 'finished_at': 3600.0}]
-        assert node_hours_from_history(hist, _SIZES, now=1e9) == \
-            pytest.approx(2.0)
 
 
 # ---------------------------------------------------------------------------

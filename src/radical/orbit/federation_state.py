@@ -25,7 +25,7 @@ Accounting
 ----------
 Node-hours are **derived**, never stored: a resource's usage is recomputed
 from the dispatcher's ``pilot_history`` (see
-:func:`node_hours_from_history`).  A pilot that never reached ``ACTIVE``
+:func:`~radical.orbit.task_dispatcher_state.node_hours`).  A pilot that never reached ``ACTIVE``
 consumed nothing; a live one is measured against *now*; a finished one
 against its ``finished_at``.  That makes the number monotone under repeated
 reads and correct across a broker restart, with no accumulator to drift.
@@ -42,10 +42,8 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
 
-from .task_dispatcher_config import PilotSize
+from .task_dispatcher_config import PilotSize, PILOT_SUBMIT, PILOT_ENDPOINT
 from .task_dispatcher_state  import write_json_atomic, read_json
-# re-exported under the federation's name -- see 'Accounting' below
-from .task_dispatcher_state  import node_hours as node_hours_from_history  # noqa: F401
 
 log = logging.getLogger('radical.orbit')
 
@@ -92,14 +90,6 @@ STATE_IDLE  = 'idle'
 # never hide one it does.
 STATE_RANK = {LIVENESS_LOST: 5, STATE_FAILING: 4, LIVENESS_SUSPECT: 3,
               STATE_STALE: 2, LIVENESS_OK: 1, STATE_IDLE: 0}
-
-# How a member's pilots come into being (Orbit plan 122), mirroring the
-# dispatcher's ``PoolMember.pilot``.  ``endpoint``: the joined endpoint runs
-# inside its allocation and *is* the pilot.  ``submit``: pilots are batch
-# jobs the dispatcher asks that endpoint to submit.
-PILOT_SUBMIT   = 'submit'
-PILOT_ENDPOINT = 'endpoint'
-PILOT_MODES    = (PILOT_SUBMIT, PILOT_ENDPOINT)
 
 # How many consecutive pilot failures make a member read as ``failing``.
 # Mirrors the conservative policy's ``max_consecutive_failures`` default —
@@ -644,21 +634,6 @@ def ledger_from_dict(data: dict) -> SubmitLedgerEntry:
     known = set(SubmitLedgerEntry.__dataclass_fields__)
     return SubmitLedgerEntry(
         **{k: v for k, v in (data or {}).items() if k in known})
-
-
-# ---------------------------------------------------------------------------
-# Accounting
-# ---------------------------------------------------------------------------
-#
-# ``node_hours_from_history`` is the dispatcher's own
-# :func:`~radical.orbit.task_dispatcher_state.node_hours`, re-exported under
-# the federation's name (imported above).  The two had byte-identical
-# semantics -- ``active_at``-only, live pilots charged to *now*, finalised
-# ones to their ``finished_at``, never negative -- so there is one
-# implementation, and a federation usage figure and a dispatcher per-member
-# figure can never disagree.  The dispatcher's version additionally prefers
-# each entry's ``nodes`` snapshot over the ``pilot_sizes`` menu, which is
-# what makes it correct for a mixed-node-count class pool.
 
 
 # ---------------------------------------------------------------------------

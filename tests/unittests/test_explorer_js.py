@@ -248,23 +248,6 @@ def test_pools_empty_renders_placeholder(render_pools):
     assert "No pools configured." in render_pools({"fed": {}})
 
 
-def test_pools_legacy_flat_listing_still_renders(render_pools):
-    # An older broker answered `{pool name: summary}` with no session level.
-    html = render_pools({"default": {"name": "default", "queue": "debug",
-                                     "account": None, "min_pilots": 0,
-                                     "max_pilots": 2, "live_pilots": 0,
-                                     "pending_tasks": 0,
-                                     "default_size": "small",
-                                     "pilot_sizes": {"small": _size()},
-                                     "multi_member": False,
-                                     "member_ids": []}})
-
-    assert html.count('data-td-card=') == 1
-    assert _card_names(html) == ["default"]
-    assert "session " not in html
-    assert "<strong>queue</strong>" in html
-
-
 def test_verbose_class_pool_shows_member_sizes_and_node_hours(render_pools):
     # The shape of the verbose `pool/{sid}/{name}` re-render: `members`
     # objects carry per-member sizes and node-hours.
@@ -413,18 +396,6 @@ def test_fed_paused_member_says_until_when(render_resources):
     html   = render_resources([_fed_resource([member], state="failing")])
 
     assert "paused until" in html
-
-
-def test_fed_record_without_state_still_shows_its_liveness(render_resources):
-    # an older broker sends no `state`: the column reads exactly as before
-    member = _fed_member()
-    member.pop("state")
-    rec = _fed_resource([member])
-    rec.pop("state")
-    html = render_resources([rec])
-
-    assert "fed-live-ok" in html
-    assert "fed-live-failing" not in html
 
 
 # ── federation.js: the pilot-row layout (Orbit 122 / ATOMIC 09) ────────────
