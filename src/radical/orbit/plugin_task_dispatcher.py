@@ -286,46 +286,39 @@ def parse_requirements(raw: Any) -> dict:
 def check_requirements_against_pool(req: dict, pool: PoolConfig) -> None:
     '''Reject a shape-valid *req* that no member of *pool* can ever host.
 
-    Pool-dependent gates.  A pool is a **capability class**, so "every
-    pilot size in the pool" means "every pilot size of every declared
-    member"; a legacy pool has exactly one (implicit) member, so its
-    behaviour — and its exact error strings — are unchanged.
+    Pool-dependent gates.  Two shapes, as everywhere in the dispatcher:
 
-    *Fit* — compared **per node** (``cores <= size.cpus_per_node``,
-    ``gpus <= size.gpus_per_node``), because none of the shipped backends
-    spreads one task across nodes here.  A pool passes when **any** size
-    of **any** member fits, so a mixed pool is judged on its best size,
-    and ``largest`` in the message is the max over the *failing*
-    dimension.  In a class pool that size name is **member-qualified**
-    (``'bridges.gpu/default'``); in a legacy pool it stays the bare size
-    key, so 120's exact strings survive verbatim.  ``ranks`` needs no
-    check of its own: ``cores >= ranks`` (shape) together with
-    ``cores <= cpus_per_node`` (here) already implies
-    ``ranks <= cpus_per_node``.  ``mem_gb`` has no fit check at all —
-    :class:`PilotSize` carries no memory field.  Note the ``ranks`` bound
-    is only *approximate* for ``dragon_v1``, whose real hang condition is
-    ``ranks`` above the **free** slot count at that instant
-    (``DragonExecutionBackendV1._submit_task``); only enforcement
-    (deferred) can bound that.
+    *Class pool* — the gate is **the policy's own test**:
+    :func:`_no_member_reason`, i.e. :func:`satisfies` against each
+    member's attributes and its **default** pilot size, the only size the
+    policy ever grows or dispatches to.  Judging on any other size would
+    accept a task that then queues forever, and the member-removal sweep
+    in ``_route_remove_member`` (the runtime counterpart of this gate,
+    which asks the same question) would fail it on the next unrelated
+    removal.
+
+    *Legacy pool* (its single implicit member) — plan 120's gates and
+    exact error strings, unchanged:
+
+    - *Fit* — compared **per node** (``cores <= size.cpus_per_node``,
+      ``gpus <= size.gpus_per_node``), because none of the shipped
+      backends spreads one task across nodes here.  The pool passes when
+      **any** size fits, and ``largest`` in the message is the max over
+      the *failing* dimension.  ``ranks`` needs no check of its own:
+      ``cores >= ranks`` (shape) together with ``cores <= cpus_per_node``
+      (here) already implies ``ranks <= cpus_per_node``.  ``mem_gb`` has
+      no fit check at all — :class:`PilotSize` carries no memory field.
+      Note the ``ranks`` bound is only *approximate* for ``dragon_v1``,
+      whose real hang condition is ``ranks`` above the **free** slot count
+      at that instant (``DragonExecutionBackendV1._submit_task``); only
+      enforcement (deferred) can bound that.
+    - *Backend* — ``mpi: true`` is refused only when **every** pilot size
+      names a backend in :data:`_NO_MPI_BACKENDS`.
+    - *Attributes* — none: the implicit member declares no attributes, so
+      120's "carried but not acted on" contract holds.
 
     Beware the built-in ``default`` pool: its single size has
     ``cpus_per_node = 1``, so any ``cores >= 2`` is a 400 there.
-
-    *Backend* — ``mpi: true`` is refused only when **no** pilot size of
-    **any** member can host it, i.e. every size names a backend in
-    :data:`_NO_MPI_BACKENDS`.  Member-level, not pool-level, precisely
-    because a class pool now mixes backends: where some members can, the
-    task is accepted and ``pick_dispatch`` simply never offers it a
-    ``dragon_v1`` pilot.
-
-    *Attributes* (**class pools only**) — a task whose ``software`` /
-    ``labels`` no *declared* member can satisfy is a client error, and
-    queueing it forever is the worse answer.  A legacy pool is exempt: its
-    implicit member declares no attributes at all, so the gate would be
-    meaningless there and 120's "carried but not acted on" contract holds.
-    The runtime counterpart of this gate — a task whose only capable
-    member *left* after the submit — is the sweep in
-    ``_route_remove_member``.
 
     Raises :class:`RequirementsError` carrying the exact 400 detail string.
     '''
@@ -338,63 +331,42 @@ def check_requirements_against_pool(req: dict, pool: PoolConfig) -> None:
         # whether or not the task declared requirements.
         raise RequirementsError(f'pool {pool.name!r} has no members')
 
-    # (display_name, PilotSize) across every member, ordered by the name
-    # the message would print, so `max` breaks ties lexically exactly as
-    # the pre-121 single-member version did.
-    qualify = pool.multi_member
-    entries = sorted(
-        ((f'{m.member_id}/{k}' if qualify else k, s)
-         for m in members for k, s in m.pilot_sizes.items()),
-        key=lambda kv: kv[0])
-    if not entries:
+    if pool.multi_member:
+        reason = _no_member_reason(members, req)
+        if reason:
+            raise RequirementsError(
+                f'no member satisfies the task requirements: {reason}')
         return
 
+    sizes = members[0].pilot_sizes
     r     = {**_REQ_DEFAULTS, **req}
     cores = r['cores']
     gpus  = r['gpus']
 
     def _largest(attr: str) -> tuple:
-        '''Return the ``(name, value)`` maximising *attr* (name breaks ties).'''
-        return max(((n, getattr(s, attr)) for n, s in entries),
-                   key=lambda kv: kv[1])
+        '''Return the ``(size_key, value)`` maximising *attr* (name breaks ties).'''
+        key = max(sorted(sizes), key=lambda k: getattr(sizes[k], attr))
+        return key, getattr(sizes[key], attr)
 
-    if not any(cores <= s.cpus_per_node for _, s in entries):
+    if not any(cores <= s.cpus_per_node for s in sizes.values()):
         key, val = _largest('cpus_per_node')
         raise RequirementsError(
             f"requirements: {cores} cores exceed every pilot_size "
             f"(largest: {key!r}, {val} cpus/node)")
 
-    if not any(gpus <= s.gpus_per_node for _, s in entries):
+    if not any(gpus <= s.gpus_per_node for s in sizes.values()):
         key, val = _largest('gpus_per_node')
         raise RequirementsError(
             f"requirements: {gpus} gpus exceed every pilot_size "
             f"(largest: {key!r}, {val} gpus/node)")
 
     if r['mpi'] and all(s.rhapsody_backend in _NO_MPI_BACKENDS
-                        for _, s in entries):
-        if qualify:
-            backends = sorted({s.rhapsody_backend for _, s in entries})
-            raise RequirementsError(
-                f"an mpi task cannot run on this pool: every member's "
-                f"backend is {', '.join(backends)}")
-        key, size = entries[0]
+                        for s in sizes.values()):
+        key = sorted(sizes)[0]
         raise RequirementsError(
             f"requirements: 'mpi' is unsupported on "
-            f"{size.rhapsody_backend} (pool {pool.name!r}, "
+            f"{sizes[key].rhapsody_backend} (pool {pool.name!r}, "
             f"size {key!r})")
-
-    if qualify:
-        # Attribute gate: software/labels only.  cores/gpus are the fit
-        # check above; every other key is the matcher's business at
-        # dispatch time.
-        attrs_req = {k: v for k, v in req.items()
-                     if k in ('software', 'labels')}
-        if attrs_req:
-            reason = _no_member_reason(members, attrs_req)
-            if reason is not None:
-                raise RequirementsError(
-                    f'no member satisfies the task requirements: '
-                    f'{reason}')
 
 
 def _no_member_reason(members: list[PoolMember],
@@ -581,6 +553,21 @@ class PoolState:
         self.tasks:  dict[str, TaskRecord]  = records_from(
             payload.get('tasks'), TaskRecord)
 
+        # A pre-121 pilot record carries no size / endpoint snapshot:
+        # backfill it once, here, from its member, so every later reader
+        # takes the record as authoritative.
+        for p in self.pilots.values():
+            member = config.members.get(p.member_id)
+            if member is None:
+                continue
+            size = member.pilot_sizes.get(p.size_key)
+            if not p.cpus_per_node and size is not None:
+                p.nodes         = size.nodes
+                p.cpus_per_node = size.cpus_per_node
+                p.gpus_per_node = size.gpus_per_node
+            if not p.endpoint_name:
+                p.endpoint_name = member.endpoint_name
+
         # Policy resolved by name through the manual registry (see
         # task_dispatcher_policy; default 'conservative').
         self.policy = make_policy(config)
@@ -613,7 +600,7 @@ class PoolState:
 
     def member(self, mid: str | None) -> PoolMember | None:
         '''Return one member by id (``''`` is the implicit one).'''
-        return self.config.member(mid)
+        return self.config.members.get(mid)
 
     def live_pilots_for(self, mid: str) -> list[PilotRecord]:
         '''Return this member's live pilots.
@@ -650,26 +637,16 @@ class PoolState:
             return None
         return total - node_hours(self.pilot_history(mid), now=now)
 
-    def size_of(self, pilot: PilotRecord) -> PilotSize | None:
-        '''Return the pilot's shape, preferring its own submit-time snapshot.
+    def size_of(self, pilot: PilotRecord) -> PilotSize:
+        '''Return the pilot's submit-time shape (backfilled at load).
 
-        ``size_key`` alone is no longer enough: sizes live *per member*, so
-        resolving a key against the pool's flat (primary-member) menu gives
-        the wrong node count for a mixed pool and gives nothing at all once
-        the member has been removed — and a removed member's pilots are
-        exactly the ones whose node-hours still have to be reported.  The
-        snapshot is therefore authoritative; the member menu is the
-        fallback for a pre-121 record.
+        The record's own snapshot is authoritative: sizes live *per
+        member*, and a removed member's pilots still have to be sized.
         '''
-        if pilot.cpus_per_node:
-            return PilotSize(nodes            = pilot.nodes,
-                             cpus_per_node    = pilot.cpus_per_node,
-                             gpus_per_node    = pilot.gpus_per_node,
-                             rhapsody_backend = pilot.rhapsody_backend)
-        member = self.member(pilot.member_id)
-        if member is None:
-            return self.config.pilot_sizes.get(pilot.size_key)
-        return member.pilot_sizes.get(pilot.size_key)
+        return PilotSize(nodes            = pilot.nodes,
+                         cpus_per_node    = pilot.cpus_per_node,
+                         gpus_per_node    = pilot.gpus_per_node,
+                         rhapsody_backend = pilot.rhapsody_backend)
 
     # -- task scratch and input spool ------------------------------------
 
@@ -1726,6 +1703,11 @@ class PluginTaskDispatcher(Plugin):
             pilot.accepting_new_tasks = False
         ps.config.members.pop(mid)
         ps.config.reproject()
+        try:
+            ps.policy.on_member_removed(mid)
+        except Exception as e:
+            log.exception('[%s] on_member_removed raised: %s',
+                          self.instance_name, e)
         ps.persist()
 
         doomed_pids = {p.pid for p in doomed}
@@ -2484,14 +2466,7 @@ class PluginTaskDispatcher(Plugin):
 
     def _activate_pilot(self, ps: PoolState, pilot: PilotRecord) -> None:
         '''Transition a PENDING/STARTING pilot to ACTIVE on child handshake.'''
-        # ``size_of`` prefers the pilot's own submit-time snapshot; repair
-        # a pre-121 record in place so every later consumer gets one.
-        size     = ps.size_of(pilot)
-        capacity = (size.nodes * size.cpus_per_node) if size else 0
-        if size is not None and not pilot.cpus_per_node:
-            pilot.nodes         = size.nodes
-            pilot.cpus_per_node = size.cpus_per_node
-            pilot.gpus_per_node = size.gpus_per_node
+        capacity = pilot.nodes * pilot.cpus_per_node
         if capacity <= 0:
             log.warning('[%s] cannot bind pilot %s: pool size %r has zero '
                         'capacity', self.instance_name, pilot.pid,
@@ -2751,26 +2726,19 @@ class PluginTaskDispatcher(Plugin):
                         record: PilotRecord) -> str | None:
         '''Resolve the endpoint that runs a pilot's psij job.
 
-        Reads the **pilot's own snapshot first** and must not look the
-        member up before it: removing a member drops it from the config
-        *before* awaiting the cancels of its pilots, so a member-first
+        The **pilot's own snapshot** (backfilled at load for a pre-121
+        record), never the member: removing a member drops it from the
+        config *before* awaiting the cancels of its pilots, so a member
         lookup would return ``None`` exactly when the cancel matters most.
-        The member and then the pool are only fallbacks for a pre-121
-        record with an empty snapshot.
         '''
-        if record.endpoint_name:
-            return record.endpoint_name
-        member = pool_state.member(record.member_id)
-        if member is not None and member.endpoint_name:
-            return member.endpoint_name
-        return pool_state.config.endpoint_name
+        return record.endpoint_name or None
 
     async def _do_pilot_cancel(self, pool_state: PoolState,
                                record: PilotRecord) -> None:
         '''Best-effort psij cancel + FAILED for one pilot.'''
         if record.is_terminal():
             return
-        endpoint_name = self._pilot_endpoint(pool_state, record)
+        endpoint_name = record.endpoint_name
         if not endpoint_name or not record.psij_job_id:
             self._mark_pilot_failed(pool_state, record, 'cancel requested')
             return
@@ -2790,7 +2758,7 @@ class PluginTaskDispatcher(Plugin):
         '''Sweeper path: query psij state for an overdue pilot.'''
         if record.is_terminal():
             return
-        endpoint_name = self._pilot_endpoint(pool_state, record)
+        endpoint_name = record.endpoint_name
         if not endpoint_name or not record.psij_job_id:
             return
         psij_c = await self._get_psij_client(endpoint_name)
@@ -2864,13 +2832,11 @@ class PluginTaskDispatcher(Plugin):
                 t.pilot_id  = None
                 t.member_id = None
                 if t.requeues > cap:
-                    t.state       = TASK_FAILED
-                    t.error       = 'requeued too often (pilot lost)'
-                    t.finished_at = time.time()
-                    pool_state.drop_spool(t.task_id)
+                    self._mark_task_failed(
+                        pool_state, t, 'requeued too often (pilot lost)')
                 else:
                     t.state = TASK_QUEUED
-                self._dispatch_notify('task_status', self._task_dict(t))
+                    self._dispatch_notify('task_status', self._task_dict(t))
         pool_state.persist()
 
         try:

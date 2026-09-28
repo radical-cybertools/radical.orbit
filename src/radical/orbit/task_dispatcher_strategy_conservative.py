@@ -178,6 +178,12 @@ class ConservativePolicy(DispatchPolicy):
                     "member %r; pausing submissions for %.0fs",
                     self._pool.name, fails, mid, self._failure_backoff_sec)
 
+    def on_member_removed(self, member_id: str) -> None:
+        '''Drop the removed member's backoff and dwell bookkeeping.'''
+        for d in (self._last_submit_ts, self._consecutive_failures,
+                  self._backoff_until, self._backoff_logged):
+            d.pop(member_id, None)
+
     # -- member helpers --------------------------------------------------
 
     def _in_backoff(self, mid: str, now_ts: float) -> bool:
@@ -203,8 +209,6 @@ class ConservativePolicy(DispatchPolicy):
         if not total:
             return 1.0
         left = pool_state.member_budget_left(member.member_id, now_ts)
-        if left is None:
-            return 1.0
         return max(0.0, min(1.0, left / total))
 
     def _pass_guards(self, pool_state, candidates, now_ts):
@@ -278,8 +282,7 @@ class ConservativePolicy(DispatchPolicy):
             for task in pending:
                 served = False
                 for p in live:
-                    if satisfies(task.requirements, p.attributes,
-                                 pool_state.size_of(p)) is None:
+                    if satisfies(task.requirements, p.attributes, p) is None:
                         served = True
                         servers.add(p.pid)
                 if not served:
@@ -360,8 +363,7 @@ class ConservativePolicy(DispatchPolicy):
 
         for task in pending:
             cands = [p for p in active
-                     if satisfies(task.requirements, p.attributes,
-                                  pool_state.size_of(p)) is None]
+                     if satisfies(task.requirements, p.attributes, p) is None]
             if not cands:
                 continue
 

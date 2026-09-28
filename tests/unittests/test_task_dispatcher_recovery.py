@@ -367,11 +367,12 @@ class TestLegacyReplayUnchanged:
         assert ps.config.members[''].endpoint_name == 'endpoint0'
         pilot = ps.pilots['p.1']
         assert pilot.member_id == ''          # -> the implicit member
-        assert pilot.nodes     == 0           # no snapshot yet
         assert pilot.child_endpoint_name == 'cpu_p.1'   # untouched
 
-        # the snapshot is repaired at the handshake, off the member menu
+        # the snapshot is backfilled once at load, off the member
+        assert (pilot.nodes, pilot.cpus_per_node) == (3, 4)
+        assert pilot.endpoint_name == 'endpoint0'
+
         plugin._dispatch_notify = lambda t, d: None
         plugin._activate_pilot(ps, pilot)
-        assert (pilot.nodes, pilot.cpus_per_node) == (3, 4)
         assert pilot.capacity == 12

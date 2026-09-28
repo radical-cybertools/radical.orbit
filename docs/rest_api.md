@@ -524,23 +524,23 @@ requirements: 2 gpus exceed every pilot_size (largest: 's', 0 gpus/node)
 requirements: 'mpi' is unsupported on dragon_v1 (pool 'x', size 's')
 ```
 
-**On a class pool** the same checks run across *every* size of *every*
-member, and the size name in the fit message is member-qualified
-(`largest: 'bridges.gpu/default'`).  A legacy pool keeps the bare size key,
-so the strings above are unchanged there.  Two further gates exist only for
-class pools, where members actually declare something to match against:
+**On a class pool** the gate is the dispatch policy's own test: a task is
+accepted only if some member's declared attributes **and default pilot
+size** — the only size the policy ever grows or dispatches to — satisfy
+it.  A task that fits nothing but a larger, non-default size would queue
+forever, so it is a 400 too.  The detail names the first member's reason:
 
 ```
 no member satisfies the task requirements: software missing: lammps
-an mpi task cannot run on this pool: every member's backend is dragon_v1
+no member satisfies the task requirements: cores 4 < 32
+no member satisfies the task requirements: backend dragon_v1 cannot run an mpi task
 ```
 
 A task no *declared* member could ever run is a client error; queueing it
-forever is the worse answer.  The mpi gate is member-level precisely
-because a class pool mixes backends — when some members can run MPI the
-task is accepted and the policy simply never offers it a `dragon_v1`
-pilot.  The runtime counterpart (the only capable member *left* after the
-submit) is `DELETE …/members`' `fail_unsatisfiable` sweep.
+forever is the worse answer.  The runtime counterpart (the only capable
+member *left* after the submit) is `DELETE …/members`'
+`fail_unsatisfiable` sweep, which asks exactly the same question — so
+removing an unrelated member never fails a task the gate accepted.
 
 `software` and `labels` never reach rhapsody: they are dispatcher-side
 placement attributes, matched against a member's (and then a pilot's)

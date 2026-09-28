@@ -96,6 +96,13 @@ class DispatchPolicy:
         '''Observe one pilot state transition.  Default: ignore it.'''
         return None
 
+    def on_member_removed(self, member_id: str) -> None:
+        '''Forget per-member state for a removed member.  Default: none.
+
+        A member id may be re-added later; it must then start clean.
+        '''
+        return None
+
     def on_tick(self, pool_state: 'PoolState',
                 submit_pilot: Callable[..., str]) -> None:
         '''Housekeeping tick: maybe request pilots.  Default: never scale.
