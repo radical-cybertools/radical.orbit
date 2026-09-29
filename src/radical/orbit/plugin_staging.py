@@ -35,8 +35,26 @@ class StagingSession(PluginSession):
         os.path.realpath('/tmp'),
     ]
 
+    # Env var naming this endpoint's scratch tree.  A task-dispatcher pilot
+    # is started with it set to its pool member's ``scratch_base``
+    # (``_build_pilot_env``), which on a real machine is a site path like
+    # ``/pscratch/...`` -- outside both static bases above.  Without this
+    # the dispatcher's own input placement to a non-shared member (a ``put``
+    # of ``<scratch_base>/<task_id>/<file>``) is refused by this very
+    # plugin.  Resolved per session, not at import, so a test or an
+    # operator can set it after the module loads.
+    _SCRATCH_ENV = 'RADICAL_ORBIT_SCRATCH_BASE'
+
     def __init__(self, sid: str):
         super().__init__(sid)
+        self._allowed_bases = list(self._ALLOWED_BASES)
+        scratch = os.environ.get(self._SCRATCH_ENV)
+        if scratch:
+            base = os.path.realpath(os.path.expanduser(scratch))
+            if base not in self._allowed_bases:
+                self._allowed_bases.append(base)
+                log.info('[staging] allowing scratch base %s (%s)',
+                         base, self._SCRATCH_ENV)
 
     def _validate_path(self, path: str) -> str:
         """Validate that path is absolute (or starts with ~) and within an
@@ -51,7 +69,7 @@ class StagingSession(PluginSession):
         if not os.path.isabs(path):
             raise ValueError(f"Path must be absolute (or use ~): {path}")
         resolved = os.path.realpath(path)
-        for base in self._ALLOWED_BASES:
+        for base in self._allowed_bases:
             if resolved == base or resolved.startswith(base + os.sep):
                 return resolved
         raise ValueError(

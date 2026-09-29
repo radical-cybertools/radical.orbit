@@ -420,17 +420,41 @@ def test_validate_path_relative_raises():
 
 def test_validate_path_outside_allowed_raises(tmp_path):
     """Path not under $HOME or /tmp must be rejected."""
-    import tempfile, os
-    session = StagingSession("sid-val-2")
-    # Create a temporary dir that is NOT under HOME or /tmp
-    # We'll manipulate _ALLOWED_BASES directly to test the logic
+    # The allow-list is snapshotted per session (a session also picks up
+    # $RADICAL_ORBIT_SCRATCH_BASE), so patch the class default BEFORE
+    # constructing the session under test.
     original = StagingSession._ALLOWED_BASES[:]
     StagingSession._ALLOWED_BASES = ["/nonexistent/base"]
     try:
+        session = StagingSession("sid-val-2")
         with pytest.raises(ValueError, match="escapes"):
             session._validate_path(str(tmp_path / "file.txt"))
     finally:
         StagingSession._ALLOWED_BASES = original
+
+
+def test_scratch_base_env_extends_the_allow_list(tmp_path, monkeypatch):
+    """A task-dispatcher pilot is started with
+    RADICAL_ORBIT_SCRATCH_BASE set to its pool member's scratch_base --
+    a site path like /pscratch/... on a real machine.  Without this the
+    dispatcher's own input placement to a non-shared member would be
+    refused by this plugin."""
+    scratch = tmp_path / "site_scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(
+        StagingSession, "_ALLOWED_BASES", ["/nonexistent/base"])
+
+    denied = StagingSession("sid-noenv")
+    with pytest.raises(ValueError, match="escapes"):
+        denied._validate_path(str(scratch / "t.1" / "in.txt"))
+
+    monkeypatch.setenv("RADICAL_ORBIT_SCRATCH_BASE", str(scratch))
+    allowed = StagingSession("sid-env")
+    resolved = allowed._validate_path(str(scratch / "t.1" / "in.txt"))
+    assert resolved == os.path.realpath(str(scratch / "t.1" / "in.txt"))
+    # ...and it does not open up anything else
+    with pytest.raises(ValueError, match="escapes"):
+        allowed._validate_path(str(tmp_path / "elsewhere" / "in.txt"))
 
 
 def test_validate_path_valid_tmp(tmp_path):

@@ -397,7 +397,8 @@ class TestRunId:
         assert r1 == r2
 
     def test_run_id_changes_on_mtime(self, tmp_path: Path):
-        import os, time
+        import os
+        import time
         p = tmp_path / 'wf.makeflow'
         p.write_text('POOL = "p"\n')
         r1 = _prep.compute_run_id(p)

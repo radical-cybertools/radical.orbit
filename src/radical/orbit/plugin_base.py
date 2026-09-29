@@ -295,19 +295,30 @@ class Plugin(object):
 
     def add_route_post(self, path: str, method: Callable):
         """Add a POST route to the plugin's namespace."""
-        full_path = self._namespace + '/' + path
-        full_path = full_path.replace('//', '/')
-        self._register_direct(full_path, "POST", method)
-        self._app.add_route(full_path, self._wrap_handler(method),
-                            methods=["POST"])
+        self._add_route(path, "POST", method)
 
     def add_route_get(self, path: str, method: Callable):
         """Add a GET route to the plugin's namespace."""
+        self._add_route(path, "GET", method)
+
+    def add_route_delete(self, path: str, method: Callable):
+        """Add a DELETE route to the plugin's namespace.
+
+        Direct dispatch (``_register_direct``) and the broker plugin host
+        are method-generic, and the gateway catch-all already lists
+        ``DELETE`` -- so a DELETE route is reachable over every transport
+        without further plumbing.
+        """
+        self._add_route(path, "DELETE", method)
+
+    def _add_route(self, path: str, verb: str, handler: Callable):
+        """Register *handler* for *verb* on *path* in the plugin's namespace,
+        for both direct dispatch and the ASGI app."""
         full_path = self._namespace + '/' + path
         full_path = full_path.replace('//', '/')
-        self._register_direct(full_path, "GET", method)
-        self._app.add_route(full_path, self._wrap_handler(method),
-                            methods=["GET"])
+        self._register_direct(full_path, verb, handler)
+        self._app.add_route(full_path, self._wrap_handler(handler),
+                            methods=[verb])
 
     @staticmethod
     def _wrap_handler(handler: Callable) -> Callable:

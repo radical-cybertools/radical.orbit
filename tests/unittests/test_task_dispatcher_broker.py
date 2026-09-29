@@ -68,6 +68,65 @@ class _FakePilot(Plugin):
         return {'pong': True}
 
 
+class _FakeRhapsody(Plugin):
+    """A rhapsody-shaped served plugin on the fake pilot.
+
+    Mounted at instance name ``rhapsody`` so its namespace is
+    ``/rhapsody`` -- exactly what a real ``RhapsodyClient`` formats.  The
+    submit body is msgpack (that is the rhapsody wire form), and every
+    forwarded task dict is recorded on the class so a test can assert what
+    actually crossed to which pilot.
+    """
+    plugin_name   = 'fake_rhapsody'
+    session_class = PluginSession
+    version       = '0.0.1'
+
+    # (endpoint_name, task dict), appended in submit order
+    received: list = []
+
+    def __init__(self, app, instance_name: str = 'rhapsody'):
+        super().__init__(app, instance_name)
+        self.add_route_post('submit/{sid}', self._submit)
+
+    async def _submit(self, request):
+        import msgpack as _mp
+        body = await request.body()
+        data = _mp.unpackb(body, raw=False)
+        me   = getattr(self._app.state, 'endpoint_name', '?')
+        acks = []
+        for td in data.get('tasks', []):
+            _FakeRhapsody.received.append((me, td))
+            acks.append({'uid': td.get('uid'), 'state': 'RUNNING'})
+        return acks
+
+
+class _FakeStaging(Plugin):
+    """A staging-shaped served plugin on the fake pilot: ``put`` only.
+
+    The real staging plugin is in the default plugin set, so it is faked
+    here rather than hosted, to keep the assertion (what was put, where,
+    and in what order relative to the rhapsody submit) local to the test.
+    """
+    plugin_name   = 'fake_staging'
+    session_class = PluginSession
+    version       = '0.0.1'
+
+    # (endpoint_name, target path, byte count)
+    puts: list = []
+
+    def __init__(self, app, instance_name: str = 'staging'):
+        super().__init__(app, instance_name)
+        self.add_route_post('put/{sid}', self._put)
+
+    async def _put(self, request):
+        import base64 as _b64
+        data = await request.json()
+        me   = getattr(self._app.state, 'endpoint_name', '?')
+        raw  = _b64.b64decode(data.get('content') or '')
+        _FakeStaging.puts.append((me, data.get('filename'), len(raw)))
+        return {'path': data.get('filename'), 'size': len(raw)}
+
+
 class _FakePsij(Plugin):
     """A psij-shaped served plugin: base ``register_session`` + a canned
     ``submit_tunneled/{sid}`` that echoes what crossed the wire.
@@ -263,3 +322,339 @@ def test_gateway_unknown_hosted_route_404(harness):
     with httpx.Client(timeout=10.0) as c:
         r = c.get('%s/broker/task_dispatcher/nope' % srv.url)
     assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Capability-class pools, end to end (plan 121 §13, acceptance tests 1-5)
+#
+# These drive a real broker hosting the dispatcher, a real login-node
+# endpoint serving the fake psij, and one real child endpoint per pilot
+# registered under the **exact** ``child_endpoint_name`` the dispatcher
+# recorded -- read out of the pilot record rather than hard-coded, which is
+# precisely the naming rule 121 changed.
+# ---------------------------------------------------------------------------
+
+def _member(mid, software, **overrides):
+    m = {
+        'member_id'    : mid,
+        'endpoint_name': 'login',
+        'queue'        : 'regular',
+        'account'      : 'proj',
+        'default_size' : 'd',
+        'pilot_sizes'  : {'d': {'nodes': 1, 'cpus_per_node': 2,
+                                'rhapsody_backend': 'concurrent'}},
+        'attributes'   : {'software': list(software)},
+    }
+    m.update(overrides)
+    return m
+
+
+def _class_pool(members, name='fed', **overrides):
+    d = {'name': name, 'pool_class': 'gpu', 'members': members,
+         'strategy': 'conservative',
+         'strategy_config': {'min_dwell_sec': 0.0}}
+    d.update(overrides)
+    return d
+
+
+class _Fed:
+    """Broker + dispatcher + login endpoint + a class pool, session 'A'."""
+
+    def __init__(self, harness, members, tmp_path, **pool_kw):
+        make_broker, make_runtime = harness
+        _FakeRhapsody.received.clear()
+        _FakeStaging.puts.clear()
+        self.make_runtime = make_runtime
+        self.srv = make_broker(plugins='task_dispatcher')
+        make_runtime(self.srv.url, name='login', serve=[_FakePsij])
+        self.td  = _dispatcher(self.srv)
+        self.sid = 'A'
+        with httpx.Client(timeout=10.0) as c:
+            r = c.post('%s/broker/task_dispatcher/register_session'
+                       % self.srv.url,
+                       json={'sid': 'A', 'lifetime': 'persistent',
+                             'pools': [_class_pool(members, **pool_kw)]})
+            assert r.status_code == 200, r.text
+        self.ps = self.td._pool_states['A']['fed']
+
+    def post(self, path, body):
+        with httpx.Client(timeout=10.0) as c:
+            return c.post('%s/broker/task_dispatcher/%s'
+                          % (self.srv.url, path), json=body)
+
+    def delete(self, path, body):
+        with httpx.Client(timeout=10.0) as c:
+            return c.request(
+                'DELETE',
+                '%s/broker/task_dispatcher/%s' % (self.srv.url, path),
+                json=body)
+
+    def submit(self, task_id, **extra):
+        body = {'pool': 'fed', 'task_id': task_id, 'cmd': ['/bin/echo', 'x']}
+        body.update(extra)
+        return self.post('submit/A', body)
+
+    def on_loop(self, fn, timeout=10.0):
+        """Run *fn* on the plugin-host loop the dispatcher actually lives
+        on -- ``_submit_pilot`` schedules the psij submission with
+        ``asyncio.create_task``, so it needs that loop running under it."""
+        import concurrent.futures
+        fut = concurrent.futures.Future()
+
+        def _run():
+            try:
+                fut.set_result(fn())
+            except Exception as e:              # pragma: no cover - test aid
+                fut.set_exception(e)
+
+        self.td._main_loop.call_soon_threadsafe(_run)
+        return fut.result(timeout=timeout)
+
+    def tick(self):
+        """One housekeeping tick: policy scale-up, then drain."""
+        self.on_loop(lambda: self.ps.policy.on_tick(
+            self.ps, self.td._make_submit_pilot(self.ps)))
+
+    def wait(self, pred, timeout=10.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if pred():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def bring_up(self, member_id):
+        """Submit a pilot for *member_id* and register its child endpoint
+        under the name the dispatcher actually recorded."""
+        before = set(self.ps.pilots)
+        pid    = self.on_loop(
+            lambda: self.td._submit_pilot(self.ps, None,
+                                          member_id=member_id))
+        assert self.wait(lambda: self.ps.pilots[pid].child_endpoint_name)
+        rec = self.ps.pilots[pid]
+        self.make_runtime(self.srv.url, name=rec.child_endpoint_name,
+                          serve=[_FakeRhapsody, _FakeStaging])
+        assert self.wait(lambda: self.ps.pilots[pid].state == 'ACTIVE')
+        assert set(self.ps.pilots) - before == {pid}
+        return rec
+
+
+def test_class_pool_routes_by_attribute(harness, tmp_path):
+    """Test 1: a task lands only on a pilot whose member declares its
+    software, and the pilot's child endpoint name carries the member."""
+    fed = _Fed(harness, [_member('m_x', ['x']), _member('m_y', ['y'])],
+               tmp_path)
+    px = fed.bring_up('m_x')
+    py = fed.bring_up('m_y')
+    assert px.child_endpoint_name == 'fed_m_x_%s' % px.pid
+    assert py.child_endpoint_name == 'fed_m_y_%s' % py.pid
+
+    assert fed.submit('t.x', requirements={'software': ['x']}
+                      ).status_code == 200
+    assert fed.submit('t.y', requirements={'software': ['y']}
+                      ).status_code == 200
+    assert fed.wait(lambda: len(_FakeRhapsody.received) == 2)
+
+    landed = {td['uid']: ep for ep, td in _FakeRhapsody.received}
+    assert landed['t.x'] == px.child_endpoint_name
+    assert landed['t.y'] == py.child_endpoint_name
+    assert fed.ps.tasks['t.x'].member_id == 'm_x'
+    assert fed.ps.tasks['t.y'].member_id == 'm_y'
+
+
+def test_scale_up_picks_the_matching_member(harness, tmp_path):
+    """Test 2: empty fleet, one task -- exactly one pilot, for m_y."""
+    fed = _Fed(harness, [_member('m_x', ['x']), _member('m_y', ['y'])],
+               tmp_path)
+    assert fed.submit('t.1', requirements={'software': ['y']}
+                      ).status_code == 200
+    fed.tick()
+    assert len(fed.ps.pilots) == 1
+    assert next(iter(fed.ps.pilots.values())).member_id == 'm_y'
+
+
+def test_member_removal_drains_to_a_sibling(harness, tmp_path):
+    """Test 3: a RUNNING task on m_x is re-queued and picked up by m_y."""
+    fed = _Fed(harness, [_member('m_x', ['x', 'shared']),
+                         _member('m_y', ['y', 'shared'])], tmp_path)
+    pilots = {m: fed.bring_up(m) for m in ('m_x', 'm_y')}
+    assert fed.submit('t.1', requirements={'software': ['shared']}
+                      ).status_code == 200
+
+    task = fed.ps.tasks['t.1']
+    assert fed.wait(lambda: task.pilot_id is not None)
+    # either member can serve it; drain whichever one actually got it
+    gone  = task.member_id
+    other = 'm_y' if gone == 'm_x' else 'm_x'
+
+    r = fed.delete('pool/A/fed/members/%s' % gone, {})
+    assert r.status_code == 200, r.text
+    assert r.json()['pilots_cancelled'] == 1
+
+    assert pilots[gone].state == 'FAILED'
+    assert gone not in fed.ps.config.members
+    assert task.requeues == 1
+    assert fed.wait(lambda: task.pilot_id == pilots[other].pid)
+    assert task.member_id == other
+
+
+def test_member_removal_fails_an_unsatisfiable_task(harness, tmp_path):
+    """Test 3b: no remaining member can serve it -> FAILED with a reason."""
+    fed = _Fed(harness, [_member('m_x', ['x']), _member('m_y', ['y'])],
+               tmp_path)
+    px = fed.bring_up('m_x')
+    fed.bring_up('m_y')
+    assert fed.submit('t.1', requirements={'software': ['x']}
+                      ).status_code == 200
+    assert fed.wait(lambda: fed.ps.tasks['t.1'].pilot_id == px.pid)
+
+    r = fed.delete('pool/A/fed/members/m_x', {})
+    assert r.status_code == 200, r.text
+    assert r.json()['tasks_failed'] == 1
+    task = fed.ps.tasks['t.1']
+    assert task.state == 'FAILED'
+    assert task.error == \
+        'no member satisfies the task requirements: software missing: x'
+
+
+def test_budget_per_member(harness, tmp_path):
+    """Test 4: an exhausted member is skipped, and the verbose summary
+    reports the two node_hours figures independently."""
+    fed = _Fed(harness, [
+        _member('m_x', ['shared'], budget={'node_hours': 0.001}),
+        _member('m_y', ['shared'], budget={'node_hours': 100.0})],
+        tmp_path)
+    # burn m_x's budget with a long-running pilot of its own
+    now = time.time()
+    fed.ps.pilots['p.old'] = __import__(
+        'radical.orbit.task_dispatcher_state', fromlist=['PilotRecord']
+    ).PilotRecord(
+        pid='p.old', pool='fed', owning_sid='A', size_key='d',
+        rhapsody_backend='concurrent', state='DONE', member_id='m_x',
+        nodes=1, cpus_per_node=2, submitted_at=now - 3600,
+        active_at=now - 3600, finished_at=now)
+
+    assert fed.submit('t.1', requirements={'software': ['shared']}
+                      ).status_code == 200
+    fed.tick()
+    fresh = [p for p in fed.ps.pilots.values() if p.pid != 'p.old']
+    assert [p.member_id for p in fresh] == ['m_y']
+
+    with httpx.Client(timeout=10.0) as c:
+        r = c.get('%s/broker/task_dispatcher/pool/A/fed' % fed.srv.url)
+    assert r.status_code == 200, r.text
+    members = {m['member_id']: m for m in r.json()['members']}
+    assert members['m_x']['node_hours_used'] == pytest.approx(1.0, abs=0.05)
+    assert members['m_y']['node_hours_used'] == pytest.approx(0.0, abs=0.05)
+    assert members['m_x']['node_hours_remaining'] < 0
+    assert r.json()['node_hours_used'] == pytest.approx(1.0, abs=0.05)
+
+
+def test_inputs_reach_a_non_shared_member(harness, tmp_path):
+    """Test 5: the file is ``put`` at <cwd>/<name> BEFORE submit_tasks, and
+    the broker creates nothing under the member's scratch_base."""
+    import base64
+    remote = tmp_path / 'remote_scratch'
+    fed = _Fed(harness, [_member('m_x', ['x'], shared_fs=False,
+                                 scratch_base=str(remote))], tmp_path)
+    px = fed.bring_up('m_x')
+
+    r = fed.submit('t.1', requirements={'software': ['x']},
+                   inputs_b64={'md.json':
+                               base64.b64encode(b'{"a":1}').decode()})
+    assert r.status_code == 200, r.text
+    assert fed.wait(lambda: len(_FakeRhapsody.received) == 1)
+
+    task = fed.ps.tasks['t.1']
+    assert task.cwd     == str(remote / 't.1')
+    assert task.spooled == ['md.json']
+    assert _FakeStaging.puts == [
+        (px.child_endpoint_name, str(remote / 't.1' / 'md.json'), 7)]
+    # the put happened before the task was forwarded
+    assert _FakeRhapsody.received[0][1]['uid'] == 't.1'
+    # nothing created on the broker host under the member's scratch
+    assert not remote.exists()
+
+
+def test_inputs_reach_a_non_shared_member_through_the_real_staging_plugin(
+        harness, tmp_path, monkeypatch):
+    """The staging plugin's allow-list is `$HOME` + `/tmp` only, so a real
+    member's `scratch_base` (`/pscratch/...`) would be refused with "Path
+    escapes allowed directories" -- the dispatcher's own input placement
+    blocked by its own staging plugin.  The pilot is started with
+    `RADICAL_ORBIT_SCRATCH_BASE` set to that member's scratch_base
+    (`_build_pilot_env`), and the staging session extends its allow-list
+    from it.
+
+    To *prove* the mechanism rather than ride on /tmp already being
+    allowed, the static bases are narrowed to a nonexistent directory here:
+    only the env var can let this put through.
+    """
+    import base64
+    from radical.orbit.plugin_staging import PluginStaging, StagingSession
+
+    scratch = tmp_path / 'site_scratch'
+    scratch.mkdir()
+    monkeypatch.setattr(StagingSession, '_ALLOWED_BASES',
+                        ['/nonexistent/base'])
+    monkeypatch.setenv('RADICAL_ORBIT_SCRATCH_BASE', str(scratch))
+
+    fed = _Fed(harness, [_member('m_x', ['x'], shared_fs=False,
+                                 scratch_base=str(scratch))], tmp_path)
+
+    # the pilot serves the REAL staging plugin, not the fake one
+    before = set(fed.ps.pilots)
+    pid    = fed.on_loop(
+        lambda: fed.td._submit_pilot(fed.ps, None, member_id='m_x'))
+    assert fed.wait(lambda: fed.ps.pilots[pid].child_endpoint_name)
+    rec = fed.ps.pilots[pid]
+    fed.make_runtime(fed.srv.url, name=rec.child_endpoint_name,
+                     serve=[_FakeRhapsody, PluginStaging])
+    assert fed.wait(lambda: fed.ps.pilots[pid].state == 'ACTIVE')
+    assert set(fed.ps.pilots) - before == {pid}
+
+    r = fed.submit('t.1', requirements={'software': ['x']},
+                   inputs_b64={'md.json':
+                               base64.b64encode(b'{"a":1}').decode()})
+    assert r.status_code == 200, r.text
+    assert fed.wait(lambda: len(_FakeRhapsody.received) == 1), \
+        'task never reached the pilot: %s' % fed.ps.tasks['t.1'].error
+
+    task = fed.ps.tasks['t.1']
+    assert task.state == 'RUNNING', task.error
+    assert task.cwd   == str(scratch / 't.1')
+    # the real plugin actually wrote the bytes where the task will run
+    assert (scratch / 't.1' / 'md.json').read_bytes() == b'{"a":1}'
+
+
+def test_real_staging_refuses_a_scratch_outside_the_allow_list(
+        harness, tmp_path, monkeypatch):
+    """The negative half: without the env var the same put is refused, and
+    the task fails with a reason instead of running without its inputs."""
+    import base64
+    from radical.orbit.plugin_staging import PluginStaging, StagingSession
+
+    scratch = tmp_path / 'site_scratch'
+    scratch.mkdir()
+    monkeypatch.setattr(StagingSession, '_ALLOWED_BASES',
+                        ['/nonexistent/base'])
+    monkeypatch.delenv('RADICAL_ORBIT_SCRATCH_BASE', raising=False)
+
+    fed = _Fed(harness, [_member('m_x', ['x'], shared_fs=False,
+                                 scratch_base=str(scratch))], tmp_path)
+    pid = fed.on_loop(
+        lambda: fed.td._submit_pilot(fed.ps, None, member_id='m_x'))
+    assert fed.wait(lambda: fed.ps.pilots[pid].child_endpoint_name)
+    fed.make_runtime(fed.srv.url,
+                     name=fed.ps.pilots[pid].child_endpoint_name,
+                     serve=[_FakeRhapsody, PluginStaging])
+    assert fed.wait(lambda: fed.ps.pilots[pid].state == 'ACTIVE')
+
+    assert fed.submit('t.1', requirements={'software': ['x']},
+                      inputs_b64={'md.json':
+                                  base64.b64encode(b'x').decode()}
+                      ).status_code == 200
+    task = fed.ps.tasks['t.1']
+    assert fed.wait(lambda: task.state == 'FAILED')
+    assert task.error.startswith('could not place inputs on the pilot:')
+    assert _FakeRhapsody.received == []

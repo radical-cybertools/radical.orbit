@@ -141,9 +141,32 @@ one pending task queue, one policy.
 - Visible to users: yes — the `POOL = "..."` directive in `.makeflow`
   names a pool.
 
-A pool is the unit of resource budget (queue+account+max_pilots), the unit
-of policy (one strategy instance), and the unit of task grouping (one
-pending queue per pool; tasks do not migrate between pools).
+A pool is the unit of policy (one strategy instance) and the unit of task
+grouping (one pending queue per pool; tasks do not migrate between pools).
+
+**Amended by plan 121 — a pool is a capability *class*, not a site.**  A
+pool now has one or more **members**; a member is one
+`(endpoint, queue, account, pilot-size menu, attributes, budget)` tuple, so
+a GPU pilot on Bridges and a GPU pilot on Perlmutter both live in the pool
+`fed-gpu`.  Consequences:
+
+- Resource budget is **per member** (allocations are per site), as are
+  `min_pilots` / `max_pilots`, the pilot-size menu, and the scratch tree.
+- `pool_class` is an explicit string field the declarer sets; it is never
+  derived inside the dispatcher, so new classes need no dispatcher change.
+- A member's `attributes` (conventionally `site` and `software`) are
+  **declared, not self-reported** — no handshake or protocol change.  A
+  pilot snapshots its member's attributes, size and endpoint at submit
+  time and keeps them for its life.
+- A *legacy* declaration (no `members` key) keeps its scalar fields and
+  gains exactly one **implicit** member synthesised from them, so every
+  runtime path reads `config.members` only: one shape at runtime, two on
+  the wire.  A legacy pool is never promoted in place.
+- Pools **can** be added to a live session — `register_session` reconnects
+  the sid and then materialises every declared pool — but members are
+  added and removed through their own routes
+  (`POST`/`DELETE pool/{sid}/{name}/members[/{member_id}]`), because a
+  re-declaration of an existing pool is deliberately an idempotent no-op.
 
 ### 3.2 Pilot
 
@@ -227,16 +250,23 @@ one edge ──┬─── 0…N pools               (operator-declared)
 one pool ──┬─── one strategy instance
            ├─── one pending task queue
            ├─── one pilot ledger
-           ├─── one scratch tree
-           └── 0…max_pilots live pilots
+           ├─── one broker-local scratch tree
+           └── 1…N members            (plan 121; legacy = 1 implicit)
+
+one member ┬─── one endpoint, queue, account
+           ├─── one pilot-size menu + default size
+           ├─── one attribute map and one budget
+           ├─── one scratch tree ON ITS OWN HOST (shared_fs or not)
+           └── 0…member.max_pilots live pilots
 
 one pilot ─┬─── one SLURM/PBS job
+           ├─── exactly one member (snapshotted at submit)
            ├─── one child radical.edge service (rhapsody + staging)
            ├─── one rhapsody backend (fixed at submit time)
            └── 0…capacity in-flight tasks
 
 one task ──┬─── exactly one pool (its target)
-           ├─── at most one pilot (once assigned)
+           ├─── at most one pilot, and with it one member (at dispatch)
            └── one task_id (stable across retries in a run)
 ```
 
@@ -564,18 +594,47 @@ class PilotSize:
     walltime_sec: int = 3600
 
 @dataclass
-class PoolConfig:
-    name: str                            # unique per edge
-    queue: str
+class PoolMember:                        # plan 121
+    member_id: str                       # unique in the pool; [a-z0-9][a-z0-9_.-]*
+    endpoint_name: str                   # required -- no auto-pick
+    queue: str                           # not the 'default' sentinel
     account: str | None
-    pilot_sizes: dict[str, PilotSize]    # strategy picks by key
-    default_size: str                    # key into pilot_sizes
+    pilot_sizes: dict[str, PilotSize]
+    default_size: str
     min_pilots: int = 0
     max_pilots: int = 4
-    scratch_base: str | None = None
+    scratch_base: str | None = None      # path ON THE MEMBER'S HOST
+    shared_fs: bool = True               # broker host shares scratch_base
+    attributes: dict = field(default_factory=dict)   # site, software, …
+    budget: dict = field(default_factory=dict)       # {'node_hours': x}
+
+@dataclass
+class PoolConfig:
+    name: str                            # unique per session
+    queue: str                           # projection of the primary member
+    account: str | None                  # projection
+    pilot_sizes: dict[str, PilotSize]    # projection
+    default_size: str                    # projection
+    endpoint_name: str | None = None     # projection
+    min_pilots: int = 0                  # projection
+    max_pilots: int = 4                  # projection
+    scratch_base: str | None = None      # projection
     strategy: str = 'conservative'
     strategy_config: dict = field(default_factory=dict)
+    # -- plan 121 ------------------------------------------------------
+    pool_class: str = ''                 # '' = unclassified (legacy)
+    members: dict[str, PoolMember] = field(default_factory=dict)
+    multi_member: bool = False           # the declaration carried 'members'
 ```
+
+When `multi_member` is true, `members` is authoritative and the nine
+scalar fields are a read-only projection of the **primary** member (first
+by declaration order), recomputed on every parse.  When it is false,
+`members` holds exactly one implicit member (`member_id = '_'`) built from
+those fields — synthesised in `__post_init__`, so a `PoolConfig` built
+directly (tests, `default_pool_config`) has it too, and dropped again by
+`to_dict()` so a legacy pool never *persists* it (persisting it would make
+replay read the pool as a class pool).
 
 - Location: `~/.radical/edge/task_dispatcher/pools.json` on each
   login-node edge.
@@ -617,16 +676,23 @@ consumes. No runtime coupling between preprocessor and dispatcher.
 ### 9.1 On-disk layout
 
 ```
-~/.radical/edge/task_dispatcher/
-├── pools.json                      # operator-maintained config
+~/.radical/orbit/task_dispatcher/
 ├── state/
-│   ├── <pool_name>/
-│   │   ├── pilot.log               # JSONL append-only
-│   │   ├── task.log                # JSONL append-only
-│   │   └── snapshot.json           # periodic compaction
+│   └── <sid>/<pool>__<tag>/        # tag: endpoint_name | 'members'
+│       ├── state.json              # config + pilots + tasks, atomic
+│       └── inputs/<task_id>/       # broker-local input spool (121 §4.3)
 └── scratch/
-    └── <pool_name>/<task_id>/      # rule-scoped staging dirs
+    └── <pool_name>/<task_id>/      # task-scoped scratch dirs
 ```
+
+The directory **tag** is `members` for a class pool, so the pool's state
+does not move when its primary member leaves; a legacy pool keeps its
+endpoint tag.  Replay passes the directory it found back into
+`_materialise_pool`, so the name rule can never make replay and
+declaration disagree.  A class pool's `PoolState.scratch_base` is always
+broker-local — a member's own `scratch_base` names a path on *its* host
+and is read only when building the pilot env and when assigning a task's
+cwd at dispatch.
 
 ### 9.2 Recovery contract
 

@@ -242,3 +242,271 @@ class TestSchemaErrors:
     def test_endpoint_name_non_string_rejected(self):
         with pytest.raises(PoolConfigError, match="endpoint_name"):
             parse_pools(_minimal_pool_dict(endpoint_name=42))
+
+
+# ---------------------------------------------------------------------------
+# Capability-class pools: members (plan 121 §3)
+# ---------------------------------------------------------------------------
+
+def _member_dict(**overrides):
+    """Return a valid member declaration; overrides merged in."""
+    m = {
+        'member_id'    : 'perlmutter',
+        'endpoint_name': 'ep_pm',
+        'queue'        : 'regular',
+        'account'      : 'm1234',
+        'default_size' : 'default',
+        'pilot_sizes'  : {
+            'default': {'nodes': 1, 'cpus_per_node': 128,
+                        'gpus_per_node': 4, 'walltime_sec': 1800,
+                        'rhapsody_backend': 'concurrent'}
+        },
+        'attributes'   : {'site': 'NERSC', 'software': ['lammps']},
+        'budget'       : {'node_hours': 40.0},
+    }
+    m.update(overrides)
+    return m
+
+
+def _class_pool_dict(members=None, **overrides):
+    pool = {
+        'name'      : 'fed-gpu',
+        'pool_class': 'gpu',
+        'members'   : members if members is not None else [_member_dict()],
+    }
+    pool.update(overrides)
+    return {'pools': [pool]}
+
+
+class TestMemberParsing:
+
+    def test_list_form(self):
+        cfg = parse_pools(_class_pool_dict())['fed-gpu']
+        assert cfg.multi_member is True
+        assert list(cfg.members) == ['perlmutter']
+        assert cfg.pool_class == 'gpu'
+
+    def test_map_form_is_equivalent(self):
+        as_map = parse_pools(_class_pool_dict(
+            members={'perlmutter': {k: v for k, v in _member_dict().items()
+                                    if k != 'member_id'}}))['fed-gpu']
+        as_list = parse_pools(_class_pool_dict())['fed-gpu']
+        assert as_map == as_list
+
+    def test_declaration_order_is_preserved(self):
+        cfg = parse_pools(_class_pool_dict(members=[
+            _member_dict(member_id='zeta'),
+            _member_dict(member_id='alpha'),
+        ]))['fed-gpu']
+        assert list(cfg.members) == ['zeta', 'alpha']
+        assert cfg.primary_member().member_id == 'zeta'
+
+    def test_duplicate_member_id(self):
+        with pytest.raises(PoolConfigError, match='duplicate member_id'):
+            parse_pools(_class_pool_dict(
+                members=[_member_dict(), _member_dict()]))
+
+    @pytest.mark.parametrize('bad', ['Perlmutter', '_pm', '-pm', 'p m', ''])
+    def test_bad_member_id_charset(self, bad):
+        with pytest.raises(PoolConfigError, match='member_id'):
+            parse_pools(_class_pool_dict(
+                members=[_member_dict(member_id=bad)]))
+
+    def test_default_queue_sentinel_rejected(self):
+        with pytest.raises(PoolConfigError, match='sentinel'):
+            parse_pools(_class_pool_dict(
+                members=[_member_dict(queue='default')]))
+
+    def test_max_pilots_zero_rejected(self):
+        with pytest.raises(PoolConfigError, match='max_pilots'):
+            parse_pools(_class_pool_dict(
+                members=[_member_dict(max_pilots=0)]))
+
+    def test_endpoint_name_required(self):
+        m = _member_dict()
+        del m['endpoint_name']
+        with pytest.raises(PoolConfigError, match='endpoint_name'):
+            parse_pools(_class_pool_dict(members=[m]))
+
+    def test_default_size_must_be_in_pilot_sizes(self):
+        with pytest.raises(PoolConfigError, match='default_size'):
+            parse_pools(_class_pool_dict(
+                members=[_member_dict(default_size='nope')]))
+
+    def test_bad_attribute_value_rejected(self):
+        with pytest.raises(PoolConfigError, match='attribute'):
+            parse_pools(_class_pool_dict(
+                members=[_member_dict(attributes={'a': {'nested': 1}})]))
+
+    def test_attribute_list_of_strings_accepted(self):
+        cfg = parse_pools(_class_pool_dict(members=[
+            _member_dict(attributes={'software': ['a', 'b'],
+                                     'site': 'x', 'mem_gb_per_node': 256})
+        ]))['fed-gpu']
+        assert cfg.primary_member().attributes['software'] == ['a', 'b']
+
+    def test_unknown_budget_key_rejected(self):
+        with pytest.raises(PoolConfigError, match='budget'):
+            parse_pools(_class_pool_dict(
+                members=[_member_dict(budget={'core_hours': 1})]))
+
+    def test_non_positive_budget_rejected(self):
+        with pytest.raises(PoolConfigError, match='node_hours'):
+            parse_pools(_class_pool_dict(
+                members=[_member_dict(budget={'node_hours': 0})]))
+
+    def test_shared_fs_must_be_bool(self):
+        with pytest.raises(PoolConfigError, match='shared_fs'):
+            parse_pools(_class_pool_dict(
+                members=[_member_dict(shared_fs='yes')]))
+
+    def test_long_pool_plus_member_name_rejected(self):
+        with pytest.raises(PoolConfigError, match='64 characters'):
+            parse_pools(_class_pool_dict(
+                members=[_member_dict(member_id='m' * 60)],
+                name='p' * 10))
+
+
+class TestShapeSwitch:
+
+    def test_members_key_makes_it_a_class_pool(self):
+        assert parse_pools(_class_pool_dict())['fed-gpu'].multi_member
+
+    def test_legacy_declaration_has_one_implicit_member(self):
+        cfg = parse_pools(_minimal_pool_dict())['cpu']
+        assert cfg.multi_member is False
+        assert list(cfg.members) == ['']
+        assert cfg.members[''].queue == 'batch'
+
+    def test_explicit_false_beside_members_parses_legacy(self):
+        """Defence in depth for an old or hand-edited state file."""
+        raw = _minimal_pool_dict()
+        raw['pools'][0]['multi_member'] = False
+        raw['pools'][0]['members'] = [_member_dict()]
+        cfg = parse_pools(raw)['cpu']
+        assert cfg.multi_member is False
+        assert list(cfg.members) == ['']
+        assert cfg.queue == 'batch'
+
+    def test_empty_members_rejected_on_the_declaration_path(self):
+        with pytest.raises(PoolConfigError, match='must not be empty'):
+            parse_pools(_class_pool_dict(members=[]))
+
+    def test_empty_members_accepted_on_the_replay_path(self):
+        cfg = parse_pools(_class_pool_dict(members=[]),
+                          allow_empty_members=True)['fed-gpu']
+        assert cfg.members == {}
+        assert cfg.multi_member is True
+
+    def test_missing_members_key_when_flagged(self):
+        with pytest.raises(PoolConfigError, match="'members'"):
+            parse_pools({'pools': [{'name': 'x', 'multi_member': True}]})
+
+
+class TestProjection:
+
+    def test_scalars_project_the_primary_member(self):
+        cfg = parse_pools(_class_pool_dict(members=[
+            _member_dict(member_id='primary', queue='q1',
+                         endpoint_name='ep1', account='a1',
+                         min_pilots=1, max_pilots=3,
+                         scratch_base='/scratch/a'),
+            _member_dict(member_id='second', queue='q2',
+                         endpoint_name='ep2'),
+        ]))['fed-gpu']
+        assert cfg.queue         == 'q1'
+        assert cfg.endpoint_name == 'ep1'
+        assert cfg.account       == 'a1'
+        assert cfg.min_pilots    == 1
+        assert cfg.max_pilots    == 3
+        assert cfg.scratch_base  == '/scratch/a'
+        assert cfg.default_size  == 'default'
+
+    def test_reproject_after_primary_removal(self):
+        cfg = parse_pools(_class_pool_dict(members=[
+            _member_dict(member_id='a', queue='q1', endpoint_name='ep1'),
+            _member_dict(member_id='b', queue='q2', endpoint_name='ep2'),
+        ]))['fed-gpu']
+        cfg.members.pop('a')
+        cfg.reproject()
+        assert cfg.queue == 'q2' and cfg.endpoint_name == 'ep2'
+
+    def test_bind_endpoint_writes_through_to_implicit_member(self):
+        cfg = parse_pools(_minimal_pool_dict(endpoint_name=None))['cpu']
+        cfg.bind_endpoint('picked')
+        assert cfg.endpoint_name              == 'picked'
+        assert cfg.members[''].endpoint_name == 'picked'
+
+
+class TestPoolClass:
+
+    def test_default_is_empty(self):
+        assert parse_pools(_minimal_pool_dict())['cpu'].pool_class == ''
+
+    @pytest.mark.parametrize('bad', ['GPU', 'g pu', 'gpu!', 42])
+    def test_bad_pool_class_rejected_not_coerced(self, bad):
+        with pytest.raises(PoolConfigError, match='pool_class'):
+            parse_pools(_minimal_pool_dict(pool_class=bad))
+
+
+class TestRoundTrip:
+    """``parse_pools({'pools': [cfg.to_dict()]})`` is exactly the replay path."""
+
+    def test_legacy_to_dict_flags_the_shape(self):
+        """The persisted implicit member is ignored on replay because the
+        explicit ``multi_member: false`` wins."""
+        cfg = parse_pools(_minimal_pool_dict())['cpu']
+        d   = cfg.to_dict()
+        assert d['multi_member'] is False
+        assert list(d['members']) == ['']
+
+    def test_legacy_round_trip(self):
+        cfg = parse_pools(_minimal_pool_dict())['cpu']
+        assert parse_pools({'pools': [cfg.to_dict()]})['cpu'] == cfg
+
+    def test_legacy_round_trip_is_stable_twice(self):
+        cfg  = parse_pools(_minimal_pool_dict())['cpu']
+        once = parse_pools({'pools': [cfg.to_dict()]})['cpu']
+        assert parse_pools({'pools': [once.to_dict()]})['cpu'] == cfg
+
+    def test_class_pool_round_trip(self):
+        cfg = parse_pools(_class_pool_dict(members=[
+            _member_dict(member_id='a'),
+            _member_dict(member_id='b', endpoint_name='ep_br',
+                         shared_fs=False, budget={}),
+        ]))['fed-gpu']
+        assert parse_pools({'pools': [cfg.to_dict()]})['fed-gpu'] == cfg
+
+    def test_emptied_class_pool_round_trip(self):
+        cfg = parse_pools(_class_pool_dict())['fed-gpu']
+        cfg.members.clear()
+        cfg.reproject()
+        back = parse_pools({'pools': [cfg.to_dict()]}, 'replay',
+                           allow_empty_members=True)['fed-gpu']
+        assert back.members == {} and back.multi_member is True
+
+
+class TestDirectConstruction:
+    """``__post_init__`` is the single construction site of the implicit
+    member: PoolConfig is instantiated directly in several places that
+    never touch the parser."""
+
+    def test_direct_poolconfig_has_its_implicit_member(self):
+        from radical.orbit.task_dispatcher_config import PoolConfig
+        cfg = PoolConfig(
+            name='x', queue='batch', account=None,
+            pilot_sizes={'s': PilotSize(nodes=1, cpus_per_node=4,
+                                        rhapsody_backend='concurrent')},
+            default_size='s')
+        assert list(cfg.members) == ['']
+        assert cfg.members[''].default_size == 's'
+
+    def test_default_pool_config_has_its_implicit_member(self):
+        cfg = default_pool_config()
+        assert list(cfg.members) == ['']
+        assert cfg.members[''].queue == DEFAULT_POOL_NAME
+
+    def test_pilot_sizes_are_shared_by_reference(self):
+        """The legacy projection and the member can never drift."""
+        cfg = default_pool_config()
+        assert cfg.members[''].pilot_sizes is cfg.pilot_sizes

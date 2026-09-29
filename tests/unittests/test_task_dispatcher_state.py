@@ -218,7 +218,7 @@ class TestPoolStore:
 
     def test_save_creates_parent_dirs(self, tmp_path: Path):
         nested = tmp_path / 'a' / 'b' / 'state.json'
-        store = PoolStore(nested)
+        PoolStore(nested)
         assert nested.parent.is_dir()
 
     def test_path_property(self, tmp_path: Path):
@@ -262,3 +262,127 @@ class TestPoolStore:
         payload = store.load()
         assert payload['pilots'] == {}
         assert payload['tasks']  == {}
+
+
+# ---------------------------------------------------------------------------
+# Capability-class record fields (plan 121 §3.3)
+# ---------------------------------------------------------------------------
+
+from dataclasses import asdict                                  # noqa: E402
+
+from radical.orbit.task_dispatcher_state import node_hours      # noqa: E402
+
+
+class TestPilotRecordMemberFields:
+
+    def test_round_trip(self):
+        p = PilotRecord(pid='p.1', pool='fed-gpu', size_key='default',
+                        rhapsody_backend='concurrent',
+                        member_id='perlmutter',
+                        attributes={'site': 'NERSC',
+                                    'software': ['lammps']},
+                        endpoint_name='ep_pm',
+                        nodes=2, cpus_per_node=128, gpus_per_node=4)
+        back = record_from_dict(PilotRecord, asdict(p))
+        assert back == p
+
+    def test_old_dict_loads_with_defaults(self):
+        """A pre-121 record: implicit member, zero size snapshot."""
+        old = {'pid': 'p.1', 'pool': 'cpu', 'size_key': 's',
+               'rhapsody_backend': 'concurrent', 'state': PILOT_ACTIVE,
+               'capacity': 4}
+        p = record_from_dict(PilotRecord, old)
+        assert p.member_id     == ''
+        assert p.attributes    == {}
+        assert p.endpoint_name == ''
+        assert (p.nodes, p.cpus_per_node, p.gpus_per_node) == (0, 0, 0)
+        assert p.finished_at is None
+
+
+class TestTaskRecordMemberFields:
+
+    def test_round_trip(self):
+        t = TaskRecord(task_id='t.1', pool='fed-gpu', cmd=['/bin/echo'],
+                       cwd='/scratch/t.1',
+                       requirements={'software': ['lammps']},
+                       member_id='perlmutter', requeues=2,
+                       spooled=['md.json'], cwd_assigned=True)
+        assert record_from_dict(TaskRecord, asdict(t)) == t
+
+    def test_old_dict_loads_with_defaults(self):
+        t = record_from_dict(TaskRecord, {
+            'task_id': 't.1', 'pool': 'cpu', 'cmd': [], 'cwd': '/tmp'})
+        assert t.member_id    is None
+        assert t.requeues     == 0
+        assert t.spooled      == []
+        assert t.cwd_assigned is False
+        assert t.requirements == {}
+
+    def test_spooled_is_not_inputs(self):
+        """``inputs`` keeps its client-declared meaning; ``spooled`` is what
+        the dispatcher actually holds."""
+        t = TaskRecord(task_id='t.1', pool='p', cmd=[], cwd='/tmp',
+                       inputs=['declared.txt'], spooled=['held.txt'])
+        assert t.inputs == ['declared.txt']
+        assert t.spooled == ['held.txt']
+
+
+def _recs(hist):
+    """Build pilot records from field dicts (``node_hours`` input)."""
+    return [PilotRecord(**{'pid': f'p.{i}', 'pool': 'x', 'size_key': 's',
+                           'rhapsody_backend': 'b', **d})
+            for i, d in enumerate(hist)]
+
+
+class TestNodeHours:
+
+    def test_empty_history(self):
+        assert node_hours([]) == 0.0
+        assert node_hours(None) == 0.0
+
+    def test_from_the_snapshot(self):
+        hist = [{'nodes': 2, 'active_at': 1000.0, 'finished_at': 4600.0}]
+        assert node_hours(_recs(hist)) == 2.0
+
+    def test_queue_time_is_never_charged(self):
+        """No ``active_at`` -> the pilot never ran; charge nothing.  Queue
+        time is not allocation time."""
+        hist = [{'nodes': 1, 'submitted_at': 1000.0, 'finished_at': 2800.0}]
+        assert node_hours(_recs(hist)) == 0.0
+
+    def test_charged_from_active_at_not_submitted_at(self):
+        hist = [{'nodes': 1, 'submitted_at': 0.0, 'active_at': 1000.0,
+                 'finished_at': 2800.0}]
+        assert node_hours(_recs(hist)) == 0.5
+
+    def test_live_pilot_charged_up_to_now(self):
+        hist = [{'nodes': 1, 'active_at': 1000.0, 'finished_at': None}]
+        assert node_hours(_recs(hist), now=8200.0) == 2.0
+
+    def test_unstarted_pilot_is_not_charged(self):
+        """A record that never reached ACTIVE must not be charged from the
+        epoch to now."""
+        assert node_hours(_recs([{'nodes': 4, 'submitted_at': 1000.0,
+                                  'active_at': None}]), now=8200.0) == 0.0
+
+    def test_entry_without_snapshot_is_skipped(self):
+        hist = [{'size_key': 's', 'active_at': 1000.0,
+                 'finished_at': 4600.0}]
+        assert node_hours(_recs(hist)) == 0.0
+
+    def test_mixed_node_counts_are_summed_per_snapshot(self):
+        """The reason the snapshot exists: a mixed-node-count pool sized
+        off one flat menu would give a different -- wrong -- total."""
+        hist = [{'nodes': 1, 'size_key': 's', 'active_at': 1000.0,
+                 'finished_at': 4600.0},
+                {'nodes': 8, 'size_key': 's', 'active_at': 1000.0,
+                 'finished_at': 4600.0}]
+        assert node_hours(_recs(hist)) == 9.0
+
+    def test_negative_interval_is_clamped(self):
+        hist = [{'nodes': 1, 'active_at': 100.0, 'finished_at': 50.0}]
+        assert node_hours(_recs(hist)) == 0.0
+
+    def test_zero_node_entry_skipped(self):
+        assert node_hours(_recs([{'nodes': 0, 'active_at': 1000.0,
+                                  'finished_at': 4600.0}])) == 0.0

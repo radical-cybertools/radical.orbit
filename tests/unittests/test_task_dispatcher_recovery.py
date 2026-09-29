@@ -216,3 +216,163 @@ def test_no_get_event_loop_run_until_complete_in_tests():
     offenders = [p.name for p in here.glob('test_*.py')
                  if p.name != Path(__file__).name and pattern in p.read_text()]
     assert not offenders, f"use asyncio.run instead: {offenders}"
+
+
+# ---------------------------------------------------------------------------
+# Capability-class pools: persistence and replay (plan 121 §10)
+# ---------------------------------------------------------------------------
+
+import json                                                     # noqa: E402
+
+from radical.orbit.task_dispatcher_config import PoolMember     # noqa: E402
+
+
+def _member(mid='m_x', **overrides) -> PoolMember:
+    defaults = dict(
+        member_id=mid, endpoint_name=f'ep_{mid}', queue='regular',
+        account='proj',
+        pilot_sizes={'d': PilotSize(nodes=1, cpus_per_node=4,
+                                    rhapsody_backend='concurrent')},
+        default_size='d', attributes={'software': [mid[-1]]})
+    defaults.update(overrides)
+    return PoolMember(**defaults)
+
+
+def _class_cfg(*members, name='fed') -> PoolConfig:
+    members = members or (_member(),)
+    primary = members[0]
+    return PoolConfig(
+        name=name, queue=primary.queue, account=primary.account,
+        pilot_sizes=primary.pilot_sizes, default_size=primary.default_size,
+        endpoint_name=primary.endpoint_name,
+        pool_class='gpu', multi_member=True,
+        members={m.member_id: m for m in members},
+        strategy='conservative', strategy_config={'min_dwell_sec': 0.0})
+
+
+class TestClassPoolReplay:
+
+    def test_members_and_pilots_survive(self, tmp_path):
+        plugin = _make_plugin(tmp_path, with_pool=False)
+        ps = plugin._materialise_pool(_SID, _class_cfg(_member('m_x'),
+                                                       _member('m_y')))
+        ps.pilots['p.1'] = PilotRecord(
+            pid='p.1', pool='fed', owning_sid=_SID, size_key='d',
+            rhapsody_backend='concurrent', state=PILOT_ACTIVE,
+            member_id='m_y', endpoint_name='ep_m_y',
+            attributes={'software': ['y']}, nodes=2, cpus_per_node=8,
+            child_endpoint_name='fed_m_y_p.1', capacity=16)
+        ps.persist()
+
+        plugin2 = _make_plugin(tmp_path, with_pool=False)
+        ps2 = plugin2._pool_states[_SID]['fed']
+        assert ps2.config.multi_member is True
+        assert ps2.config.pool_class   == 'gpu'
+        assert list(ps2.config.members) == ['m_x', 'm_y']
+        p = ps2.pilots['p.1']
+        assert p.member_id     == 'm_y'
+        assert p.endpoint_name == 'ep_m_y'
+        assert p.attributes    == {'software': ['y']}
+        assert (p.nodes, p.cpus_per_node) == (2, 8)
+        assert p.child_endpoint_name == 'fed_m_y_p.1'
+
+    def test_replays_from_the_directory_it_was_found_in(self, tmp_path):
+        """The dir must not be re-derived from mutable config: replay and
+        declaration would then diverge and lose the pool's history."""
+        plugin = _make_plugin(tmp_path, with_pool=False)
+        ps = plugin._materialise_pool(_SID, _class_cfg(_member('m_x'),
+                                                       _member('m_y')))
+        found_dir = ps.state_dir
+        ps.config.members.pop('m_x')          # primary member departs
+        ps.config.reproject()
+        ps.tasks['t.1'] = TaskRecord(task_id='t.1', pool='fed',
+                                     owning_sid=_SID, cmd=[], cwd='/tmp')
+        ps.persist()
+
+        plugin2 = _make_plugin(tmp_path, with_pool=False)
+        ps2 = plugin2._pool_states[_SID]['fed']
+        assert ps2.state_dir == found_dir
+        assert list(ps2.config.members) == ['m_y']
+        assert 't.1' in ps2.tasks
+
+    def test_emptied_class_pool_replays(self, tmp_path):
+        """DELETE .../members with force: true legitimately produces one."""
+        plugin = _make_plugin(tmp_path, with_pool=False)
+        ps = plugin._materialise_pool(_SID, _class_cfg())
+        ps.pilots['p.1'] = PilotRecord(
+            pid='p.1', pool='fed', owning_sid=_SID, size_key='d',
+            rhapsody_backend='concurrent', state=PILOT_DONE,
+            member_id='m_x', nodes=1, cpus_per_node=4)
+        ps.config.members.clear()
+        ps.config.reproject()
+        ps.persist()
+
+        plugin2 = _make_plugin(tmp_path, with_pool=False)
+        ps2 = plugin2._pool_states[_SID]['fed']
+        assert ps2.config.members == {}
+        assert ps2.config.multi_member is True
+        assert 'p.1' in ps2.pilots     # its history is NOT lost
+
+
+class TestLegacyReplayUnchanged:
+
+    def test_persist_replay_persist_is_stable(self, tmp_path):
+        """The explicit ``multi_member: false`` wins on replay, so the
+        persisted implicit member never turns a legacy pool into a class
+        pool."""
+        plugin = _make_plugin(tmp_path)
+        ps = _pool(plugin)
+        ps.persist()
+        first = json.loads((ps.state_dir / 'state.json').read_text())
+        assert first['config']['multi_member'] is False
+
+        plugin2 = _make_plugin(tmp_path, with_pool=False)
+        ps2 = _pool(plugin2)
+        assert ps2.config.multi_member is False
+        assert list(ps2.config.members) == ['']
+        ps2.persist()
+        assert json.loads(
+            (ps2.state_dir / 'state.json').read_text())['config'] == \
+            first['config']
+
+    def test_pre_121_state_file_replays_with_its_live_pilot(self, tmp_path):
+        """An on-disk file written before 121: no members, no multi_member,
+        and a pilot with no member/size snapshot."""
+        state_dir = tmp_path / 'state' / _SID / 'cpu__endpoint0'
+        state_dir.mkdir(parents=True)
+        (state_dir / 'state.json').write_text(json.dumps({
+            'owning_sid': _SID,
+            'config': {
+                'name': 'cpu', 'queue': 'batch', 'account': 'proj',
+                'endpoint_name': 'endpoint0', 'default_size': 's',
+                'pilot_sizes': {'s': {'nodes': 3, 'cpus_per_node': 4,
+                                      'gpus_per_node': 0,
+                                      'walltime_sec': 3600,
+                                      'rhapsody_backend': 'concurrent'}},
+                'min_pilots': 0, 'max_pilots': 4, 'scratch_base': None,
+                'strategy': 'conservative', 'strategy_config': {}},
+            'pilots': {'p.1': {
+                'pid': 'p.1', 'pool': 'cpu', 'size_key': 's',
+                'rhapsody_backend': 'concurrent', 'owning_sid': _SID,
+                'state': 'STARTING', 'capacity': 0,
+                'child_endpoint_name': 'cpu_p.1',
+                'submitted_at': 100.0}},
+            'tasks': {},
+        }))
+
+        plugin = _make_plugin(tmp_path, with_pool=False)
+        ps = plugin._pool_states[_SID]['cpu']
+        assert ps.config.multi_member is False
+        assert list(ps.config.members) == ['']
+        assert ps.config.members[''].endpoint_name == 'endpoint0'
+        pilot = ps.pilots['p.1']
+        assert pilot.member_id == ''          # -> the implicit member
+        assert pilot.child_endpoint_name == 'cpu_p.1'   # untouched
+
+        # the snapshot is backfilled once at load, off the member
+        assert (pilot.nodes, pilot.cpus_per_node) == (3, 4)
+        assert pilot.endpoint_name == 'endpoint0'
+
+        plugin._dispatch_notify = lambda t, d: None
+        plugin._activate_pilot(ps, pilot)
+        assert pilot.capacity == 12

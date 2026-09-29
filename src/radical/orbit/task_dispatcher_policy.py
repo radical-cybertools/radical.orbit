@@ -58,6 +58,13 @@ class DispatchPolicy:
     - ``pool_state.pending_queue()`` returns QUEUED tasks already
       priority-ordered (highest priority first, FIFO within a priority);
       ``pool_state.live_pilots()`` returns non-terminal pilots.
+    - A pool is a **capability class** with one or more members
+      (:class:`~radical.orbit.task_dispatcher_config.PoolMember`).  A policy
+      reads them through the pool handle — ``members()``, ``member(mid)``,
+      ``live_pilots_for(mid)``, ``member_budget_left(mid)``,
+      ``size_of(pilot)`` — never off
+      ``config.members`` directly.  A legacy single-site pool has exactly
+      one (implicit) member, so a member-unaware policy still works.
     - :meth:`pick_dispatch` is called in a loop until it returns ``None``,
       bounded by the pending-queue length; the dispatcher performs the
       actual assignment and state mutation — policies only *choose*.
@@ -75,14 +82,38 @@ class DispatchPolicy:
         self._cfg  = cfg
         self._now  = now
 
+    @property
+    def max_requeues(self) -> int:
+        '''How often a pilot loss may re-queue one task before it fails.
+
+        Read by the dispatcher's ``_finalize_pilot``, so the cap is a policy
+        decision with a safe default for every policy that does not care.
+        '''
+        return 1
+
     def on_pilot_state(self, pilot: 'PilotRecord',
                        old_state: str, new_state: str) -> None:
         '''Observe one pilot state transition.  Default: ignore it.'''
         return None
 
+    def on_member_removed(self, member_id: str) -> None:
+        '''Forget per-member state for a removed member.  Default: none.
+
+        A member id may be re-added later; it must then start clean.
+        '''
+        return None
+
     def on_tick(self, pool_state: 'PoolState',
-                submit_pilot: Callable[[str | None], str]) -> None:
-        '''Housekeeping tick: maybe request pilots.  Default: never scale.'''
+                submit_pilot: Callable[..., str]) -> None:
+        '''Housekeeping tick: maybe request pilots.  Default: never scale.
+
+        *submit_pilot* has the signature
+        ``submit_pilot(size_key: str | None = None, *,
+        member_id: str | None = None) -> str``.  ``size_key`` keeps
+        position 0, so every existing positional call keeps its meaning;
+        ``member_id`` is keyword-only and ``None`` selects the pool's
+        primary member (the implicit one for a legacy pool).
+        '''
         return None
 
     def pick_dispatch(self, pool_state: 'PoolState') -> \
