@@ -2911,16 +2911,18 @@ class PluginTaskDispatcher(Plugin):
             return
         if record.adopted:
             # The endpoint outlives the record: no psij cancel kills the
-            # tasks it still runs, and ``_finalize_pilot`` re-queues them,
-            # so stop them first or a sibling runs them a second time.  A
-            # uid still in ``_uid_to_task`` is one rhapsody has not ended —
-            # this also covers tasks a ``cancel_tasks`` removal already
-            # failed.  Per task: the rhapsody session is shared.
-            await self._cancel_rhapsody_tasks(
-                record, [t.rhapsody_uid for t in pool_state.tasks.values()
-                         if t.pilot_id == record.pid
-                         and t.rhapsody_uid in self._uid_to_task])
+            # tasks it still runs, so stop them there.  A uid still in
+            # ``_uid_to_task`` is one rhapsody has not ended -- this also
+            # covers tasks a ``cancel_tasks`` removal already failed.
+            # Finalize (re-queue) first: each cancel yields the loop, and a
+            # CANCELED event landing on a still-RUNNING task would end it
+            # instead of re-queueing it.  Per task: the rhapsody session is
+            # shared.
+            uids = [t.rhapsody_uid for t in pool_state.tasks.values()
+                    if t.pilot_id == record.pid
+                    and t.rhapsody_uid in self._uid_to_task]
             self._mark_pilot_done(pool_state, record, 'endpoint released')
+            await self._cancel_rhapsody_tasks(record, uids)
             return
         endpoint_name = record.endpoint_name
         if not endpoint_name or not record.psij_job_id:

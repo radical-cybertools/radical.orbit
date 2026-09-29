@@ -3318,25 +3318,49 @@ class TestEndpointAdoption:
         (and a failed one keeps running)."""
         plugin, client, sid, ps = self._session(tmp_path)
         _, rec = self._adopt(plugin, ps)
-        ps.tasks['t.1'] = TaskRecord(
-            task_id='t.1', pool='fed', owning_sid=sid, cmd=['/bin/echo'],
-            cwd='/tmp', state=TASK_RUNNING, pilot_id=rec.pid,
-            member_id='m_a', rhapsody_uid='rh.1')
-        plugin._uid_to_task['rh.1'] = (sid, 'fed', 't.1')
+        for i in (1, 2):
+            ps.tasks[f't.{i}'] = TaskRecord(
+                task_id=f't.{i}', pool='fed', owning_sid=sid,
+                cmd=['/bin/echo'], cwd='/tmp', state=TASK_RUNNING,
+                pilot_id=rec.pid, member_id='m_a', rhapsody_uid=f'rh.{i}')
+            plugin._uid_to_task[f'rh.{i}'] = (sid, 'fed', f't.{i}')
+
+        loop = None
+
+        async def get_rh(_name):
+            nonlocal loop
+            loop = asyncio.get_running_loop()
+            return rh_mock
+
+        def cancel(uid):
+            # rhapsody reports CANCELED over the tap, and the loop handles
+            # it, before the next cancel call returns
+            handled = threading.Event()
+
+            def deliver():
+                plugin._on_task_status({'uid': uid, 'state': 'CANCELED'})
+                handled.set()
+
+            loop.call_soon_threadsafe(deliver)
+            assert handled.wait(5)
 
         rh_mock = MagicMock()
-        with patch.object(plugin, '_get_rhapsody_client',
-                          new=AsyncMock(return_value=rh_mock)):
+        rh_mock.cancel_task = MagicMock(side_effect=cancel)
+        with patch.object(plugin, '_get_rhapsody_client', new=get_rh):
             r = client.request(
                 'DELETE', f'{plugin.namespace}/pool/{sid}/fed/members/m_a',
                 json={'force': True, 'fail_unsatisfiable': False,
                       'cancel_tasks': cancel_tasks})
         assert r.status_code == 200, r.text
-        rh_mock.cancel_task.assert_called_once_with('rh.1')
+        assert sorted(c.args[0] for c in rh_mock.cancel_task.call_args_list) \
+            == ['rh.1', 'rh.2']
         rh_mock.cancel_all_tasks.assert_not_called()
         assert rec.state == PILOT_DONE
-        assert ps.tasks['t.1'].state == (TASK_FAILED if cancel_tasks
-                                         else TASK_QUEUED)
+        want = TASK_FAILED if cancel_tasks else TASK_QUEUED
+        assert ps.tasks['t.1'].state == want
+        assert ps.tasks['t.2'].state == want
+        if not cancel_tasks:
+            assert r.json()['tasks_requeued'] == 2
 
     def test_the_summary_reports_the_pilot_mode_and_the_runway(self,
                                                               tmp_path):
