@@ -1350,6 +1350,16 @@ class PluginFederation(Plugin):
                 removed  += 1
                 requeued += int((resp or {}).get('tasks_requeued') or 0)
                 failed   += int((resp or {}).get('tasks_failed')   or 0)
+            except HTTPException as e:
+                # a member already detached (its endpoint lost, its
+                # allocation ended) is simply not there any more: nothing
+                # to remove.  It is still asked, since a failed detach or
+                # re-attach can leave a stale copy behind.
+                if e.status_code != 404 or \
+                        member.member_id in self._attached:
+                    log.info('[%s] leave %r: removing member %s failed: %s',
+                             self.instance_name, name, member.member_id, e)
+                    errors.append(f'{member.member_id}: {e}')
             except Exception as e:
                 log.info('[%s] leave %r: removing member %s failed: %s',
                          self.instance_name, name, member.member_id, e)

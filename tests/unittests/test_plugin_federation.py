@@ -65,7 +65,8 @@ class _FakeDispatcher:
     real one, and raises ``HTTPException`` the same way so error mapping is
     exercised.  ``del_member`` records its flags so a test can assert
     ``force`` / ``fail_unsatisfiable`` rather than guess, and 404s on a
-    session that was never registered, as the real one does.
+    session that was never registered or a member it does not hold, as
+    the real one does.
 
     Two behaviours are modelled tightly because the plugin *relies* on them:
 
@@ -149,7 +150,10 @@ class _FakeDispatcher:
         if sid not in self.sessions:
             raise HTTPException(status_code=404,
                                 detail=f'unknown session: {sid}')
-        (self.pools.get(pool) or {}).pop(member_id, None)
+        if member_id not in (self.pools.get(pool) or {}):
+            raise HTTPException(status_code=404,
+                                detail=f'unknown member: {member_id}')
+        self.pools[pool].pop(member_id)
         counts = self.drain.get(member_id) or {}
         return {'pool': pool, 'member_id': member_id, 'pilots_cancelled': 0,
                 'tasks_requeued': counts.get('tasks_requeued', 0),
@@ -1554,6 +1558,26 @@ class TestLeave:
             [('fed-cpu', 'local_b.cpu'), ('fed-gpu', 'local_b.gpu')]
         assert plugin._state.resources == {}
 
+    def test_a_stale_copy_of_a_detached_member_is_still_removed(self,
+                                                                 tmp_path):
+        # a failed detach or re-attach leaves the dispatcher holding a
+        # member the federation no longer counts as attached
+        client, plugin, fake = _joinable(tmp_path)
+        _join(client, plugin, _alloc_body())
+        plugin._attached.discard('alpha.default')
+        r = self._leave(client, plugin, name='alpha')
+        assert r.json()['ok'] is True
+        assert fake.members_of('fed-cpu') == []
+
+    def test_an_attached_member_the_dispatcher_lost_is_an_error(self,
+                                                                tmp_path):
+        client, plugin, fake = _joinable(tmp_path)
+        _join(client, plugin, _alloc_body())
+        fake.pools['fed-cpu'].pop('alpha.default')
+        body = self._leave(client, plugin, name='alpha').json()
+        assert body['ok'] is False
+        assert 'unknown member' in body['errors'][0]
+
     def test_the_fed_session_is_never_unregistered(self, tmp_path):
         # R4: the single fed session holds every other resource's class
         # pools; unregistering it would kill all of them
@@ -1925,6 +1949,8 @@ class TestRestartReattach:
         client2 = TestClient(plugin2._app)
         r = client2.post(f'{plugin2.namespace}/leave/default/alpha', json={})
         assert r.status_code == 200
+        assert r.json()['ok'] is True           # detached: nothing to remove
+        assert 'errors' not in r.json()
         assert plugin2._state.resources == {}
 
         r = _join(client2, plugin2, _alloc_body())
