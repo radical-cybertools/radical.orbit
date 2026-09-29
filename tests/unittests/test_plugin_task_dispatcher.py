@@ -3326,10 +3326,12 @@ class TestEndpointAdoption:
             plugin._uid_to_task[f'rh.{i}'] = (sid, 'fed', f't.{i}')
 
         loop = None
+        keys = []
 
-        async def get_rh(_name):
+        async def get_rh(name, backend=None):
             nonlocal loop
             loop = asyncio.get_running_loop()
+            keys.append((name, backend))
             return rh_mock
 
         def cancel(uid):
@@ -3355,6 +3357,9 @@ class TestEndpointAdoption:
         assert sorted(c.args[0] for c in rh_mock.cancel_task.call_args_list) \
             == ['rh.1', 'rh.2']
         rh_mock.cancel_all_tasks.assert_not_called()
+        # the session the tasks were submitted on, not a backend-less one
+        assert rec.rhapsody_backend
+        assert keys == [(rec.child_endpoint_name, rec.rhapsody_backend)]
         assert rec.state == PILOT_DONE
         want = TASK_FAILED if cancel_tasks else TASK_QUEUED
         assert ps.tasks['t.1'].state == want

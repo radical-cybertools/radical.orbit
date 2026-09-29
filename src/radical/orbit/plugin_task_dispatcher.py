@@ -3532,7 +3532,9 @@ class PluginTaskDispatcher(Plugin):
         if not pilot.child_endpoint_name or not uids:
             return
         try:
-            rh = await self._get_rhapsody_client(pilot.child_endpoint_name)
+            # the submit's session: its cache key includes the backend
+            rh = await self._get_rhapsody_client(pilot.child_endpoint_name,
+                                                 pilot.rhapsody_backend)
         except Exception as e:
             log.warning('[%s] rhapsody client failed for %s: %s',
                         self.instance_name, pilot.pid, e)
