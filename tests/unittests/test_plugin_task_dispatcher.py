@@ -610,6 +610,42 @@ class TestPilotSubmitTransport:
         assert record.state       == PILOT_FAILED
         assert record.psij_job_id is None
 
+    def test_child_registered_during_submit_stays_active(self, tmp_path):
+        """The child may register (topology -> ACTIVE) before submit_tunneled
+        returns; the late submit result must not demote the pilot back to
+        STARTING, which would leave it unschedulable until the next
+        topology change."""
+        _, plugin = _make_plugin(tmp_path)
+        plugin._materialise_pool('A', _make_pool_cfg())
+        ps = _pool(plugin, 'A', 'cpu')
+        member = ps.config.primary_member()
+        size = member.pilot_sizes[member.default_size]
+        record = PilotRecord(
+            pid='p.a', pool='cpu', owning_sid='A',
+            size_key=member.default_size,
+            rhapsody_backend=size.rhapsody_backend, state=PILOT_PENDING,
+            endpoint_name=member.endpoint_name,
+            nodes=size.nodes, cpus_per_node=size.cpus_per_node)
+        ps.pilots[record.pid] = record
+
+        def _submit(*_args):
+            # The child's registration reaches on_topology_change first.
+            plugin._reconcile_pilots_for(
+                ps, {record.child_endpoint_name: {'liveness': 'present'}})
+            return {'job_id': 'jid'}
+
+        psij_mock = MagicMock()
+        psij_mock.submit_tunneled = MagicMock(side_effect=_submit)
+        with patch.object(plugin, '_get_psij_client',
+                          new=AsyncMock(return_value=psij_mock)), \
+             patch('radical.orbit.batch_system.detect_batch_system') as bs:
+            bs.return_value.psij_executor = 'local'
+            asyncio.run(plugin._do_pilot_submit(ps, record, size, member))
+
+        assert record.state       == PILOT_ACTIVE
+        assert record.psij_job_id == 'jid'
+        assert record.capacity    >  0
+
     def test_refuses_without_broker_caller(self, tmp_path):
         """Old-stack construction (no caller) → the child-client factory
         refuses cleanly (None), so pilot/rhapsody paths mark work failed
