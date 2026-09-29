@@ -947,10 +947,7 @@ class PluginFederation(Plugin):
 
         The ``members`` carried here only matter for a dispatcher that does
         not have the pool yet; a re-declaration of an existing pool is
-        ignored, which is precisely why the member routes exist.  A member
-        whose allocation ended is left out: a wiped dispatcher would
-        otherwise materialise the pool *with* it and adopt its endpoint
-        with a past deadline.
+        ignored, which is precisely why the member routes exist.
         '''
         records = list(self._state.resources.values())
         if extra is not None and \
@@ -960,8 +957,6 @@ class PluginFederation(Plugin):
         by_class: dict[str, list] = {}
         for rec in records:
             for member in rec.member_list():
-                if self._allocation_ended(member):
-                    continue
                 by_class.setdefault(member.cls, []).append(
                     self._member_decl(rec, member))
 
@@ -2003,8 +1998,11 @@ class PluginFederation(Plugin):
         In order: release any pre-08 per-resource session, register ``fed``
         with the **full** class-pool list, then re-POST *every* member of
         *every* stored record -- except a member whose allocation ended: it
-        is ``lost``, and is removed from a dispatcher that replayed it from
-        its own persisted pool config.  The dispatcher has already replayed
+        is ``lost``, and is removed again, whether the dispatcher replayed
+        it from its own persisted pool config or the registration above
+        just declared it.  It *is* declared, so that ``fed`` exists (and
+        ``leave`` can remove it) even when every member has ended.  The
+        dispatcher has already replayed
         those pools with their persisted members, so the re-POST is a
         no-op — and it is the recovery path when the dispatcher's own state
         was wiped, which is exactly why an identical re-POST must be a no-op
@@ -2025,8 +2023,6 @@ class PluginFederation(Plugin):
         except Exception as e:
             log.warning('[%s] could not register the %r session: %s',
                         self.instance_name, FED_SESSION_SID, e)
-            for rec in self._state.resources.values():
-                rec.liveness = LIVENESS_LOST
             self._state.save()
             return
 
@@ -2034,8 +2030,6 @@ class PluginFederation(Plugin):
             for member in rec.member_list():
                 if self._allocation_ended(member):
                     await self._detach(member)
-                    member.liveness = LIVENESS_LOST
-                    rec.liveness    = LIVENESS_LOST
                     continue
                 try:
                     await self._dispatcher.add_member(
@@ -2045,8 +2039,6 @@ class PluginFederation(Plugin):
                 except Exception as e:
                     log.warning('[%s] could not re-attach member %s: %s',
                                 self.instance_name, member.member_id, e)
-                    member.liveness = LIVENESS_LOST
-                    rec.liveness    = LIVENESS_LOST
         self._state.save()
 
     def _allocation_ended(self, member: MemberRecord) -> bool:
@@ -2056,12 +2048,12 @@ class PluginFederation(Plugin):
         or a lost/present cycle): re-declared with the old ``end_time``, its
         adopted pilot would get a past deadline and never receive a task.
         Only a new join knows the new end, so the member is treated as
-        ``lost`` -- detached, never declared -- until it leaves and joins
+        ``lost`` -- detached, never re-attached -- until it leaves and joins
         again.  Logged once per member and allocation, not on every
         topology delivery: an endpoint already ``lost`` when its allocation
         ended would otherwise never say why it stays ``lost``.
         '''
-        if not member.end_time or member.end_time > time.time():
+        if not member.allocation_ended():
             return False
         key = (member.member_id, float(member.end_time))
         if key not in self._ended_logged:
@@ -2122,7 +2114,7 @@ class PluginFederation(Plugin):
                         await self._detach(member)
 
                 elif state == LIVENESS_SUSPECT:
-                    continue
+                    pass        # a blip: mark it, touch no dispatcher route
 
                 elif member.member_id not in self._attached:
                     try:

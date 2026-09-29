@@ -306,6 +306,15 @@ class MemberRecord:
             return max(0.0, float(self.end_time) - time.time())
         return self.usage.remaining_sec
 
+    def allocation_ended(self) -> bool:
+        '''Return whether this member's allocation ``end_time`` has passed.
+
+        Such a member is ``lost`` whatever its endpoint reports -- that
+        endpoint can only be back in a *new* allocation -- on the read path
+        as on the attach path, and before any topology delivery.
+        '''
+        return bool(self.end_time) and float(self.end_time) <= time.time()
+
     def state(self) -> str:
         '''Return the derived state word: ``liveness``, or one of three.
 
@@ -326,8 +335,10 @@ class MemberRecord:
 
         Anything other than ``ok`` is passed through untouched — a lost
         endpoint is lost, and the fact that its last pilot also failed is
-        not the headline.
+        not the headline.  An ended allocation reads ``lost``.
         '''
+        if self.allocation_ended():
+            return LIVENESS_LOST
         if self.liveness != LIVENESS_OK:
             return self.liveness
         usage = self.usage

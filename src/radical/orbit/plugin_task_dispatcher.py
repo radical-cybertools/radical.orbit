@@ -2637,8 +2637,11 @@ class PluginTaskDispatcher(Plugin):
             # bound to the same child endpoint name.
             live = pool_state.live_pilots_for(member.member_id)
             if live:
-                log.warning('[%s] pool %r: member %r already holds adopted '
-                            'pilot %s; not adopting %r again',
+                # the live pilot need not be an adopted one: a member
+                # re-declared from ``submit`` to ``endpoint`` keeps its
+                # submitted pilot until that one ends
+                log.warning('[%s] pool %r: member %r already holds live '
+                            'pilot %s; not adopting %r as well',
                             self.instance_name, cfg.name, member.member_id,
                             live[0].pid, member.endpoint_name)
                 return live[0].pid

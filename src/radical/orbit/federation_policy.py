@@ -109,7 +109,8 @@ class BudgetLoadPolicy(FederationPolicy):
 
     - *liveness* is ``ok``.  A ``suspect`` member is excluded too: its
       endpoint may be seconds from ``lost``, and a task routed there would
-      sit in a pool nobody is serving.
+      sit in a pool nobody is serving.  So is one whose allocation ended,
+      whatever its liveness still says.
     - :func:`satisfies` — the *same* matcher the dispatcher uses at
       dispatch, against the member's attributes and its pilot size.  So
       federation and dispatcher agree by construction, and their reasons
@@ -182,6 +183,8 @@ class BudgetLoadPolicy(FederationPolicy):
     def reject_reason(self, requirements: dict,
                       member: MemberRecord) -> str | None:
         '''Return why *member* cannot serve *requirements*, or ``None``.'''
+        if member.allocation_ended():
+            return 'allocation ended'
         if member.liveness != LIVENESS_OK:
             return f'liveness is {member.liveness}'
 

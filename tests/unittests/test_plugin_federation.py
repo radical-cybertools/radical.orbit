@@ -64,7 +64,8 @@ class _FakeDispatcher:
     Mirrors only what the federation calls; every method is async, like the
     real one, and raises ``HTTPException`` the same way so error mapping is
     exercised.  ``del_member`` records its flags so a test can assert
-    ``force`` / ``fail_unsatisfiable`` rather than guess.
+    ``force`` / ``fail_unsatisfiable`` rather than guess, and 404s on a
+    session that was never registered, as the real one does.
 
     Two behaviours are modelled tightly because the plugin *relies* on them:
 
@@ -145,6 +146,9 @@ class _FakeDispatcher:
                              'cancel_tasks': cancel_tasks, 'force': force,
                              'fail_unsatisfiable': fail_unsatisfiable})
         self._maybe_fail('del_member')
+        if sid not in self.sessions:
+            raise HTTPException(status_code=404,
+                                detail=f'unknown session: {sid}')
         (self.pools.get(pool) or {}).pop(member_id, None)
         counts = self.drain.get(member_id) or {}
         return {'pool': pool, 'member_id': member_id, 'pilots_cancelled': 0,
@@ -1197,6 +1201,19 @@ class TestPick:
         assert r.status_code == 409
         assert 'liveness' in r.json()['reasons']['gpu.default']
 
+    def test_an_ended_member_is_not_picked_before_any_topology(self,
+                                                               tmp_path):
+        # liveness still says ok -- no topology delivery since the join --
+        # but the allocation is over
+        client, plugin, _ = self._two(tmp_path)
+        member = plugin._state.resources['gpu'].members['default']
+        member.end_time = time.time() - 10
+        assert member.liveness == LIVENESS_OK
+        assert member.state()  == LIVENESS_LOST
+        r = self._pick(client, plugin, {'gpus': 2})
+        assert r.status_code == 409
+        assert r.json()['reasons']['gpu.default'] == 'allocation ended'
+
     def test_empty_federation_409(self, tmp_path):
         client, plugin, _ = _joinable(tmp_path)
         r = self._pick(client, plugin, {})
@@ -1830,7 +1847,8 @@ class TestRestartReattach:
             self, tmp_path, caplog):
         """Re-POSTed with its stored end_time, the endpoint back in a new
         allocation would be adopted with a past deadline and never
-        receive a task -- the same guard as the lost/present re-attach."""
+        receive a task -- the same guard as the lost/present re-attach.
+        It is declared with the pool, then detached again."""
         client, plugin, _fake = _joinable(tmp_path)
         _join(client, plugin, _alloc_body())
         _join(client, plugin, _members_body())
@@ -1855,11 +1873,9 @@ class TestRestartReattach:
                  if 'allocation ended' in r.getMessage()]
         assert len(ended) == 1
         assert 'alpha.default' in ended[0].getMessage()
-        # a wiped dispatcher must not materialise the pool WITH it either
+        # a wiped dispatcher that materialised the pool WITH it drops it
         assert 'alpha.default' not in fake2.members_of('fed-cpu')
-        assert 'alpha.default' not in \
-            [m['member_id'] for d in fake2.sessions[FED_SESSION_SID]
-             for m in d['members']]
+        assert [c['member_id'] for c in fake2.removed] == ['alpha.default']
 
     @pytest.mark.asyncio
     async def test_replay_removes_an_ended_member_the_dispatcher_kept(
@@ -1883,6 +1899,40 @@ class TestRestartReattach:
             [('alpha.default', True, False, False)]
         assert 'alpha.default' not in plugin2._attached
         assert plugin2._state.resources['alpha'].liveness == LIVENESS_LOST
+
+    @pytest.mark.asyncio
+    async def test_a_lone_ended_member_can_leave_and_join_again(self,
+                                                               tmp_path):
+        """A single-allocation federation restarted after its job ended:
+        ``fed`` must still be registered, or the detach, the leave and the
+        re-join all hit a dispatcher that kept the stale member."""
+        client, plugin, fake = _joinable(tmp_path)
+        _join(client, plugin, _alloc_body())
+        past = time.time() - 10
+        plugin._state.resources['alpha'].members['default'].end_time = past
+        plugin._state.save()
+        _member_decl(fake, 'fed-cpu', 'alpha.default')['end_time'] = past
+
+        # the dispatcher replayed its pool from disk; no session yet
+        fake2 = _FakeDispatcher()
+        fake2.pools = {p: dict(m) for p, m in fake.pools.items()}
+        plugin2 = self._restart(tmp_path, fake2)
+        await plugin2.on_topology_change(_topo(ep0='present'))
+        assert FED_SESSION_SID in fake2.sessions
+        assert fake2.members_of('fed-cpu') == []
+        assert plugin2._attached == set()
+
+        client2 = TestClient(plugin2._app)
+        r = client2.post(f'{plugin2.namespace}/leave/default/alpha', json={})
+        assert r.status_code == 200
+        assert plugin2._state.resources == {}
+
+        r = _join(client2, plugin2, _alloc_body())
+        assert r.status_code == 200, r.text
+        assert fake2.members_of('fed-cpu') == ['alpha.default']
+        assert _member_decl(fake2, 'fed-cpu',
+                            'alpha.default')['end_time'] is None
+        assert plugin2._attached == {'alpha.default'}
 
     @pytest.mark.asyncio
     async def test_a_re_post_onto_a_live_dispatcher_is_a_no_op(self,
