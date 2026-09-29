@@ -17,6 +17,7 @@ Two layers:
 import asyncio
 import concurrent.futures
 import json
+import logging
 import os
 import shutil
 import time
@@ -1725,6 +1726,35 @@ class TestTopology:
         assert fake.members_of('fed-cpu') == ['local_b.cpu']
         assert fake.members_of('fed-gpu') == ['local_b.gpu']
         assert plugin._state.resources['local_b'].liveness == LIVENESS_OK
+
+    @pytest.mark.asyncio
+    async def test_a_past_allocation_end_keeps_the_member_detached(
+            self, tmp_path, caplog):
+        """The same endpoint name back in a *new* allocation: re-declared
+        with the old end_time, its adopted pilot would get a past deadline
+        and never receive a task.  Only a new join knows the new end."""
+        client, plugin, fake = _joinable(tmp_path)
+        _join(client, plugin, _members_body(endpoint='ep0'))
+        rec = plugin._state.resources['local_b']
+        await plugin.on_topology_change(_topo(ep0='lost'))
+        for m in rec.member_list():
+            m.end_time = time.time() - 10
+        fake.calls.clear()
+
+        with caplog.at_level(logging.WARNING):
+            await plugin.on_topology_change(_topo(ep0='present'))
+            await plugin.on_topology_change(_topo(ep0='present'))
+        assert [c for c in fake.calls if c[0] == 'add_member'] == []
+        assert plugin._attached == set()
+        assert rec.liveness == LIVENESS_LOST
+        assert all(m.liveness == LIVENESS_LOST for m in rec.member_list())
+        # once per member, not on every topology delivery
+        ended = [r for r in caplog.records
+                 if 'allocation ended' in r.getMessage()]
+        assert len(ended) == 2
+        assert {mid for mid in ('local_b.cpu', 'local_b.gpu')
+                for r in ended if mid in r.getMessage()} == \
+            {'local_b.cpu', 'local_b.gpu'}
 
     @pytest.mark.asyncio
     async def test_a_vanished_class_pool_is_re_declared_first(self,

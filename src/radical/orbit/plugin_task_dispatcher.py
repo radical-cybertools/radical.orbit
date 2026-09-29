@@ -806,9 +806,9 @@ class TaskDispatcherClient(PluginClient):
 
         Returns ``{pool, member, members, created, updated}``.  An identical
         re-POST is a ``created: False`` no-op, so a restart replay can just
-        re-declare everything; one differing only in ``pilot`` / ``end_time``
-        answers ``updated: True`` and takes the new values.  Anything else
-        differing is a 409.
+        re-declare everything; one differing only in ``pilot`` answers
+        ``updated: True`` and takes the new mode.  Anything else differing
+        (``end_time`` included) is a 409.
         '''
         self._require_session()
         resp = self._http.post(
@@ -1660,7 +1660,8 @@ class PluginTaskDispatcher(Plugin):
             raise HTTPException(status_code=400, detail=str(e)) from e
 
         existing = ps.config.members.get(member.member_id)
-        if existing is not None:
+        created  = existing is None
+        if not created:
             if self._member_fingerprint(replace(existing, pilot=member.pilot)) \
                     != self._member_fingerprint(member):
                 raise HTTPException(
@@ -1683,24 +1684,20 @@ class PluginTaskDispatcher(Plugin):
         self._dispatch_notify('pool_members', {
             'pool'      : name,
             'sid'       : sid,
-            'action'    : 'add' if existing is None else 'update',
+            'action'    : 'add' if created else 'update',
             'member_id' : member.member_id,
             'member_ids': list(ps.config.members),
         })
-        if existing is None:
-            log.info('[%s] pool %r (sid=%s): added member %r on endpoint %r',
-                     self.instance_name, name, sid, member.member_id,
-                     member.endpoint_name)
-        else:
-            log.info('[%s] pool %r (sid=%s): updated member %r (pilot=%s)',
-                     self.instance_name, name, sid, member.member_id,
-                     member.pilot)
+        log.info('[%s] pool %r (sid=%s): %s member %r on endpoint %r '
+                 '(pilot=%s)', self.instance_name, name, sid,
+                 'added' if created else 'updated', member.member_id,
+                 member.endpoint_name, member.pilot)
 
         return {'pool'   : name,
                 'member' : asdict(member),
                 'members': list(ps.config.members),
-                'created': existing is None,
-                'updated': existing is not None}
+                'created': created,
+                'updated': not created}
 
     async def _route_remove_member(self, request: Request) -> dict:
         '''Remove one member from a class pool, draining its pilots.
@@ -2697,12 +2694,22 @@ class PluginTaskDispatcher(Plugin):
     def _pilot_deadline(member: PoolMember, size: PilotSize) -> float:
         '''Return the walltime deadline for a new pilot of *member*.
 
-        ``now + walltime_sec``, capped by the member's ``end_time`` when it
-        knows one.  The cap is what keeps a **re-**adopted endpoint honest:
-        a member is re-POSTed with its join-time ``walltime_sec`` on every
-        re-attach, so a pilot adopted an hour into the allocation would
-        otherwise be given a deadline past the allocation's own end.
+        A submitted pilot: ``now + walltime_sec``, capped by the member's
+        ``end_time`` when it knows one.
+
+        An adopted endpoint (``pilot == PILOT_ENDPOINT``): the allocation's
+        ``end_time`` only, ``0.0`` (unknown) without one.  Nothing ends an
+        adopted endpoint at ``now + walltime_sec`` -- that figure is a size
+        default (3600 when the allocation reports no end, or runs
+        UNLIMITED) -- so a deadline made of it would drop the endpoint from
+        dispatch and capacity near that time while it keeps holding the
+        member's single pilot slot: the pool would stall with every task
+        queued.  The allocation's end is also what keeps a **re-**adopted
+        endpoint honest, since the member is re-declared with its join-time
+        ``walltime_sec`` on every re-attach.
         '''
+        if member.pilot == PILOT_ENDPOINT:
+            return float(member.end_time or 0.0)
         deadline = time.time() + size.walltime_sec
         if member.end_time:
             return min(deadline, float(member.end_time))

@@ -232,8 +232,8 @@ class ConservativePolicy(DispatchPolicy):
         free slots matter — :meth:`pick_dispatch` and ``on_tick``'s
         capacity sum.
 
-        A record with **no** deadline at all (``0.0``, which
-        ``_submit_pilot`` never writes) is not filtered: an unknown
+        A record with **no** deadline at all (``0.0``: an adopted endpoint
+        whose allocation reports no end) is not filtered: an unknown
         deadline is not a near one, and reading it as such would stop a
         fleet from dispatching at all.
         '''

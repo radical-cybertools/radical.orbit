@@ -3182,11 +3182,29 @@ class TestEndpointAdoption:
         _, rec = self._adopt(plugin, ps)
         assert rec.walltime_deadline == pytest.approx(end, abs=1)
 
-    def test_without_an_end_time_the_walltime_stands(self, tmp_path):
+    def test_without_an_end_time_the_deadline_is_unknown(self, tmp_path):
+        """Nothing ends an adopted endpoint at ``now + walltime_sec``, so
+        that figure must not become its deadline."""
         plugin, _, _, ps = self._session(tmp_path)
         _, rec = self._adopt(plugin, ps)
-        assert rec.walltime_deadline == pytest.approx(
-            time.time() + 3600, abs=5)
+        assert rec.walltime_deadline == 0.0
+
+    def test_without_an_end_time_tasks_flow_past_the_walltime(self,
+                                                              tmp_path):
+        """The size's walltime passing must not drop the endpoint from
+        dispatch: it still holds the member's single pilot slot, so the
+        pool would stall with every task queued."""
+        plugin, _, sid, ps = self._session(tmp_path)
+        _, rec = self._adopt(plugin, ps)
+        ps.tasks['t.1'] = TaskRecord(
+            task_id='t.1', pool='fed', owning_sid=sid, cmd=['/bin/echo'],
+            cwd='/tmp', state=TASK_QUEUED)
+
+        later = time.time() + 2 * 3600
+        ps.policy._now = lambda: later
+        pair = ps.policy.pick_dispatch(ps)
+        assert pair is not None
+        assert pair[1] is rec
 
     def test_a_suspect_endpoint_pauses_the_adopted_pilot(self, tmp_path):
         plugin, _, _, ps = self._session(tmp_path)

@@ -291,9 +291,10 @@ class _DispatcherAPI:
     async def add_member(self, sid: str, pool: str, member: dict) -> dict:
         '''Add (or re-assert) one member of a class pool.
 
-        Idempotent by contract: an identical re-POST is a ``200`` no-op, a
-        *differing* one is a ``409``.  That is what lets restart replay send
-        every member unconditionally.
+        Idempotent by contract: an identical re-POST is a ``200`` no-op;
+        one differing **only** in ``pilot`` updates it in place
+        (``updated: True``); any other difference is a ``409``.  That is
+        what lets restart replay send every member unconditionally.
         '''
         return await self._call('POST', f'pool/{sid}/{pool}/members', member)
 
@@ -486,6 +487,11 @@ class PluginFederation(Plugin):
         # endpoint but attach independently, and one can fail while the
         # other succeeds.
         self._attached: set[str] = set()
+
+        # (member_id, end_time) pairs whose "allocation ended" refusal to
+        # re-attach was already logged -- once per member and allocation,
+        # not on every topology delivery.
+        self._ended_logged: set[tuple[str, float]] = set()
 
         # Class pool names the ``fed`` session was last registered with, so
         # a re-attach knows whether it must re-declare the pool first.
@@ -766,8 +772,8 @@ class PluginFederation(Plugin):
             cpus_per_node    = size['cpus_per_node'],
             gpus_per_node    = size['gpus_per_node'],
             walltime_sec     = size['walltime_sec'],
-            min_pilots       = decl['min_pilots'],
-            max_pilots       = decl['max_pilots'],
+            min_pilots       = decl.get('min_pilots', 0),
+            max_pilots       = decl.get('max_pilots', 1),
             rhapsody_backend = size['rhapsody_backend'],
             scratch_base     = rec.scratch_base,
             shared_fs        = rec.shared_fs,
@@ -885,11 +891,6 @@ class PluginFederation(Plugin):
                                                    label=label),
             budget           = budget,
         )
-        if pilot == PILOT_ENDPOINT:
-            # mirrors ``PoolMember.__post_init__``: the dispatcher holds
-            # exactly one adopted pilot, so report the bounds it enforces
-            member.min_pilots = 1
-            member.max_pilots = 1
         declared   = decl.get('class')
         member.cls = (validate_class(declared, label=label) if declared
                       else member.default_class())
@@ -1021,7 +1022,8 @@ class PluginFederation(Plugin):
         The pilot **is** the allocation, literally: the endpoint that joined
         runs inside it, so the declaration says ``pilot: endpoint`` and the
         dispatcher adopts that endpoint instead of submitting a second
-        process onto it.  One pilot, live at join (``min_pilots=1``), sized
+        process onto it.  One pilot, live at join (``pilot: endpoint`` pins
+        ``min_pilots`` / ``max_pilots`` to 1 in ``MemberRecord``), sized
         from what the endpoint reports about its own job and deadlined by
         that job's ``end_time``.
 
@@ -1047,8 +1049,6 @@ class PluginFederation(Plugin):
         return {
             'queue'      : 'allocation',
             'account'    : None,
-            'min_pilots' : 1,
-            'max_pilots' : 1,
             'pilot'      : PILOT_ENDPOINT,
             'end_time'   : end_time,
             'pilot_sizes': {_SIZE_KEY: {
@@ -2042,7 +2042,7 @@ class PluginFederation(Plugin):
 
         | endpoint | action |
         |---|---|
-        | ``present``, not attached | ``add_member`` (re-declaring the class pool first when it no longer exists — every member of that class may have left while the endpoint was down) |
+        | ``present``, not attached | ``add_member`` (re-declaring the class pool first when it no longer exists — every member of that class may have left while the endpoint was down) -- unless the member's ``end_time`` has passed: that endpoint is back in a new allocation, and stays detached (``lost``) until it leaves and joins again |
         | ``suspect`` | mark ``suspect``, **nothing else**.  The policy already refuses to route to a non-``ok`` member, which is the whole point of ``suspect``; a blip must not touch the dispatcher |
         | ``lost``, attached | ``del_member`` with ``fail_unsatisfiable=False``.  Its pilots died with the endpoint anyway and its RUNNING tasks re-queue onto a sibling — but a task only *this* member could run stays QUEUED instead of failing, because a lost endpoint is very often back in a minute |
         '''  # noqa: E501
@@ -2069,6 +2069,25 @@ class PluginFederation(Plugin):
                     continue
 
                 elif member.member_id not in self._attached:
+                    if member.end_time and member.end_time <= time.time():
+                        # The same endpoint name back in a *new*
+                        # allocation: re-declared with the old end_time,
+                        # its adopted pilot would get a past deadline and
+                        # never receive a task.  Only a new join knows the
+                        # new end.
+                        key = (member.member_id, float(member.end_time))
+                        if key not in self._ended_logged:
+                            self._ended_logged.add(key)
+                            log.warning(
+                                '[%s] not re-attaching member %s: its '
+                                'allocation ended at %s; leave and join '
+                                'again', self.instance_name,
+                                member.member_id,
+                                time.strftime('%Y-%m-%d %H:%M:%S',
+                                              time.localtime(
+                                                  member.end_time)))
+                        result = LIVENESS_LOST
+                        continue
                     try:
                         if member.pool_name not in self._pools:
                             await self._register_fed()

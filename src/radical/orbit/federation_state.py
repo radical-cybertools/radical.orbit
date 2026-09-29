@@ -239,6 +239,18 @@ class MemberRecord:
     usage           : ResourceUsage = field(default_factory=ResourceUsage)
     liveness        : str = LIVENESS_OK
 
+    def __post_init__(self) -> None:
+        '''Force the pilot floor and ceiling of an ``endpoint`` member to 1.
+
+        Mirrors ``PoolMember.__post_init__``: the dispatcher holds exactly
+        one adopted pilot, so these are the bounds it enforces and the ones
+        to report.  One place for the rule, whether the member was built
+        from an allocation, a declared ``members`` entry, or loaded back.
+        '''
+        if self.pilot == PILOT_ENDPOINT:
+            self.min_pilots = 1
+            self.max_pilots = 1
+
     def budget_node_hours(self) -> float:
         '''Return this member's declared node-hour allowance (0.0 = none).'''
         try:
@@ -281,13 +293,13 @@ class MemberRecord:
     def remaining_sec(self) -> float | None:
         '''Return the seconds of runway this member has left, or ``None``.
 
-        Recomputed on every read, never stored: it is a countdown.
-
         The allocation's own ``end_time`` answers it where there is one —
         that is the instant the endpoint disappears, whatever the pilot
-        record says.  Otherwise it is the dispatcher's number: the most
-        walltime any of this member's live pilots still has, which is
-        ``None`` when it holds none.  Never negative: an allocation past its
+        record says — recomputed on every read, since it is a countdown.
+        Otherwise it is the dispatcher's number, persisted with the usage
+        snapshot and overwritten on every refresh: the most walltime any of
+        this member's live pilots still has, which is ``None`` when it
+        holds none.  Never negative: an allocation past its
         end has no time left, it does not owe any.
         '''
         if self.end_time:
