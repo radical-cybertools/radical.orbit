@@ -108,6 +108,7 @@ nav:
       - Plugin Writer's Tutorial: tutorial_plugin.md
       - Plugin Development: plugin_development.md
       - Plugin API Reference: plugin_api.md
+      - Federation Plugin: plugin_federation.md
       - Globus Plugin: plugin_globus.md
       - Queue Info Plugin: plugin_queue_info.md
       - IRI Plugins: plugin_iri.md

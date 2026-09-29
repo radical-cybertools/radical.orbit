@@ -19,6 +19,9 @@ State machines
 Pilot:  ``PENDING → STARTING → ACTIVE → (DONE | FAILED)``
         (``ACTIVE`` may be entered from any earlier state on handshake,
         skipping ``STARTING`` if the pilot came up faster than expected.)
+        Three timestamps bracket that walk — ``submitted_at``, ``active_at``
+        and ``finished_at`` — so a terminal pilot still carries the interval
+        it actually held the allocation (see :func:`node_hours`).
 
 Task:   ``QUEUED → RUNNING → (DONE | FAILED | CANCELED)``
 '''
@@ -66,6 +69,12 @@ TASK_STATES          = {TASK_QUEUED, TASK_RUNNING, TASK_DONE,
                         TASK_FAILED, TASK_CANCELED}
 TASK_TERMINAL_STATES = {TASK_DONE, TASK_FAILED, TASK_CANCELED}
 
+# How much of a pilot's failure reason is kept on its record.  A psij
+# traceback can be kilobytes and the record rides in the ``pilot_history``
+# of every verbose summary, so it is truncated to something a table row
+# and a tooltip can carry.
+PILOT_ERROR_MAX = 300
+
 
 # ---------------------------------------------------------------------------
 # Records
@@ -90,6 +99,11 @@ class PilotRecord:
     walltime_deadline  : float       = 0.0
     accepting_new_tasks: bool        = True    # flipped False by drain
     finished_at        : float | None = None   # terminal-state timestamp
+    # Why this pilot went FAILED, truncated to ``PILOT_ERROR_MAX``.  A
+    # submit-side failure ('psij error: … Disk quota exceeded') is
+    # otherwise visible only in the broker log, while every consumer of
+    # this record sees a pilot that simply is not there.
+    error              : str | None  = None
     # -- capability-class fields ------------------------------------------
     # ``member_id`` is the pool member this pilot was submitted for; ``''``
     # means the implicit member of a legacy pool.  ``attributes`` and the
@@ -103,6 +117,15 @@ class PilotRecord:
     nodes              : int         = 0
     cpus_per_node      : int         = 0
     gpus_per_node      : int         = 0
+    # This pilot **is** an endpoint the dispatcher adopted (a
+    # ``pilot: endpoint`` member, plan 122), not a batch job it submitted.
+    # Stamped once at creation and persisted, because the two end
+    # differently -- an adopted pilot goes DONE, never FAILED, when its
+    # endpoint disappears or its member is removed -- and the distinction
+    # has to survive a restart.  Deliberately NOT inferred from a missing
+    # ``psij_job_id``: a *submitted* pilot has none either, for the window
+    # between its child endpoint name being pre-bound and psij answering.
+    adopted            : bool        = False
 
     def lag(self) -> float | None:
         '''Return the PENDING→ACTIVE duration, or ``None`` if not yet active.'''
@@ -218,12 +241,16 @@ def node_hours(pilots: Iterable[PilotRecord] | None,
         # allocation time, and a pilot that never reached ACTIVE consumed
         # nothing.  (Falling back to ``submitted_at`` would both bill queue
         # time and charge a never-started record from the epoch to `now`.)
-        # This matches the federation's node_hours_from_history semantics.
+        # Both timestamps are tested against ``None``, not truthiness: a
+        # ``0.0`` is the epoch, which is a legitimate (if odd) instant and
+        # must not read as "absent".
         start = pilot.active_at
-        if not start:
+        if start is None:
             continue
-        end = pilot.finished_at or now
-        total += nodes * max(0.0, float(end) - float(start)) / 3600.0
+        end = pilot.finished_at
+        if end is None:
+            end = now
+        total += nodes * max(0.0, end - start) / 3600.0
 
     return total
 

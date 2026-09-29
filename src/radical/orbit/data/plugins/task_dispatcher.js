@@ -5,8 +5,12 @@
  * strategy, pilot sizes (nodes/cpus/gpus/walltime/rhapsody backend),
  * min/max pilots, live pilot count, pending task count.
  *
- * Default view fetches GET /pools (session-less); per-pool refresh
- * could later be extended to GET /pool/{name} for live pilot details.
+ * Default view fetches GET /pools, which answers pools *grouped by owning
+ * session*: `{pools: {"<sid>": {"<pool name>": <summary>}}}`.  Each pool of
+ * each session gets its own card, tagged with its session.  Class pools
+ * (`multi_member`) are then refreshed one by one from the verbose
+ * `GET /pool/{sid}/{name}` route, which is the only place per-member pilot
+ * sizes and node-hours come from.
  */
 
 export const name = 'task_dispatcher';
@@ -120,10 +124,11 @@ async function loadPools(page, api) {
   const summary = page.querySelector('.td-summary');
   try {
     const r = await api.fetch('pools');
-    const pools = r.pools || {};
-    const names = Object.keys(pools);
-    summary.textContent = `${names.length} pool${names.length === 1 ? '' : 's'}`;
-    content.innerHTML = renderPools(pools, api);
+    const entries = flattenPools(r.pools || {});
+    const n = entries.length;
+    summary.textContent = `${n} pool${n === 1 ? '' : 's'}`;
+    content.innerHTML = renderEntries(entries, api);
+    await refreshClassPools(page, entries, api);
   } catch (e) {
     summary.textContent = '?';
     content.innerHTML =
@@ -132,13 +137,49 @@ async function loadPools(page, api) {
   }
 }
 
-function renderPools(pools, api) {
-  const names = Object.keys(pools);
-  if (names.length === 0) {
+// `GET /pools` groups pools by owning session: the top level maps a sid to
+// that session's pools.  Flatten it into `{sid, pool}` entries so one card
+// is rendered per *pool* (not per session).
+function flattenPools(pools) {
+  const entries = [];
+  Object.keys(pools || {}).forEach(key => {
+    const v = pools[key];
+    if (!v || typeof v !== 'object') return;
+    Object.keys(v).forEach(name => {
+      const p = v[name];
+      if (!p || typeof p !== 'object') return;
+      entries.push({sid: key, pool: p});
+    });
+  });
+  return entries;
+}
+
+function renderEntries(entries, api) {
+  if (entries.length === 0) {
     return `<div class="card td-empty-pools">No pools configured.</div>`;
   }
 
-  return names.map(n => renderPoolCard(pools[n], api)).join('');
+  return entries.map((e, i) => renderPoolCard(e.pool, api, e.sid, i)).join('');
+}
+
+// Per-member pilot sizes and node-hours live only in the verbose per-pool
+// route, so each class pool's card is re-rendered from `pool/{sid}/{name}`
+// once the (cheap) grouped listing is on screen.  A failing fetch leaves the
+// non-verbose card in place; this never throws.
+async function refreshClassPools(page, entries, api) {
+  for (let i = 0; i < entries.length; i++) {
+    const {sid, pool} = entries[i];
+    if (!sid || !pool.multi_member || !pool.name) continue;
+    try {
+      const v = await api.fetch(`pool/${encodeURIComponent(sid)}`
+                              + `/${encodeURIComponent(pool.name)}`);
+      if (!v || typeof v !== 'object') continue;
+      const card = page.querySelector(`[data-td-card="${i}"]`);
+      if (card) card.outerHTML = renderPoolCard(v, api, sid, i);
+    } catch (e) {
+      // keep the non-verbose card
+    }
+  }
 }
 
 function sizeRows(sizes, defaultSize, api) {
@@ -220,10 +261,13 @@ function membersTable(p, api) {
       </table>`;
 }
 
-function renderPoolCard(p, api) {
+function renderPoolCard(p, api, sid, idx) {
   const account = p.account ? api.escHtml(p.account) : '<em style="color:var(--muted)">none</em>';
   const classBadge = p.pool_class
     ? `<span class="td-strategy-badge">${api.escHtml(p.pool_class)}</span>` : '';
+  // pools are session-scoped: say which session owns this one
+  const sessionBadge = sid
+    ? `<span class="td-strategy-badge">session ${api.escHtml(sid)}</span>` : '';
   // The ceiling is the sum over the members (a legacy pool's one implicit
   // member makes that its own max_pilots).
   const maxPilots = p.max_pilots_total ?? p.max_pilots ?? '?';
@@ -238,9 +282,10 @@ function renderPoolCard(p, api) {
       ${sizesTable(p.pilot_sizes || {}, p.default_size, api)}`;
 
   return `
-    <div class="card">
+    <div class="card" data-td-card="${idx ?? 0}">
       <div class="td-pool-header">
         <span class="td-pool-name">${api.escHtml(p.name)}</span>
+        ${sessionBadge}
         <span class="td-strategy-badge">${api.escHtml(p.strategy || 'conservative')}</span>
         ${classBadge}
         <span class="td-pilot-count">

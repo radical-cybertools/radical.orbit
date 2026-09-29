@@ -22,7 +22,7 @@ log = logging.getLogger('radical.orbit')
 
 DEFAULT_PLUGINS_BY_ROLE: Dict[str, List[str]] = {
     'broker'    : ['iri*',     'sfapi*',  'staging', 'sysinfo',
-                   'task_dispatcher'],
+                   'task_dispatcher', 'federation'],
     'login'     : ['psij',     'staging', 'sysinfo', 'queue_info'],
     'compute'   : ['rhapsody', 'staging', 'sysinfo', 'queue_info'],
     'standalone': ['psij',     'staging', 'sysinfo', 'rhapsody', 'queue_info'],

@@ -19,6 +19,12 @@ dispatcher's signal that the pilot is ACTIVE — capacity is taken from the
 pool's pilot-size config.  Tasks then flow via ``rhapsody.submit_tasks`` on the
 child endpoint; completion arrives as broker ``event`` frames on the raw tap.
 
+A member declared ``pilot: endpoint`` is **adopted** instead of submitted: its
+endpoint already runs inside a compute allocation, so it *is* the pilot.  The
+record is created PENDING with that endpoint as its own child and reaches
+ACTIVE through the same topology path every other pilot takes — no psij job,
+no second process, and one endpoint's liveness to track instead of two.
+
 Pools are strictly per-session: keyed ``(owning_sid, pool_name)``, pool names
 are session-local, and there is no cross-session attach.  A pool's pilots
 follow the owning session's lifetime — session close (owner ``lost`` +
@@ -40,7 +46,7 @@ import uuid
 
 import msgpack
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
@@ -55,14 +61,14 @@ from .plugin_rhapsody                   import (
 )
 from .task_dispatcher_config            import (
     PoolConfig, PoolMember, PilotSize, PoolConfigError,
-    default_pool_config, parse_pools, parse_member,
+    PILOT_ENDPOINT, default_pool_config, parse_pools, parse_member,
 )
 from .task_dispatcher_match             import NO_MPI_BACKENDS
 from .task_dispatcher_state             import (
     PilotRecord, TaskRecord, PoolStore, node_hours,
     records_from, read_json, write_json_atomic,
     PILOT_PENDING, PILOT_STARTING, PILOT_ACTIVE,
-    PILOT_DONE, PILOT_FAILED, PILOT_LIVE_STATES,
+    PILOT_DONE, PILOT_FAILED, PILOT_LIVE_STATES, PILOT_ERROR_MAX,
     TASK_QUEUED, TASK_RUNNING, TASK_DONE, TASK_FAILED, TASK_CANCELED,
     TASK_TERMINAL_STATES,
 )
@@ -570,8 +576,13 @@ class PoolState:
 
         # A pre-121 pilot record carries no size / endpoint snapshot:
         # backfill it once, here, from its member, so every later reader
-        # takes the record as authoritative.
+        # takes the record as authoritative.  An adopted pilot (plan 122)
+        # post-dates 121 and always carries its adoption-time snapshot --
+        # even a zero one, which ``_activate_pilot`` must see and fail --
+        # so it is never re-sized from a (possibly re-declared) member.
         for p in self.pilots.values():
+            if p.adopted:
+                continue
             member = config.members.get(p.member_id)
             if member is None:
                 continue
@@ -793,9 +804,11 @@ class TaskDispatcherClient(PluginClient):
     def add_member(self, pool: str, member: dict) -> dict:
         '''Add one member to a class pool.
 
-        Returns ``{pool, member, members, created}``.  An identical
-        re-POST is a ``created: False`` no-op, so a restart replay can
-        just re-declare everything.
+        Returns ``{pool, member, members, created, updated}``.  An identical
+        re-POST is a ``created: False`` no-op, so a restart replay can just
+        re-declare everything; one differing only in ``pilot`` answers
+        ``updated: True`` and takes the new mode.  Anything else differing
+        (``end_time`` included) is a 409.
         '''
         self._require_session()
         resp = self._http.post(
@@ -1049,6 +1062,12 @@ class PluginTaskDispatcher(Plugin):
         # validate the target of an endpoint-mode task submission.
         self._connected_endpoints: dict[str, set[str]] = {}
 
+        # The last rich topology, minus ``lost`` entries (a one-delivery
+        # event, not a state).  Adopting an endpoint (plan 122) replays it
+        # through ``_reconcile_pilots_for``, so a new record is activated
+        # by exactly the rule the topology hook applies.
+        self._participants: dict[str, dict] = {}
+
         # Endpoint-mode task tracking: task_id → target_endpoint_name.
         # Endpoint mode bypasses pool state — the dispatcher is a transparent
         # proxy to the target endpoint's rhapsody.  Backed by one atomic
@@ -1292,6 +1311,18 @@ class PluginTaskDispatcher(Plugin):
         Replaces the four separate sweeper loops.  Ticks every
         ``_TICK_INTERVAL_SEC``; reconciles overdue pilot handshakes each tick;
         prunes stale state dirs at most once per ``_PRUNE_INTERVAL_SEC``.
+
+        Only pools whose owning session is *live* are ticked.  ``_replay_state``
+        re-materialises every on-disk pool at construction, before any client
+        has re-registered its session — those orphans must not scale up on
+        their own: a pool with a ``min_pilots`` floor whose owner never comes
+        back would otherwise submit pilots forever.  An orphan is still
+        drained-free and still pruned; it wakes when its owner re-registers.
+
+        This covers the reserved ``default`` session too — it is created on
+        demand, so a pool replayed under ``default`` also stays un-ticked
+        until the first request mints that session.  Same rule, not an
+        exception to it.
         '''
         last_prune = time.time()
         while True:
@@ -1299,6 +1330,8 @@ class PluginTaskDispatcher(Plugin):
                 await asyncio.sleep(_TICK_INTERVAL_SEC)
                 now = time.time()
                 for ps in list(self._all_pools()):
+                    if ps.owning_sid not in self._sessions:
+                        continue                 # replayed, owner-less pool
                     ps.policy.on_tick(ps, self._make_submit_pilot(ps))
                     self._drain_pending(ps)
                 await self._reconcile_overdue_pilots(now)
@@ -1334,7 +1367,9 @@ class PluginTaskDispatcher(Plugin):
         '''Reconcile PENDING/STARTING pilots overdue for a handshake.
 
         For each such pilot older than ``_HANDSHAKE_TIMEOUT_SEC``, query psij
-        for its job state and mark it FAILED if the job is terminal.
+        for its job state and mark it FAILED if the job is terminal; an
+        adopted pilot has no job to query and is failed outright (see
+        :meth:`_reconcile_pilot`).
         '''
         for pool_state in list(self._all_pools()):
             for pilot in list(pool_state.pilots.values()):
@@ -1585,12 +1620,26 @@ class PluginTaskDispatcher(Plugin):
 
         Body is one member declaration.  An **identical** re-POST is a
         ``200 {"created": false}`` no-op, which is what makes the
-        federation's restart replay idempotent; a differing one is a 409.
-        There is no partial/mutable update: a member is replaced by
+        federation's restart replay idempotent; one that differs **only** in
+        ``pilot`` updates it in place and answers
+        ``200 {"created": false, "updated": true}``; any other difference is
+        a 409.  There is no other partial update: a member is replaced by
         removing and re-adding it.
 
+        ``pilot`` may change in place (plan 122) because an upgraded
+        federation re-POSTs its allocation members as ``endpoint`` against a
+        pool this dispatcher replayed as ``submit``.  The comparison applies
+        it to the existing member and re-runs its ``__post_init__``, so the
+        bound check on a mode switch bites for ``endpoint`` -> ``submit``
+        only: the existing member's forced 1/1 is what the new declaration
+        must carry, and a switch that *also* changes a bound is a 409 like
+        any other change.  For ``submit`` -> ``endpoint`` ``parse_member``
+        has already forced the new declaration's bounds to 1/1 before the
+        comparison, so whatever bounds it declared never differ.
+
         No pilot is submitted here — the next housekeeping tick applies
-        the new member's ``min_pilots`` floor.
+        the new member's ``min_pilots`` floor.  A member switched to
+        ``pilot: endpoint`` therefore adopts its endpoint on that tick.
         '''
         sid  = request.path_params['sid']
         name = request.path_params['name']
@@ -1611,17 +1660,23 @@ class PluginTaskDispatcher(Plugin):
             raise HTTPException(status_code=400, detail=str(e)) from e
 
         existing = ps.config.members.get(member.member_id)
-        if existing is not None:
-            if self._member_fingerprint(existing) == \
-                    self._member_fingerprint(member):
+        created  = existing is None
+        if not created:
+            if self._member_fingerprint(replace(existing, pilot=member.pilot)) \
+                    != self._member_fingerprint(member):
+                raise HTTPException(
+                    status_code=409,
+                    detail='member exists with a different declaration')
+            if existing.pilot == member.pilot:
+                # everything else matched above: an identical re-POST
                 return {'pool'   : name,
                         'member' : asdict(existing),
                         'members': list(ps.config.members),
-                        'created': False}
-            raise HTTPException(
-                status_code=409,
-                detail='member exists with a different declaration')
+                        'created': False,
+                        'updated': False}
 
+        # a new member, or only ``pilot`` differs: the new one holds from
+        # the next tick on
         ps.config.members[member.member_id] = member
         ps.config.reproject()
         ps.persist()
@@ -1629,18 +1684,20 @@ class PluginTaskDispatcher(Plugin):
         self._dispatch_notify('pool_members', {
             'pool'      : name,
             'sid'       : sid,
-            'action'    : 'add',
+            'action'    : 'add' if created else 'update',
             'member_id' : member.member_id,
             'member_ids': list(ps.config.members),
         })
-        log.info('[%s] pool %r (sid=%s): added member %r on endpoint %r',
-                 self.instance_name, name, sid, member.member_id,
-                 member.endpoint_name)
+        log.info('[%s] pool %r (sid=%s): %s member %r on endpoint %r '
+                 '(pilot=%s)', self.instance_name, name, sid,
+                 'added' if created else 'updated', member.member_id,
+                 member.endpoint_name, member.pilot)
 
         return {'pool'   : name,
                 'member' : asdict(member),
                 'members': list(ps.config.members),
-                'created': True}
+                'created': created,
+                'updated': not created}
 
     async def _route_remove_member(self, request: Request) -> dict:
         '''Remove one member from a class pool, draining its pilots.
@@ -2393,15 +2450,16 @@ class PluginTaskDispatcher(Plugin):
           reclaim-drain for a *session owner* declared ``lost``; the drain then
           closes the session, which tears down its pools.
 
-        Also refreshes the cached per-endpoint plugin set from the non-lost
-        participants.
+        Also refreshes the cached per-endpoint plugin set and the cached
+        topology from the non-lost participants.
         '''
         participants = participants or {}
 
         # Refresh {endpoint_name: set(plugin_names)} from the non-lost,
         # non-self participants.
         self_name = getattr(self._app.state, 'endpoint_name', None)
-        new: dict[str, set[str]] = {}
+        new:  dict[str, set[str]] = {}
+        live: dict[str, dict]     = {}
         for name, info in participants.items():
             if name == self_name:
                 continue
@@ -2414,8 +2472,10 @@ class PluginTaskDispatcher(Plugin):
             plugins = (info or {}).get('plugins', {})
             if isinstance(plugins, dict):
                 plugins = list(plugins.keys())
-            new[name] = set(plugins)
+            new[name]  = set(plugins)
+            live[name] = info
         self._connected_endpoints = new
+        self._participants        = live
 
         for ps in self._all_pools():
             self._reconcile_pilots_for(ps, participants)
@@ -2450,7 +2510,12 @@ class PluginTaskDispatcher(Plugin):
                     ps.persist()
 
             elif liveness == 'lost':
-                if time.time() >= pilot.walltime_deadline:
+                if pilot.adopted:
+                    # An adopted endpoint that goes away has left, or its
+                    # allocation ended -- neither is a pilot failure,
+                    # whatever the deadline says.
+                    self._mark_pilot_done(ps, pilot, 'adopted endpoint gone')
+                elif time.time() >= pilot.walltime_deadline:
                     self._mark_pilot_done(ps, pilot, 'walltime reached')
                 else:
                     self._mark_pilot_failed(
@@ -2464,6 +2529,22 @@ class PluginTaskDispatcher(Plugin):
             log.warning('[%s] cannot bind pilot %s: pool size %r has zero '
                         'capacity', self.instance_name, pilot.pid,
                         pilot.size_key)
+            if pilot.adopted:
+                # Nothing will ever change that for an adopted endpoint;
+                # left PENDING, the sweeper would later fail it with a
+                # misleading "endpoint not connected".
+                self._mark_pilot_failed(
+                    ps, pilot, f'pilot size {pilot.size_key!r} has zero '
+                               f'capacity')
+            return
+        if pilot.adopted and 'rhapsody' not in \
+                self._connected_endpoints.get(pilot.child_endpoint_name, ()):
+            # A submitted pilot's child is our own wrapper; an adopted
+            # endpoint is whatever joined, and without rhapsody every task
+            # dispatched to it would fail.
+            self._mark_pilot_failed(
+                ps, pilot, f'endpoint {pilot.child_endpoint_name} serves '
+                           f'no rhapsody')
             return
 
         old_state = pilot.state
@@ -2524,6 +2605,14 @@ class PluginTaskDispatcher(Plugin):
         re-declared or removed: a pilot's node really does have the
         software it had when it started, and a departed member's pilots
         still have to be sized for accounting.
+
+        A ``pilot: endpoint`` member is **adopted**, not submitted (plan
+        122): its endpoint already runs inside the allocation, so the
+        record is created PENDING with the endpoint as its own child, no
+        psij job is asked for, and the last topology is replayed through
+        :meth:`_reconcile_pilots_for` — so it is activated at once when the
+        endpoint is ``present``, and otherwise (``suspect`` or absent) by
+        the next delivery, exactly as a submitted pilot's child is.
         '''
         cfg    = pool_state.config
         member = cfg.member(member_id) if member_id else None
@@ -2541,6 +2630,22 @@ class PluginTaskDispatcher(Plugin):
                 f"{size_key!r} (available: "
                 f"{sorted(member.pilot_sizes)})")
 
+        adopt = member.pilot == PILOT_ENDPOINT
+        if adopt:
+            # There is exactly one endpoint to adopt, so a second call
+            # while a record for it is live would create a second pilot
+            # bound to the same child endpoint name.
+            live = pool_state.live_pilots_for(member.member_id)
+            if live:
+                # the live pilot need not be an adopted one: a member
+                # re-declared from ``submit`` to ``endpoint`` keeps its
+                # submitted pilot until that one ends
+                log.warning('[%s] pool %r: member %r already holds live '
+                            'pilot %s; not adopting %r as well',
+                            self.instance_name, cfg.name, member.member_id,
+                            live[0].pid, member.endpoint_name)
+                return live[0].pid
+
         size   = member.pilot_sizes[size_key]
         pid    = f'p.{uuid.uuid4().hex[:10]}'
         record = PilotRecord(
@@ -2551,28 +2656,67 @@ class PluginTaskDispatcher(Plugin):
             rhapsody_backend = size.rhapsody_backend,
             state            = PILOT_PENDING,
             submitted_at     = time.time(),
-            walltime_deadline= time.time() + size.walltime_sec,
+            walltime_deadline= self._pilot_deadline(member, size),
             member_id        = member.member_id,
             attributes       = dict(member.attributes),
             endpoint_name    = member.endpoint_name or '',
             nodes            = size.nodes,
             cpus_per_node    = size.cpus_per_node,
             gpus_per_node    = size.gpus_per_node,
+            # the stamp every later rule reads (see ``PilotRecord.adopted``)
+            adopted          = adopt,
         )
+        if adopt:
+            # Pre-bind the endpoint as its own child, exactly as
+            # ``_do_pilot_submit`` does for a submitted pilot, so the
+            # topology hook matches it.
+            record.child_endpoint_name = member.endpoint_name
+
         pool_state.pilots[pid] = record
         pool_state.persist()
 
-        asyncio.create_task(
-            self._do_pilot_submit(pool_state, record, size, member))
+        if adopt:
+            log.info('[%s] pool %r: adopting endpoint %r as pilot %s for '
+                     'member %r', self.instance_name, cfg.name,
+                     member.endpoint_name, pid, member.member_id)
+            self._reconcile_pilots_for(pool_state, self._participants)
+        else:
+            asyncio.create_task(
+                self._do_pilot_submit(pool_state, record, size, member))
 
         self._dispatch_notify('autoscale_decision', {
             'pool'     : cfg.name,
-            'action'   : 'submit_pilot',
+            'action'   : 'adopt_pilot' if adopt else 'submit_pilot',
             'pilot_id' : pid,
             'size_key' : size_key,
             'member_id': member.member_id,
         })
         return pid
+
+    @staticmethod
+    def _pilot_deadline(member: PoolMember, size: PilotSize) -> float:
+        '''Return the walltime deadline for a new pilot of *member*.
+
+        A submitted pilot: ``now + walltime_sec``, capped by the member's
+        ``end_time`` when it knows one.
+
+        An adopted endpoint (``pilot == PILOT_ENDPOINT``): the allocation's
+        ``end_time`` only, ``0.0`` (unknown) without one.  Nothing ends an
+        adopted endpoint at ``now + walltime_sec`` -- that figure is a size
+        default (3600 when the allocation reports no end, or runs
+        UNLIMITED) -- so a deadline made of it would drop the endpoint from
+        dispatch and capacity near that time while it keeps holding the
+        member's single pilot slot: the pool would stall with every task
+        queued.  The allocation's end is also what keeps a **re-**adopted
+        endpoint honest, since the member is re-declared with its join-time
+        ``walltime_sec`` on every re-attach.
+        '''
+        if member.pilot == PILOT_ENDPOINT:
+            return float(member.end_time or 0.0)
+        deadline = time.time() + size.walltime_sec
+        if member.end_time:
+            return min(deadline, float(member.end_time))
+        return deadline
 
     def _build_pilot_env(self, pool_state: PoolState,
                          record: PilotRecord,
@@ -2595,8 +2739,16 @@ class PluginTaskDispatcher(Plugin):
         }
         if pool_state.config.multi_member:
             env['RADICAL_ORBIT_MEMBER'] = record.member_id
-        cert = os.environ.get('RADICAL_ORBIT_BROKER_CERT')
-        if cert:
+        # The broker's cert path is a path on the BROKER host.  A member
+        # that shares the filesystem sees the same file; a non-shared
+        # member runs elsewhere, where that path (e.g. the broker user's
+        # $HOME) need not exist -- shipping it made every remote pilot
+        # fail TLS silently.  Such a pilot inherits its endpoint's own
+        # RADICAL_ORBIT_BROKER_CERT, or falls back to the endpoint's
+        # default ~/.radical/orbit/broker_cert.pem on its host.
+        shared = member.shared_fs
+        cert   = os.environ.get('RADICAL_ORBIT_BROKER_CERT')
+        if cert and shared:
             env['RADICAL_ORBIT_BROKER_CERT'] = cert
         return env
 
@@ -2689,10 +2841,18 @@ class PluginTaskDispatcher(Plugin):
             self._mark_pilot_failed(pool_state, record, f'psij error: {e}')
             return
 
+        job_id = result.get('job_id')
+
+        # The submission is the one long await on this path, and the record
+        # can reach a terminal state under it: a member removed, the owning
+        # session closed, the handshake sweep giving up.  Writing STARTING
+        # over that would resurrect a pilot nobody is waiting for -- and its
+        # batch job would keep the allocation.  So cancel what we just
+        # started and leave the record as the other path left it.
         if record.is_terminal():
-            job_id = result.get('job_id')
-            log.info('[%s] pilot %s cancelled during submit; cancelling '
-                     'psij job %s', self.instance_name, record.pid, job_id)
+            log.warning('[%s] pilot %s reached %s while its psij submit was '
+                        'in flight; cancelling job %s',
+                        self.instance_name, record.pid, record.state, job_id)
             if job_id:
                 try:
                     await asyncio.to_thread(psij_c.cancel_job, job_id)
@@ -2701,7 +2861,7 @@ class PluginTaskDispatcher(Plugin):
                                 self.instance_name, record.pid, e)
             return
 
-        record.psij_job_id = result.get('job_id')
+        record.psij_job_id = job_id
         if record.state != PILOT_PENDING:
             # The child registered while the submit was in flight and
             # on_topology_change already activated the pilot: keep the job
@@ -2738,8 +2898,31 @@ class PluginTaskDispatcher(Plugin):
 
     async def _do_pilot_cancel(self, pool_state: PoolState,
                                record: PilotRecord) -> None:
-        '''Best-effort psij cancel + FAILED for one pilot.'''
+        '''Best-effort psij cancel + FAILED for one pilot.
+
+        The second of the two exits an adopted pilot can take (the other is
+        the topology ``lost`` branch): removing its member — a ``leave``, or
+        an endpoint the federation detached — releases the endpoint rather
+        than killing a job, so the record ends **DONE**.  Whichever of the
+        two hooks fires first, the pilot's member is never charged a
+        failure for it.
+        '''
         if record.is_terminal():
+            return
+        if record.adopted:
+            # The endpoint outlives the record: no psij cancel kills the
+            # tasks it still runs, so stop them there.  A uid still in
+            # ``_uid_to_task`` is one rhapsody has not ended -- this also
+            # covers tasks a ``cancel_tasks`` removal already failed.
+            # Finalize (re-queue) first: each cancel yields the loop, and a
+            # CANCELED event landing on a still-RUNNING task would end it
+            # instead of re-queueing it.  Per task: the rhapsody session is
+            # shared.
+            uids = [t.rhapsody_uid for t in pool_state.tasks.values()
+                    if t.pilot_id == record.pid
+                    and t.rhapsody_uid in self._uid_to_task]
+            self._mark_pilot_done(pool_state, record, 'endpoint released')
+            await self._cancel_rhapsody_tasks(record, uids)
             return
         endpoint_name = record.endpoint_name
         if not endpoint_name or not record.psij_job_id:
@@ -2758,8 +2941,20 @@ class PluginTaskDispatcher(Plugin):
 
     async def _reconcile_pilot(self, pool_state: PoolState,
                                record: PilotRecord) -> None:
-        '''Sweeper path: query psij state for an overdue pilot.'''
+        '''Sweeper path: query psij state for an overdue pilot.
+
+        An **adopted** pilot has no psij job to ask about: it is waiting for
+        its own endpoint to appear in the topology.  Past the handshake
+        timeout that endpoint is not coming, and the record is failed with
+        that reason — left PENDING it would sit forever while counting
+        against the strategy's in-flight guards and the pool ceiling.
+        '''
         if record.is_terminal():
+            return
+        if record.adopted:
+            self._mark_pilot_failed(
+                pool_state, record,
+                f'endpoint {record.child_endpoint_name} not connected')
             return
         endpoint_name = record.endpoint_name
         if not endpoint_name or not record.psij_job_id:
@@ -2803,6 +2998,10 @@ class PluginTaskDispatcher(Plugin):
         so a late terminal event from the dead pilot can't clobber the requeued
         task), and signals the policy.
 
+        Stamps ``finished_at`` — the only place a pilot reaches a terminal
+        state — so the pool's ``pilot_history`` keeps the interval this pilot
+        held its allocation after it disappears from the live fleet.
+
         A re-queued task also drops its ``member_id`` — it is set at
         dispatch beside ``pilot_id`` and would otherwise report a placement
         it no longer has — and bumps ``requeues``.  Past the policy's
@@ -2810,9 +3009,16 @@ class PluginTaskDispatcher(Plugin):
         also protects the pre-existing pilot-loss path from an infinite
         bounce.  Its input spool deliberately survives: the task is about
         to be dispatched somewhere else.
+
+        A FAILED pilot also keeps *why* on its record (``error``), so the
+        reason travels with every ``pilot_history`` entry instead of living
+        only in the broker log.  A DONE pilot's reason is not an error and
+        is not stamped.
         '''
         old_state = record.state
         record.state = new_state
+        if new_state == PILOT_FAILED and reason:
+            record.error = str(reason)[:PILOT_ERROR_MAX]
         if record.finished_at is None:
             record.finished_at = time.time()
         self._dispatch_notify('pilot_status', {
@@ -2999,7 +3205,8 @@ class PluginTaskDispatcher(Plugin):
                 elif task.task_dict is None:
                     marker = spool / _CWD_MARKER
                     marker.parent.mkdir(parents=True, exist_ok=True)
-                    marker.touch()
+                    # 1 byte, not 0: older endpoints' staging 400s an empty put
+                    marker.write_bytes(b'\n')
                     await asyncio.to_thread(
                         stg.put, str(marker),
                         str(Path(task.cwd) / _CWD_MARKER), True)
@@ -3316,6 +3523,31 @@ class PluginTaskDispatcher(Plugin):
         self._mark_dirty(pool_state)
         self._notify_task(pool_state, task)
 
+    async def _cancel_rhapsody_tasks(self, pilot: PilotRecord,
+                                     uids: list) -> None:
+        '''Best-effort rhapsody cancel of *uids* on *pilot*'s endpoint.
+
+        Errors are logged, never raised.
+        '''
+        if not pilot.child_endpoint_name or not uids:
+            return
+        try:
+            # the submit's session: its cache key includes the backend
+            rh = await self._get_rhapsody_client(pilot.child_endpoint_name,
+                                                 pilot.rhapsody_backend)
+        except Exception as e:
+            log.warning('[%s] rhapsody client failed for %s: %s',
+                        self.instance_name, pilot.pid, e)
+            return
+        if rh is None:
+            return
+        for uid in uids:
+            try:
+                await asyncio.to_thread(rh.cancel_task, uid)
+            except Exception as e:
+                log.warning('[%s] rhapsody cancel_task failed: %s',
+                            self.instance_name, e)
+
     async def _cancel_task(self, pool_state: PoolState,
                            task: TaskRecord) -> dict:
         '''Cancel path: either remove from queue or cancel on the pilot.'''
@@ -3331,14 +3563,8 @@ class PluginTaskDispatcher(Plugin):
 
         # RUNNING — best-effort cancel on the pilot
         pilot = pool_state.pilots.get(task.pilot_id or '')
-        if pilot and pilot.child_endpoint_name and task.rhapsody_uid:
-            rh = await self._get_rhapsody_client(pilot.child_endpoint_name)
-            if rh is not None:
-                try:
-                    await asyncio.to_thread(rh.cancel_task, task.rhapsody_uid)
-                except Exception as e:
-                    log.warning('[%s] rhapsody cancel_task failed: %s',
-                                self.instance_name, e)
+        if pilot and task.rhapsody_uid:
+            await self._cancel_rhapsody_tasks(pilot, [task.rhapsody_uid])
         task.state       = TASK_CANCELED
         task.finished_at = time.time()
         pool_state.drop_spool(task.task_id)
@@ -3446,9 +3672,43 @@ class PluginTaskDispatcher(Plugin):
             ] if cfg.multi_member else []
         return summary
 
+    @staticmethod
+    def _last_pilot_error(history: list[PilotRecord]) -> str | None:
+        '''Return the ``error`` of the most recent FAILED pilot, or ``None``.
+
+        *history* is oldest first, so the newest failure is found by walking
+        it backwards.  The walk stops at the newest pilot that reached
+        ACTIVE (``active_at`` set): a failure older than a healthy pilot is
+        history, not the member's current problem -- otherwise a lost-and-
+        re-added member would show "child endpoint lost" under an ``ok``
+        row forever.  A FAILED pilot written before this field existed
+        carries no error and is skipped rather than reported as a healthy
+        member: an older failure that *does* say why is the better answer.
+        '''
+        for pilot in reversed(history or []):
+            if pilot.active_at:
+                return None
+            if pilot.state == PILOT_FAILED and pilot.error:
+                return pilot.error
+        return None
+
     def _member_dict(self, ps: PoolState, m: PoolMember,
                      now: float, views: dict[str, dict]) -> dict:
         '''Return the verbose per-member block (frozen contract, §9).
+
+        ``pilot`` / ``end_time`` are the member's declaration; the derived
+        ``remaining_sec`` is the most walltime any of its **live** pilots
+        still has (``None`` when it holds none) -- a pilot's deadline is
+        dispatcher state.  A consumer that knows the member's ``end_time``
+        prefers that and falls back to this live figure (see the
+        federation's ``MemberRecord.remaining_sec``).  Never negative: a
+        pilot past a mis-estimated deadline has no time left, it does not
+        owe any.
+
+        The failure count and pause come from the policy's
+        ``member_health``; ``register_policy`` admits only
+        :class:`DispatchPolicy` subclasses, whose base answers a healthy
+        member.
 
         *views* maps pid to the ``asdict`` view :meth:`_summarize_pool`
         already built for the pool-level history.
@@ -3456,11 +3716,17 @@ class PluginTaskDispatcher(Plugin):
         mine    = ps.live_pilots_for(m.member_id)
         history = ps.pilot_history(m.member_id)
         used    = node_hours(history, now=now)
+        health  = ps.policy.member_health(m.member_id)
+        left    = [max(0.0, p.walltime_deadline - now) for p in mine
+                   if p.walltime_deadline]
         return {
             'member_id'           : m.member_id,
             'endpoint_name'       : m.endpoint_name,
             'queue'               : m.queue,
             'account'             : m.account,
+            'pilot'               : m.pilot,
+            'end_time'            : m.end_time,
+            'remaining_sec'       : max(left) if left else None,
             'attributes'          : dict(m.attributes),
             'budget'              : dict(m.budget),
             'min_pilots'          : m.min_pilots,
@@ -3474,6 +3740,15 @@ class PluginTaskDispatcher(Plugin):
             'node_hours_used'     : used,
             'node_hours_remaining': ps.member_budget_left(m.member_id, now),
             'pilot_history'       : [views[p.pid] for p in history],
+            # -- why this member is not producing pilots ------------------
+            # The reason the most recent pilot of this member died, plus
+            # what the policy holds against it.  Without these a member
+            # whose every submit fails is indistinguishable from an idle
+            # one: `live_pilots` is 0 either way.
+            'last_pilot_error'          : self._last_pilot_error(history),
+            'consecutive_pilot_failures':
+                health['consecutive_pilot_failures'],
+            'paused_until'              : health['paused_until'],
         }
 
     # -- session-close teardown (owner lost / ttl / cancel_all) ---------

@@ -60,8 +60,26 @@ PSIJ_POLL_INTERVAL = 5.0
 # RUNNING — beyond this we conclude the job left the queue and bail
 UNKNOWN_TOLERANCE = 3
 
-# Persistent directory for job stdout/stderr capture
-_OUTPUT_BASE = pathlib.Path.home() / '.radical' / 'orbit' / 'psij' / 'output'
+# Where this plugin writes: job stdout/stderr capture under ``output/``
+# and psij's own work directory (generated launch scripts) under ``work/``.
+# ``$RADICAL_ORBIT_PSIJ_DIR`` moves the whole tree -- HPC home directories
+# are quota'd, and a full home made every ``submit_tunneled`` on a
+# Perlmutter compute node fail with "[Errno 122] Disk quota exceeded"
+# (2026-09-08).  Resolved per call so an operator or a test can set it
+# after import.
+_PSIJ_DIR_ENV = 'RADICAL_ORBIT_PSIJ_DIR'
+
+
+def _psij_dir() -> pathlib.Path:
+    raw = os.environ.get(_PSIJ_DIR_ENV)
+    if raw:
+        return pathlib.Path(raw).expanduser()
+    return pathlib.Path.home() / '.radical' / 'orbit' / 'psij'
+
+
+def _output_base() -> pathlib.Path:
+    return _psij_dir() / 'output'
+
 
 # Maximum age (days) for stale output directories cleaned up on session creation
 _OUTPUT_MAX_AGE_DAYS = 7
@@ -132,7 +150,7 @@ class PSIJSession(PluginSession):
         self._poll_task = None
 
         # Persistent output directory for this session's job stdout/stderr
-        self._output_dir = _OUTPUT_BASE / sid
+        self._output_dir = _output_base() / sid
         self._cleanup_stale_output()
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -151,10 +169,11 @@ class PSIJSession(PluginSession):
 
     def _cleanup_stale_output(self) -> None:
         """Remove output directories older than _OUTPUT_MAX_AGE_DAYS."""
-        if not _OUTPUT_BASE.exists():
+        base = _output_base()
+        if not base.exists():
             return
         cutoff = time.time() - _OUTPUT_MAX_AGE_DAYS * 86400
-        for entry in _OUTPUT_BASE.iterdir():
+        for entry in base.iterdir():
             if not entry.is_dir() or entry == self._output_dir:
                 continue
             try:
@@ -259,20 +278,21 @@ class PSIJSession(PluginSession):
 
             # ``keep_files=True`` only meaningful for batch-scheduler
             # executors (slurm/pbs/lsf/cobalt/...).  ``local`` ignores it.
-            ex_config = None
+            work_dir = _psij_dir() / 'work'
+            work_dir.mkdir(parents=True, exist_ok=True)
             if _KEEP_PSIJ_FILES and executor_name in ('slurm', 'pbs', 'lsf',
                                                        'cobalt', 'flux'):
                 from psij.executors.batch.batch_scheduler_executor \
                     import BatchSchedulerExecutorConfig
-                ex_config = BatchSchedulerExecutorConfig(keep_files=True)
+                ex_config = BatchSchedulerExecutorConfig(
+                    keep_files=True, work_directory=work_dir)
                 log.info("[psij] RADICAL_ORBIT_PSIJ_KEEP_FILES set: "
                          "executor=%s keep_files=True", executor_name)
-
-            if ex_config is not None:
-                ex = psij.JobExecutor.get_instance(executor_name,
-                                                    config=ex_config)
             else:
-                ex = psij.JobExecutor.get_instance(executor_name)
+                ex_config = psij.JobExecutorConfig(work_directory=work_dir)
+
+            ex = psij.JobExecutor.get_instance(executor_name,
+                                                config=ex_config)
 
             # Set poll interval for status updates
             if hasattr(ex, 'poll_interval'):

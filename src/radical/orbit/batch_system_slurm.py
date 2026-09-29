@@ -2,6 +2,7 @@
 
 import os
 import shutil
+import time
 
 from .batch_system import (BatchSystem, register_backend, run_cmd,
                            run_cmd_strict,
@@ -123,15 +124,33 @@ class SlurmBatchSystem(BatchSystem):
             raise RuntimeError(
                 f"SLURM_JOB_ID={job_id!r} is set but SLURM_NNODES is unavailable")
 
-        # walltime: query squeue for the per-job time limit
+        # walltime: query squeue for the per-job time limit (%l) AND the
+        # time this job has left (%L).  ``%L`` is a duration in the same
+        # ``D-HH:MM:SS`` form as ``%l`` -- not ``%e``, which prints a local
+        # wall-clock *date* -- so one parser serves both, and an unlimited
+        # job answers UNLIMITED for both and parses to None.
         try:
             stdout = run_cmd_strict(
-                ['squeue', '--job', job_id, '--noheader', '--format=%l'],
+                ['squeue', '--job', job_id, '--noheader', '--format=%l;%L'],
                 timeout=10)
         except RuntimeError as exc:
             raise RuntimeError(
                 f"Cannot query runtime for job {job_id}: {exc}") from exc
-        runtime = _parse_slurm_time(stdout.strip())
+        fields    = (stdout.strip().split(';') + [''])[:2]
+        runtime   = _parse_slurm_time(fields[0])
+        try:
+            remaining = _parse_slurm_time(fields[1])
+        except RuntimeError:
+            # end_time is optional and runtime is not: a ``%L`` token this
+            # parser does not know (an odd Slurm build, an INVALID) must not
+            # take the whole allocation summary -- and with it the endpoint's
+            # federation join -- down with it.
+            remaining = None
+        # An absolute instant, computed inside the allocation: a remaining
+        # time is only true at the moment it was read, and the consumer of
+        # this summary is on another host.
+        end_time  = (time.time() + remaining) if remaining is not None \
+            else None
 
         def _intenv(key):
             v = os.environ.get(key)
@@ -162,6 +181,7 @@ class SlurmBatchSystem(BatchSystem):
             'account'      : os.environ.get('SLURM_JOB_ACCOUNT'),
             'job_name'     : os.environ.get('SLURM_JOB_NAME'),
             'runtime'      : runtime,
+            'end_time'     : end_time,
         }
 
 

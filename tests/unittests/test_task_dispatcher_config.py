@@ -9,7 +9,7 @@ import pytest
 
 from radical.orbit.task_dispatcher_config import (
     DEFAULT_POOL_NAME, PilotSize, PoolConfigError,
-    default_pool_config, parse_pools,
+    default_pool_config, parse_member, parse_pools,
 )
 
 
@@ -365,6 +365,64 @@ class TestMemberParsing:
             parse_pools(_class_pool_dict(
                 members=[_member_dict(member_id='m' * 60)],
                 name='p' * 10))
+
+
+class TestPilotMode:
+    """``pilot`` / ``end_time``: an endpoint inside an allocation is the
+    pilot (plan 122)."""
+
+    def test_default_is_submit_with_no_end_time(self):
+        m = parse_member(_member_dict(), 'src', pool_name='fed-gpu')
+        assert (m.pilot, m.end_time) == ('submit', None)
+
+    def test_pilot_endpoint_is_accepted(self):
+        m = parse_member(_member_dict(pilot='endpoint'), 'src', pool_name='fed-gpu')
+        assert m.pilot == 'endpoint'
+
+    def test_an_unknown_pilot_mode_is_refused(self):
+        with pytest.raises(PoolConfigError, match="'pilot'"):
+            parse_member(_member_dict(pilot='adopt'), 'src', pool_name='fed-gpu')
+
+    def test_an_adopted_member_holds_exactly_one_pilot(self):
+        """Forced, not trusted: min 0 would never adopt until a backlog
+        appeared, and max > 1 would adopt the same endpoint twice."""
+        m = parse_member(_member_dict(pilot='endpoint', min_pilots=0,
+                                      max_pilots=4), 'src',
+                         pool_name='fed-gpu')
+        assert (m.min_pilots, m.max_pilots) == (1, 1)
+
+    def test_a_submit_member_keeps_its_declared_bounds(self):
+        m = parse_member(_member_dict(min_pilots=0, max_pilots=4),
+                         'src', pool_name='fed-gpu')
+        assert (m.min_pilots, m.max_pilots) == (0, 4)
+
+    def test_a_directly_built_member_is_bounded_too(self):
+        """``__post_init__`` is the single site, so a hand-built member --
+        a test, an embedder -- gets the same rule as a parsed one."""
+        from radical.orbit.task_dispatcher_config import PoolMember
+        m = PoolMember(member_id='m', endpoint_name='ep', queue='q',
+                       account=None, pilot_sizes={}, default_size='d',
+                       min_pilots=0, max_pilots=4, pilot='endpoint')
+        assert (m.min_pilots, m.max_pilots) == (1, 1)
+
+    def test_end_time_round_trips_through_to_dict(self):
+        cfg = parse_pools(_class_pool_dict(members=[
+            _member_dict(pilot='endpoint', end_time=1757000000.0)]))['fed-gpu']
+        member = cfg.members['perlmutter']
+        assert member.end_time == 1757000000.0
+        back = parse_pools({'pools': [cfg.to_dict()]})['fed-gpu']
+        assert back == cfg
+        assert back.members['perlmutter'].end_time == 1757000000.0
+        assert back.members['perlmutter'].pilot    == 'endpoint'
+
+    def test_an_end_time_of_zero_is_not_an_end_time(self):
+        """It would cap every pilot deadline at the epoch."""
+        with pytest.raises(PoolConfigError, match="'end_time'"):
+            parse_member(_member_dict(end_time=0), 'src', pool_name='fed-gpu')
+
+    def test_a_non_numeric_end_time_is_refused(self):
+        with pytest.raises(PoolConfigError, match="'end_time'"):
+            parse_member(_member_dict(end_time='soon'), 'src', pool_name='fed-gpu')
 
 
 class TestShapeSwitch:

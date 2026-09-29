@@ -234,8 +234,10 @@ class QueueInfoClient(PluginClient):
         Returns:
             The allocation summary (keys ``job_id``, ``partition``, ``n_nodes``,
             ``nodelist``, ``cpus_per_node``, ``gpus_per_node``, ``account``,
-            ``job_name``, ``runtime``), or ``None`` when the endpoint runs on a
-            login node (outside any batch allocation).
+            ``job_name``, ``runtime``, ``end_time``), or ``None`` when the
+            endpoint runs on a login node (outside any batch allocation).
+            ``runtime`` is the job's time limit; ``end_time`` is the epoch at
+            which the allocation ends, computed on the endpoint.
 
         Raises:
             RuntimeError: Endpoint is inside an allocation but the scheduler did
@@ -381,11 +383,17 @@ class PluginQueueInfo(Plugin):
     async def job_allocation_endpoint(self, request: Request) -> dict:
         """Session-less endpoint: returns current endpoint job allocation info.
 
+        The batch system's summary is passed through **verbatim**, so a key
+        it learns to report -- ``end_time``, the epoch at which this
+        allocation ends -- reaches the caller without a change here.
+
         Response::
 
-            {"allocation": null}                              # login node
-            {"allocation": {"n_nodes": 4, "runtime": 3600}}  # inside a job
-            {"allocation": {"n_nodes": 4, "runtime": null}}  # unlimited walltime
+            {"allocation": null}                             # login node
+            {"allocation": {"n_nodes": 4, "runtime": 3600,
+                            "end_time": 1757000000.0}}       # inside a job
+            {"allocation": {"n_nodes": 4, "runtime": null,
+                            "end_time": null}}               # no time limit
         """
         try:
             alloc = await asyncio.to_thread(self.get_job_allocation)

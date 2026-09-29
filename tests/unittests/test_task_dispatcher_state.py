@@ -189,6 +189,29 @@ class TestRecordSerialisation:
         assert records_from(None, PilotRecord) == {}
         assert records_from({}, PilotRecord) == {}
 
+    def test_finished_at_survives_a_round_trip(self):
+        """A terminal pilot keeps its end timestamp across a restart.
+
+        Node-hour accounting reads ``active_at``/``finished_at`` off the
+        persisted pilots, so a lost ``finished_at`` would silently keep
+        charging a dead pilot against its budget.
+        """
+        pilots = {'p.1': PilotRecord(
+            pid='p.1', pool='cpu', size_key='s',
+            rhapsody_backend='concurrent', state=PILOT_DONE,
+            submitted_at=10.0, active_at=20.0, finished_at=80.0)}
+        restored = records_from(records_to(pilots), PilotRecord)
+        assert restored['p.1'].finished_at == 80.0
+
+    def test_finished_at_defaults_to_none_on_older_state(self):
+        """A state.json written before the field loads with finished_at=None."""
+        p = record_from_dict(PilotRecord, {
+            'pid': 'p.old', 'pool': 'cpu', 'size_key': 's',
+            'rhapsody_backend': 'concurrent', 'state': PILOT_ACTIVE,
+            'active_at': 5.0,
+        })
+        assert p.finished_at is None
+
     def test_records_to_and_from_round_trip(self):
         pilots = {
             'p.1': PilotRecord(pid='p.1', pool='cpu', size_key='s',
@@ -386,3 +409,12 @@ class TestNodeHours:
     def test_zero_node_entry_skipped(self):
         assert node_hours(_recs([{'nodes': 0, 'active_at': 1000.0,
                                   'finished_at': 4600.0}])) == 0.0
+
+    def test_sums_over_several_pilots_and_sizes(self):
+        hist  = [{'nodes':  2, 'size_key': 'default', 'active_at': 0.0,
+                  'finished_at': 3600.0},                      # 2 nh
+                 {'nodes': 10, 'size_key': 'big',     'active_at': 0.0,
+                  'finished_at': 1800.0},                      # 5 nh
+                 {'nodes':  2, 'size_key': 'default',
+                  'active_at': None}]                          # 0
+        assert node_hours(_recs(hist), now=1e9) == 7.0

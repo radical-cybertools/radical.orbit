@@ -2,6 +2,7 @@
 
 import os
 import subprocess
+import time
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -210,6 +211,46 @@ class TestSlurmBackend:
             with pytest.raises(RuntimeError, match='scancel failed'):
                 SlurmBatchSystem().cancel('5')
 
+    # -- job_allocation: the time limit (%l) AND the time left (%L) -------
+
+    _ALLOC_ENV = {'SLURM_JOB_ID': '42', 'SLURM_NNODES': '2',
+                  'SLURM_CPUS_ON_NODE': '64'}
+
+    def _alloc(self, squeue_out):
+        with patch.dict(os.environ, dict(self._ALLOC_ENV), clear=True), \
+             patch('subprocess.run',
+                   return_value=MagicMock(returncode=0, stdout=squeue_out,
+                                          stderr='')) as m:
+            return SlurmBatchSystem().job_allocation(), m
+
+    def test_job_allocation_asks_for_the_limit_and_the_time_left(self):
+        alloc, m = self._alloc('2-00:00:00;23:30:00\n')
+        # %L (a duration), never %e (a local wall-clock date)
+        assert '--format=%l;%L' in m.call_args[0][0]
+        assert alloc['runtime'] == 2 * 86400
+        # ... and end_time is now + what is left, computed in here
+        assert alloc['end_time'] == pytest.approx(
+            time.time() + 23.5 * 3600, abs=5)
+
+    def test_job_allocation_has_no_end_time_when_unlimited(self):
+        alloc, _ = self._alloc('UNLIMITED;UNLIMITED\n')
+        assert alloc['runtime']  is None
+        assert alloc['end_time'] is None
+
+    def test_job_allocation_has_no_end_time_when_squeue_omits_it(self):
+        """An older squeue answering the limit alone still parses."""
+        alloc, _ = self._alloc('01:00:00\n')
+        assert alloc['runtime']  == 3600
+        assert alloc['end_time'] is None
+
+    def test_an_unparseable_time_left_does_not_break_the_summary(self):
+        """`end_time` is optional where `runtime` is not: a `%L` token this
+        parser does not know must not take the allocation summary -- and with
+        it the endpoint's federation join -- down with it."""
+        alloc, _ = self._alloc('01:00:00;INVALID\n')
+        assert alloc['runtime']  == 3600
+        assert alloc['end_time'] is None
+
 
 class TestParseSlurmTime:
 
@@ -336,6 +377,42 @@ class TestPBSBackend:
         assert alloc['gpus_per_node'] == 4
         assert alloc['account'] == 'proj1'
         assert alloc['job_name'] == 'demo'
+        # no Walltime.Remaining and no stime: no end is better than a guess
+        assert alloc['end_time'] is None
+
+    # -- end_time: Walltime.Remaining, else stime + the walltime limit ----
+
+    def _pbs_alloc(self, tmp_path, extra_lines):
+        nf = tmp_path / 'nodefile'
+        nf.write_text('nid001\n')
+        env = {'PBS_JOBID': '42.aurora', 'PBS_NODEFILE': str(nf)}
+        out = ('Job Id: 42.aurora\n'
+               '    job_state = R\n'
+               '    Resource_List.walltime = 01:00:00\n' + extra_lines)
+        with patch.dict(os.environ, env, clear=True), \
+             patch('subprocess.run',
+                   return_value=MagicMock(returncode=0, stdout=out)):
+            return PBSProBatchSystem().job_allocation()
+
+    def test_job_allocation_end_time_from_walltime_remaining(self, tmp_path):
+        alloc = self._pbs_alloc(tmp_path,
+                                '    Walltime.Remaining = 1800\n')
+        assert alloc['end_time'] == pytest.approx(time.time() + 1800, abs=5)
+
+    def test_job_allocation_end_time_falls_back_to_stime(self, tmp_path):
+        """No remaining time: the start time plus the limit says the same."""
+        started = time.time() - 600
+        stime   = time.strftime('%a %b %d %H:%M:%S %Y',
+                                time.localtime(started))
+        alloc   = self._pbs_alloc(tmp_path, f'    stime = {stime}\n')
+        # started 10 min ago with a 1 h limit -> ~50 min left
+        assert alloc['end_time'] == pytest.approx(started + 3600, abs=5)
+
+    def test_job_allocation_end_time_ignores_a_garbage_remaining(self,
+                                                                 tmp_path):
+        alloc = self._pbs_alloc(tmp_path,
+                                '    Walltime.Remaining = soon\n')
+        assert alloc['end_time'] is None
 
     def test_job_allocation_raises_when_unknown(self):
         env = {'PBS_JOBID': '42.aurora'}

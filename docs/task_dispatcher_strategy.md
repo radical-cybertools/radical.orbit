@@ -70,6 +70,7 @@ class DispatchPolicy:
     def max_requeues(self) -> int: ...           # default 1
 
     def on_pilot_state(self, pilot, old_state, new_state) -> None: ...
+    def member_health(self, member_id) -> dict: ...  # see below
     def on_member_removed(self, member_id) -> None: ...
     def on_tick(self, pool_state, submit_pilot) -> None: ...
     def pick_dispatch(self, pool_state) \
@@ -106,6 +107,12 @@ pilots expire at walltime.
 - ``max_requeues`` is read by the dispatcher when a pilot loss re-queues a
   task.  Past the cap the task is failed with ``requeued too often (pilot
   lost)`` instead of bouncing forever.
+- ``member_health(member_id)`` is read by the dispatcher's per-member
+  summary and must answer ``{'consecutive_pilot_failures': int,
+  'paused_until': float | None}`` — what the policy holds against that
+  member, so a paused member says so on the wire instead of only in the
+  broker log.  The default reports a healthy member; the conservative
+  policy reports its own failure counter and backoff deadline.
 - ``on_member_removed`` is called when a member leaves a class pool; a
   policy drops its per-member bookkeeping there, so a re-added member id
   starts clean.
@@ -180,6 +187,13 @@ Favors efficient utilization over low latency.
   are matched against the pilot's *shape*, never against its occupancy, so
   a 4-GPU pilot will happily accept a fifth 1-GPU task.  Resource-aware
   reservation is deferred.
+- A pilot with less than ``min_remaining_sec`` (default 120) of walltime
+  left is neither dispatched to **nor counted as free capacity**: a task
+  started there would be killed with the allocation, and counting the idle
+  slot would suppress the scale-up that has to replace it.  A record with
+  no deadline at all (``0.0``, which ``_submit_pilot`` never writes) is not
+  filtered — an unknown deadline is not a near one.  A pilot that outlives
+  a mis-estimated deadline stays ACTIVE until its endpoint disappears.
 
 **Per member.**  Every piece of bookkeeping — dwell, in-flight
 submissions, the pilot ceiling, the failure backoff, the budget — is per
@@ -223,6 +237,14 @@ not — accepted for class pools and documented here; a future
 bounded by the pending-queue length, so the cost is O(pending²) worst case
 (tens, at demo scale).
 
+**Two notes on the floor.**  It counts a member's *live* pilots, so one
+still coming up already satisfies it — a 5-second tick cannot stack up
+batch jobs while the first one boots.  And a pool replayed off disk at
+broker start has no owning session until its client re-registers:
+housekeeping deliberately does **not** tick such a pool, because an orphan
+with a floor would otherwise submit pilots forever to an endpoint that may
+be long gone.
+
 Config knobs:
 
 | key                       | default         | meaning |
@@ -234,6 +256,11 @@ Config knobs:
 | ``failure_backoff_sec``   | ``60.0``        | how long a member backs off |
 | ``member_preference``     | ``budget``      | which member to grow: alt ``least_loaded`` |
 | ``max_requeues``          | ``1``           | pilot losses a task survives before it fails |
+| ``min_remaining_sec``     | ``120.0``       | walltime a pilot must have left to be dispatched to, or to count as capacity |
+
+(``min_pilots`` / ``max_pilots`` are pool fields, not strategy knobs — see
+``PoolConfig``.  A member declared ``pilot: endpoint`` has both forced to
+1: its endpoint *is* the pilot, so there is exactly one of it.)
 
 ### ``aggressive_scale_to_backlog``
 

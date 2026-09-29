@@ -466,12 +466,17 @@ class TestTopologyBinding:
     def _plugin_with_pilot(self, tmp_path, pid='p.1',
                            child='endpoint0_p.1', state=PILOT_PENDING,
                            walltime=1e12):
+        """A pool holding one *submitted* pilot -- a psij job whose child
+        endpoint is expected under *child*.  ``psij_job_id`` is what
+        distinguishes it from an adopted endpoint (plan 122), which ends
+        DONE rather than FAILED when its child goes away."""
         _, plugin = _make_plugin(tmp_path)
         plugin._materialise_pool('A', _make_pool_cfg())
         ps = _pool(plugin, 'A', 'cpu')
         ps.pilots[pid] = PilotRecord(
             pid=pid, pool='cpu', owning_sid='A', size_key='s',
             rhapsody_backend='concurrent', state=state, submitted_at=100.0,
+            psij_job_id='j.1',
             child_endpoint_name=child, walltime_deadline=walltime,
             endpoint_name='endpoint0', nodes=1, cpus_per_node=4)
         return plugin, ps
@@ -541,6 +546,133 @@ class TestMarkPilotFailed:
         assert pilot.state == PILOT_FAILED
         assert ps.tasks['t.r'].state == TASK_QUEUED
         assert ps.tasks['t.r'].pilot_id is None
+
+    def test_finalize_stamps_finished_at(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        plugin._materialise_pool('A', _make_pool_cfg())
+        ps = _pool(plugin, 'A', 'cpu')
+        pilot = PilotRecord(pid='p.1', pool='cpu', owning_sid='A',
+                            size_key='s', rhapsody_backend='concurrent',
+                            state=PILOT_ACTIVE, submitted_at=time.time(),
+                            active_at=time.time())
+        ps.pilots['p.1'] = pilot
+        assert pilot.finished_at is None
+        plugin._mark_pilot_done(ps, pilot, 'walltime reached')
+        assert pilot.state == PILOT_DONE
+        assert pilot.finished_at is not None
+        assert pilot.finished_at >= pilot.active_at
+
+
+# ---------------------------------------------------------------------------
+# Pilot history in the verbose pool summary (accounting surface)
+# ---------------------------------------------------------------------------
+
+class TestPilotHistory:
+
+    def _seeded(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _session_with_cpu(client, plugin, sid='A', lifetime='persistent')
+        ps  = _pool(plugin, sid, 'cpu')
+        return plugin, client, sid, ps
+
+    def test_history_keeps_a_pilot_the_live_list_drops(self, tmp_path):
+        plugin, client, sid, ps = self._seeded(tmp_path)
+        pilot = PilotRecord(pid='p.gone', pool='cpu', owning_sid=sid,
+                            size_key='s', rhapsody_backend='concurrent',
+                            state=PILOT_ACTIVE, submitted_at=100.0,
+                            active_at=150.0, child_endpoint_name='cpu_p.gone')
+        ps.pilots['p.gone'] = pilot
+        plugin._mark_pilot_failed(ps, pilot, 'child endpoint lost')
+
+        r = client.get(f'{plugin.namespace}/pool/{sid}/cpu')
+        assert r.status_code == 200
+        body = r.json()
+        # gone from the live fleet ...
+        assert body['pilots'] == []
+        # ... but still in the history, with its end timestamp and the
+        # size_key that resolves its node count through pilot_sizes.
+        hist = {p['pid']: p for p in body['pilot_history']}
+        assert set(hist) == {'p.gone'}
+        assert hist['p.gone']['state']       == PILOT_FAILED
+        assert hist['p.gone']['active_at']   == 150.0
+        assert hist['p.gone']['finished_at'] is not None
+        assert hist['p.gone']['size_key']    == 's'
+        assert hist['p.gone']['child_endpoint_name'] == 'cpu_p.gone'
+        assert body['pilot_sizes']['s']['nodes'] == 1
+
+    def test_history_lists_live_and_terminal_pilots(self, tmp_path):
+        plugin, client, sid, ps = self._seeded(tmp_path)
+        ps.pilots['p.live'] = PilotRecord(
+            pid='p.live', pool='cpu', owning_sid=sid, size_key='s',
+            rhapsody_backend='concurrent', state=PILOT_ACTIVE)
+        ps.pilots['p.dead'] = PilotRecord(
+            pid='p.dead', pool='cpu', owning_sid=sid, size_key='s',
+            rhapsody_backend='concurrent', state=PILOT_DONE,
+            finished_at=42.0)
+        body = client.get(f'{plugin.namespace}/pool/{sid}/cpu').json()
+        assert {p['pid'] for p in body['pilots']}        == {'p.live'}
+        assert {p['pid'] for p in body['pilot_history']} == {'p.live',
+                                                             'p.dead'}
+
+    def test_non_verbose_summary_has_no_history(self, tmp_path):
+        plugin, client, sid, ps = self._seeded(tmp_path)
+        body = client.get(f'{plugin.namespace}/pools').json()
+        assert 'pilot_history' not in body['pools'][sid]['cpu']
+
+
+# ---------------------------------------------------------------------------
+# Housekeeping: an owner-less (replayed) pool is never ticked
+# ---------------------------------------------------------------------------
+
+class TestHousekeepingOrphanGuard:
+
+    @pytest.mark.asyncio
+    async def test_replayed_pool_without_session_is_not_ticked(self, tmp_path):
+        """A pool replayed off disk has no session until its owner returns.
+
+        ``_replay_state`` re-materialises every state dir at construction,
+        before any client re-registers.  Such a pool must not scale up on
+        its own — with a ``min_pilots`` floor it would otherwise submit a
+        pilot per backoff window forever, to an endpoint that may be gone.
+        """
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        _session_with_cpu(client, plugin, sid='A', lifetime='persistent')
+
+        # restart: fresh plugin over the same state root, no session yet
+        _, plugin2 = _make_plugin(tmp_path)
+        assert 'cpu' in plugin2._pool_states['A']
+        assert 'A' not in plugin2._sessions
+
+        ps = _pool(plugin2, 'A', 'cpu')
+        with patch.object(ps.policy, 'on_tick') as tick, \
+                patch('radical.orbit.plugin_task_dispatcher'
+                      '._TICK_INTERVAL_SEC', 0.01):
+            task = asyncio.ensure_future(plugin2._housekeeping())
+            await asyncio.sleep(0.1)
+            task.cancel()
+            try:    await task
+            except asyncio.CancelledError:
+                pass
+        tick.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pool_with_a_live_session_is_ticked(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _session_with_cpu(client, plugin, sid='A', lifetime='persistent')
+        ps  = _pool(plugin, sid, 'cpu')
+        with patch.object(ps.policy, 'on_tick') as tick, \
+                patch('radical.orbit.plugin_task_dispatcher'
+                      '._TICK_INTERVAL_SEC', 0.01):
+            task = asyncio.ensure_future(plugin._housekeeping())
+            await asyncio.sleep(0.1)
+            task.cancel()
+            try:    await task
+            except asyncio.CancelledError:
+                pass
+        assert tick.called
 
 
 # ---------------------------------------------------------------------------
@@ -1818,11 +1950,16 @@ class TestMemberRemoval:
         assert r.status_code == 404
 
     def _pilot_with_task(self, plugin, sid, mid, req=None):
+        """One ACTIVE *submitted* pilot of member *mid*, running one task.
+
+        ``psij_job_id`` marks it a batch job rather than an adopted
+        endpoint: cancelling one is a failure, releasing the other is not
+        (plan 122)."""
         ps = _pool(plugin, sid, 'fed')
         pilot = PilotRecord(
             pid=f'p.{mid}', pool='fed', owning_sid=sid, size_key='d',
             rhapsody_backend='concurrent', state=PILOT_ACTIVE,
-            member_id=mid, endpoint_name=f'ep_{mid}',
+            member_id=mid, endpoint_name=f'ep_{mid}', psij_job_id=f'j.{mid}',
             attributes={'software': [mid[-1]]},
             nodes=1, cpus_per_node=4,
             child_endpoint_name=f'fed_{mid}_p.{mid}',
@@ -2602,6 +2739,105 @@ class TestClassPoolSummary:
         assert s['node_hours_used'] == pytest.approx(1.0, abs=0.01)
 
 
+class TestPilotFailureIsVisible:
+    """A member whose every submit fails must not read as a healthy idle one.
+
+    The demo case: psij answered ``[Errno 122] Disk quota exceeded`` for half
+    an hour, the pilots went FAILED, and every summary showed the member with
+    0 pilots and nothing else — the reason lived only in the broker log.
+    """
+
+    QUOTA = 'OSError: [Errno 122] Disk quota exceeded'
+
+    def _submit(self, plugin, ps, pid, exc):
+        size   = ps.config.member('m_x').pilot_sizes['d']
+        record = PilotRecord(
+            pid=pid, pool='fed', owning_sid='A', size_key='d',
+            rhapsody_backend='concurrent', state=PILOT_PENDING,
+            member_id='m_x', submitted_at=time.time(),
+            endpoint_name=ps.config.member('m_x').endpoint_name)
+        ps.pilots[pid] = record
+        psij_mock = MagicMock()
+        psij_mock.submit_tunneled = MagicMock(side_effect=exc)
+        with patch.object(plugin, '_get_psij_client',
+                          new=AsyncMock(return_value=psij_mock)), \
+             patch('radical.orbit.batch_system.detect_batch_system') as bs:
+            bs.return_value.psij_executor = 'local'
+            asyncio.run(plugin._do_pilot_submit(
+                ps, record, size, ps.config.member('m_x')))
+        return record
+
+    def test_a_failed_submit_is_kept_on_the_pilot_record(self, tmp_path):
+        plugin, _client, sid = _class_session(tmp_path)
+        ps     = _pool(plugin, sid, 'fed')
+        record = self._submit(plugin, ps, 'p.1', OSError(self.QUOTA))
+
+        assert record.state == PILOT_FAILED
+        assert 'psij error' in record.error
+        assert 'Disk quota exceeded' in record.error
+        # and it travels in the history, which is what the summaries carry
+        entry = ps.pilot_history('m_x')[0]
+        assert entry.error == record.error
+
+    def test_the_error_is_truncated(self, tmp_path):
+        plugin, _client, sid = _class_session(tmp_path)
+        ps     = _pool(plugin, sid, 'fed')
+        record = self._submit(plugin, ps, 'p.1', OSError('x' * 5000))
+        assert len(record.error) == 300
+
+    def test_a_done_pilot_carries_no_error(self, tmp_path):
+        plugin, _client, sid = _class_session(tmp_path)
+        ps = _pool(plugin, sid, 'fed')
+        rec = PilotRecord(pid='p.9', pool='fed', owning_sid=sid,
+                          size_key='d', rhapsody_backend='concurrent',
+                          state=PILOT_ACTIVE, member_id='m_x')
+        ps.pilots['p.9'] = rec
+        plugin._mark_pilot_done(ps, rec, 'walltime reached')
+        assert rec.state == PILOT_DONE
+        assert rec.error is None
+
+    def test_the_member_block_reports_the_error_and_the_pause(self, tmp_path):
+        plugin, _client, sid = _class_session(tmp_path)
+        ps = _pool(plugin, sid, 'fed')
+        for n in range(3):
+            self._submit(plugin, ps, 'p.%d' % n, OSError(self.QUOTA))
+
+        m = plugin._summarize_pool(ps, verbose=True)['members'][0]
+        assert m['member_id'] == 'm_x'
+        assert m['live_pilots'] == 0            # what used to be the whole
+        assert 'Disk quota exceeded' in m['last_pilot_error']
+        assert m['consecutive_pilot_failures'] == 3
+        # the conservative policy's backoff, read off the policy itself
+        assert m['paused_until'] > time.time()
+
+    def test_a_healthy_member_reports_nothing_held_against_it(self, tmp_path):
+        plugin, _client, sid = _class_session(tmp_path)
+        m = plugin._summarize_pool(_pool(plugin, sid, 'fed'),
+                                   verbose=True)['members'][0]
+        assert m['last_pilot_error']           is None
+        assert m['consecutive_pilot_failures'] == 0
+        assert m['paused_until']               is None
+
+    def test_the_newest_failure_wins(self, tmp_path):
+        plugin, _client, sid = _class_session(tmp_path)
+        ps = _pool(plugin, sid, 'fed')
+        self._submit(plugin, ps, 'p.0', OSError('older failure'))
+        self._submit(plugin, ps, 'p.1', OSError(self.QUOTA))
+        m = plugin._summarize_pool(ps, verbose=True)['members'][0]
+        assert 'Disk quota exceeded' in m['last_pilot_error']
+
+    def test_a_policy_without_member_health_reports_a_healthy_member(
+            self, tmp_path):
+        from radical.orbit.task_dispatcher_policy import DispatchPolicy
+        plugin, _client, sid = _class_session(tmp_path)
+        ps = _pool(plugin, sid, 'fed')
+        with patch.object(type(ps.policy), 'member_health',
+                          DispatchPolicy.member_health):
+            m = plugin._summarize_pool(ps, verbose=True)['members'][0]
+        assert m['consecutive_pilot_failures'] == 0
+        assert m['paused_until'] is None
+
+
 # ---------------------------------------------------------------------------
 # Review round 2 (plan 121 Implementation notes)
 # ---------------------------------------------------------------------------
@@ -2798,6 +3034,509 @@ class TestAddMemberFingerprint:
                                      attributes={'software': ['a', 'c']}))
         assert r.status_code == 409
 
+    def test_an_identical_repost_says_it_updated_nothing(self, tmp_path):
+        plugin, client, sid = _class_session(tmp_path)
+        r = client.post(f'{plugin.namespace}/pool/{sid}/fed/members',
+                        json=_member('m_x'))
+        assert r.status_code == 200, r.text
+        assert (r.json()['created'], r.json()['updated']) == (False, False)
+
+    def test_only_the_pilot_mode_differing_updates_in_place(self, tmp_path):
+        """The upgrade path: a member replayed off a pre-122 state dir says
+        `submit` while the federation re-POSTs it as `endpoint`.  A 409 there
+        would leave the member detached until the state dir was wiped."""
+        plugin, client, sid = _class_session(tmp_path, members=[
+            _member('m_x', endpoint_name='alloc_ep')])
+        seen = []
+        plugin._dispatch_notify = lambda t, d: seen.append((t, d))
+        r = client.post(f'{plugin.namespace}/pool/{sid}/fed/members',
+                        json=_member('m_x', endpoint_name='alloc_ep',
+                                     pilot='endpoint'))
+        assert r.status_code == 200, r.text
+        assert (r.json()['created'], r.json()['updated']) == (False, True)
+        # the Explorer learns of an update the way it learns of an add
+        assert [(t, d['action']) for t, d in seen] == \
+            [('pool_members', 'update')]
+
+        member = _pool(plugin, sid, 'fed').config.members['m_x']
+        assert member.pilot    == 'endpoint'
+        # ... and the new mode brings its own pilot bounds with it
+        assert (member.min_pilots, member.max_pilots) == (1, 1)
+        # the update is durable: a reload sees the new declaration
+        _, plugin2 = _make_plugin(tmp_path)
+        assert _pool(plugin2, sid, 'fed').config.members['m_x'].pilot \
+            == 'endpoint'
+
+    def test_a_mode_switch_that_changes_a_bound_is_409(self, tmp_path):
+        """endpoint -> submit keeps the forced 1/1 bounds: a declaration
+        that also moves them is a redeclaration, not a mode switch."""
+        plugin, client, sid = _class_session(tmp_path, members=[
+            _member('m_x', pilot='endpoint')])
+        r = client.post(f'{plugin.namespace}/pool/{sid}/fed/members',
+                        json=_member('m_x', min_pilots=0, max_pilots=4))
+        assert r.status_code == 409
+        r = client.post(f'{plugin.namespace}/pool/{sid}/fed/members',
+                        json=_member('m_x', min_pilots=1, max_pilots=1))
+        assert r.status_code == 200, r.text
+        assert r.json()['updated'] is True
+
+    def test_a_pilot_mode_change_plus_a_real_change_is_still_409(self,
+                                                                tmp_path):
+        plugin, client, sid = _class_session(tmp_path, members=[
+            _member('m_x')])
+        r = client.post(f'{plugin.namespace}/pool/{sid}/fed/members',
+                        json=_member('m_x', pilot='endpoint', queue='other'))
+        assert r.status_code == 409
+        assert _pool(plugin, sid, 'fed').config.members['m_x'].pilot \
+            == 'submit'
+
+
+# ---------------------------------------------------------------------------
+# An endpoint inside an allocation IS the pilot (plan 122)
+# ---------------------------------------------------------------------------
+
+_ALLOC_EP = 'alloc_ep'
+
+
+def _adopted_member(mid='m_a', **overrides):
+    """A member whose endpoint runs inside its allocation."""
+    return _member(mid, endpoint_name=_ALLOC_EP, pilot='endpoint',
+                   **overrides)
+
+
+class TestEndpointAdoption:
+
+    def _session(self, tmp_path, connected=True, **mkw):
+        plugin, client, sid = _class_session(
+            tmp_path, members=[_adopted_member(**mkw)])
+        plugin._dispatch_notify = lambda t, d: None
+        if connected:
+            asyncio.run(plugin.on_topology_change(_child_topo(_ALLOC_EP)))
+        return plugin, client, sid, _pool(plugin, sid, 'fed')
+
+    def _adopt(self, plugin, ps):
+        """Adopt, with the psij path patched so a call to it would show."""
+        submit = AsyncMock(return_value=None)
+        with patch.object(plugin, '_do_pilot_submit', new=submit):
+            pid = plugin._submit_pilot(ps, None, member_id='m_a')
+        assert submit.await_count == 0, 'a psij job was submitted'
+        return pid, ps.pilots[pid]
+
+    def test_a_connected_endpoint_is_active_at_once(self, tmp_path):
+        plugin, _, _, ps = self._session(tmp_path)
+        pid, rec = self._adopt(plugin, ps)
+        assert rec.state               == PILOT_ACTIVE
+        assert rec.child_endpoint_name == _ALLOC_EP
+        assert rec.endpoint_name       == _ALLOC_EP
+        assert rec.psij_job_id         is None
+        # capacity comes from the size snapshot, exactly as for a submitted
+        # pilot -- adoption rides _activate_pilot, it does not bypass it
+        assert rec.capacity  == 4
+        assert rec.active_at is not None
+        assert ps.live_pilots_for('m_a') == [rec]
+
+    def test_the_declaration_forces_one_pilot(self, tmp_path):
+        _, _, _, ps = self._session(tmp_path, min_pilots=0, max_pilots=4)
+        member = ps.config.members['m_a']
+        assert (member.min_pilots, member.max_pilots) == (1, 1)
+
+    def test_an_absent_endpoint_waits_for_the_topology(self, tmp_path):
+        plugin, _, _, ps = self._session(tmp_path, connected=False)
+        _, rec = self._adopt(plugin, ps)
+        assert rec.state == PILOT_PENDING
+
+        asyncio.run(plugin.on_topology_change(_child_topo(_ALLOC_EP)))
+        assert rec.state    == PILOT_ACTIVE
+        assert rec.capacity == 4
+
+    def test_a_pending_adoption_times_out_with_the_reason(self, tmp_path):
+        """Left PENDING it would sit forever, counting against the
+        strategy's in-flight guards -- there is no psij job to ask about."""
+        from radical.orbit.plugin_task_dispatcher import _HANDSHAKE_TIMEOUT_SEC
+        plugin, _, _, ps = self._session(tmp_path, connected=False)
+        _, rec = self._adopt(plugin, ps)
+        rec.submitted_at -= _HANDSHAKE_TIMEOUT_SEC + 1
+
+        asyncio.run(plugin._reconcile_overdue_pilots(time.time()))
+        assert rec.state == PILOT_FAILED
+        assert rec.error == f'endpoint {_ALLOC_EP} not connected'
+
+    def test_a_zero_capacity_adoption_fails_with_that_reason(self, tmp_path):
+        """Nothing will ever bind it; the sweeper's "not connected" would
+        be the wrong reason, and later."""
+        plugin, _, _, ps = self._session(tmp_path)
+        member = ps.config.members['m_a']
+        member.pilot_sizes[member.default_size].cpus_per_node = 0
+        _, rec = self._adopt(plugin, ps)
+        assert rec.state == PILOT_FAILED
+        assert 'zero capacity' in rec.error
+
+    def test_a_pending_adoption_is_left_alone_before_the_timeout(self,
+                                                                tmp_path):
+        plugin, _, _, ps = self._session(tmp_path, connected=False)
+        _, rec = self._adopt(plugin, ps)
+        asyncio.run(plugin._reconcile_overdue_pilots(time.time()))
+        assert rec.state == PILOT_PENDING
+
+    def test_a_suspect_endpoint_is_not_activated_on_the_spot(self, tmp_path):
+        """It is still in the topology but on its way out, so the record
+        waits for the delivery that says `present` -- exactly as a submitted
+        pilot's child does."""
+        plugin, _, _, ps = self._session(tmp_path, connected=False)
+        asyncio.run(plugin.on_topology_change(
+            _child_topo(_ALLOC_EP, 'suspect')))
+        _, rec = self._adopt(plugin, ps)
+        assert rec.state == PILOT_PENDING
+
+        asyncio.run(plugin.on_topology_change(_child_topo(_ALLOC_EP)))
+        assert rec.state == PILOT_ACTIVE
+
+    def test_an_endpoint_without_rhapsody_fails_at_once(self, tmp_path):
+        """Every task dispatched to it would fail; say why, up front."""
+        plugin, _, _, ps = self._session(tmp_path, connected=False)
+        topo = _child_topo(_ALLOC_EP)
+        topo[_ALLOC_EP]['plugins'] = {'sysinfo': {'namespace': '/sysinfo'}}
+        asyncio.run(plugin.on_topology_change(topo))
+        _, rec = self._adopt(plugin, ps)
+        assert rec.state == PILOT_FAILED
+        assert rec.error == f'endpoint {_ALLOC_EP} serves no rhapsody'
+
+    def test_a_second_adoption_is_a_no_op(self, tmp_path):
+        """There is one endpoint to adopt; a second record would bind a
+        second pilot to the same child endpoint name."""
+        plugin, _, _, ps = self._session(tmp_path)
+        pid, _ = self._adopt(plugin, ps)
+        again, _ = self._adopt(plugin, ps)
+        assert again == pid
+        assert list(ps.pilots) == [pid]
+
+    def test_the_deadline_is_capped_by_the_allocation_end(self, tmp_path):
+        """The member is re-declared with its join-time walltime on every
+        re-attach, so only the absolute end keeps a re-adoption honest."""
+        end = time.time() + 60
+        plugin, _, _, ps = self._session(tmp_path, end_time=end)
+        _, rec = self._adopt(plugin, ps)
+        assert rec.walltime_deadline == pytest.approx(end, abs=1)
+
+    def test_without_an_end_time_the_deadline_is_unknown(self, tmp_path):
+        """Nothing ends an adopted endpoint at ``now + walltime_sec``, so
+        that figure must not become its deadline."""
+        plugin, _, _, ps = self._session(tmp_path)
+        _, rec = self._adopt(plugin, ps)
+        assert rec.walltime_deadline == 0.0
+
+    def test_without_an_end_time_tasks_flow_past_the_walltime(self,
+                                                              tmp_path):
+        """The size's walltime passing must not drop the endpoint from
+        dispatch: it still holds the member's single pilot slot, so the
+        pool would stall with every task queued."""
+        plugin, _, sid, ps = self._session(tmp_path)
+        _, rec = self._adopt(plugin, ps)
+        ps.tasks['t.1'] = TaskRecord(
+            task_id='t.1', pool='fed', owning_sid=sid, cmd=['/bin/echo'],
+            cwd='/tmp', state=TASK_QUEUED)
+
+        later = time.time() + 2 * 3600
+        ps.policy._now = lambda: later
+        pair = ps.policy.pick_dispatch(ps)
+        assert pair is not None
+        assert pair[1] is rec
+
+    def test_a_suspect_endpoint_pauses_the_adopted_pilot(self, tmp_path):
+        plugin, _, _, ps = self._session(tmp_path)
+        _, rec = self._adopt(plugin, ps)
+        asyncio.run(plugin.on_topology_change(
+            _child_topo(_ALLOC_EP, 'suspect')))
+        assert rec.state               == PILOT_ACTIVE   # not demoted
+        assert rec.accepting_new_tasks is False
+        asyncio.run(plugin.on_topology_change(_child_topo(_ALLOC_EP)))
+        assert rec.accepting_new_tasks is True
+
+    def test_a_lost_endpoint_is_done_never_failed(self, tmp_path):
+        """An allocation ending is not a pilot failure, whatever the
+        deadline says -- and it must not feed the failure counter."""
+        plugin, _, sid, ps = self._session(tmp_path)
+        _, rec = self._adopt(plugin, ps)
+        ps.tasks['t.1'] = TaskRecord(
+            task_id='t.1', pool='fed', owning_sid=sid, cmd=['/bin/echo'],
+            cwd='/tmp', state=TASK_RUNNING, pilot_id=rec.pid,
+            member_id='m_a')
+
+        asyncio.run(plugin.on_topology_change(
+            _child_topo(_ALLOC_EP, 'lost')))
+        assert rec.state         == PILOT_DONE
+        assert rec.error         is None
+        assert ps.tasks['t.1'].state    == TASK_QUEUED
+        assert ps.tasks['t.1'].pilot_id is None
+        assert ps.policy.member_health('m_a')[
+            'consecutive_pilot_failures'] == 0
+
+    def test_a_re_added_member_is_adopted_again(self, tmp_path):
+        """Lost, dropped by the federation, re-added: a fresh adoption with
+        a deadline capped by the allocation's own end."""
+        plugin, client, sid, ps = self._session(tmp_path)
+        first_pid, first = self._adopt(plugin, ps)
+        asyncio.run(plugin.on_topology_change(
+            _child_topo(_ALLOC_EP, 'lost')))
+        assert first.state == PILOT_DONE
+
+        # the endpoint comes back -- which is what makes the federation
+        # re-add the member in the first place
+        asyncio.run(plugin.on_topology_change(_child_topo(_ALLOC_EP)))
+        end = time.time() + 90
+        r = client.request(
+            'DELETE', f'{plugin.namespace}/pool/{sid}/fed/members/m_a',
+            json={'force': True})
+        assert r.status_code == 200, r.text
+        r = client.post(f'{plugin.namespace}/pool/{sid}/fed/members',
+                        json=_adopted_member(end_time=end))
+        assert r.status_code == 200, r.text
+
+        pid, rec = self._adopt(plugin, ps)
+        assert pid != first_pid
+        assert rec.state == PILOT_ACTIVE
+        assert rec.walltime_deadline == pytest.approx(end, abs=1)
+
+    def test_removing_the_member_releases_the_endpoint(self, tmp_path):
+        """The other exit: a leave, not a lost endpoint.  Same verdict, so
+        the two hooks can fire in either order."""
+        plugin, client, sid, ps = self._session(tmp_path)
+        _, rec = self._adopt(plugin, ps)
+        r = client.request(
+            'DELETE', f'{plugin.namespace}/pool/{sid}/fed/members/m_a',
+            json={'force': True})
+        assert r.status_code == 200, r.text
+        assert r.json()['pilots_cancelled'] == 1
+        assert rec.state == PILOT_DONE
+        assert rec.error is None
+
+    @pytest.mark.parametrize('cancel_tasks', [False, True])
+    def test_releasing_the_endpoint_stops_its_tasks(self, tmp_path,
+                                                    cancel_tasks):
+        """The endpoint outlives the record and no psij cancel kills its
+        tasks: they must be stopped on it, or a re-queued task runs twice
+        (and a failed one keeps running)."""
+        plugin, client, sid, ps = self._session(tmp_path)
+        _, rec = self._adopt(plugin, ps)
+        for i in (1, 2):
+            ps.tasks[f't.{i}'] = TaskRecord(
+                task_id=f't.{i}', pool='fed', owning_sid=sid,
+                cmd=['/bin/echo'], cwd='/tmp', state=TASK_RUNNING,
+                pilot_id=rec.pid, member_id='m_a', rhapsody_uid=f'rh.{i}')
+            plugin._uid_to_task[f'rh.{i}'] = (sid, 'fed', f't.{i}')
+
+        loop = None
+        keys = []
+
+        async def get_rh(name, backend=None):
+            nonlocal loop
+            loop = asyncio.get_running_loop()
+            keys.append((name, backend))
+            return rh_mock
+
+        def cancel(uid):
+            # rhapsody reports CANCELED over the tap, and the loop handles
+            # it, before the next cancel call returns
+            handled = threading.Event()
+
+            def deliver():
+                plugin._on_task_status({'uid': uid, 'state': 'CANCELED'})
+                handled.set()
+
+            loop.call_soon_threadsafe(deliver)
+            assert handled.wait(5)
+
+        rh_mock = MagicMock()
+        rh_mock.cancel_task = MagicMock(side_effect=cancel)
+        with patch.object(plugin, '_get_rhapsody_client', new=get_rh):
+            r = client.request(
+                'DELETE', f'{plugin.namespace}/pool/{sid}/fed/members/m_a',
+                json={'force': True, 'fail_unsatisfiable': False,
+                      'cancel_tasks': cancel_tasks})
+        assert r.status_code == 200, r.text
+        assert sorted(c.args[0] for c in rh_mock.cancel_task.call_args_list) \
+            == ['rh.1', 'rh.2']
+        rh_mock.cancel_all_tasks.assert_not_called()
+        # the session the tasks were submitted on, not a backend-less one
+        assert rec.rhapsody_backend
+        assert keys == [(rec.child_endpoint_name, rec.rhapsody_backend)]
+        assert rec.state == PILOT_DONE
+        want = TASK_FAILED if cancel_tasks else TASK_QUEUED
+        assert ps.tasks['t.1'].state == want
+        assert ps.tasks['t.2'].state == want
+        if not cancel_tasks:
+            assert r.json()['tasks_requeued'] == 2
+
+    def test_the_summary_reports_the_pilot_mode_and_the_runway(self,
+                                                              tmp_path):
+        end = time.time() + 600
+        plugin, client, sid, ps = self._session(tmp_path, end_time=end)
+        self._adopt(plugin, ps)
+        r = client.get(f'{plugin.namespace}/pool/{sid}/fed')
+        assert r.status_code == 200, r.text
+        member = r.json()['members'][0]
+        assert member['pilot']    == 'endpoint'
+        assert member['end_time'] == pytest.approx(end, abs=1)
+        assert member['remaining_sec'] == pytest.approx(600, abs=5)
+
+    def test_the_summary_reports_no_runway_without_a_pilot(self, tmp_path):
+        plugin, client, sid, _ = self._session(tmp_path)
+        r = client.get(f'{plugin.namespace}/pool/{sid}/fed')
+        assert r.json()['members'][0]['remaining_sec'] is None
+
+    def test_a_submit_member_reports_the_longest_lived_pilot(self, tmp_path):
+        """`remaining_sec` is the max over a member's live pilots -- the
+        number the federation shows for a login-mode shape."""
+        plugin, client, sid = _class_session(
+            tmp_path, members=[_member('m_x')])
+        ps  = _pool(plugin, sid, 'fed')
+        now = time.time()
+        for pid, left in (('p.1', 300), ('p.2', 900)):
+            ps.pilots[pid] = PilotRecord(
+                pid=pid, pool='fed', owning_sid=sid, size_key='d',
+                rhapsody_backend='concurrent', state=PILOT_ACTIVE,
+                psij_job_id='j.' + pid, member_id='m_x', nodes=1,
+                cpus_per_node=4, submitted_at=now, active_at=now,
+                child_endpoint_name=f'fed_m_x_{pid}',
+                walltime_deadline=now + left)
+        r = client.get(f'{plugin.namespace}/pool/{sid}/fed')
+        member = r.json()['members'][0]
+        assert member['pilot']    == 'submit'
+        assert member['end_time'] is None
+        assert member['remaining_sec'] == pytest.approx(900, abs=5)
+
+        # a pilot past a mis-estimated deadline has nothing left rather than
+        # owing time: the summary must never report a negative runway
+        for pilot in ps.pilots.values():
+            pilot.walltime_deadline = now - 300
+        r = client.get(f'{plugin.namespace}/pool/{sid}/fed')
+        assert r.json()['members'][0]['remaining_sec'] == 0.0
+
+    def test_the_floor_adopts_a_declared_endpoint_member_on_tick(self,
+                                                                tmp_path):
+        """min_pilots is forced to 1, so the floor step does the adopting --
+        no task has to arrive first."""
+        plugin, _, _, ps = self._session(tmp_path)
+        submit = AsyncMock(return_value=None)
+        with patch.object(plugin, '_do_pilot_submit', new=submit):
+            ps.policy.on_tick(ps, plugin._make_submit_pilot(ps))
+            # a second tick must not adopt the same endpoint twice
+            ps.policy.on_tick(ps, plugin._make_submit_pilot(ps))
+        assert submit.await_count == 0
+        assert len(ps.pilots) == 1
+        rec = next(iter(ps.pilots.values()))
+        assert (rec.state, rec.child_endpoint_name) == \
+            (PILOT_ACTIVE, _ALLOC_EP)
+
+    def test_an_adopted_active_pilot_survives_a_reload(self, tmp_path):
+        """Replay keeps it ACTIVE with its absolute deadline, and
+        `live_pilots_for` counts it -- so the floor does not double-adopt."""
+        end = time.time() + 1800
+        plugin, _, sid, ps = self._session(tmp_path, end_time=end)
+        pid, rec = self._adopt(plugin, ps)
+        active_at = rec.active_at
+        ps.persist()
+
+        _, plugin2 = _make_plugin(tmp_path)
+        ps2 = _pool(plugin2, sid, 'fed')
+        back = ps2.pilots[pid]
+        assert back.state             == PILOT_ACTIVE
+        assert back.active_at         == active_at
+        assert back.psij_job_id       is None
+        assert back.walltime_deadline == pytest.approx(end, abs=1)
+        assert ps2.live_pilots_for('m_a') == [back]
+        assert ps2.config.members['m_a'].pilot    == 'endpoint'
+        assert ps2.config.members['m_a'].end_time == pytest.approx(end, abs=1)
+
+        plugin2._dispatch_notify = lambda t, d: None
+        plugin2._connected_endpoints = {_ALLOC_EP: {'rhapsody'}}
+        submit = AsyncMock(return_value=None)
+        with patch.object(plugin2, '_do_pilot_submit', new=submit):
+            ps2.policy.on_tick(ps2, plugin2._make_submit_pilot(ps2))
+        assert list(ps2.pilots) == [pid]
+        assert submit.await_count == 0
+        assert back.adopted is True     # the stamp survives the reload too
+
+
+class TestInFlightSubmitIsNotAdoption:
+    """``_do_pilot_submit`` pre-binds the child endpoint name *before*
+    awaiting psij, so for the length of that submit a **submitted** record
+    carries a child name and no ``psij_job_id`` — which is why adoption is an
+    explicit stamp on the record and never inferred from those two.
+    """
+
+    def _pending(self, tmp_path, **kw):
+        _, plugin = _make_plugin(tmp_path)
+        plugin._dispatch_notify = lambda t, d: None
+        plugin._materialise_pool('A', _make_pool_cfg())
+        ps  = _pool(plugin, 'A', 'cpu')
+        rec = PilotRecord(
+            pid='p.1', pool='cpu', owning_sid='A', size_key='s',
+            rhapsody_backend='concurrent', state=PILOT_PENDING,
+            submitted_at=time.time(), child_endpoint_name='cpu__p.1',
+            walltime_deadline=time.time() + 3600,
+            endpoint_name=ps.config.endpoint_name, **kw)
+        ps.pilots['p.1'] = rec
+        return plugin, ps, rec
+
+    def test_a_pre_bound_record_without_a_job_id_is_not_adopted(self,
+                                                               tmp_path):
+        _, _, rec = self._pending(tmp_path)
+        assert rec.adopted is False
+
+    def test_the_handshake_sweep_does_not_fail_an_in_flight_submit(self,
+                                                                  tmp_path):
+        """It would read as "endpoint never connected" and kill a submission
+        that is still perfectly alive."""
+        from radical.orbit.plugin_task_dispatcher import _HANDSHAKE_TIMEOUT_SEC
+        plugin, ps, rec = self._pending(tmp_path)
+        rec.submitted_at -= _HANDSHAKE_TIMEOUT_SEC + 1
+        with patch.object(plugin, '_get_psij_client',
+                          new=AsyncMock(return_value=None)):
+            asyncio.run(plugin._reconcile_overdue_pilots(time.time()))
+        assert rec.state == PILOT_PENDING
+        assert rec.error is None
+
+    def test_cancelling_an_in_flight_submit_fails_it(self, tmp_path):
+        """DONE is the *adopted* verdict.  A submitted record may already
+        have a batch job behind it, so it fails with a reason."""
+        plugin, ps, rec = self._pending(tmp_path)
+        with patch.object(plugin, '_get_psij_client',
+                          new=AsyncMock(return_value=None)):
+            asyncio.run(plugin._do_pilot_cancel(ps, rec))
+        assert rec.state == PILOT_FAILED
+        assert rec.error == 'cancel requested'
+
+    def test_a_late_submit_result_does_not_resurrect_a_terminal_record(
+            self, tmp_path):
+        """The record went terminal under the await (member removed, session
+        closed): STARTING must not be written back, and the job that was
+        started in the meantime has to be cancelled -- it would otherwise
+        hold the allocation with nobody waiting for it."""
+        plugin, ps, rec = self._pending(tmp_path)
+        size = ps.config.pilot_sizes['s']
+
+        psij_mock = MagicMock()
+        psij_mock.cancel_job = MagicMock()
+
+        def _submit(*args, **kw):
+            # the state change that lands while psij is being called
+            plugin._mark_pilot_failed(ps, rec, 'cancel requested')
+            return {'job_id': 'jid'}
+
+        psij_mock.submit_tunneled = MagicMock(side_effect=_submit)
+        with patch.object(plugin, '_get_psij_client',
+                          new=AsyncMock(return_value=psij_mock)), \
+             patch('radical.orbit.batch_system.detect_batch_system') as bs:
+            bs.return_value.psij_executor = 'local'
+            asyncio.run(plugin._do_pilot_submit(
+                ps, rec, size, ps.config.member(rec.member_id)))
+
+        assert rec.state       == PILOT_FAILED
+        assert rec.error       == 'cancel requested'
+        assert rec.psij_job_id is None
+        psij_mock.cancel_job.assert_called_once_with('jid')
+
 
 class TestLegacyPilotMemberId:
 
@@ -2819,3 +3558,19 @@ class TestLegacyPilotMemberId:
         # ...and it still resolves to the implicit member
         assert ps.member(ps.pilots[pid].member_id).member_id == ''
         assert ps.live_pilots_for('') == [ps.pilots[pid]]
+
+
+def test_last_pilot_error_stops_at_the_newest_healthy_pilot():
+    # a failure older than a pilot that reached ACTIVE is history, not the
+    # member's current problem (a lost-and-re-added member would otherwise
+    # show "child endpoint lost" under an ok row forever)
+    from radical.orbit.plugin_task_dispatcher import PluginTaskDispatcher as P
+    def _rec(pid, **kw):
+        return PilotRecord(pid=pid, pool='p', size_key='s',
+                           rhapsody_backend='concurrent', **kw)
+    failed = _rec('p.f', state=PILOT_FAILED, error='quota exceeded')
+    active = _rec('p.a', state=PILOT_ACTIVE, active_at=1.0)
+    assert P._last_pilot_error([failed]) == 'quota exceeded'
+    assert P._last_pilot_error([failed, active]) is None
+    assert P._last_pilot_error([active, failed]) == 'quota exceeded'
+    assert P._last_pilot_error([]) is None

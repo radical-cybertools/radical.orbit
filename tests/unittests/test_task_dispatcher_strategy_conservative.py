@@ -244,6 +244,89 @@ class TestOnTick:
 
 
 # ---------------------------------------------------------------------------
+# min_pilots floor — warm capacity with an empty backlog
+# ---------------------------------------------------------------------------
+
+class TestMinPilotsFloor:
+
+    def test_empty_queue_below_floor_submits_once(self):
+        h = _Harness(_pool(min_pilots=1, max_pilots=1))
+        s = _policy(h, {'min_dwell_sec': 0.0})
+        s.on_tick(h, h.submit_pilot)
+        assert h.submitted == [None]
+
+    def test_empty_queue_without_floor_does_not_submit(self):
+        h = _Harness(_pool(min_pilots=0, max_pilots=1))
+        s = _policy(h, {'min_dwell_sec': 0.0})
+        s.on_tick(h, h.submit_pilot)
+        assert h.submitted == []
+
+    def test_floor_satisfied_by_a_pending_pilot(self):
+        # The floor counts *live* pilots, not ACTIVE ones: a pilot still
+        # coming up already satisfies it, so a tick every 5 s must not keep
+        # queueing batch jobs while the first one boots.
+        h = _Harness(_pool(min_pilots=1, max_pilots=1))
+        h.add_pilot(state=PILOT_PENDING, capacity=0)
+        s = _policy(h, {'min_dwell_sec': 0.0})
+        s.on_tick(h, h.submit_pilot)
+        assert h.submitted == []
+
+    def test_floor_satisfied_by_an_active_pilot(self):
+        h = _Harness(_pool(min_pilots=1, max_pilots=2))
+        h.add_pilot(state=PILOT_ACTIVE, capacity=4)
+        s = _policy(h, {'min_dwell_sec': 0.0})
+        s.on_tick(h, h.submit_pilot)
+        assert h.submitted == []
+
+    def test_floor_refills_after_the_pilot_dies(self):
+        h = _Harness(_pool(min_pilots=1, max_pilots=1))
+        h.add_pilot(state=PILOT_FAILED, capacity=0)
+        s = _policy(h, {'min_dwell_sec': 0.0})
+        s.on_tick(h, h.submit_pilot)
+        assert h.submitted == [None]
+
+    def test_floor_still_respects_dwell(self):
+        h = _Harness(_pool(min_pilots=2, max_pilots=2))
+        s = _policy(h, {'min_dwell_sec': 30.0})
+        s.on_tick(h, h.submit_pilot)          # first submit passes dwell
+        s.on_tick(h, h.submit_pilot)          # second is inside the window
+        assert h.submitted == [None]
+        h.advance(31)
+        s.on_tick(h, h.submit_pilot)
+        assert h.submitted == [None, None]
+
+    def test_floor_still_respects_max_in_flight(self):
+        h = _Harness(_pool(min_pilots=3, max_pilots=3))
+        h.add_pilot(state=PILOT_PENDING,  capacity=0)
+        h.add_pilot(state=PILOT_STARTING, capacity=0)
+        s = _policy(h, {'min_dwell_sec': 0.0,
+                        'max_in_flight_submissions': 2})
+        s.on_tick(h, h.submit_pilot)
+        assert h.submitted == []
+
+    def test_floor_still_respects_backoff(self):
+        h = _Harness(_pool(min_pilots=1, max_pilots=1))
+        s = _policy(h, {'min_dwell_sec': 0.0, 'max_consecutive_failures': 1,
+                        'failure_backoff_sec': 60.0})
+        s.on_pilot_state(PilotRecord(pid='p.x', pool='cpu', size_key='s',
+                                     rhapsody_backend='concurrent'),
+                         PILOT_PENDING, PILOT_FAILED)
+        s.on_tick(h, h.submit_pilot)
+        assert h.submitted == []
+
+    def test_backlog_scale_up_still_works_with_a_floor(self):
+        # The floor is a minimum, not a maximum: an ACTIVE pilot satisfies
+        # min_pilots=1, but a backlog it cannot absorb still scales up.
+        h = _Harness(_pool(min_pilots=1, max_pilots=4))
+        h.add_pilot(state=PILOT_ACTIVE, capacity=1, in_flight=1)
+        for _ in range(10):
+            h.add_task()
+        s = _policy(h, {'min_dwell_sec': 0.0})
+        s.on_tick(h, h.submit_pilot)
+        assert h.submitted == [None]
+
+
+# ---------------------------------------------------------------------------
 # pick_dispatch
 # ---------------------------------------------------------------------------
 
@@ -322,6 +405,77 @@ class TestPickDispatch:
         h.add_pilot(capacity=10, in_flight=0)
         s = _policy(h, {})
         assert s.pick_dispatch(h) is None
+
+
+# ---------------------------------------------------------------------------
+# min_remaining_sec — a pilot about to lose its allocation (plan 122)
+# ---------------------------------------------------------------------------
+
+class TestMinRemaining:
+
+    def test_a_pilot_near_its_deadline_is_not_dispatched_to(self):
+        h = _Harness(_pool())
+        h.add_task()
+        h.add_pilot(capacity=4, walltime_deadline=h.time + 60)
+        s = _policy(h, {'min_remaining_sec': 120.0})
+        assert s.pick_dispatch(h) is None
+
+    def test_a_pilot_with_runway_still_takes_the_task(self):
+        h = _Harness(_pool())
+        h.add_task()
+        h.add_pilot(capacity=4, walltime_deadline=h.time + 600)
+        s = _policy(h, {'min_remaining_sec': 120.0})
+        assert s.pick_dispatch(h) is not None
+
+    def test_the_last_pilot_is_skipped_for_a_sibling_with_time(self):
+        h = _Harness(_pool())
+        h.add_task()
+        h.add_pilot(pid='p.dying', capacity=4,
+                    walltime_deadline=h.time + 30)
+        h.add_pilot(pid='p.fresh', capacity=4,
+                    walltime_deadline=h.time + 3600)
+        s = _policy(h, {'min_remaining_sec': 120.0})
+        _, pilot = s.pick_dispatch(h)
+        assert pilot.pid == 'p.fresh'
+
+    def test_near_deadline_capacity_does_not_suppress_growth(self):
+        """The whole point: an idle pilot about to expire must not read as
+        capacity, or nothing would replace it."""
+        h = _Harness(_pool())
+        for _ in range(2):
+            h.add_task()
+        h.add_pilot(capacity=4, in_flight=0,
+                    walltime_deadline=h.time + 60)
+        s = _policy(h, {'min_dwell_sec': 0.0, 'min_remaining_sec': 120.0})
+        s.on_tick(h, h.submit_pilot)
+        assert h.submitted == [None]
+
+    def test_the_same_capacity_absorbs_the_backlog_with_runway(self):
+        h = _Harness(_pool())
+        for _ in range(2):
+            h.add_task()
+        h.add_pilot(capacity=4, in_flight=0,
+                    walltime_deadline=h.time + 3600)
+        s = _policy(h, {'min_dwell_sec': 0.0, 'min_remaining_sec': 120.0})
+        s.on_tick(h, h.submit_pilot)
+        assert h.submitted == []
+
+    def test_a_record_without_a_deadline_is_not_filtered(self):
+        """``0.0`` is 'nobody said', not 'the epoch': a pilot record with no
+        deadline must not stop a fleet from dispatching."""
+        h = _Harness(_pool())
+        h.add_task()
+        h.add_pilot(capacity=4, walltime_deadline=0.0)
+        s = _policy(h, {'min_remaining_sec': 120.0})
+        assert s.pick_dispatch(h) is not None
+
+    def test_the_default_is_two_minutes(self):
+        h = _Harness(_pool())
+        h.add_task()
+        h.add_pilot(capacity=4, walltime_deadline=h.time + 119)
+        assert _policy(h, {}).pick_dispatch(h) is None
+        h.pilots[-1].walltime_deadline = h.time + 121
+        assert _policy(h, {}).pick_dispatch(h) is not None
 
 
 # ---------------------------------------------------------------------------

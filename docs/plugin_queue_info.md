@@ -75,7 +75,11 @@ Session-less. Report the active backend: `{"backend": "slurm" | "pbs" | "none"}`
 `GET /job_allocation`  
 Session-less. Return the **endpoint** process's own batch allocation
 (`{"allocation": {...}}`), or `{"allocation": null}` when the
-endpoint runs on a login node.
+endpoint runs on a login node. The batch system's summary is passed through
+verbatim: `job_id`, `partition`, `n_nodes`, `nodelist`, `cpus_per_node`,
+`gpus_per_node`, `account`, `job_name`, `runtime` (the walltime *limit*) and
+`end_time` (the epoch at which the allocation ends, computed here from the
+scheduler's remaining-time field; `null` when it reports none).
 
 `GET /nodelist`  
 Session-less. Return the expanded hostname list of the endpoint's own

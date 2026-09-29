@@ -516,3 +516,29 @@ def test_staging_client_put_local_not_found(tmp_path):
     client._sid = "fake-sid"
     with pytest.raises(FileNotFoundError):
         client.put(str(tmp_path / "nonexistent.txt"), str(tmp_path / "dst.txt"))
+
+
+@pytest.mark.asyncio
+async def test_put_endpoint_accepts_an_empty_file(tmp_path):
+    """An empty put is legitimate: the task dispatcher creates a task's cwd
+    on a non-shared member by putting a marker file.  Only an *absent*
+    content field is an error."""
+    app = FastAPI()
+    plugin = PluginStaging(app)
+    client = TestClient(app)
+
+    resp = client.post(f"{plugin.namespace}/register_session")
+    sid = resp.json()['sid']
+
+    target = tmp_path / "cwd" / ".orbit-cwd"
+    resp = client.post(f"{plugin.namespace}/put/{sid}", json={
+        "filename": str(target), "content": ""
+    })
+    assert resp.status_code == 200, resp.text
+    assert target.exists() and target.stat().st_size == 0
+
+    resp = client.post(f"{plugin.namespace}/put/{sid}", json={
+        "filename": str(tmp_path / "x")
+    })
+    assert resp.status_code == 400
+    assert "content" in resp.json()['detail']

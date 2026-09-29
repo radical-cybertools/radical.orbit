@@ -66,10 +66,17 @@ def _pool(plugin, name='cpu'):
 
 def _active_pilot(plugin, *, pid='p.1', child='endpoint0_p.1',
                   walltime_deadline=0.0):
+    """One ACTIVE, *submitted* pilot: a psij job plus its child endpoint.
+
+    ``psij_job_id`` is what makes it submitted rather than an adopted
+    endpoint (plan 122), and the two end differently when their child goes
+    away: a batch job lost before its walltime is FAILED, an adopted
+    endpoint is DONE.
+    """
     ps = _pool(plugin)
     pilot = PilotRecord(
         pid=pid, pool='cpu', owning_sid=_SID, size_key='s',
-        rhapsody_backend='concurrent', state=PILOT_ACTIVE,
+        rhapsody_backend='concurrent', state=PILOT_ACTIVE, psij_job_id='j.1',
         submitted_at=100.0, active_at=110.0, capacity=4, in_flight=1,
         child_endpoint_name=child, walltime_deadline=walltime_deadline)
     ps.pilots[pid] = pilot
@@ -376,3 +383,35 @@ class TestLegacyReplayUnchanged:
         plugin._dispatch_notify = lambda t, d: None
         plugin._activate_pilot(ps, pilot)
         assert pilot.capacity == 12
+
+    def test_adopted_pilot_is_never_backfilled(self, tmp_path):
+        """An adopted pilot (plan 122) keeps its adoption-time snapshot at
+        load, even a zero one: re-sizing it off the member would hand it
+        capacity ``_activate_pilot`` must refuse."""
+        state_dir = tmp_path / 'state' / _SID / 'cpu__endpoint0'
+        state_dir.mkdir(parents=True)
+        (state_dir / 'state.json').write_text(json.dumps({
+            'owning_sid': _SID,
+            'config': {
+                'name': 'cpu', 'queue': 'batch', 'account': 'proj',
+                'endpoint_name': 'endpoint0', 'default_size': 's',
+                'pilot_sizes': {'s': {'nodes': 3, 'cpus_per_node': 4,
+                                      'gpus_per_node': 0,
+                                      'walltime_sec': 3600,
+                                      'rhapsody_backend': 'concurrent'}},
+                'min_pilots': 0, 'max_pilots': 4, 'scratch_base': None,
+                'strategy': 'conservative', 'strategy_config': {}},
+            'pilots': {'p.1': {
+                'pid': 'p.1', 'pool': 'cpu', 'size_key': 's',
+                'rhapsody_backend': 'concurrent', 'owning_sid': _SID,
+                'state': 'PENDING', 'capacity': 0,
+                'child_endpoint_name': 'endpoint0', 'adopted': True,
+                'submitted_at': 100.0}},
+            'tasks': {},
+        }))
+
+        plugin = _make_plugin(tmp_path, with_pool=False)
+        pilot  = plugin._pool_states[_SID]['cpu'].pilots['p.1']
+        assert pilot.adopted is True
+        assert (pilot.nodes, pilot.cpus_per_node) == (0, 0)
+        assert pilot.endpoint_name == ''

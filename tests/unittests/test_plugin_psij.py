@@ -82,7 +82,8 @@ async def test_submit_job(mock_psij):
     
     # Verify PSIJ calls
     mock_psij.JobSpec.assert_called()
-    mock_psij.JobExecutor.get_instance.assert_called_with('local')
+    assert mock_psij.JobExecutor.get_instance.call_args[0] == ('local',)
+    assert 'config' in mock_psij.JobExecutor.get_instance.call_args[1]
     
     # Verify job is cached in session
     p_session = plugin._sessions[sid]
@@ -541,3 +542,14 @@ def test_submit_tunneled_rejects_boolean_tunnel(mock_psij):
     resp = client.post(f"{plugin.namespace}/submit_tunneled/{sid}", json=payload)
     assert resp.status_code == 400
     assert 'tunnel must be one of' in resp.json()['detail']
+
+
+def test_psij_dir_follows_the_environment(monkeypatch, tmp_path):
+    # HPC home directories are quota'd: the whole psij tree (output capture
+    # and psij's own work directory) must be relocatable after import
+    from radical.orbit import plugin_psij as m
+    monkeypatch.delenv('RADICAL_ORBIT_PSIJ_DIR', raising=False)
+    assert m._psij_dir() == m.pathlib.Path.home() / '.radical' / 'orbit' / 'psij'
+    monkeypatch.setenv('RADICAL_ORBIT_PSIJ_DIR', str(tmp_path / 'psij'))
+    assert m._psij_dir() == tmp_path / 'psij'
+    assert m._output_base() == tmp_path / 'psij' / 'output'

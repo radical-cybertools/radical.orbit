@@ -143,8 +143,11 @@ class _FakePsij(Plugin):
         super().__init__(app, instance_name)
         self.add_route_post('submit_tunneled/{sid}', self._submit_tunneled)
 
+    submitted: list = []           # every job spec the dispatcher sent
+
     async def _submit_tunneled(self, request):
         data = await request.json()
+        _FakePsij.submitted.append(data)
         return {'job_id':        'j.1',
                 'native_id':     'n.1',
                 'echo_tunnel':   data.get('tunnel'),
@@ -358,15 +361,26 @@ def _class_pool(members, name='fed', **overrides):
 
 
 class _Fed:
-    """Broker + dispatcher + login endpoint + a class pool, session 'A'."""
+    """Broker + dispatcher + login endpoint + a class pool, session 'A'.
 
-    def __init__(self, harness, members, tmp_path, **pool_kw):
+    *endpoints* are extra runtimes brought up **before** the pool is
+    declared, each serving a pilot's plugin set (rhapsody + staging).  That
+    is what an ``allocation``-mode resource looks like to the dispatcher: the
+    endpoint is already inside its allocation when it hears about it, so it
+    can be adopted on the spot instead of waiting for a handshake.
+    """
+
+    def __init__(self, harness, members, tmp_path, endpoints=(), **pool_kw):
         make_broker, make_runtime = harness
         _FakeRhapsody.received.clear()
         _FakeStaging.puts.clear()
+        _FakePsij.submitted.clear()
         self.make_runtime = make_runtime
         self.srv = make_broker(plugins='task_dispatcher')
         make_runtime(self.srv.url, name='login', serve=[_FakePsij])
+        for name in endpoints:
+            make_runtime(self.srv.url, name=name,
+                         serve=[_FakeRhapsody, _FakeStaging])
         self.td  = _dispatcher(self.srv)
         self.sid = 'A'
         with httpx.Client(timeout=10.0) as c:
@@ -658,3 +672,122 @@ def test_real_staging_refuses_a_scratch_outside_the_allow_list(
     assert fed.wait(lambda: task.state == 'FAILED')
     assert task.error.startswith('could not place inputs on the pilot:')
     assert _FakeRhapsody.received == []
+
+
+def test_broker_cert_path_travels_only_to_shared_members(
+        harness, tmp_path, monkeypatch):
+    """The broker cert path is a path on the BROKER host.  A shared member
+    can use it; a non-shared member runs on another machine where that
+    path (the broker user's $HOME) need not exist -- shipping it made every
+    remote pilot fail TLS silently.  Such a pilot keeps its endpoint's own
+    setting, or the default ~/.radical/orbit/broker_cert.pem on its host."""
+
+    monkeypatch.setenv('RADICAL_ORBIT_BROKER_CERT',
+                       '/home/broker/.radical/orbit/broker_cert.pem')
+    monkeypatch.setenv('RADICAL_ORBIT_SCRATCH_BASE', str(tmp_path))
+
+    fed = _Fed(harness, [_member('m_shared', ['x']),
+                         _member('m_remote', ['y'], shared_fs=False,
+                                 scratch_base='/pscratch/u/atomic')],
+               tmp_path)
+
+    _FakePsij.submitted.clear()
+    for mid in ('m_shared', 'm_remote'):
+        pid = fed.on_loop(
+            lambda mid=mid: fed.td._submit_pilot(fed.ps, None, member_id=mid))
+        assert fed.wait(lambda pid=pid: fed.ps.pilots[pid].child_endpoint_name)
+
+    assert fed.wait(lambda: len(_FakePsij.submitted) == 2)
+    envs = {d['job_spec']['environment'].get('RADICAL_ORBIT_MEMBER'):
+            d['job_spec']['environment'] for d in _FakePsij.submitted}
+
+    assert envs['m_shared']['RADICAL_ORBIT_BROKER_CERT'] \
+        == '/home/broker/.radical/orbit/broker_cert.pem'
+    assert 'RADICAL_ORBIT_BROKER_CERT' not in envs['m_remote']
+    assert envs['m_remote']['RADICAL_ORBIT_SCRATCH_BASE'] == '/pscratch/u/atomic'
+
+
+# ---------------------------------------------------------------------------
+# An endpoint inside an allocation IS the pilot (plan 122)
+#
+# Same broker, same class pool, but the member says ``pilot: endpoint``: the
+# dispatcher adopts the endpoint it was told about instead of asking psij for
+# a second process on it.  These tests assert the *whole* consequence -- no
+# psij submit, tasks and staging reaching that endpoint's own plugins.
+# ---------------------------------------------------------------------------
+
+_ALLOC_EP = 'alloc_ep'
+
+
+def test_an_allocation_endpoint_is_adopted_as_its_own_pilot(harness, tmp_path):
+    remote = tmp_path / 'alloc_scratch'
+    fed = _Fed(harness, [_member('m_a', ['x'], endpoint_name=_ALLOC_EP,
+                                 pilot='endpoint', shared_fs=False,
+                                 scratch_base=str(remote))],
+               tmp_path, endpoints=[_ALLOC_EP])
+    assert fed.wait(lambda: _ALLOC_EP in fed.td._connected_endpoints)
+
+    # the floor adopts on the first tick -- min_pilots is forced to 1
+    fed.tick()
+    assert len(fed.ps.pilots) == 1
+    rec = next(iter(fed.ps.pilots.values()))
+    assert rec.child_endpoint_name == _ALLOC_EP
+    assert rec.psij_job_id         is None
+    assert fed.wait(lambda: rec.state == 'ACTIVE')
+    # nothing was submitted anywhere: no second endpoint, no psij job
+    assert _FakePsij.submitted == []
+
+    # ... and the endpoint runs the work itself, through its own plugins
+    import base64
+    r = fed.submit('t.1', requirements={'software': ['x']},
+                   inputs_b64={'md.json':
+                               base64.b64encode(b'{"a":1}').decode()})
+    assert r.status_code == 200, r.text
+    assert fed.wait(lambda: len(_FakeRhapsody.received) == 1)
+    assert _FakeRhapsody.received[0][0] == _ALLOC_EP
+    assert _FakeStaging.puts == [
+        (_ALLOC_EP, str(remote / 't.1' / 'md.json'), 7)]
+    assert fed.ps.tasks['t.1'].member_id == 'm_a'
+    # a second tick does not adopt the same endpoint twice
+    fed.tick()
+    assert len(fed.ps.pilots) == 1
+
+
+def test_an_absent_endpoint_is_adopted_when_it_connects(harness, tmp_path):
+    """PENDING until the topology carries it, then ACTIVE through the very
+    same hook a submitted pilot's child goes through."""
+    fed = _Fed(harness, [_member('m_a', ['x'], endpoint_name=_ALLOC_EP,
+                                 pilot='endpoint')], tmp_path)
+    fed.tick()
+    rec = next(iter(fed.ps.pilots.values()))
+    assert rec.state == 'PENDING'
+
+    fed.make_runtime(fed.srv.url, name=_ALLOC_EP,
+                     serve=[_FakeRhapsody, _FakeStaging])
+    assert fed.wait(lambda: rec.state == 'ACTIVE')
+    assert _FakePsij.submitted == []
+
+
+def test_a_departing_adopted_endpoint_ends_done(harness, tmp_path):
+    """Its allocation ended or it left: DONE, no failure counted, and the
+    task it was running is re-queued for a sibling."""
+    fed = _Fed(harness, [_member('m_a', ['x'], endpoint_name=_ALLOC_EP,
+                                 pilot='endpoint'),
+                         _member('m_b', ['x'])],
+               tmp_path, endpoints=[_ALLOC_EP])
+    assert fed.wait(lambda: _ALLOC_EP in fed.td._connected_endpoints)
+    fed.tick()
+    rec = next(iter(fed.ps.pilots.values()))
+    assert fed.wait(lambda: rec.state == 'ACTIVE')
+
+    assert fed.submit('t.1', requirements={'software': ['x']}
+                      ).status_code == 200
+    task = fed.ps.tasks['t.1']
+    assert fed.wait(lambda: task.pilot_id == rec.pid)
+
+    r = fed.delete('pool/A/fed/members/m_a', {})
+    assert r.status_code == 200, r.text
+    assert r.json()['pilots_cancelled'] == 1
+    assert rec.state == 'DONE'
+    assert rec.error is None
+    assert task.requeues == 1

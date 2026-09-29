@@ -139,7 +139,13 @@ class BatchSystem(ABC):
         On a login node returns None. Inside a batch job returns a dict with
         keys: job_id, partition, n_nodes, nodelist, cpus_per_node,
         gpus_per_node, account, job_name, runtime (seconds, None for
-        unlimited).
+        unlimited) and end_time (epoch, None when the scheduler does not
+        say).
+
+        ``runtime`` is the job's *time limit*; ``end_time`` is when the
+        allocation actually ends, computed here -- inside the allocation --
+        from the scheduler's remaining-time field, because a consumer on
+        another host cannot derive it from a limit.
 
         Raises RuntimeError when in_allocation() is true but details cannot
         be collected.

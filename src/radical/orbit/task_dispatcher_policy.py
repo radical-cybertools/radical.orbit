@@ -96,6 +96,18 @@ class DispatchPolicy:
         '''Observe one pilot state transition.  Default: ignore it.'''
         return None
 
+    def member_health(self, member_id: str) -> dict:
+        '''Return what this policy currently holds against one member.
+
+        ``{'consecutive_pilot_failures': int, 'paused_until': float|None}``
+        — read by the dispatcher's per-member summary so that a member the
+        policy has stopped submitting to says so **on the wire**, not only
+        in the broker log.  A policy that tracks nothing reports a healthy
+        member, which is what this default does.
+        '''
+        return {'consecutive_pilot_failures': 0,
+                'paused_until'              : None}
+
     def on_member_removed(self, member_id: str) -> None:
         '''Forget per-member state for a removed member.  Default: none.
 

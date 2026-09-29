@@ -415,7 +415,10 @@ class PluginStaging(Plugin):
 
         if not filename:
             raise HTTPException(status_code=400, detail="Missing 'filename'")
-        if not content_b64:
+        # an empty file is a legitimate put (the task dispatcher creates a
+        # task's cwd on a non-shared member by putting a marker file):
+        # only an *absent* content field is an error
+        if content_b64 is None:
             raise HTTPException(status_code=400, detail="Missing 'content'")
 
         session = self._sessions.get(sid)

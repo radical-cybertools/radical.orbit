@@ -53,6 +53,15 @@ IMPLICIT_MEMBER: str = ''
 # Charset for a declared member id: endpoint names are built from it.
 MEMBER_RE = re.compile(r'^[a-z0-9][a-z0-9_.-]*$')
 
+# How a member's pilots come into being (plan 122).  ``submit``: the
+# dispatcher asks the member's endpoint to submit a batch job and waits for
+# the child endpoint that job registers.  ``endpoint``: the member's
+# endpoint already runs *inside* its allocation and **is** the pilot, so the
+# dispatcher adopts it instead of submitting a second process.
+PILOT_SUBMIT  : str = 'submit'
+PILOT_ENDPOINT: str = 'endpoint'
+PILOT_MODES         = (PILOT_SUBMIT, PILOT_ENDPOINT)
+
 # Charset for ``pool_class``.  The empty string is legal and means
 # "unclassified" (every legacy pool); a non-empty name that does not match
 # is an error -- never silently lowercased or coerced.
@@ -117,6 +126,19 @@ class PoolMember:
     ``scratch_base``.  When false the dispatcher never touches
     ``scratch_base`` locally; task inputs travel to the pilot through its
     own ``staging`` plugin instead.
+
+    ``pilot`` says where this member's pilots come from (plan 122).  A
+    ``submit`` member gets a batch job through its endpoint's ``psij``
+    plugin; an ``endpoint`` member's endpoint runs *inside* its allocation
+    and **is** the pilot, so the dispatcher adopts it.  Such a member holds
+    exactly one pilot — its endpoint — so ``min_pilots`` and ``max_pilots``
+    are forced to 1 here rather than trusted from the declaration.
+
+    ``end_time`` is the absolute epoch at which the member's allocation
+    ends, when it is known.  It is *not* a walltime: a member is re-declared
+    with the same ``walltime_sec`` on every re-attach, so only an absolute
+    instant keeps a re-adopted pilot from being given a deadline past the
+    allocation it runs in.
     '''
     member_id     : str                     # unique within the pool; MEMBER_RE
     endpoint_name : str                     # required — no auto-pick for members
@@ -130,6 +152,22 @@ class PoolMember:
     shared_fs     : bool = True             # broker host and member share it
     attributes    : dict[str, Any] = field(default_factory=dict)
     budget        : dict[str, float] = field(default_factory=dict)
+    pilot         : str  = PILOT_SUBMIT     # 'submit' | 'endpoint'
+    end_time      : float | None = None     # allocation end, absolute epoch
+
+    def __post_init__(self) -> None:
+        '''Force the pilot floor and ceiling of an adopted member to 1.
+
+        The single place the rule lives, so it holds for a parsed
+        declaration, a replayed one and a hand-built :class:`PoolMember`
+        alike: an ``endpoint`` member has exactly one pilot (its endpoint).
+        ``min_pilots = 0`` would never adopt it until a backlog appeared,
+        and ``max_pilots > 1`` would let the strategy ask for a second
+        adoption of the same endpoint.
+        '''
+        if self.pilot == PILOT_ENDPOINT:
+            self.min_pilots = 1
+            self.max_pilots = 1
 
     def reject_reason(self, req: dict | None) -> str | None:
         '''Return why this member cannot run a task with *req*, or ``None``.
@@ -567,6 +605,24 @@ def parse_member(d: Any, source: str, *, pool_name: str) -> PoolMember:
                 f"{source}: attribute {key!r} must be a string, a number, "
                 f"or a list of strings")
 
+    pilot = d.get('pilot', PILOT_SUBMIT)
+    if pilot not in PILOT_MODES:
+        raise PoolConfigError(
+            f"{source}: 'pilot' must be one of {', '.join(PILOT_MODES)} "
+            f"(got {pilot!r})")
+
+    # An absolute epoch, never a duration: see PoolMember.end_time.  ``0``
+    # is not a plausible allocation end and reads as "unknown", so it is
+    # rejected rather than silently capping every deadline to the epoch.
+    end_time = d.get('end_time')
+    if end_time is not None:
+        if isinstance(end_time, bool) or \
+                not isinstance(end_time, (int, float)) or end_time <= 0:
+            raise PoolConfigError(
+                f"{source}: 'end_time' must be a positive epoch or null, "
+                f"got {end_time!r}")
+        end_time = float(end_time)
+
     budget = d.get('budget', {})
     if not isinstance(budget, dict):
         raise PoolConfigError(f"{source}: 'budget' must be an object")
@@ -589,6 +645,8 @@ def parse_member(d: Any, source: str, *, pool_name: str) -> PoolMember:
         shared_fs     = shared_fs,
         attributes    = dict(attributes),
         budget        = {k: float(v) for k, v in budget.items()},
+        pilot         = pilot,
+        end_time      = end_time,
     )
 
 

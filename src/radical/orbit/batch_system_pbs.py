@@ -9,6 +9,7 @@ universal.
 
 import os
 import shutil
+import time
 
 from .batch_system import (BatchSystem, register_backend, run_cmd,
                            run_cmd_strict,
@@ -122,6 +123,37 @@ def _parse_exec_host(s: str) -> list:
     return hosts
 
 
+def _pbs_end_time(info: dict, runtime: 'int | None') -> 'float | None':
+    """Return the epoch at which a running PBS job's allocation ends.
+
+    Two sources, in order:
+
+    1. ``Walltime.Remaining`` — seconds left, published by PBSPro for a
+       running job.  Authoritative and already relative to *now*.
+    2. ``stime`` + ``Resource_List.walltime`` — the job's start time (ctime
+       text, which is ``time.strptime``'s default format) plus its limit.
+       The fallback for a PBS that publishes no remaining time.
+
+    ``None`` when neither is available (a queued job has no start time and
+    no remaining time), and never a guess from the limit alone: a limit is
+    not an end.
+    """
+    remaining = (info.get('Walltime.Remaining') or '').strip()
+    if remaining:
+        try:
+            return time.time() + int(remaining)
+        except ValueError:
+            pass
+
+    stime = (info.get('stime') or '').strip()
+    if stime and runtime:
+        try:
+            return time.mktime(time.strptime(stime)) + runtime
+        except ValueError:
+            pass
+    return None
+
+
 def _read_pbs_nodefile() -> list:
     """Return deduplicated host list from $PBS_NODEFILE, empty if missing."""
     path = os.environ.get('PBS_NODEFILE')
@@ -214,6 +246,7 @@ class PBSProBatchSystem(BatchSystem):
 
         # Pull walltime / partition / account from qstat.
         runtime    = None
+        end_time   = None
         partition  = os.environ.get('PBS_QUEUE') or os.environ.get('PBS_O_QUEUE')
         account    = os.environ.get('PBS_ACCOUNT')
         job_name   = os.environ.get('PBS_JOBNAME')
@@ -243,6 +276,14 @@ class PBSProBatchSystem(BatchSystem):
                 if eh:
                     nodelist = ','.join(_parse_exec_host(eh))
 
+            # When the allocation ends, as an absolute instant computed
+            # here.  PBSPro publishes ``Walltime.Remaining`` (seconds) for a
+            # running job; where it does not, the job's start time plus its
+            # walltime limit is the same answer one round-trip later.
+            # ``stime`` is ctime text ("Mon Sep  8 12:00:00 2026"), which is
+            # exactly ``time.strptime``'s default format.
+            end_time = _pbs_end_time(info, runtime)
+
             # Extract per-node resources from select=... when possible.
             # Format: "1:ncpus=64:ngpus=4" or "2:ncpus=64".
             select = info.get('Resource_List.select', '')
@@ -271,6 +312,7 @@ class PBSProBatchSystem(BatchSystem):
             'account'      : account,
             'job_name'     : job_name,
             'runtime'      : runtime,
+            'end_time'     : end_time,
         }
 
 

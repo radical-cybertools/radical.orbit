@@ -36,6 +36,10 @@ Policy
 - Among candidate pilots, prefer fewest ``in_flight`` (``'least_loaded'``)
   or youngest (``'youngest'``), configurable via
   ``strategy_config.router_preference``; ties break on ``member_id``.
+- A pilot with less than ``min_remaining_sec`` of walltime left is neither
+  dispatched to nor counted as free capacity: a task started there would be
+  killed with the allocation, and counting the slot would suppress the
+  growth that has to replace it.
 - Pilots are never terminated early; they expire at walltime.
 
 Deliberate semantic change (plan 121 §5, risk R2)
@@ -61,6 +65,9 @@ Knobs (``strategy_config``)
 - ``member_preference``        : str   = ``'budget'``
                                   (or ``'least_loaded'``)
 - ``max_requeues``             : int   = 1
+- ``min_remaining_sec``        : float = 120   (walltime a pilot must have
+                                 left to be dispatched to, or to count as
+                                 free capacity)
 '''
 
 from __future__ import annotations
@@ -114,6 +121,8 @@ class ConservativePolicy(DispatchPolicy):
         self._member_preference   : str   = str(
             cfg.get('member_preference', 'budget'))
         self._max_requeues        : int   = int(cfg.get('max_requeues', 1))
+        self._min_remaining_sec   : float = float(
+            cfg.get('min_remaining_sec', 120.0))
 
         if self._router_preference not in ('least_loaded', 'youngest'):
             raise ValueError(
@@ -178,6 +187,22 @@ class ConservativePolicy(DispatchPolicy):
                     "member %r; pausing submissions for %.0fs",
                     self._pool.name, fails, mid, self._failure_backoff_sec)
 
+    def member_health(self, member_id: str) -> dict:
+        '''Report this member's failure counter and backoff deadline.
+
+        The two numbers behind the "N consecutive pilot failures on member
+        …; pausing submissions" warning, so a summary can show what the log
+        line said.  ``paused_until`` is ``None`` outside the window — a
+        deadline already in the past is not a pause any more, and reading
+        it as one would leave a healthy member marked forever.
+        '''
+        mid   = member_id
+        until = self._backoff_until.get(mid, 0.0)
+        return {'consecutive_pilot_failures':
+                    int(self._consecutive_failures.get(mid, 0)),
+                'paused_until':
+                    until if until > self._now() else None}
+
     def on_member_removed(self, member_id: str) -> None:
         '''Drop the removed member's backoff and dwell bookkeeping.'''
         for d in (self._last_submit_ts, self._consecutive_failures,
@@ -196,6 +221,25 @@ class ConservativePolicy(DispatchPolicy):
                      "%.0fs more", self._pool.name, mid, until - now_ts)
             self._backoff_logged[mid] = True
         return True
+
+    def _has_runway(self, pilot: 'PilotRecord', now_ts: float) -> bool:
+        '''Return whether *pilot* has enough walltime left to be useful.
+
+        A pilot inside ``min_remaining_sec`` of its deadline is about to
+        lose its allocation: a task dispatched there would be killed with
+        it, and counting its idle slots as capacity would suppress the
+        scale-up that has to replace it.  Applied at both places a pilot's
+        free slots matter — :meth:`pick_dispatch` and ``on_tick``'s
+        capacity sum.
+
+        A record with **no** deadline at all (``0.0``: an adopted endpoint
+        whose allocation reports no end) is not filtered: an unknown
+        deadline is not a near one, and reading it as such would stop a
+        fleet from dispatching at all.
+        '''
+        if not pilot.walltime_deadline:
+            return True
+        return pilot.walltime_deadline - now_ts >= self._min_remaining_sec
 
     def _budget_fraction(self, pool_state, member: 'PoolMember',
                          now_ts: float) -> float:
@@ -290,7 +334,8 @@ class ConservativePolicy(DispatchPolicy):
 
             free_capacity = sum(p.free_capacity() for p in live
                                 if p.state == PILOT_ACTIVE
-                                and p.pid in servers)
+                                and p.pid in servers
+                                and self._has_runway(p, now_ts))
             if not unservable and len(pending) <= free_capacity:
                 return  # existing capacity will absorb the backlog
 
@@ -345,7 +390,8 @@ class ConservativePolicy(DispatchPolicy):
 
         Called repeatedly by the dispatcher until it returns ``None``.  A
         task whose requirements no candidate pilot satisfies is skipped
-        rather than blocking the queue — see the module docstring.
+        rather than blocking the queue — see the module docstring.  So is a
+        pilot inside ``min_remaining_sec`` of its walltime.
         '''
         pending = [t for t in pool_state.pending_queue()
                    if t.state == TASK_QUEUED]
@@ -356,8 +402,10 @@ class ConservativePolicy(DispatchPolicy):
         # Tie-break: earlier arrival first.
         pending.sort(key=lambda t: (-t.priority, t.arrival_ts))
 
+        now_ts = self._now()
         active = [p for p in pool_state.live_pilots()
-                  if p.state == PILOT_ACTIVE and p.free_capacity() > 0]
+                  if p.state == PILOT_ACTIVE and p.free_capacity() > 0
+                  and self._has_runway(p, now_ts)]
         if not active:
             return None
 

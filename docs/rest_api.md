@@ -178,15 +178,21 @@ without requiring a session.
     {"allocation": null}
 
     # Endpoint running inside a SLURM job allocation:
-    {"allocation": {"n_nodes": 4, "runtime": 3600}}
+    {"allocation": {"n_nodes": 4, "runtime": 3600,
+                    "end_time": 1757000000.0}}
 
     # Endpoint running inside a SLURM job with unlimited walltime:
-    {"allocation": {"n_nodes": 4, "runtime": null}}
+    {"allocation": {"n_nodes": 4, "runtime": null, "end_time": null}}
 
 `n_nodes` is the number of nodes in the allocation; `runtime` is the
-walltime limit in seconds (`null` for UNLIMITED). A 500 response is
-returned if `SLURM_JOB_ID` is set but allocation details cannot be
-determined (missing env vars, `squeue` failure or timeout).
+walltime *limit* in seconds (`null` for UNLIMITED); `end_time` is the epoch
+at which the allocation actually ends, computed **on the endpoint** from the
+scheduler's remaining-time field (`squeue %L`; PBS `Walltime.Remaining`, else
+`stime` plus the limit) and `null` when the scheduler reports neither.  A
+consumer on another host cannot derive `end_time` from `runtime`, which is
+why it is answered here.  A 500 response is returned if `SLURM_JOB_ID` is set
+but allocation details cannot be determined (missing env vars, `squeue`
+failure or timeout).
 
 ## Sysinfo Plugin
 
@@ -605,6 +611,67 @@ exactly as a changed `priority` is; only `FAILED`/`CANCELED` re-executes.
 There is deliberately no mutation path. Validation runs **before** that
 cache ladder, so a malformed `requirements` is a 400 even on a resubmit of
 a cached `DONE` task.
+
+## Federation Plugin
+
+Namespace: `federation`. **Broker-hosted**, so its routes are reached at
+`/broker/federation/…` rather than through an endpoint name. Every route
+uses the reserved persistent `default` session — a client never registers
+one of its own. Full guide: [Federation Plugin](plugin_federation.md).
+
+A resource declares one or more **members** — one per shape it is willing to
+run — and each member joins the dispatcher pool of its capability **class**
+(`fed-cpu`, `fed-gpu`, …), all inside the single persistent dispatcher
+session `fed`. A submit therefore names a *class*; the dispatcher chooses
+the member at dispatch and reports it as `member_id`
+(`<resource>.<member>`; split it on the **last** dot, since a resource name
+may contain dots and a member name may not).
+
+| Method | Path | Description |
+|----|----|----|
+| `POST` | `join/{sid}` | Join a resource. Body: the client fields of a resource record (`name`, `endpoint`, `mode`, `capabilities`, `budget`, optional `site`/`kind`/`scratch_base`/`shared_fs`, plus either a `members` list or a flat login `pool` block). `shared_fs` (bool, default `true`) says whether the broker host sees `scratch_base`; with `false` the path names a directory on the resource's own host, so it is kept as declared and only has to be absolute (or `~`-prefixed), and each member inherits the flag. Returns the full record, with each member's `member_id`, `class` and `pool_name`. **400** invalid declaration — bad name/mode/capabilities, a non-bool `shared_fs`, a `shared_fs` `scratch_base` outside `~` or `/tmp` (a relative one when not shared), a malformed or unknown-keyed `pool`/member field, a duplicate or dotted member name, a `class` that does not match `^[a-z0-9][a-z0-9_-]*$`, `members` in allocation mode, or an `endpoint` that is the broker itself; **404** endpoint not connected; **409** name in use; **503** no task dispatcher hosted. A join is all-or-nothing: a member that fails to be added rolls the earlier ones back. |
+| `POST` | `leave/{sid}/{name}` | Remove each member from its class pool and forget the resource. Optional body `{"cancel_tasks": false}`. Returns `{"resource", "ok", "members_removed", "tasks_requeued", "tasks_failed", "tasks_cancelled"}`, plus `"errors"` (and `ok: false`) when a member could not be removed. Without `cancel_tasks` the live tasks are **not** cancelled — they may keep running on a sibling member — and their ledger entries survive, re-pointed to `resource: null` |
+| `GET` | `resources/{sid}` | `{"resources": [record, …]}` with usage refreshed (cached 2 s), sorted by name |
+| `GET` | `resource/{sid}/{name}` | One resource record with usage refreshed |
+| `POST` | `pick/{sid}` | Body: `{"requirements": {"cores": 4, "gpus": 0, "software": ["lammps"], "labels": {…}, "node_hours": 0.1}}` → `{"class", "pool", "dispatcher_sid", "members", "resource", "score"}`. `resource` is **advisory**. **409** with `{"detail", "reasons": {member_id: why}}` when nothing fits |
+| `POST` | `submit/{sid}` | Body: `{"task": {"task_id", "cmd", "inputs", "outputs", "priority", "inputs_b64"?}, "requirements": {…}}` → `{"task", "pool", "class", "dispatcher_sid", "resource", "member", "members_eligible"}`. Chooses a class and forwards to its pool with `requirements` (minus the federation-only `node_hours`) and `inputs_b64`. It **never** sends a `cwd` — the dispatcher assigns it at dispatch — so a client-supplied `task.cwd` is a **400**, as is a non-object `inputs_b64`. A dispatcher **400** (e.g. "no member satisfies the task requirements") propagates verbatim; same **409** as `pick` |
+| `GET` | `task/{sid}/{task_id}` | The dispatcher's task dict plus `member_id`, `member`, `resource`, `class`, and `child_endpoint` while the task's pilot is alive. `member_id` and `resource` may be `null` — the task is not placed yet, or its resource has left |
+
+A resource record:
+
+    {"name": "perlmutter_a", "endpoint": "ep_perlmutter_a",
+     "mode": "allocation" | "login", "site": "NERSC", "kind": "hpc",
+     // capabilities / budget / usage are the AGGREGATE of the members and
+     // stay on the record for every existing consumer
+     "capabilities": {"cores": 128, "gpus": 4, "mem_gb": 256,
+                      "software": ["lammps", "pytorch"]},
+     "budget": {"node_hours": 40.0},
+     "scratch_base": "/tmp/orbit/perlmutter_a",
+     "shared_fs": true,                   // false: a path on the resource
+     "pool": {...},                       // login mode without members only
+     "members": [
+       {"member": "gpu", "member_id": "perlmutter_a.gpu",
+        "class": "gpu", "pool_name": "fed-gpu",
+        "queue": "regular", "account": "m1234",
+        "nodes": 1, "cpus_per_node": 64, "gpus_per_node": 4,
+        "walltime_sec": 3600, "min_pilots": 0, "max_pilots": 2,
+        "rhapsody_backend": "concurrent",
+        "scratch_base": "/tmp/orbit/perlmutter_a", "shared_fs": true,
+        "software": ["pytorch"],
+        "attributes": {"site": "NERSC", "mem_gb_per_node": 256},
+        "budget": {"node_hours": 40.0},
+        "usage": {...}, "liveness": "ok"}],
+     "joined_at": 1757100000.0,
+     "dispatcher_sid": "fed",
+     "pool_name": "fed-gpu",              // the first member's class pool
+     "usage": {"node_hours_used": 1.25, "node_hours_remaining": 38.75,
+               "pilots_active": 1, "tasks_running": 3, "tasks_done": 12,
+               "tasks_failed": 0, "stale": false, "updated_at": 1757100050.0},
+     "liveness": "ok" | "suspect" | "lost"}
+
+A record with **no** `members` — one written before capability-class pools —
+derives exactly one member named `default` from its stored pool
+declaration, so a consumer only ever sees one shape.
 
 ## Error Responses
 
