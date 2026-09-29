@@ -294,7 +294,9 @@ so a GPU pilot on two different clusters can live in the same pool:
 - `shared_fs` says whether the broker host and the member see the same
   `scratch_base`.  When false the dispatcher never touches `scratch_base`
   locally; a task's inputs travel to the pilot through its own `staging`
-  plugin instead.
+  plugin instead.  A non-shared member should set its own `scratch_base`:
+  without one it inherits the pool's, which by default is a path on the
+  broker host and usually does not exist on the member's machine.
 - `pool_class` is an explicit string matching `^[a-z0-9_.-]*$`; `""` (the
   default, and every legacy pool) means "unclassified".  It is never
   derived inside the dispatcher.
