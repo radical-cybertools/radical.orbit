@@ -2025,6 +2025,10 @@ class PluginFederation(Plugin):
 
         for rec in list(self._state.resources.values()):
             for member in rec.member_list():
+                if self._allocation_ended(member):
+                    member.liveness = LIVENESS_LOST
+                    rec.liveness    = LIVENESS_LOST
+                    continue
                 try:
                     await self._dispatcher.add_member(
                         FED_SESSION_SID, member.pool_name,
@@ -2036,6 +2040,27 @@ class PluginFederation(Plugin):
                     member.liveness = LIVENESS_LOST
                     rec.liveness    = LIVENESS_LOST
         self._state.save()
+
+    def _allocation_ended(self, member: MemberRecord) -> bool:
+        '''Return whether *member*'s allocation is over -- never re-attach it.
+
+        The same endpoint name back in a *new* allocation (after a restart
+        or a lost/present cycle): re-declared with the old ``end_time``, its
+        adopted pilot would get a past deadline and never receive a task.
+        Only a new join knows the new end.  Logged once per member and
+        allocation, not on every topology delivery.
+        '''
+        if not member.end_time or member.end_time > time.time():
+            return False
+        key = (member.member_id, float(member.end_time))
+        if key not in self._ended_logged:
+            self._ended_logged.add(key)
+            log.warning('[%s] not re-attaching member %s: its allocation '
+                        'ended at %s; leave and join again',
+                        self.instance_name, member.member_id,
+                        time.strftime('%Y-%m-%d %H:%M:%S',
+                                      time.localtime(member.end_time)))
+        return True
 
     async def _sync_attachments(self) -> None:
         '''Apply endpoint liveness to every member, at member granularity.
@@ -2069,23 +2094,7 @@ class PluginFederation(Plugin):
                     continue
 
                 elif member.member_id not in self._attached:
-                    if member.end_time and member.end_time <= time.time():
-                        # The same endpoint name back in a *new*
-                        # allocation: re-declared with the old end_time,
-                        # its adopted pilot would get a past deadline and
-                        # never receive a task.  Only a new join knows the
-                        # new end.
-                        key = (member.member_id, float(member.end_time))
-                        if key not in self._ended_logged:
-                            self._ended_logged.add(key)
-                            log.warning(
-                                '[%s] not re-attaching member %s: its '
-                                'allocation ended at %s; leave and join '
-                                'again', self.instance_name,
-                                member.member_id,
-                                time.strftime('%Y-%m-%d %H:%M:%S',
-                                              time.localtime(
-                                                  member.end_time)))
+                    if self._allocation_ended(member):
                         result = LIVENESS_LOST
                         continue
                     try:

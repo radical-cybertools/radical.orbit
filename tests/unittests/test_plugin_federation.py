@@ -1826,6 +1826,37 @@ class TestRestartReattach:
         assert plugin2._attached == set(adds)
 
     @pytest.mark.asyncio
+    async def test_replay_skips_a_member_whose_allocation_ended(
+            self, tmp_path, caplog):
+        """Re-POSTed with its stored end_time, the endpoint back in a new
+        allocation would be adopted with a past deadline and never
+        receive a task -- the same guard as the lost/present re-attach."""
+        client, plugin, _fake = _joinable(tmp_path)
+        _join(client, plugin, _alloc_body())
+        _join(client, plugin, _members_body())
+        for m in plugin._state.resources['alpha'].member_list():
+            m.end_time = time.time() - 10
+        plugin._state.save()
+
+        fake2 = _FakeDispatcher()
+        plugin2 = self._restart(tmp_path, fake2)
+        with caplog.at_level(logging.WARNING):
+            await plugin2.on_topology_change(
+                _topo(ep0='present', ep1='present'))
+            await plugin2.on_topology_change(
+                _topo(ep0='present', ep1='present'))
+        adds = sorted(c[3] for c in fake2.calls if c[0] == 'add_member')
+        assert adds == ['local_b.cpu', 'local_b.gpu']
+        assert plugin2._attached == set(adds)
+        rec = plugin2._state.resources['alpha']
+        assert rec.liveness == LIVENESS_LOST
+        assert all(m.liveness == LIVENESS_LOST for m in rec.member_list())
+        ended = [r for r in caplog.records
+                 if 'allocation ended' in r.getMessage()]
+        assert len(ended) == 1
+        assert 'alpha.default' in ended[0].getMessage()
+
+    @pytest.mark.asyncio
     async def test_a_re_post_onto_a_live_dispatcher_is_a_no_op(self,
                                                                tmp_path):
         # the dispatcher already replayed its pools with their members; the
