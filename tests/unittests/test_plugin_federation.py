@@ -1855,6 +1855,34 @@ class TestRestartReattach:
                  if 'allocation ended' in r.getMessage()]
         assert len(ended) == 1
         assert 'alpha.default' in ended[0].getMessage()
+        # a wiped dispatcher must not materialise the pool WITH it either
+        assert 'alpha.default' not in fake2.members_of('fed-cpu')
+        assert 'alpha.default' not in \
+            [m['member_id'] for d in fake2.sessions[FED_SESSION_SID]
+             for m in d['members']]
+
+    @pytest.mark.asyncio
+    async def test_replay_removes_an_ended_member_the_dispatcher_kept(
+            self, tmp_path):
+        """An intact dispatcher replays the member from its own persisted
+        pool config: it is removed, not left adopted with a past deadline."""
+        client, plugin, fake = _joinable(tmp_path)
+        _join(client, plugin, _alloc_body())
+        _join(client, plugin, _members_body())
+        for m in plugin._state.resources['alpha'].member_list():
+            m.end_time = time.time() - 10
+        plugin._state.save()
+        assert 'alpha.default' in fake.members_of('fed-cpu')
+
+        fake.removed.clear()
+        plugin2 = self._restart(tmp_path, fake)
+        await plugin2.on_topology_change(_topo(ep0='present', ep1='present'))
+        assert fake.members_of('fed-cpu') == ['local_b.cpu']
+        assert [(c['member_id'], c['force'], c['fail_unsatisfiable'],
+                 c['cancel_tasks']) for c in fake.removed] == \
+            [('alpha.default', True, False, False)]
+        assert 'alpha.default' not in plugin2._attached
+        assert plugin2._state.resources['alpha'].liveness == LIVENESS_LOST
 
     @pytest.mark.asyncio
     async def test_a_re_post_onto_a_live_dispatcher_is_a_no_op(self,

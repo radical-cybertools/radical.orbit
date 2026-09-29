@@ -538,7 +538,7 @@ def resource_attributes(site: Any = '', kind: Any = '',
     return {k: v for k, v in attrs.items() if v is not None and v != ''}
 
 
-def _derive_member(rec: ResourceRecord) -> MemberRecord:
+def _derive_member(rec: ResourceRecord, pilot: str) -> MemberRecord:
     '''Synthesise the single member of a record written before class pools.
 
     The pool declaration stored at join (``pool_config``) is the authority:
@@ -556,6 +556,7 @@ def _derive_member(rec: ResourceRecord) -> MemberRecord:
     pool = rec.pool or {}
 
     member = MemberRecord(
+        pilot            = pilot,
         member           = DEFAULT_MEMBER,
         member_id        = f'{rec.name}.{DEFAULT_MEMBER}',
         endpoint         = rec.endpoint,
@@ -606,6 +607,17 @@ def record_from_dict(data: dict) -> ResourceRecord:
     usage = kw.pop('usage', None)
     raw   = kw.pop('members', None)
     rec   = ResourceRecord(**kw)
+
+    # A record written before ``pilot`` existed defaults to ``submit``, which
+    # for an allocation-mode resource means "start a batch job on the compute
+    # node you are already sitting on" -- precisely the second endpoint plan
+    # 122 removed, re-POSTed on the first restart after the upgrade.  The
+    # mode says what it is: the endpoint is inside the allocation, so it is
+    # the pilot, whichever shape the record was loaded from.  Migrated
+    # *before* the member is built, so ``MemberRecord.__post_init__`` forces
+    # its 1/1 pilot bounds like any other endpoint member.
+    pilot = PILOT_ENDPOINT if rec.mode == MODE_ALLOCATION else None
+
     if isinstance(usage, dict):
         ukeys = set(ResourceUsage.__dataclass_fields__)
         rec.usage = ResourceUsage(
@@ -616,6 +628,8 @@ def record_from_dict(data: dict) -> ResourceRecord:
         for entry in members:
             if not isinstance(entry, dict):
                 continue
+            if pilot:
+                entry = dict(entry, pilot=pilot)
             m = member_from_dict(entry)
             # A record written before members carried their own endpoint
             # gets the resource's -- which is the one they were always
@@ -623,18 +637,8 @@ def record_from_dict(data: dict) -> ResourceRecord:
             m.endpoint = m.endpoint or rec.endpoint
             rec.members[m.member] = m
     else:
-        m = _derive_member(rec)
+        m = _derive_member(rec, pilot or PILOT_SUBMIT)
         rec.members[m.member] = m
-
-    # A record written before ``pilot`` existed defaults to ``submit``, which
-    # for an allocation-mode resource means "start a batch job on the compute
-    # node you are already sitting on" -- precisely the second endpoint plan
-    # 122 removed, re-POSTed on the first restart after the upgrade.  The
-    # mode says what it is: the endpoint is inside the allocation, so it is
-    # the pilot, whichever shape the record was loaded from.
-    if rec.mode == MODE_ALLOCATION:
-        for m in rec.members.values():
-            m.pilot = PILOT_ENDPOINT
     return rec
 
 

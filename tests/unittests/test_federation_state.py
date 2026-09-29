@@ -540,6 +540,13 @@ class TestPilotModeMigration:
         raw = self._raw(MODE_ALLOCATION, pilot='submit')
         assert record_from_dict(raw).members['default'].pilot == 'endpoint'
 
+    def test_a_migrated_allocation_member_reads_one_pilot(self):
+        """Migrated before the member is built, so the endpoint member's
+        forced 1/1 applies -- not the stale 0/N it was stored with."""
+        raw = self._raw(MODE_ALLOCATION, min_pilots=0, max_pilots=4)
+        m   = record_from_dict(raw).members['default']
+        assert (m.min_pilots, m.max_pilots) == (1, 1)
+
     def test_the_migration_survives_a_save_and_reload(self, tmp_path):
         p  = tmp_path / 'state.json'
         st = FederationState(p)
@@ -611,6 +618,7 @@ class TestSingleMemberDerivation:
         raw['mode'] = MODE_ALLOCATION
         m = record_from_dict(raw).members['default']
         assert (m.pilot, m.endpoint) == ('endpoint', 'ep0')
+        assert (m.min_pilots, m.max_pilots) == (1, 1)
 
     def test_the_derived_member_inherits_budget_software_attributes(self):
         m = record_from_dict(dict(self._PRE08)).members['default']

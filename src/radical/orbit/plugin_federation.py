@@ -488,9 +488,9 @@ class PluginFederation(Plugin):
         # other succeeds.
         self._attached: set[str] = set()
 
-        # (member_id, end_time) pairs whose "allocation ended" refusal to
-        # re-attach was already logged -- once per member and allocation,
-        # not on every topology delivery.
+        # (member_id, end_time) pairs whose "allocation ended" loss was
+        # already logged -- once per member and allocation, not on every
+        # topology delivery.
         self._ended_logged: set[tuple[str, float]] = set()
 
         # Class pool names the ``fed`` session was last registered with, so
@@ -947,7 +947,10 @@ class PluginFederation(Plugin):
 
         The ``members`` carried here only matter for a dispatcher that does
         not have the pool yet; a re-declaration of an existing pool is
-        ignored, which is precisely why the member routes exist.
+        ignored, which is precisely why the member routes exist.  A member
+        whose allocation ended is left out: a wiped dispatcher would
+        otherwise materialise the pool *with* it and adopt its endpoint
+        with a past deadline.
         '''
         records = list(self._state.resources.values())
         if extra is not None and \
@@ -957,6 +960,8 @@ class PluginFederation(Plugin):
         by_class: dict[str, list] = {}
         for rec in records:
             for member in rec.member_list():
+                if self._allocation_ended(member):
+                    continue
                 by_class.setdefault(member.cls, []).append(
                     self._member_decl(rec, member))
 
@@ -1997,11 +2002,13 @@ class PluginFederation(Plugin):
 
         In order: release any pre-08 per-resource session, register ``fed``
         with the **full** class-pool list, then re-POST *every* member of
-        *every* stored record.  The dispatcher has already replayed those
-        pools with their persisted members, so the re-POST is a no-op — and
-        it is the recovery path when the dispatcher's own state was wiped,
-        which is exactly why an identical re-POST must be a no-op rather
-        than an error.
+        *every* stored record -- except a member whose allocation ended: it
+        is ``lost``, and is removed from a dispatcher that replayed it from
+        its own persisted pool config.  The dispatcher has already replayed
+        those pools with their persisted members, so the re-POST is a
+        no-op — and it is the recovery path when the dispatcher's own state
+        was wiped, which is exactly why an identical re-POST must be a no-op
+        rather than an error.
 
         Called from whichever comes first after a restart: the first
         topology delivery (the normal case) or the first route
@@ -2026,6 +2033,7 @@ class PluginFederation(Plugin):
         for rec in list(self._state.resources.values()):
             for member in rec.member_list():
                 if self._allocation_ended(member):
+                    await self._detach(member)
                     member.liveness = LIVENESS_LOST
                     rec.liveness    = LIVENESS_LOST
                     continue
@@ -2042,34 +2050,61 @@ class PluginFederation(Plugin):
         self._state.save()
 
     def _allocation_ended(self, member: MemberRecord) -> bool:
-        '''Return whether *member*'s allocation is over -- never re-attach it.
+        '''Return whether *member*'s allocation is over -- it reads ``lost``.
 
         The same endpoint name back in a *new* allocation (after a restart
         or a lost/present cycle): re-declared with the old ``end_time``, its
         adopted pilot would get a past deadline and never receive a task.
-        Only a new join knows the new end.  Logged once per member and
-        allocation, not on every topology delivery.
+        Only a new join knows the new end, so the member is treated as
+        ``lost`` -- detached, never declared -- until it leaves and joins
+        again.  Logged once per member and allocation, not on every
+        topology delivery: an endpoint already ``lost`` when its allocation
+        ended would otherwise never say why it stays ``lost``.
         '''
         if not member.end_time or member.end_time > time.time():
             return False
         key = (member.member_id, float(member.end_time))
         if key not in self._ended_logged:
             self._ended_logged.add(key)
-            log.warning('[%s] not re-attaching member %s: its allocation '
+            log.warning('[%s] member %s is lost: its allocation '
                         'ended at %s; leave and join again',
                         self.instance_name, member.member_id,
                         time.strftime('%Y-%m-%d %H:%M:%S',
                                       time.localtime(member.end_time)))
         return True
 
+    async def _detach(self, member: MemberRecord) -> None:
+        '''Remove a lost *member* from its class pool, best effort.
+
+        ``fail_unsatisfiable=False``: its pilots died with the endpoint (or
+        the allocation) anyway and its RUNNING tasks re-queue onto a sibling
+        -- but a task only *this* member could run stays QUEUED instead of
+        failing.  An error (a 404 from a dispatcher that never had it) is
+        logged and ignored: the member is gone either way.
+        '''
+        try:
+            await self._dispatcher.del_member(
+                FED_SESSION_SID, member.pool_name,
+                member.member_id, cancel_tasks=False,
+                force=True, fail_unsatisfiable=False)
+        except Exception as e:
+            log.info('[%s] detach %s: %s',
+                     self.instance_name, member.member_id, e)
+        self._attached.discard(member.member_id)
+        self._detail_cache.pop(member.pool_name, None)
+
     async def _sync_attachments(self) -> None:
         '''Apply endpoint liveness to every member, at member granularity.
 
         | endpoint | action |
         |---|---|
-        | ``present``, not attached | ``add_member`` (re-declaring the class pool first when it no longer exists — every member of that class may have left while the endpoint was down) -- unless the member's ``end_time`` has passed: that endpoint is back in a new allocation, and stays detached (``lost``) until it leaves and joins again |
+        | ``present``, not attached | ``add_member`` (re-declaring the class pool first when it no longer exists — every member of that class may have left while the endpoint was down) |
         | ``suspect`` | mark ``suspect``, **nothing else**.  The policy already refuses to route to a non-``ok`` member, which is the whole point of ``suspect``; a blip must not touch the dispatcher |
         | ``lost``, attached | ``del_member`` with ``fail_unsatisfiable=False``.  Its pilots died with the endpoint anyway and its RUNNING tasks re-queue onto a sibling — but a task only *this* member could run stays QUEUED instead of failing, because a lost endpoint is very often back in a minute |
+
+        A member whose allocation ``end_time`` has passed is ``lost`` whatever
+        its endpoint reports: that endpoint is back in a new allocation, and
+        stays detached until it leaves and joins again.
         '''  # noqa: E501
         dirty = False
         for rec in list(self._state.resources.values()):
@@ -2077,26 +2112,19 @@ class PluginFederation(Plugin):
             result = target
 
             for member in rec.member_list():
-                if target == LIVENESS_LOST:
-                    if member.member_id in self._attached:
-                        try:
-                            await self._dispatcher.del_member(
-                                FED_SESSION_SID, member.pool_name,
-                                member.member_id, cancel_tasks=False,
-                                force=True, fail_unsatisfiable=False)
-                        except Exception as e:
-                            log.info('[%s] detach %s: %s',
-                                     self.instance_name, member.member_id, e)
-                        self._attached.discard(member.member_id)
-                        self._detail_cache.pop(member.pool_name, None)
+                state = target
+                if self._allocation_ended(member):
+                    state  = LIVENESS_LOST
+                    result = LIVENESS_LOST
 
-                elif target == LIVENESS_SUSPECT:
+                if state == LIVENESS_LOST:
+                    if member.member_id in self._attached:
+                        await self._detach(member)
+
+                elif state == LIVENESS_SUSPECT:
                     continue
 
                 elif member.member_id not in self._attached:
-                    if self._allocation_ended(member):
-                        result = LIVENESS_LOST
-                        continue
                     try:
                         if member.pool_name not in self._pools:
                             await self._register_fed()
