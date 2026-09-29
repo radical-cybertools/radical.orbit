@@ -2910,6 +2910,16 @@ class PluginTaskDispatcher(Plugin):
         if record.is_terminal():
             return
         if record.adopted:
+            # The endpoint outlives the record: no psij cancel kills the
+            # tasks it still runs, and ``_finalize_pilot`` re-queues them,
+            # so stop them first or a sibling runs them a second time.  A
+            # uid still in ``_uid_to_task`` is one rhapsody has not ended —
+            # this also covers tasks a ``cancel_tasks`` removal already
+            # failed.  Per task: the rhapsody session is shared.
+            await self._cancel_rhapsody_tasks(
+                record, [t.rhapsody_uid for t in pool_state.tasks.values()
+                         if t.pilot_id == record.pid
+                         and t.rhapsody_uid in self._uid_to_task])
             self._mark_pilot_done(pool_state, record, 'endpoint released')
             return
         endpoint_name = record.endpoint_name
@@ -3511,6 +3521,29 @@ class PluginTaskDispatcher(Plugin):
         self._mark_dirty(pool_state)
         self._notify_task(pool_state, task)
 
+    async def _cancel_rhapsody_tasks(self, pilot: PilotRecord,
+                                     uids: list) -> None:
+        '''Best-effort rhapsody cancel of *uids* on *pilot*'s endpoint.
+
+        Errors are logged, never raised.
+        '''
+        if not pilot.child_endpoint_name or not uids:
+            return
+        try:
+            rh = await self._get_rhapsody_client(pilot.child_endpoint_name)
+        except Exception as e:
+            log.warning('[%s] rhapsody client failed for %s: %s',
+                        self.instance_name, pilot.pid, e)
+            return
+        if rh is None:
+            return
+        for uid in uids:
+            try:
+                await asyncio.to_thread(rh.cancel_task, uid)
+            except Exception as e:
+                log.warning('[%s] rhapsody cancel_task failed: %s',
+                            self.instance_name, e)
+
     async def _cancel_task(self, pool_state: PoolState,
                            task: TaskRecord) -> dict:
         '''Cancel path: either remove from queue or cancel on the pilot.'''
@@ -3526,14 +3559,8 @@ class PluginTaskDispatcher(Plugin):
 
         # RUNNING — best-effort cancel on the pilot
         pilot = pool_state.pilots.get(task.pilot_id or '')
-        if pilot and pilot.child_endpoint_name and task.rhapsody_uid:
-            rh = await self._get_rhapsody_client(pilot.child_endpoint_name)
-            if rh is not None:
-                try:
-                    await asyncio.to_thread(rh.cancel_task, task.rhapsody_uid)
-                except Exception as e:
-                    log.warning('[%s] rhapsody cancel_task failed: %s',
-                                self.instance_name, e)
+        if pilot and task.rhapsody_uid:
+            await self._cancel_rhapsody_tasks(pilot, [task.rhapsody_uid])
         task.state       = TASK_CANCELED
         task.finished_at = time.time()
         pool_state.drop_spool(task.task_id)

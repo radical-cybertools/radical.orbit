@@ -950,8 +950,7 @@ class PluginFederation(Plugin):
         ignored, which is precisely why the member routes exist.
         '''
         records = list(self._state.resources.values())
-        if extra is not None and \
-                self._state.resources.get(extra.name) is not extra:
+        if extra is not None:
             records.append(extra)
 
         by_class: dict[str, list] = {}
@@ -1350,20 +1349,16 @@ class PluginFederation(Plugin):
                 removed  += 1
                 requeued += int((resp or {}).get('tasks_requeued') or 0)
                 failed   += int((resp or {}).get('tasks_failed')   or 0)
-            except HTTPException as e:
+            except Exception as e:
                 # a member already detached (its endpoint lost, its
                 # allocation ended) is simply not there any more: nothing
                 # to remove.  It is still asked, since a failed detach or
                 # re-attach can leave a stale copy behind.
-                if e.status_code != 404 or \
-                        member.member_id in self._attached:
+                gone = isinstance(e, HTTPException) and e.status_code == 404
+                if not gone or member.member_id in self._attached:
                     log.info('[%s] leave %r: removing member %s failed: %s',
                              self.instance_name, name, member.member_id, e)
                     errors.append(f'{member.member_id}: {e}')
-            except Exception as e:
-                log.info('[%s] leave %r: removing member %s failed: %s',
-                         self.instance_name, name, member.member_id, e)
-                errors.append(f'{member.member_id}: {e}')
             self._attached.discard(member.member_id)
             self._detail_cache.pop(member.pool_name, None)
 

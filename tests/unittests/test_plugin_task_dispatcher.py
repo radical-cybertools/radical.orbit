@@ -3310,6 +3310,34 @@ class TestEndpointAdoption:
         assert rec.state == PILOT_DONE
         assert rec.error is None
 
+    @pytest.mark.parametrize('cancel_tasks', [False, True])
+    def test_releasing_the_endpoint_stops_its_tasks(self, tmp_path,
+                                                    cancel_tasks):
+        """The endpoint outlives the record and no psij cancel kills its
+        tasks: they must be stopped on it, or a re-queued task runs twice
+        (and a failed one keeps running)."""
+        plugin, client, sid, ps = self._session(tmp_path)
+        _, rec = self._adopt(plugin, ps)
+        ps.tasks['t.1'] = TaskRecord(
+            task_id='t.1', pool='fed', owning_sid=sid, cmd=['/bin/echo'],
+            cwd='/tmp', state=TASK_RUNNING, pilot_id=rec.pid,
+            member_id='m_a', rhapsody_uid='rh.1')
+        plugin._uid_to_task['rh.1'] = (sid, 'fed', 't.1')
+
+        rh_mock = MagicMock()
+        with patch.object(plugin, '_get_rhapsody_client',
+                          new=AsyncMock(return_value=rh_mock)):
+            r = client.request(
+                'DELETE', f'{plugin.namespace}/pool/{sid}/fed/members/m_a',
+                json={'force': True, 'fail_unsatisfiable': False,
+                      'cancel_tasks': cancel_tasks})
+        assert r.status_code == 200, r.text
+        rh_mock.cancel_task.assert_called_once_with('rh.1')
+        rh_mock.cancel_all_tasks.assert_not_called()
+        assert rec.state == PILOT_DONE
+        assert ps.tasks['t.1'].state == (TASK_FAILED if cancel_tasks
+                                         else TASK_QUEUED)
+
     def test_the_summary_reports_the_pilot_mode_and_the_runway(self,
                                                               tmp_path):
         end = time.time() + 600
