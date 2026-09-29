@@ -67,6 +67,21 @@ PILOT_MODES         = (PILOT_SUBMIT, PILOT_ENDPOINT)
 # is an error -- never silently lowercased or coerced.
 POOL_CLASS_RE = re.compile(r'^[a-z0-9_.-]*$')
 
+# The legacy scalar projection of a class pool with no member to project
+# from: the parser's placeholders (``__post_init__`` overwrites them) and an
+# emptied pool's values (replay only).  Deterministic, so it persists and
+# replays to an identical config.  Copy ``pilot_sizes`` on use.
+_EMPTY_PROJECTION: dict[str, Any] = {
+    'queue'        : DEFAULT_POOL_NAME,
+    'account'      : None,
+    'endpoint_name': None,
+    'pilot_sizes'  : {},
+    'default_size' : '',
+    'min_pilots'   : 0,
+    'max_pilots'   : 4,
+    'scratch_base' : None,
+}
+
 # ``<pool>_<member_id>_<pid>`` becomes a broker participant name; keep the
 # operator-chosen part bounded (plan 121 §14 R6).
 MAX_POOL_MEMBER_NAME_LEN: int = 64
@@ -256,17 +271,9 @@ class PoolConfig:
         if not self.multi_member:
             return
         if not self.members:
-            # Harmless placeholders for an emptied class pool (replay
-            # only); deterministic, so it persists and replays to an
-            # identical config.
-            self.queue         = DEFAULT_POOL_NAME
-            self.account       = None
-            self.endpoint_name = None
-            self.pilot_sizes   = {}
-            self.default_size  = ''
-            self.min_pilots    = 0
-            self.max_pilots    = 4
-            self.scratch_base  = None
+            for key, val in _EMPTY_PROJECTION.items():
+                setattr(self, key, val)
+            self.pilot_sizes = {}
             return
         primary = next(iter(self.members.values()))
         self.queue         = primary.queue
@@ -386,8 +393,7 @@ def _parse_pool(d: Any, source: str, *,
                                   allow_empty=allow_empty_members)
         # Placeholders only: ``PoolConfig.__post_init__`` overwrites every
         # scalar with the primary member's projection.
-        resource = {'queue': DEFAULT_POOL_NAME, 'account': None,
-                    'pilot_sizes': {}, 'default_size': ''}
+        resource = {**_EMPTY_PROJECTION, 'pilot_sizes': {}}
     else:
         resource = _parse_resource(d, source, endpoint_required=False)
 

@@ -268,10 +268,9 @@ function renderPoolCard(p, api, sid, idx) {
   // pools are session-scoped: say which session owns this one
   const sessionBadge = sid
     ? `<span class="td-strategy-badge">session ${api.escHtml(sid)}</span>` : '';
-  // A class pool's ceiling is the sum over its members; a legacy pool's is
-  // its own max_pilots, exactly as before.
-  const maxPilots = p.multi_member ? (p.max_pilots_total ?? '?')
-                                   : (p.max_pilots ?? '?');
+  // The ceiling is the sum over the members (a legacy pool's one implicit
+  // member makes that its own max_pilots).
+  const maxPilots = p.max_pilots_total ?? p.max_pilots ?? '?';
 
   const body = p.multi_member
     ? membersTable(p, api)

@@ -71,6 +71,7 @@ class DispatchPolicy:
 
     def on_pilot_state(self, pilot, old_state, new_state) -> None: ...
     def member_health(self, member_id) -> dict: ...  # see below
+    def on_member_removed(self, member_id) -> None: ...
     def on_tick(self, pool_state, submit_pilot) -> None: ...
     def pick_dispatch(self, pool_state) \
             -> tuple[TaskRecord, PilotRecord] | None: ...
@@ -112,6 +113,9 @@ pilots expire at walltime.
   member, so a paused member says so on the wire instead of only in the
   broker log.  The default reports a healthy member; the conservative
   policy reports its own failure counter and backoff deadline.
+- ``on_member_removed`` is called when a member leaves a class pool; a
+  policy drops its per-member bookkeeping there, so a re-added member id
+  starts clean.
 
 ### The pool handle
 
@@ -125,7 +129,7 @@ ps.members()                     # [PoolMember] in declaration order
 ps.member(mid)                   # PoolMember | None  ('' = implicit)
 ps.live_pilots_for(mid)          # [PilotRecord] for one member
 ps.member_budget_left(mid, now)  # float | None  (None = no budget)
-ps.size_of(pilot)                # PilotSize | None (snapshot first)
+ps.size_of(pilot)                # PilotSize (the record's snapshot)
 ```
 
 Accessors return snapshots — safe to iterate, not to cache across calls.
@@ -177,7 +181,8 @@ Favors efficient utilization over low latency.
 - Routing: configurable ``least_loaded`` (default) or ``youngest``; ties
   break on ``member_id``.
 - ``pick_dispatch`` filters pilots on ``free_capacity() > 0`` **and** on
-  ``satisfies(task.requirements, pilot.attributes, ps.size_of(pilot))``.
+  ``satisfies(task.requirements, pilot.attributes, pilot)`` (the
+  record carries its submit-time size snapshot).
   The slot test is still pure task counting: a task's ``cores``/``gpus``
   are matched against the pilot's *shape*, never against its occupancy, so
   a 4-GPU pilot will happily accept a fifth 1-GPU task.  Resource-aware

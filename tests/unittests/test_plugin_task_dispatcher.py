@@ -477,7 +477,8 @@ class TestTopologyBinding:
             pid=pid, pool='cpu', owning_sid='A', size_key='s',
             rhapsody_backend='concurrent', state=state, submitted_at=100.0,
             psij_job_id='j.1',
-            child_endpoint_name=child, walltime_deadline=walltime)
+            child_endpoint_name=child, walltime_deadline=walltime,
+            endpoint_name='endpoint0', nodes=1, cpus_per_node=4)
         return plugin, ps
 
     def test_present_binds_pending_pilot(self, tmp_path):
@@ -1869,6 +1870,26 @@ class TestMemberRemoval:
             _member('m_x', attributes={'software': ['x']}),
             _member('m_y', attributes={'software': ['y']})])
 
+    def test_readded_member_starts_with_clean_policy_state(self, tmp_path):
+        """A removed-then-re-added member id must not inherit backoff."""
+        plugin, client, sid = self._two_members(tmp_path)
+        pol = _pool(plugin, sid, 'fed').policy
+        pol._last_submit_ts['m_x']       = 1e12
+        pol._consecutive_failures['m_x'] = 5
+        pol._backoff_until['m_x']        = 1e12
+        pol._backoff_logged['m_x']       = True
+        r = client.request(
+            'DELETE', f'{plugin.namespace}/pool/{sid}/fed/members/m_x',
+            json={})
+        assert r.status_code == 200, r.text
+        r = client.post(f'{plugin.namespace}/pool/{sid}/fed/members',
+                        json=_member('m_x', attributes={'software': ['x']}))
+        assert r.status_code == 200, r.text
+        for d in (pol._last_submit_ts, pol._consecutive_failures,
+                  pol._backoff_until, pol._backoff_logged):
+            assert 'm_x' not in d
+        assert not pol._in_backoff('m_x', 0.0)
+
     def test_last_member_without_force_is_409(self, tmp_path):
         plugin, client, sid = _class_session(tmp_path)
         r = client.request(
@@ -1934,6 +1955,23 @@ class TestMemberRemoval:
         assert task.member_id is None       # cleared with the pilot_id
         assert 'm_x' not in ps.config.members
 
+    def test_requeue_cap_failure_is_counted(self, tmp_path):
+        """A task the pilot cancel fails (``_finalize_pilot``: re-queued
+        too often) is in ``tasks_failed``, not ``tasks_requeued``."""
+        plugin, client, sid = self._two_members(tmp_path)
+        ps, _, task = self._pilot_with_task(plugin, sid, 'm_x')
+        task.requeues = ps.policy.max_requeues
+        with patch.object(plugin, '_get_psij_client',
+                          new=AsyncMock(return_value=None)):
+            r = client.request(
+                'DELETE', f'{plugin.namespace}/pool/{sid}/fed/members/m_x',
+                json={})
+        assert r.status_code == 200, r.text
+        assert task.state == TASK_FAILED
+        assert 'requeued too often' in task.error
+        assert r.json()['tasks_failed']   == 1
+        assert r.json()['tasks_requeued'] == 0
+
     def test_pilots_are_paused_before_the_member_is_dropped(self, tmp_path):
         """No other path may dispatch onto a pilot that is about to die."""
         plugin, client, sid = self._two_members(tmp_path)
@@ -1961,7 +1999,7 @@ class TestMemberRemoval:
                 json={})
         assert task.state == TASK_FAILED
         assert task.error == \
-            'no member satisfies task requirements: software missing: x'
+            'no member satisfies the task requirements: software missing: x'
         assert r.json()['tasks_failed'] == 1
 
     def test_fail_unsatisfiable_false_keeps_them_queued(self, tmp_path):
@@ -2022,7 +2060,7 @@ class TestMemberAwareSubmitValidation:
             'no member satisfies the task requirements: '
             'software missing: lammps')
 
-    def test_gpus_exceed_every_member_names_the_member(self, tmp_path):
+    def test_gpus_exceed_every_member(self, tmp_path):
         plugin, client, sid = _class_session(tmp_path, members=[
             _member('m_x'),
             _member('m_y', pilot_sizes={'d': {
@@ -2033,8 +2071,56 @@ class TestMemberAwareSubmitValidation:
             'cwd': '/tmp', 'requirements': {'gpus': 2}})
         assert r.status_code == 400
         assert r.json()['detail'] == (
-            "requirements: 2 gpus exceed every pilot_size "
-            "(largest: 'm_y/d', 1 gpus/node)")
+            'no member satisfies the task requirements: gpus 0 < 2')
+
+    def test_only_a_non_default_size_fits_is_a_400(self, tmp_path):
+        """The policy only grows a member's default size, so a task that
+        fits nothing but a larger, non-default size would queue forever."""
+        sizes = {'d'  : {'nodes': 1, 'cpus_per_node': 4,
+                         'rhapsody_backend': 'concurrent'},
+                 'big': {'nodes': 1, 'cpus_per_node': 64,
+                         'rhapsody_backend': 'concurrent'}}
+        plugin, client, sid = _class_session(tmp_path, members=[
+            _member('m_x', pilot_sizes=sizes)])
+        r = client.post(f'{plugin.namespace}/submit/{sid}', json={
+            'pool': 'fed', 'task_id': 't.1', 'cmd': ['/bin/echo'],
+            'requirements': {'cores': 32}})
+        assert r.status_code == 400
+        assert r.json()['detail'] == (
+            'no member satisfies the task requirements: cores 4 < 32')
+        assert 't.1' not in _pool(plugin, sid, 'fed').tasks
+
+    def test_gate_and_removal_sweep_agree(self, tmp_path):
+        """Whatever the submit gate accepts, removing an unrelated member
+        must leave QUEUED -- the sweep asks the gate's own question."""
+        sizes = {'d'  : {'nodes': 1, 'cpus_per_node': 4,
+                         'rhapsody_backend': 'concurrent'},
+                 'big': {'nodes': 1, 'cpus_per_node': 64,
+                         'rhapsody_backend': 'concurrent'}}
+        plugin, client, sid = _class_session(tmp_path, members=[
+            _member('m_x', pilot_sizes=sizes),
+            _member('m_y', pilot_sizes={'d': {
+                'nodes': 1, 'cpus_per_node': 16,
+                'rhapsody_backend': 'concurrent'}}),
+            _member('m_z')])
+        ps = _pool(plugin, sid, 'fed')
+        accepted = []
+        with patch.object(ps.policy, 'pick_dispatch', return_value=None):
+            for cores in (2, 8, 16, 32, 64):
+                tid = f't.{cores}'
+                r = client.post(f'{plugin.namespace}/submit/{sid}', json={
+                    'pool': 'fed', 'task_id': tid, 'cmd': ['/bin/echo'],
+                    'requirements': {'cores': cores}})
+                if r.status_code == 200:
+                    accepted.append(tid)
+        assert accepted == ['t.2', 't.8', 't.16']
+        with patch.object(ps.policy, 'pick_dispatch', return_value=None):
+            r = client.request(
+                'DELETE', f'{plugin.namespace}/pool/{sid}/fed/members/m_z',
+                json={})
+        assert r.status_code == 200, r.text
+        assert r.json()['tasks_failed'] == 0
+        assert all(ps.tasks[t].state == TASK_QUEUED for t in accepted)
 
     def test_legacy_pool_keeps_the_unqualified_size_name(self, tmp_path):
         """120's exact strings survive for a single-site pool."""
@@ -2080,8 +2166,8 @@ class TestMemberAwareSubmitValidation:
             'cwd': '/tmp', 'requirements': {'mpi': True}})
         assert r.status_code == 400
         assert r.json()['detail'] == (
-            "an mpi task cannot run on this pool: every member's backend "
-            "is dragon_v1")
+            'no member satisfies the task requirements: '
+            'backend dragon_v1 cannot run an mpi task')
 
     def test_mpi_accepted_when_one_member_can(self, tmp_path):
         v1 = {'d': {'nodes': 1, 'cpus_per_node': 4,
@@ -2170,6 +2256,25 @@ class TestCwdAtDispatch:
         assert task.cwd == str(tmp_path / 'member_x' / 't.1')
         assert Path(task.cwd).is_dir()      # shared_fs → broker mkdirs it
         assert task.member_id == 'm_x'
+
+    def test_unwritable_scratch_fails_the_task(self, tmp_path):
+        """A shared member whose scratch_base cannot be created (here: a
+        path through a regular file, which fails even as root) fails the
+        task at claim time instead of launching it into a missing cwd."""
+        (tmp_path / 'blocker').write_text('')
+        plugin, client, sid = _class_session(tmp_path, members=[
+            _member('m_x', scratch_base=str(tmp_path / 'blocker' / 's'))])
+        ps    = _pool(plugin, sid, 'fed')
+        pilot = self._active(ps, sid)
+        with patch.object(ps.policy, 'pick_dispatch', return_value=None):
+            client.post(f'{plugin.namespace}/submit/{sid}', json={
+                'pool': 'fed', 'task_id': 't.1', 'cmd': ['/bin/echo']})
+        self._dispatch(plugin, ps, ps.tasks['t.1'], pilot)
+        task = ps.tasks['t.1']
+        assert task.state == TASK_FAILED
+        assert task.error.startswith(
+            f"could not create task cwd {tmp_path / 'blocker' / 's' / 't.1'}")
+        assert pilot.in_flight == 0
 
     def test_nothing_created_locally_for_a_non_shared_member(self, tmp_path):
         plugin, client, sid = _class_session(tmp_path, members=[
@@ -2472,6 +2577,26 @@ class TestStagingRefusals:
         assert r.status_code == 409
         assert 'not broker-local' in r.json()['detail']
 
+    def test_stage_out_reads_the_placed_cwd(self, tmp_path):
+        """A placed shared-fs task's output lives in its assigned cwd, not
+        in ``pool scratch / task_id``."""
+        site = tmp_path / 'site'
+        plugin, client, sid = _class_session(tmp_path, members=[
+            _member('m_x', scratch_base=str(site))])
+        ps  = _pool(plugin, sid, 'fed')
+        cwd = site / 't.1'
+        cwd.mkdir(parents=True)
+        (cwd / 'out.txt').write_bytes(b'placed')
+        decoy = ps.scratch_base / 't.1'
+        decoy.mkdir(parents=True)
+        (decoy / 'out.txt').write_bytes(b'decoy')
+        ps.tasks['t.1'] = TaskRecord(
+            task_id='t.1', pool='fed', owning_sid=sid, cmd=[],
+            cwd=str(cwd), member_id='m_x', state=TASK_DONE)
+        r = client.get(f'{plugin.namespace}/stage_out/{sid}/t.1/out.txt')
+        assert r.status_code == 200, r.text
+        assert base64.b64decode(r.json()['content_b64']) == b'placed'
+
 
 class TestClassPoolScratchAndDirs:
 
@@ -2616,7 +2741,7 @@ class TestPilotFailureIsVisible:
         assert 'Disk quota exceeded' in record.error
         # and it travels in the history, which is what the summaries carry
         entry = ps.pilot_history('m_x')[0]
-        assert entry['error'] == record.error
+        assert entry.error == record.error
 
     def test_the_error_is_truncated(self, tmp_path):
         plugin, _client, sid = _class_session(tmp_path)
@@ -3329,8 +3454,11 @@ def test_last_pilot_error_stops_at_the_newest_healthy_pilot():
     # member's current problem (a lost-and-re-added member would otherwise
     # show "child endpoint lost" under an ok row forever)
     from radical.orbit.plugin_task_dispatcher import PluginTaskDispatcher as P
-    failed = {'state': 'FAILED', 'error': 'quota exceeded', 'active_at': None}
-    active = {'state': 'ACTIVE', 'error': None, 'active_at': 1.0}
+    def _rec(pid, **kw):
+        return PilotRecord(pid=pid, pool='p', size_key='s',
+                           rhapsody_backend='concurrent', **kw)
+    failed = _rec('p.f', state=PILOT_FAILED, error='quota exceeded')
+    active = _rec('p.a', state=PILOT_ACTIVE, active_at=1.0)
     assert P._last_pilot_error([failed]) == 'quota exceeded'
     assert P._last_pilot_error([failed, active]) is None
     assert P._last_pilot_error([active, failed]) == 'quota exceeded'

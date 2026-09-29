@@ -528,7 +528,7 @@ def test_member_removal_fails_an_unsatisfiable_task(harness, tmp_path):
     task = fed.ps.tasks['t.1']
     assert task.state == 'FAILED'
     assert task.error == \
-        'no member satisfies task requirements: software missing: x'
+        'no member satisfies the task requirements: software missing: x'
 
 
 def test_budget_per_member(harness, tmp_path):

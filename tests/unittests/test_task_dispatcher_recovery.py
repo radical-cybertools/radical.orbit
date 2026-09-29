@@ -374,11 +374,44 @@ class TestLegacyReplayUnchanged:
         assert ps.config.members[''].endpoint_name == 'endpoint0'
         pilot = ps.pilots['p.1']
         assert pilot.member_id == ''          # -> the implicit member
-        assert pilot.nodes     == 0           # no snapshot yet
         assert pilot.child_endpoint_name == 'cpu_p.1'   # untouched
 
-        # the snapshot is repaired at the handshake, off the member menu
+        # the snapshot is backfilled once at load, off the member
+        assert (pilot.nodes, pilot.cpus_per_node) == (3, 4)
+        assert pilot.endpoint_name == 'endpoint0'
+
         plugin._dispatch_notify = lambda t, d: None
         plugin._activate_pilot(ps, pilot)
-        assert (pilot.nodes, pilot.cpus_per_node) == (3, 4)
         assert pilot.capacity == 12
+
+    def test_adopted_pilot_is_never_backfilled(self, tmp_path):
+        """An adopted pilot (plan 122) keeps its adoption-time snapshot at
+        load, even a zero one: re-sizing it off the member would hand it
+        capacity ``_activate_pilot`` must refuse."""
+        state_dir = tmp_path / 'state' / _SID / 'cpu__endpoint0'
+        state_dir.mkdir(parents=True)
+        (state_dir / 'state.json').write_text(json.dumps({
+            'owning_sid': _SID,
+            'config': {
+                'name': 'cpu', 'queue': 'batch', 'account': 'proj',
+                'endpoint_name': 'endpoint0', 'default_size': 's',
+                'pilot_sizes': {'s': {'nodes': 3, 'cpus_per_node': 4,
+                                      'gpus_per_node': 0,
+                                      'walltime_sec': 3600,
+                                      'rhapsody_backend': 'concurrent'}},
+                'min_pilots': 0, 'max_pilots': 4, 'scratch_base': None,
+                'strategy': 'conservative', 'strategy_config': {}},
+            'pilots': {'p.1': {
+                'pid': 'p.1', 'pool': 'cpu', 'size_key': 's',
+                'rhapsody_backend': 'concurrent', 'owning_sid': _SID,
+                'state': 'PENDING', 'capacity': 0,
+                'child_endpoint_name': 'endpoint0', 'adopted': True,
+                'submitted_at': 100.0}},
+            'tasks': {},
+        }))
+
+        plugin = _make_plugin(tmp_path, with_pool=False)
+        pilot  = plugin._pool_states[_SID]['cpu'].pilots['p.1']
+        assert pilot.adopted is True
+        assert (pilot.nodes, pilot.cpus_per_node) == (0, 0)
+        assert pilot.endpoint_name == ''
