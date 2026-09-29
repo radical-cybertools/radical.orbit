@@ -2792,6 +2792,10 @@ class PluginTaskDispatcher(Plugin):
         cancel yet and is simply marked FAILED.  So a submit that returns
         onto a terminal record must cancel the job it just created rather
         than resurrect the pilot around an orphaned allocation.
+
+        Equally, the child may register before ``submit_tunneled`` returns
+        (a fast queue, a slow login endpoint): the pilot is then already
+        ACTIVE and only gains its psij job id here.
         '''
         endpoint_name = record.endpoint_name
         if not endpoint_name:
@@ -2855,6 +2859,12 @@ class PluginTaskDispatcher(Plugin):
             return
 
         record.psij_job_id = job_id
+        if record.state != PILOT_PENDING:
+            # The child registered while the submit was in flight and
+            # on_topology_change already activated the pilot: keep the job
+            # id, never demote an ACTIVE pilot back to STARTING.
+            pool_state.persist()
+            return
         record.state       = PILOT_STARTING
         pool_state.persist()
         self._dispatch_notify('pilot_status', {
