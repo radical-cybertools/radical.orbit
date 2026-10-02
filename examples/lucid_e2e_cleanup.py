@@ -16,7 +16,8 @@ import time
 
 from pathlib import Path
 
-from radical.orbit import EndpointRuntime
+from radical.orbit            import EndpointRuntime
+from radical.orbit.lucid_flow import RUN_ID_RE
 
 
 LUCID_COLL = '54387d00-a525-11f0-8d5c-0affdd0cd947'
@@ -51,9 +52,12 @@ def main():
         globus = rt.get_plugin(eid, 'globus', refresh_token=refresh,
                                client_id=CLIENT_ID)
 
+        # only names that look like demo runs: /tmp_radical is shared, and
+        # the names end up in Globus deletes and an ``rm -rf``
         existing = sorted(e['name'] for e in
                           globus.ls(LUCID_COLL, OUT_BASE + '/').get('entries', [])
-                          if e.get('type') == 'dir')
+                          if e.get('type') == 'dir'
+                          and RUN_ID_RE.match(e.get('name') or ''))
         runs = existing if args.all else args.runs
         if not runs:
             print(f'runs in lucid:{OUT_BASE}/:')
@@ -61,10 +65,11 @@ def main():
                 print(f'  {r}')
             return
 
-        paths = [f'{OUT_BASE}/{r}/' for r in runs if r in existing]
         for r in runs:
             if r not in existing:
-                print(f'  {r}: not in lucid:{OUT_BASE}/ -- skipped')
+                print(f'  {r}: not a demo run in lucid:{OUT_BASE}/ -- skipped')
+        runs  = [r for r in runs if r in existing]
+        paths = [f'{OUT_BASE}/{r}/' for r in runs]
         if paths:
             sub = globus.delete(LUCID_COLL, paths, recursive=True,
                                 label='lucid e2e cleanup')
@@ -75,11 +80,12 @@ def main():
                 time.sleep(3)
             print(f'  lucid: deleted {len(paths)} run(s): {task.get("status")}')
 
-        if args.nersc:
+        if args.nersc and runs:
+            # run ids as positional args, never spliced into the script
             rh  = rt.get_plugin(eid, 'rhapsody')
-            cmd = ' '.join(f'"$SCRATCH/lucid-e2e/runs/{r}"' for r in runs)
+            cmd = 'cd "$SCRATCH/lucid-e2e/runs" && rm -rf -- "$@"'
             uid = rh.submit_tasks([{'executable': '/bin/bash',
-                                    'arguments' : ['-lc', f'rm -rf {cmd}']}])[0]['uid']
+                                    'arguments' : ['-lc', cmd, 'rm'] + runs}])[0]['uid']
             rh.wait_tasks([uid], timeout=600)
             print(f'  nersc: removed {len(runs)} run dir(s): '
                   f'{rh.get_task(uid).get("state")}')

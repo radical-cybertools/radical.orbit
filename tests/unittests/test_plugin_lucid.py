@@ -14,6 +14,8 @@ globus / rhapsody / staging plugin clients, and the ``lucid`` plugin on top.
 import asyncio
 import base64
 import json
+import os
+import threading
 import time
 
 import pytest
@@ -31,9 +33,11 @@ PNG = b'\x89PNG\r\n\x1a\nfake'
 # fakes
 #
 class FakeGlobus:
-    def __init__(self, fail=False):
+    def __init__(self, fail=False, status=None):
         self.fail      = fail
+        self.status    = status            # force a status (e.g. INACTIVE)
         self.transfers = []
+        self.cancelled = []
         self.closed    = False
 
     def submit_transfer(self, source, destination, items, label=None,
@@ -43,9 +47,13 @@ class FakeGlobus:
 
     def get_task(self, task_id):
         n = len(self.transfers[int(task_id[1:]) - 1][2])
-        return {'status'           : 'FAILED' if self.fail else 'SUCCEEDED',
+        status = self.status or ('FAILED' if self.fail else 'SUCCEEDED')
+        return {'status'           : status,
                 'files'            : n, 'files_transferred': n,
                 'bytes_transferred': 1000 * n}
+
+    def cancel_task(self, task_id):
+        self.cancelled.append(task_id)
 
     def close(self):
         self.closed = True
@@ -62,8 +70,8 @@ class FakeRhapsody:
         for t in tasks:
             uid    = f'task.{len(self.tasks):04d}'
             script = t['arguments'][1]
-            if 'echo $SCRATCH' in script:
-                stdout = '/scratch/me\n'
+            if 'echo scratch=$SCRATCH' in script:
+                stdout = 'Welcome to the login banner\nscratch=/scratch/me\n'
             elif 'cellprofiler -c -r' in script:
                 stdout = 'host=nid001 files=42\n'
             else:
@@ -82,11 +90,14 @@ class FakeRhapsody:
 
 
 class FakeStaging:
-    def __init__(self):
-        self.closed = False
-        self.got    = []
+    def __init__(self, allowed=('/scratch',)):
+        self.closed  = False
+        self.got     = []
+        self.allowed = allowed
 
     def list(self, path):
+        if not path.startswith(self.allowed):
+            raise RuntimeError('Path escapes allowed directories')
         return {'path': path, 'entries': [{'name': 'cell_00.png', 'type': 'file'},
                                           {'name': 'cell_01.png', 'type': 'file'},
                                           {'name': 'notes.txt',   'type': 'file'}]}
@@ -317,3 +328,122 @@ async def test_plugin_rejects_concurrent_run(monkeypatch):
         await p._submit({'endpoint': 'hpc1', 'wells': ['r01c01']})
     assert e.value.status_code == 409
     await asyncio.to_thread(p._thread.join, 10)
+
+
+# ------------------------------------------------------------------------------
+# review round 1: bounded waits, cancel, input validation, races
+#
+def test_globus_inactive_fails_and_cancels(tmp_path):
+    g  = FakeGlobus(status='INACTIVE')
+    rt = FakeRuntime(globus=g)
+    st = _run(rt, tmp_path).run()
+    assert st['status'] == 'failed'
+    assert 'inactive' in st['error']
+    assert g.cancelled == ['t1']
+    assert all(c.closed for c in rt.clients.values())
+
+
+def test_globus_wait_times_out_and_cancels(tmp_path):
+    g   = FakeGlobus(status='ACTIVE')
+    run = _run(FakeRuntime(globus=g), tmp_path)
+    g.submit_transfer('a', 'b', [{}])
+    with pytest.raises(lf.LucidError, match='did not finish'):
+        run._globus_wait(g, 't1', 'stage_in', timeout=0.05)
+    assert g.cancelled == ['t1']
+
+
+def test_cancel_stops_a_run(tmp_path):
+    g   = FakeGlobus(status='ACTIVE')
+    rt  = FakeRuntime(globus=g)
+    run = _run(rt, tmp_path)
+    t   = threading.Thread(target=run.run)
+    t.start()
+    time.sleep(0.1)
+    run.cancel()
+    t.join(5)
+    st = run.snapshot()
+    assert st['status'] == 'failed' and 'cancelled' in st['error']
+    assert all(c.closed for c in rt.clients.values())
+
+
+def test_preflight_fails_early_without_staging_access(tmp_path):
+    rt = FakeRuntime(staging=FakeStaging(allowed=('/home',)))
+    st = _run(rt, tmp_path).run()
+    assert st['status'] == 'failed'
+    assert st['phases']['preflight']['state'] == 'failed'
+    assert st['phases']['stage_in']['state'] == 'pending'
+    assert 'RADICAL_ORBIT_SCRATCH_BASE' in st['error']
+    assert rt.clients['globus'].transfers == []
+
+
+@pytest.mark.parametrize('kw', [
+    {'images_path'  : '/x\nTXT\nrm -rf ~\nTXT'},     # heredoc break-out
+    {'images_path'  : '/a/../../etc'},
+    {'images_path'  : 'relative/path'},
+    {'pipeline_path': '/p;id'},
+    {'collection'   : 'not-a-uuid'},
+])
+def test_run_rejects_unsafe_inputs(tmp_path, kw):
+    with pytest.raises(lf.LucidError):
+        _run(FakeRuntime(), tmp_path, **kw)
+
+
+def test_run_id_is_unique_and_matches_cleanup_pattern():
+    ids = {lf.new_run_id() for _ in range(50)}
+    assert len(ids) > 1
+    assert all(lf.RUN_ID_RE.match(i) for i in ids)
+    assert not lf.RUN_ID_RE.match('..')
+
+
+@pytest.mark.asyncio
+async def test_plugin_concurrent_submits_start_one_run(monkeypatch):
+    monkeypatch.setattr(lf, 'transfer_refresh_token', lambda *a, **k: 'rt')
+
+    class SlowTopoRuntime(FakeRuntime):
+        def topology(self):
+            time.sleep(0.2)              # widen the window between checks
+            return super().topology()
+
+    p   = _plugin(SlowTopoRuntime())
+    res = await asyncio.gather(
+            p._submit({'endpoint': 'hpc1', 'wells': ['r01c01']}),
+            p._submit({'endpoint': 'hpc1', 'wells': ['r01c02']}),
+            return_exceptions=True)
+    ok  = [r for r in res if isinstance(r, dict)]
+    err = [r for r in res if isinstance(r, HTTPException)]
+    assert len(ok) == 1 and len(err) == 1 and err[0].status_code == 409
+    await asyncio.to_thread(p._thread.join, 10)
+    # the slot is free again once the run ended
+    await p._submit({'endpoint': 'hpc1', 'wells': ['r01c03']})
+    await asyncio.to_thread(p._thread.join, 10)
+
+
+@pytest.mark.asyncio
+async def test_plugin_failed_submit_frees_the_slot(monkeypatch):
+    monkeypatch.setattr(lf, 'transfer_refresh_token', lambda *a, **k: 'rt')
+    p = _plugin(FakeRuntime())
+    with pytest.raises(HTTPException):
+        await p._submit({'endpoint': 'hpc1', 'wells': []})
+    res = await p._submit({'endpoint': 'hpc1', 'wells': ['r01c01']})
+    await asyncio.to_thread(p._thread.join, 10)
+    assert p._status()['run_id'] == res['run_id']
+
+
+def test_plugin_ignores_stale_run_updates():
+    p = _plugin(FakeRuntime())
+    p._run   = type('R', (), {'run_id': 'current'})()
+    p._state = {'run_id': 'current', 'status': 'running', 'images': []}
+    p._on_update('old', {'run_id': 'old', 'status': 'done', 'images': []})
+    assert p._status()['run_id'] == 'current'
+
+
+@pytest.mark.asyncio
+async def test_plugin_shutdown_cancels_run_and_removes_images(monkeypatch):
+    monkeypatch.setattr(lf, 'transfer_refresh_token', lambda *a, **k: 'rt')
+    p = _plugin(FakeRuntime(globus=FakeGlobus(status='ACTIVE')))
+    await p._submit({'endpoint': 'hpc1', 'wells': ['r01c01']})
+    imgdir = p._imgdir
+    await p.shutdown()
+    assert not p._thread.is_alive()
+    assert p._status()['status'] == 'failed'
+    assert not os.path.exists(imgdir)

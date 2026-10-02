@@ -12,9 +12,7 @@ export const name = 'lucid';
 
 let escHtml = s => String(s || '');   // replaced by api.escHtml in init()
 
-const sessions  = {};                  // endpointName -> sid promise
 const pollers   = {};                  // endpointName -> interval id
-const shownRuns = {};                  // endpointName -> run_id with images loaded
 
 const PHASES = [
   ['preflight', 'Preflight'],
@@ -158,11 +156,10 @@ export function onNotification(data, page, api) {
 //  Internals
 // ─────────────────────────────────────────────────────────────
 
+// The Explorer caches sessions and heals stale ones (expiry, endpoint
+// restart) -- always go through it.
 async function getSession(api) {
-  if (!sessions[api.endpointName]) {
-    sessions[api.endpointName] = api.getSession('lucid');
-  }
-  return await sessions[api.endpointName];
+  return await api.getSession('lucid');
 }
 
 async function load(page, api) {
@@ -363,9 +360,9 @@ function render(page, api, st) {
 }
 
 async function showImages(page, api, st) {
-  const ep = api.endpointName;
-  if (shownRuns[ep] === st.run_id) return;
-  shownRuns[ep] = st.run_id;
+  // tracked per page: a rebuilt page (reconnect) shows the results again
+  if (page.dataset.shownRun === st.run_id) return;
+  page.dataset.shownRun = st.run_id;
 
   const card = page.querySelector('.lc-results-card');
   const out  = page.querySelector('.lc-images-out');
@@ -384,7 +381,7 @@ async function showImages(page, api, st) {
       out.appendChild(el);
     }
   } catch (e) {
-    shownRuns[ep] = null;
+    delete page.dataset.shownRun;
     api.flash(`Could not load result images: ${e.message}`, false);
   }
 }

@@ -27,6 +27,8 @@ infrastructure demo, not a scientific result.
 import json
 import logging
 import os
+import re
+import secrets
 import threading
 import time
 
@@ -76,6 +78,7 @@ ANALYSES = [
 ]
 
 NEEDED_PLUGINS = ('globus', 'rhapsody', 'staging')
+GLOBUS_TIMEOUT = 2 * 3600       # give up (and cancel) a transfer after this
 PHASES         = ('preflight', 'stage_in', 'compute', 'package', 'stage_out',
                   'fetch')
 N_PREVIEW      = 8
@@ -114,6 +117,33 @@ def get_analysis(analysis_id: str) -> Dict[str, Any]:
                 raise LucidError(f'analysis {analysis_id!r} is not available')
             return a
     raise LucidError(f'unknown analysis {analysis_id!r}')
+
+
+# Caller-supplied strings end up in Globus requests and (via the run README)
+# in a remote shell script: accept plain absolute paths and UUIDs only.
+_PATH_RE = re.compile(r'^/[A-Za-z0-9._/-]*$')
+_UUID_RE = re.compile(r'^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$')
+
+
+def validate_path(path: str, what: str) -> str:
+    if not isinstance(path, str) or not _PATH_RE.match(path) \
+            or '..' in path.split('/'):
+        raise LucidError(f'invalid {what}: {path!r} (absolute path of '
+                         '[A-Za-z0-9._/-] expected)')
+    return path
+
+
+def validate_collection(uuid: str) -> str:
+    if not isinstance(uuid, str) or not _UUID_RE.match(uuid):
+        raise LucidError(f'invalid collection id: {uuid!r}')
+    return uuid
+
+
+def new_run_id() -> str:
+    return time.strftime('e2e-%Y%m%d-%H%M%S-') + secrets.token_hex(2)
+
+
+RUN_ID_RE = re.compile(r'^e2e-\d{8}-\d{6}(-[0-9a-f]{4})?$')
 
 
 def validate_wells(wells: List[str]) -> List[str]:
@@ -226,17 +256,18 @@ class LucidRun:
         self._analysis  = get_analysis(analysis)
         self._refresh   = refresh_token
         self._local     = Path(local_dir)
-        self._coll      = collection
-        self._pipe_path = pipeline_path.rstrip('/') + '/'
-        self._img_path  = images_path.rstrip('/')
-        self._out_base  = out_base.rstrip('/')
+        self._coll      = validate_collection(collection)
+        self._pipe_path = validate_path(pipeline_path, 'pipeline path').rstrip('/') + '/'
+        self._img_path  = validate_path(images_path, 'images path').rstrip('/')
+        self._out_base  = validate_path(out_base, 'output base').rstrip('/')
         self._field     = field
         self._backend   = backend
         self._on_update = on_update
         self._poll      = poll
         self._lock      = threading.Lock()
+        self._cancel    = threading.Event()
 
-        self.run_id = run_id or time.strftime('e2e-%Y%m%d-%H%M%S')
+        self.run_id = run_id or new_run_id()
         self.state  = {
             'run_id'  : self.run_id,
             'endpoint': endpoint,
@@ -258,6 +289,14 @@ class LucidRun:
 
     # --------------------------------------------------------------------------
     #
+    def cancel(self) -> None:
+        '''Ask a running :meth:`run` to stop at its next poll.'''
+        self._cancel.set()
+
+    def _sleep(self):
+        if self._cancel.wait(self._poll):
+            raise LucidError('run cancelled')
+
     def snapshot(self) -> dict:
         with self._lock:
             return json.loads(json.dumps(self.state))
@@ -356,7 +395,7 @@ class LucidRun:
                 return {names[u]: listed[u] for u in uids}
             if time.time() > end:
                 raise LucidError(f'tasks did not finish within {timeout} s')
-            time.sleep(self._poll)
+            self._sleep()
 
     @staticmethod
     def _check(task: dict, what: str) -> str:
@@ -365,34 +404,62 @@ class LucidRun:
                              f'{(task.get("stderr") or task.get("error") or "")[-500:]}')
         return task.get('stdout') or ''
 
-    def _globus_wait(self, globus, task_id: str, key: str) -> dict:
-        # poll: the plugin's task_wait outlives the routed-RPC timeout
-        while True:
-            task = globus.get_task(task_id)
-            with self._lock:
-                self.state['stats'][key] = {
-                    'files': task.get('files_transferred') or 0,
-                    'bytes': task.get('bytes_transferred') or 0,
-                    'total': task.get('files')}
-            self._update()
-            if task.get('status') == 'SUCCEEDED':
-                return task
-            if task.get('status') == 'FAILED':
-                raise LucidError(f'{key} transfer failed: '
-                                 f'{task.get("nice_status_details") or task.get("nice_status")}')
-            time.sleep(self._poll)
+    def _globus_wait(self, globus, task_id: str, key: str,
+                     timeout: float = GLOBUS_TIMEOUT) -> dict:
+        # poll: the plugin's task_wait outlives the routed-RPC timeout.
+        # Globus keeps a task ACTIVE while it retries recoverable errors and
+        # turns it INACTIVE when the credential expires -- neither ends on
+        # its own, so give up on INACTIVE, on timeout, or on cancel.
+        end = time.time() + timeout
+        try:
+            while True:
+                task = globus.get_task(task_id)
+                with self._lock:
+                    self.state['stats'][key] = {
+                        'files': task.get('files_transferred') or 0,
+                        'bytes': task.get('bytes_transferred') or 0,
+                        'total': task.get('files')}
+                self._update()
+                status = task.get('status')
+                detail = task.get('nice_status_details') or task.get('nice_status')
+                if status == 'SUCCEEDED':
+                    return task
+                if status == 'FAILED':
+                    raise LucidError(f'{key} transfer failed: {detail}')
+                if status == 'INACTIVE':
+                    raise LucidError(f'{key} transfer inactive (expired '
+                                     f'credential?): {detail}')
+                if time.time() > end:
+                    raise LucidError(f'{key} transfer did not finish within '
+                                     f'{timeout} s (last: {detail})')
+                self._sleep()
+        except Exception:
+            try:
+                globus.cancel_task(task_id)
+            except Exception as e:
+                log.warning('[lucid] cancel of transfer %s failed: %s',
+                            task_id, e)
+            raise
 
     # --------------------------------------------------------------------------
     #
     def _preflight(self, globus, rh, stage):
-        pre = self._shell(rh, {'pre': f'echo $SCRATCH\n'
+        pre = self._shell(rh, {'pre': f'echo scratch=$SCRATCH\n'
                                       f'shifterimg lookup {CP_IMAGE} >/dev/null'
                                       f' || shifterimg pull {CP_IMAGE} >/dev/null'},
                           900)['pre']
-        scratch = self._check(pre, 'preflight').split()
+        scratch = _kv(self._check(pre, 'preflight')).get('scratch')
         if not scratch:
             raise LucidError('endpoint reports no $SCRATCH')
-        self._run_dir = f'{scratch[0]}/lucid-e2e/runs/{self.run_id}'
+        # previews come back through staging at the very end: fail now, not
+        # after an hour of compute, if it may not read scratch
+        try:
+            stage.list(scratch)
+        except Exception as e:
+            raise LucidError(f'staging plugin cannot access {scratch} -- start '
+                             'the endpoint with RADICAL_ORBIT_SCRATCH_BASE='
+                             f'$SCRATCH ({e})') from e
+        self._run_dir = f'{scratch}/lucid-e2e/runs/{self.run_id}'
         self._update(run_dir=self._run_dir)
 
     def _stage_in(self, globus, rh, stage):

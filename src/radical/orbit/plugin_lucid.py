@@ -31,6 +31,7 @@ import asyncio
 import base64
 import logging
 import os
+import shutil
 import tempfile
 import threading
 
@@ -140,8 +141,10 @@ class PluginLucid(Plugin):
         self._run    : Optional[lf.LucidRun]      = None
         self._thread : Optional[threading.Thread] = None
         self._state  : Optional[Dict[str, Any]]   = None
+        self._busy   = False                       # run slot reserved / active
         self._rt_own = None                        # runtime to $RADICAL_ORBIT_LUCID_BROKER
-        self._lock   = threading.Lock()
+        self._lock   = threading.Lock()            # run slot + state
+        self._rt_lock = threading.Lock()           # lazy creation of _rt_own
         self._imgdir = tempfile.mkdtemp(prefix='orbit-lucid-')
 
         self.add_route_get ('config/{sid}',                self.get_config)
@@ -182,12 +185,13 @@ class PluginLucid(Plugin):
         '''The runtime the flow drives remote endpoints through.'''
         url = os.environ.get(_BROKER_ENV)
         if url:
-            if self._rt_own is None:
-                from .runtime import EndpointRuntime
-                rt = EndpointRuntime(broker_url=url)
-                rt.start(wait=True)
-                self._rt_own = rt
-            return self._rt_own
+            with self._rt_lock:
+                if self._rt_own is None:
+                    from .runtime import EndpointRuntime
+                    rt = EndpointRuntime(broker_url=url)
+                    rt.start(wait=True)
+                    self._rt_own = rt
+                return self._rt_own
         rt = getattr(self._app.state, 'endpoint_service', None)
         if rt is None:
             raise HTTPException(status_code=503,
@@ -208,11 +212,21 @@ class PluginLucid(Plugin):
                 'endpoint' : cands[0] if cands else None}
 
     async def _submit(self, params: dict) -> dict:
+        # reserve the run slot before the first await: one run at a time
         with self._lock:
-            if self._thread and self._thread.is_alive():
+            if self._busy:
+                active = self._run.run_id if self._run else 'a run'
                 raise HTTPException(status_code=409,
-                                    detail=f'run {self._run.run_id} is still '
-                                           'active')
+                                    detail=f'{active} is still active')
+            self._busy = True
+        try:
+            return await self._start(params)
+        except BaseException:
+            with self._lock:
+                self._busy = False
+            raise
+
+    async def _start(self, params: dict) -> dict:
         endpoint = params.get('endpoint')
         if not endpoint:
             raise HTTPException(status_code=400, detail='no endpoint selected')
@@ -228,22 +242,34 @@ class PluginLucid(Plugin):
                    if params.get(k)}
             run = lf.LucidRun(rt, endpoint, params.get('wells') or [],
                               refresh_token=refresh, local_dir=self._imgdir,
-                              on_update=self._on_update, **kw)
+                              **kw)
         except lf.LucidError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
+        run._on_update = lambda st, rid=run.run_id: self._on_update(rid, st)
         with self._lock:
             self._run    = run
             self._state  = run.snapshot()
-            self._thread = threading.Thread(target=run.run, daemon=True,
+            self._thread = threading.Thread(target=self._execute, args=(run,),
+                                            daemon=True,
                                             name=f'lucid-{run.run_id}')
             self._thread.start()
         log.info('[lucid] started run %s on %s (%d wells)', run.run_id,
                  endpoint, len(run.state['wells']))
         return {'run_id': run.run_id}
 
-    def _on_update(self, state: dict) -> None:
+    def _execute(self, run: lf.LucidRun) -> None:
+        try:
+            run.run()
+        finally:
+            with self._lock:
+                if self._run is run:
+                    self._busy = False
+
+    def _on_update(self, run_id: str, state: dict) -> None:
         with self._lock:
+            if not self._run or self._run.run_id != run_id:
+                return                      # stale run: never clobber state
             self._state = state
         self._dispatch_notify('run_status', self._public(state))
 
@@ -274,6 +300,12 @@ class PluginLucid(Plugin):
         return {'name': name, 'mime': 'image/png', 'data': data}
 
     async def shutdown(self) -> None:
+        # stop the run first: it may still use the runtime stopped below
+        run, thread = self._run, self._thread
+        if run and thread and thread.is_alive():
+            run.cancel()
+            await asyncio.to_thread(thread.join, 60)
+        shutil.rmtree(self._imgdir, ignore_errors=True)
         if self._rt_own is not None:
             try:
                 await asyncio.to_thread(self._rt_own.stop)
