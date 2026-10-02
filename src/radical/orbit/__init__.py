@@ -34,13 +34,9 @@ from .plugin_math       import PluginMath     # noqa: F401
 from .plugin_task_dispatcher import PluginTaskDispatcher  # noqa: F401
 from .plugin_federation      import PluginFederation      # noqa: F401
 from .plugin_replay      import PluginReplay  # noqa: F401
+from .plugin_lucid       import PluginLucid   # noqa: F401
 
 # Optional plugins with external dependencies.
-try:
-    from .plugin_lucid import PluginLucid  # noqa: F401
-except ImportError as e:
-    log.warning('optional plugin "lucid" not loaded: %s', e)
-
 try:
     from .plugin_psij import PluginPSIJ  # noqa: F401
 except ImportError as e:
