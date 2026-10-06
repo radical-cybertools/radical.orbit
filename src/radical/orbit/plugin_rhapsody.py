@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 import uuid
@@ -38,6 +39,12 @@ ROUTE_LIST_TASKS  = 'list_tasks/{sid}'
 ROUTE_TASK        = 'task/{sid}/{uid}'
 ROUTE_CANCEL      = 'cancel/{sid}/{uid}'
 ROUTE_CANCEL_ALL  = 'cancel_all/{sid}'
+ROUTE_DATA_START     = 'data_start/{sid}'
+ROUTE_DATA_ENDPOINTS = 'data_endpoints/{sid}'
+ROUTE_DATA_SHUTDOWN  = 'data_shutdown/{sid}/{name}'
+
+# data backend names travel as a URL path segment (data_shutdown)
+DATA_NAME_RE = re.compile(r'[A-Za-z0-9_.-]+')
 
 TERMINAL_STATES     = {'DONE', 'FAILED', 'CANCELED', 'COMPLETED'}
 WS_PAYLOAD_LIMIT    = 8 * 1024 * 1024  # target max per batch (conservative)
@@ -205,6 +212,12 @@ class RhapsodySession(PluginSession):
         self._rh_session         = None
         self._telemetry          = None
         self._tasks: dict[str, dict] = {}
+
+        # Data backends started via ``data_start``, keyed by name.  Once
+        # started they are also registered with the rhapsody session, so
+        # session close shuts them down; this map is what the data routes
+        # report on, and it holds a name reserved while its start runs.
+        self._data: dict[str, tuple] = {}         # name -> (backend, kind)
 
         # Async init tracking
         self._init_ready = threading.Event()
@@ -796,19 +809,122 @@ class RhapsodySession(PluginSession):
         results = await asyncio.gather(*[_try_cancel(u) for u in uids])
         return {"canceled": sum(1 for r in results if r)}
 
+    # -- data backends -------------------------------------------------------
+
+    async def data_start(self, kind: str, name: str | None = None,
+                         kwargs: dict | None = None) -> dict:
+        """
+        Start a rhapsody data backend (``redis``, ``dragon``, ...) inside this
+        session, so the store runs next to the session's tasks.
+
+        ``name`` defaults to ``<kind>_data`` and must not collide with any
+        backend of the session, execution backends included.
+
+        Returns the backend's name, kind and serialized endpoints.
+        """
+        self._check_initialized()
+
+        get_data_backend = getattr(rh, 'get_data_backend', None)
+        if get_data_backend is None:
+            raise HTTPException(status_code=501,
+                                detail="installed rhapsody has no data backends")
+
+        name = name or f'{kind}_data'
+        if not DATA_NAME_RE.fullmatch(name):
+            raise HTTPException(status_code=400,
+                                detail=f"invalid data backend name {name!r}")
+        if name in self._data or name in self._rh_session.backends:
+            raise HTTPException(status_code=409,
+                                detail=f"backend {name!r} exists")
+
+        try:
+            backend = get_data_backend(kind, name=name, **(kwargs or {}))
+        except (ValueError, ImportError, TypeError) as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+        # reserve the name before the (slow) start so a concurrent request
+        # with the same name gets 409, not a second store
+        self._data[name] = (backend, kind)
+        try:
+            await backend.start()
+        except BaseException:
+            # includes cancellation by the endpoint's call timeout; a failing
+            # cleanup must not mask the original error
+            if self._data.get(name, (None,))[0] is backend:
+                del self._data[name]
+            try:
+                await asyncio.shield(backend.shutdown())
+            except Exception as e:
+                log.warning("[%s] data backend %s cleanup failed: %s",
+                            self._sid, name, e)
+            raise
+
+        # data_shutdown or session close may have run while start awaited
+        if self._data.get(name, (None,))[0] is not backend \
+                or self._rh_session is None:
+            try:
+                await backend.shutdown()
+            except Exception as e:
+                log.warning("[%s] data backend %s cleanup failed: %s",
+                            self._sid, name, e)
+            raise HTTPException(status_code=409,
+                                detail=f"data backend {name!r} was shut "
+                                        "down during start")
+
+        self._rh_session.add_backend(backend)
+        return self._data_info(name)
+
+    def _data_info(self, name: str) -> dict:
+        backend, kind = self._data[name]
+        state = backend.state.name
+        eps   = [e.serialize() for e in backend.endpoints] \
+                if state == 'READY' else []
+        return {"name": name, "kind": kind, "state": state, "endpoints": eps}
+
+    async def data_endpoints(self) -> dict:
+        """Report all data backends of this session with their endpoints."""
+        self._check_initialized()
+        return {"backends": {n: self._data_info(n) for n in list(self._data)}}
+
+    async def data_shutdown(self, name: str) -> dict:
+        """Shut down one data backend of this session."""
+        self._check_initialized()
+
+        entry = self._data.pop(name, None)
+        if entry is None:
+            raise HTTPException(status_code=404,
+                                detail=f"data backend {name} not found")
+        if self._rh_session is not None:
+            self._rh_session.backends.pop(name, None)
+        await entry[0].shutdown()
+        return {"name": name, "status": "shutdown"}
+
     async def close(self) -> dict:
         """
         Shutdown RHAPSODY session and clean up.
         """
-        if self._rh_session:
+        # Detach before awaiting: a data_start / data_shutdown still in
+        # flight then sees no session and no reservation, instead of
+        # mutating the backend dict rhapsody's close iterates.
+        data, self._data = self._data, {}
+        rh_session, self._rh_session = self._rh_session, None
+        if rh_session:
             if self._telemetry is not None:
                 summary = json.dumps(self._telemetry.summary(), indent=4)
                 log.info(summary)
                 print(summary, flush=True)
                 self._telemetry = None
-            await self._rh_session.close()
-            self._rh_session = None
+            await rh_session.close()
         self._tasks = {}
+
+        # stop data backends the rhapsody session did not own yet (start
+        # still running); shutdown is idempotent for the ones it closed
+        for backend, _ in data.values():
+            try:
+                await backend.shutdown()
+            except Exception as e:
+                log.warning("[%s] data backend %s shutdown failed: %s",
+                            self._sid, backend.name, e)
         return await super().close()
 
 
@@ -1271,6 +1387,41 @@ class RhapsodyClient(PluginClient):
         self._raise(resp)
         return resp.json()
 
+    def data_start(self, kind: str, name: str | None = None,
+                   **kwargs) -> dict:
+        """
+        Start a data backend of type ``kind`` in the remote session.
+
+        ``kwargs`` go to the remote data backend's constructor and must be
+        JSON-serializable.  Returns ``{name, kind, state, endpoints}`` with
+        the endpoints serialized as seen from the endpoint's side.
+        """
+        self._require_session()
+
+        url  = self._url(ROUTE_DATA_START.format(sid=self.sid))
+        resp = self._http.post(url, json={"kind": kind, "name": name,
+                                          "kwargs": kwargs})
+        self._raise(resp)
+        return resp.json()
+
+    def data_endpoints(self) -> dict:
+        """Return ``{"backends": {name: {kind, state, endpoints}}}``."""
+        self._require_session()
+
+        url  = self._url(ROUTE_DATA_ENDPOINTS.format(sid=self.sid))
+        resp = self._http.get(url)
+        self._raise(resp)
+        return resp.json()
+
+    def data_shutdown(self, name: str) -> dict:
+        """Shut down the remote data backend ``name``."""
+        self._require_session()
+
+        url  = self._url(ROUTE_DATA_SHUTDOWN.format(sid=self.sid, name=name))
+        resp = self._http.post(url)
+        self._raise(resp)
+        return resp.json()
+
 
 # ---------------------------------------------------------------------------
 # Server-side plugin
@@ -1289,6 +1440,9 @@ class PluginRhapsody(Plugin):
     - GET   /rhapsody/task/{sid}/{uid}       – get single task
     - POST  /rhapsody/cancel/{sid}/{uid}     – cancel single task
     - POST  /rhapsody/cancel_all/{sid}       – cancel all tasks
+    - POST  /rhapsody/data_start/{sid}       – start a data backend
+    - GET   /rhapsody/data_endpoints/{sid}   – list data backends
+    - POST  /rhapsody/data_shutdown/{sid}/{name} – stop a data backend
 
     Notification topics: ``session_status``, ``task_status``,
     ``task_status_batch``.
@@ -1371,6 +1525,10 @@ class PluginRhapsody(Plugin):
         self.add_route_get (ROUTE_TASK,       self.get_task)
         self.add_route_post(ROUTE_CANCEL,     self.cancel_task)
         self.add_route_post(ROUTE_CANCEL_ALL, self.cancel_all_tasks)
+
+        self.add_route_post(ROUTE_DATA_START,     self.data_start)
+        self.add_route_get (ROUTE_DATA_ENDPOINTS, self.data_endpoints)
+        self.add_route_post(ROUTE_DATA_SHUTDOWN,  self.data_shutdown)
 
     async def register_session(self, request: Request) -> dict:
         """Register a new Rhapsody session.
@@ -1572,3 +1730,29 @@ class PluginRhapsody(Plugin):
         sid = request.path_params['sid']
         return await self._forward(sid, RhapsodySession.cancel_all_tasks)
 
+    async def data_start(self, request: Request) -> dict:
+        sid  = request.path_params['sid']
+        data = await request.json()
+        if not isinstance(data, dict) or not isinstance(data.get('kind'), str):
+            raise HTTPException(status_code=400,
+                                detail="body needs a string 'kind'")
+        if not isinstance(data.get('name'), (str, type(None))):
+            raise HTTPException(status_code=400,
+                                detail="'name' must be a string")
+        kwargs = data.get('kwargs') or {}
+        if not isinstance(kwargs, dict):
+            raise HTTPException(status_code=400,
+                                detail="'kwargs' must be an object")
+        return await self._forward(sid, RhapsodySession.data_start,
+                                   kind=data['kind'], name=data.get('name'),
+                                   kwargs=kwargs)
+
+    async def data_endpoints(self, request: Request) -> dict:
+        sid = request.path_params['sid']
+        return await self._forward(sid, RhapsodySession.data_endpoints)
+
+    async def data_shutdown(self, request: Request) -> dict:
+        sid  = request.path_params['sid']
+        name = request.path_params['name']
+        return await self._forward(sid, RhapsodySession.data_shutdown,
+                                   name=name)
