@@ -59,6 +59,11 @@ try:
 except ImportError:
     globus_sdk = None
 
+# globus-sdk 4.x replaced TransferClient's ``transport_params`` with a
+# ``transport`` instance; 3.x accepts only the former.
+_SDK4 = globus_sdk is not None \
+    and int(globus_sdk.__version__.split('.')[0]) >= 4
+
 log = logging.getLogger('radical.orbit')
 
 # Background poll interval for active transfer tasks (seconds).
@@ -182,9 +187,13 @@ class GlobusSession(PluginSession):
 
         # Bound every HTTP call so a hung Globus endpoint cannot block the
         # offload thread indefinitely (mirrors the IRI client's timeout=30).
-        self._tc = globus_sdk.TransferClient(
-            authorizer=authorizer,
-            transport_params={"http_timeout": 60})
+        if _SDK4:
+            from globus_sdk.transport import RequestsTransport
+            tc_kwargs = {'transport': RequestsTransport(http_timeout=60)}
+        else:
+            tc_kwargs = {'transport_params': {'http_timeout': 60}}
+        self._tc = globus_sdk.TransferClient(authorizer=authorizer,
+                                             **tc_kwargs)
 
         # task_id -> {status, label}
         self._tasks: Dict[str, Dict[str, Any]] = {}

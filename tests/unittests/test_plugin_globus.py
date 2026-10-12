@@ -92,6 +92,29 @@ def test_session_no_credential():
             GlobusSession('s1')
 
 
+@pytest.mark.parametrize('sdk4', [True, False])
+def test_session_transport_kwargs(sdk4):
+    '''globus-sdk 4.x takes a ``transport``; 3.x takes ``transport_params``.'''
+    pytest.importorskip('globus_sdk')
+    with patch('radical.orbit.plugin_globus._SDK4', sdk4), \
+         patch('radical.orbit.plugin_globus.globus_sdk') as gs:
+        GlobusSession('s1', access_token='tok')
+    kwargs = gs.TransferClient.call_args.kwargs
+    if sdk4:
+        assert kwargs['transport'].http_timeout == 60
+        assert 'transport_params' not in kwargs
+    else:
+        assert kwargs['transport_params'] == {'http_timeout': 60}
+        assert 'transport' not in kwargs
+
+def test_session_real_transfer_client():
+    '''Unmocked: the installed globus-sdk (3.x or 4.x) accepts the
+    TransferClient construction, with the 60 s HTTP timeout applied.'''
+    pytest.importorskip('globus_sdk')
+    session = GlobusSession('s1', access_token='tok')
+    assert session._tc.transport.http_timeout == 60
+
+
 # ---------------------------------------------------------------------------
 # _resolve — local collection handling
 # ---------------------------------------------------------------------------
