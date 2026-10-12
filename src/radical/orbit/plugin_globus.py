@@ -44,6 +44,7 @@ import asyncio
 import concurrent.futures
 import json
 import logging
+import math
 import os
 import time
 import uuid
@@ -87,8 +88,8 @@ GLOBUS_WAIT_SLICE = 10
 
 # Poll failures ``GlobusClient.task_wait`` retries until its deadline:
 # 504 (call reaped or handler timed out), 503 (broker / runtime overload
-# fast-fail, or a transient Globus network error / 5xx) and 429 (Globus rate
-# limit), plus transport-level losses.  Not 502: the broker sends it for an
+# fast-fail, or a transient Globus network error / 5xx on a status query)
+# and 429 (Globus rate limit), plus transport-level losses.  Not 502: the broker sends it for an
 # unknown endpoint, and this plugin maps other unmapped Globus errors to it.
 _WAIT_RETRY_STATUS = {429, 503, 504}
 _WAIT_RETRY_EXC    = (TimeoutError, ConnectionError, httpx.TransportError,
@@ -100,12 +101,16 @@ _WAIT_RETRY_EXC    = (TimeoutError, ConnectionError, httpx.TransportError,
 # Utilities
 # ---------------------------------------------------------------------------
 
-def _retry_after(resp, default: Optional[float] = 1.0) -> Optional[float]:
-    """Seconds from a response's ``Retry-After`` header, else *default*."""
+def _retry_after(resp) -> Optional[float]:
+    """Seconds from a response's ``Retry-After`` header (at least 1), or
+    ``None`` when it is absent or not a positive finite number."""
     try:
-        return max(0.0, float(resp.headers.get('retry-after')))
+        val = float(resp.headers.get('retry-after'))
     except (TypeError, ValueError):
-        return default
+        return None
+    if not math.isfinite(val) or val <= 0:
+        return None
+    return max(1.0, val)
 
 
 def detect_local_collection() -> Optional[str]:
@@ -151,13 +156,17 @@ def _as_dict(res: Any) -> dict:
     return res.data if hasattr(res, 'data') else res
 
 
-def _globus_http_exc(exc: Exception, context: str = '') -> HTTPException:
+def _globus_http_exc(exc: Exception, context: str = '',
+                     read_only: bool = False) -> HTTPException:
     '''Map a globus-sdk API error to an HTTPException.
 
     ``ConsentRequired`` (the ``data_access`` consent needed for mapped
     collections) is surfaced as a clear 401 rather than an opaque 502, so the
     caller knows to re-acquire a token carrying the collection's data_access
     scope.
+
+    A Globus-side 5xx becomes 503 (retryable) only for *read_only* calls; a
+    mutating call keeps 502, since a retry could duplicate its effect.
     '''
     prefix = f'Globus {context}: ' if context else 'Globus: '
 
@@ -177,8 +186,8 @@ def _globus_http_exc(exc: Exception, context: str = '') -> HTTPException:
     elif sc == 403: return HTTPException(status_code=403, detail=f'{prefix}forbidden')
     elif sc == 404: return HTTPException(status_code=404, detail=f'{prefix}not found')
     elif sc == 429: return HTTPException(status_code=429, detail=f'{prefix}rate limited by Globus')
-    # a Globus-side 5xx is transient: 503, which clients may retry
-    elif sc >= 500: return HTTPException(status_code=503, detail=f'{prefix}{msg}')
+    elif sc >= 500 and read_only:
+        return HTTPException(status_code=503, detail=f'{prefix}{msg}')
     else:           return HTTPException(status_code=502, detail=f'{prefix}{msg}')
 
 
@@ -237,8 +246,14 @@ class GlobusSession(PluginSession):
             return self._local_collection
         return collection
 
-    async def _call(self, fn, *args, context: str = '', **kwargs) -> Any:
-        '''Offload a synchronous globus-sdk call and map its errors.'''
+    async def _call(self, fn, *args, context: str = '',
+                    read_only: bool = False, **kwargs) -> Any:
+        '''Offload a synchronous globus-sdk call and map its errors.
+
+        For *read_only* calls (status queries), transient Globus failures
+        (network errors, Globus 5xx) map to a retryable 503; for anything
+        else they stay 502, since a retry could duplicate the effect.
+        '''
         self._check_active()
         try:
             return await asyncio.to_thread(fn, *args, **kwargs)
@@ -247,8 +262,8 @@ class GlobusSession(PluginSession):
         except Exception as exc:
             if globus_sdk is not None \
                     and isinstance(exc, globus_sdk.GlobusAPIError):
-                raise _globus_http_exc(exc, context) from exc
-            if globus_sdk is not None \
+                raise _globus_http_exc(exc, context, read_only) from exc
+            if read_only and globus_sdk is not None \
                     and isinstance(exc, globus_sdk.NetworkError):
                 # connection error / timeout towards Globus: transient
                 raise HTTPException(status_code=503,
@@ -303,7 +318,7 @@ class GlobusSession(PluginSession):
 
     async def get_task(self, task_id: str) -> dict:
         res = _as_dict(await self._call(
-            self._tc.get_task, task_id, context='get_task'))
+            self._tc.get_task, task_id, context='get_task', read_only=True))
         if task_id in self._tasks and res.get('status'):
             self._tasks[task_id]['status'] = res['status']
         return res
@@ -324,7 +339,8 @@ class GlobusSession(PluginSession):
         timeout          = max(1, min(timeout, GLOBUS_WAIT_SLICE))
         polling_interval = max(1, min(polling_interval, timeout))
         done = await self._call(self._tc.task_wait, task_id, context='task_wait',
-                                timeout=timeout, polling_interval=polling_interval)
+                                read_only=True, timeout=timeout,
+                                polling_interval=polling_interval)
         return {'task_id': task_id, 'completed': bool(done)}
 
     async def cancel_task(self, task_id: str) -> dict:
@@ -507,8 +523,8 @@ class GlobusClient(PluginClient):
         never starts a poll past it.
 
         A failed poll is retried within *timeout* when it is transient: HTTP
-        504, 503 (after ``Retry-After``), 429 (after ``Retry-After``, else
-        one interval), or a transport-level loss (timeout, connection
+        504, 503 or 429 (after ``Retry-After`` if given, else at the next
+        scheduled poll), or a transport-level loss (timeout, connection
         error).  If the last poll before the deadline failed that way, its
         error is raised; other errors raise at once.
 
@@ -533,8 +549,7 @@ class GlobusClient(PluginClient):
             else:
                 if resp.status_code in _WAIT_RETRY_STATUS:
                     error = resp
-                    retry = _retry_after(
-                        resp, 1.0 if resp.status_code == 503 else None)
+                    retry = _retry_after(resp)
                 else:
                     self._raise(resp, f'task_wait {task_id!r}')
                     if resp.json().get('status') in GLOBUS_WAIT_DONE:

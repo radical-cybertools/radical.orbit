@@ -299,6 +299,24 @@ def test_client_task_wait_503_honours_retry_after(monkeypatch):
     assert sleeps == [3.0]
 
 
+def test_client_task_wait_503_without_retry_after_waits_for_slot(monkeypatch):
+    """No Retry-After: retry at the next scheduled poll, not after 1 s."""
+    client, http, sleeps = _wait_client([(503, {}), (200, _DONE)],
+                                        monkeypatch)
+    assert client.task_wait('t1', timeout=60) == _WAITED
+    assert sleeps == [10.0]
+
+
+@pytest.mark.parametrize('value, expected', [
+    ('3',    3.0), ('0.2', 1.0),          # floor at 1 s
+    ('0', None), ('-5', None), ('nan', None), ('inf', None), ('x', None),
+    (None, None),
+])
+def test_retry_after_parsing(value, expected):
+    resp = MagicMock(headers={} if value is None else {'retry-after': value})
+    assert pg._retry_after(resp) == expected
+
+
 def test_client_task_wait_503_retry_after_capped_by_deadline(monkeypatch):
     client, http, sleeps = _wait_client(
         [(503, {}, 0.0, {'retry-after': '30'}), (200, _ACTIVE)], monkeypatch)
@@ -495,29 +513,32 @@ def test_globus_http_exc_404():
     assert mapped.status_code == 404
 
 
-@pytest.mark.parametrize('http_status, expected', [
-    (500,  503),     # Globus-side 5xx: transient, retryable by clients
-    (503,  503),
-    (400,  502),     # other unmapped errors stay 502
-    (None, 502),
+@pytest.mark.parametrize('http_status, read_only, expected', [
+    (500,  True,  503),   # Globus 5xx on a status query: transient
+    (503,  True,  503),
+    (500,  False, 502),   # mutating call: a retry could duplicate work
+    (503,  False, 502),
+    (400,  True,  502),   # other unmapped errors stay 502
+    (None, True,  502),
 ])
-def test_globus_http_exc_unmapped(http_status, expected):
+def test_globus_http_exc_unmapped(http_status, read_only, expected):
     exc             = MagicMock(spec=['http_status', 'message', 'code'])
     exc.code        = 'EndpointError'
     exc.http_status = http_status
     exc.message     = 'boom'
-    mapped = _globus_http_exc(exc)
+    mapped = _globus_http_exc(exc, read_only=read_only)
     assert mapped.status_code == expected
     assert 'boom' in mapped.detail
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('exc_name, expected', [
-    ('GlobusConnectionError', 503),
-    ('GlobusTimeoutError',    503),
-    (None,                    502),     # anything else unexpected
+@pytest.mark.parametrize('exc_name, read_only, expected', [
+    ('GlobusConnectionError', True,  503),
+    ('GlobusTimeoutError',    True,  503),
+    ('GlobusConnectionError', False, 502),   # mutating call: not retryable
+    (None,                    True,  502),   # anything else unexpected
 ])
-async def test_call_maps_network_errors_to_503(exc_name, expected):
+async def test_call_maps_network_errors(exc_name, read_only, expected):
     pytest.importorskip('globus_sdk')
     import globus_sdk
     session = _make_session()
@@ -531,8 +552,31 @@ async def test_call_maps_network_errors_to_503(exc_name, expected):
 
     with patch('radical.orbit.plugin_globus.globus_sdk', globus_sdk):
         with pytest.raises(HTTPException) as info:
-            await session._call(_boom, context='get_task')
+            await session._call(_boom, context='x', read_only=read_only)
     assert info.value.status_code == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('method, args, read_only', [
+    ('get_task',       ('t1',),                          True),
+    ('task_wait',      ('t1',),                          True),
+    ('cancel_task',    ('t1',),                          False),
+    ('submit_transfer', ('src', 'dst', [{'source': '/a',
+                                         'destination': '/b'}]), False),
+])
+async def test_status_calls_read_only_mutations_not(method, args, read_only):
+    """Only status queries may report a transient Globus failure as 503."""
+    session = _make_session()
+    with patch.object(session, '_call') as call, \
+            patch('radical.orbit.plugin_globus.globus_sdk'):
+        call.return_value = {'task_id': 't1', 'status': 'ACTIVE'}
+        try:
+            await getattr(session, method)(*args)
+        except Exception:
+            pass
+    assert call.call_count >= 1
+    assert all(c.kwargs.get('read_only', False) is read_only
+               for c in call.call_args_list)
 
 
 def test_as_dict_response_object():

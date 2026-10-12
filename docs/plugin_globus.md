@@ -113,8 +113,8 @@ Task monitoring and control. The client's `task_wait` polls `get_task`
 every `polling_interval` on a fixed schedule up to `timeout` (at least
 once, so `timeout=0` is a status probe), so no routed call blocks near the
 broker's call timeout. It retries transient poll failures (HTTP 504, 503
-and 429 after `Retry-After`, timeouts and connection errors; the endpoint
-reports Globus network errors and Globus 5xx as 503) and returns
+and 429, after `Retry-After` if given, else at the next scheduled poll;
+timeouts and connection errors) and returns
 `{task_id, completed}`. Its `completed` is true once the task reports
 `SUCCEEDED`, `FAILED`, `CANCELED` or `INACTIVE` (e.g. an expired
 credential); a missing or unknown status does not count. Use `get_task`
@@ -123,6 +123,11 @@ for the status.
 The endpoint's `wait` route, for direct HTTP callers, bounds one wait to
 `GLOBUS_WAIT_SLICE` (10 s) and follows globus-sdk semantics: `completed`
 is true for any non-ACTIVE status.
+
+For status queries (`get_task`, the `wait` route) the endpoint reports a
+Globus network error or Globus 5xx as a retryable 503; mutating calls
+(submit, delete, mkdir, rename, cancel) keep 502, since a retry could
+duplicate their effect.
 
 `ls(collection, path=None)` / `mkdir(collection, path)` / `rename(collection, oldpath, newpath)` / `delete(collection, paths, recursive=False, label=None)`  
 Filesystem operations on a collection (`delete` submits a Globus delete
