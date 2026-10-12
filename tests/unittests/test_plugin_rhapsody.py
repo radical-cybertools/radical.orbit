@@ -1120,64 +1120,6 @@ async def test_session_close_cleans_up_when_rh_close_raises():
 
 
 @pytest.mark.asyncio
-async def test_session_close_keeps_session_during_shutdown():
-    '''While rhapsody shuts down, new requests are refused (session
-    inactive) but in-flight paths still see ``_rh_session``; it is
-    cleared only afterwards.'''
-    session = RhapsodySession("test.004")
-    mock_rh_session = MagicMock()
-    seen = []
-    mock_rh_session.close = AsyncMock(
-        side_effect=lambda: seen.append((session._rh_session,
-                                         session._active)))
-    session._rh_session = mock_rh_session
-
-    await session.close()
-
-    assert seen == [(mock_rh_session, False)]
-    assert session._rh_session is None
-
-
-@pytest.mark.asyncio
-async def test_session_close_concurrent_runs_rhapsody_close_once():
-    '''Two overlapping close() calls shut rhapsody down only once, and
-    the second returns only after that shutdown has finished.'''
-    session = RhapsodySession("test.005")
-    started  = asyncio.Event()
-    release  = asyncio.Event()
-    finished = asyncio.Event()
-    mock_rh_session = MagicMock()
-
-    async def _slow_close():
-        started.set()
-        await release.wait()
-        finished.set()
-
-    mock_rh_session.close = AsyncMock(side_effect=_slow_close)
-    session._rh_session = mock_rh_session
-
-    first = asyncio.ensure_future(session.close())
-    await started.wait()                   # first close is inside rhapsody
-
-    async def _second():
-        result = await session.close()
-        return result, finished.is_set()
-
-    second = asyncio.ensure_future(_second())
-    await asyncio.sleep(0.01)
-    assert not second.done()               # waits for the first close
-
-    release.set()
-    await first
-    result, rh_done = await second
-
-    assert result == {}
-    assert rh_done                         # returned after rhapsody closed
-    mock_rh_session.close.assert_awaited_once()
-    assert session._rh_session is None
-
-
-@pytest.mark.asyncio
 async def test_session_close_resets_tasks_without_rh_session():
     '''close() clears the task table even when no rhapsody session
     was ever built.'''
@@ -1186,16 +1128,6 @@ async def test_session_close_resets_tasks_without_rh_session():
 
     assert await session.close() == {}
     assert session._tasks == {}
-
-
-def test_live_rh_session_after_close():
-    '''In-flight paths get a clean error, not AttributeError, once
-    close() has cleared the rhapsody session.'''
-    session = RhapsodySession("test.live_rh")
-    session._rh_session = None
-
-    with pytest.raises(RuntimeError, match="session is closed"):
-        session._task_future('task.000001', MagicMock())
 
 
 @pytest.mark.asyncio
@@ -1214,46 +1146,6 @@ async def test_unwind_telemetry_stops_and_detaches():
     tm.stop.assert_awaited_once()
     assert rh_session._telemetry is None
     assert rh_session._state_manager._telemetry_observer is None
-
-
-@pytest.mark.asyncio
-async def test_close_during_initialize_releases_rhapsody(monkeypatch):
-    '''A close() that lands while initialize() is still awaiting must not
-    leak the rhapsody session that initialize() goes on to build.'''
-    from radical.orbit import plugin_rhapsody as prh
-
-    in_start = asyncio.Event()
-    release  = asyncio.Event()
-
-    async def _slow_start(**kwargs):
-        in_start.set()
-        await release.wait()
-        return MagicMock()
-
-    fake_session = MagicMock(spec=['start_telemetry', 'close'])
-    fake_session.start_telemetry = AsyncMock(side_effect=_slow_start)
-    fake_session.close = AsyncMock()
-    monkeypatch.setattr(prh.rh, 'get_backend',
-                        MagicMock(return_value=MagicMock(spec=[])))
-    monkeypatch.setattr(prh.rh, 'Session',
-                        MagicMock(return_value=fake_session))
-    monkeypatch.setattr(prh, '_telemetry_available', lambda: True)
-    monkeypatch.setattr(prh, '_resolve_telemetry', lambda: True)
-
-    sess = RhapsodySession('sess.close_in_init', backend_names=['fake'])
-    init = asyncio.ensure_future(_REAL_INITIALIZE(sess))
-    await in_start.wait()
-
-    await sess.close()                     # nothing built yet to close
-    fake_session.close.assert_not_awaited()
-
-    release.set()
-    await init
-
-    fake_session.close.assert_awaited_once()
-    assert sess._rh_session is None
-    assert sess._init_error is not None
-    assert sess._init_ready.is_set()
 
 
 @pytest.mark.asyncio

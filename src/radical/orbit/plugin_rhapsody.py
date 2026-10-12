@@ -244,7 +244,6 @@ class RhapsodySession(PluginSession):
         self.allow_pickled_tasks = allow_pickled_tasks
         self._rh_session         = None
         self._telemetry          = None
-        self._closed: asyncio.Event | None = None
         self._tasks: dict[str, dict] = {}
 
         # Async init tracking
@@ -286,25 +285,25 @@ class RhapsodySession(PluginSession):
             # Offload the blocking ``rh.Session`` construction to a worker
             # thread (the established ``_prepare_batch`` offload pattern) so it
             # keeps the work loop responsive to other requests during init.
-            rh_session = await asyncio.to_thread(
+            self._rh_session = await asyncio.to_thread(
                 rh.Session, backends=backends, uid=self._sid)
 
             # Telemetry is optional: older rhapsody lacks start_telemetry,
             # it needs the [telemetry] extra, the operator can switch it off,
             # and a failure to start it must not fail the session.
-            telemetry = None
-            start_telemetry = getattr(rh_session, 'start_telemetry', None)
+            self._telemetry = None
+            start_telemetry = getattr(self._rh_session, 'start_telemetry', None)
             if start_telemetry is not None and _resolve_telemetry() \
                     and _telemetry_available():
                 try:
-                    telemetry = await start_telemetry(
+                    self._telemetry = await start_telemetry(
                         resource_poll_interval=0.1,
                         checkpoint_path="telemetry-output")
                 except Exception as e:
                     log.warning("[%s] telemetry start failed: %r; not "
                                 "reporting telemetry for this session",
                                 self._sid, e)
-                    await self._unwind_telemetry(rh_session)
+                    await self._unwind_telemetry(self._rh_session)
 
             # Register state-change callbacks for intermediate notifications
             self._notified_states: dict[str, str] = {}
@@ -320,18 +319,6 @@ class RhapsodySession(PluginSession):
 
                     b.register_callback(_on_state)
 
-            if self._closed is not None:
-                # close() ran during the awaits above and found no rhapsody
-                # session to shut down: release what was built here.
-                self._init_error = "session closed during initialization"
-                self._init_ready.set()
-                log.info("[%s] Session closed during initialization",
-                         self._sid)
-                await rh_session.close()
-                return
-
-            self._rh_session = rh_session
-            self._telemetry  = telemetry
             self._init_ready.set()
             log.info("[%s] Session initialization complete", self._sid)
 
@@ -360,14 +347,6 @@ class RhapsodySession(PluginSession):
         sm = getattr(rh_session, '_state_manager', None)
         if hasattr(sm, '_telemetry_observer'):
             sm._telemetry_observer = None
-
-    def _live_rh_session(self):
-        """The rhapsody session, or a clean error once close() cleared it
-        (for request paths still in flight during teardown)."""
-        rh_session = self._rh_session
-        if rh_session is None:
-            raise RuntimeError("session is closed")
-        return rh_session
 
     def _on_task_state_change(self, task, state):
         """Fire notification on intermediate state changes (e.g. RUNNING).
@@ -495,7 +474,7 @@ class RhapsodySession(PluginSession):
         for i in range(0, len(task_dicts), _CHUNK):
             chunk = task_dicts[i:i + _CHUNK]
             tasks = await asyncio.to_thread(self._prepare_batch, chunk)
-            await self._live_rh_session().submit_tasks(tasks)
+            await self._rh_session.submit_tasks(tasks)
             for t in tasks:
                 uid_str = str(t.uid)
                 self._tasks[uid_str] = t
@@ -609,8 +588,7 @@ class RhapsodySession(PluginSession):
         dependency is a single greppable line that a dependency upgrade can
         find.
         """
-        return self._live_rh_session()._state_manager.get_wait_future(
-            uid_str, task)
+        return self._rh_session._state_manager.get_wait_future(uid_str, task)
 
     async def _watch_batch(self, tasks):
         """Watch a batch of tasks, notifying as each completes.
@@ -850,9 +828,9 @@ class RhapsodySession(PluginSession):
                                 detail=f"task {uid} not found")
 
         backend_name = task.get("backend")
-        backends     = self._live_rh_session().backends
-        if backend_name and backend_name in backends:
-            await backends[backend_name].cancel_task(uid)
+        if backend_name and backend_name in self._rh_session.backends:
+            backend = self._rh_session.backends[backend_name]
+            await backend.cancel_task(uid)
 
         return {"uid": uid, "status": "canceled"}
 
@@ -889,19 +867,8 @@ class RhapsodySession(PluginSession):
         """
         Shutdown RHAPSODY session and clean up.
         """
-        # A concurrent close() waits for the first one instead of shutting
-        # rhapsody down twice.
-        if self._closed is not None:
-            await self._closed.wait()
-            return {}
-        self._closed = asyncio.Event()
-
-        rh_session = self._rh_session
         try:
-            # New requests now fail in _check_active; in-flight ones still
-            # see _rh_session until the shutdown below completes.
-            self._active = False
-            if rh_session is not None:
+            if self._rh_session:
                 # Telemetry is best effort: never let it block teardown.
                 if self._telemetry is not None \
                         and log.isEnabledFor(logging.INFO):
@@ -912,15 +879,10 @@ class RhapsodySession(PluginSession):
                         log.warning("[%s] telemetry summary failed: %r",
                                     self._sid, e)
                 self._telemetry = None
-                try:
-                    await rh_session.close()
-                finally:
-                    # cleared only after the await, so in-flight request
-                    # paths still see the session while it shuts down
-                    self._rh_session = None
+                await self._rh_session.close()
         finally:
+            self._rh_session = None
             self._tasks = {}
-            self._closed.set()
             await super().close()
         return {}
 
