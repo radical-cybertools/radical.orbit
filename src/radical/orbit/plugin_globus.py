@@ -44,6 +44,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 
 from typing import Any, Dict, List, Optional
@@ -69,6 +70,13 @@ GLOBUS_TERMINAL = {'SUCCEEDED', 'FAILED', 'CANCELED', 'CANCELLED'}
 
 # Local-collection config file (lowest-priority auto-detection source).
 GLOBUS_CONFIG_FILE = '~/.radical/orbit/globus.json'
+
+# Upper bound for one server-side ``task_wait`` (seconds).  The broker reaps
+# a routed call after ``BrokerTuning.call_timeout`` (30 s by default) with
+# HTTP 504 while the transfer keeps running, so one wait (plus a few Globus
+# API round trips) must stay well below it.  ``GlobusClient.task_wait``
+# loops such waits up to the caller's total timeout.
+GLOBUS_WAIT_SLICE = 15
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +278,11 @@ class GlobusSession(PluginSession):
 
     async def task_wait(self, task_id: str, timeout: int = 60,
                         polling_interval: int = 10) -> dict:
+        # Bound the blocking wait below the routed-call timeout (see
+        # GLOBUS_WAIT_SLICE); globus-sdk sleeps a full polling_interval
+        # even past its timeout, so bound that too.
+        timeout          = max(1, min(timeout, GLOBUS_WAIT_SLICE))
+        polling_interval = max(1, min(polling_interval, timeout))
         done = await self._call(self._tc.task_wait, task_id, context='task_wait',
                                 timeout=timeout, polling_interval=polling_interval)
         return {'task_id': task_id, 'completed': bool(done)}
@@ -439,11 +452,24 @@ class GlobusClient(PluginClient):
 
     def task_wait(self, task_id: str, timeout: int = 60,
                  polling_interval: int = 10) -> dict:
+        '''Wait up to *timeout* seconds for the task to finish.
+
+        The endpoint bounds each wait to ``GLOBUS_WAIT_SLICE`` (below the
+        routed-call timeout), so this loops such waits until the task
+        completes or *timeout* expires.  Returns ``{task_id, completed}``.
+        '''
         self._require_session()
-        resp = self._http.post(self._url(f'wait/{self._sid}/{task_id}'), json={
-            'timeout': timeout, 'polling_interval': polling_interval})
-        self._raise(resp, f'task_wait {task_id!r}')
-        return resp.json()
+        deadline = time.monotonic() + timeout
+        while True:
+            wait = max(1, min(GLOBUS_WAIT_SLICE,
+                              int(deadline - time.monotonic())))
+            resp = self._http.post(self._url(f'wait/{self._sid}/{task_id}'),
+                                   json={'timeout': wait,
+                                         'polling_interval': polling_interval})
+            self._raise(resp, f'task_wait {task_id!r}')
+            res = resp.json()
+            if res.get('completed') or time.monotonic() >= deadline:
+                return res
 
     def cancel_task(self, task_id: str) -> dict:
         self._require_session()

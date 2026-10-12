@@ -10,9 +10,12 @@ from unittest.mock import MagicMock, patch
 
 from fastapi import FastAPI, HTTPException
 
+from radical.orbit import plugin_globus as pg
 from radical.orbit.plugin_globus import (
     PluginGlobus,
     GlobusSession,
+    GlobusClient,
+    GLOBUS_WAIT_SLICE,
     detect_local_collection,
     _globus_http_exc,
     _as_dict,
@@ -168,6 +171,48 @@ async def test_task_wait():
     session._tc.task_wait.return_value = True
     result = await session.task_wait('t1', timeout=5)
     assert result == {'task_id': 't1', 'completed': True}
+
+
+@pytest.mark.asyncio
+async def test_task_wait_clamped_below_call_timeout():
+    """A long wait is bounded per call so the routed call is not reaped."""
+    session = _make_session()
+    session._tc.task_wait.return_value = False
+    await session.task_wait('t1', timeout=600, polling_interval=60)
+    kwargs = session._tc.task_wait.call_args.kwargs
+    assert kwargs['timeout']          == GLOBUS_WAIT_SLICE
+    assert kwargs['polling_interval'] == GLOBUS_WAIT_SLICE
+
+
+def _wait_client(results):
+    """GlobusClient whose wait route answers with *results* in order."""
+    http = MagicMock()
+    http.post.side_effect = [
+        MagicMock(is_error=False, json=MagicMock(return_value=r))
+        for r in results]
+    client = GlobusClient(http, '/globus')
+    client._sid = 'sid'
+    return client, http
+
+
+def test_client_task_wait_loops_until_completed():
+    client, http = _wait_client([{'task_id': 't1', 'completed': False},
+                                 {'task_id': 't1', 'completed': True}])
+    res = client.task_wait('t1', timeout=300)
+    assert res == {'task_id': 't1', 'completed': True}
+    assert http.post.call_count == 2
+    for call in http.post.call_args_list:
+        assert call.kwargs['json']['timeout'] <= GLOBUS_WAIT_SLICE
+
+
+def test_client_task_wait_stops_at_deadline(monkeypatch):
+    clock = iter([0.0, 0.0, 16.0, 16.0, 31.0])
+    monkeypatch.setattr(pg.time, 'monotonic', lambda: next(clock))
+    client, http = _wait_client([{'task_id': 't1', 'completed': False}] * 2)
+    res = client.task_wait('t1', timeout=30)
+    assert res['completed'] is False
+    assert [c.kwargs['json']['timeout'] for c in http.post.call_args_list] \
+        == [GLOBUS_WAIT_SLICE, 14]
 
 
 @pytest.mark.asyncio

@@ -109,7 +109,10 @@ Submit a transfer. `items` is a list of
 `{task_id, submission_id, status}`.
 
 `get_task(task_id)` / `task_wait(task_id, timeout=60, polling_interval=10)` / `cancel_task(task_id)` / `list_tasks(limit=100)`  
-Task monitoring and control.
+Task monitoring and control. The endpoint bounds one wait to
+`GLOBUS_WAIT_SLICE` (15 s), below the broker's routed-call timeout;
+`task_wait` loops such waits up to `timeout` and returns
+`{task_id, completed}`.
 
 `ls(collection, path=None)` / `mkdir(collection, path)` / `rename(collection, oldpath, newpath)` / `delete(collection, paths, recursive=False, label=None)`  
 Filesystem operations on a collection (`delete` submits a Globus delete
