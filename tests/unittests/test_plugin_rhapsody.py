@@ -1130,22 +1130,28 @@ async def test_session_close_resets_tasks_without_rh_session():
     assert session._tasks == {}
 
 
+@pytest.mark.parametrize('failed_start, warned', [(True, False),
+                                                  (False, True)])
 @pytest.mark.asyncio
-async def test_unwind_telemetry_stops_and_detaches():
-    '''A half-started manager is stopped best effort (a failing stop is
-    tolerated) and detached from the rhapsody session.'''
+async def test_unwind_telemetry_stops_and_detaches(orbit_caplog,
+                                                   failed_start, warned):
+    '''The manager is stopped best effort (a failing stop is tolerated)
+    and detached.  The stop failure is a warning on a normal close and
+    expected (debug only) after a failed start.'''
     session = RhapsodySession("test.unwind")
     tm = MagicMock()
-    tm.stop = AsyncMock(side_effect=TypeError("never started"))
+    tm.stop = AsyncMock(side_effect=TypeError("stop broke"))
     rh_session = MagicMock()
     rh_session._telemetry = tm
     rh_session._state_manager._telemetry_observer = tm._on_task_state_change
 
-    await session._unwind_telemetry(rh_session)
+    await session._unwind_telemetry(rh_session, failed_start=failed_start)
 
     tm.stop.assert_awaited_once()
     assert rh_session._telemetry is None
     assert rh_session._state_manager._telemetry_observer is None
+    assert any('telemetry stop failed' in r.getMessage()
+               for r in orbit_caplog.records) is warned
 
 
 @pytest.mark.asyncio
@@ -1154,6 +1160,7 @@ async def test_session_close_survives_telemetry_failure():
     session = RhapsodySession("test.telem_summary_fails")
     mock_rh_session = MagicMock()
     mock_rh_session.close = AsyncMock()
+    mock_rh_session._telemetry = None       # nothing for the unwind to stop
     session._rh_session = mock_rh_session
     telemetry = MagicMock()
     telemetry.summary.side_effect = RuntimeError("otel broke")
@@ -1498,6 +1505,42 @@ async def test_initialize_telemetry_start_failure(monkeypatch, orbit_caplog):
     assert sess._telemetry is None
     assert sess._init_error is None
     assert sess._init_ready.is_set()
+
+
+@pytest.mark.asyncio
+async def test_initialize_cancelled_during_telemetry_start(monkeypatch):
+    '''A cancel while start_telemetry() is pending unwinds the manager,
+    unblocks init waiters and re-raises the cancellation.'''
+    from radical.orbit import plugin_rhapsody as prh
+
+    in_start = asyncio.Event()
+
+    async def _hang(**kwargs):
+        in_start.set()
+        await asyncio.Event().wait()
+
+    fake_session = MagicMock(spec=['start_telemetry'])
+    fake_session.start_telemetry = AsyncMock(side_effect=_hang)
+    monkeypatch.setattr(prh.rh, 'get_backend',
+                        MagicMock(return_value=MagicMock(spec=[])))
+    monkeypatch.setattr(prh.rh, 'Session',
+                        MagicMock(return_value=fake_session))
+    monkeypatch.setattr(prh, '_telemetry_available', lambda: True)
+    monkeypatch.setattr(prh, '_resolve_telemetry', lambda: True)
+
+    sess = RhapsodySession('sess.telem_cancel', backend_names=['fake'])
+    sess._unwind_telemetry = AsyncMock()
+    init = asyncio.ensure_future(_REAL_INITIALIZE(sess))
+    await in_start.wait()
+    init.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await init
+
+    sess._unwind_telemetry.assert_awaited_once_with(fake_session,
+                                                    failed_start=True)
+    assert sess._init_ready.is_set()
+    assert sess._init_error is not None
 
 
 @pytest.fixture

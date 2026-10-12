@@ -303,7 +303,15 @@ class RhapsodySession(PluginSession):
                     log.warning("[%s] telemetry start failed: %r; not "
                                 "reporting telemetry for this session",
                                 self._sid, e)
-                    await self._unwind_telemetry(self._rh_session)
+                    await self._unwind_telemetry(self._rh_session,
+                                                 failed_start=True)
+                except BaseException:
+                    # cancelled mid-start: unwind and unblock waiters
+                    await self._unwind_telemetry(self._rh_session,
+                                                 failed_start=True)
+                    self._init_error = "session initialization cancelled"
+                    self._init_ready.set()
+                    raise
 
             # Register state-change callbacks for intermediate notifications
             self._notified_states: dict[str, str] = {}
@@ -329,7 +337,8 @@ class RhapsodySession(PluginSession):
                       self._sid, e)
             raise
 
-    async def _unwind_telemetry(self, rh_session) -> None:
+    async def _unwind_telemetry(self, rh_session,
+                                failed_start: bool = False) -> None:
         """Stop rhapsody's telemetry manager best effort and detach it.
 
         Workaround: rhapsody (<= 0.4) ``Session.close()`` stops telemetry
@@ -338,14 +347,21 @@ class RhapsodySession(PluginSession):
         half-started manager whose ``stop()`` does raise.  Used after a
         failed start and before every rhapsody close; drop this once
         rhapsody isolates telemetry failures itself.
+
+        A stop failure is expected after a failed start (logged at debug)
+        and unexpected otherwise (logged as a warning).
         """
         tm = getattr(rh_session, '_telemetry', None)
         if tm is not None:
             try:
                 await tm.stop()
             except Exception as e:
-                log.debug("[%s] stopping half-started telemetry: %r",
-                          self._sid, e)
+                if failed_start:
+                    log.debug("[%s] stopping half-started telemetry: %r",
+                              self._sid, e)
+                else:
+                    log.warning("[%s] telemetry stop failed: %r",
+                                self._sid, e)
             rh_session._telemetry = None
         sm = getattr(rh_session, '_state_manager', None)
         if hasattr(sm, '_telemetry_observer'):
