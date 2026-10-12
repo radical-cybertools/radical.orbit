@@ -75,6 +75,11 @@ RETURN_VALUE_LIMIT  = FRAME_CAP // BUDGET_RATIO
 # trips) sets `0` to flush every completion immediately.
 ENV_NOTIFY_WINDOW   = 'RADICAL_ORBIT_RHAPSODY_NOTIFY_WINDOW'
 
+# Endpoint-level telemetry switch: rhapsody session telemetry (when its
+# ``[telemetry]`` extra is installed) is on unless this is set to one of
+# ``0`` / ``false`` / ``no`` / ``off``.
+ENV_TELEMETRY       = 'RADICAL_ORBIT_RHAPSODY_TELEMETRY'
+
 # Guard optional dependencies
 try:
     import rhapsody as rh
@@ -101,6 +106,12 @@ def _telemetry_available() -> bool:
         log.warning("rhapsody telemetry disabled: opentelemetry-sdk "
                     "(the rhapsody [telemetry] extra) is not installed")
     return ok
+
+
+def _telemetry_enabled() -> bool:
+    """Whether ``$RADICAL_ORBIT_RHAPSODY_TELEMETRY`` leaves telemetry on."""
+    raw = os.environ.get(ENV_TELEMETRY, '').strip().lower()
+    return raw not in ('0', 'false', 'no', 'off')
 
 
 def _json_safe(v):
@@ -268,13 +279,19 @@ class RhapsodySession(PluginSession):
                 rh.Session, backends=backends, uid=self._sid)
 
             # Telemetry is optional: older rhapsody lacks start_telemetry,
-            # and it needs the [telemetry] extra.
+            # it needs the [telemetry] extra, the operator can switch it off,
+            # and a failure to start it must not fail the session.
             self._telemetry = None
             start_telemetry = getattr(self._rh_session, 'start_telemetry', None)
-            if start_telemetry is not None and _telemetry_available():
-                self._telemetry = await start_telemetry(
-                    resource_poll_interval=0.1,
-                    checkpoint_path="telemetry-output")
+            if start_telemetry is not None and _telemetry_enabled() \
+                    and _telemetry_available():
+                try:
+                    self._telemetry = await start_telemetry(
+                        resource_poll_interval=0.1,
+                        checkpoint_path="telemetry-output")
+                except Exception as e:
+                    log.warning("[%s] telemetry disabled, start failed: %r",
+                                self._sid, e)
 
             # Register state-change callbacks for intermediate notifications
             self._notified_states: dict[str, str] = {}
@@ -821,9 +838,12 @@ class RhapsodySession(PluginSession):
         """
         if self._rh_session:
             if self._telemetry is not None:
-                summary = json.dumps(self._telemetry.summary(), indent=4)
-                log.info(summary)
-                print(summary, flush=True)
+                # Telemetry is best effort: never let it block teardown.
+                try:
+                    log.info(json.dumps(self._telemetry.summary(), indent=4))
+                except Exception as e:
+                    log.warning("[%s] telemetry summary failed: %r",
+                                self._sid, e)
                 self._telemetry = None
             await self._rh_session.close()
             self._rh_session = None

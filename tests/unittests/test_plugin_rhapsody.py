@@ -1091,8 +1091,7 @@ async def test_session_close():
 
     expected = json.dumps(session._telemetry.summary.return_value, indent=4)
 
-    with patch('radical.orbit.plugin_rhapsody.log') as mock_log, \
-         patch('builtins.print') as mock_print:
+    with patch('radical.orbit.plugin_rhapsody.log') as mock_log:
         result = await session.close()
 
     assert result == {}
@@ -1100,7 +1099,24 @@ async def test_session_close():
     assert session._telemetry is None
     mock_rh_session.close.assert_called_once()
     mock_log.info.assert_called_once_with(expected)
-    mock_print.assert_called_once_with(expected, flush=True)
+
+
+@pytest.mark.asyncio
+async def test_session_close_survives_telemetry_failure():
+    '''A failing telemetry summary must not block the rhapsody teardown.'''
+    session = RhapsodySession("test.002")
+    mock_rh_session = MagicMock()
+    mock_rh_session.close = AsyncMock()
+    session._rh_session = mock_rh_session
+    session._telemetry = MagicMock()
+    session._telemetry.summary.side_effect = RuntimeError("otel broke")
+
+    result = await session.close()
+
+    assert result == {}
+    assert session._telemetry is None
+    assert session._rh_session is None
+    mock_rh_session.close.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1329,6 +1345,63 @@ async def test_initialize_without_telemetry(monkeypatch, has_method, otel):
         fake_session.start_telemetry.assert_not_awaited()
     assert sess._telemetry is None
     assert sess._rh_session is fake_session
+    assert sess._init_error is None
+    assert sess._init_ready.is_set()
+
+
+@pytest.mark.parametrize('env, started', [
+    (None,    True),
+    ('1',     True),
+    ('0',     False),
+    ('off',   False),
+    ('False', False),
+])
+@pytest.mark.asyncio
+async def test_initialize_telemetry_env_switch(monkeypatch, env, started):
+    '''``$RADICAL_ORBIT_RHAPSODY_TELEMETRY`` switches telemetry off;
+    unset keeps it on.'''
+    from radical.orbit import plugin_rhapsody as prh
+
+    fake_session = MagicMock(spec=['start_telemetry'])
+    fake_session.start_telemetry = AsyncMock(return_value='telem')
+    monkeypatch.setattr(prh.rh, 'get_backend',
+                        MagicMock(return_value=MagicMock(spec=[])))
+    monkeypatch.setattr(prh.rh, 'Session',
+                        MagicMock(return_value=fake_session))
+    monkeypatch.setattr(prh, '_telemetry_available', lambda: True)
+    if env is None:
+        monkeypatch.delenv(prh.ENV_TELEMETRY, raising=False)
+    else:
+        monkeypatch.setenv(prh.ENV_TELEMETRY, env)
+
+    sess = RhapsodySession('sess.telem_env', backend_names=['fake'])
+    await _REAL_INITIALIZE(sess)
+
+    assert sess._init_error is None
+    assert (fake_session.start_telemetry.await_count == 1) is started
+    assert sess._telemetry == ('telem' if started else None)
+
+
+@pytest.mark.asyncio
+async def test_initialize_telemetry_start_failure(monkeypatch):
+    '''A telemetry start failure (e.g. an unwritable checkpoint dir)
+    disables telemetry instead of failing the session.'''
+    from radical.orbit import plugin_rhapsody as prh
+
+    fake_session = MagicMock(spec=['start_telemetry'])
+    fake_session.start_telemetry = AsyncMock(
+        side_effect=PermissionError("telemetry-output"))
+    monkeypatch.setattr(prh.rh, 'get_backend',
+                        MagicMock(return_value=MagicMock(spec=[])))
+    monkeypatch.setattr(prh.rh, 'Session',
+                        MagicMock(return_value=fake_session))
+    monkeypatch.setattr(prh, '_telemetry_available', lambda: True)
+    monkeypatch.delenv(prh.ENV_TELEMETRY, raising=False)
+
+    sess = RhapsodySession('sess.telem_fail', backend_names=['fake'])
+    await _REAL_INITIALIZE(sess)
+
+    assert sess._telemetry is None
     assert sess._init_error is None
     assert sess._init_ready.is_set()
 
