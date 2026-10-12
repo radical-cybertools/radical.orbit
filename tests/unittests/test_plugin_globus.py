@@ -209,88 +209,123 @@ def test_resolve_wait_slice(call_timeout, expected):
     assert pg._resolve_wait_slice(app) == expected
 
 
-def _wait_client(replies, monkeypatch):
-    """GlobusClient whose wait route answers with *replies* in order.
+@pytest.mark.asyncio
+async def test_wait_route_resolves_slice_per_request(endpoint_app):
+    """The runtime sets its call timeout only after building its plugins
+    (EndpointRuntime.__init__), so the bound must be read per request."""
+    endpoint_app.state.endpoint_service = MagicMock(spec=[])  # no timeout yet
+    plugin = PluginGlobus(endpoint_app)
+    endpoint_app.state.endpoint_service._call_timeout = 15.0  # set later
 
-    Each reply is ``(status, body, elapsed)``; *elapsed* (default: the
-    requested wait) advances a fake clock, as does ``time.sleep``.
+    request = MagicMock(path_params={'sid': 's1', 'task_id': 't1'})
+
+    async def _json():
+        return {'timeout': 60}
+    request.json = _json
+    with patch.object(plugin, '_forward') as fwd:
+        fwd.return_value = {}
+        await plugin.task_wait(request)
+    assert fwd.call_args.args[-1] == 5          # 15 s / 3
+
+
+def _wait_client(replies, monkeypatch):
+    """GlobusClient whose get_task route answers with *replies* in order.
+
+    Each reply is ``(status, body)`` or ``(status, body, elapsed,
+    headers)``; *elapsed* (default 0) advances a fake clock, as does
+    ``time.sleep`` (whose arguments are recorded).
     """
     now     = [0.0]
+    sleeps  = []
     replies = iter(replies)
 
-    def _post(url, json):
-        status, body, elapsed = next(replies)
-        now[0] += json['timeout'] if elapsed is None else elapsed
+    def _get(url):
+        status, body, elapsed, headers = (tuple(next(replies)) + (0.0, {}))[:4]
+        now[0] += elapsed
         return MagicMock(status_code=status, is_error=status >= 400,
-                         json=MagicMock(return_value=body))
+                         headers=headers, json=MagicMock(return_value=body))
 
     def _sleep(t):
+        sleeps.append(t)
         now[0] += t
 
     monkeypatch.setattr(pg.time, 'monotonic', lambda: now[0])
     monkeypatch.setattr(pg.time, 'sleep', _sleep)
     http = MagicMock()
-    http.post.side_effect = _post
+    http.get.side_effect = _get
     client = GlobusClient(http, '/globus')
     client._sid = 'sid'
-    return client, http, now
+    return client, http, sleeps
 
 
-_ACTIVE = {'task_id': 't1', 'completed': False}
-_DONE   = {'task_id': 't1', 'completed': True}
+_ACTIVE = {'task_id': 't1', 'status': 'ACTIVE'}
+_DONE   = {'task_id': 't1', 'status': 'SUCCEEDED'}
+_WAITED = {'task_id': 't1', 'completed': True}
+_TIMED  = {'task_id': 't1', 'completed': False}
 
 
-def _sent(http):
-    return [c.kwargs['json']['timeout'] for c in http.post.call_args_list]
+def test_client_task_wait_polls_until_done(monkeypatch):
+    client, http, sleeps = _wait_client([(200, _ACTIVE), (200, _ACTIVE),
+                                         (200, _DONE)], monkeypatch)
+    assert client.task_wait('t1', timeout=300) == _WAITED
+    assert sleeps == [10, 10]
 
 
-def test_client_task_wait_loops_until_completed(monkeypatch):
-    client, http, _ = _wait_client([(200, _ACTIVE, None),
-                                    (200, _DONE,   None)], monkeypatch)
-    assert client.task_wait('t1', timeout=300) == _DONE
-    assert _sent(http) == [GLOBUS_WAIT_SLICE, GLOBUS_WAIT_SLICE]
+def test_client_task_wait_one_poll_per_interval(monkeypatch):
+    """Globus sees one status call per interval, plus one at the deadline."""
+    client, http, sleeps = _wait_client([(200, _ACTIVE)] * 7, monkeypatch)
+    assert client.task_wait('t1', timeout=60, polling_interval=10) == _TIMED
+    assert http.get.call_count == 7             # t = 0, 10, ..., 60
+    assert sleeps == [10] * 6
 
 
-def test_client_task_wait_stops_at_deadline(monkeypatch):
-    """No final 1 s round trip once less than a second is left."""
-    client, http, _ = _wait_client([(200, _ACTIVE, None),
-                                    (200, _ACTIVE, 9.5)], monkeypatch)
-    res = client.task_wait('t1', timeout=20)
-    assert res['completed'] is False
-    assert _sent(http) == [GLOBUS_WAIT_SLICE, GLOBUS_WAIT_SLICE]
-
-
-def test_client_task_wait_slice_overruns_clock(monkeypatch):
-    """A slice that takes far longer than requested ends the wait at the
-    deadline instead of issuing another call."""
-    client, http, _ = _wait_client([(200, _ACTIVE, 40.0)], monkeypatch)
-    assert client.task_wait('t1', timeout=30)['completed'] is False
-    assert http.post.call_count == 1
+def test_client_task_wait_inactive_counts_as_completed(monkeypatch):
+    client, _, _ = _wait_client([(200, {'status': 'INACTIVE'})], monkeypatch)
+    assert client.task_wait('t1', timeout=60) == _WAITED
 
 
 def test_client_task_wait_zero_timeout_probes_once(monkeypatch):
-    """timeout=0 still asks once (a status probe)."""
-    client, http, _ = _wait_client([(200, _DONE, 0.2)], monkeypatch)
-    assert client.task_wait('t1', timeout=0) == _DONE
-    assert _sent(http) == [1]
+    client, http, _ = _wait_client([(200, _ACTIVE)], monkeypatch)
+    assert client.task_wait('t1', timeout=0) == _TIMED
+    assert http.get.call_count == 1
 
 
-@pytest.mark.parametrize('status', [503, 504])
-def test_client_task_wait_retries_lost_slice(monkeypatch, status):
-    """A slice lost in transit mid-loop is retried, not raised."""
-    client, http, _ = _wait_client([(200,    _ACTIVE, None),
-                                    (status, {'detail': 'lost'}, 30.0),
-                                    (200,    _DONE,   None)], monkeypatch)
-    assert client.task_wait('t1', timeout=120) == _DONE
-    assert http.post.call_count == 3
+def test_client_task_wait_slow_poll_ends_at_deadline(monkeypatch):
+    """A poll that takes past the deadline ends the wait, no extra call."""
+    client, http, _ = _wait_client([(200, _ACTIVE, 40.0, {})], monkeypatch)
+    assert client.task_wait('t1', timeout=30) == _TIMED
+    assert http.get.call_count == 1
 
 
-def test_client_task_wait_raises_lost_slice_at_deadline(monkeypatch):
-    """If the last attempt before the deadline was lost, raise it rather
-    than report a silent completed=False."""
-    client, http, _ = _wait_client([(200, _ACTIVE, None),
-                                    (504, {'detail': 'call timed out'}, 30.0)],
-                                   monkeypatch)
+def test_client_task_wait_retries_504(monkeypatch):
+    client, http, sleeps = _wait_client(
+        [(200, _ACTIVE), (504, {'detail': 'lost'}, 30.0, {}), (200, _DONE)],
+        monkeypatch)
+    assert client.task_wait('t1', timeout=120) == _WAITED
+    assert sleeps == [10, 10]
+
+
+def test_client_task_wait_503_honours_retry_after(monkeypatch):
+    client, http, sleeps = _wait_client(
+        [(503, {'detail': 'cap'}, 0.0, {'retry-after': '3'}), (200, _DONE)],
+        monkeypatch)
+    assert client.task_wait('t1', timeout=60) == _WAITED
+    assert sleeps == [3.0]
+
+
+def test_client_task_wait_503_retry_after_capped_by_deadline(monkeypatch):
+    client, http, sleeps = _wait_client(
+        [(503, {}, 0.0, {'retry-after': '30'}), (200, _ACTIVE)], monkeypatch)
+    assert client.task_wait('t1', timeout=5) == _TIMED
+    assert sleeps == [5]
+
+
+def test_client_task_wait_raises_lost_poll_at_deadline(monkeypatch):
+    """If the last poll before the deadline was lost, raise it rather than
+    report a silent completed=False."""
+    client, _, _ = _wait_client(
+        [(200, _ACTIVE), (504, {'detail': 'call timed out'}, 30.0, {})],
+        monkeypatch)
     with pytest.raises(RuntimeError, match='HTTP 504'):
         client.task_wait('t1', timeout=30)
 
@@ -298,11 +333,11 @@ def test_client_task_wait_raises_lost_slice_at_deadline(monkeypatch):
 @pytest.mark.parametrize('status', [404, 502])
 def test_client_task_wait_raises_other_errors(monkeypatch, status):
     """502 is not retried: it is how the plugin reports Globus errors."""
-    client, http, _ = _wait_client([(status, {'detail': 'boom'}, 0.0)],
+    client, http, _ = _wait_client([(status, {'detail': 'boom'})],
                                    monkeypatch)
     with pytest.raises(RuntimeError, match=f'HTTP {status}'):
         client.task_wait('t1', timeout=60)
-    assert http.post.call_count == 1
+    assert http.get.call_count == 1
 
 
 @pytest.mark.asyncio

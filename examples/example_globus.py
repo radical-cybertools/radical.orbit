@@ -96,6 +96,10 @@ def main():
             print('  … still transferring')
 
         task = globus.get_task(task_id)
+        if not res['completed']:
+            print(f"Timed out after 300 s, transfer still "
+                  f"{task.get('status')}")
+            return
         print(f"Final status: {task.get('status')} "
               f"({task.get('files_transferred')} files, "
               f"{task.get('bytes_transferred')} bytes)")

@@ -71,19 +71,20 @@ GLOBUS_TERMINAL = {'SUCCEEDED', 'FAILED', 'CANCELED', 'CANCELLED'}
 # Local-collection config file (lowest-priority auto-detection source).
 GLOBUS_CONFIG_FILE = '~/.radical/orbit/globus.json'
 
-# Bounds for one server-side ``task_wait`` (seconds).  The broker reaps a
-# routed call after ``BrokerTuning.call_timeout`` (30 s by default) with
-# HTTP 504 while the transfer keeps running.  globus-sdk sleeps at most
-# ``timeout`` in total; the unbounded part is the HTTP time of each poll
-# (one ``get_task`` per polling interval).  The slice shrinks further when
-# the hosting runtime's call timeout is lower (``_resolve_wait_slice``).
-# ``GlobusClient.task_wait`` loops such waits up to the caller's timeout.
+# Upper bound for one server-side ``wait`` route call (seconds).  The broker
+# reaps a routed call after ``BrokerTuning.call_timeout`` (30 s by default)
+# with HTTP 504 while the transfer keeps running.  globus-sdk sleeps at most
+# ``timeout`` in total; the unbounded part is the HTTP time of each poll.
+# The bound shrinks further when the hosting runtime's call timeout is lower
+# (``_resolve_wait_slice``).  ``GlobusClient.task_wait`` does not use this
+# route: it paces short ``get_task`` calls itself.
 GLOBUS_WAIT_SLICE = 10
 
-# Statuses of a wait slice lost in transit, which the client retries until
-# its deadline: 504 (call reaped or handler timed out) and 503 (broker /
-# runtime overload fast-fail).  Not 502: the broker sends it for an unknown
-# endpoint, and this plugin maps every unmapped Globus error to it.
+# Statuses of a call lost in transit, which ``GlobusClient.task_wait``
+# retries until its deadline: 504 (call reaped or handler timed out) and 503
+# (broker / runtime overload fast-fail, with ``Retry-After``).  Not 502: the
+# broker sends it for an unknown endpoint, and this plugin maps every
+# unmapped Globus error to it.
 _WAIT_TRANSIENT = {503, 504}
 
 
@@ -105,6 +106,14 @@ def _resolve_wait_slice(app) -> int:
     if isinstance(ct, (int, float)) and ct > 0:
         return max(1, min(GLOBUS_WAIT_SLICE, int(ct / 3)))
     return GLOBUS_WAIT_SLICE
+
+
+def _retry_after(resp, default: float = 1.0) -> float:
+    """Seconds from a response's ``Retry-After`` header, else *default*."""
+    try:
+        return max(0.0, float(resp.headers.get('retry-after')))
+    except (TypeError, ValueError):
+        return default
 
 
 def detect_local_collection() -> Optional[str]:
@@ -484,45 +493,42 @@ class GlobusClient(PluginClient):
                  polling_interval: int = 10) -> dict:
         '''Wait up to *timeout* seconds for the task to leave ``ACTIVE``.
 
-        The endpoint bounds each wait below the routed-call timeout, so
-        this loops such waits until the task completes or less than a
-        second of *timeout* is left; it always makes at least one request
-        (``timeout=0`` is a quick status probe).  A wait lost in transit
-        (HTTP 503/504) is retried within *timeout*, and raised if the last
-        attempt before the deadline was lost; other errors raise at once.
+        Polls ``get_task`` once per *polling_interval* (at least 1 s) from
+        this side, so no routed call blocks near the broker's call timeout
+        and Globus sees one status call per interval.  Polls at least once
+        (``timeout=0`` is a status probe) and once more at the deadline.  A
+        poll lost in transit (HTTP 503/504) is retried within *timeout*
+        (after ``Retry-After`` for a 503) and raised if the last poll before
+        the deadline was lost; other errors raise at once.
 
         Returns ``{task_id, completed, ...}``.  ``completed`` is true for any
         non-ACTIVE status, including ``INACTIVE`` (e.g. an expired
         credential) — call ``get_task`` for the status itself.
         '''
         self._require_session()
+        interval = max(1, polling_interval)
         deadline = time.monotonic() + timeout
         while True:
-            # Also cap the request here: an endpoint predating the server
-            # clamp would otherwise block a worker thread past the reap
-            # deadline on every retry.
-            wait = max(1, min(int(deadline - time.monotonic()),
-                              GLOBUS_WAIT_SLICE))
-            resp = self._http.post(self._url(f'wait/{self._sid}/{task_id}'),
-                                   json={'timeout': wait,
-                                         'polling_interval': polling_interval})
+            resp = self._http.get(self._url(f'task/{self._sid}/{task_id}'))
             lost = resp.status_code in _WAIT_TRANSIENT
             if not lost:
                 self._raise(resp, f'task_wait {task_id!r}')
-                res = resp.json()
-                if res.get('completed'):
-                    return res
+                if resp.json().get('status') != 'ACTIVE':
+                    return {'task_id': task_id, 'completed': True}
 
             remaining = deadline - time.monotonic()
-            if remaining < 1:
+            if remaining <= 0:
                 if lost:
                     self._raise(resp, f'task_wait {task_id!r}')
-                return res
+                return {'task_id': task_id, 'completed': False}
 
+            pause = interval
             if lost:
-                log.debug('[globus] task_wait %s: slice lost (HTTP %s), '
+                log.debug('[globus] task_wait %s: poll lost (HTTP %s), '
                           'retrying', task_id, resp.status_code)
-                time.sleep(min(1.0, remaining))   # overload: back off briefly
+                if resp.status_code == 503:
+                    pause = _retry_after(resp)
+            time.sleep(min(pause, remaining))
 
     def cancel_task(self, task_id: str) -> dict:
         self._require_session()
@@ -609,8 +615,6 @@ class PluginGlobus(Plugin):
 
     def __init__(self, app: FastAPI, instance_name: str = 'globus'):
         super().__init__(app, instance_name)
-
-        self._wait_slice = _resolve_wait_slice(app)
 
         # Endpoint's local collection UUID (optional), overridable per session.
         # Auto-detected via env var → GCP → config file.
@@ -705,7 +709,9 @@ class PluginGlobus(Plugin):
         return await self._forward(
             sid, GlobusSession.task_wait, task_id,
             int(body.get('timeout', 60)), int(body.get('polling_interval', 10)),
-            self._wait_slice)
+            # resolved per request: the runtime sets its call timeout only
+            # after building its plugins
+            _resolve_wait_slice(self._app))
 
     async def cancel_task(self, request: Request) -> dict:
         sid     = request.path_params['sid']
