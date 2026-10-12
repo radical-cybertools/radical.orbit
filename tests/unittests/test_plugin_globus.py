@@ -2,17 +2,22 @@
 
 # pylint: disable=protected-access
 
+import asyncio
 import time
 
+import httpx
 import pytest
 
 from unittest.mock import MagicMock, patch
 
 from fastapi import FastAPI, HTTPException
 
+from radical.orbit import plugin_globus as pg
 from radical.orbit.plugin_globus import (
     PluginGlobus,
     GlobusSession,
+    GlobusClient,
+    GLOBUS_WAIT_SLICE,
     detect_local_collection,
     _globus_http_exc,
     _as_dict,
@@ -171,6 +176,353 @@ async def test_task_wait():
 
 
 @pytest.mark.asyncio
+async def test_task_wait_clamped_below_call_timeout():
+    """A long wait is bounded per call so the routed call is not reaped."""
+    session = _make_session()
+    session._tc.task_wait.return_value = False
+    res = await session.task_wait('t1', timeout=600, polling_interval=60)
+    kwargs = session._tc.task_wait.call_args.kwargs
+    assert kwargs['timeout']          == GLOBUS_WAIT_SLICE
+    assert kwargs['polling_interval'] == GLOBUS_WAIT_SLICE
+    assert res == {'task_id': 't1', 'completed': False}
+
+    # the caller's interval is honoured down to the sdk minimum of 1 s
+    await session.task_wait('t1', timeout=600, polling_interval=2)
+    assert session._tc.task_wait.call_args.kwargs['polling_interval'] == 2
+    await session.task_wait('t1', timeout=0, polling_interval=0)
+    kwargs = session._tc.task_wait.call_args.kwargs
+    assert (kwargs['timeout'], kwargs['polling_interval']) == (1, 1)
+
+
+def _wait_client(replies, monkeypatch, undershoot=0.0):
+    """GlobusClient whose get_task route answers with *replies* in order.
+
+    Each reply is ``(status, body)``, ``(status, body, elapsed, headers)``
+    or an exception to raise; *elapsed* (default 0) advances a fake clock,
+    as does ``time.sleep`` (whose arguments are recorded).
+    """
+    now     = [0.0]
+    sleeps  = []
+    replies = iter(replies)
+
+    def _get(url):
+        reply = next(replies)
+        if isinstance(reply, Exception):
+            now[0] += 1.0
+            raise reply
+        status, body, elapsed, headers = (tuple(reply) + (0.0, {}))[:4]
+        now[0] += elapsed
+        return MagicMock(status_code=status, is_error=status >= 400,
+                         headers=headers, json=MagicMock(return_value=body))
+
+    def _sleep(t):
+        sleeps.append(t)
+        now[0] += t - undershoot        # a real sleep may wake a bit early
+
+    monkeypatch.setattr(pg.time, 'monotonic', lambda: now[0])
+    monkeypatch.setattr(pg.time, 'sleep', _sleep)
+    http = MagicMock()
+    http.get.side_effect = _get
+    client = GlobusClient(http, '/globus')
+    client._sid = 'sid'
+    return client, http, sleeps
+
+
+_ACTIVE = {'task_id': 't1', 'status': 'ACTIVE'}
+_DONE   = {'task_id': 't1', 'status': 'SUCCEEDED'}
+_WAITED = {'task_id': 't1', 'completed': True}
+_TIMED  = {'task_id': 't1', 'completed': False}
+
+
+def test_client_task_wait_polls_until_done(monkeypatch):
+    client, http, sleeps = _wait_client([(200, _ACTIVE), (200, _ACTIVE),
+                                         (200, _DONE)], monkeypatch)
+    assert client.task_wait('t1', timeout=300) == _WAITED
+    assert sleeps == [10, 10]
+
+
+def test_client_task_wait_one_poll_per_interval(monkeypatch):
+    """Globus sees one status call per interval, plus one at the deadline."""
+    client, http, sleeps = _wait_client([(200, _ACTIVE)] * 7, monkeypatch)
+    assert client.task_wait('t1', timeout=60, polling_interval=10) == _TIMED
+    assert http.get.call_count == 7             # t = 0, 10, ..., 60
+    assert sleeps == [10] * 6
+
+
+def test_client_task_wait_fixed_schedule(monkeypatch):
+    """Poll latency does not shift the schedule (polls at 0, 10, 20)."""
+    client, http, sleeps = _wait_client([(200, _ACTIVE, 3.0, {}),
+                                         (200, _ACTIVE, 3.0, {}),
+                                         (200, _DONE)], monkeypatch)
+    assert client.task_wait('t1', timeout=60) == _WAITED
+    assert sleeps == [7.0, 7.0]
+
+
+def test_client_task_wait_last_poll_at_deadline(monkeypatch):
+    """A deadline between slots gets one last poll at the deadline."""
+    client, http, sleeps = _wait_client([(200, _ACTIVE)] * 3, monkeypatch)
+    assert client.task_wait('t1', timeout=15) == _TIMED
+    assert sleeps == [10.0, 5.0]
+    assert http.get.call_count == 3
+
+
+def test_client_task_wait_stops_after_deadline_poll(monkeypatch):
+    """A sleep that wakes just before the deadline must not cause one more
+    tiny sleep and an extra poll."""
+    client, http, _ = _wait_client([(200, _ACTIVE)] * 4, monkeypatch,
+                                   undershoot=0.001)
+    assert client.task_wait('t1', timeout=15) == _TIMED
+    assert http.get.call_count == 3             # t = 0, 10, 15 (deadline)
+
+
+def test_client_task_wait_inactive_counts_as_completed(monkeypatch):
+    client, _, _ = _wait_client([(200, {'status': 'INACTIVE'})], monkeypatch)
+    assert client.task_wait('t1', timeout=60) == _WAITED
+
+
+def test_client_task_wait_zero_timeout_probes_once(monkeypatch):
+    client, http, _ = _wait_client([(200, _ACTIVE)], monkeypatch)
+    assert client.task_wait('t1', timeout=0) == _TIMED
+    assert http.get.call_count == 1
+
+
+def test_client_task_wait_slow_poll_ends_at_deadline(monkeypatch):
+    """A poll that takes past the deadline ends the wait, no extra call."""
+    client, http, _ = _wait_client([(200, _ACTIVE, 40.0, {})], monkeypatch)
+    assert client.task_wait('t1', timeout=30) == _TIMED
+    assert http.get.call_count == 1
+
+
+def test_client_task_wait_retries_504(monkeypatch):
+    client, http, sleeps = _wait_client(
+        [(200, _ACTIVE), (504, {'detail': 'lost'}, 30.0, {}), (200, _DONE)],
+        monkeypatch)
+    assert client.task_wait('t1', timeout=120) == _WAITED
+    assert sleeps == [10, 10]
+
+
+def test_client_task_wait_503_honours_retry_after(monkeypatch):
+    client, http, sleeps = _wait_client(
+        [(503, {'detail': 'cap'}, 0.0, {'retry-after': '12'}), (200, _DONE)],
+        monkeypatch)
+    assert client.task_wait('t1', timeout=60) == _WAITED
+    assert sleeps == [12.0]
+
+
+def test_client_task_wait_short_retry_after_keeps_interval(monkeypatch):
+    """A Retry-After shorter than the interval must not poll faster."""
+    client, http, sleeps = _wait_client(
+        [(503, {}, 0.0, {'retry-after': '1'}), (200, _DONE)], monkeypatch)
+    assert client.task_wait('t1', timeout=60) == _WAITED
+    assert sleeps == [10.0]
+
+
+def test_client_task_wait_503_without_retry_after_waits_for_slot(monkeypatch):
+    """No Retry-After: retry at the next scheduled poll, not after 1 s."""
+    client, http, sleeps = _wait_client([(503, {}), (200, _DONE)],
+                                        monkeypatch)
+    assert client.task_wait('t1', timeout=60) == _WAITED
+    assert sleeps == [10.0]
+
+
+@pytest.mark.parametrize('value, expected', [
+    ('3',    3.0), ('0.2', 1.0),          # floor at 1 s
+    ('0', None), ('-5', None), ('nan', None), ('inf', None), ('x', None),
+    (None, None),
+])
+def test_retry_after_parsing(value, expected):
+    resp = MagicMock(headers={} if value is None else {'retry-after': value})
+    assert pg._retry_after(resp) == expected
+
+
+def test_client_task_wait_503_retry_after_capped_by_deadline(monkeypatch):
+    client, http, sleeps = _wait_client(
+        [(503, {}, 0.0, {'retry-after': '30'}), (200, _ACTIVE)], monkeypatch)
+    assert client.task_wait('t1', timeout=5) == _TIMED
+    assert sleeps == [5]
+
+
+def test_client_task_wait_lost_last_poll_after_answer(monkeypatch):
+    """An earlier poll got through: a lost last poll is just a timeout."""
+    client, _, _ = _wait_client(
+        [(200, _ACTIVE), (504, {'detail': 'call timed out'}, 30.0, {})],
+        monkeypatch)
+    assert client.task_wait('t1', timeout=30) == _TIMED
+
+
+def test_client_task_wait_raises_when_no_poll_got_through(monkeypatch):
+    """No poll got through before the deadline: raise the last loss rather
+    than report a silent completed=False."""
+    client, _, _ = _wait_client(
+        [(504, {'detail': 'call timed out'}, 30.0, {}),
+         (504, {'detail': 'call timed out'}, 30.0, {})], monkeypatch)
+    with pytest.raises(RuntimeError, match='HTTP 504'):
+        client.task_wait('t1', timeout=40)
+
+
+def test_client_task_wait_429_backs_off(monkeypatch):
+    """Globus rate limit: the later of Retry-After and the next slot."""
+    client, http, sleeps = _wait_client(
+        [(429, {}, 0.0, {'retry-after': '7'}),      # shorter: slot at 10
+         (429, {}, 0.0, {'retry-after': '13'}),     # longer: until 23
+         (429, {}),                                  # no header: slot at 30
+         (200, _DONE)], monkeypatch)
+    assert client.task_wait('t1', timeout=60) == _WAITED
+    assert sleeps == [10.0, 13.0, 7.0]
+
+
+@pytest.mark.parametrize('exc', [TimeoutError('call'), ConnectionError('ws'),
+                                 httpx.ConnectError('down')])
+def test_client_task_wait_retries_transport_loss(monkeypatch, exc):
+    client, http, sleeps = _wait_client([exc, (200, _DONE)], monkeypatch)
+    assert client.task_wait('t1', timeout=60) == _WAITED
+    assert http.get.call_count == 2
+
+
+def test_client_task_wait_raises_transport_loss_at_deadline(monkeypatch):
+    client, _, _ = _wait_client([TimeoutError('call timed out')] * 3,
+                                monkeypatch)
+    with pytest.raises(TimeoutError):
+        client.task_wait('t1', timeout=10)
+
+
+@pytest.mark.parametrize('body', [{}, {'status': 'SOMETHING_NEW'}])
+def test_client_task_wait_unknown_status_not_completed(monkeypatch, body):
+    """Completion needs a known non-ACTIVE status."""
+    client, _, _ = _wait_client([(200, body)] * 2, monkeypatch)
+    assert client.task_wait('t1', timeout=10) == _TIMED
+
+
+@pytest.mark.parametrize('status', [404, 502])
+def test_client_task_wait_raises_other_errors(monkeypatch, status):
+    """502 is not retried: it is how the plugin reports Globus errors."""
+    client, http, _ = _wait_client([(status, {'detail': 'boom'})],
+                                   monkeypatch)
+    with pytest.raises(RuntimeError, match=f'HTTP {status}'):
+        client.task_wait('t1', timeout=60)
+    assert http.get.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_poller_notifies_after_get_task_saw_terminal():
+    """A get_task call (e.g. a client's task_wait poll) that sees the
+    terminal status first must not swallow the poller's notification."""
+    session = _make_session()
+    session._tasks['t1'] = {'status': 'ACTIVE', 'label': ''}
+    session._tc.get_task.return_value = {'task_id': 't1',
+                                         'status' : 'SUCCEEDED'}
+    await session.get_task('t1')
+    meta = session._tasks['t1']
+    assert meta['status'] == 'SUCCEEDED'
+
+    res = await session._fetch_task_status('t1', meta)
+    assert res is not None
+    assert session._task_payload('t1', meta, res)['status'] == 'SUCCEEDED'
+    assert await session._fetch_task_status('t1', meta) is None   # once
+
+
+@pytest.mark.asyncio
+async def test_poller_cached_terminal_skips_failing_fetch(monkeypatch):
+    """A terminal status cached by get_task is notified once without a
+    fetch, so a failing fetch (expired token) cannot poll forever."""
+    monkeypatch.setattr(pg, 'GLOBUS_POLL_INTERVAL', 0.01)
+    session = _make_session()
+    session.notify = MagicMock()
+    session._tasks['t1'] = {'status': 'ACTIVE', 'label': ''}
+    session._tc.get_task.return_value = {
+        'task_id': 't1', 'status': 'FAILED', 'nice_status': 'PERMISSION_DENIED',
+        'bytes_transferred': 5, 'files_transferred': 1}
+    await session.get_task('t1')                     # caches the full result
+    session._tc.get_task.reset_mock()
+    session._tc.get_task.side_effect = RuntimeError('401 token expired')
+
+    session._start_polling()
+    await asyncio.wait_for(session._status_poller_task, timeout=2.0)
+
+    session._tc.get_task.assert_not_called()
+    session.notify.assert_called_once()
+    topic, payload = session.notify.call_args.args
+    assert topic == 'transfer_status'
+    assert payload['status']      == 'FAILED'
+    assert payload['nice_status'] == 'PERMISSION_DENIED'   # full result
+    assert payload['bytes_transferred'] == 5
+
+
+@pytest.mark.asyncio
+async def test_poller_stale_fetch_keeps_cached_terminal():
+    """A get_task that sees SUCCEEDED while the poller's fetch is in flight
+    must not be overwritten by that fetch's stale ACTIVE."""
+    session = _make_session()
+    session.notify = MagicMock()
+    meta = {'status': 'ACTIVE', 'label': ''}
+    session._tasks['t1'] = meta
+
+    def _stale_fetch(task_id):
+        meta['status'] = 'SUCCEEDED'            # concurrent get_task lands
+        meta['result'] = {'task_id': 't1', 'status': 'SUCCEEDED',
+                          'nice_status': 'OK'}
+        return {'task_id': 't1', 'status': 'ACTIVE'}
+
+    session._tc.get_task.side_effect = _stale_fetch
+    res = await session._fetch_task_status('t1', meta)     # same sweep
+    assert meta['status'] == 'SUCCEEDED'
+    assert res['nice_status'] == 'OK'
+    assert meta['notified'] == 'SUCCEEDED'
+    assert 'result' not in meta                 # dropped after notification
+    assert await session._fetch_task_status('t1', meta) is None
+
+
+@pytest.mark.asyncio
+async def test_poller_drops_result_after_terminal_notification():
+    session = _make_session()
+    meta = {'status': 'ACTIVE', 'label': ''}
+    session._tasks['t1'] = meta
+    session._tc.get_task.return_value = {'task_id': 't1', 'status': 'FAILED'}
+    assert await session._fetch_task_status('t1', meta) is not None
+    assert meta == {'status': 'FAILED', 'notified': 'FAILED', 'label': ''}
+
+    await session.get_task('t1')                # a later client poll
+    assert 'result' not in meta
+
+
+@pytest.mark.asyncio
+async def test_cache_keeps_result_only_for_terminal():
+    session = _make_session()
+    session._tasks['t1'] = {'status': 'ACTIVE', 'label': ''}
+    session._tc.get_task.return_value = {'task_id': 't1', 'status': 'INACTIVE'}
+    await session.get_task('t1')
+    assert session._tasks['t1'] == {'status': 'INACTIVE', 'label': ''}
+
+    session._tc.get_task.return_value = {'task_id': 't1', 'status': 'FAILED'}
+    await session.get_task('t1')
+    assert session._tasks['t1']['result']['status'] == 'FAILED'
+
+
+@pytest.mark.asyncio
+async def test_poller_corrects_stale_cached_status():
+    """A fetched status that differs from the cache updates it, even when it
+    equals the last notified one (INACTIVE cached, task ACTIVE again)."""
+    session = _make_session()
+    meta = {'status': 'INACTIVE', 'notified': 'ACTIVE', 'label': ''}
+    session._tc.get_task.return_value = {'task_id': 't1', 'status': 'ACTIVE'}
+    assert await session._fetch_task_status('t1', meta) is None
+    assert meta['status'] == 'ACTIVE'
+
+
+def test_globus_http_exc_forwards_retry_after():
+    exc             = MagicMock(spec=['http_status', 'message', 'code',
+                                      'headers'])
+    exc.code        = 'RateLimited'
+    exc.message     = 'slow down'
+    exc.headers     = {'Retry-After': '9'}
+    exc.http_status = 429
+    assert _globus_http_exc(exc).headers == {'Retry-After': '9'}
+    exc.http_status = 503
+    assert _globus_http_exc(exc, read_only=True).headers \
+        == {'Retry-After': '9'}
+
+
+@pytest.mark.asyncio
 async def test_cancel_task():
     session = _make_session()
     session._tasks['t1'] = {'status': 'ACTIVE', 'label': ''}
@@ -289,14 +641,70 @@ def test_globus_http_exc_404():
     assert mapped.status_code == 404
 
 
-def test_globus_http_exc_502_default():
+@pytest.mark.parametrize('http_status, read_only, expected', [
+    (500,  True,  503),   # Globus 5xx on a status query: transient
+    (503,  True,  503),
+    (500,  False, 502),   # mutating call: a retry could duplicate work
+    (503,  False, 502),
+    (400,  True,  502),   # other unmapped errors stay 502
+    (None, True,  502),
+])
+def test_globus_http_exc_unmapped(http_status, read_only, expected):
     exc             = MagicMock(spec=['http_status', 'message', 'code'])
     exc.code        = 'EndpointError'
-    exc.http_status = 500
+    exc.http_status = http_status
     exc.message     = 'boom'
-    mapped = _globus_http_exc(exc)
-    assert mapped.status_code == 502
+    mapped = _globus_http_exc(exc, read_only=read_only)
+    assert mapped.status_code == expected
     assert 'boom' in mapped.detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('exc_name, read_only, expected', [
+    ('GlobusConnectionError', True,  503),
+    ('GlobusTimeoutError',    True,  503),
+    ('GlobusConnectionError', False, 502),   # mutating call: not retryable
+    (None,                    True,  502),   # anything else unexpected
+])
+async def test_call_maps_network_errors(exc_name, read_only, expected):
+    pytest.importorskip('globus_sdk')
+    import globus_sdk
+    session = _make_session()
+    if exc_name:
+        err = getattr(globus_sdk, exc_name)('net down', Exception('x'))
+    else:
+        err = ValueError('odd')
+
+    def _boom():
+        raise err
+
+    with patch('radical.orbit.plugin_globus.globus_sdk', globus_sdk):
+        with pytest.raises(HTTPException) as info:
+            await session._call(_boom, context='x', read_only=read_only)
+    assert info.value.status_code == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('method, args, read_only', [
+    ('get_task',       ('t1',),                          True),
+    ('task_wait',      ('t1',),                          True),
+    ('cancel_task',    ('t1',),                          False),
+    ('submit_transfer', ('src', 'dst', [{'source': '/a',
+                                         'destination': '/b'}]), False),
+])
+async def test_status_calls_read_only_mutations_not(method, args, read_only):
+    """Only status queries may report a transient Globus failure as 503."""
+    session = _make_session()
+    with patch.object(session, '_call') as call, \
+            patch('radical.orbit.plugin_globus.globus_sdk'):
+        call.return_value = {'task_id': 't1', 'status': 'ACTIVE'}
+        try:
+            await getattr(session, method)(*args)
+        except Exception:
+            pass
+    assert call.call_count >= 1
+    assert all(c.kwargs.get('read_only', False) is read_only
+               for c in call.call_args_list)
 
 
 def test_as_dict_response_object():

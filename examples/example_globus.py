@@ -57,6 +57,15 @@ def _auth_kwargs() -> dict:
         '(see get_globus_token.py).')
 
 
+def _cancel(globus, task_id: str) -> None:
+    """Cancel a transfer we gave up on, reporting a failure to do so."""
+    try:
+        globus.cancel_task(task_id)
+        print(f'Cancelled task {task_id}')
+    except Exception as exc:
+        print(f'  cancel failed: {exc}')
+
+
 def main():
 
     rt   = EndpointRuntime()
@@ -88,18 +97,41 @@ def main():
         task_id = sub['task_id']
         print(f'Submitted transfer: {task_id}')
 
-        # Wait for completion (polls Globus server-side).
-        deadline = time.time() + 300
-        while time.time() < deadline:
-            res = globus.task_wait(task_id, timeout=30, polling_interval=10)
-            if res['completed']:
-                break
-            print('  … still transferring')
+        # Wait for completion in short waits so progress shows; 'completed'
+        # means the task left ACTIVE (check get_task for the outcome).
+        start     = time.monotonic()
+        attempts  = 10
+        completed = False
+        try:
+            for attempt in range(attempts):
+                res = globus.task_wait(task_id, timeout=30,
+                                       polling_interval=10)
+                if res['completed']:
+                    completed = True
+                    break
+                if attempt < attempts - 1:
+                    print('  … still transferring')
+        except Exception as exc:
+            # the wait failed, not necessarily the transfer: leave it running
+            print(f'Waiting for task {task_id} failed: {exc}')
+            raise
+        if not completed:
+            print(f'No completion after {time.monotonic() - start:.0f} s')
+            _cancel(globus, task_id)
+            return
 
-        task = globus.get_task(task_id)
-        print(f"Final status: {task.get('status')} "
+        task    = globus.get_task(task_id)
+        status  = task.get('status')
+        elapsed = time.monotonic() - start
+        print(f"Final status: {status} after {elapsed:.0f} s "
               f"({task.get('files_transferred')} files, "
               f"{task.get('bytes_transferred')} bytes)")
+        if status != 'SUCCEEDED':
+            print(f"Transfer did not succeed: {task.get('nice_status')}")
+            if status == 'INACTIVE':
+                # paused (e.g. expired credential): don't leave it pending
+                _cancel(globus, task_id)
+            return
 
         # List what landed on the destination.
         listing = globus.ls(DST, DST_PATH)
