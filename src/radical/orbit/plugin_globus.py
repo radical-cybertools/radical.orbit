@@ -632,9 +632,9 @@ class PluginGlobus(Plugin):
         if sid is None:
             sid = f'session.{uuid.uuid4().hex[:8]}'
 
-        kwargs = {'access_token' : access_token,
-                  'refresh_token': refresh_token,
-                  'client_id'    : client_id,
+        kwargs = {'access_token'    : access_token,
+                  'refresh_token'   : refresh_token,
+                  'client_id'       : client_id,
                   'local_collection': local_coll}
         try:
             if access_token:

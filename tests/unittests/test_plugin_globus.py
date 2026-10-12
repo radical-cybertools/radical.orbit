@@ -547,8 +547,11 @@ async def test_register_session_refresh_errors(endpoint_app, monkeypatch,
     import requests
     if reply == 'network':
         reply = requests.ConnectionError('unreachable')
-        # globus-sdk retries network errors with backoff sleeps.
-        monkeypatch.setattr('time.sleep', lambda _s: None)
+        # globus-sdk retries network errors with backoff sleeps; skip them
+        # (RequestsTransport._retry_sleep exists on 3.x and 4.x).
+        from globus_sdk.transport import RequestsTransport
+        monkeypatch.setattr(RequestsTransport, '_retry_sleep',
+                            lambda *_a, **_k: None)
     _stub_http(monkeypatch, reply)
 
     plugin  = PluginGlobus(endpoint_app)
