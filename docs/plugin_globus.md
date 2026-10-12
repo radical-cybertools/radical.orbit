@@ -113,7 +113,7 @@ Task monitoring and control. The client's `task_wait` polls `get_task`
 every `polling_interval` on a fixed schedule up to `timeout` (at least
 once, so `timeout=0` is a status probe), so no routed call blocks near the
 broker's call timeout. It retries transient poll failures (HTTP 504, 503
-and 429, after `Retry-After` if given, else at the next scheduled poll;
+and 429, at the next scheduled poll or after a longer `Retry-After`;
 timeouts and connection errors) and returns
 `{task_id, completed}`. Its `completed` is true once the task reports
 `SUCCEEDED`, `FAILED`, `CANCELED` or `INACTIVE` (e.g. an expired

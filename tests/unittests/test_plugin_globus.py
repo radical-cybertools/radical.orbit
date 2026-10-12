@@ -303,10 +303,18 @@ def test_client_task_wait_retries_504(monkeypatch):
 
 def test_client_task_wait_503_honours_retry_after(monkeypatch):
     client, http, sleeps = _wait_client(
-        [(503, {'detail': 'cap'}, 0.0, {'retry-after': '3'}), (200, _DONE)],
+        [(503, {'detail': 'cap'}, 0.0, {'retry-after': '12'}), (200, _DONE)],
         monkeypatch)
     assert client.task_wait('t1', timeout=60) == _WAITED
-    assert sleeps == [3.0]
+    assert sleeps == [12.0]
+
+
+def test_client_task_wait_short_retry_after_keeps_interval(monkeypatch):
+    """A Retry-After shorter than the interval must not poll faster."""
+    client, http, sleeps = _wait_client(
+        [(503, {}, 0.0, {'retry-after': '1'}), (200, _DONE)], monkeypatch)
+    assert client.task_wait('t1', timeout=60) == _WAITED
+    assert sleeps == [10.0]
 
 
 def test_client_task_wait_503_without_retry_after_waits_for_slot(monkeypatch):
@@ -353,12 +361,14 @@ def test_client_task_wait_raises_when_no_poll_got_through(monkeypatch):
 
 
 def test_client_task_wait_429_backs_off(monkeypatch):
-    """Globus rate limit: Retry-After if given, else one interval."""
+    """Globus rate limit: the later of Retry-After and the next slot."""
     client, http, sleeps = _wait_client(
-        [(429, {}, 0.0, {'retry-after': '7'}), (429, {}), (200, _DONE)],
-        monkeypatch)
+        [(429, {}, 0.0, {'retry-after': '7'}),      # shorter: slot at 10
+         (429, {}, 0.0, {'retry-after': '13'}),     # longer: until 23
+         (429, {}),                                  # no header: slot at 30
+         (200, _DONE)], monkeypatch)
     assert client.task_wait('t1', timeout=60) == _WAITED
-    assert sleeps == [7.0, 3.0]            # then back on the 10 s schedule
+    assert sleeps == [10.0, 13.0, 7.0]
 
 
 @pytest.mark.parametrize('exc', [TimeoutError('call'), ConnectionError('ws'),

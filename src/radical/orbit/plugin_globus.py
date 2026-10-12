@@ -463,7 +463,8 @@ class GlobusSession(PluginSession):
                 if status == meta.get('notified', 'ACTIVE'):
                     return None
                 meta['notified'] = status
-                meta.pop('result', None)
+                if status in GLOBUS_TERMINAL:
+                    meta.pop('result', None)    # cached just above
                 return res
             # else a concurrent get_task cached the end while we fetched
             if not self._terminal_pending(meta):
@@ -572,8 +573,8 @@ class GlobusClient(PluginClient):
         never starts a poll past it.
 
         A failed poll is retried within *timeout* when it is transient: HTTP
-        504, 503 or 429 (after ``Retry-After`` if given, else at the next
-        scheduled poll), or a transport-level loss (timeout, connection
+        504, 503 or 429 (at the next scheduled poll, or after a longer
+        ``Retry-After``), or a transport-level loss (timeout, connection
         error).  If no poll got through before the deadline, the last such
         error is raised; other errors raise at once.
 
@@ -620,14 +621,13 @@ class GlobusClient(PluginClient):
             if error is not None:
                 log.debug('[globus] task_wait %s: poll failed (%s), retrying',
                           task_id, getattr(error, 'status_code', error))
-            # next slot of the fixed schedule, unless the server asked for
-            # a specific pause; the deadline gets a last poll
-            # (a slot index, so an early wake-up cannot repeat a slot)
+            # next slot of the fixed schedule (a slot index, so an early
+            # wake-up cannot repeat a slot), or later if the server asked
+            # for a longer pause; the deadline gets a last poll
+            slot = max(slot + 1, int((now - start) // interval) + 1)
+            due  = start + slot * interval
             if retry is not None:
-                due  = now + retry
-            else:
-                slot = max(slot + 1, int((now - start) // interval) + 1)
-                due  = start + slot * interval
+                due = max(due, now + retry)
             if due >= deadline:
                 due, last = deadline, True
             time.sleep(due - now)
