@@ -421,6 +421,7 @@ class PluginFederation(Plugin):
     '''Broker-hosted resource federation: registry, budget, and the pick.'''
 
     plugin_name   = 'federation'
+    default_roles = ('broker',)
     session_class = FederationSession
     client_class  = FederationClient
     version       = '0.0.1'

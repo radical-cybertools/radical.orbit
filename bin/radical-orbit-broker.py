@@ -14,8 +14,10 @@ import ssl
 import sys
 
 import radical.orbit.logging_config as _lc
-from radical.orbit        import utils
-from radical.orbit.broker import Broker
+from radical.orbit                  import utils
+from radical.orbit.broker           import Broker
+from radical.orbit.plugin_base      import Plugin
+from radical.orbit.plugin_host_base import default_plugins
 
 
 _SETUP_HOWTO = f'''\
@@ -68,12 +70,15 @@ def main():
     parser.add_argument('--plugins', '-p', default='default',
                         help='Comma-separated plugins to host on the '
                              'broker (default: the broker role default '
-                             'set — see plugin_host_base.'
-                             'DEFAULT_PLUGINS_BY_ROLE).  Special tokens: '
+                             'set, plugins declaring default_roles '
+                             '"broker"; bundled: '
+                             + ','.join(default_plugins(
+                                 'broker', Plugin.get_plugin_names()))
+                             + ').  Special tokens: '
                              '"default" (role default), "all" (every '
                              'registered plugin), "" (none).  Wildcards '
-                             'allowed: "iri*". Prefix matching '
-                             'supported. Combine, e.g.: "-p default,rose".')
+                             'allowed: "iri*"; otherwise names must match '
+                             'exactly.  Combine, e.g.: "-p default,rose".')
     parser.add_argument('--token', default=None,
                         help='Shared ingress auth token.  CLI > '
                              '$RADICAL_ORBIT_BROKER_TOKEN > '

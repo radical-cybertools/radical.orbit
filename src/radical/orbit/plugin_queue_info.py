@@ -287,6 +287,7 @@ class PluginQueueInfo(Plugin):
     """
 
     plugin_name = "queue_info"
+    default_roles = ('login', 'compute', 'standalone')
     session_class = QueueInfoSession
     client_class = QueueInfoClient
     version = '0.0.1'

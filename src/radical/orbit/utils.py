@@ -308,14 +308,18 @@ def tokens_match(provided: Any, expected: Any) -> bool:
     return hmac.compare_digest(provided, expected)
 
 
+# Host roles returned by :func:`host_role`; plugins name them in
+# ``Plugin.default_roles``.
+HOST_ROLES = ('broker', 'login', 'compute', 'standalone')
+
+
 def host_role(app: Any) -> Dict[str, Any]:
     """Classify the host that *app* is running on.
 
     Single source of truth for role / scheduler / executor detection
     across the codebase.  Returns a dict with these fields:
 
-    - ``role``           — one of ``'broker'`` / ``'login'`` /
-                           ``'compute'`` / ``'standalone'``.
+    - ``role``           — one of :data:`HOST_ROLES`.
     - ``scheduler``      — the detected batch system's full name (e.g.
                            ``'slurm'``, ``'pbs'``, ``'pbs-aurora'``,
                            ``'none'``).

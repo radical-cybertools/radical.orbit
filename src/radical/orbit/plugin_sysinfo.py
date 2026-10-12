@@ -576,6 +576,7 @@ class PluginSysInfo(Plugin):
     """
 
     plugin_name = "sysinfo"
+    default_roles = ('broker', 'login', 'compute', 'standalone')
     session_class = SysInfoSession
     client_class = SysInfoClient
     version = '0.0.1'

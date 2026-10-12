@@ -8,7 +8,7 @@ Status check (2026-08-25): **partially done**:
   `is_enabled`-gates on availability so a missing RP never breaks load).
 - Plugin auto-load concern — done since: plugins are selected via
   `--plugins` / `plugins=` with role-based `default` sets
-  (plugin_host_base.py, `DEFAULT_PLUGINS_BY_ROLE`), and missing-dependency
+  (each plugin class's `default_roles`), and missing-dependency
   plugins are skipped/isolated at load.
 - **Remaining**: the actual conversion — metadata still lives in `setup.py`
   (+ setup.cfg); `pyproject.toml` only declares the build backend.

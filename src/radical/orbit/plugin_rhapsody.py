@@ -1390,6 +1390,7 @@ class PluginRhapsody(Plugin):
     '''
 
     plugin_name = "rhapsody"
+    default_roles = ('compute', 'standalone')
     session_class = RhapsodySession
     client_class = RhapsodyClient
     version = '0.0.1'

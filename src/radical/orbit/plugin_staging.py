@@ -375,6 +375,7 @@ class PluginStaging(Plugin):
     """
 
     plugin_name   = "staging"
+    default_roles = ('broker', 'login', 'compute', 'standalone')
     session_class = StagingSession
     client_class  = StagingClient
     version       = '0.0.1'
