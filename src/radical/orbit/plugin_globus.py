@@ -69,6 +69,12 @@ log = logging.getLogger('radical.orbit')
 # Background poll interval for active transfer tasks (seconds).
 GLOBUS_POLL_INTERVAL = 10.0
 
+# HTTP timeout for every Globus API call (seconds).  globus-sdk defaults to
+# 60 s as well; setting it explicitly overrides $GLOBUS_SDK_HTTP_TIMEOUT,
+# where -1 means no timeout at all.  Set on each client's transport, which
+# reads it per request (the constructor keyword differs between 3.x and 4.x).
+GLOBUS_HTTP_TIMEOUT = 60
+
 # Terminal Globus task statuses (no further polling needed).
 GLOBUS_TERMINAL = {'SUCCEEDED', 'FAILED', 'CANCELED', 'CANCELLED'}
 
@@ -182,6 +188,14 @@ def _globus_http_exc(exc: Exception, context: str = '',
     sc  = getattr(exc, 'http_status', None) or 0
     msg = getattr(exc, 'message', None) or str(exc)
 
+    # Globus Auth answers an expired or revoked refresh token with a 400
+    # ``invalid_grant`` (``exc.code`` differs between globus-sdk 3.x and 4.x).
+    if sc == 400 and globus_sdk is not None \
+            and isinstance(exc, globus_sdk.AuthAPIError):
+        raw = getattr(exc, 'raw_json', None)
+        if isinstance(raw, dict) and raw.get('error') == 'invalid_grant':
+            sc = 401
+
     # pass Globus's Retry-After on, so a retrying client honours it
     ra    = (getattr(exc, 'headers', None) or {}).get('Retry-After')
     retry = {'Retry-After': str(ra)} if ra else None
@@ -220,21 +234,31 @@ class GlobusSession(PluginSession):
             raise RuntimeError('globus-sdk is not installed')
 
         self._local_collection = local_collection or None
+        self._tc          = None
+        self._auth_client = None
 
-        if access_token:
-            authorizer = globus_sdk.AccessTokenAuthorizer(access_token)
-        elif refresh_token and client_id:
-            authorizer = globus_sdk.RefreshTokenAuthorizer(
-                refresh_token, globus_sdk.NativeAppAuthClient(client_id))
-        else:
+        if not access_token and not (refresh_token and client_id):
             raise ValueError(
                 "provide either 'access_token' or 'refresh_token'+'client_id'")
 
-        # Bound every HTTP call so a hung Globus endpoint cannot block the
-        # offload thread indefinitely (mirrors the IRI client's timeout=30).
-        self._tc = globus_sdk.TransferClient(
-            authorizer=authorizer,
-            transport_params={"http_timeout": 60})
+        try:
+            if access_token:
+                authorizer = globus_sdk.AccessTokenAuthorizer(access_token)
+            else:
+                self._auth_client = globus_sdk.NativeAppAuthClient(client_id)
+                self._auth_client.transport.http_timeout = GLOBUS_HTTP_TIMEOUT
+                # Fetches the first access token synchronously, so
+                # register_session builds such sessions off the event loop.
+                authorizer = globus_sdk.RefreshTokenAuthorizer(
+                    refresh_token, self._auth_client)
+
+            # Bound every HTTP call so a hung Globus endpoint cannot block the
+            # offload thread indefinitely (mirrors the IRI client's timeout=30).
+            self._tc = globus_sdk.TransferClient(authorizer=authorizer)
+            self._tc.transport.http_timeout = GLOBUS_HTTP_TIMEOUT
+        except Exception:
+            self._close_clients()     # never raises: keeps the original error
+            raise
 
         # task_id -> {status, label}
         self._tasks: Dict[str, Dict[str, Any]] = {}
@@ -295,7 +319,9 @@ class GlobusSession(PluginSession):
         if label      is not None: td_kwargs['label']      = label
         if sync_level is not None: td_kwargs['sync_level'] = sync_level
 
-        tdata = globus_sdk.TransferData(self._tc, **td_kwargs)
+        # No client argument: 4.x dropped it, and submit_transfer fills in
+        # the submission_id itself (globus-sdk >= 3.11).
+        tdata = globus_sdk.TransferData(**td_kwargs)
         for it in items:
             s = it.get('source')
             d = it.get('destination')
@@ -396,7 +422,7 @@ class GlobusSession(PluginSession):
                                      'recursive': bool(recursive)}
         if label is not None: dd_kwargs['label'] = label
 
-        ddata = globus_sdk.DeleteData(self._tc, **dd_kwargs)
+        ddata = globus_sdk.DeleteData(**dd_kwargs)
         for p in paths:
             ddata.add_item(p)
 
@@ -424,11 +450,29 @@ class GlobusSession(PluginSession):
         return _as_dict(await self._call(
             self._tc.get_endpoint, coll, context='get_endpoint'))
 
+    # -- lifecycle ------------------------------------------------------------
+
+    def _close_clients(self) -> None:
+        '''Release the SDK clients' HTTP connections (``close()`` exists on
+        globus-sdk 4.x clients only).  Best effort: a failing close is
+        logged and does not skip the other client.'''
+        for client in (self._tc, self._auth_client):
+            close = getattr(client, 'close', None)
+            if close is None:
+                continue
+            try:
+                close()
+            except Exception as exc:
+                log.debug('[globus] session %s: closing %s failed: %s',
+                          self._sid, type(client).__name__, exc)
+
+    async def close(self) -> Dict[str, Any]:
+        # Stop the status poller (base close) before closing its client.
+        result = await super().close()
+        self._close_clients()
+        return result
+
     # -- background polling -------------------------------------------------
-    #
-    # Lifecycle (task cancellation on close) is handled by the base
-    # ``PluginSession.close()`` / ``stop_status_poller()`` — no override
-    # needed here.
 
     def _start_polling(self) -> None:
         '''(Re)start the shared status poller for the session's active tasks.'''
@@ -775,12 +819,27 @@ class PluginGlobus(Plugin):
         if sid is None:
             sid = f'session.{uuid.uuid4().hex[:8]}'
 
+        kwargs = {'access_token'    : access_token,
+                  'refresh_token'   : refresh_token,
+                  'client_id'       : client_id,
+                  'local_collection': local_coll}
         try:
-            session = self._create_session(
-                sid, access_token=access_token, refresh_token=refresh_token,
-                client_id=client_id, local_collection=local_coll)
+            if access_token:
+                # No I/O: build inline, not queued behind offloaded calls.
+                session = self._create_session(sid, **kwargs)
+            else:
+                # Offloaded: a refresh-token session fetches its first access
+                # token synchronously, which can take longer than one HTTP
+                # timeout since the SDK transport retries failed requests.
+                session = await asyncio.to_thread(
+                    self._create_session, sid, **kwargs)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            if globus_sdk is not None \
+                    and isinstance(exc, globus_sdk.GlobusError):
+                raise _globus_http_exc(exc, 'register_session') from exc
+            raise
 
         self._record_session(sid, session, lifetime, ttl, owner)
         log.info('[globus] Registered session %s', sid)
