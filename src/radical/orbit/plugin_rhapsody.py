@@ -77,7 +77,7 @@ ENV_NOTIFY_WINDOW   = 'RADICAL_ORBIT_RHAPSODY_NOTIFY_WINDOW'
 
 # Endpoint-level telemetry switch: rhapsody session telemetry (when its
 # ``[telemetry]`` extra is installed) is on unless this is set to one of
-# ``0`` / ``false`` / ``no`` / ``off``.  Resolved once per plugin.
+# ``0`` / ``false`` / ``no`` / ``off``.  Resolved once per process.
 ENV_TELEMETRY       = 'RADICAL_ORBIT_RHAPSODY_TELEMETRY'
 
 # Guard optional dependencies
@@ -108,10 +108,12 @@ def _telemetry_available() -> bool:
     return ok
 
 
+@functools.cache
 def _resolve_telemetry() -> bool:
     """Whether ``$RADICAL_ORBIT_RHAPSODY_TELEMETRY`` leaves telemetry on.
 
     Unset means on.  An unrecognised value warns and keeps the default.
+    Cached, so the switch is read (and any warning logged) once per process.
     """
     raw = os.environ.get(ENV_TELEMETRY, '').strip().lower()
     if raw in ('0', 'false', 'no', 'off'):
@@ -260,7 +262,6 @@ class RhapsodySession(PluginSession):
         self._flush_scheduled        = False
         self._notify_window          = NOTIFY_BATCH_WINDOW
         self._notify_batch_bytes     = NOTIFY_BATCH_BYTES
-        self._telemetry_on           = True
         self._return_value_limit     = RETURN_VALUE_LIMIT
 
         # Cache for deserialized cloudpickle payloads — avoids decoding the
@@ -292,7 +293,7 @@ class RhapsodySession(PluginSession):
             # and a failure to start it must not fail the session.
             self._telemetry = None
             start_telemetry = getattr(self._rh_session, 'start_telemetry', None)
-            if start_telemetry is not None and self._telemetry_on \
+            if start_telemetry is not None and _resolve_telemetry() \
                     and _telemetry_available():
                 try:
                     self._telemetry = await start_telemetry(
@@ -860,9 +861,15 @@ class RhapsodySession(PluginSession):
                         log.warning("[%s] telemetry summary failed: %r",
                                     self._sid, e)
                 self._telemetry = None
-                rh_session, self._rh_session = self._rh_session, None
-                await rh_session.close()
+                await self._rh_session.close()
+        except Exception:
+            # log here: a failing super().close() below would mask it
+            log.exception("[%s] rhapsody session close failed", self._sid)
+            raise
         finally:
+            # cleared only after the await, so in-flight request paths
+            # still see the session while it shuts down
+            self._rh_session = None
             self._tasks = {}
             result = await super().close()
         return result
@@ -1412,7 +1419,6 @@ class PluginRhapsody(Plugin):
         # Endpoint-wide notification coalescing window — resolved once here
         # (not per flush) and handed to every session this plugin creates.
         self._notify_window = _resolve_notify_window()
-        self._telemetry_on  = _resolve_telemetry()
 
         # Endpoint-wide frame budgets — likewise resolved once, from the
         # hosting runtime's *effective* frame cap rather than the protocol
@@ -1529,7 +1535,6 @@ class PluginRhapsody(Plugin):
         session._prof = getattr(svc, '_prof', None) or \
                         rprof.Profiler('rhapsody', ns='radical.orbit')
         session._notify_window      = self._notify_window
-        session._telemetry_on       = self._telemetry_on
         session._notify_batch_bytes = self._notify_batch_bytes
         session._return_value_limit = self._return_value_limit
         return session

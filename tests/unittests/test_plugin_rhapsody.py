@@ -1111,12 +1111,31 @@ async def test_session_close_cleans_up_when_rh_close_raises():
     session._rh_session = mock_rh_session
     session._tasks = {'t1': {}}
 
-    with pytest.raises(RuntimeError, match="stop"):
+    with patch('radical.orbit.plugin_rhapsody.log') as mock_log, \
+         pytest.raises(RuntimeError, match="stop"):
         await session.close()
 
+    mock_log.exception.assert_called_once()
     assert session._rh_session is None
     assert session._tasks == {}
     assert session._active is False
+
+
+@pytest.mark.asyncio
+async def test_session_close_keeps_session_during_shutdown():
+    '''In-flight request paths still see ``_rh_session`` while rhapsody
+    shuts down; it is cleared only afterwards.'''
+    session = RhapsodySession("test.004")
+    mock_rh_session = MagicMock()
+    seen = []
+    mock_rh_session.close = AsyncMock(
+        side_effect=lambda: seen.append(session._rh_session))
+    session._rh_session = mock_rh_session
+
+    await session.close()
+
+    assert seen == [mock_rh_session]
+    assert session._rh_session is None
 
 
 @pytest.mark.asyncio
@@ -1367,30 +1386,36 @@ async def test_initialize_without_telemetry(monkeypatch, has_method, otel):
     assert sess._init_ready.is_set()
 
 
+@pytest.fixture
+def _fresh_telemetry_switch():
+    '''Clear the per-process telemetry switch cache around a test.'''
+    from radical.orbit import plugin_rhapsody as prh
+    prh._resolve_telemetry.cache_clear()
+    yield prh
+    prh._resolve_telemetry.cache_clear()
+
+
 @pytest.mark.parametrize('env, on', [
     (None, True), ('1', True), ('on', True), ('YES', True),
     ('0', False), ('off', False), ('False', False), ('no', False),
 ])
-def test_telemetry_switch_resolved_per_plugin(monkeypatch, env, on):
-    '''``$RADICAL_ORBIT_RHAPSODY_TELEMETRY`` is resolved once per plugin
-    and handed to every session; unset keeps telemetry on.'''
-    from radical.orbit import plugin_rhapsody as prh
-
+def test_telemetry_switch(monkeypatch, _fresh_telemetry_switch, env, on):
+    '''``$RADICAL_ORBIT_RHAPSODY_TELEMETRY`` switches telemetry off;
+    unset keeps it on.'''
+    prh = _fresh_telemetry_switch
     if env is None:
         monkeypatch.delenv(prh.ENV_TELEMETRY, raising=False)
     else:
         monkeypatch.setenv(prh.ENV_TELEMETRY, env)
-    _, plugin, client = _make_plugin()
-    sid = _register(client, plugin)
 
-    assert plugin._telemetry_on is on
-    assert plugin._sessions[sid]._telemetry_on is on
+    assert prh._resolve_telemetry() is on
 
 
-def test_telemetry_switch_invalid_warns(monkeypatch, caplog):
-    '''An unrecognised switch value warns and keeps telemetry on.'''
+def test_telemetry_switch_invalid_warns_once(monkeypatch, caplog,
+                                             _fresh_telemetry_switch):
+    '''An unrecognised switch value warns once and keeps telemetry on.'''
     import logging as _logging
-    from radical.orbit import plugin_rhapsody as prh
+    prh = _fresh_telemetry_switch
 
     monkeypatch.setenv(prh.ENV_TELEMETRY, 'maybe')
     re_log = _logging.getLogger('radical.orbit')
@@ -1398,9 +1423,12 @@ def test_telemetry_switch_invalid_warns(monkeypatch, caplog):
     try:
         caplog.set_level(_logging.WARNING, logger='radical.orbit')
         assert prh._resolve_telemetry() is True
+        assert prh._resolve_telemetry() is True
     finally:
         re_log.removeHandler(caplog.handler)
-    assert any(prh.ENV_TELEMETRY in r.getMessage() for r in caplog.records)
+    # count distinct records: with propagation on, caplog sees each twice
+    assert len({id(r) for r in caplog.records
+                if prh.ENV_TELEMETRY in r.getMessage()}) == 1
 
 
 @pytest.mark.asyncio
@@ -1415,9 +1443,9 @@ async def test_initialize_telemetry_switched_off(monkeypatch):
     monkeypatch.setattr(prh.rh, 'Session',
                         MagicMock(return_value=fake_session))
     monkeypatch.setattr(prh, '_telemetry_available', lambda: True)
+    monkeypatch.setattr(prh, '_resolve_telemetry', lambda: False)
 
     sess = RhapsodySession('sess.telem_off', backend_names=['fake'])
-    sess._telemetry_on = False
     await _REAL_INITIALIZE(sess)
 
     fake_session.start_telemetry.assert_not_awaited()
@@ -1439,6 +1467,7 @@ async def test_initialize_telemetry_start_failure(monkeypatch, caplog):
     monkeypatch.setattr(prh.rh, 'Session',
                         MagicMock(return_value=fake_session))
     monkeypatch.setattr(prh, '_telemetry_available', lambda: True)
+    monkeypatch.setattr(prh, '_resolve_telemetry', lambda: True)
 
     import logging as _logging
     sess = RhapsodySession('sess.telem_fail', backend_names=['fake'])
