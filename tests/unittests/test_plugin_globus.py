@@ -112,6 +112,41 @@ def test_session_refresh_failure_keeps_refresh_error():
             GlobusSession('s1', refresh_token='rt', client_id='cid')
 
 
+def test_session_client_failure_closes_auth_client():
+    '''A failure after the auth client exists (here: TransferClient) closes
+    it and re-raises the original error.'''
+    with patch('radical.orbit.plugin_globus.globus_sdk') as gs:
+        gs.TransferClient.side_effect = RuntimeError('tc failed')
+        with pytest.raises(RuntimeError, match='tc failed'):
+            GlobusSession('s1', refresh_token='rt', client_id='cid')
+        gs.NativeAppAuthClient.return_value.close.assert_called_once()
+
+
+@pytest.mark.parametrize('body, offloaded', [
+    ({'access_token': 'tok'},                     False),
+    ({'refresh_token': 'rt', 'client_id': 'cid'}, True),
+])
+@pytest.mark.asyncio
+async def test_register_session_offloads_only_refresh(endpoint_app, body,
+                                                      offloaded):
+    '''Only refresh-token sessions (initial token fetch) go to a thread.'''
+    plugin  = PluginGlobus(endpoint_app)
+    request = MagicMock()
+    async def _json():
+        return body
+    request.json = _json
+
+    async def _to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    with patch('radical.orbit.plugin_globus.globus_sdk'), \
+         patch('radical.orbit.plugin_globus.asyncio.to_thread',
+               side_effect=_to_thread) as tt:
+        result = await plugin.register_session(request)
+    assert result['sid'] in plugin._sessions
+    assert tt.called is offloaded
+
+
 @pytest.mark.asyncio
 async def test_invalid_grant_401_only_for_auth_errors(monkeypatch):
     '''A 400 ``invalid_grant`` maps to 401 only for Globus Auth errors; the

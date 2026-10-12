@@ -187,27 +187,28 @@ class GlobusSession(PluginSession):
         self._tc          = None
         self._auth_client = None
 
-        if access_token:
-            authorizer = globus_sdk.AccessTokenAuthorizer(access_token)
-        elif refresh_token and client_id:
-            self._auth_client = globus_sdk.NativeAppAuthClient(client_id)
-            self._auth_client.transport.http_timeout = GLOBUS_HTTP_TIMEOUT
-            try:
-                # Fetches the first access token synchronously, so
-                # register_session builds sessions off the event loop.
-                authorizer = globus_sdk.RefreshTokenAuthorizer(
-                    refresh_token, self._auth_client)
-            except Exception:
-                self._close_clients()     # never raises: keeps this error
-                raise
-        else:
+        if not access_token and not (refresh_token and client_id):
             raise ValueError(
                 "provide either 'access_token' or 'refresh_token'+'client_id'")
 
-        # Bound every HTTP call so a hung Globus endpoint cannot block the
-        # offload thread indefinitely (mirrors the IRI client's timeout=30).
-        self._tc = globus_sdk.TransferClient(authorizer=authorizer)
-        self._tc.transport.http_timeout = GLOBUS_HTTP_TIMEOUT
+        try:
+            if access_token:
+                authorizer = globus_sdk.AccessTokenAuthorizer(access_token)
+            else:
+                self._auth_client = globus_sdk.NativeAppAuthClient(client_id)
+                self._auth_client.transport.http_timeout = GLOBUS_HTTP_TIMEOUT
+                # Fetches the first access token synchronously, so
+                # register_session builds such sessions off the event loop.
+                authorizer = globus_sdk.RefreshTokenAuthorizer(
+                    refresh_token, self._auth_client)
+
+            # Bound every HTTP call so a hung Globus endpoint cannot block the
+            # offload thread indefinitely (mirrors the IRI client's timeout=30).
+            self._tc = globus_sdk.TransferClient(authorizer=authorizer)
+            self._tc.transport.http_timeout = GLOBUS_HTTP_TIMEOUT
+        except Exception:
+            self._close_clients()     # never raises: keeps the original error
+            raise
 
         # task_id -> {status, label}
         self._tasks: Dict[str, Dict[str, Any]] = {}
@@ -631,14 +632,20 @@ class PluginGlobus(Plugin):
         if sid is None:
             sid = f'session.{uuid.uuid4().hex[:8]}'
 
+        kwargs = {'access_token' : access_token,
+                  'refresh_token': refresh_token,
+                  'client_id'    : client_id,
+                  'local_collection': local_coll}
         try:
-            # Offloaded: a refresh-token session fetches its first access
-            # token synchronously, which can take longer than one HTTP
-            # timeout since the SDK transport retries failed requests.
-            session = await asyncio.to_thread(
-                self._create_session,
-                sid, access_token=access_token, refresh_token=refresh_token,
-                client_id=client_id, local_collection=local_coll)
+            if access_token:
+                # No I/O: build inline, not queued behind offloaded calls.
+                session = self._create_session(sid, **kwargs)
+            else:
+                # Offloaded: a refresh-token session fetches its first access
+                # token synchronously, which can take longer than one HTTP
+                # timeout since the SDK transport retries failed requests.
+                session = await asyncio.to_thread(
+                    self._create_session, sid, **kwargs)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
