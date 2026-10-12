@@ -41,6 +41,7 @@ __copyright__ = 'Copyright 2024, RADICAL@Rutgers'
 __license__   = 'MIT'
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -61,8 +62,8 @@ except ImportError:
 
 # globus-sdk 4.x replaced TransferClient's ``transport_params`` with a
 # ``transport`` instance; 3.x accepts only the former.
-_SDK4 = globus_sdk is not None \
-    and int(globus_sdk.__version__.split('.')[0]) >= 4
+_SDK4 = globus_sdk is not None and 'transport' in \
+    inspect.signature(globus_sdk.TransferClient.__init__).parameters
 
 log = logging.getLogger('radical.orbit')
 
@@ -243,7 +244,9 @@ class GlobusSession(PluginSession):
         if label      is not None: td_kwargs['label']      = label
         if sync_level is not None: td_kwargs['sync_level'] = sync_level
 
-        tdata = globus_sdk.TransferData(self._tc, **td_kwargs)
+        # No client argument: 4.x dropped it, and submit_transfer fills in
+        # the submission_id on both 3.x and 4.x.
+        tdata = globus_sdk.TransferData(**td_kwargs)
         for it in items:
             s = it.get('source')
             d = it.get('destination')
@@ -330,7 +333,7 @@ class GlobusSession(PluginSession):
                                      'recursive': bool(recursive)}
         if label is not None: dd_kwargs['label'] = label
 
-        ddata = globus_sdk.DeleteData(self._tc, **dd_kwargs)
+        ddata = globus_sdk.DeleteData(**dd_kwargs)
         for p in paths:
             ddata.add_item(p)
 

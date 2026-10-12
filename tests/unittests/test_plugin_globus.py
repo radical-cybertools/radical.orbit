@@ -107,12 +107,37 @@ def test_session_transport_kwargs(sdk4):
         assert kwargs['transport_params'] == {'http_timeout': 60}
         assert 'transport' not in kwargs
 
+
 def test_session_real_transfer_client():
     '''Unmocked: the installed globus-sdk (3.x or 4.x) accepts the
     TransferClient construction, with the 60 s HTTP timeout applied.'''
     pytest.importorskip('globus_sdk')
     session = GlobusSession('s1', access_token='tok')
     assert session._tc.transport.http_timeout == 60
+
+
+@pytest.mark.asyncio
+async def test_submit_real_sdk_payloads():
+    '''Unmocked SDK: TransferData / DeleteData build on 3.x and 4.x (4.x
+    dropped their leading transfer_client argument).'''
+    pytest.importorskip('globus_sdk')
+    session = GlobusSession('s1', access_token='tok')
+    session._start_polling = MagicMock()
+    with patch.object(session._tc, 'submit_transfer',
+                      return_value={'task_id': 't1'}) as st, \
+         patch.object(session._tc, 'submit_delete',
+                      return_value={'task_id': 't2'}) as sd:
+        await session.submit_transfer(
+            'src', 'dst', [{'source': '/a', 'destination': '/b'}], label='l')
+        await session.submit_delete('src', ['/a'], recursive=True)
+
+    tdata = st.call_args.args[0]
+    assert tdata['source_endpoint']      == 'src'
+    assert tdata['destination_endpoint'] == 'dst'
+    assert tdata['DATA'][0]['source_path'] == '/a'
+    ddata = sd.call_args.args[0]
+    assert ddata['endpoint']  == 'src'
+    assert ddata['recursive'] is True
 
 
 # ---------------------------------------------------------------------------
