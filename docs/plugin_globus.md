@@ -8,7 +8,8 @@ from the byte-streaming `staging` plugin.
 
 The plugin is **endpoint-side** (it is not hosted on the broker) and is only
 enabled when [globus-sdk](https://globus-sdk-python.readthedocs.io/) is
-importable.
+importable. It is part of the `default` plugin set on `login`, `compute` and
+`standalone` endpoints.
 
 ## Architecture
 

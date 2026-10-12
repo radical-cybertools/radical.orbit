@@ -236,7 +236,8 @@ The `default` token expands against the host's detected role — `broker`,
 `login` (a scheduler is present, not inside an allocation), `compute`
 (inside an allocation), or `standalone` (no scheduler) — using
 `DEFAULT_PLUGINS_BY_ROLE` in `plugin_host_base.py`. That is why a login
-node gets `psij` by default while a compute node gets `rhapsody`.
+node gets `psij` by default while a compute node gets `rhapsody`; every
+endpoint role also gets `globus`.
 
 The math plugin is intentionally **not** in any default set; load it
 explicitly on top of the defaults:

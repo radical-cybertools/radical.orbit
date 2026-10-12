@@ -121,6 +121,22 @@ class TestExpandSpecialTokens:
         out = _expand_special_tokens(['psij', 'sys'], app, ['psij', 'sysinfo'])
         assert out == ['psij', 'sys']
 
+    @pytest.mark.parametrize('role, expected', [
+        ('login',   ['psij',     'staging', 'sysinfo', 'globus']),
+        ('compute', ['rhapsody', 'staging', 'sysinfo', 'globus']),
+        ('standalone', ['psij', 'staging', 'sysinfo', 'rhapsody', 'globus']),
+    ])
+    def test_default_includes_globus(self, role, expected):
+        """``default`` on every endpoint role loads globus."""
+        from unittest.mock import patch
+        app = self._app()
+        with patch('radical.orbit.utils.host_role',
+                   return_value={'role': role}):
+            out = _expand_special_tokens(['default'], app,
+                                         ['psij', 'rhapsody', 'staging',
+                                          'sysinfo', 'globus'])
+        assert out == expected
+
     def test_default_role_table_complete(self):
         """Sanity: every advertised role has a default set."""
         for role in ('broker', 'login', 'compute', 'standalone'):
