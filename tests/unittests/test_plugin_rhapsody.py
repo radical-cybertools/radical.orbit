@@ -1322,6 +1322,31 @@ async def test_initialize_without_start_telemetry(monkeypatch):
     assert sess._init_ready.is_set()
 
 
+@pytest.mark.asyncio
+async def test_initialize_telemetry_extra_missing(monkeypatch):
+    '''Session init must succeed when ``start_telemetry`` raises
+    ImportError (rhapsody installed without the ``[telemetry]`` extra).'''
+    from radical.orbit import plugin_rhapsody as prh
+
+    fake_backend = MagicMock(spec=[])
+    fake_session = MagicMock(spec=['start_telemetry'])
+    fake_session.start_telemetry = AsyncMock(
+        side_effect=ImportError("requires opentelemetry-sdk"))
+
+    monkeypatch.setattr(prh.rh, 'get_backend',
+                        MagicMock(return_value=fake_backend))
+    monkeypatch.setattr(prh.rh, 'Session',
+                        MagicMock(return_value=fake_session))
+
+    sess = RhapsodySession('sess.no_otel', backend_names=['fake'])
+    await _REAL_INITIALIZE(sess)
+
+    fake_session.start_telemetry.assert_awaited_once()
+    assert sess._telemetry is None
+    assert sess._init_error is None
+    assert sess._init_ready.is_set()
+
+
 # ---------------------------------------------------------------------------
 # Notification coalescing window ($RADICAL_ORBIT_RHAPSODY_NOTIFY_WINDOW)
 # ---------------------------------------------------------------------------

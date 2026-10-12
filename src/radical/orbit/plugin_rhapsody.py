@@ -248,14 +248,17 @@ class RhapsodySession(PluginSession):
             self._rh_session = await asyncio.to_thread(
                 rh.Session, backends=backends, uid=self._sid)
 
-            # start_telemetry only exists on newer rhapsody; older
-            # installs don't support it. Skip silently if unavailable.
+            # Telemetry is optional: older rhapsody lacks start_telemetry,
+            # newer rhapsody raises ImportError without the [telemetry] extra.
             self._telemetry = None
             start_telemetry = getattr(self._rh_session, 'start_telemetry', None)
             if start_telemetry is not None:
-                self._telemetry = await start_telemetry(
-                    resource_poll_interval=0.1,
-                    checkpoint_path="telemetry-output")
+                try:
+                    self._telemetry = await start_telemetry(
+                        resource_poll_interval=0.1,
+                        checkpoint_path="telemetry-output")
+                except ImportError as e:
+                    log.warning("[%s] Telemetry disabled: %s", self._sid, e)
 
             # Register state-change callbacks for intermediate notifications
             self._notified_states: dict[str, str] = {}
