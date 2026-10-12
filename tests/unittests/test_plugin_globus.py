@@ -93,6 +93,41 @@ def test_session_no_credential():
             GlobusSession('s1')
 
 
+def test_close_clients_is_best_effort():
+    '''One client's close() raising must not skip the other's.'''
+    session = _make_session()
+    session._auth_client = MagicMock()
+    session._tc.close.side_effect = RuntimeError('boom')
+    session._close_clients()
+    session._auth_client.close.assert_called_once()
+
+
+def test_session_refresh_failure_keeps_refresh_error():
+    '''A failing close during the refresh-failure cleanup must not mask
+    the refresh error.'''
+    with patch('radical.orbit.plugin_globus.globus_sdk') as gs:
+        gs.RefreshTokenAuthorizer.side_effect = RuntimeError('refresh failed')
+        gs.NativeAppAuthClient.return_value.close.side_effect = OSError('x')
+        with pytest.raises(RuntimeError, match='refresh failed'):
+            GlobusSession('s1', refresh_token='rt', client_id='cid')
+
+
+@pytest.mark.asyncio
+async def test_invalid_grant_401_only_for_auth_errors(monkeypatch):
+    '''A 400 ``invalid_grant`` maps to 401 only for Globus Auth errors; the
+    same body from the Transfer API stays a 502.'''
+    pytest.importorskip('globus_sdk')
+    _stub_http(monkeypatch, (400, {'error': 'invalid_grant',
+                                   'code': 'BadRequest'}))
+    session = GlobusSession('s1', access_token='tok')
+    try:
+        with pytest.raises(HTTPException) as exc:
+            await session.get_task('tid-1')
+        assert exc.value.status_code == 502
+    finally:
+        await session.close()
+
+
 def test_session_refresh_failure_closes_auth_client():
     '''A failing initial token refresh must not leak the auth client.'''
     with patch('radical.orbit.plugin_globus.globus_sdk') as gs:
@@ -100,6 +135,44 @@ def test_session_refresh_failure_closes_auth_client():
         with pytest.raises(RuntimeError, match='refresh failed'):
             GlobusSession('s1', refresh_token='rt', client_id='cid')
         gs.NativeAppAuthClient.return_value.close.assert_called_once()
+
+
+def _stub_http(monkeypatch, reply):
+    '''Stub globus-sdk's HTTP layer (``requests.Session.send``).
+
+    *reply* is a requests exception to raise, a ``(status, json)`` response,
+    or a callable ``req -> (status, json)``.  Returns the list of sent
+    ``(method, url, body, timeout)`` tuples.
+    '''
+    import requests
+    sent = []
+
+    def fake_send(_self, req, **kw):
+        sent.append((req.method, req.url, req.body, kw.get('timeout')))
+        if isinstance(reply, Exception):
+            raise reply
+        status, data = reply(req) if callable(reply) else reply
+        resp = requests.Response()
+        resp.status_code = status
+        resp._content    = json.dumps(data).encode()
+        resp.headers['Content-Type'] = 'application/json'
+        resp.request, resp.url = req, req.url
+        return resp
+
+    monkeypatch.setattr(requests.Session, 'send', fake_send)
+    return sent
+
+
+def _globus_reply(req):
+    '''Canned successful Globus Auth / Transfer replies.'''
+    if req.url.endswith('/oauth2/token'):
+        return 200, {'access_token': 'at', 'expires_in': 3600,
+                     'resource_server': 'transfer.api.globus.org',
+                     'scope': 'urn:globus:auth:scope:transfer.api.globus.org:all',
+                     'token_type': 'Bearer', 'other_tokens': []}
+    if req.url.endswith('/submission_id'):
+        return 200, {'value': 'sid-1'}
+    return 200, {'task_id': 'tid-1', 'submission_id': 'sid-1'}
 
 
 @pytest.mark.parametrize('creds', [
@@ -114,31 +187,10 @@ async def test_real_sdk_requests(monkeypatch, creds):
     dropped the client argument of TransferData / DeleteData that used to
     fetch it).'''
     pytest.importorskip('globus_sdk')
-    import requests
 
     # A different SDK default proves the session sets the timeout itself.
     monkeypatch.setenv('GLOBUS_SDK_HTTP_TIMEOUT', '5')
-    sent = []
-
-    def fake_send(_self, req, **kw):
-        sent.append((req.method, req.url, req.body, kw.get('timeout')))
-        if req.url.endswith('/oauth2/token'):
-            data = {'access_token': 'at', 'expires_in': 3600,
-                    'resource_server': 'transfer.api.globus.org',
-                    'scope': 'urn:globus:auth:scope:transfer.api.globus.org:all',
-                    'token_type': 'Bearer', 'other_tokens': []}
-        elif req.url.endswith('/submission_id'):
-            data = {'value': 'sid-1'}
-        else:
-            data = {'task_id': 'tid-1', 'submission_id': 'sid-1'}
-        resp = requests.Response()
-        resp.status_code = 200
-        resp._content    = json.dumps(data).encode()
-        resp.headers['Content-Type'] = 'application/json'
-        resp.request, resp.url = req, req.url
-        return resp
-
-    monkeypatch.setattr(requests.Session, 'send', fake_send)
+    sent = _stub_http(monkeypatch, _globus_reply)
     session = GlobusSession('s1', **creds)
     session._start_polling = MagicMock()
     # globus-sdk 4.x clients have close(); 3.x clients have none.
@@ -447,24 +499,6 @@ async def test_register_session_requires_credential(endpoint_app):
     assert exc.value.status_code == 400
 
 
-def _stub_token_endpoint(monkeypatch, reply):
-    '''Stub the HTTP layer: every request gets *reply* (a requests
-    exception to raise, or a ``(status, json)`` response).'''
-    import requests
-
-    def fake_send(_self, req, **kw):
-        if isinstance(reply, Exception):
-            raise reply
-        resp = requests.Response()
-        resp.status_code = reply[0]
-        resp._content    = json.dumps(reply[1]).encode()
-        resp.headers['Content-Type'] = 'application/json'
-        resp.request, resp.url = req, req.url
-        return resp
-
-    monkeypatch.setattr(requests.Session, 'send', fake_send)
-
-
 @pytest.mark.parametrize('reply, status', [
     ((400, {'error': 'invalid_grant'}), 401),
     ('network', 502),
@@ -480,7 +514,7 @@ async def test_register_session_refresh_errors(endpoint_app, monkeypatch,
         reply = requests.ConnectionError('unreachable')
         # globus-sdk retries network errors with backoff sleeps.
         monkeypatch.setattr('time.sleep', lambda _s: None)
-    _stub_token_endpoint(monkeypatch, reply)
+    _stub_http(monkeypatch, reply)
 
     plugin  = PluginGlobus(endpoint_app)
     request = MagicMock()

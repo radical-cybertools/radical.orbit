@@ -148,9 +148,11 @@ def _globus_http_exc(exc: Exception, context: str = '') -> HTTPException:
 
     # Globus Auth answers an expired or revoked refresh token with a 400
     # ``invalid_grant`` (``exc.code`` differs between globus-sdk 3.x and 4.x).
-    raw = getattr(exc, 'raw_json', None)
-    if sc == 400 and isinstance(raw, dict) and raw.get('error') == 'invalid_grant':
-        sc = 401
+    if sc == 400 and globus_sdk is not None \
+            and isinstance(exc, globus_sdk.AuthAPIError):
+        raw = getattr(exc, 'raw_json', None)
+        if isinstance(raw, dict) and raw.get('error') == 'invalid_grant':
+            sc = 401
 
     if   sc == 401: return HTTPException(status_code=401, detail=f'{prefix}token expired or invalid')
     elif sc == 403: return HTTPException(status_code=403, detail=f'{prefix}forbidden')
@@ -196,7 +198,7 @@ class GlobusSession(PluginSession):
                 authorizer = globus_sdk.RefreshTokenAuthorizer(
                     refresh_token, self._auth_client)
             except Exception:
-                self._close_clients()
+                self._close_clients()     # never raises: keeps this error
                 raise
         else:
             raise ValueError(
@@ -376,11 +378,17 @@ class GlobusSession(PluginSession):
 
     def _close_clients(self) -> None:
         '''Release the SDK clients' HTTP connections (``close()`` exists on
-        globus-sdk 4.x clients only).'''
+        globus-sdk 4.x clients only).  Best effort: a failing close is
+        logged and does not skip the other client.'''
         for client in (self._tc, self._auth_client):
             close = getattr(client, 'close', None)
-            if close is not None:
+            if close is None:
+                continue
+            try:
                 close()
+            except Exception as exc:
+                log.debug('[globus] session %s: closing %s failed: %s',
+                          self._sid, type(client).__name__, exc)
 
     async def close(self) -> Dict[str, Any]:
         # Stop the status poller (base close) before closing its client.
@@ -625,7 +633,8 @@ class PluginGlobus(Plugin):
 
         try:
             # Offloaded: a refresh-token session fetches its first access
-            # token synchronously (up to the HTTP timeout).
+            # token synchronously, which can take longer than one HTTP
+            # timeout since the SDK transport retries failed requests.
             session = await asyncio.to_thread(
                 self._create_session,
                 sid, access_token=access_token, refresh_token=refresh_token,
