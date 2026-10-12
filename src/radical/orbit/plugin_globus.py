@@ -75,16 +75,16 @@ GLOBUS_CONFIG_FILE = '~/.radical/orbit/globus.json'
 # routed call after ``BrokerTuning.call_timeout`` (30 s by default) with
 # HTTP 504 while the transfer keeps running.  globus-sdk sleeps at most
 # ``timeout`` in total; the unbounded part is the HTTP time of each poll
-# (one ``get_task`` per interval), so the interval has a floor to keep the
-# number of polls per wait small.  The slice shrinks further when the
-# hosting runtime's call timeout is lower (``_resolve_wait_slice``).
+# (one ``get_task`` per polling interval).  The slice shrinks further when
+# the hosting runtime's call timeout is lower (``_resolve_wait_slice``).
 # ``GlobusClient.task_wait`` loops such waits up to the caller's timeout.
 GLOBUS_WAIT_SLICE = 10
-GLOBUS_WAIT_POLL  = 5       # minimum polling interval within one wait
 
-# Gateway/broker statuses for a wait slice that died in transit (reaped,
-# unreachable, overloaded); the client retries these until its deadline.
-_WAIT_TRANSIENT = {502, 503, 504}
+# Statuses of a wait slice lost in transit, which the client retries until
+# its deadline: 504 (call reaped or handler timed out) and 503 (broker /
+# runtime overload fast-fail).  Not 502: the broker sends it for an unknown
+# endpoint, and this plugin maps every unmapped Globus error to it.
+_WAIT_TRANSIENT = {503, 504}
 
 
 # ---------------------------------------------------------------------------
@@ -305,19 +305,17 @@ class GlobusSession(PluginSession):
                         max_wait: int = GLOBUS_WAIT_SLICE) -> dict:
         '''Wait for the task to leave ``ACTIVE``, bounded to *max_wait*.
 
-        Returns ``{task_id, completed, timeout}``: ``timeout`` is the wait
-        actually applied.  ``completed`` is true for any non-ACTIVE status,
-        including ``INACTIVE`` (e.g. an expired credential) — use
-        ``get_task`` for the status itself.
+        Returns ``{task_id, completed}``.  ``completed`` is true for any
+        non-ACTIVE status, including ``INACTIVE`` (e.g. an expired
+        credential) — use ``get_task`` for the status itself.
         '''
         # Bound the blocking wait below the routed-call timeout (see
-        # GLOBUS_WAIT_SLICE): its duration and its number of API calls.
+        # GLOBUS_WAIT_SLICE); globus-sdk requires values >= 1.
         timeout          = max(1, min(timeout, max_wait))
-        polling_interval = min(max(polling_interval, GLOBUS_WAIT_POLL),
-                               timeout)
+        polling_interval = max(1, min(polling_interval, timeout))
         done = await self._call(self._tc.task_wait, task_id, context='task_wait',
                                 timeout=timeout, polling_interval=polling_interval)
-        return {'task_id': task_id, 'completed': bool(done), 'timeout': timeout}
+        return {'task_id': task_id, 'completed': bool(done)}
 
     async def cancel_task(self, task_id: str) -> dict:
         res = _as_dict(await self._call(
@@ -486,40 +484,45 @@ class GlobusClient(PluginClient):
                  polling_interval: int = 10) -> dict:
         '''Wait up to *timeout* seconds for the task to leave ``ACTIVE``.
 
-        The endpoint bounds each wait below the routed-call timeout and
-        reports the bound it applied, so this loops such waits until the
-        task completes or less than a second of *timeout* is left.  A wait
-        lost in transit (HTTP 502/503/504) is retried within *timeout*;
-        other errors raise.
+        The endpoint bounds each wait below the routed-call timeout, so
+        this loops such waits until the task completes or less than a
+        second of *timeout* is left; it always makes at least one request
+        (``timeout=0`` is a quick status probe).  A wait lost in transit
+        (HTTP 503/504) is retried within *timeout*, and raised if the last
+        attempt before the deadline was lost; other errors raise at once.
 
         Returns ``{task_id, completed, ...}``.  ``completed`` is true for any
         non-ACTIVE status, including ``INACTIVE`` (e.g. an expired
         credential) — call ``get_task`` for the status itself.
         '''
         self._require_session()
-        res      = {'task_id': task_id, 'completed': False}
         deadline = time.monotonic() + timeout
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining < 1:
-                return res
             # Also cap the request here: an endpoint predating the server
             # clamp would otherwise block a worker thread past the reap
             # deadline on every retry.
+            wait = max(1, min(int(deadline - time.monotonic()),
+                              GLOBUS_WAIT_SLICE))
             resp = self._http.post(self._url(f'wait/{self._sid}/{task_id}'),
-                                   json={'timeout': min(int(remaining),
-                                                        GLOBUS_WAIT_SLICE),
+                                   json={'timeout': wait,
                                          'polling_interval': polling_interval})
-            if resp.status_code in _WAIT_TRANSIENT:
+            lost = resp.status_code in _WAIT_TRANSIENT
+            if not lost:
+                self._raise(resp, f'task_wait {task_id!r}')
+                res = resp.json()
+                if res.get('completed'):
+                    return res
+
+            remaining = deadline - time.monotonic()
+            if remaining < 1:
+                if lost:
+                    self._raise(resp, f'task_wait {task_id!r}')
+                return res
+
+            if lost:
                 log.debug('[globus] task_wait %s: slice lost (HTTP %s), '
                           'retrying', task_id, resp.status_code)
-                time.sleep(max(0, min(GLOBUS_WAIT_POLL,
-                                      deadline - time.monotonic())))
-                continue
-            self._raise(resp, f'task_wait {task_id!r}')
-            res = resp.json()
-            if res.get('completed'):
-                return res
+                time.sleep(min(1.0, remaining))   # overload: back off briefly
 
     def cancel_task(self, task_id: str) -> dict:
         self._require_session()

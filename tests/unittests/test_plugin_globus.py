@@ -170,30 +170,30 @@ async def test_task_wait():
     session = _make_session()
     session._tc.task_wait.return_value = True
     result = await session.task_wait('t1', timeout=5)
-    assert result == {'task_id': 't1', 'completed': True, 'timeout': 5}
+    assert result == {'task_id': 't1', 'completed': True}
 
 
 @pytest.mark.asyncio
 async def test_task_wait_clamped_below_call_timeout():
-    """A long wait is bounded per call so the routed call is not reaped,
-    and the response reports the bound applied."""
+    """A long wait is bounded per call so the routed call is not reaped."""
     session = _make_session()
     session._tc.task_wait.return_value = False
     res = await session.task_wait('t1', timeout=600, polling_interval=60)
     kwargs = session._tc.task_wait.call_args.kwargs
     assert kwargs['timeout']          == GLOBUS_WAIT_SLICE
     assert kwargs['polling_interval'] == GLOBUS_WAIT_SLICE
-    assert res == {'task_id': 't1', 'completed': False,
-                   'timeout': GLOBUS_WAIT_SLICE}
+    assert res == {'task_id': 't1', 'completed': False}
 
-    # a tiny interval would multiply Globus API round trips per wait
-    await session.task_wait('t1', timeout=600, polling_interval=1)
-    assert session._tc.task_wait.call_args.kwargs['polling_interval'] \
-        == pg.GLOBUS_WAIT_POLL
+    # the caller's interval is honoured down to the sdk minimum of 1 s
+    await session.task_wait('t1', timeout=600, polling_interval=2)
+    assert session._tc.task_wait.call_args.kwargs['polling_interval'] == 2
+    await session.task_wait('t1', timeout=0, polling_interval=0)
+    kwargs = session._tc.task_wait.call_args.kwargs
+    assert (kwargs['timeout'], kwargs['polling_interval']) == (1, 1)
 
     # a lower host-derived bound wins
-    res = await session.task_wait('t1', timeout=600, max_wait=3)
-    assert res['timeout'] == 3
+    await session.task_wait('t1', timeout=600, max_wait=3)
+    assert session._tc.task_wait.call_args.kwargs['timeout'] == 3
 
 
 @pytest.mark.parametrize('call_timeout, expected', [
@@ -268,20 +268,41 @@ def test_client_task_wait_slice_overruns_clock(monkeypatch):
     assert http.post.call_count == 1
 
 
-def test_client_task_wait_retries_lost_slice(monkeypatch):
-    """A 504 (reaped in transit) mid-loop is retried, not raised."""
-    client, http, _ = _wait_client([(200, _ACTIVE, None),
-                                    (504, {'detail': 'call timed out'}, 30.0),
-                                    (200, _DONE,   None)], monkeypatch)
+def test_client_task_wait_zero_timeout_probes_once(monkeypatch):
+    """timeout=0 still asks once (a status probe)."""
+    client, http, _ = _wait_client([(200, _DONE, 0.2)], monkeypatch)
+    assert client.task_wait('t1', timeout=0) == _DONE
+    assert _sent(http) == [1]
+
+
+@pytest.mark.parametrize('status', [503, 504])
+def test_client_task_wait_retries_lost_slice(monkeypatch, status):
+    """A slice lost in transit mid-loop is retried, not raised."""
+    client, http, _ = _wait_client([(200,    _ACTIVE, None),
+                                    (status, {'detail': 'lost'}, 30.0),
+                                    (200,    _DONE,   None)], monkeypatch)
     assert client.task_wait('t1', timeout=120) == _DONE
     assert http.post.call_count == 3
 
 
-def test_client_task_wait_raises_other_errors(monkeypatch):
-    client, http, _ = _wait_client([(404, {'detail': 'no session'}, 0.0)],
+def test_client_task_wait_raises_lost_slice_at_deadline(monkeypatch):
+    """If the last attempt before the deadline was lost, raise it rather
+    than report a silent completed=False."""
+    client, http, _ = _wait_client([(200, _ACTIVE, None),
+                                    (504, {'detail': 'call timed out'}, 30.0)],
                                    monkeypatch)
-    with pytest.raises(RuntimeError, match='HTTP 404'):
+    with pytest.raises(RuntimeError, match='HTTP 504'):
+        client.task_wait('t1', timeout=30)
+
+
+@pytest.mark.parametrize('status', [404, 502])
+def test_client_task_wait_raises_other_errors(monkeypatch, status):
+    """502 is not retried: it is how the plugin reports Globus errors."""
+    client, http, _ = _wait_client([(status, {'detail': 'boom'}, 0.0)],
+                                   monkeypatch)
+    with pytest.raises(RuntimeError, match=f'HTTP {status}'):
         client.task_wait('t1', timeout=60)
+    assert http.post.call_count == 1
 
 
 @pytest.mark.asyncio

@@ -111,10 +111,10 @@ Submit a transfer. `items` is a list of
 `get_task(task_id)` / `task_wait(task_id, timeout=60, polling_interval=10)` / `cancel_task(task_id)` / `list_tasks(limit=100)`  
 Task monitoring and control. The endpoint bounds one wait to
 `GLOBUS_WAIT_SLICE` (10 s, less when the endpoint's own call timeout is
-low), below the broker's routed-call timeout, and reports the bound it
-applied as `timeout`. The client's `task_wait` loops such waits up to
-`timeout`, retrying a wait lost in transit (HTTP 502/503/504), and returns
-`{task_id, completed, …}`. `completed` is true for any non-ACTIVE status,
+low), below the broker's routed-call timeout. The client's `task_wait`
+loops such waits up to `timeout` (at least one request, so `timeout=0` is
+a status probe), retries a wait lost in transit (HTTP 503/504), and
+returns `{task_id, completed}`. `completed` is true for any non-ACTIVE status,
 including `INACTIVE` (e.g. an expired credential); use `get_task` for the
 status.
 
