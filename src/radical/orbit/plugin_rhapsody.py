@@ -286,34 +286,25 @@ class RhapsodySession(PluginSession):
             # Offload the blocking ``rh.Session`` construction to a worker
             # thread (the established ``_prepare_batch`` offload pattern) so it
             # keeps the work loop responsive to other requests during init.
-            self._rh_session = await asyncio.to_thread(
+            rh_session = await asyncio.to_thread(
                 rh.Session, backends=backends, uid=self._sid)
 
             # Telemetry is optional: older rhapsody lacks start_telemetry,
             # it needs the [telemetry] extra, the operator can switch it off,
             # and a failure to start it must not fail the session.
-            self._telemetry = None
-            start_telemetry = getattr(self._rh_session, 'start_telemetry', None)
+            telemetry = None
+            start_telemetry = getattr(rh_session, 'start_telemetry', None)
             if start_telemetry is not None and _resolve_telemetry() \
                     and _telemetry_available():
                 try:
-                    self._telemetry = await start_telemetry(
+                    telemetry = await start_telemetry(
                         resource_poll_interval=0.1,
                         checkpoint_path="telemetry-output")
                 except Exception as e:
                     log.warning("[%s] telemetry start failed: %r; not "
                                 "reporting telemetry for this session",
                                 self._sid, e)
-                    # Workaround: rhapsody (<= 0.4) does not unwind a failed
-                    # start.  Its session keeps the half-started manager,
-                    # whose stop() then raises in Session.close() before the
-                    # backends are shut down.  Detach it; drop this once
-                    # rhapsody unwinds start_telemetry() itself.
-                    if hasattr(self._rh_session, '_telemetry'):
-                        self._rh_session._telemetry = None
-                    sm = getattr(self._rh_session, '_state_manager', None)
-                    if hasattr(sm, '_telemetry_observer'):
-                        sm._telemetry_observer = None
+                    await self._unwind_telemetry(rh_session)
 
             # Register state-change callbacks for intermediate notifications
             self._notified_states: dict[str, str] = {}
@@ -329,6 +320,18 @@ class RhapsodySession(PluginSession):
 
                     b.register_callback(_on_state)
 
+            if self._closed is not None:
+                # close() ran during the awaits above and found no rhapsody
+                # session to shut down: release what was built here.
+                self._init_error = "session closed during initialization"
+                self._init_ready.set()
+                log.info("[%s] Session closed during initialization",
+                         self._sid)
+                await rh_session.close()
+                return
+
+            self._rh_session = rh_session
+            self._telemetry  = telemetry
             self._init_ready.set()
             log.info("[%s] Session initialization complete", self._sid)
 
@@ -338,6 +341,33 @@ class RhapsodySession(PluginSession):
             log.error("[%s] Session initialization failed: %s",
                       self._sid, e)
             raise
+
+    async def _unwind_telemetry(self, rh_session) -> None:
+        """Workaround: rhapsody (<= 0.4) does not unwind a failed
+        ``start_telemetry()``.  Its session keeps the half-started manager,
+        whose ``stop()`` then raises in ``Session.close()`` before the
+        backends are shut down.  Stop it best effort and detach it; drop
+        this once rhapsody unwinds a failed start itself.
+        """
+        tm = getattr(rh_session, '_telemetry', None)
+        if tm is not None:
+            try:
+                await tm.stop()
+            except Exception as e:
+                log.debug("[%s] stopping half-started telemetry: %r",
+                          self._sid, e)
+            rh_session._telemetry = None
+        sm = getattr(rh_session, '_state_manager', None)
+        if hasattr(sm, '_telemetry_observer'):
+            sm._telemetry_observer = None
+
+    def _live_rh_session(self):
+        """The rhapsody session, or a clean error once close() cleared it
+        (for request paths still in flight during teardown)."""
+        rh_session = self._rh_session
+        if rh_session is None:
+            raise RuntimeError("session is closed")
+        return rh_session
 
     def _on_task_state_change(self, task, state):
         """Fire notification on intermediate state changes (e.g. RUNNING).
@@ -465,7 +495,7 @@ class RhapsodySession(PluginSession):
         for i in range(0, len(task_dicts), _CHUNK):
             chunk = task_dicts[i:i + _CHUNK]
             tasks = await asyncio.to_thread(self._prepare_batch, chunk)
-            await self._rh_session.submit_tasks(tasks)
+            await self._live_rh_session().submit_tasks(tasks)
             for t in tasks:
                 uid_str = str(t.uid)
                 self._tasks[uid_str] = t
@@ -579,7 +609,8 @@ class RhapsodySession(PluginSession):
         dependency is a single greppable line that a dependency upgrade can
         find.
         """
-        return self._rh_session._state_manager.get_wait_future(uid_str, task)
+        return self._live_rh_session()._state_manager.get_wait_future(
+            uid_str, task)
 
     async def _watch_batch(self, tasks):
         """Watch a batch of tasks, notifying as each completes.
@@ -819,9 +850,9 @@ class RhapsodySession(PluginSession):
                                 detail=f"task {uid} not found")
 
         backend_name = task.get("backend")
-        if backend_name and backend_name in self._rh_session.backends:
-            backend = self._rh_session.backends[backend_name]
-            await backend.cancel_task(uid)
+        backends     = self._live_rh_session().backends
+        if backend_name and backend_name in backends:
+            await backends[backend_name].cancel_task(uid)
 
         return {"uid": uid, "status": "canceled"}
 
@@ -887,8 +918,8 @@ class RhapsodySession(PluginSession):
                     # cleared only after the await, so in-flight request
                     # paths still see the session while it shuts down
                     self._rh_session = None
-                    self._tasks = {}
         finally:
+            self._tasks = {}
             self._closed.set()
             await super().close()
         return {}

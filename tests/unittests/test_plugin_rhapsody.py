@@ -1178,13 +1178,91 @@ async def test_session_close_concurrent_runs_rhapsody_close_once():
 
 
 @pytest.mark.asyncio
+async def test_session_close_resets_tasks_without_rh_session():
+    '''close() clears the task table even when no rhapsody session
+    was ever built.'''
+    session = RhapsodySession("test.close_no_rh")
+    session._tasks = {'t1': {}}
+
+    assert await session.close() == {}
+    assert session._tasks == {}
+
+
+def test_live_rh_session_after_close():
+    '''In-flight paths get a clean error, not AttributeError, once
+    close() has cleared the rhapsody session.'''
+    session = RhapsodySession("test.live_rh")
+    session._rh_session = None
+
+    with pytest.raises(RuntimeError, match="session is closed"):
+        session._task_future('task.000001', MagicMock())
+
+
+@pytest.mark.asyncio
+async def test_unwind_telemetry_stops_and_detaches():
+    '''A half-started manager is stopped best effort (a failing stop is
+    tolerated) and detached from the rhapsody session.'''
+    session = RhapsodySession("test.unwind")
+    tm = MagicMock()
+    tm.stop = AsyncMock(side_effect=TypeError("never started"))
+    rh_session = MagicMock()
+    rh_session._telemetry = tm
+    rh_session._state_manager._telemetry_observer = tm._on_task_state_change
+
+    await session._unwind_telemetry(rh_session)
+
+    tm.stop.assert_awaited_once()
+    assert rh_session._telemetry is None
+    assert rh_session._state_manager._telemetry_observer is None
+
+
+@pytest.mark.asyncio
+async def test_close_during_initialize_releases_rhapsody(monkeypatch):
+    '''A close() that lands while initialize() is still awaiting must not
+    leak the rhapsody session that initialize() goes on to build.'''
+    from radical.orbit import plugin_rhapsody as prh
+
+    in_start = asyncio.Event()
+    release  = asyncio.Event()
+
+    async def _slow_start(**kwargs):
+        in_start.set()
+        await release.wait()
+        return MagicMock()
+
+    fake_session = MagicMock(spec=['start_telemetry', 'close'])
+    fake_session.start_telemetry = AsyncMock(side_effect=_slow_start)
+    fake_session.close = AsyncMock()
+    monkeypatch.setattr(prh.rh, 'get_backend',
+                        MagicMock(return_value=MagicMock(spec=[])))
+    monkeypatch.setattr(prh.rh, 'Session',
+                        MagicMock(return_value=fake_session))
+    monkeypatch.setattr(prh, '_telemetry_available', lambda: True)
+    monkeypatch.setattr(prh, '_resolve_telemetry', lambda: True)
+
+    sess = RhapsodySession('sess.close_in_init', backend_names=['fake'])
+    init = asyncio.ensure_future(_REAL_INITIALIZE(sess))
+    await in_start.wait()
+
+    await sess.close()                     # nothing built yet to close
+    fake_session.close.assert_not_awaited()
+
+    release.set()
+    await init
+
+    fake_session.close.assert_awaited_once()
+    assert sess._rh_session is None
+    assert sess._init_error is not None
+    assert sess._init_ready.is_set()
+
+
+@pytest.mark.asyncio
 async def test_session_close_survives_telemetry_failure():
     '''A failing telemetry summary must not block the rhapsody teardown.'''
-    session = RhapsodySession("test.002")
+    session = RhapsodySession("test.telem_summary_fails")
     mock_rh_session = MagicMock()
     mock_rh_session.close = AsyncMock()
     session._rh_session = mock_rh_session
-    session._telemetry = MagicMock()
     telemetry = MagicMock()
     telemetry.summary.side_effect = RuntimeError("otel broke")
     session._telemetry = telemetry
