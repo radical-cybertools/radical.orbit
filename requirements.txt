@@ -13,6 +13,6 @@ rich
 
 psij-python
 rhapsody-py
-globus-sdk
+globus-sdk>=3.11
 authlib
 

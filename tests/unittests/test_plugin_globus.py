@@ -2,6 +2,7 @@
 
 # pylint: disable=protected-access
 
+import json
 import time
 
 import pytest
@@ -92,52 +93,48 @@ def test_session_no_credential():
             GlobusSession('s1')
 
 
-@pytest.mark.parametrize('sdk4', [True, False])
-def test_session_transport_kwargs(sdk4):
-    '''globus-sdk 4.x takes a ``transport``; 3.x takes ``transport_params``.'''
-    pytest.importorskip('globus_sdk')
-    with patch('radical.orbit.plugin_globus._SDK4', sdk4), \
-         patch('radical.orbit.plugin_globus.globus_sdk') as gs:
-        GlobusSession('s1', access_token='tok')
-    kwargs = gs.TransferClient.call_args.kwargs
-    if sdk4:
-        assert kwargs['transport'].http_timeout == 60
-        assert 'transport_params' not in kwargs
-    else:
-        assert kwargs['transport_params'] == {'http_timeout': 60}
-        assert 'transport' not in kwargs
-
-
-def test_session_real_transfer_client():
-    '''Unmocked: the installed globus-sdk (3.x or 4.x) accepts the
-    TransferClient construction, with the 60 s HTTP timeout applied.'''
-    pytest.importorskip('globus_sdk')
-    session = GlobusSession('s1', access_token='tok')
-    assert session._tc.transport.http_timeout == 60
-
-
 @pytest.mark.asyncio
-async def test_submit_real_sdk_payloads():
-    '''Unmocked SDK: TransferData / DeleteData build on 3.x and 4.x (4.x
-    dropped their leading transfer_client argument).'''
+async def test_real_sdk_requests(monkeypatch):
+    '''Unmocked globus-sdk (3.x or 4.x), stubbed at the HTTP layer: the
+    60 s timeout reaches every request, and the transfer / delete payloads
+    the SDK sends carry a submission_id (4.x dropped the client argument
+    of TransferData / DeleteData that used to fetch it).'''
     pytest.importorskip('globus_sdk')
+    import requests
+
+    # A different SDK default proves the session sets the timeout itself.
+    monkeypatch.setenv('GLOBUS_SDK_HTTP_TIMEOUT', '5')
+    sent = []
+
+    def fake_send(_self, req, **kw):
+        sent.append((req.method, req.url, req.body, kw.get('timeout')))
+        if req.url.endswith('/submission_id'):
+            data = {'value': 'sid-1'}
+        else:
+            data = {'task_id': 'tid-1', 'submission_id': 'sid-1'}
+        resp = requests.Response()
+        resp.status_code = 200
+        resp._content    = json.dumps(data).encode()
+        resp.headers['Content-Type'] = 'application/json'
+        resp.request, resp.url = req, req.url
+        return resp
+
+    monkeypatch.setattr(requests.Session, 'send', fake_send)
     session = GlobusSession('s1', access_token='tok')
     session._start_polling = MagicMock()
-    with patch.object(session._tc, 'submit_transfer',
-                      return_value={'task_id': 't1'}) as st, \
-         patch.object(session._tc, 'submit_delete',
-                      return_value={'task_id': 't2'}) as sd:
-        await session.submit_transfer(
-            'src', 'dst', [{'source': '/a', 'destination': '/b'}], label='l')
-        await session.submit_delete('src', ['/a'], recursive=True)
 
-    tdata = st.call_args.args[0]
-    assert tdata['source_endpoint']      == 'src'
-    assert tdata['destination_endpoint'] == 'dst'
-    assert tdata['DATA'][0]['source_path'] == '/a'
-    ddata = sd.call_args.args[0]
-    assert ddata['endpoint']  == 'src'
-    assert ddata['recursive'] is True
+    await session.submit_transfer(
+        'src', 'dst', [{'source': '/a', 'destination': '/b'}], label='l')
+    await session.submit_delete('src', ['/a'], recursive=True)
+
+    assert {t for *_, t in sent} == {60}
+    posts = {url.rsplit('/', 1)[-1]: json.loads(body)
+             for method, url, body, _ in sent if method == 'POST'}
+    assert posts['transfer']['submission_id']   == 'sid-1'
+    assert posts['transfer']['source_endpoint'] == 'src'
+    assert posts['transfer']['DATA'][0]['source_path'] == '/a'
+    assert posts['delete']['submission_id'] == 'sid-1'
+    assert posts['delete']['recursive']     is True
 
 
 # ---------------------------------------------------------------------------

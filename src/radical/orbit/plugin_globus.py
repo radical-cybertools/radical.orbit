@@ -41,7 +41,6 @@ __copyright__ = 'Copyright 2024, RADICAL@Rutgers'
 __license__   = 'MIT'
 
 import asyncio
-import inspect
 import json
 import logging
 import os
@@ -59,11 +58,6 @@ try:
     import globus_sdk
 except ImportError:
     globus_sdk = None
-
-# globus-sdk 4.x replaced TransferClient's ``transport_params`` with a
-# ``transport`` instance; 3.x accepts only the former.
-_SDK4 = globus_sdk is not None and 'transport' in \
-    inspect.signature(globus_sdk.TransferClient.__init__).parameters
 
 log = logging.getLogger('radical.orbit')
 
@@ -188,13 +182,10 @@ class GlobusSession(PluginSession):
 
         # Bound every HTTP call so a hung Globus endpoint cannot block the
         # offload thread indefinitely (mirrors the IRI client's timeout=30).
-        if _SDK4:
-            from globus_sdk.transport import RequestsTransport
-            tc_kwargs = {'transport': RequestsTransport(http_timeout=60)}
-        else:
-            tc_kwargs = {'transport_params': {'http_timeout': 60}}
-        self._tc = globus_sdk.TransferClient(authorizer=authorizer,
-                                             **tc_kwargs)
+        # Set on the transport, which reads it per request: the constructor
+        # keyword differs between globus-sdk 3.x and 4.x.
+        self._tc = globus_sdk.TransferClient(authorizer=authorizer)
+        self._tc.transport.http_timeout = 60
 
         # task_id -> {status, label}
         self._tasks: Dict[str, Dict[str, Any]] = {}
@@ -245,7 +236,7 @@ class GlobusSession(PluginSession):
         if sync_level is not None: td_kwargs['sync_level'] = sync_level
 
         # No client argument: 4.x dropped it, and submit_transfer fills in
-        # the submission_id on both 3.x and 4.x.
+        # the submission_id itself (globus-sdk >= 3.11).
         tdata = globus_sdk.TransferData(**td_kwargs)
         for it in items:
             s = it.get('source')
