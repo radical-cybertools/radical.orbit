@@ -41,6 +41,7 @@ __copyright__ = 'Copyright 2024, RADICAL@Rutgers'
 __license__   = 'MIT'
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
@@ -48,6 +49,8 @@ import time
 import uuid
 
 from typing import Any, Dict, List, Optional
+
+import httpx
 
 from fastapi import FastAPI, HTTPException, Request
 
@@ -68,45 +71,34 @@ GLOBUS_POLL_INTERVAL = 10.0
 # Terminal Globus task statuses (no further polling needed).
 GLOBUS_TERMINAL = {'SUCCEEDED', 'FAILED', 'CANCELED', 'CANCELLED'}
 
+# Statuses that end ``task_wait``: the task has left ACTIVE.  INACTIVE
+# (e.g. an expired credential) is not terminal but needs intervention.
+GLOBUS_WAIT_DONE = GLOBUS_TERMINAL | {'INACTIVE'}
+
 # Local-collection config file (lowest-priority auto-detection source).
 GLOBUS_CONFIG_FILE = '~/.radical/orbit/globus.json'
 
-# Upper bound for one server-side ``wait`` route call (seconds).  The broker
-# reaps a routed call after ``BrokerTuning.call_timeout`` (30 s by default)
-# with HTTP 504 while the transfer keeps running.  globus-sdk sleeps at most
-# ``timeout`` in total; the unbounded part is the HTTP time of each poll.
-# The bound shrinks further when the hosting runtime's call timeout is lower
-# (``_resolve_wait_slice``).  ``GlobusClient.task_wait`` does not use this
+# Upper bound for one call of the server-side ``wait`` route (seconds), kept
+# for direct HTTP callers.  The broker reaps a routed call after
+# ``BrokerTuning.call_timeout`` (30 s by default) with HTTP 504 while the
+# transfer keeps running.  ``GlobusClient.task_wait`` does not use this
 # route: it paces short ``get_task`` calls itself.
 GLOBUS_WAIT_SLICE = 10
 
-# Statuses of a call lost in transit, which ``GlobusClient.task_wait``
-# retries until its deadline: 504 (call reaped or handler timed out) and 503
-# (broker / runtime overload fast-fail, with ``Retry-After``).  Not 502: the
-# broker sends it for an unknown endpoint, and this plugin maps every
-# unmapped Globus error to it.
-_WAIT_TRANSIENT = {503, 504}
+# Poll failures ``GlobusClient.task_wait`` retries until its deadline:
+# 504 (call reaped or handler timed out), 503 (broker / runtime overload
+# fast-fail) and 429 (Globus rate limit), plus transport-level losses.
+# Not 502: the broker sends it for an unknown endpoint, and this plugin maps
+# every unmapped Globus error to it.
+_WAIT_RETRY_STATUS = {429, 503, 504}
+_WAIT_RETRY_EXC    = (TimeoutError, ConnectionError, httpx.TransportError,
+                      # distinct from TimeoutError before Python 3.11
+                      asyncio.TimeoutError, concurrent.futures.TimeoutError)
 
 
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
-
-def _resolve_wait_slice(app) -> int:
-    """Effective upper bound for one server-side wait on this host.
-
-    ``GLOBUS_WAIT_SLICE``, shrunk to a third of the hosting runtime's call
-    timeout (``EndpointRuntime._call_timeout``, reached through
-    ``app.state.endpoint_service`` like rhapsody's frame cap) when that is
-    lower.  Only the local timeout is discoverable: the broker's
-    ``call_timeout`` is not advertised in the handshake.
-    """
-    svc = getattr(getattr(app, 'state', None), 'endpoint_service', None)
-    ct  = getattr(svc, '_call_timeout', None)
-    if isinstance(ct, (int, float)) and ct > 0:
-        return max(1, min(GLOBUS_WAIT_SLICE, int(ct / 3)))
-    return GLOBUS_WAIT_SLICE
-
 
 def _retry_after(resp, default: float = 1.0) -> float:
     """Seconds from a response's ``Retry-After`` header, else *default*."""
@@ -310,9 +302,9 @@ class GlobusSession(PluginSession):
         return res
 
     async def task_wait(self, task_id: str, timeout: int = 60,
-                        polling_interval: int = 10,
-                        max_wait: int = GLOBUS_WAIT_SLICE) -> dict:
-        '''Wait for the task to leave ``ACTIVE``, bounded to *max_wait*.
+                        polling_interval: int = 10) -> dict:
+        '''Wait for the task to leave ``ACTIVE``, at most
+        ``GLOBUS_WAIT_SLICE`` seconds.
 
         Returns ``{task_id, completed}``.  ``completed`` is true for any
         non-ACTIVE status, including ``INACTIVE`` (e.g. an expired
@@ -320,7 +312,7 @@ class GlobusSession(PluginSession):
         '''
         # Bound the blocking wait below the routed-call timeout (see
         # GLOBUS_WAIT_SLICE); globus-sdk requires values >= 1.
-        timeout          = max(1, min(timeout, max_wait))
+        timeout          = max(1, min(timeout, GLOBUS_WAIT_SLICE))
         polling_interval = max(1, min(polling_interval, timeout))
         done = await self._call(self._tc.task_wait, task_id, context='task_wait',
                                 timeout=timeout, polling_interval=polling_interval)
@@ -412,7 +404,7 @@ class GlobusSession(PluginSession):
         self.start_status_poller(
             interval=GLOBUS_POLL_INTERVAL,
             items=lambda: self._tasks,
-            is_terminal=lambda meta: meta.get('status') in GLOBUS_TERMINAL,
+            is_terminal=lambda meta: meta.get('notified') in GLOBUS_TERMINAL,
             fetch=self._fetch_task_status,
             to_payload=self._task_payload,
             topic='transfer_status',
@@ -420,11 +412,16 @@ class GlobusSession(PluginSession):
 
     async def _fetch_task_status(self, task_id: str,
                                  meta: Dict[str, Any]) -> Optional[dict]:
-        '''Poll one task; return the raw Globus result when its status changed.'''
+        '''Poll one task; return the raw Globus result when its status changed.
+
+        Compares against the last *notified* status, not ``meta['status']``:
+        ``get_task`` (e.g. a client's ``task_wait`` polls) writes the latter,
+        and must not swallow the change notification.
+        '''
         res    = _as_dict(await asyncio.to_thread(self._tc.get_task, task_id))
         status = res.get('status')
-        if status and status != meta.get('status'):
-            meta['status'] = status
+        if status and status != meta.get('notified', 'ACTIVE'):
+            meta['status'] = meta['notified'] = status
             return res
         return None
 
@@ -496,38 +493,51 @@ class GlobusClient(PluginClient):
         Polls ``get_task`` once per *polling_interval* (at least 1 s) from
         this side, so no routed call blocks near the broker's call timeout
         and Globus sees one status call per interval.  Polls at least once
-        (``timeout=0`` is a status probe) and once more at the deadline.  A
-        poll lost in transit (HTTP 503/504) is retried within *timeout*
-        (after ``Retry-After`` for a 503) and raised if the last poll before
-        the deadline was lost; other errors raise at once.
+        (``timeout=0`` is a status probe) and once more at the deadline.
 
-        Returns ``{task_id, completed, ...}``.  ``completed`` is true for any
-        non-ACTIVE status, including ``INACTIVE`` (e.g. an expired
-        credential) — call ``get_task`` for the status itself.
+        A failed poll is retried within *timeout* when it is transient: HTTP
+        504, 503 (after ``Retry-After``), 429 (after ``Retry-After``, else
+        one interval), or a transport-level loss (timeout, connection
+        error).  If the last poll before the deadline failed that way, its
+        error is raised; other errors raise at once.
+
+        Returns ``{task_id, completed}``.  ``completed`` is true once the
+        task reports a status in ``GLOBUS_WAIT_DONE``: SUCCEEDED, FAILED,
+        CANCELED, or INACTIVE (e.g. an expired credential) — call
+        ``get_task`` for the status itself.  A missing or unknown status
+        does not count.
         '''
         self._require_session()
         interval = max(1, polling_interval)
         deadline = time.monotonic() + timeout
         while True:
-            resp = self._http.get(self._url(f'task/{self._sid}/{task_id}'))
-            lost = resp.status_code in _WAIT_TRANSIENT
-            if not lost:
-                self._raise(resp, f'task_wait {task_id!r}')
-                if resp.json().get('status') != 'ACTIVE':
-                    return {'task_id': task_id, 'completed': True}
+            error = None                # the last poll's transient failure
+            pause = interval
+            try:
+                resp = self._http.get(self._url(f'task/{self._sid}/{task_id}'))
+            except _WAIT_RETRY_EXC as exc:
+                error = exc
+            else:
+                if resp.status_code in _WAIT_RETRY_STATUS:
+                    error = resp
+                    pause = _retry_after(
+                        resp, 1.0 if resp.status_code == 503 else interval)
+                else:
+                    self._raise(resp, f'task_wait {task_id!r}')
+                    if resp.json().get('status') in GLOBUS_WAIT_DONE:
+                        return {'task_id': task_id, 'completed': True}
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                if lost:
-                    self._raise(resp, f'task_wait {task_id!r}')
+                if isinstance(error, Exception):
+                    raise error
+                if error is not None:
+                    self._raise(error, f'task_wait {task_id!r}')
                 return {'task_id': task_id, 'completed': False}
 
-            pause = interval
-            if lost:
-                log.debug('[globus] task_wait %s: poll lost (HTTP %s), '
-                          'retrying', task_id, resp.status_code)
-                if resp.status_code == 503:
-                    pause = _retry_after(resp)
+            if error is not None:
+                log.debug('[globus] task_wait %s: poll failed (%s), retrying',
+                          task_id, getattr(error, 'status_code', error))
             time.sleep(min(pause, remaining))
 
     def cancel_task(self, task_id: str) -> dict:
@@ -708,10 +718,7 @@ class PluginGlobus(Plugin):
             body = {}
         return await self._forward(
             sid, GlobusSession.task_wait, task_id,
-            int(body.get('timeout', 60)), int(body.get('polling_interval', 10)),
-            # resolved per request: the runtime sets its call timeout only
-            # after building its plugins
-            _resolve_wait_slice(self._app))
+            int(body.get('timeout', 60)), int(body.get('polling_interval', 10)))
 
     async def cancel_task(self, request: Request) -> dict:
         sid     = request.path_params['sid']

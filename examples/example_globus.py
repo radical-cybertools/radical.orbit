@@ -25,6 +25,7 @@ resolves to the endpoint's configured local collection.
 """
 
 import os
+import time
 
 from radical.orbit import EndpointRuntime
 
@@ -89,20 +90,26 @@ def main():
 
         # Wait for completion in short waits so progress shows; 'completed'
         # means the task left ACTIVE (check get_task for the outcome).
+        start = time.monotonic()
         for _ in range(10):
             res = globus.task_wait(task_id, timeout=30, polling_interval=10)
             if res['completed']:
                 break
             print('  … still transferring')
 
-        task = globus.get_task(task_id)
+        task    = globus.get_task(task_id)
+        status  = task.get('status')
+        elapsed = time.monotonic() - start
         if not res['completed']:
-            print(f"Timed out after 300 s, transfer still "
-                  f"{task.get('status')}")
+            print(f'Timed out after {elapsed:.0f} s, transfer still {status}')
             return
-        print(f"Final status: {task.get('status')} "
+        print(f"Final status: {status} after {elapsed:.0f} s "
               f"({task.get('files_transferred')} files, "
               f"{task.get('bytes_transferred')} bytes)")
+        if status != 'SUCCEEDED':
+            # FAILED / CANCELED, or INACTIVE (e.g. expired credential)
+            print(f"Transfer did not succeed: {task.get('nice_status')}")
+            return
 
         # List what landed on the destination.
         listing = globus.ls(DST, DST_PATH)

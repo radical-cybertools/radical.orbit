@@ -112,12 +112,13 @@ Submit a transfer. `items` is a list of
 Task monitoring and control. The client's `task_wait` polls `get_task`
 once per `polling_interval` up to `timeout` (at least once, so `timeout=0`
 is a status probe), so no routed call blocks near the broker's call
-timeout; it retries a poll lost in transit (HTTP 503 after `Retry-After`,
-504) and returns `{task_id, completed}`. The endpoint's `wait` route,
-used by direct HTTP callers, bounds one wait to `GLOBUS_WAIT_SLICE` (10 s,
-less when the endpoint's own call timeout is low). `completed` is true for any non-ACTIVE status,
-including `INACTIVE` (e.g. an expired credential); use `get_task` for the
-status.
+timeout. It retries transient poll failures (HTTP 504, 503 and 429 after
+`Retry-After`, timeouts and connection errors) and returns
+`{task_id, completed}`. The endpoint's `wait` route, used by direct HTTP
+callers, bounds one wait to `GLOBUS_WAIT_SLICE` (10 s). `completed` is
+true once the task reports `SUCCEEDED`, `FAILED`, `CANCELED` or `INACTIVE`
+(e.g. an expired credential); a missing or unknown status does not count.
+Use `get_task` for the status.
 
 `ls(collection, path=None)` / `mkdir(collection, path)` / `rename(collection, oldpath, newpath)` / `delete(collection, paths, recursive=False, label=None)`  
 Filesystem operations on a collection (`delete` submits a Globus delete

@@ -4,6 +4,7 @@
 
 import time
 
+import httpx
 import pytest
 
 from unittest.mock import MagicMock, patch
@@ -191,56 +192,24 @@ async def test_task_wait_clamped_below_call_timeout():
     kwargs = session._tc.task_wait.call_args.kwargs
     assert (kwargs['timeout'], kwargs['polling_interval']) == (1, 1)
 
-    # a lower host-derived bound wins
-    await session.task_wait('t1', timeout=600, max_wait=3)
-    assert session._tc.task_wait.call_args.kwargs['timeout'] == 3
-
-
-@pytest.mark.parametrize('call_timeout, expected', [
-    (None,  GLOBUS_WAIT_SLICE),      # no hosting runtime (broker, tests)
-    (600.0, GLOBUS_WAIT_SLICE),      # runtime default: constant wins
-    (15.0,  5),                      # low runtime timeout shrinks the slice
-    (1.0,   1),
-])
-def test_resolve_wait_slice(call_timeout, expected):
-    app = FastAPI()
-    if call_timeout is not None:
-        app.state.endpoint_service = MagicMock(_call_timeout=call_timeout)
-    assert pg._resolve_wait_slice(app) == expected
-
-
-@pytest.mark.asyncio
-async def test_wait_route_resolves_slice_per_request(endpoint_app):
-    """The runtime sets its call timeout only after building its plugins
-    (EndpointRuntime.__init__), so the bound must be read per request."""
-    endpoint_app.state.endpoint_service = MagicMock(spec=[])  # no timeout yet
-    plugin = PluginGlobus(endpoint_app)
-    endpoint_app.state.endpoint_service._call_timeout = 15.0  # set later
-
-    request = MagicMock(path_params={'sid': 's1', 'task_id': 't1'})
-
-    async def _json():
-        return {'timeout': 60}
-    request.json = _json
-    with patch.object(plugin, '_forward') as fwd:
-        fwd.return_value = {}
-        await plugin.task_wait(request)
-    assert fwd.call_args.args[-1] == 5          # 15 s / 3
-
 
 def _wait_client(replies, monkeypatch):
     """GlobusClient whose get_task route answers with *replies* in order.
 
-    Each reply is ``(status, body)`` or ``(status, body, elapsed,
-    headers)``; *elapsed* (default 0) advances a fake clock, as does
-    ``time.sleep`` (whose arguments are recorded).
+    Each reply is ``(status, body)``, ``(status, body, elapsed, headers)``
+    or an exception to raise; *elapsed* (default 0) advances a fake clock,
+    as does ``time.sleep`` (whose arguments are recorded).
     """
     now     = [0.0]
     sleeps  = []
     replies = iter(replies)
 
     def _get(url):
-        status, body, elapsed, headers = (tuple(next(replies)) + (0.0, {}))[:4]
+        reply = next(replies)
+        if isinstance(reply, Exception):
+            now[0] += 1.0
+            raise reply
+        status, body, elapsed, headers = (tuple(reply) + (0.0, {}))[:4]
         now[0] += elapsed
         return MagicMock(status_code=status, is_error=status >= 400,
                          headers=headers, json=MagicMock(return_value=body))
@@ -330,6 +299,38 @@ def test_client_task_wait_raises_lost_poll_at_deadline(monkeypatch):
         client.task_wait('t1', timeout=30)
 
 
+def test_client_task_wait_429_backs_off(monkeypatch):
+    """Globus rate limit: Retry-After if given, else one interval."""
+    client, http, sleeps = _wait_client(
+        [(429, {}, 0.0, {'retry-after': '7'}), (429, {}), (200, _DONE)],
+        monkeypatch)
+    assert client.task_wait('t1', timeout=60) == _WAITED
+    assert sleeps == [7.0, 10]
+
+
+@pytest.mark.parametrize('exc', [TimeoutError('call'), ConnectionError('ws'),
+                                 httpx.ConnectError('down')])
+def test_client_task_wait_retries_transport_loss(monkeypatch, exc):
+    client, http, sleeps = _wait_client([exc, (200, _DONE)], monkeypatch)
+    assert client.task_wait('t1', timeout=60) == _WAITED
+    assert http.get.call_count == 2
+
+
+def test_client_task_wait_raises_transport_loss_at_deadline(monkeypatch):
+    client, _, _ = _wait_client([(200, _ACTIVE, 9.0, {}),
+                                 TimeoutError('call timed out')],
+                                monkeypatch)
+    with pytest.raises(TimeoutError):
+        client.task_wait('t1', timeout=10)
+
+
+@pytest.mark.parametrize('body', [{}, {'status': 'SOMETHING_NEW'}])
+def test_client_task_wait_unknown_status_not_completed(monkeypatch, body):
+    """Completion needs a known non-ACTIVE status."""
+    client, _, _ = _wait_client([(200, body)] * 2, monkeypatch)
+    assert client.task_wait('t1', timeout=10) == _TIMED
+
+
 @pytest.mark.parametrize('status', [404, 502])
 def test_client_task_wait_raises_other_errors(monkeypatch, status):
     """502 is not retried: it is how the plugin reports Globus errors."""
@@ -338,6 +339,24 @@ def test_client_task_wait_raises_other_errors(monkeypatch, status):
     with pytest.raises(RuntimeError, match=f'HTTP {status}'):
         client.task_wait('t1', timeout=60)
     assert http.get.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_poller_notifies_after_get_task_saw_terminal():
+    """A get_task call (e.g. a client's task_wait poll) that sees the
+    terminal status first must not swallow the poller's notification."""
+    session = _make_session()
+    session._tasks['t1'] = {'status': 'ACTIVE', 'label': ''}
+    session._tc.get_task.return_value = {'task_id': 't1',
+                                         'status' : 'SUCCEEDED'}
+    await session.get_task('t1')
+    meta = session._tasks['t1']
+    assert meta['status'] == 'SUCCEEDED'
+
+    res = await session._fetch_task_status('t1', meta)
+    assert res is not None
+    assert session._task_payload('t1', meta, res)['status'] == 'SUCCEEDED'
+    assert await session._fetch_task_status('t1', meta) is None   # once
 
 
 @pytest.mark.asyncio
