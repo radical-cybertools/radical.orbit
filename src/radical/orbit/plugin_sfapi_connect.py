@@ -134,6 +134,7 @@ class PluginSFAPIConnect(Plugin):
     '''Broker-only endpoint configurator for direct SFAPI.'''
 
     plugin_name   = 'sfapi_connect'
+    default_roles = ('broker',)
     session_class = None
     client_class  = SFAPIConnectClient
     version       = '0.0.1'

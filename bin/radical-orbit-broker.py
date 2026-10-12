@@ -68,8 +68,8 @@ def main():
     parser.add_argument('--plugins', '-p', default='default',
                         help='Comma-separated plugins to host on the '
                              'broker (default: the broker role default '
-                             'set — see plugin_host_base.'
-                             'DEFAULT_PLUGINS_BY_ROLE).  Special tokens: '
+                             'set — plugins whose default_roles include '
+                             '"broker").  Special tokens: '
                              '"default" (role default), "all" (every '
                              'registered plugin), "" (none).  Wildcards '
                              'allowed: "iri*". Prefix matching '

@@ -13,24 +13,6 @@ log = logging.getLogger('radical.orbit')
 
 
 # ---------------------------------------------------------------------------
-# Default plugin set per host role.
-#
-# Wildcards (fnmatch-style) are accepted; missing plugins are silently
-# skipped at expansion time so that an environment without (say) Rhapsody
-# installed still gets a working default set.
-# ---------------------------------------------------------------------------
-
-DEFAULT_PLUGINS_BY_ROLE: Dict[str, List[str]] = {
-    'broker'    : ['iri*',     'sfapi*',  'staging', 'sysinfo',
-                   'task_dispatcher', 'federation'],
-    'login'     : ['psij',     'staging', 'sysinfo', 'queue_info', 'globus'],
-    'compute'   : ['rhapsody', 'staging', 'sysinfo', 'queue_info', 'globus'],
-    'standalone': ['psij',     'staging', 'sysinfo', 'rhapsody', 'queue_info',
-                   'globus'],
-}
-
-
-# ---------------------------------------------------------------------------
 # Utility functions (shared by BrokerPluginHost and EndpointService)
 # ---------------------------------------------------------------------------
 
@@ -39,11 +21,10 @@ def _expand_special_tokens(requested: list, app: FastAPI,
     """Expand the special tokens ``'all'`` and ``'default'`` in a plugin list.
 
     ``'all'``     -> every registered plugin name.
-    ``'default'`` -> the role-specific default set (see
-                     ``DEFAULT_PLUGINS_BY_ROLE``).  Wildcards in that set
-                     (e.g. ``'iri*'``) are expanded against ``available``.
-                     Missing entries are silently skipped — a plugin that
-                     isn't installed shouldn't break the default load.
+    ``'default'`` -> every plugin in ``available`` whose class lists the
+                     host role in ``Plugin.default_roles``, in registry
+                     order.  A plugin that isn't installed is simply not
+                     registered, so it never breaks the default load.
 
     Other tokens are passed through unchanged for ``_resolve_plugin_names``
     to handle (exact match or wildcard glob).
@@ -55,12 +36,9 @@ def _expand_special_tokens(requested: list, app: FastAPI,
         elif token == 'default':
             from .utils import host_role
             role = host_role(app)['role']
-            for name in DEFAULT_PLUGINS_BY_ROLE.get(role, []):
-                if '*' in name:
-                    expanded.extend(fnmatch.filter(available, name))
-                elif name in available:
-                    expanded.append(name)
-                # else: plugin not installed — silently skip
+            expanded.extend(name for name in available
+                            if role in getattr(Plugin.get_plugin_class(name),
+                                               'default_roles', ()))
         else:
             expanded.append(token)
     return expanded

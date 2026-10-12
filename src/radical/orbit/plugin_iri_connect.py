@@ -82,6 +82,7 @@ class PluginIRIConnect(Plugin):
     '''Broker-only endpoint configurator for IRI.'''
 
     plugin_name   = 'iri_connect'
+    default_roles = ('broker',)
     session_class = None
     client_class  = IRIConnectClient
     version       = '0.0.1'

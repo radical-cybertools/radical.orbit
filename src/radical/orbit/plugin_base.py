@@ -165,6 +165,9 @@ class Plugin(object):
     reclaim_drain: float = 300  # 'lost' owner -> ephemeral-session reclaim grace
     ui_config: Union[Dict, UIConfig, None] = None  # UI configuration for portal
     ui_module: Optional[str] = None  # Absolute path to JS plugin module, or None
+    # Host roles ('broker', 'login', 'compute', 'standalone') whose
+    # ``default`` plugin set includes this plugin.
+    default_roles: tuple[str, ...] = ()
 
     def __init_subclass__(cls, **kwargs):
         """Auto-register subclasses that define plugin_name."""

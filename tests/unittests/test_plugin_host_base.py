@@ -12,7 +12,6 @@ from radical.orbit.plugin_host_base import (
     _resolve_plugin_names,
     _discover_entry_points,
     _expand_special_tokens,
-    DEFAULT_PLUGINS_BY_ROLE,
 )
 
 
@@ -121,26 +120,45 @@ class TestExpandSpecialTokens:
         out = _expand_special_tokens(['psij', 'sys'], app, ['psij', 'sysinfo'])
         assert out == ['psij', 'sys']
 
+    # The ``default`` set per role, pinned: plugins declare their roles via
+    # ``Plugin.default_roles``; this guards against an accidental change.
     @pytest.mark.parametrize('role, expected', [
-        ('login',   ['psij',     'staging', 'sysinfo', 'globus']),
-        ('compute', ['rhapsody', 'staging', 'sysinfo', 'globus']),
-        ('standalone', ['psij', 'staging', 'sysinfo', 'rhapsody', 'globus']),
+        ('broker',     {'iri_connect', 'sfapi_connect', 'staging', 'sysinfo',
+                        'task_dispatcher', 'federation'}),
+        ('login',      {'psij', 'staging', 'sysinfo', 'queue_info',
+                        'globus'}),
+        ('compute',    {'rhapsody', 'staging', 'sysinfo', 'queue_info',
+                        'globus'}),
+        ('standalone', {'psij', 'staging', 'sysinfo', 'rhapsody',
+                        'queue_info', 'globus'}),
     ])
-    def test_default_includes_globus(self, role, expected):
-        """``default`` on every endpoint role loads globus."""
+    def test_default_set_per_role(self, role, expected):
+        """``default`` expands to the plugins declaring the host role,
+        in registry order."""
         from unittest.mock import patch
-        app = self._app()
+        import radical.orbit  # noqa: F401  (registers the bundled plugins)
+        available = Plugin.get_plugin_names()
         with patch('radical.orbit.utils.host_role',
                    return_value={'role': role}):
-            out = _expand_special_tokens(['default'], app,
-                                         ['psij', 'rhapsody', 'staging',
-                                          'sysinfo', 'globus'])
-        assert out == expected
+            out = _expand_special_tokens(['default'], self._app(), available)
+        # optional plugins (psij, rhapsody, globus) may be absent here
+        assert set(out) == expected & set(available)
+        assert out == [n for n in available if n in out]
+        assert {'staging', 'sysinfo'} <= set(out)
 
-    def test_default_role_table_complete(self):
-        """Sanity: every advertised role has a default set."""
-        for role in ('broker', 'login', 'compute', 'standalone'):
-            assert role in DEFAULT_PLUGINS_BY_ROLE
+    def test_default_includes_declaring_external_plugin(self, monkeypatch):
+        """An entry-point plugin joins a role's defaults by declaring it."""
+        from unittest.mock import patch
+
+        class _Ext:
+            default_roles = ('compute',)
+
+        monkeypatch.setitem(Plugin._registry, 'ext', _Ext)
+        for role, expected in (('compute', ['ext']), ('login', [])):
+            with patch('radical.orbit.utils.host_role',
+                       return_value={'role': role}):
+                assert _expand_special_tokens(['default'], self._app(),
+                                              ['ext']) == expected
 
 
 # ---------------------------------------------------------------------------

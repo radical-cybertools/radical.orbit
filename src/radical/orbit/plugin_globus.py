@@ -511,6 +511,7 @@ class PluginGlobus(Plugin):
     '''Globus Online file-staging plugin (endpoint-side).'''
 
     plugin_name   = 'globus'
+    default_roles = ('login', 'compute', 'standalone')
     session_class = GlobusSession
     client_class  = GlobusClient
     version       = '0.0.1'

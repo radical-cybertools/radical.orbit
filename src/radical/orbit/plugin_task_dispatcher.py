@@ -1015,6 +1015,7 @@ class PluginTaskDispatcher(Plugin):
     '''Broker-hosted task dispatcher: elastic pilot pools + per-pool policy.'''
 
     plugin_name   = 'task_dispatcher'
+    default_roles = ('broker',)
     session_class = TaskDispatcherSession
     client_class  = TaskDispatcherClient
     version       = '0.0.1'
