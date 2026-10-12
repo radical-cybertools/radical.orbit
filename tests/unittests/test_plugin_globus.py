@@ -170,62 +170,118 @@ async def test_task_wait():
     session = _make_session()
     session._tc.task_wait.return_value = True
     result = await session.task_wait('t1', timeout=5)
-    assert result == {'task_id': 't1', 'completed': True}
+    assert result == {'task_id': 't1', 'completed': True, 'timeout': 5}
 
 
 @pytest.mark.asyncio
 async def test_task_wait_clamped_below_call_timeout():
-    """A long wait is bounded per call so the routed call is not reaped."""
+    """A long wait is bounded per call so the routed call is not reaped,
+    and the response reports the bound applied."""
     session = _make_session()
     session._tc.task_wait.return_value = False
-    await session.task_wait('t1', timeout=600, polling_interval=60)
+    res = await session.task_wait('t1', timeout=600, polling_interval=60)
     kwargs = session._tc.task_wait.call_args.kwargs
     assert kwargs['timeout']          == GLOBUS_WAIT_SLICE
     assert kwargs['polling_interval'] == GLOBUS_WAIT_SLICE
+    assert res == {'task_id': 't1', 'completed': False,
+                   'timeout': GLOBUS_WAIT_SLICE}
 
     # a tiny interval would multiply Globus API round trips per wait
     await session.task_wait('t1', timeout=600, polling_interval=1)
     assert session._tc.task_wait.call_args.kwargs['polling_interval'] \
         == pg.GLOBUS_WAIT_POLL
 
+    # a lower host-derived bound wins
+    res = await session.task_wait('t1', timeout=600, max_wait=3)
+    assert res['timeout'] == 3
 
-def _wait_client(results, monkeypatch):
-    """GlobusClient whose wait route answers with *results* in order, each
-    call advancing a fake clock by the requested wait."""
+
+@pytest.mark.parametrize('call_timeout, expected', [
+    (None,  GLOBUS_WAIT_SLICE),      # no hosting runtime (broker, tests)
+    (600.0, GLOBUS_WAIT_SLICE),      # runtime default: constant wins
+    (15.0,  5),                      # low runtime timeout shrinks the slice
+    (1.0,   1),
+])
+def test_resolve_wait_slice(call_timeout, expected):
+    app = FastAPI()
+    if call_timeout is not None:
+        app.state.endpoint_service = MagicMock(_call_timeout=call_timeout)
+    assert pg._resolve_wait_slice(app) == expected
+
+
+def _wait_client(replies, monkeypatch):
+    """GlobusClient whose wait route answers with *replies* in order.
+
+    Each reply is ``(status, body, elapsed)``; *elapsed* (default: the
+    requested wait) advances a fake clock, as does ``time.sleep``.
+    """
     now     = [0.0]
-    replies = iter(results)
+    replies = iter(replies)
 
     def _post(url, json):
-        now[0] += json['timeout']
-        return MagicMock(is_error=False,
-                         json=MagicMock(return_value=next(replies)))
+        status, body, elapsed = next(replies)
+        now[0] += json['timeout'] if elapsed is None else elapsed
+        return MagicMock(status_code=status, is_error=status >= 400,
+                         json=MagicMock(return_value=body))
+
+    def _sleep(t):
+        now[0] += t
 
     monkeypatch.setattr(pg.time, 'monotonic', lambda: now[0])
+    monkeypatch.setattr(pg.time, 'sleep', _sleep)
     http = MagicMock()
     http.post.side_effect = _post
     client = GlobusClient(http, '/globus')
     client._sid = 'sid'
-    return client, http
+    return client, http, now
+
+
+_ACTIVE = {'task_id': 't1', 'completed': False}
+_DONE   = {'task_id': 't1', 'completed': True}
+
+
+def _sent(http):
+    return [c.kwargs['json']['timeout'] for c in http.post.call_args_list]
 
 
 def test_client_task_wait_loops_until_completed(monkeypatch):
-    client, http = _wait_client([{'task_id': 't1', 'completed': False},
-                                 {'task_id': 't1', 'completed': True}],
-                                monkeypatch)
-    res = client.task_wait('t1', timeout=300)
-    assert res == {'task_id': 't1', 'completed': True}
-    assert http.post.call_count == 2
-    for call in http.post.call_args_list:
-        assert call.kwargs['json']['timeout'] <= GLOBUS_WAIT_SLICE
+    client, http, _ = _wait_client([(200, _ACTIVE, None),
+                                    (200, _DONE,   None)], monkeypatch)
+    assert client.task_wait('t1', timeout=300) == _DONE
+    assert _sent(http) == [GLOBUS_WAIT_SLICE, GLOBUS_WAIT_SLICE]
 
 
 def test_client_task_wait_stops_at_deadline(monkeypatch):
-    client, http = _wait_client([{'task_id': 't1', 'completed': False}] * 3,
-                                monkeypatch)
-    res = client.task_wait('t1', timeout=25)
+    """No final 1 s round trip once less than a second is left."""
+    client, http, _ = _wait_client([(200, _ACTIVE, None),
+                                    (200, _ACTIVE, 9.5)], monkeypatch)
+    res = client.task_wait('t1', timeout=20)
     assert res['completed'] is False
-    assert [c.kwargs['json']['timeout'] for c in http.post.call_args_list] \
-        == [GLOBUS_WAIT_SLICE, GLOBUS_WAIT_SLICE, 5]
+    assert _sent(http) == [GLOBUS_WAIT_SLICE, GLOBUS_WAIT_SLICE]
+
+
+def test_client_task_wait_slice_overruns_clock(monkeypatch):
+    """A slice that takes far longer than requested ends the wait at the
+    deadline instead of issuing another call."""
+    client, http, _ = _wait_client([(200, _ACTIVE, 40.0)], monkeypatch)
+    assert client.task_wait('t1', timeout=30)['completed'] is False
+    assert http.post.call_count == 1
+
+
+def test_client_task_wait_retries_lost_slice(monkeypatch):
+    """A 504 (reaped in transit) mid-loop is retried, not raised."""
+    client, http, _ = _wait_client([(200, _ACTIVE, None),
+                                    (504, {'detail': 'call timed out'}, 30.0),
+                                    (200, _DONE,   None)], monkeypatch)
+    assert client.task_wait('t1', timeout=120) == _DONE
+    assert http.post.call_count == 3
+
+
+def test_client_task_wait_raises_other_errors(monkeypatch):
+    client, http, _ = _wait_client([(404, {'detail': 'no session'}, 0.0)],
+                                   monkeypatch)
+    with pytest.raises(RuntimeError, match='HTTP 404'):
+        client.task_wait('t1', timeout=60)
 
 
 @pytest.mark.asyncio

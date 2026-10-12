@@ -87,10 +87,13 @@ def main():
         task_id = sub['task_id']
         print(f'Submitted transfer: {task_id}')
 
-        # Wait for completion (polls Globus server-side in bounded slices).
-        res = globus.task_wait(task_id, timeout=300, polling_interval=10)
-        if not res['completed']:
-            print('  … still transferring after 300 s')
+        # Wait for completion in short waits so progress shows; 'completed'
+        # means the task left ACTIVE (check get_task for the outcome).
+        for _ in range(10):
+            res = globus.task_wait(task_id, timeout=30, polling_interval=10)
+            if res['completed']:
+                break
+            print('  … still transferring')
 
         task = globus.get_task(task_id)
         print(f"Final status: {task.get('status')} "

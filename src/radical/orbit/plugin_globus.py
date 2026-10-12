@@ -73,18 +73,39 @@ GLOBUS_CONFIG_FILE = '~/.radical/orbit/globus.json'
 
 # Bounds for one server-side ``task_wait`` (seconds).  The broker reaps a
 # routed call after ``BrokerTuning.call_timeout`` (30 s by default) with
-# HTTP 504 while the transfer keeps running.  globus-sdk polls until it has
-# waited *more* than its timeout, so one wait takes up to timeout +
-# polling_interval plus one Globus API round trip per poll: a 10 s slice
-# with a 5..10 s interval stays near 20 s.  ``GlobusClient.task_wait``
-# loops such waits up to the caller's total timeout.
+# HTTP 504 while the transfer keeps running.  globus-sdk sleeps at most
+# ``timeout`` in total; the unbounded part is the HTTP time of each poll
+# (one ``get_task`` per interval), so the interval has a floor to keep the
+# number of polls per wait small.  The slice shrinks further when the
+# hosting runtime's call timeout is lower (``_resolve_wait_slice``).
+# ``GlobusClient.task_wait`` loops such waits up to the caller's timeout.
 GLOBUS_WAIT_SLICE = 10
 GLOBUS_WAIT_POLL  = 5       # minimum polling interval within one wait
+
+# Gateway/broker statuses for a wait slice that died in transit (reaped,
+# unreachable, overloaded); the client retries these until its deadline.
+_WAIT_TRANSIENT = {502, 503, 504}
 
 
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
+
+def _resolve_wait_slice(app) -> int:
+    """Effective upper bound for one server-side wait on this host.
+
+    ``GLOBUS_WAIT_SLICE``, shrunk to a third of the hosting runtime's call
+    timeout (``EndpointRuntime._call_timeout``, reached through
+    ``app.state.endpoint_service`` like rhapsody's frame cap) when that is
+    lower.  Only the local timeout is discoverable: the broker's
+    ``call_timeout`` is not advertised in the handshake.
+    """
+    svc = getattr(getattr(app, 'state', None), 'endpoint_service', None)
+    ct  = getattr(svc, '_call_timeout', None)
+    if isinstance(ct, (int, float)) and ct > 0:
+        return max(1, min(GLOBUS_WAIT_SLICE, int(ct / 3)))
+    return GLOBUS_WAIT_SLICE
+
 
 def detect_local_collection() -> Optional[str]:
     '''Best-effort discovery of the endpoint's local Globus collection UUID.
@@ -280,15 +301,23 @@ class GlobusSession(PluginSession):
         return res
 
     async def task_wait(self, task_id: str, timeout: int = 60,
-                        polling_interval: int = 10) -> dict:
+                        polling_interval: int = 10,
+                        max_wait: int = GLOBUS_WAIT_SLICE) -> dict:
+        '''Wait for the task to leave ``ACTIVE``, bounded to *max_wait*.
+
+        Returns ``{task_id, completed, timeout}``: ``timeout`` is the wait
+        actually applied.  ``completed`` is true for any non-ACTIVE status,
+        including ``INACTIVE`` (e.g. an expired credential) — use
+        ``get_task`` for the status itself.
+        '''
         # Bound the blocking wait below the routed-call timeout (see
         # GLOBUS_WAIT_SLICE): its duration and its number of API calls.
-        timeout          = max(1, min(timeout, GLOBUS_WAIT_SLICE))
+        timeout          = max(1, min(timeout, max_wait))
         polling_interval = min(max(polling_interval, GLOBUS_WAIT_POLL),
                                timeout)
         done = await self._call(self._tc.task_wait, task_id, context='task_wait',
                                 timeout=timeout, polling_interval=polling_interval)
-        return {'task_id': task_id, 'completed': bool(done)}
+        return {'task_id': task_id, 'completed': bool(done), 'timeout': timeout}
 
     async def cancel_task(self, task_id: str) -> dict:
         res = _as_dict(await self._call(
@@ -455,24 +484,41 @@ class GlobusClient(PluginClient):
 
     def task_wait(self, task_id: str, timeout: int = 60,
                  polling_interval: int = 10) -> dict:
-        '''Wait up to *timeout* seconds for the task to finish.
+        '''Wait up to *timeout* seconds for the task to leave ``ACTIVE``.
 
-        The endpoint bounds each wait to ``GLOBUS_WAIT_SLICE`` (below the
-        routed-call timeout), so this loops such waits until the task
-        completes or *timeout* expires; the last wait may overrun *timeout*
-        by up to one polling interval.  Returns ``{task_id, completed}``.
+        The endpoint bounds each wait below the routed-call timeout and
+        reports the bound it applied, so this loops such waits until the
+        task completes or less than a second of *timeout* is left.  A wait
+        lost in transit (HTTP 502/503/504) is retried within *timeout*;
+        other errors raise.
+
+        Returns ``{task_id, completed, ...}``.  ``completed`` is true for any
+        non-ACTIVE status, including ``INACTIVE`` (e.g. an expired
+        credential) — call ``get_task`` for the status itself.
         '''
         self._require_session()
+        res      = {'task_id': task_id, 'completed': False}
         deadline = time.monotonic() + timeout
         while True:
-            wait = max(1, min(GLOBUS_WAIT_SLICE,
-                              int(deadline - time.monotonic())))
+            remaining = deadline - time.monotonic()
+            if remaining < 1:
+                return res
+            # Also cap the request here: an endpoint predating the server
+            # clamp would otherwise block a worker thread past the reap
+            # deadline on every retry.
             resp = self._http.post(self._url(f'wait/{self._sid}/{task_id}'),
-                                   json={'timeout': wait,
+                                   json={'timeout': min(int(remaining),
+                                                        GLOBUS_WAIT_SLICE),
                                          'polling_interval': polling_interval})
+            if resp.status_code in _WAIT_TRANSIENT:
+                log.debug('[globus] task_wait %s: slice lost (HTTP %s), '
+                          'retrying', task_id, resp.status_code)
+                time.sleep(max(0, min(GLOBUS_WAIT_POLL,
+                                      deadline - time.monotonic())))
+                continue
             self._raise(resp, f'task_wait {task_id!r}')
             res = resp.json()
-            if res.get('completed') or time.monotonic() >= deadline:
+            if res.get('completed'):
                 return res
 
     def cancel_task(self, task_id: str) -> dict:
@@ -560,6 +606,8 @@ class PluginGlobus(Plugin):
 
     def __init__(self, app: FastAPI, instance_name: str = 'globus'):
         super().__init__(app, instance_name)
+
+        self._wait_slice = _resolve_wait_slice(app)
 
         # Endpoint's local collection UUID (optional), overridable per session.
         # Auto-detected via env var → GCP → config file.
@@ -653,7 +701,8 @@ class PluginGlobus(Plugin):
             body = {}
         return await self._forward(
             sid, GlobusSession.task_wait, task_id,
-            int(body.get('timeout', 60)), int(body.get('polling_interval', 10)))
+            int(body.get('timeout', 60)), int(body.get('polling_interval', 10)),
+            self._wait_slice)
 
     async def cancel_task(self, request: Request) -> dict:
         sid     = request.path_params['sid']
