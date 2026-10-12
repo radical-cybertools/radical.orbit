@@ -71,12 +71,15 @@ GLOBUS_TERMINAL = {'SUCCEEDED', 'FAILED', 'CANCELED', 'CANCELLED'}
 # Local-collection config file (lowest-priority auto-detection source).
 GLOBUS_CONFIG_FILE = '~/.radical/orbit/globus.json'
 
-# Upper bound for one server-side ``task_wait`` (seconds).  The broker reaps
-# a routed call after ``BrokerTuning.call_timeout`` (30 s by default) with
-# HTTP 504 while the transfer keeps running, so one wait (plus a few Globus
-# API round trips) must stay well below it.  ``GlobusClient.task_wait``
+# Bounds for one server-side ``task_wait`` (seconds).  The broker reaps a
+# routed call after ``BrokerTuning.call_timeout`` (30 s by default) with
+# HTTP 504 while the transfer keeps running.  globus-sdk polls until it has
+# waited *more* than its timeout, so one wait takes up to timeout +
+# polling_interval plus one Globus API round trip per poll: a 10 s slice
+# with a 5..10 s interval stays near 20 s.  ``GlobusClient.task_wait``
 # loops such waits up to the caller's total timeout.
-GLOBUS_WAIT_SLICE = 15
+GLOBUS_WAIT_SLICE = 10
+GLOBUS_WAIT_POLL  = 5       # minimum polling interval within one wait
 
 
 # ---------------------------------------------------------------------------
@@ -279,10 +282,10 @@ class GlobusSession(PluginSession):
     async def task_wait(self, task_id: str, timeout: int = 60,
                         polling_interval: int = 10) -> dict:
         # Bound the blocking wait below the routed-call timeout (see
-        # GLOBUS_WAIT_SLICE); globus-sdk sleeps a full polling_interval
-        # even past its timeout, so bound that too.
+        # GLOBUS_WAIT_SLICE): its duration and its number of API calls.
         timeout          = max(1, min(timeout, GLOBUS_WAIT_SLICE))
-        polling_interval = max(1, min(polling_interval, timeout))
+        polling_interval = min(max(polling_interval, GLOBUS_WAIT_POLL),
+                               timeout)
         done = await self._call(self._tc.task_wait, task_id, context='task_wait',
                                 timeout=timeout, polling_interval=polling_interval)
         return {'task_id': task_id, 'completed': bool(done)}
@@ -456,7 +459,8 @@ class GlobusClient(PluginClient):
 
         The endpoint bounds each wait to ``GLOBUS_WAIT_SLICE`` (below the
         routed-call timeout), so this loops such waits until the task
-        completes or *timeout* expires.  Returns ``{task_id, completed}``.
+        completes or *timeout* expires; the last wait may overrun *timeout*
+        by up to one polling interval.  Returns ``{task_id, completed}``.
         '''
         self._require_session()
         deadline = time.monotonic() + timeout

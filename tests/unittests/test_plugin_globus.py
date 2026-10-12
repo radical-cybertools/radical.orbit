@@ -183,21 +183,35 @@ async def test_task_wait_clamped_below_call_timeout():
     assert kwargs['timeout']          == GLOBUS_WAIT_SLICE
     assert kwargs['polling_interval'] == GLOBUS_WAIT_SLICE
 
+    # a tiny interval would multiply Globus API round trips per wait
+    await session.task_wait('t1', timeout=600, polling_interval=1)
+    assert session._tc.task_wait.call_args.kwargs['polling_interval'] \
+        == pg.GLOBUS_WAIT_POLL
 
-def _wait_client(results):
-    """GlobusClient whose wait route answers with *results* in order."""
+
+def _wait_client(results, monkeypatch):
+    """GlobusClient whose wait route answers with *results* in order, each
+    call advancing a fake clock by the requested wait."""
+    now     = [0.0]
+    replies = iter(results)
+
+    def _post(url, json):
+        now[0] += json['timeout']
+        return MagicMock(is_error=False,
+                         json=MagicMock(return_value=next(replies)))
+
+    monkeypatch.setattr(pg.time, 'monotonic', lambda: now[0])
     http = MagicMock()
-    http.post.side_effect = [
-        MagicMock(is_error=False, json=MagicMock(return_value=r))
-        for r in results]
+    http.post.side_effect = _post
     client = GlobusClient(http, '/globus')
     client._sid = 'sid'
     return client, http
 
 
-def test_client_task_wait_loops_until_completed():
+def test_client_task_wait_loops_until_completed(monkeypatch):
     client, http = _wait_client([{'task_id': 't1', 'completed': False},
-                                 {'task_id': 't1', 'completed': True}])
+                                 {'task_id': 't1', 'completed': True}],
+                                monkeypatch)
     res = client.task_wait('t1', timeout=300)
     assert res == {'task_id': 't1', 'completed': True}
     assert http.post.call_count == 2
@@ -206,13 +220,12 @@ def test_client_task_wait_loops_until_completed():
 
 
 def test_client_task_wait_stops_at_deadline(monkeypatch):
-    clock = iter([0.0, 0.0, 16.0, 16.0, 31.0])
-    monkeypatch.setattr(pg.time, 'monotonic', lambda: next(clock))
-    client, http = _wait_client([{'task_id': 't1', 'completed': False}] * 2)
-    res = client.task_wait('t1', timeout=30)
+    client, http = _wait_client([{'task_id': 't1', 'completed': False}] * 3,
+                                monkeypatch)
+    res = client.task_wait('t1', timeout=25)
     assert res['completed'] is False
     assert [c.kwargs['json']['timeout'] for c in http.post.call_args_list] \
-        == [GLOBUS_WAIT_SLICE, 14]
+        == [GLOBUS_WAIT_SLICE, GLOBUS_WAIT_SLICE, 5]
 
 
 @pytest.mark.asyncio

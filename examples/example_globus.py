@@ -25,7 +25,6 @@ resolves to the endpoint's configured local collection.
 """
 
 import os
-import time
 
 from radical.orbit import EndpointRuntime
 
@@ -88,13 +87,10 @@ def main():
         task_id = sub['task_id']
         print(f'Submitted transfer: {task_id}')
 
-        # Wait for completion (polls Globus server-side).
-        deadline = time.time() + 300
-        while time.time() < deadline:
-            res = globus.task_wait(task_id, timeout=30, polling_interval=10)
-            if res['completed']:
-                break
-            print('  … still transferring')
+        # Wait for completion (polls Globus server-side in bounded slices).
+        res = globus.task_wait(task_id, timeout=300, polling_interval=10)
+        if not res['completed']:
+            print('  … still transferring after 300 s')
 
         task = globus.get_task(task_id)
         print(f"Final status: {task.get('status')} "
