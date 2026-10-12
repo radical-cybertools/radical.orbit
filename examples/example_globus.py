@@ -90,18 +90,22 @@ def main():
 
         # Wait for completion in short waits so progress shows; 'completed'
         # means the task left ACTIVE (check get_task for the outcome).
-        start = time.monotonic()
-        for _ in range(10):
+        start    = time.monotonic()
+        attempts = 10
+        for attempt in range(attempts):
             res = globus.task_wait(task_id, timeout=30, polling_interval=10)
             if res['completed']:
                 break
-            print('  … still transferring')
+            if attempt < attempts - 1:
+                print('  … still transferring')
 
         task    = globus.get_task(task_id)
         status  = task.get('status')
         elapsed = time.monotonic() - start
         if not res['completed']:
-            print(f'Timed out after {elapsed:.0f} s, transfer still {status}')
+            globus.cancel_task(task_id)
+            print(f'Timed out after {elapsed:.0f} s (transfer still '
+                  f'{status}); cancelled task {task_id}')
             return
         print(f"Final status: {status} after {elapsed:.0f} s "
               f"({task.get('files_transferred')} files, "

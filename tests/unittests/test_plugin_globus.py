@@ -248,6 +248,23 @@ def test_client_task_wait_one_poll_per_interval(monkeypatch):
     assert sleeps == [10] * 6
 
 
+def test_client_task_wait_fixed_schedule(monkeypatch):
+    """Poll latency does not shift the schedule (polls at 0, 10, 20)."""
+    client, http, sleeps = _wait_client([(200, _ACTIVE, 3.0, {}),
+                                         (200, _ACTIVE, 3.0, {}),
+                                         (200, _DONE)], monkeypatch)
+    assert client.task_wait('t1', timeout=60) == _WAITED
+    assert sleeps == [7.0, 7.0]
+
+
+def test_client_task_wait_last_poll_at_deadline(monkeypatch):
+    """A deadline between slots gets one last poll at the deadline."""
+    client, http, sleeps = _wait_client([(200, _ACTIVE)] * 3, monkeypatch)
+    assert client.task_wait('t1', timeout=15) == _TIMED
+    assert sleeps == [10.0, 5.0]
+    assert http.get.call_count == 3
+
+
 def test_client_task_wait_inactive_counts_as_completed(monkeypatch):
     client, _, _ = _wait_client([(200, {'status': 'INACTIVE'})], monkeypatch)
     assert client.task_wait('t1', timeout=60) == _WAITED
@@ -305,7 +322,7 @@ def test_client_task_wait_429_backs_off(monkeypatch):
         [(429, {}, 0.0, {'retry-after': '7'}), (429, {}), (200, _DONE)],
         monkeypatch)
     assert client.task_wait('t1', timeout=60) == _WAITED
-    assert sleeps == [7.0, 10]
+    assert sleeps == [7.0, 3.0]            # then back on the 10 s schedule
 
 
 @pytest.mark.parametrize('exc', [TimeoutError('call'), ConnectionError('ws'),
@@ -478,14 +495,44 @@ def test_globus_http_exc_404():
     assert mapped.status_code == 404
 
 
-def test_globus_http_exc_502_default():
+@pytest.mark.parametrize('http_status, expected', [
+    (500,  503),     # Globus-side 5xx: transient, retryable by clients
+    (503,  503),
+    (400,  502),     # other unmapped errors stay 502
+    (None, 502),
+])
+def test_globus_http_exc_unmapped(http_status, expected):
     exc             = MagicMock(spec=['http_status', 'message', 'code'])
     exc.code        = 'EndpointError'
-    exc.http_status = 500
+    exc.http_status = http_status
     exc.message     = 'boom'
     mapped = _globus_http_exc(exc)
-    assert mapped.status_code == 502
+    assert mapped.status_code == expected
     assert 'boom' in mapped.detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('exc_name, expected', [
+    ('GlobusConnectionError', 503),
+    ('GlobusTimeoutError',    503),
+    (None,                    502),     # anything else unexpected
+])
+async def test_call_maps_network_errors_to_503(exc_name, expected):
+    pytest.importorskip('globus_sdk')
+    import globus_sdk
+    session = _make_session()
+    if exc_name:
+        err = getattr(globus_sdk, exc_name)('net down', Exception('x'))
+    else:
+        err = ValueError('odd')
+
+    def _boom():
+        raise err
+
+    with patch('radical.orbit.plugin_globus.globus_sdk', globus_sdk):
+        with pytest.raises(HTTPException) as info:
+            await session._call(_boom, context='get_task')
+    assert info.value.status_code == expected
 
 
 def test_as_dict_response_object():

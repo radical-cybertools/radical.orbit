@@ -110,15 +110,19 @@ Submit a transfer. `items` is a list of
 
 `get_task(task_id)` / `task_wait(task_id, timeout=60, polling_interval=10)` / `cancel_task(task_id)` / `list_tasks(limit=100)`  
 Task monitoring and control. The client's `task_wait` polls `get_task`
-once per `polling_interval` up to `timeout` (at least once, so `timeout=0`
-is a status probe), so no routed call blocks near the broker's call
-timeout. It retries transient poll failures (HTTP 504, 503 and 429 after
-`Retry-After`, timeouts and connection errors) and returns
-`{task_id, completed}`. The endpoint's `wait` route, used by direct HTTP
-callers, bounds one wait to `GLOBUS_WAIT_SLICE` (10 s). `completed` is
-true once the task reports `SUCCEEDED`, `FAILED`, `CANCELED` or `INACTIVE`
-(e.g. an expired credential); a missing or unknown status does not count.
-Use `get_task` for the status.
+every `polling_interval` on a fixed schedule up to `timeout` (at least
+once, so `timeout=0` is a status probe), so no routed call blocks near the
+broker's call timeout. It retries transient poll failures (HTTP 504, 503
+and 429 after `Retry-After`, timeouts and connection errors; the endpoint
+reports Globus network errors and Globus 5xx as 503) and returns
+`{task_id, completed}`. Its `completed` is true once the task reports
+`SUCCEEDED`, `FAILED`, `CANCELED` or `INACTIVE` (e.g. an expired
+credential); a missing or unknown status does not count. Use `get_task`
+for the status.
+
+The endpoint's `wait` route, for direct HTTP callers, bounds one wait to
+`GLOBUS_WAIT_SLICE` (10 s) and follows globus-sdk semantics: `completed`
+is true for any non-ACTIVE status.
 
 `ls(collection, path=None)` / `mkdir(collection, path)` / `rename(collection, oldpath, newpath)` / `delete(collection, paths, recursive=False, label=None)`  
 Filesystem operations on a collection (`delete` submits a Globus delete
