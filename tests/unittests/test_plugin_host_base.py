@@ -171,6 +171,25 @@ class TestExpandSpecialTokens:
         assert default_plugins('compute', ['_test_parent', '_test_child']) \
             == ['_test_parent']
 
+    def test_default_roles_inherited_from_abstract_base(self, monkeypatch):
+        """A plugin inherits roles declared on an abstract base that is
+        not itself a registered plugin, and its own declaration wins."""
+        monkeypatch.setattr(Plugin, '_registry', dict(Plugin._registry))
+
+        class _Base(Plugin):
+            default_roles = ('compute',)
+
+        class _Impl(_Base):
+            plugin_name   = '_test_impl'
+
+        class _Own(_Base):
+            plugin_name   = '_test_own'
+            default_roles = ('login',)
+
+        assert '_Base' not in [c.__name__ for c in Plugin._registry.values()]
+        assert _Impl.default_roles == ('compute',)
+        assert _Own.default_roles  == ('login',)
+
     def test_default_roles_kept_under_parent_name(self, monkeypatch):
         """A subclass that keeps the parent's ``plugin_name`` (and so
         replaces it in the registry) keeps the parent's roles, unless it

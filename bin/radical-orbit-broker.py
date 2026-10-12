@@ -14,8 +14,8 @@ import ssl
 import sys
 
 import radical.orbit.logging_config as _lc
-from radical.orbit        import utils
-from radical.orbit.broker import Broker
+from radical.orbit                  import utils
+from radical.orbit.broker           import Broker
 from radical.orbit.plugin_base      import Plugin
 from radical.orbit.plugin_host_base import default_plugins
 
