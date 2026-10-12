@@ -25,7 +25,8 @@ DEFAULT_PLUGINS_BY_ROLE: Dict[str, List[str]] = {
                    'task_dispatcher', 'federation'],
     'login'     : ['psij',     'staging', 'sysinfo', 'queue_info', 'globus'],
     'compute'   : ['rhapsody', 'staging', 'sysinfo', 'queue_info', 'globus'],
-    'standalone': ['psij',     'staging', 'sysinfo', 'rhapsody', 'queue_info'],
+    'standalone': ['psij',     'staging', 'sysinfo', 'rhapsody', 'queue_info',
+                   'globus'],
 }
 
 
