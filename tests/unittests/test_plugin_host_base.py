@@ -12,6 +12,7 @@ from radical.orbit.plugin_host_base import (
     _resolve_plugin_names,
     _discover_entry_points,
     _expand_special_tokens,
+    default_plugins,
 )
 
 
@@ -133,18 +134,44 @@ class TestExpandSpecialTokens:
                         'queue_info', 'globus'}),
     ])
     def test_default_set_per_role(self, role, expected):
-        """``default`` expands to the plugins declaring the host role,
-        in registry order."""
+        """``default`` expands to exactly the bundled plugins declaring
+        the host role (optional ones included: they are test deps)."""
         from unittest.mock import patch
         import radical.orbit  # noqa: F401  (registers the bundled plugins)
         available = Plugin.get_plugin_names()
         with patch('radical.orbit.utils.host_role',
                    return_value={'role': role}):
             out = _expand_special_tokens(['default'], self._app(), available)
-        # optional plugins (psij, rhapsody, globus) may be absent here
-        assert set(out) == expected & set(available)
-        assert out == [n for n in available if n in out]
-        assert {'staging', 'sysinfo'} <= set(out)
+        assert set(out) == expected
+
+    def test_default_roles_not_inherited(self, monkeypatch):
+        """A subclass registered under a new name does not inherit its
+        parent's default roles; it declares its own."""
+        monkeypatch.setattr(Plugin, '_registry', dict(Plugin._registry))
+
+        class _Parent(Plugin):
+            plugin_name   = '_test_parent'
+            default_roles = ('compute',)
+
+        class _Child(_Parent):
+            plugin_name   = '_test_child'
+
+        assert _Parent.default_roles == ('compute',)
+        assert _Child.default_roles  == ()
+        assert default_plugins('compute', ['_test_parent', '_test_child']) \
+            == ['_test_parent']
+
+    @pytest.mark.parametrize('roles, exc', [
+        ('compute',            TypeError),     # bare str would substring-match
+        (('compute', 'gpu'),   ValueError),    # unknown role
+    ])
+    def test_default_roles_validated(self, monkeypatch, roles, exc):
+        """Invalid ``default_roles`` raise at class creation, unregistered."""
+        monkeypatch.setattr(Plugin, '_registry', dict(Plugin._registry))
+        with pytest.raises(exc):
+            type('_Bad', (Plugin,), {'plugin_name'  : '_test_bad',
+                                     'default_roles': roles})
+        assert '_test_bad' not in Plugin._registry
 
     def test_default_includes_declaring_external_plugin(self, monkeypatch):
         """An entry-point plugin joins a role's defaults by declaring it."""

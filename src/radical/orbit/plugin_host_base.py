@@ -16,14 +16,23 @@ log = logging.getLogger('radical.orbit')
 # Utility functions (shared by BrokerPluginHost and EndpointService)
 # ---------------------------------------------------------------------------
 
+def default_plugins(role: str, available: list) -> list:
+    """The ``default`` plugin set for host *role*: every name in
+    *available* whose plugin class lists *role* in ``default_roles``,
+    in *available* (registry) order.
+    """
+    return [name for name in available
+            if role in getattr(Plugin.get_plugin_class(name),
+                               'default_roles', ())]
+
+
 def _expand_special_tokens(requested: list, app: FastAPI,
                            available: list) -> list:
     """Expand the special tokens ``'all'`` and ``'default'`` in a plugin list.
 
     ``'all'``     -> every registered plugin name.
-    ``'default'`` -> every plugin in ``available`` whose class lists the
-                     host role in ``Plugin.default_roles``, in registry
-                     order.  A plugin that isn't installed is simply not
+    ``'default'`` -> :func:`default_plugins` for the host role.  A
+                     plugin that isn't installed is simply not
                      registered, so it never breaks the default load.
 
     Other tokens are passed through unchanged for ``_resolve_plugin_names``
@@ -35,10 +44,8 @@ def _expand_special_tokens(requested: list, app: FastAPI,
             expanded.extend(available)
         elif token == 'default':
             from .utils import host_role
-            role = host_role(app)['role']
-            expanded.extend(name for name in available
-                            if role in getattr(Plugin.get_plugin_class(name),
-                                               'default_roles', ()))
+            expanded.extend(default_plugins(host_role(app)['role'],
+                                            available))
         else:
             expanded.append(token)
     return expanded

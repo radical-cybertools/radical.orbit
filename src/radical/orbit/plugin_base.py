@@ -13,6 +13,7 @@ from starlette.responses import JSONResponse
 
 from .plugin_session_base import PluginSession
 from .ui_schema import UIConfig, ui_config_to_dict
+from .utils import HOST_ROLES
 
 log = logging.getLogger("radical.orbit")
 
@@ -165,17 +166,34 @@ class Plugin(object):
     reclaim_drain: float = 300  # 'lost' owner -> ephemeral-session reclaim grace
     ui_config: Union[Dict, UIConfig, None] = None  # UI configuration for portal
     ui_module: Optional[str] = None  # Absolute path to JS plugin module, or None
-    # Host roles ('broker', 'login', 'compute', 'standalone') whose
-    # ``default`` plugin set includes this plugin.
+    # Host roles (``utils.HOST_ROLES``) whose ``default`` plugin set
+    # includes this plugin.  Not inherited: each class declares its own.
     default_roles: tuple[str, ...] = ()
 
     def __init_subclass__(cls, **kwargs):
-        """Auto-register subclasses that define plugin_name."""
+        """Validate ``default_roles`` and auto-register subclasses that
+        define plugin_name.
+
+        Raises on an invalid ``default_roles``: the class is then never
+        registered, and entry-point discovery isolates the failure.
+        """
         super().__init_subclass__(**kwargs)
+        roles = cls.__dict__.get('default_roles', ())
+        if not isinstance(roles, (tuple, list, set, frozenset)):
+            raise TypeError(
+                f"{cls.__name__}.default_roles must be a tuple of role "
+                f"names, not {type(roles).__name__}")
+        unknown = set(roles) - set(HOST_ROLES)
+        if unknown:
+            raise ValueError(
+                f"{cls.__name__}.default_roles: unknown role(s) "
+                f"{sorted(unknown)}; valid: {list(HOST_ROLES)}")
+        cls.default_roles = tuple(roles)
         if hasattr(cls, 'plugin_name'):
             name = getattr(cls, 'plugin_name')
             if name in Plugin._registry:
-                log.warning("[Plugin] Duplicate plugin_name '%s' - overwriting", name)
+                log.warning("[Plugin] Duplicate plugin_name '%s' - overwriting "
+                            "(the new class's default_roles apply)", name)
             Plugin._registry[name] = cls
             log.debug("[Plugin] Registered plugin: %s -> %s", name, cls.__name__)
 
