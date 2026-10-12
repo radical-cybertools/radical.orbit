@@ -167,9 +167,9 @@ class Plugin(object):
     ui_config: Union[Dict, UIConfig, None] = None  # UI configuration for portal
     ui_module: Optional[str] = None  # Absolute path to JS plugin module, or None
     # Host roles (``utils.HOST_ROLES``) whose ``default`` plugin set
-    # includes this plugin.  An own declaration wins; otherwise the roles
-    # are inherited, except from another registered plugin (a class with
-    # its own ``plugin_name``) by a class registering under a new name.
+    # includes this plugin.  An own declaration wins; otherwise a class
+    # inherits its parent's roles only under the same identity (the
+    # parent's ``plugin_name``, or a parent without one), else gets ().
     default_roles: tuple[str, ...] = ()
 
     def __init_subclass__(cls, **kwargs):
@@ -182,23 +182,24 @@ class Plugin(object):
         super().__init_subclass__(**kwargs)
         if 'default_roles' in cls.__dict__:
             roles = cls.__dict__['default_roles']
+            if not isinstance(roles, (tuple, list, set, frozenset)):
+                raise TypeError(
+                    f"{cls.__name__}.default_roles must be a tuple of role "
+                    f"names, not {type(roles).__name__}")
+            unknown = set(roles) - set(HOST_ROLES)
+            if unknown:
+                raise ValueError(
+                    f"{cls.__name__}.default_roles: unknown role(s) "
+                    f"{sorted(unknown)}; valid: {list(HOST_ROLES)}")
         else:
-            src = next(k for k in cls.__mro__[1:]
-                       if 'default_roles' in k.__dict__)
-            if 'plugin_name' in cls.__dict__ \
-                    and 'plugin_name' in src.__dict__:
-                roles = ()
-            else:
-                roles = src.__dict__['default_roles']
-        if not isinstance(roles, (tuple, list, set, frozenset)):
-            raise TypeError(
-                f"{cls.__name__}.default_roles must be a tuple of role "
-                f"names, not {type(roles).__name__}")
-        unknown = set(roles) - set(HOST_ROLES)
-        if unknown:
-            raise ValueError(
-                f"{cls.__name__}.default_roles: unknown role(s) "
-                f"{sorted(unknown)}; valid: {list(HOST_ROLES)}")
+            # Parents hold their effective roles (stored below); the
+            # decision depends on plugin names only.
+            parent_name = next((k.__dict__['plugin_name']
+                                for k in cls.__mro__[1:]
+                                if 'plugin_name' in k.__dict__), None)
+            same = parent_name is None \
+                or getattr(cls, 'plugin_name', None) == parent_name
+            roles = super(cls, cls).default_roles if same else ()
         cls.default_roles = tuple(roles)
         if hasattr(cls, 'plugin_name'):
             name = getattr(cls, 'plugin_name')

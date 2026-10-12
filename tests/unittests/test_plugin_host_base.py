@@ -16,6 +16,12 @@ from radical.orbit.plugin_host_base import (
 )
 
 
+def _bundled(name):
+    """Whether *name* is registered to its bundled ``radical.orbit`` class."""
+    cls = Plugin.get_plugin_class(name)
+    return cls is not None and cls.__module__ == f'radical.orbit.plugin_{name}'
+
+
 # ---------------------------------------------------------------------------
 # _resolve_plugin_names
 # ---------------------------------------------------------------------------
@@ -83,9 +89,15 @@ class TestExpandSpecialTokens:
         out = _expand_special_tokens(['all'], app, ['psij', 'sysinfo'])
         assert out == ['psij', 'sysinfo']
 
+    def _expect(self, names):
+        """*names* minus optional plugins that are not registered (their
+        dependency is absent)."""
+        return [n for n in names
+                if n not in self._OPTIONAL or _bundled(n)]
+
     def test_default_for_broker(self, monkeypatch):
         app = self._app(is_broker=True)
-        # broker default is ['iri*', 'staging', 'sysinfo']
+        # psij does not declare 'broker'; the other three do
         out = _expand_special_tokens(['default'], app,
                                      ['iri_connect', 'staging', 'sysinfo', 'psij'])
         assert out == ['iri_connect', 'staging', 'sysinfo']
@@ -96,12 +108,12 @@ class TestExpandSpecialTokens:
             monkeypatch.delenv(v, raising=False)
         from unittest.mock import patch
         app = self._app()
-        # Force 'standalone' role: no scheduler.  Default = psij/staging/sysinfo/rhapsody.
-        # If rhapsody isn't installed, the default expansion just drops it.
+        # Force 'standalone' role: no scheduler.  rhapsody, queue_info and
+        # globus declare it too but are not available, so they are dropped.
         with patch('shutil.which', return_value=None):
             out = _expand_special_tokens(['default'], app,
                                          ['psij', 'staging', 'sysinfo'])
-        assert out == ['psij', 'staging', 'sysinfo']
+        assert out == self._expect(['psij', 'staging', 'sysinfo'])
 
     def test_default_plus_extra(self, monkeypatch):
         """``-p default,rose`` -> default set + 'rose'."""
@@ -113,7 +125,8 @@ class TestExpandSpecialTokens:
             out = _expand_special_tokens(['default', 'rose'], app,
                                          ['psij', 'staging', 'sysinfo',
                                           'rhapsody', 'rose'])
-        assert out == ['psij', 'staging', 'sysinfo', 'rhapsody', 'rose']
+        assert out == self._expect(['psij', 'staging', 'sysinfo',
+                                    'rhapsody']) + ['rose']
 
     def test_passthrough_for_other_tokens(self):
         """Non-special tokens come back unchanged for later resolution."""
@@ -142,8 +155,7 @@ class TestExpandSpecialTokens:
         from unittest.mock import patch
         import radical.orbit  # noqa: F401  (registers the bundled plugins)
         # Bundled classes only: isolate from plugins other tests registered.
-        bundled = {n: c for n, c in Plugin._registry.items()
-                   if c.__module__ == f'radical.orbit.plugin_{n}'}
+        bundled = {n: c for n, c in Plugin._registry.items() if _bundled(n)}
         monkeypatch.setattr(Plugin, '_registry', bundled)
         expected = core | {n for n, roles in self._OPTIONAL.items()
                            if role in roles and n in bundled}
@@ -206,11 +218,33 @@ class TestExpandSpecialTokens:
         assert _Keep.default_roles == ('compute',)
         assert default_plugins('compute', ['_test_same']) == ['_test_same']
 
+        class _Restated(_Parent):
+            plugin_name   = '_test_same'
+
+        assert _Restated.default_roles == ('compute',)
+
         class _Own(_Parent):
             default_roles = ('login',)
 
         assert _Own.default_roles == ('login',)
         assert default_plugins('compute', ['_test_same']) == []
+
+    def test_default_roles_chain_new_name(self, monkeypatch):
+        """A <- B (A's name, inherited) <- C (new name): C gets no roles."""
+        monkeypatch.setattr(Plugin, '_registry', dict(Plugin._registry))
+
+        class _A(Plugin):
+            plugin_name   = '_test_a'
+            default_roles = ('compute',)
+
+        class _B(_A):
+            pass
+
+        class _C(_B):
+            plugin_name   = '_test_c'
+
+        assert _B.default_roles == ('compute',)
+        assert _C.default_roles == ()
 
     @pytest.mark.parametrize('roles, exc', [
         ('compute',            TypeError),     # bare str would substring-match
