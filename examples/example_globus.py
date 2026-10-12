@@ -74,10 +74,11 @@ def main():
         rt.stop()
         return
 
-    # get_plugin() registers the session: the Globus token goes in here.
-    globus = rt.get_plugin(eid, 'globus', **_auth_kwargs())
-
+    globus = None
     try:
+        # get_plugin() registers the session: the Globus token goes in here.
+        globus = rt.get_plugin(eid, 'globus', **_auth_kwargs())
+
         # Submit a recursive directory transfer.
         sub = globus.submit_transfer(
             source=SRC, destination=DST,
@@ -106,7 +107,8 @@ def main():
         print(f'Destination {DST_PATH} now has {len(names)} entries: {names}')
 
     finally:
-        globus.close()
+        if globus:
+            globus.close()
         rt.stop()
         print('Done.')
 
