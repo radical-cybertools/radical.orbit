@@ -167,7 +167,9 @@ class Plugin(object):
     ui_config: Union[Dict, UIConfig, None] = None  # UI configuration for portal
     ui_module: Optional[str] = None  # Absolute path to JS plugin module, or None
     # Host roles (``utils.HOST_ROLES``) whose ``default`` plugin set
-    # includes this plugin.  Not inherited: each class declares its own.
+    # includes this plugin.  Not inherited by a subclass that registers
+    # under its own ``plugin_name``; a subclass keeping the parent's name
+    # keeps the parent's roles unless it declares its own.
     default_roles: tuple[str, ...] = ()
 
     def __init_subclass__(cls, **kwargs):
@@ -178,7 +180,10 @@ class Plugin(object):
         registered, and entry-point discovery isolates the failure.
         """
         super().__init_subclass__(**kwargs)
-        roles = cls.__dict__.get('default_roles', ())
+        if 'plugin_name' in cls.__dict__:
+            roles = cls.__dict__.get('default_roles', ())
+        else:
+            roles = cls.default_roles
         if not isinstance(roles, (tuple, list, set, frozenset)):
             raise TypeError(
                 f"{cls.__name__}.default_roles must be a tuple of role "

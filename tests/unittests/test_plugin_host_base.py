@@ -123,25 +123,35 @@ class TestExpandSpecialTokens:
 
     # The ``default`` set per role, pinned: plugins declare their roles via
     # ``Plugin.default_roles``; this guards against an accidental change.
-    @pytest.mark.parametrize('role, expected', [
+    # Optional plugins (their dependency may be absent) are expected exactly
+    # when they are registered.
+    _OPTIONAL = {'psij'    : ('login', 'standalone'),
+                 'rhapsody': ('compute', 'standalone'),
+                 'globus'  : ('login', 'compute', 'standalone')}
+
+    @pytest.mark.parametrize('role, core', [
         ('broker',     {'iri_connect', 'sfapi_connect', 'staging', 'sysinfo',
                         'task_dispatcher', 'federation'}),
-        ('login',      {'psij', 'staging', 'sysinfo', 'queue_info',
-                        'globus'}),
-        ('compute',    {'rhapsody', 'staging', 'sysinfo', 'queue_info',
-                        'globus'}),
-        ('standalone', {'psij', 'staging', 'sysinfo', 'rhapsody',
-                        'queue_info', 'globus'}),
+        ('login',      {'staging', 'sysinfo', 'queue_info'}),
+        ('compute',    {'staging', 'sysinfo', 'queue_info'}),
+        ('standalone', {'staging', 'sysinfo', 'queue_info'}),
     ])
-    def test_default_set_per_role(self, role, expected):
+    def test_default_set_per_role(self, monkeypatch, role, core):
         """``default`` expands to exactly the bundled plugins declaring
-        the host role (optional ones included: they are test deps)."""
+        the host role."""
         from unittest.mock import patch
         import radical.orbit  # noqa: F401  (registers the bundled plugins)
-        available = Plugin.get_plugin_names()
+        # Bundled classes only: isolate from plugins other tests registered.
+        bundled = {n: c for n, c in Plugin._registry.items()
+                   if c.__module__ == f'radical.orbit.plugin_{n}'}
+        monkeypatch.setattr(Plugin, '_registry', bundled)
+        expected = core | {n for n, roles in self._OPTIONAL.items()
+                           if role in roles and n in bundled}
+        assert core <= set(bundled)
         with patch('radical.orbit.utils.host_role',
                    return_value={'role': role}):
-            out = _expand_special_tokens(['default'], self._app(), available)
+            out = _expand_special_tokens(['default'], self._app(),
+                                         list(bundled))
         assert set(out) == expected
 
     def test_default_roles_not_inherited(self, monkeypatch):
@@ -160,6 +170,28 @@ class TestExpandSpecialTokens:
         assert _Child.default_roles  == ()
         assert default_plugins('compute', ['_test_parent', '_test_child']) \
             == ['_test_parent']
+
+    def test_default_roles_kept_under_parent_name(self, monkeypatch):
+        """A subclass that keeps the parent's ``plugin_name`` (and so
+        replaces it in the registry) keeps the parent's roles, unless it
+        declares its own."""
+        monkeypatch.setattr(Plugin, '_registry', dict(Plugin._registry))
+
+        class _Parent(Plugin):
+            plugin_name   = '_test_same'
+            default_roles = ('compute',)
+
+        class _Keep(_Parent):
+            pass
+
+        assert _Keep.default_roles == ('compute',)
+        assert default_plugins('compute', ['_test_same']) == ['_test_same']
+
+        class _Own(_Parent):
+            default_roles = ('login',)
+
+        assert _Own.default_roles == ('login',)
+        assert default_plugins('compute', ['_test_same']) == []
 
     @pytest.mark.parametrize('roles, exc', [
         ('compute',            TypeError),     # bare str would substring-match

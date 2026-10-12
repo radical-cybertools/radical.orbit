@@ -71,14 +71,14 @@ def main():
                         help='Comma-separated plugins to host on the '
                              'broker (default: the broker role default '
                              'set, plugins declaring default_roles '
-                             '"broker": '
+                             '"broker"; bundled: '
                              + ','.join(default_plugins(
                                  'broker', Plugin.get_plugin_names()))
                              + ').  Special tokens: '
                              '"default" (role default), "all" (every '
                              'registered plugin), "" (none).  Wildcards '
-                             'allowed: "iri*". Prefix matching '
-                             'supported. Combine, e.g.: "-p default,rose".')
+                             'allowed: "iri*"; otherwise names must match '
+                             'exactly.  Combine, e.g.: "-p default,rose".')
     parser.add_argument('--token', default=None,
                         help='Shared ingress auth token.  CLI > '
                              '$RADICAL_ORBIT_BROKER_TOKEN > '
