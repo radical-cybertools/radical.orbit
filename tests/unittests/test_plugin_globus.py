@@ -334,14 +334,22 @@ def test_client_task_wait_503_retry_after_capped_by_deadline(monkeypatch):
     assert sleeps == [5]
 
 
-def test_client_task_wait_raises_lost_poll_at_deadline(monkeypatch):
-    """If the last poll before the deadline was lost, raise it rather than
-    report a silent completed=False."""
+def test_client_task_wait_lost_last_poll_after_answer(monkeypatch):
+    """An earlier poll got through: a lost last poll is just a timeout."""
     client, _, _ = _wait_client(
         [(200, _ACTIVE), (504, {'detail': 'call timed out'}, 30.0, {})],
         monkeypatch)
+    assert client.task_wait('t1', timeout=30) == _TIMED
+
+
+def test_client_task_wait_raises_when_no_poll_got_through(monkeypatch):
+    """No poll got through before the deadline: raise the last loss rather
+    than report a silent completed=False."""
+    client, _, _ = _wait_client(
+        [(504, {'detail': 'call timed out'}, 30.0, {}),
+         (504, {'detail': 'call timed out'}, 30.0, {})], monkeypatch)
     with pytest.raises(RuntimeError, match='HTTP 504'):
-        client.task_wait('t1', timeout=30)
+        client.task_wait('t1', timeout=40)
 
 
 def test_client_task_wait_429_backs_off(monkeypatch):
@@ -362,8 +370,7 @@ def test_client_task_wait_retries_transport_loss(monkeypatch, exc):
 
 
 def test_client_task_wait_raises_transport_loss_at_deadline(monkeypatch):
-    client, _, _ = _wait_client([(200, _ACTIVE, 9.0, {}),
-                                 TimeoutError('call timed out')],
+    client, _, _ = _wait_client([TimeoutError('call timed out')] * 3,
                                 monkeypatch)
     with pytest.raises(TimeoutError):
         client.task_wait('t1', timeout=10)
@@ -447,13 +454,12 @@ async def test_poller_stale_fetch_keeps_cached_terminal():
         return {'task_id': 't1', 'status': 'ACTIVE'}
 
     session._tc.get_task.side_effect = _stale_fetch
-    assert await session._fetch_task_status('t1', meta) is None
+    res = await session._fetch_task_status('t1', meta)     # same sweep
     assert meta['status'] == 'SUCCEEDED'
-
-    res = await session._fetch_task_status('t1', meta)     # next sweep
     assert res['nice_status'] == 'OK'
     assert meta['notified'] == 'SUCCEEDED'
     assert 'result' not in meta                 # dropped after notification
+    assert await session._fetch_task_status('t1', meta) is None
 
 
 @pytest.mark.asyncio
@@ -467,6 +473,19 @@ async def test_poller_drops_result_after_terminal_notification():
 
     await session.get_task('t1')                # a later client poll
     assert 'result' not in meta
+
+
+@pytest.mark.asyncio
+async def test_cache_keeps_result_only_for_terminal():
+    session = _make_session()
+    session._tasks['t1'] = {'status': 'ACTIVE', 'label': ''}
+    session._tc.get_task.return_value = {'task_id': 't1', 'status': 'INACTIVE'}
+    await session.get_task('t1')
+    assert session._tasks['t1'] == {'status': 'INACTIVE', 'label': ''}
+
+    session._tc.get_task.return_value = {'task_id': 't1', 'status': 'FAILED'}
+    await session.get_task('t1')
+    assert session._tasks['t1']['result']['status'] == 'FAILED'
 
 
 @pytest.mark.asyncio

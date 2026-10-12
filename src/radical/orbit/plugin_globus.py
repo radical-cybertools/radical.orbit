@@ -451,33 +451,42 @@ class GlobusSession(PluginSession):
         already cached by ``get_task`` is notified without fetching, so a
         failing fetch (e.g. an expired token) cannot keep the task polled.
         '''
-        cached = meta.get('status')
-        if cached in GLOBUS_TERMINAL and cached != meta.get('notified'):
-            meta['notified'] = cached
-            return meta.pop('result', None) \
-                or {'task_id': task_id, 'status': cached}
-        res    = _as_dict(await asyncio.to_thread(self._tc.get_task, task_id))
-        status = res.get('status')
-        if not status:
-            return None
-        # keep the cache current (e.g. INACTIVE back to ACTIVE)
-        self._cache_result(meta, res)
-        if meta['status'] != status:
-            return None         # a concurrent get_task saw it finish: next sweep
-        if status != meta.get('notified', 'ACTIVE'):
-            meta['notified'] = status
-            if status in GLOBUS_TERMINAL:
+        if not self._terminal_pending(meta):
+            res    = _as_dict(await asyncio.to_thread(self._tc.get_task,
+                                                      task_id))
+            status = res.get('status')
+            if not status:
+                return None
+            # keep the cache current (e.g. INACTIVE back to ACTIVE)
+            self._cache_result(meta, res)
+            if meta['status'] == status:
+                if status == meta.get('notified', 'ACTIVE'):
+                    return None
+                meta['notified'] = status
                 meta.pop('result', None)
-            return res
-        return None
+                return res
+            # else a concurrent get_task cached the end while we fetched
+            if not self._terminal_pending(meta):
+                return None
+
+        # notify a cached terminal status (from get_task) without a fetch
+        meta['notified'] = meta['status']
+        return meta.pop('result', None) \
+            or {'task_id': task_id, 'status': meta['status']}
+
+    @staticmethod
+    def _terminal_pending(meta: Dict[str, Any]) -> bool:
+        '''A terminal status is cached but not yet notified.'''
+        return meta.get('status') in GLOBUS_TERMINAL \
+            and meta.get('status') != meta.get('notified')
 
     @staticmethod
     def _cache_result(meta: Dict[str, Any], res: dict) -> None:
         '''Cache a ``get_task`` result in the task meta for the poller.
 
         Never downgrades a cached terminal status (a stale ACTIVE fetch
-        racing a ``get_task`` that saw the end), and keeps the full result
-        only until the terminal notification is sent.
+        racing a ``get_task`` that saw the end).  The full result is kept
+        only for a terminal status not yet notified, for the notification.
         '''
         status = res.get('status')
         if not status:
@@ -486,7 +495,8 @@ class GlobusSession(PluginSession):
                 and status not in GLOBUS_TERMINAL:
             return
         meta['status'] = status
-        if meta.get('notified') not in GLOBUS_TERMINAL:
+        if status in GLOBUS_TERMINAL \
+                and meta.get('notified') not in GLOBUS_TERMINAL:
             meta['result'] = res
 
     @staticmethod
@@ -564,7 +574,7 @@ class GlobusClient(PluginClient):
         A failed poll is retried within *timeout* when it is transient: HTTP
         504, 503 or 429 (after ``Retry-After`` if given, else at the next
         scheduled poll), or a transport-level loss (timeout, connection
-        error).  If the last poll before the deadline failed that way, its
+        error).  If no poll got through before the deadline, the last such
         error is raised; other errors raise at once.
 
         Returns ``{task_id, completed}``.  ``completed`` is true once the
@@ -580,6 +590,7 @@ class GlobusClient(PluginClient):
         deadline = start + timeout
         slot     = 0                    # index of the current scheduled poll
         last     = False                # this poll is the one at the deadline
+        answered = False                # some poll in this wait succeeded
         while True:
             error = None                # the last poll's transient failure
             retry = None                # server-requested pause, if any
@@ -593,14 +604,16 @@ class GlobusClient(PluginClient):
                     retry = _retry_after(resp)
                 else:
                     self._raise(resp, f'task_wait {task_id!r}')
+                    answered = True
                     if resp.json().get('status') in GLOBUS_WAIT_DONE:
                         return {'task_id': task_id, 'completed': True}
 
             now = time.monotonic()
             if last or now >= deadline:
-                if isinstance(error, Exception):
-                    raise error
-                if error is not None:
+                # a lost last poll is only an error if no poll got through
+                if error is not None and not answered:
+                    if isinstance(error, Exception):
+                        raise error
                     self._raise(error, f'task_wait {task_id!r}')
                 return {'task_id': task_id, 'completed': False}
 
