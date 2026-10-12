@@ -89,6 +89,15 @@ class TestExpandSpecialTokens:
         out = _expand_special_tokens(['all'], app, ['psij', 'sysinfo'])
         assert out == ['psij', 'sysinfo']
 
+    @staticmethod
+    def _isolate(monkeypatch):
+        """Restrict the registry to the bundled plugin classes, so a test
+        does not depend on plugins other tests registered."""
+        import radical.orbit  # noqa: F401  (registers the bundled plugins)
+        bundled = {n: c for n, c in Plugin._registry.items() if _bundled(n)}
+        monkeypatch.setattr(Plugin, '_registry', bundled)
+        return bundled
+
     def _expect(self, names):
         """*names* minus optional plugins that are not registered (their
         dependency is absent)."""
@@ -96,6 +105,7 @@ class TestExpandSpecialTokens:
                 if n not in self._OPTIONAL or _bundled(n)]
 
     def test_default_for_broker(self, monkeypatch):
+        self._isolate(monkeypatch)
         app = self._app(is_broker=True)
         # psij does not declare 'broker'; the other three do
         out = _expand_special_tokens(['default'], app,
@@ -104,6 +114,7 @@ class TestExpandSpecialTokens:
 
     def test_default_skips_uninstalled_plugins(self, monkeypatch):
         """A plugin in the role default but not in available is silently skipped."""
+        self._isolate(monkeypatch)
         for v in ('SLURM_JOB_ID', 'PBS_JOBID'):
             monkeypatch.delenv(v, raising=False)
         from unittest.mock import patch
@@ -117,6 +128,7 @@ class TestExpandSpecialTokens:
 
     def test_default_plus_extra(self, monkeypatch):
         """``-p default,rose`` -> default set + 'rose'."""
+        self._isolate(monkeypatch)
         from unittest.mock import patch
         for v in ('SLURM_JOB_ID', 'PBS_JOBID'):
             monkeypatch.delenv(v, raising=False)
@@ -153,10 +165,7 @@ class TestExpandSpecialTokens:
         """``default`` expands to exactly the bundled plugins declaring
         the host role."""
         from unittest.mock import patch
-        import radical.orbit  # noqa: F401  (registers the bundled plugins)
-        # Bundled classes only: isolate from plugins other tests registered.
-        bundled = {n: c for n, c in Plugin._registry.items() if _bundled(n)}
-        monkeypatch.setattr(Plugin, '_registry', bundled)
+        bundled = self._isolate(monkeypatch)
         expected = core | {n for n, roles in self._OPTIONAL.items()
                            if role in roles and n in bundled}
         assert core <= set(bundled)
