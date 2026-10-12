@@ -108,7 +108,8 @@ class _EchoPlugin(Plugin):
     async def _busy(self, request):
         from fastapi import HTTPException
         raise HTTPException(status_code=429, detail='slow down',
-                            headers={'Retry-After': '7'})
+                            headers={'Retry-After' : '7',
+                                     'Content-Type': 'text/plain'})
 
     async def _block(self, request):
         # A synchronous sleep pins the WORK loop — the transport thread must
@@ -390,6 +391,10 @@ def test_served_handler_exception_headers_forwarded(harness):
     resp = b.call('epA', 'GET', '/echo_rt/busy', timeout=3.0)
     assert resp.status_code == 429
     assert resp.headers.get('retry-after') == '7'
+    # the body is the runtime's JSON error, whatever the handler claimed
+    ctypes = [v for k, v in resp.headers.items() if k.lower() == 'content-type']
+    assert ctypes == ['application/json']
+    assert resp.json()
 
 
 # ---------------------------------------------------------------------------

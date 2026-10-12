@@ -432,6 +432,44 @@ async def test_poller_cached_terminal_skips_failing_fetch(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_poller_stale_fetch_keeps_cached_terminal():
+    """A get_task that sees SUCCEEDED while the poller's fetch is in flight
+    must not be overwritten by that fetch's stale ACTIVE."""
+    session = _make_session()
+    session.notify = MagicMock()
+    meta = {'status': 'ACTIVE', 'label': ''}
+    session._tasks['t1'] = meta
+
+    def _stale_fetch(task_id):
+        meta['status'] = 'SUCCEEDED'            # concurrent get_task lands
+        meta['result'] = {'task_id': 't1', 'status': 'SUCCEEDED',
+                          'nice_status': 'OK'}
+        return {'task_id': 't1', 'status': 'ACTIVE'}
+
+    session._tc.get_task.side_effect = _stale_fetch
+    assert await session._fetch_task_status('t1', meta) is None
+    assert meta['status'] == 'SUCCEEDED'
+
+    res = await session._fetch_task_status('t1', meta)     # next sweep
+    assert res['nice_status'] == 'OK'
+    assert meta['notified'] == 'SUCCEEDED'
+    assert 'result' not in meta                 # dropped after notification
+
+
+@pytest.mark.asyncio
+async def test_poller_drops_result_after_terminal_notification():
+    session = _make_session()
+    meta = {'status': 'ACTIVE', 'label': ''}
+    session._tasks['t1'] = meta
+    session._tc.get_task.return_value = {'task_id': 't1', 'status': 'FAILED'}
+    assert await session._fetch_task_status('t1', meta) is not None
+    assert meta == {'status': 'FAILED', 'notified': 'FAILED', 'label': ''}
+
+    await session.get_task('t1')                # a later client poll
+    assert 'result' not in meta
+
+
+@pytest.mark.asyncio
 async def test_poller_corrects_stale_cached_status():
     """A fetched status that differs from the cache updates it, even when it
     equals the last notified one (INACTIVE cached, task ACTIVE again)."""

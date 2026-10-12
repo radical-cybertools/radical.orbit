@@ -325,9 +325,8 @@ class GlobusSession(PluginSession):
     async def get_task(self, task_id: str) -> dict:
         res = _as_dict(await self._call(
             self._tc.get_task, task_id, context='get_task', read_only=True))
-        if task_id in self._tasks and res.get('status'):
-            # the full result too: the poller may notify from this cache
-            self._tasks[task_id].update(status=res['status'], result=res)
+        if task_id in self._tasks:
+            self._cache_result(self._tasks[task_id], res)
         return res
 
     async def task_wait(self, task_id: str, timeout: int = 60,
@@ -455,17 +454,40 @@ class GlobusSession(PluginSession):
         cached = meta.get('status')
         if cached in GLOBUS_TERMINAL and cached != meta.get('notified'):
             meta['notified'] = cached
-            return meta.get('result') or {'task_id': task_id, 'status': cached}
+            return meta.pop('result', None) \
+                or {'task_id': task_id, 'status': cached}
         res    = _as_dict(await asyncio.to_thread(self._tc.get_task, task_id))
         status = res.get('status')
         if not status:
             return None
         # keep the cache current (e.g. INACTIVE back to ACTIVE)
-        meta.update(status=status, result=res)
+        self._cache_result(meta, res)
+        if meta['status'] != status:
+            return None         # a concurrent get_task saw it finish: next sweep
         if status != meta.get('notified', 'ACTIVE'):
             meta['notified'] = status
+            if status in GLOBUS_TERMINAL:
+                meta.pop('result', None)
             return res
         return None
+
+    @staticmethod
+    def _cache_result(meta: Dict[str, Any], res: dict) -> None:
+        '''Cache a ``get_task`` result in the task meta for the poller.
+
+        Never downgrades a cached terminal status (a stale ACTIVE fetch
+        racing a ``get_task`` that saw the end), and keeps the full result
+        only until the terminal notification is sent.
+        '''
+        status = res.get('status')
+        if not status:
+            return
+        if meta.get('status') in GLOBUS_TERMINAL \
+                and status not in GLOBUS_TERMINAL:
+            return
+        meta['status'] = status
+        if meta.get('notified') not in GLOBUS_TERMINAL:
+            meta['result'] = res
 
     @staticmethod
     def _task_payload(task_id: str, meta: Dict[str, Any], res: dict) -> dict:

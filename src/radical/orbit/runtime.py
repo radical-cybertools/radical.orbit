@@ -827,10 +827,12 @@ class EndpointRuntime(PluginHostBase):
         try:
             result = await handler(shim)
         except HTTPException as e:
-            # keep the handler's headers (e.g. Retry-After on a 429 / 503)
-            return (e.status_code,
-                    {**(e.headers or {}), 'content-type': 'application/json'},
-                    error_body(e.status_code, e.detail))
+            # keep the handler's headers (e.g. Retry-After on a 429 / 503),
+            # but the body is our JSON error: drop any content-type of theirs
+            hdrs = {k: v for k, v in (e.headers or {}).items()
+                    if k.lower() != 'content-type'}
+            hdrs['content-type'] = 'application/json'
+            return (e.status_code, hdrs, error_body(e.status_code, e.detail))
         except Exception as e:
             log.exception("[Runtime] handler error: %s %s", req.method, path)
             return (500, {'content-type': 'application/json'},
