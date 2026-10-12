@@ -75,6 +75,11 @@ RETURN_VALUE_LIMIT  = FRAME_CAP // BUDGET_RATIO
 # trips) sets `0` to flush every completion immediately.
 ENV_NOTIFY_WINDOW   = 'RADICAL_ORBIT_RHAPSODY_NOTIFY_WINDOW'
 
+# Endpoint-level telemetry switch: rhapsody session telemetry (when its
+# ``[telemetry]`` extra is installed) is on unless this is set to one of
+# ``0`` / ``false`` / ``no`` / ``off``.  Resolved once per process.
+ENV_TELEMETRY       = 'RADICAL_ORBIT_RHAPSODY_TELEMETRY'
+
 # Guard optional dependencies
 try:
     import rhapsody as rh
@@ -101,6 +106,22 @@ def _telemetry_available() -> bool:
         log.warning("rhapsody telemetry disabled: opentelemetry-sdk "
                     "(the rhapsody [telemetry] extra) is not installed")
     return ok
+
+
+@functools.cache
+def _resolve_telemetry() -> bool:
+    """Whether ``$RADICAL_ORBIT_RHAPSODY_TELEMETRY`` leaves telemetry on.
+
+    Unset means on.  An unrecognised value warns and keeps the default.
+    Cached, so the switch is read (and any warning logged) once per process.
+    """
+    raw = os.environ.get(ENV_TELEMETRY, '').strip().lower()
+    if raw in ('0', 'false', 'no', 'off'):
+        return False
+    if raw not in ('', '1', 'true', 'yes', 'on'):
+        log.warning("[rhapsody] invalid %s=%r — telemetry stays on",
+                    ENV_TELEMETRY, raw)
+    return True
 
 
 def _json_safe(v):
@@ -268,13 +289,29 @@ class RhapsodySession(PluginSession):
                 rh.Session, backends=backends, uid=self._sid)
 
             # Telemetry is optional: older rhapsody lacks start_telemetry,
-            # and it needs the [telemetry] extra.
+            # it needs the [telemetry] extra, the operator can switch it off,
+            # and a failure to start it must not fail the session.
             self._telemetry = None
             start_telemetry = getattr(self._rh_session, 'start_telemetry', None)
-            if start_telemetry is not None and _telemetry_available():
-                self._telemetry = await start_telemetry(
-                    resource_poll_interval=0.1,
-                    checkpoint_path="telemetry-output")
+            if start_telemetry is not None and _resolve_telemetry() \
+                    and _telemetry_available():
+                try:
+                    self._telemetry = await start_telemetry(
+                        resource_poll_interval=0.1,
+                        checkpoint_path="telemetry-output")
+                except Exception as e:
+                    log.warning("[%s] telemetry start failed: %r; not "
+                                "reporting telemetry for this session",
+                                self._sid, e)
+                    await self._unwind_telemetry(self._rh_session,
+                                                 failed_start=True)
+                except BaseException:
+                    # cancelled mid-start: unwind and unblock waiters
+                    await self._unwind_telemetry(self._rh_session,
+                                                 failed_start=True)
+                    self._init_error = "session initialization cancelled"
+                    self._init_ready.set()
+                    raise
 
             # Register state-change callbacks for intermediate notifications
             self._notified_states: dict[str, str] = {}
@@ -299,6 +336,36 @@ class RhapsodySession(PluginSession):
             log.error("[%s] Session initialization failed: %s",
                       self._sid, e)
             raise
+
+    async def _unwind_telemetry(self, rh_session,
+                                failed_start: bool = False) -> None:
+        """Stop rhapsody's telemetry manager best effort and detach it.
+
+        Workaround: rhapsody (<= 0.4) ``Session.close()`` stops telemetry
+        before shutting the backends down, so a raising ``stop()`` leaks
+        the backends -- and a failed ``start_telemetry()`` leaves a
+        half-started manager whose ``stop()`` does raise.  Used after a
+        failed start and before every rhapsody close; drop this once
+        rhapsody isolates telemetry failures itself.
+
+        A stop failure is expected after a failed start (logged at debug)
+        and unexpected otherwise (logged as a warning).
+        """
+        tm = getattr(rh_session, '_telemetry', None)
+        if tm is not None:
+            try:
+                await tm.stop()
+            except Exception as e:
+                if failed_start:
+                    log.debug("[%s] stopping half-started telemetry: %r",
+                              self._sid, e)
+                else:
+                    log.warning("[%s] telemetry stop failed: %r",
+                                self._sid, e)
+            rh_session._telemetry = None
+        sm = getattr(rh_session, '_state_manager', None)
+        if hasattr(sm, '_telemetry_observer'):
+            sm._telemetry_observer = None
 
     def _on_task_state_change(self, task, state):
         """Fire notification on intermediate state changes (e.g. RUNNING).
@@ -819,16 +886,25 @@ class RhapsodySession(PluginSession):
         """
         Shutdown RHAPSODY session and clean up.
         """
-        if self._rh_session:
-            if self._telemetry is not None:
-                summary = json.dumps(self._telemetry.summary(), indent=4)
-                log.info(summary)
-                print(summary, flush=True)
+        try:
+            if self._rh_session:
+                # Telemetry is best effort: never let it block teardown.
+                if self._telemetry is not None \
+                        and log.isEnabledFor(logging.INFO):
+                    try:
+                        log.info(json.dumps(self._telemetry.summary(),
+                                            indent=4))
+                    except Exception as e:
+                        log.warning("[%s] telemetry summary failed: %r",
+                                    self._sid, e)
                 self._telemetry = None
-            await self._rh_session.close()
+                await self._unwind_telemetry(self._rh_session)
+                await self._rh_session.close()
+        finally:
             self._rh_session = None
-        self._tasks = {}
-        return await super().close()
+            self._tasks = {}
+            await super().close()
+        return {}
 
 
 # ---------------------------------------------------------------------------
