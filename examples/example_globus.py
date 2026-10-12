@@ -41,7 +41,7 @@ DST_PATH = os.environ.get('GLOBUS_DST_PATH', '/~/endpoint-globus-demo/')
 
 
 def _auth_kwargs() -> dict:
-    """Build register_session auth kwargs from the environment."""
+    """Build the globus session auth kwargs from the environment."""
     access  = os.environ.get('GLOBUS_ACCESS_TOKEN')
     refresh = os.environ.get('GLOBUS_REFRESH_TOKEN')
     cid     = os.environ.get('GLOBUS_CLIENT_ID')
@@ -74,10 +74,8 @@ def main():
         rt.stop()
         return
 
-    globus = rt.get_plugin(eid, 'globus')
-
-    # Register a session carrying the Globus token.
-    globus.register_session(**_auth_kwargs())
+    # get_plugin() registers the session: the Globus token goes in here.
+    globus = rt.get_plugin(eid, 'globus', **_auth_kwargs())
 
     try:
         # Submit a recursive directory transfer.
