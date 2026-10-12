@@ -146,6 +146,12 @@ def _globus_http_exc(exc: Exception, context: str = '') -> HTTPException:
     sc  = getattr(exc, 'http_status', 502) or 502
     msg = getattr(exc, 'message', None) or str(exc)
 
+    # Globus Auth answers an expired or revoked refresh token with a 400
+    # ``invalid_grant`` (``exc.code`` differs between globus-sdk 3.x and 4.x).
+    raw = getattr(exc, 'raw_json', None)
+    if sc == 400 and isinstance(raw, dict) and raw.get('error') == 'invalid_grant':
+        sc = 401
+
     if   sc == 401: return HTTPException(status_code=401, detail=f'{prefix}token expired or invalid')
     elif sc == 403: return HTTPException(status_code=403, detail=f'{prefix}forbidden')
     elif sc == 404: return HTTPException(status_code=404, detail=f'{prefix}not found')
@@ -176,14 +182,22 @@ class GlobusSession(PluginSession):
             raise RuntimeError('globus-sdk is not installed')
 
         self._local_collection = local_collection or None
+        self._tc          = None
+        self._auth_client = None
 
         if access_token:
             authorizer = globus_sdk.AccessTokenAuthorizer(access_token)
         elif refresh_token and client_id:
-            auth_client = globus_sdk.NativeAppAuthClient(client_id)
-            auth_client.transport.http_timeout = GLOBUS_HTTP_TIMEOUT
-            authorizer  = globus_sdk.RefreshTokenAuthorizer(
-                refresh_token, auth_client)
+            self._auth_client = globus_sdk.NativeAppAuthClient(client_id)
+            self._auth_client.transport.http_timeout = GLOBUS_HTTP_TIMEOUT
+            try:
+                # Fetches the first access token synchronously, so
+                # register_session builds sessions off the event loop.
+                authorizer = globus_sdk.RefreshTokenAuthorizer(
+                    refresh_token, self._auth_client)
+            except Exception:
+                self._close_clients()
+                raise
         else:
             raise ValueError(
                 "provide either 'access_token' or 'refresh_token'+'client_id'")
@@ -358,11 +372,23 @@ class GlobusSession(PluginSession):
         return _as_dict(await self._call(
             self._tc.get_endpoint, coll, context='get_endpoint'))
 
+    # -- lifecycle ------------------------------------------------------------
+
+    def _close_clients(self) -> None:
+        '''Release the SDK clients' HTTP connections (``close()`` exists on
+        globus-sdk 4.x clients only).'''
+        for client in (self._tc, self._auth_client):
+            close = getattr(client, 'close', None)
+            if close is not None:
+                close()
+
+    async def close(self) -> Dict[str, Any]:
+        # Stop the status poller (base close) before closing its client.
+        result = await super().close()
+        self._close_clients()
+        return result
+
     # -- background polling -------------------------------------------------
-    #
-    # Lifecycle (task cancellation on close) is handled by the base
-    # ``PluginSession.close()`` / ``stop_status_poller()`` — no override
-    # needed here.
 
     def _start_polling(self) -> None:
         '''(Re)start the shared status poller for the session's active tasks.'''
@@ -598,11 +624,19 @@ class PluginGlobus(Plugin):
             sid = f'session.{uuid.uuid4().hex[:8]}'
 
         try:
-            session = self._create_session(
+            # Offloaded: a refresh-token session fetches its first access
+            # token synchronously (up to the HTTP timeout).
+            session = await asyncio.to_thread(
+                self._create_session,
                 sid, access_token=access_token, refresh_token=refresh_token,
                 client_id=client_id, local_collection=local_coll)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            if globus_sdk is not None \
+                    and isinstance(exc, globus_sdk.GlobusError):
+                raise _globus_http_exc(exc, 'register_session') from exc
+            raise
 
         self._record_session(sid, session, lifetime, ttl, owner)
         log.info('[globus] Registered session %s', sid)
