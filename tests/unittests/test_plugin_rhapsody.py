@@ -1287,7 +1287,8 @@ async def test_cancel_all_skips_terminal():
 
 # ---------------------------------------------------------------------------
 # Regression: RhapsodySession.initialize survives older rhapsody libs that
-# don't expose `Session.start_telemetry`.
+# don't expose `Session.start_telemetry`, and installs without the
+# rhapsody `[telemetry]` extra.
 # ---------------------------------------------------------------------------
 #
 # Bug surfaced during the local e2e smoke (memory/project_broker_dispatcher.md):
@@ -1295,20 +1296,28 @@ async def test_cancel_all_skips_terminal():
 # unconditionally; older rhapsody installs raise AttributeError.  Fix
 # guards the call with `getattr(session, 'start_telemetry', None)`.
 
+@pytest.mark.parametrize('has_method, otel', [
+    (False, True),     # older rhapsody: no Session.start_telemetry
+    (True,  False),    # [telemetry] extra (opentelemetry-sdk) missing
+])
 @pytest.mark.asyncio
-async def test_initialize_without_start_telemetry(monkeypatch):
-    '''Session init must succeed when the rhapsody Session has no
-    ``start_telemetry`` method (older rhapsody installs lack it).
-    Regression for the bug surfaced during the local e2e smoke.'''
+async def test_initialize_without_telemetry(monkeypatch, has_method, otel):
+    '''Session init must succeed without telemetry: when the rhapsody
+    Session has no ``start_telemetry`` method, or when the ``[telemetry]``
+    extra is missing (then ``start_telemetry`` must not even be called:
+    rhapsody 0.4 wires a half-built manager in before it fails).'''
     from radical.orbit import plugin_rhapsody as prh
 
     fake_backend = MagicMock(spec=[])  # no __await__, no register_callback
-    fake_session = MagicMock(spec=[])  # IMPORTANT: spec=[] → no start_telemetry
+    fake_session = MagicMock(spec=['start_telemetry'] if has_method else [])
+    if has_method:
+        fake_session.start_telemetry = AsyncMock()
 
     monkeypatch.setattr(prh.rh, 'get_backend',
                         MagicMock(return_value=fake_backend))
     monkeypatch.setattr(prh.rh, 'Session',
                         MagicMock(return_value=fake_session))
+    monkeypatch.setattr(prh, '_telemetry_available', lambda: otel)
 
     sess = RhapsodySession('sess.no_telem', backend_names=['fake'])
     # _REAL_INITIALIZE was captured at import time, before the autouse
@@ -1316,10 +1325,32 @@ async def test_initialize_without_start_telemetry(monkeypatch):
     # manually to bypass the per-test stub.
     await _REAL_INITIALIZE(sess)
 
+    if has_method:
+        fake_session.start_telemetry.assert_not_awaited()
     assert sess._telemetry is None
     assert sess._rh_session is fake_session
     assert sess._init_error is None
     assert sess._init_ready.is_set()
+
+
+def test_telemetry_available_without_otel(monkeypatch, caplog):
+    '''A missing opentelemetry package reads as unavailable (find_spec
+    raises for a dotted name whose parent is absent) and warns once.'''
+    from radical.orbit import plugin_rhapsody as prh
+
+    def _no_parent(name):
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr(prh.importlib.util, 'find_spec', _no_parent)
+    prh._telemetry_available.cache_clear()
+    try:
+        with caplog.at_level('WARNING', logger='radical.orbit'):
+            assert prh._telemetry_available() is False
+            assert prh._telemetry_available() is False
+        assert sum('telemetry disabled' in r.message
+                   for r in caplog.records) == 1
+    finally:
+        prh._telemetry_available.cache_clear()
 
 
 # ---------------------------------------------------------------------------

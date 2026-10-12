@@ -7,7 +7,9 @@ and monitor compute / AI tasks on endpoint nodes.
 
 import asyncio
 import base64
+import functools
 import importlib
+import importlib.util
 import json
 import logging
 import math
@@ -82,6 +84,23 @@ except ImportError:
 import cloudpickle as _cp
 import msgpack
 from . import _prof as rprof
+
+
+@functools.cache
+def _telemetry_available() -> bool:
+    """Whether rhapsody's ``[telemetry]`` extra (opentelemetry-sdk) is
+    installed.  Probed up front because rhapsody 0.4 fails only inside
+    ``start_telemetry()``, after wiring a half-built manager into the
+    session.  Cached, so the warning is logged once per process.
+    """
+    try:
+        ok = importlib.util.find_spec('opentelemetry.sdk') is not None
+    except ImportError:              # parent package missing
+        ok = False
+    if not ok:
+        log.warning("rhapsody telemetry disabled: opentelemetry-sdk "
+                    "(the rhapsody [telemetry] extra) is not installed")
+    return ok
 
 
 def _json_safe(v):
@@ -248,11 +267,11 @@ class RhapsodySession(PluginSession):
             self._rh_session = await asyncio.to_thread(
                 rh.Session, backends=backends, uid=self._sid)
 
-            # start_telemetry only exists on newer rhapsody; older
-            # installs don't support it. Skip silently if unavailable.
+            # Telemetry is optional: older rhapsody lacks start_telemetry,
+            # and it needs the [telemetry] extra.
             self._telemetry = None
             start_telemetry = getattr(self._rh_session, 'start_telemetry', None)
-            if start_telemetry is not None:
+            if start_telemetry is not None and _telemetry_available():
                 self._telemetry = await start_telemetry(
                     resource_poll_interval=0.1,
                     checkpoint_path="telemetry-output")
