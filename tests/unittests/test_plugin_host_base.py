@@ -258,14 +258,27 @@ class TestExpandSpecialTokens:
     @pytest.mark.parametrize('roles, exc', [
         ('compute',            TypeError),     # bare str would substring-match
         (('compute', 'gpu'),   ValueError),    # unknown role
+        ((['compute'],),       TypeError),     # unhashable element
     ])
     def test_default_roles_validated(self, monkeypatch, roles, exc):
         """Invalid ``default_roles`` raise at class creation, unregistered."""
         monkeypatch.setattr(Plugin, '_registry', dict(Plugin._registry))
-        with pytest.raises(exc):
+        with pytest.raises(exc, match='_Bad.default_roles'):
             type('_Bad', (Plugin,), {'plugin_name'  : '_test_bad',
                                      'default_roles': roles})
         assert '_test_bad' not in Plugin._registry
+
+    def test_default_roles_validated_when_inherited(self, monkeypatch):
+        """Roles inherited from a non-Plugin mixin are validated too."""
+        monkeypatch.setattr(Plugin, '_registry', dict(Plugin._registry))
+
+        class _Mixin:
+            default_roles = 'compute'
+
+        with pytest.raises(TypeError, match='_BadMix.default_roles'):
+            type('_BadMix', (_Mixin, Plugin),
+                 {'plugin_name': '_test_badmix'})
+        assert '_test_badmix' not in Plugin._registry
 
     def test_default_includes_declaring_external_plugin(self, monkeypatch):
         """An entry-point plugin joins a role's defaults by declaring it."""

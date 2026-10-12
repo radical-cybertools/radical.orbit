@@ -182,15 +182,6 @@ class Plugin(object):
         super().__init_subclass__(**kwargs)
         if 'default_roles' in cls.__dict__:
             roles = cls.__dict__['default_roles']
-            if not isinstance(roles, (tuple, list, set, frozenset)):
-                raise TypeError(
-                    f"{cls.__name__}.default_roles must be a tuple of role "
-                    f"names, not {type(roles).__name__}")
-            unknown = set(roles) - set(HOST_ROLES)
-            if unknown:
-                raise ValueError(
-                    f"{cls.__name__}.default_roles: unknown role(s) "
-                    f"{sorted(unknown)}; valid: {list(HOST_ROLES)}")
         else:
             # Parents hold their effective roles (stored below); the
             # decision depends on plugin names only.
@@ -200,6 +191,18 @@ class Plugin(object):
             same = parent_name is None \
                 or getattr(cls, 'plugin_name', None) == parent_name
             roles = super(cls, cls).default_roles if same else ()
+        # Validate declared and inherited roles alike (a mixin may supply
+        # them): a bare str would otherwise become a tuple of characters.
+        if not isinstance(roles, (tuple, list, set, frozenset)) \
+                or not all(isinstance(r, str) for r in roles):
+            raise TypeError(
+                f"{cls.__name__}.default_roles must be a tuple of role "
+                f"names, not {roles!r}")
+        unknown = set(roles) - set(HOST_ROLES)
+        if unknown:
+            raise ValueError(
+                f"{cls.__name__}.default_roles: unknown role(s) "
+                f"{sorted(unknown)}; valid: {list(HOST_ROLES)}")
         cls.default_roles = tuple(roles)
         if hasattr(cls, 'plugin_name'):
             name = getattr(cls, 'plugin_name')
