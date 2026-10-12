@@ -64,6 +64,12 @@ log = logging.getLogger('radical.orbit')
 # Background poll interval for active transfer tasks (seconds).
 GLOBUS_POLL_INTERVAL = 10.0
 
+# HTTP timeout for every Globus API call (seconds).  globus-sdk defaults to
+# 60 s as well; setting it explicitly overrides $GLOBUS_SDK_HTTP_TIMEOUT,
+# where -1 means no timeout at all.  Set on each client's transport, which
+# reads it per request (the constructor keyword differs between 3.x and 4.x).
+GLOBUS_HTTP_TIMEOUT = 60
+
 # Terminal Globus task statuses (no further polling needed).
 GLOBUS_TERMINAL = {'SUCCEEDED', 'FAILED', 'CANCELED', 'CANCELLED'}
 
@@ -174,18 +180,18 @@ class GlobusSession(PluginSession):
         if access_token:
             authorizer = globus_sdk.AccessTokenAuthorizer(access_token)
         elif refresh_token and client_id:
-            authorizer = globus_sdk.RefreshTokenAuthorizer(
-                refresh_token, globus_sdk.NativeAppAuthClient(client_id))
+            auth_client = globus_sdk.NativeAppAuthClient(client_id)
+            auth_client.transport.http_timeout = GLOBUS_HTTP_TIMEOUT
+            authorizer  = globus_sdk.RefreshTokenAuthorizer(
+                refresh_token, auth_client)
         else:
             raise ValueError(
                 "provide either 'access_token' or 'refresh_token'+'client_id'")
 
         # Bound every HTTP call so a hung Globus endpoint cannot block the
         # offload thread indefinitely (mirrors the IRI client's timeout=30).
-        # Set on the transport, which reads it per request: the constructor
-        # keyword differs between globus-sdk 3.x and 4.x.
         self._tc = globus_sdk.TransferClient(authorizer=authorizer)
-        self._tc.transport.http_timeout = 60
+        self._tc.transport.http_timeout = GLOBUS_HTTP_TIMEOUT
 
         # task_id -> {status, label}
         self._tasks: Dict[str, Dict[str, Any]] = {}

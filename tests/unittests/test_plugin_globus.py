@@ -93,12 +93,17 @@ def test_session_no_credential():
             GlobusSession('s1')
 
 
+@pytest.mark.parametrize('creds', [
+    {'access_token': 'tok'},
+    {'refresh_token': 'rt', 'client_id': 'cid'},   # token refresh at init
+])
 @pytest.mark.asyncio
-async def test_real_sdk_requests(monkeypatch):
+async def test_real_sdk_requests(monkeypatch, creds):
     '''Unmocked globus-sdk (3.x or 4.x), stubbed at the HTTP layer: the
-    60 s timeout reaches every request, and the transfer / delete payloads
-    the SDK sends carry a submission_id (4.x dropped the client argument
-    of TransferData / DeleteData that used to fetch it).'''
+    60 s timeout reaches every request (token refresh included), and the
+    transfer / delete payloads the SDK sends carry a submission_id (4.x
+    dropped the client argument of TransferData / DeleteData that used to
+    fetch it).'''
     pytest.importorskip('globus_sdk')
     import requests
 
@@ -108,7 +113,12 @@ async def test_real_sdk_requests(monkeypatch):
 
     def fake_send(_self, req, **kw):
         sent.append((req.method, req.url, req.body, kw.get('timeout')))
-        if req.url.endswith('/submission_id'):
+        if req.url.endswith('/oauth2/token'):
+            data = {'access_token': 'at', 'expires_in': 3600,
+                    'resource_server': 'transfer.api.globus.org',
+                    'scope': 'urn:globus:auth:scope:transfer.api.globus.org:all',
+                    'token_type': 'Bearer', 'other_tokens': []}
+        elif req.url.endswith('/submission_id'):
             data = {'value': 'sid-1'}
         else:
             data = {'task_id': 'tid-1', 'submission_id': 'sid-1'}
@@ -120,16 +130,23 @@ async def test_real_sdk_requests(monkeypatch):
         return resp
 
     monkeypatch.setattr(requests.Session, 'send', fake_send)
-    session = GlobusSession('s1', access_token='tok')
+    session = GlobusSession('s1', **creds)
     session._start_polling = MagicMock()
-
-    await session.submit_transfer(
-        'src', 'dst', [{'source': '/a', 'destination': '/b'}], label='l')
-    await session.submit_delete('src', ['/a'], recursive=True)
+    try:
+        await session.submit_transfer(
+            'src', 'dst', [{'source': '/a', 'destination': '/b'}], label='l')
+        await session.submit_delete('src', ['/a'], recursive=True)
+    finally:
+        await session.close()
+        if hasattr(session._tc, 'close'):      # globus-sdk 4.x only
+            session._tc.close()
 
     assert {t for *_, t in sent} == {60}
+    assert any(url.endswith('/oauth2/token') for _, url, *_ in sent) \
+        == ('refresh_token' in creds)
     posts = {url.rsplit('/', 1)[-1]: json.loads(body)
-             for method, url, body, _ in sent if method == 'POST'}
+             for method, url, body, _ in sent
+             if url.endswith(('/transfer', '/delete'))}
     assert posts['transfer']['submission_id']   == 'sid-1'
     assert posts['transfer']['source_endpoint'] == 'src'
     assert posts['transfer']['DATA'][0]['source_path'] == '/a'
