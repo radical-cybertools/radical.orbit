@@ -76,11 +76,14 @@ from radical.orbit import EndpointRuntime
 
 rt     = EndpointRuntime()
 rt.start(wait=True)
-eid    = next(n for n in rt.topology() if n != 'broker')
-globus = rt.get_plugin(eid, 'globus')
+eid    = next(n for n, info in rt.topology().items()
+              if info.get('role') == 'endpoint'
+              and 'globus' in (info.get('plugins') or {}))
 
+# get_plugin() registers the session, so the credential goes in here:
 # access token, or refresh_token=… + client_id=…
-globus.register_session(access_token='…', local_collection='…')
+globus = rt.get_plugin(eid, 'globus',
+                       access_token='…', local_collection='…')
 
 sub = globus.submit_transfer(
     source='<src-uuid>', destination='local',
@@ -95,7 +98,9 @@ print(globus.get_task(sub['task_id'])['status'])
 Methods:
 
 `register_session(access_token=None, refresh_token=None, client_id=None, local_collection=None)`  
-Open a session with a Globus credential.
+Open a session with a Globus credential. `get_plugin()` calls this with
+its keyword arguments, so pass the credential there; do not call it again
+on that client.
 
 `submit_transfer(source, destination, items, label=None, sync_level=None)`  
 Submit a transfer. `items` is a list of
