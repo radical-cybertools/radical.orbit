@@ -244,6 +244,7 @@ class RhapsodySession(PluginSession):
         self.allow_pickled_tasks = allow_pickled_tasks
         self._rh_session         = None
         self._telemetry          = None
+        self._closing            = False
         self._tasks: dict[str, dict] = {}
 
         # Async init tracking
@@ -849,8 +850,12 @@ class RhapsodySession(PluginSession):
         """
         Shutdown RHAPSODY session and clean up.
         """
+        rh_session = self._rh_session
         try:
-            if self._rh_session:
+            # _closing makes a concurrent close() skip the rhapsody shutdown
+            # instead of running it twice.
+            if rh_session is not None and not self._closing:
+                self._closing = True
                 # Telemetry is best effort: never let it block teardown.
                 if self._telemetry is not None \
                         and log.isEnabledFor(logging.INFO):
@@ -861,18 +866,16 @@ class RhapsodySession(PluginSession):
                         log.warning("[%s] telemetry summary failed: %r",
                                     self._sid, e)
                 self._telemetry = None
-                await self._rh_session.close()
-        except Exception:
-            # log here: a failing super().close() below would mask it
-            log.exception("[%s] rhapsody session close failed", self._sid)
-            raise
+                try:
+                    await rh_session.close()
+                finally:
+                    # cleared only after the await, so in-flight request
+                    # paths still see the session while it shuts down
+                    self._rh_session = None
+                    self._tasks = {}
         finally:
-            # cleared only after the await, so in-flight request paths
-            # still see the session while it shuts down
-            self._rh_session = None
-            self._tasks = {}
-            result = await super().close()
-        return result
+            await super().close()
+        return {}
 
 
 # ---------------------------------------------------------------------------

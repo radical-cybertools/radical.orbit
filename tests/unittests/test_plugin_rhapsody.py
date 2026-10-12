@@ -1111,11 +1111,9 @@ async def test_session_close_cleans_up_when_rh_close_raises():
     session._rh_session = mock_rh_session
     session._tasks = {'t1': {}}
 
-    with patch('radical.orbit.plugin_rhapsody.log') as mock_log, \
-         pytest.raises(RuntimeError, match="stop"):
+    with pytest.raises(RuntimeError, match="stop"):
         await session.close()
 
-    mock_log.exception.assert_called_once()
     assert session._rh_session is None
     assert session._tasks == {}
     assert session._active is False
@@ -1135,6 +1133,30 @@ async def test_session_close_keeps_session_during_shutdown():
     await session.close()
 
     assert seen == [mock_rh_session]
+    assert session._rh_session is None
+
+
+@pytest.mark.asyncio
+async def test_session_close_concurrent_runs_rhapsody_close_once():
+    '''Two overlapping close() calls shut rhapsody down only once.'''
+    session = RhapsodySession("test.005")
+    release = asyncio.Event()
+    mock_rh_session = MagicMock()
+
+    async def _slow_close():
+        await release.wait()
+
+    mock_rh_session.close = AsyncMock(side_effect=_slow_close)
+    session._rh_session = mock_rh_session
+
+    first  = asyncio.ensure_future(session.close())
+    await asyncio.sleep(0)                 # first close is now awaiting
+    second = await session.close()         # must not call rhapsody again
+    release.set()
+    await first
+
+    assert second == {}
+    mock_rh_session.close.assert_awaited_once()
     assert session._rh_session is None
 
 
@@ -1387,6 +1409,18 @@ async def test_initialize_without_telemetry(monkeypatch, has_method, otel):
 
 
 @pytest.fixture
+def orbit_caplog(caplog):
+    '''``caplog`` capturing WARNING+ from the ``radical.orbit`` logger,
+    which may have propagate=False (see test_plugin_psij.py).'''
+    import logging as _logging
+    re_log = _logging.getLogger('radical.orbit')
+    re_log.addHandler(caplog.handler)
+    caplog.set_level(_logging.WARNING, logger='radical.orbit')
+    yield caplog
+    re_log.removeHandler(caplog.handler)
+
+
+@pytest.fixture
 def _fresh_telemetry_switch():
     '''Clear the per-process telemetry switch cache around a test.'''
     from radical.orbit import plugin_rhapsody as prh
@@ -1411,23 +1445,16 @@ def test_telemetry_switch(monkeypatch, _fresh_telemetry_switch, env, on):
     assert prh._resolve_telemetry() is on
 
 
-def test_telemetry_switch_invalid_warns_once(monkeypatch, caplog,
+def test_telemetry_switch_invalid_warns_once(monkeypatch, orbit_caplog,
                                              _fresh_telemetry_switch):
     '''An unrecognised switch value warns once and keeps telemetry on.'''
-    import logging as _logging
     prh = _fresh_telemetry_switch
 
     monkeypatch.setenv(prh.ENV_TELEMETRY, 'maybe')
-    re_log = _logging.getLogger('radical.orbit')
-    re_log.addHandler(caplog.handler)
-    try:
-        caplog.set_level(_logging.WARNING, logger='radical.orbit')
-        assert prh._resolve_telemetry() is True
-        assert prh._resolve_telemetry() is True
-    finally:
-        re_log.removeHandler(caplog.handler)
+    assert prh._resolve_telemetry() is True
+    assert prh._resolve_telemetry() is True
     # count distinct records: with propagation on, caplog sees each twice
-    assert len({id(r) for r in caplog.records
+    assert len({id(r) for r in orbit_caplog.records
                 if prh.ENV_TELEMETRY in r.getMessage()}) == 1
 
 
@@ -1454,7 +1481,7 @@ async def test_initialize_telemetry_switched_off(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_initialize_telemetry_start_failure(monkeypatch, caplog):
+async def test_initialize_telemetry_start_failure(monkeypatch, orbit_caplog):
     '''A telemetry start failure (e.g. an unwritable checkpoint dir)
     disables telemetry instead of failing the session.'''
     from radical.orbit import plugin_rhapsody as prh
@@ -1469,25 +1496,18 @@ async def test_initialize_telemetry_start_failure(monkeypatch, caplog):
     monkeypatch.setattr(prh, '_telemetry_available', lambda: True)
     monkeypatch.setattr(prh, '_resolve_telemetry', lambda: True)
 
-    import logging as _logging
     sess = RhapsodySession('sess.telem_fail', backend_names=['fake'])
-    re_log = _logging.getLogger('radical.orbit')
-    re_log.addHandler(caplog.handler)
-    try:
-        caplog.set_level(_logging.WARNING, logger='radical.orbit')
-        await _REAL_INITIALIZE(sess)
-    finally:
-        re_log.removeHandler(caplog.handler)
+    await _REAL_INITIALIZE(sess)
 
     assert any('telemetry start failed' in r.getMessage()
-               for r in caplog.records)
+               for r in orbit_caplog.records)
     fake_session.start_telemetry.assert_awaited_once()
     assert sess._telemetry is None
     assert sess._init_error is None
     assert sess._init_ready.is_set()
 
 
-def test_telemetry_available_without_otel(monkeypatch, caplog):
+def test_telemetry_available_without_otel(monkeypatch, orbit_caplog):
     '''A missing opentelemetry package reads as unavailable (find_spec
     raises for a dotted name whose parent is absent) and warns once.'''
     from radical.orbit import plugin_rhapsody as prh
@@ -1498,11 +1518,10 @@ def test_telemetry_available_without_otel(monkeypatch, caplog):
     monkeypatch.setattr(prh.importlib.util, 'find_spec', _no_parent)
     prh._telemetry_available.cache_clear()
     try:
-        with caplog.at_level('WARNING', logger='radical.orbit'):
-            assert prh._telemetry_available() is False
-            assert prh._telemetry_available() is False
-        assert sum('telemetry disabled' in r.message
-                   for r in caplog.records) == 1
+        assert prh._telemetry_available() is False
+        assert prh._telemetry_available() is False
+        assert len({id(r) for r in orbit_caplog.records
+                    if 'telemetry disabled' in r.getMessage()}) == 1
     finally:
         prh._telemetry_available.cache_clear()
 
@@ -1536,25 +1555,16 @@ def test_notify_window_from_env(monkeypatch):
 
 
 @pytest.mark.parametrize('raw', ['abc', '-1', '0.1s', 'nan', 'inf', '-inf'])
-def test_notify_window_invalid_falls_back(monkeypatch, caplog, raw):
+def test_notify_window_invalid_falls_back(monkeypatch, orbit_caplog, raw):
     '''A non-numeric, negative or non-finite window warns and keeps the
     default — ``nan`` in particular must not sneak past as a ~0 window.'''
-    import logging as _logging
     from radical.orbit import plugin_rhapsody as prh
 
     monkeypatch.setenv(prh.ENV_NOTIFY_WINDOW, raw)
-    # The radical.orbit logger has propagate=False, so caplog's handler
-    # must be attached to it explicitly (see test_plugin_psij.py).
-    re_log = _logging.getLogger('radical.orbit')
-    re_log.addHandler(caplog.handler)
-    try:
-        caplog.set_level(_logging.WARNING, logger='radical.orbit')
-        _, plugin, _ = _make_plugin()
-    finally:
-        re_log.removeHandler(caplog.handler)
+    _, plugin, _ = _make_plugin()
 
     assert plugin._notify_window == prh.NOTIFY_BATCH_WINDOW
-    assert prh.ENV_NOTIFY_WINDOW in caplog.text
+    assert prh.ENV_NOTIFY_WINDOW in orbit_caplog.text
 
 
 def test_notify_window_zero_flushes_immediately(monkeypatch):
