@@ -326,7 +326,8 @@ class GlobusSession(PluginSession):
         res = _as_dict(await self._call(
             self._tc.get_task, task_id, context='get_task', read_only=True))
         if task_id in self._tasks and res.get('status'):
-            self._tasks[task_id]['status'] = res['status']
+            # the full result too: the poller may notify from this cache
+            self._tasks[task_id].update(status=res['status'], result=res)
         return res
 
     async def task_wait(self, task_id: str, timeout: int = 60,
@@ -454,11 +455,15 @@ class GlobusSession(PluginSession):
         cached = meta.get('status')
         if cached in GLOBUS_TERMINAL and cached != meta.get('notified'):
             meta['notified'] = cached
-            return {'task_id': task_id, 'status': cached}
+            return meta.get('result') or {'task_id': task_id, 'status': cached}
         res    = _as_dict(await asyncio.to_thread(self._tc.get_task, task_id))
         status = res.get('status')
-        if status and status != meta.get('notified', 'ACTIVE'):
-            meta['status'] = meta['notified'] = status
+        if not status:
+            return None
+        # keep the cache current (e.g. INACTIVE back to ACTIVE)
+        meta.update(status=status, result=res)
+        if status != meta.get('notified', 'ACTIVE'):
+            meta['notified'] = status
             return res
         return None
 

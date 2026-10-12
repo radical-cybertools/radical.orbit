@@ -411,7 +411,12 @@ async def test_poller_cached_terminal_skips_failing_fetch(monkeypatch):
     monkeypatch.setattr(pg, 'GLOBUS_POLL_INTERVAL', 0.01)
     session = _make_session()
     session.notify = MagicMock()
-    session._tasks['t1'] = {'status': 'SUCCEEDED', 'label': ''}   # cached
+    session._tasks['t1'] = {'status': 'ACTIVE', 'label': ''}
+    session._tc.get_task.return_value = {
+        'task_id': 't1', 'status': 'FAILED', 'nice_status': 'PERMISSION_DENIED',
+        'bytes_transferred': 5, 'files_transferred': 1}
+    await session.get_task('t1')                     # caches the full result
+    session._tc.get_task.reset_mock()
     session._tc.get_task.side_effect = RuntimeError('401 token expired')
 
     session._start_polling()
@@ -420,7 +425,21 @@ async def test_poller_cached_terminal_skips_failing_fetch(monkeypatch):
     session._tc.get_task.assert_not_called()
     session.notify.assert_called_once()
     topic, payload = session.notify.call_args.args
-    assert (topic, payload['status']) == ('transfer_status', 'SUCCEEDED')
+    assert topic == 'transfer_status'
+    assert payload['status']      == 'FAILED'
+    assert payload['nice_status'] == 'PERMISSION_DENIED'   # full result
+    assert payload['bytes_transferred'] == 5
+
+
+@pytest.mark.asyncio
+async def test_poller_corrects_stale_cached_status():
+    """A fetched status that differs from the cache updates it, even when it
+    equals the last notified one (INACTIVE cached, task ACTIVE again)."""
+    session = _make_session()
+    meta = {'status': 'INACTIVE', 'notified': 'ACTIVE', 'label': ''}
+    session._tc.get_task.return_value = {'task_id': 't1', 'status': 'ACTIVE'}
+    assert await session._fetch_task_status('t1', meta) is None
+    assert meta['status'] == 'ACTIVE'
 
 
 def test_globus_http_exc_forwards_retry_after():

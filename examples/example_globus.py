@@ -57,6 +57,15 @@ def _auth_kwargs() -> dict:
         '(see get_globus_token.py).')
 
 
+def _cancel(globus, task_id: str) -> None:
+    """Cancel a transfer we gave up on, reporting a failure to do so."""
+    try:
+        globus.cancel_task(task_id)
+        print(f'Cancelled task {task_id}')
+    except Exception as exc:
+        print(f'  cancel failed: {exc}')
+
+
 def main():
 
     rt   = EndpointRuntime()
@@ -102,16 +111,13 @@ def main():
                     break
                 if attempt < attempts - 1:
                     print('  … still transferring')
-        finally:
-            # timed out, or the wait itself failed: don't leave it running
-            if not completed:
-                print(f'No completion after {time.monotonic() - start:.0f} '
-                      f's; cancelling task {task_id}')
-                try:
-                    globus.cancel_task(task_id)
-                except Exception as exc:
-                    print(f'  cancel failed: {exc}')
+        except Exception as exc:
+            # the wait failed, not necessarily the transfer: leave it running
+            print(f'Waiting for task {task_id} failed: {exc}')
+            raise
         if not completed:
+            print(f'No completion after {time.monotonic() - start:.0f} s')
+            _cancel(globus, task_id)
             return
 
         task    = globus.get_task(task_id)
@@ -124,8 +130,7 @@ def main():
             print(f"Transfer did not succeed: {task.get('nice_status')}")
             if status == 'INACTIVE':
                 # paused (e.g. expired credential): don't leave it pending
-                globus.cancel_task(task_id)
-                print(f'Cancelled inactive task {task_id}')
+                _cancel(globus, task_id)
             return
 
         # List what landed on the destination.
