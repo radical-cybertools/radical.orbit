@@ -121,6 +121,12 @@ class TestExpandSpecialTokens:
         out = _expand_special_tokens(['psij', 'sys'], app, ['psij', 'sysinfo'])
         assert out == ['psij', 'sys']
 
+    def test_default_includes_globus_on_login_and_compute(self):
+        """globus is a default on login/compute endpoints, never the broker."""
+        assert 'globus' in DEFAULT_PLUGINS_BY_ROLE['login']
+        assert 'globus' in DEFAULT_PLUGINS_BY_ROLE['compute']
+        assert 'globus' not in DEFAULT_PLUGINS_BY_ROLE['broker']
+
     def test_default_role_table_complete(self):
         """Sanity: every advertised role has a default set."""
         for role in ('broker', 'login', 'compute', 'standalone'):
