@@ -121,8 +121,11 @@ def main():
               f"({task.get('files_transferred')} files, "
               f"{task.get('bytes_transferred')} bytes)")
         if status != 'SUCCEEDED':
-            # FAILED / CANCELED, or INACTIVE (e.g. expired credential)
             print(f"Transfer did not succeed: {task.get('nice_status')}")
+            if status == 'INACTIVE':
+                # paused (e.g. expired credential): don't leave it pending
+                globus.cancel_task(task_id)
+                print(f'Cancelled inactive task {task_id}')
             return
 
         # List what landed on the destination.

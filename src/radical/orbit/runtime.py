@@ -827,7 +827,9 @@ class EndpointRuntime(PluginHostBase):
         try:
             result = await handler(shim)
         except HTTPException as e:
-            return (e.status_code, {'content-type': 'application/json'},
+            # keep the handler's headers (e.g. Retry-After on a 429 / 503)
+            return (e.status_code,
+                    {**(e.headers or {}), 'content-type': 'application/json'},
                     error_body(e.status_code, e.detail))
         except Exception as e:
             log.exception("[Runtime] handler error: %s %s", req.method, path)

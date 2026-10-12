@@ -182,12 +182,18 @@ def _globus_http_exc(exc: Exception, context: str = '',
     sc  = getattr(exc, 'http_status', None) or 0
     msg = getattr(exc, 'message', None) or str(exc)
 
+    # pass Globus's Retry-After on, so a retrying client honours it
+    ra    = (getattr(exc, 'headers', None) or {}).get('Retry-After')
+    retry = {'Retry-After': str(ra)} if ra else None
+
     if   sc == 401: return HTTPException(status_code=401, detail=f'{prefix}token expired or invalid')
     elif sc == 403: return HTTPException(status_code=403, detail=f'{prefix}forbidden')
     elif sc == 404: return HTTPException(status_code=404, detail=f'{prefix}not found')
-    elif sc == 429: return HTTPException(status_code=429, detail=f'{prefix}rate limited by Globus')
+    elif sc == 429: return HTTPException(status_code=429, detail=f'{prefix}rate limited by Globus',
+                                         headers=retry)
     elif sc >= 500 and read_only:
-        return HTTPException(status_code=503, detail=f'{prefix}{msg}')
+        return HTTPException(status_code=503, detail=f'{prefix}{msg}',
+                             headers=retry)
     else:           return HTTPException(status_code=502, detail=f'{prefix}{msg}')
 
 
@@ -441,8 +447,14 @@ class GlobusSession(PluginSession):
 
         Compares against the last *notified* status, not ``meta['status']``:
         ``get_task`` (e.g. a client's ``task_wait`` polls) writes the latter,
-        and must not swallow the change notification.
+        and must not swallow the change notification.  A terminal status
+        already cached by ``get_task`` is notified without fetching, so a
+        failing fetch (e.g. an expired token) cannot keep the task polled.
         '''
+        cached = meta.get('status')
+        if cached in GLOBUS_TERMINAL and cached != meta.get('notified'):
+            meta['notified'] = cached
+            return {'task_id': task_id, 'status': cached}
         res    = _as_dict(await asyncio.to_thread(self._tc.get_task, task_id))
         status = res.get('status')
         if status and status != meta.get('notified', 'ACTIVE'):
@@ -539,6 +551,8 @@ class GlobusClient(PluginClient):
         interval = max(1, polling_interval)
         start    = time.monotonic()
         deadline = start + timeout
+        slot     = 0                    # index of the current scheduled poll
+        last     = False                # this poll is the one at the deadline
         while True:
             error = None                # the last poll's transient failure
             retry = None                # server-requested pause, if any
@@ -556,7 +570,7 @@ class GlobusClient(PluginClient):
                         return {'task_id': task_id, 'completed': True}
 
             now = time.monotonic()
-            if now >= deadline:
+            if last or now >= deadline:
                 if isinstance(error, Exception):
                     raise error
                 if error is not None:
@@ -568,10 +582,15 @@ class GlobusClient(PluginClient):
                           task_id, getattr(error, 'status_code', error))
             # next slot of the fixed schedule, unless the server asked for
             # a specific pause; the deadline gets a last poll
-            due = start + (int((now - start) // interval) + 1) * interval
+            # (a slot index, so an early wake-up cannot repeat a slot)
             if retry is not None:
-                due = now + retry
-            time.sleep(min(due, deadline) - now)
+                due  = now + retry
+            else:
+                slot = max(slot + 1, int((now - start) // interval) + 1)
+                due  = start + slot * interval
+            if due >= deadline:
+                due, last = deadline, True
+            time.sleep(due - now)
 
     def cancel_task(self, task_id: str) -> dict:
         self._require_session()

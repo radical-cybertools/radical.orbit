@@ -2,6 +2,7 @@
 
 # pylint: disable=protected-access
 
+import asyncio
 import time
 
 import httpx
@@ -193,7 +194,7 @@ async def test_task_wait_clamped_below_call_timeout():
     assert (kwargs['timeout'], kwargs['polling_interval']) == (1, 1)
 
 
-def _wait_client(replies, monkeypatch):
+def _wait_client(replies, monkeypatch, undershoot=0.0):
     """GlobusClient whose get_task route answers with *replies* in order.
 
     Each reply is ``(status, body)``, ``(status, body, elapsed, headers)``
@@ -216,7 +217,7 @@ def _wait_client(replies, monkeypatch):
 
     def _sleep(t):
         sleeps.append(t)
-        now[0] += t
+        now[0] += t - undershoot        # a real sleep may wake a bit early
 
     monkeypatch.setattr(pg.time, 'monotonic', lambda: now[0])
     monkeypatch.setattr(pg.time, 'sleep', _sleep)
@@ -263,6 +264,15 @@ def test_client_task_wait_last_poll_at_deadline(monkeypatch):
     assert client.task_wait('t1', timeout=15) == _TIMED
     assert sleeps == [10.0, 5.0]
     assert http.get.call_count == 3
+
+
+def test_client_task_wait_stops_after_deadline_poll(monkeypatch):
+    """A sleep that wakes just before the deadline must not cause one more
+    tiny sleep and an extra poll."""
+    client, http, _ = _wait_client([(200, _ACTIVE)] * 4, monkeypatch,
+                                   undershoot=0.001)
+    assert client.task_wait('t1', timeout=15) == _TIMED
+    assert http.get.call_count == 3             # t = 0, 10, 15 (deadline)
 
 
 def test_client_task_wait_inactive_counts_as_completed(monkeypatch):
@@ -392,6 +402,38 @@ async def test_poller_notifies_after_get_task_saw_terminal():
     assert res is not None
     assert session._task_payload('t1', meta, res)['status'] == 'SUCCEEDED'
     assert await session._fetch_task_status('t1', meta) is None   # once
+
+
+@pytest.mark.asyncio
+async def test_poller_cached_terminal_skips_failing_fetch(monkeypatch):
+    """A terminal status cached by get_task is notified once without a
+    fetch, so a failing fetch (expired token) cannot poll forever."""
+    monkeypatch.setattr(pg, 'GLOBUS_POLL_INTERVAL', 0.01)
+    session = _make_session()
+    session.notify = MagicMock()
+    session._tasks['t1'] = {'status': 'SUCCEEDED', 'label': ''}   # cached
+    session._tc.get_task.side_effect = RuntimeError('401 token expired')
+
+    session._start_polling()
+    await asyncio.wait_for(session._status_poller_task, timeout=2.0)
+
+    session._tc.get_task.assert_not_called()
+    session.notify.assert_called_once()
+    topic, payload = session.notify.call_args.args
+    assert (topic, payload['status']) == ('transfer_status', 'SUCCEEDED')
+
+
+def test_globus_http_exc_forwards_retry_after():
+    exc             = MagicMock(spec=['http_status', 'message', 'code',
+                                      'headers'])
+    exc.code        = 'RateLimited'
+    exc.message     = 'slow down'
+    exc.headers     = {'Retry-After': '9'}
+    exc.http_status = 429
+    assert _globus_http_exc(exc).headers == {'Retry-After': '9'}
+    exc.http_status = 503
+    assert _globus_http_exc(exc, read_only=True).headers \
+        == {'Retry-After': '9'}
 
 
 @pytest.mark.asyncio
