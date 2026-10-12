@@ -244,7 +244,7 @@ class RhapsodySession(PluginSession):
         self.allow_pickled_tasks = allow_pickled_tasks
         self._rh_session         = None
         self._telemetry          = None
-        self._closing            = False
+        self._closed: asyncio.Event | None = None
         self._tasks: dict[str, dict] = {}
 
         # Async init tracking
@@ -301,11 +301,19 @@ class RhapsodySession(PluginSession):
                         resource_poll_interval=0.1,
                         checkpoint_path="telemetry-output")
                 except Exception as e:
-                    # rhapsody may leave a partly started manager behind;
-                    # we only stop using it here.
                     log.warning("[%s] telemetry start failed: %r; not "
                                 "reporting telemetry for this session",
                                 self._sid, e)
+                    # Workaround: rhapsody (<= 0.4) does not unwind a failed
+                    # start.  Its session keeps the half-started manager,
+                    # whose stop() then raises in Session.close() before the
+                    # backends are shut down.  Detach it; drop this once
+                    # rhapsody unwinds start_telemetry() itself.
+                    if hasattr(self._rh_session, '_telemetry'):
+                        self._rh_session._telemetry = None
+                    sm = getattr(self._rh_session, '_state_manager', None)
+                    if hasattr(sm, '_telemetry_observer'):
+                        sm._telemetry_observer = None
 
             # Register state-change callbacks for intermediate notifications
             self._notified_states: dict[str, str] = {}
@@ -850,12 +858,19 @@ class RhapsodySession(PluginSession):
         """
         Shutdown RHAPSODY session and clean up.
         """
+        # A concurrent close() waits for the first one instead of shutting
+        # rhapsody down twice.
+        if self._closed is not None:
+            await self._closed.wait()
+            return {}
+        self._closed = asyncio.Event()
+
         rh_session = self._rh_session
         try:
-            # _closing makes a concurrent close() skip the rhapsody shutdown
-            # instead of running it twice.
-            if rh_session is not None and not self._closing:
-                self._closing = True
+            # New requests now fail in _check_active; in-flight ones still
+            # see _rh_session until the shutdown below completes.
+            self._active = False
+            if rh_session is not None:
                 # Telemetry is best effort: never let it block teardown.
                 if self._telemetry is not None \
                         and log.isEnabledFor(logging.INFO):
@@ -874,6 +889,7 @@ class RhapsodySession(PluginSession):
                     self._rh_session = None
                     self._tasks = {}
         finally:
+            self._closed.set()
             await super().close()
         return {}
 

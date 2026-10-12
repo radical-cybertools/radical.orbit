@@ -1121,41 +1121,58 @@ async def test_session_close_cleans_up_when_rh_close_raises():
 
 @pytest.mark.asyncio
 async def test_session_close_keeps_session_during_shutdown():
-    '''In-flight request paths still see ``_rh_session`` while rhapsody
-    shuts down; it is cleared only afterwards.'''
+    '''While rhapsody shuts down, new requests are refused (session
+    inactive) but in-flight paths still see ``_rh_session``; it is
+    cleared only afterwards.'''
     session = RhapsodySession("test.004")
     mock_rh_session = MagicMock()
     seen = []
     mock_rh_session.close = AsyncMock(
-        side_effect=lambda: seen.append(session._rh_session))
+        side_effect=lambda: seen.append((session._rh_session,
+                                         session._active)))
     session._rh_session = mock_rh_session
 
     await session.close()
 
-    assert seen == [mock_rh_session]
+    assert seen == [(mock_rh_session, False)]
     assert session._rh_session is None
 
 
 @pytest.mark.asyncio
 async def test_session_close_concurrent_runs_rhapsody_close_once():
-    '''Two overlapping close() calls shut rhapsody down only once.'''
+    '''Two overlapping close() calls shut rhapsody down only once, and
+    the second returns only after that shutdown has finished.'''
     session = RhapsodySession("test.005")
-    release = asyncio.Event()
+    started  = asyncio.Event()
+    release  = asyncio.Event()
+    finished = asyncio.Event()
     mock_rh_session = MagicMock()
 
     async def _slow_close():
+        started.set()
         await release.wait()
+        finished.set()
 
     mock_rh_session.close = AsyncMock(side_effect=_slow_close)
     session._rh_session = mock_rh_session
 
-    first  = asyncio.ensure_future(session.close())
-    await asyncio.sleep(0)                 # first close is now awaiting
-    second = await session.close()         # must not call rhapsody again
+    first = asyncio.ensure_future(session.close())
+    await started.wait()                   # first close is inside rhapsody
+
+    async def _second():
+        result = await session.close()
+        return result, finished.is_set()
+
+    second = asyncio.ensure_future(_second())
+    await asyncio.sleep(0.01)
+    assert not second.done()               # waits for the first close
+
     release.set()
     await first
+    result, rh_done = await second
 
-    assert second == {}
+    assert result == {}
+    assert rh_done                         # returned after rhapsody closed
     mock_rh_session.close.assert_awaited_once()
     assert session._rh_session is None
 
@@ -1168,10 +1185,16 @@ async def test_session_close_survives_telemetry_failure():
     mock_rh_session.close = AsyncMock()
     session._rh_session = mock_rh_session
     session._telemetry = MagicMock()
-    session._telemetry.summary.side_effect = RuntimeError("otel broke")
+    telemetry = MagicMock()
+    telemetry.summary.side_effect = RuntimeError("otel broke")
+    session._telemetry = telemetry
 
-    result = await session.close()
+    # patched logger: isEnabledFor(INFO) is truthy, so summary() runs
+    with patch('radical.orbit.plugin_rhapsody.log') as mock_log:
+        result = await session.close()
 
+    telemetry.summary.assert_called_once()
+    mock_log.warning.assert_called_once()
     assert result == {}
     assert session._telemetry is None
     assert session._rh_session is None
@@ -1505,6 +1528,61 @@ async def test_initialize_telemetry_start_failure(monkeypatch, orbit_caplog):
     assert sess._telemetry is None
     assert sess._init_error is None
     assert sess._init_ready.is_set()
+
+
+@pytest.mark.asyncio
+async def test_failed_telemetry_start_does_not_leak_backends(
+        monkeypatch, tmp_path):
+    '''With a real rhapsody Session, a telemetry start that fails half
+    way (checkpoint dir cannot be created) must not keep rhapsody's
+    close() from shutting the backends down.'''
+    import importlib
+    import sys
+    from radical.orbit import plugin_rhapsody as prh
+
+    # this module swaps `rhapsody` for a mock; re-import the real package
+    # for this test (monkeypatch restores the mock afterwards)
+    monkeypatch.delitem(sys.modules, 'rhapsody', raising=False)
+    try:
+        real = importlib.import_module('rhapsody')
+    except ImportError:
+        pytest.skip('needs rhapsody')
+    if not hasattr(real.Session, 'start_telemetry'):
+        pytest.skip('needs rhapsody with Session.start_telemetry')
+    pytest.importorskip('opentelemetry.sdk')
+    monkeypatch.setattr(prh, 'rh', real)
+
+    # 'telemetry-output' exists as a file, so the checkpoint mkdir fails
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / 'telemetry-output').write_text('')
+    monkeypatch.setattr(prh, '_resolve_telemetry', lambda: True)
+    monkeypatch.setattr(prh, '_telemetry_available', lambda: True)
+
+    class _FakeBackend:
+        name = 'fake'
+
+        def __init__(self):
+            self.attached_to = []
+            self.shutdown    = AsyncMock()
+
+        def register_callback(self, cb):
+            pass
+
+    backend = _FakeBackend()
+    monkeypatch.setattr(real, 'get_backend', lambda name: backend)
+
+    sess = RhapsodySession('sess.telem_real', backend_names=['fake'])
+    await _REAL_INITIALIZE(sess)
+
+    assert sess._init_error is None
+    assert sess._telemetry is None
+    rh_session = sess._rh_session
+    assert rh_session._telemetry is None
+    assert rh_session._state_manager._telemetry_observer is None
+
+    await sess.close()
+
+    backend.shutdown.assert_awaited_once()
 
 
 def test_telemetry_available_without_otel(monkeypatch, orbit_caplog):
