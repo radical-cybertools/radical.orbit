@@ -41,12 +41,17 @@ __copyright__ = 'Copyright 2024, RADICAL@Rutgers'
 __license__   = 'MIT'
 
 import asyncio
+import concurrent.futures
 import json
 import logging
+import math
 import os
+import time
 import uuid
 
 from typing import Any, Dict, List, Optional
+
+import httpx
 
 from fastapi import FastAPI, HTTPException, Request
 
@@ -67,13 +72,46 @@ GLOBUS_POLL_INTERVAL = 10.0
 # Terminal Globus task statuses (no further polling needed).
 GLOBUS_TERMINAL = {'SUCCEEDED', 'FAILED', 'CANCELED', 'CANCELLED'}
 
+# Statuses that end ``task_wait``: the task has left ACTIVE.  INACTIVE
+# (e.g. an expired credential) is not terminal but needs intervention.
+GLOBUS_WAIT_DONE = GLOBUS_TERMINAL | {'INACTIVE'}
+
 # Local-collection config file (lowest-priority auto-detection source).
 GLOBUS_CONFIG_FILE = '~/.radical/orbit/globus.json'
+
+# Upper bound for one call of the server-side ``wait`` route (seconds), kept
+# for direct HTTP callers.  The broker reaps a routed call after
+# ``BrokerTuning.call_timeout`` (30 s by default) with HTTP 504 while the
+# transfer keeps running.  ``GlobusClient.task_wait`` does not use this
+# route: it paces short ``get_task`` calls itself.
+GLOBUS_WAIT_SLICE = 10
+
+# Poll failures ``GlobusClient.task_wait`` retries until its deadline:
+# 504 (call reaped or handler timed out), 503 (broker / runtime overload
+# fast-fail, or a transient Globus network error / 5xx on a status query)
+# and 429 (Globus rate limit), plus transport-level losses.  Not 502: the broker sends it for an
+# unknown endpoint, and this plugin maps other unmapped Globus errors to it.
+_WAIT_RETRY_STATUS = {429, 503, 504}
+_WAIT_RETRY_EXC    = (TimeoutError, ConnectionError, httpx.TransportError,
+                      # distinct from TimeoutError before Python 3.11
+                      asyncio.TimeoutError, concurrent.futures.TimeoutError)
 
 
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
+
+def _retry_after(resp) -> Optional[float]:
+    """Seconds from a response's ``Retry-After`` header (at least 1), or
+    ``None`` when it is absent or not a positive finite number."""
+    try:
+        val = float(resp.headers.get('retry-after'))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(val) or val <= 0:
+        return None
+    return max(1.0, val)
+
 
 def detect_local_collection() -> Optional[str]:
     '''Best-effort discovery of the endpoint's local Globus collection UUID.
@@ -118,13 +156,17 @@ def _as_dict(res: Any) -> dict:
     return res.data if hasattr(res, 'data') else res
 
 
-def _globus_http_exc(exc: Exception, context: str = '') -> HTTPException:
+def _globus_http_exc(exc: Exception, context: str = '',
+                     read_only: bool = False) -> HTTPException:
     '''Map a globus-sdk API error to an HTTPException.
 
     ``ConsentRequired`` (the ``data_access`` consent needed for mapped
     collections) is surfaced as a clear 401 rather than an opaque 502, so the
     caller knows to re-acquire a token carrying the collection's data_access
     scope.
+
+    A Globus-side 5xx becomes 503 (retryable) only for *read_only* calls; a
+    mutating call keeps 502, since a retry could duplicate its effect.
     '''
     prefix = f'Globus {context}: ' if context else 'Globus: '
 
@@ -137,13 +179,21 @@ def _globus_http_exc(exc: Exception, context: str = '') -> HTTPException:
                    f'carrying the collection data_access scope '
                    f'(required_scopes={scopes})')
 
-    sc  = getattr(exc, 'http_status', 502) or 502
+    sc  = getattr(exc, 'http_status', None) or 0
     msg = getattr(exc, 'message', None) or str(exc)
+
+    # pass Globus's Retry-After on, so a retrying client honours it
+    ra    = (getattr(exc, 'headers', None) or {}).get('Retry-After')
+    retry = {'Retry-After': str(ra)} if ra else None
 
     if   sc == 401: return HTTPException(status_code=401, detail=f'{prefix}token expired or invalid')
     elif sc == 403: return HTTPException(status_code=403, detail=f'{prefix}forbidden')
     elif sc == 404: return HTTPException(status_code=404, detail=f'{prefix}not found')
-    elif sc == 429: return HTTPException(status_code=429, detail=f'{prefix}rate limited by Globus')
+    elif sc == 429: return HTTPException(status_code=429, detail=f'{prefix}rate limited by Globus',
+                                         headers=retry)
+    elif sc >= 500 and read_only:
+        return HTTPException(status_code=503, detail=f'{prefix}{msg}',
+                             headers=retry)
     else:           return HTTPException(status_code=502, detail=f'{prefix}{msg}')
 
 
@@ -202,8 +252,14 @@ class GlobusSession(PluginSession):
             return self._local_collection
         return collection
 
-    async def _call(self, fn, *args, context: str = '', **kwargs) -> Any:
-        '''Offload a synchronous globus-sdk call and map its errors.'''
+    async def _call(self, fn, *args, context: str = '',
+                    read_only: bool = False, **kwargs) -> Any:
+        '''Offload a synchronous globus-sdk call and map its errors.
+
+        For *read_only* calls (status queries), transient Globus failures
+        (network errors, Globus 5xx) map to a retryable 503; for anything
+        else they stay 502, since a retry could duplicate the effect.
+        '''
         self._check_active()
         try:
             return await asyncio.to_thread(fn, *args, **kwargs)
@@ -212,7 +268,12 @@ class GlobusSession(PluginSession):
         except Exception as exc:
             if globus_sdk is not None \
                     and isinstance(exc, globus_sdk.GlobusAPIError):
-                raise _globus_http_exc(exc, context) from exc
+                raise _globus_http_exc(exc, context, read_only) from exc
+            if read_only and globus_sdk is not None \
+                    and isinstance(exc, globus_sdk.NetworkError):
+                # connection error / timeout towards Globus: transient
+                raise HTTPException(status_code=503,
+                                    detail=f'Globus {context}: {exc}') from exc
             raise HTTPException(status_code=502,
                                 detail=f'Globus {context}: {exc}') from exc
 
@@ -263,15 +324,29 @@ class GlobusSession(PluginSession):
 
     async def get_task(self, task_id: str) -> dict:
         res = _as_dict(await self._call(
-            self._tc.get_task, task_id, context='get_task'))
-        if task_id in self._tasks and res.get('status'):
-            self._tasks[task_id]['status'] = res['status']
+            self._tc.get_task, task_id, context='get_task', read_only=True))
+        if task_id in self._tasks:
+            self._cache_result(self._tasks[task_id], res)
         return res
 
     async def task_wait(self, task_id: str, timeout: int = 60,
                         polling_interval: int = 10) -> dict:
+        '''Wait for the task to leave ``ACTIVE``, at most
+        ``GLOBUS_WAIT_SLICE`` seconds.
+
+        Returns ``{task_id, completed}`` with globus-sdk semantics:
+        ``completed`` is true for *any* non-ACTIVE status, including
+        ``INACTIVE`` (e.g. an expired credential) and statuses unknown to
+        this plugin.  ``GlobusClient.task_wait`` does not use this route and
+        completes only on ``GLOBUS_WAIT_DONE``.
+        '''
+        # Bound the blocking wait below the routed-call timeout (see
+        # GLOBUS_WAIT_SLICE); globus-sdk requires values >= 1.
+        timeout          = max(1, min(timeout, GLOBUS_WAIT_SLICE))
+        polling_interval = max(1, min(polling_interval, timeout))
         done = await self._call(self._tc.task_wait, task_id, context='task_wait',
-                                timeout=timeout, polling_interval=polling_interval)
+                                read_only=True, timeout=timeout,
+                                polling_interval=polling_interval)
         return {'task_id': task_id, 'completed': bool(done)}
 
     async def cancel_task(self, task_id: str) -> dict:
@@ -360,7 +435,7 @@ class GlobusSession(PluginSession):
         self.start_status_poller(
             interval=GLOBUS_POLL_INTERVAL,
             items=lambda: self._tasks,
-            is_terminal=lambda meta: meta.get('status') in GLOBUS_TERMINAL,
+            is_terminal=lambda meta: meta.get('notified') in GLOBUS_TERMINAL,
             fetch=self._fetch_task_status,
             to_payload=self._task_payload,
             topic='transfer_status',
@@ -368,13 +443,62 @@ class GlobusSession(PluginSession):
 
     async def _fetch_task_status(self, task_id: str,
                                  meta: Dict[str, Any]) -> Optional[dict]:
-        '''Poll one task; return the raw Globus result when its status changed.'''
-        res    = _as_dict(await asyncio.to_thread(self._tc.get_task, task_id))
+        '''Poll one task; return the raw Globus result when its status changed.
+
+        Compares against the last *notified* status, not ``meta['status']``:
+        ``get_task`` (e.g. a client's ``task_wait`` polls) writes the latter,
+        and must not swallow the change notification.  A terminal status
+        already cached by ``get_task`` is notified without fetching, so a
+        failing fetch (e.g. an expired token) cannot keep the task polled.
+        '''
+        if not self._terminal_pending(meta):
+            res    = _as_dict(await asyncio.to_thread(self._tc.get_task,
+                                                      task_id))
+            status = res.get('status')
+            if not status:
+                return None
+            # keep the cache current (e.g. INACTIVE back to ACTIVE)
+            self._cache_result(meta, res)
+            if meta['status'] == status:
+                if status == meta.get('notified', 'ACTIVE'):
+                    return None
+                meta['notified'] = status
+                if status in GLOBUS_TERMINAL:
+                    meta.pop('result', None)    # cached just above
+                return res
+            # else a concurrent get_task cached the end while we fetched
+            if not self._terminal_pending(meta):
+                return None
+
+        # notify a cached terminal status (from get_task) without a fetch
+        meta['notified'] = meta['status']
+        return meta.pop('result', None) \
+            or {'task_id': task_id, 'status': meta['status']}
+
+    @staticmethod
+    def _terminal_pending(meta: Dict[str, Any]) -> bool:
+        '''A terminal status is cached but not yet notified.'''
+        return meta.get('status') in GLOBUS_TERMINAL \
+            and meta.get('status') != meta.get('notified')
+
+    @staticmethod
+    def _cache_result(meta: Dict[str, Any], res: dict) -> None:
+        '''Cache a ``get_task`` result in the task meta for the poller.
+
+        Never downgrades a cached terminal status (a stale ACTIVE fetch
+        racing a ``get_task`` that saw the end).  The full result is kept
+        only for a terminal status not yet notified, for the notification.
+        '''
         status = res.get('status')
-        if status and status != meta.get('status'):
-            meta['status'] = status
-            return res
-        return None
+        if not status:
+            return
+        if meta.get('status') in GLOBUS_TERMINAL \
+                and status not in GLOBUS_TERMINAL:
+            return
+        meta['status'] = status
+        if status in GLOBUS_TERMINAL \
+                and meta.get('notified') not in GLOBUS_TERMINAL:
+            meta['result'] = res
 
     @staticmethod
     def _task_payload(task_id: str, meta: Dict[str, Any], res: dict) -> dict:
@@ -439,11 +563,74 @@ class GlobusClient(PluginClient):
 
     def task_wait(self, task_id: str, timeout: int = 60,
                  polling_interval: int = 10) -> dict:
+        '''Wait up to *timeout* seconds for the task to leave ``ACTIVE``.
+
+        Polls ``get_task`` on a fixed schedule, every *polling_interval*
+        (at least 1 s) from the start, so no routed call blocks near the
+        broker's call timeout and Globus sees one status call per interval;
+        a slow poll does not shift the schedule.  Polls at least once
+        (``timeout=0`` is a status probe) and once more at the deadline, but
+        never starts a poll past it.
+
+        A failed poll is retried within *timeout* when it is transient: HTTP
+        504, 503 or 429 (at the next scheduled poll, or after a longer
+        ``Retry-After``), or a transport-level loss (timeout, connection
+        error).  If no poll got through before the deadline, the last such
+        error is raised; other errors raise at once.
+
+        Returns ``{task_id, completed}``.  ``completed`` is true once the
+        task reports a status in ``GLOBUS_WAIT_DONE``: SUCCEEDED, FAILED,
+        CANCELED, or INACTIVE (e.g. an expired credential) — call
+        ``get_task`` for the status itself.  A missing or unknown status
+        does not count (unlike the endpoint's ``wait`` route, which follows
+        globus-sdk: any non-ACTIVE status).
+        '''
         self._require_session()
-        resp = self._http.post(self._url(f'wait/{self._sid}/{task_id}'), json={
-            'timeout': timeout, 'polling_interval': polling_interval})
-        self._raise(resp, f'task_wait {task_id!r}')
-        return resp.json()
+        interval = max(1, polling_interval)
+        start    = time.monotonic()
+        deadline = start + timeout
+        slot     = 0                    # index of the current scheduled poll
+        last     = False                # this poll is the one at the deadline
+        answered = False                # some poll in this wait succeeded
+        while True:
+            error = None                # the last poll's transient failure
+            retry = None                # server-requested pause, if any
+            try:
+                resp = self._http.get(self._url(f'task/{self._sid}/{task_id}'))
+            except _WAIT_RETRY_EXC as exc:
+                error = exc
+            else:
+                if resp.status_code in _WAIT_RETRY_STATUS:
+                    error = resp
+                    retry = _retry_after(resp)
+                else:
+                    self._raise(resp, f'task_wait {task_id!r}')
+                    answered = True
+                    if resp.json().get('status') in GLOBUS_WAIT_DONE:
+                        return {'task_id': task_id, 'completed': True}
+
+            now = time.monotonic()
+            if last or now >= deadline:
+                # a lost last poll is only an error if no poll got through
+                if error is not None and not answered:
+                    if isinstance(error, Exception):
+                        raise error
+                    self._raise(error, f'task_wait {task_id!r}')
+                return {'task_id': task_id, 'completed': False}
+
+            if error is not None:
+                log.debug('[globus] task_wait %s: poll failed (%s), retrying',
+                          task_id, getattr(error, 'status_code', error))
+            # next slot of the fixed schedule (a slot index, so an early
+            # wake-up cannot repeat a slot), or later if the server asked
+            # for a longer pause; the deadline gets a last poll
+            slot = max(slot + 1, int((now - start) // interval) + 1)
+            due  = start + slot * interval
+            if retry is not None:
+                due = max(due, now + retry)
+            if due >= deadline:
+                due, last = deadline, True
+            time.sleep(due - now)
 
     def cancel_task(self, task_id: str) -> dict:
         self._require_session()
