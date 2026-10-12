@@ -330,11 +330,14 @@ class RhapsodySession(PluginSession):
             raise
 
     async def _unwind_telemetry(self, rh_session) -> None:
-        """Workaround: rhapsody (<= 0.4) does not unwind a failed
-        ``start_telemetry()``.  Its session keeps the half-started manager,
-        whose ``stop()`` then raises in ``Session.close()`` before the
-        backends are shut down.  Stop it best effort and detach it; drop
-        this once rhapsody unwinds a failed start itself.
+        """Stop rhapsody's telemetry manager best effort and detach it.
+
+        Workaround: rhapsody (<= 0.4) ``Session.close()`` stops telemetry
+        before shutting the backends down, so a raising ``stop()`` leaks
+        the backends -- and a failed ``start_telemetry()`` leaves a
+        half-started manager whose ``stop()`` does raise.  Used after a
+        failed start and before every rhapsody close; drop this once
+        rhapsody isolates telemetry failures itself.
         """
         tm = getattr(rh_session, '_telemetry', None)
         if tm is not None:
@@ -879,6 +882,7 @@ class RhapsodySession(PluginSession):
                         log.warning("[%s] telemetry summary failed: %r",
                                     self._sid, e)
                 self._telemetry = None
+                await self._unwind_telemetry(self._rh_session)
                 await self._rh_session.close()
         finally:
             self._rh_session = None

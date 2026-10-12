@@ -1500,18 +1500,16 @@ async def test_initialize_telemetry_start_failure(monkeypatch, orbit_caplog):
     assert sess._init_ready.is_set()
 
 
-@pytest.mark.asyncio
-async def test_failed_telemetry_start_does_not_leak_backends(
-        monkeypatch, tmp_path):
-    '''With a real rhapsody Session, a telemetry start that fails half
-    way (checkpoint dir cannot be created) must not keep rhapsody's
-    close() from shutting the backends down.'''
+@pytest.fixture
+def real_rhapsody(monkeypatch, tmp_path):
+    '''The real rhapsody package (this module mocks it) with telemetry
+    forced on, cwd in *tmp_path*, and ``get_backend`` returning a fake
+    backend.  Yields ``(rhapsody module, backend)``.'''
     import importlib
     import sys
     from radical.orbit import plugin_rhapsody as prh
 
-    # this module swaps `rhapsody` for a mock; re-import the real package
-    # for this test (monkeypatch restores the mock afterwards)
+    # re-import the real package (monkeypatch restores the mock afterwards)
     monkeypatch.delitem(sys.modules, 'rhapsody', raising=False)
     try:
         real = importlib.import_module('rhapsody')
@@ -1521,10 +1519,7 @@ async def test_failed_telemetry_start_does_not_leak_backends(
         pytest.skip('needs rhapsody with Session.start_telemetry')
     pytest.importorskip('opentelemetry.sdk')
     monkeypatch.setattr(prh, 'rh', real)
-
-    # 'telemetry-output' exists as a file, so the checkpoint mkdir fails
     monkeypatch.chdir(tmp_path)
-    (tmp_path / 'telemetry-output').write_text('')
     monkeypatch.setattr(prh, '_resolve_telemetry', lambda: True)
     monkeypatch.setattr(prh, '_telemetry_available', lambda: True)
 
@@ -1540,6 +1535,38 @@ async def test_failed_telemetry_start_does_not_leak_backends(
 
     backend = _FakeBackend()
     monkeypatch.setattr(real, 'get_backend', lambda name: backend)
+    yield real, backend
+
+
+@pytest.mark.asyncio
+async def test_telemetry_stop_failure_does_not_leak_backends(
+        real_rhapsody, monkeypatch):
+    '''With a real rhapsody Session and running telemetry, a raising
+    telemetry stop() must not keep rhapsody's close() from shutting the
+    backends down.'''
+    from rhapsody.telemetry.manager import TelemetryManager
+    _, backend = real_rhapsody
+
+    sess = RhapsodySession('sess.telem_stop', backend_names=['fake'])
+    await _REAL_INITIALIZE(sess)
+    assert sess._telemetry is not None
+
+    monkeypatch.setattr(TelemetryManager, 'stop',
+                        AsyncMock(side_effect=RuntimeError("stop broke")))
+    await sess.close()
+
+    backend.shutdown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_failed_telemetry_start_does_not_leak_backends(
+        real_rhapsody, tmp_path):
+    '''With a real rhapsody Session, a telemetry start that fails half
+    way (checkpoint dir cannot be created) must not keep rhapsody's
+    close() from shutting the backends down.'''
+    _, backend = real_rhapsody
+    # 'telemetry-output' exists as a file, so the checkpoint mkdir fails
+    (tmp_path / 'telemetry-output').write_text('')
 
     sess = RhapsodySession('sess.telem_real', backend_names=['fake'])
     await _REAL_INITIALIZE(sess)
