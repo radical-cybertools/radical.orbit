@@ -72,7 +72,7 @@ RETURN_VALUE_LIMIT  = FRAME_CAP // BUDGET_RATIO
 # Size bound (UTF-8 bytes) for the stdout and for the stderr a terminal
 # notification carries.  Unlike a return value, output can be shortened
 # meaningfully: a longer stream keeps its tail behind a truncation marker,
-# and the full text stays available via ``get_task``.  Both streams together
+# and the full text stays available via this session's ``get_task``.  Both streams together
 # claim a quarter of the frame, so a payload at the return-value limit still
 # fits one frame.
 OUTPUT_RATIO        = 8
@@ -828,46 +828,51 @@ class RhapsodySession(PluginSession):
 
         Only essential fields are included to keep WebSocket/SSE
         payloads small.  ``stdout`` / ``stderr`` are kept to their last
-        ``_output_notify_limit`` bytes each (see ``_tail_output``); a cut
-        stream is flagged ``stdout_truncated`` / ``stderr_truncated`` and
-        the full task dict is available via ``GET /task/{sid}/{uid}``.
+        ``_output_notify_limit`` bytes each (see ``_fit_output``); a cut
+        stream is flagged ``stdout_truncated`` / ``stderr_truncated``.  On
+        a direct rhapsody session the full task dict is available via
+        ``GET /task/{sid}/{uid}``.
         """
         full    = self._sanitize_task(t)
         payload = {k: v for k, v in full.items()
                    if k in self._NOTIFICATION_KEYS}
         for key in ('stdout', 'stderr'):
             if isinstance(payload.get(key), str):
-                tail = self._tail_output(payload[key])
-                if tail is not None:
-                    payload[key]                = tail
+                payload[key], cut = self._fit_output(payload[key])
+                if cut:
                     payload[f'{key}_truncated'] = True
         return payload
 
-    def _tail_output(self, text: str) -> str | None:
-        """Return the last ``_output_notify_limit`` UTF-8 bytes of ``text``
-        behind a marker naming the dropped size, or ``None`` if ``text``
-        fits.
+    def _fit_output(self, text: str) -> tuple[str, bool]:
+        """Fit ``text`` into ``_output_notify_limit`` UTF-8 bytes.
 
-        The front is cut (the end of a log is where errors are), on a
-        character boundary.  Below 256 bytes of limit there is no room for
-        the marker and the bare tail is returned.
+        Returns ``(text, truncated)``.  The result is always valid UTF-8
+        (lone surrogates become ``?``), else msgpack refuses the frame.  A
+        longer stream keeps its tail (the end of a log is where errors are),
+        cut on a character boundary behind a marker naming the dropped
+        character count; below 256 bytes of limit there is no room for the
+        marker and the bare tail is returned.  Encoding is bounded by the
+        limit: the last ``limit`` characters always cover the kept bytes.
         """
         limit = self._output_notify_limit
-        if len(text) * 4 <= limit:                # fits whatever the chars
-            return None
-        raw = text.encode('utf-8', errors='replace')
-        if len(raw) <= limit:
-            return None
+        if text.isascii():
+            if len(text) <= limit:
+                return text, False
+        elif len(text) <= limit:
+            raw = text.encode('utf-8', errors='replace')
+            if len(raw) <= limit:
+                return raw.decode('utf-8'), False
 
+        raw   = text[-limit:].encode('utf-8', errors='replace')
         keep  = limit - 128 if limit >= 256 else limit  # 128: marker room
         start = len(raw) - keep
         while start < len(raw) and (raw[start] & 0xC0) == 0x80:
             start += 1                            # skip continuation bytes
         tail  = raw[start:].decode('utf-8')
         if limit < 256:
-            return tail
-        return (f"[... {start} bytes truncated, full output via get_task "
-                f"...]\n" + tail)
+            return tail, True
+        return (f"[... {len(text) - len(tail)} characters truncated ...]\n"
+                + tail), True
 
     async def list_tasks(self) -> dict:
         """Return all tasks in this session with current state."""

@@ -796,6 +796,20 @@ def test_notification_carries_output_to_sse_wait():
     assert client._completed["task.out001"]["stderr"] == "r0 err\nr1 err"
 
 
+def test_notification_output_is_valid_utf8():
+    """A lone surrogate (e.g. surrogateescape-decoded output) must not
+    reach the frame: msgpack refuses it and the whole batch is lost."""
+    import msgpack
+    session = RhapsodySession("test.out.sur")
+    session._rh_session = MagicMock()
+
+    payload = session._notification_payload(
+        _output_task("task.sur", "ok \udcff", "\udcfe" * 2000))
+    msgpack.packb(payload)
+    assert payload["stdout"] == "ok ?"
+    assert "stdout_truncated" not in payload
+
+
 def test_payload_size_counts_utf8_bytes():
     """Multi-byte output must count in bytes, else frame splitting packs a
     batch several times past the frame cap."""
@@ -818,9 +832,8 @@ def test_notification_output_keeps_tail_under_limit():
 
     assert payload["stdout"].startswith("[... ")
     assert payload["stdout"].endswith("THE END")
-    assert "get_task" in payload["stdout"]
     dropped = len(out) - (256 - 128)
-    assert f"{dropped} bytes truncated" in payload["stdout"]
+    assert f"{dropped} characters truncated" in payload["stdout"]
     for key in ("stdout", "stderr"):
         assert len(payload[key].encode("utf-8")) <= 256
         assert payload[f"{key}_truncated"] is True
@@ -828,7 +841,7 @@ def test_notification_output_keeps_tail_under_limit():
     # the cut lands on a character boundary and the count is exact
     err_tail = payload["stderr"].split("...]\n", 1)[1]
     assert set(err_tail) == {"\u00e4"}
-    assert (f"{2000 - len(err_tail.encode('utf-8'))} bytes truncated"
+    assert (f"{1000 - len(err_tail)} characters truncated"
             in payload["stderr"])
 
     # a stream that fits carries no flag
