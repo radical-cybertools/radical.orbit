@@ -55,7 +55,7 @@ import httpx
 
 from fastapi import FastAPI, HTTPException, Request
 
-from .plugin_base         import Plugin
+from .plugin_base         import Plugin, DEFAULT_SID
 from .plugin_session_base import PluginSession
 from .client              import PluginClient
 
@@ -452,11 +452,14 @@ class GlobusSession(PluginSession):
 
     # -- lifecycle ------------------------------------------------------------
 
-    def _close_clients(self) -> None:
+    def _close_clients(self, clients: Optional[tuple] = None) -> None:
         '''Release the SDK clients' HTTP connections (``close()`` exists on
-        globus-sdk 4.x clients only).  Best effort: a failing close is
-        logged and does not skip the other client.'''
-        for client in (self._tc, self._auth_client):
+        globus-sdk 4.x clients only) — this session's own, or ``clients``.
+        Best effort: a failing close is logged and does not skip the other
+        client.'''
+        if clients is None:
+            clients = (self._tc, self._auth_client)
+        for client in clients:
             close = getattr(client, 'close', None)
             if close is None:
                 continue
@@ -465,6 +468,19 @@ class GlobusSession(PluginSession):
             except Exception as exc:
                 log.debug('[globus] session %s: closing %s failed: %s',
                           self._sid, type(client).__name__, exc)
+
+    def adopt_credential(self, other: 'GlobusSession',
+                         keep_collection: bool) -> None:
+        '''Take over ``other``'s SDK clients (credential rotation on
+        re-register) and close this session's old ones.  Tracked tasks and
+        the status poller stay with this session.  ``other`` is left
+        without clients and must not be used afterwards.'''
+        old = (self._tc, self._auth_client)
+        self._tc,  self._auth_client  = other._tc, other._auth_client
+        other._tc, other._auth_client = None, None
+        if not keep_collection:
+            self._local_collection = other._local_collection
+        self._close_clients(old)
 
     async def close(self) -> Dict[str, Any]:
         # Stop the status poller (base close) before closing its client.
@@ -797,6 +813,13 @@ class PluginGlobus(Plugin):
         records the result through the base's ``_record_session`` /
         ``_normalize_session_policy`` so a globus session gets the same
         lifetime/owner bookkeeping every other plugin's sessions get.
+
+        Re-registering an existing ``sid`` passes the base's owner (403) and
+        policy (409) checks and then rotates the credential in place: the
+        session keeps its tracked tasks and poller, the old SDK clients are
+        closed, and ``local_collection`` changes only when the body gives
+        one.  The reserved ``default`` sid is rejected (400): a globus
+        session needs a caller-supplied credential.
         '''
         try:
             data = await request.json()
@@ -817,8 +840,19 @@ class PluginGlobus(Plugin):
         self._ensure_cleanup_task()
         owner              = self._request_owner(request)
         sid, lifetime, ttl = self._normalize_session_policy(data)
+        if sid == DEFAULT_SID:
+            raise HTTPException(
+                status_code=400,
+                detail=f"sid '{DEFAULT_SID}' is reserved; a globus session "
+                       "needs its own credential")
         if sid is None:
             sid = f'session.{uuid.uuid4().hex[:8]}'
+            while sid in self._sessions:
+                sid = f'session.{uuid.uuid4().hex[:8]}'
+        if sid in self._sessions:
+            # fail fast, before the credential is exercised
+            self._check_owner(sid, owner)
+            self._check_policy_conflict(sid, lifetime, ttl)
 
         kwargs = {'access_token'    : access_token,
                   'refresh_token'   : refresh_token,
@@ -841,6 +875,22 @@ class PluginGlobus(Plugin):
                     and isinstance(exc, globus_sdk.GlobusError):
                 raise _globus_http_exc(exc, 'register_session') from exc
             raise
+
+        # Re-check after the (possibly offloaded) build: the sid may have
+        # been created meanwhile by a concurrent register.
+        existing = self._sessions.get(sid)
+        if existing is not None:
+            try:
+                self._check_owner(sid, owner)
+                self._check_policy_conflict(sid, lifetime, ttl)
+            except HTTPException:
+                session._close_clients()
+                raise
+            existing.adopt_credential(
+                session, keep_collection=not data.get('local_collection'))
+            self._touch(sid)
+            log.info('[globus] Rotated credential of session %s', sid)
+            return {'sid': sid}
 
         self._record_session(sid, session, lifetime, ttl, owner)
         log.info('[globus] Registered session %s', sid)

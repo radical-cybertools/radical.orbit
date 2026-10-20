@@ -1024,6 +1024,114 @@ async def test_register_session_records_policy_and_owner(endpoint_app):
     assert plugin._session_last_access[sid] == record.last_access
 
 
+def _register_request(body, src=None):
+    request = MagicMock()
+    request.headers = {'x-orbit-src': src} if src else {}
+    async def _json():
+        return body
+    request.json = _json
+    return request
+
+
+@pytest.mark.asyncio
+async def test_register_session_rejects_default_sid(endpoint_app):
+    plugin = PluginGlobus(endpoint_app)
+    with patch('radical.orbit.plugin_globus.globus_sdk'):
+        with pytest.raises(HTTPException) as exc:
+            await plugin.register_session(
+                _register_request({'access_token': 'tok', 'sid': 'default'}))
+    assert exc.value.status_code == 400
+    assert 'default' not in plugin._sessions
+
+
+@pytest.mark.asyncio
+async def test_register_session_other_owner_cannot_replace(endpoint_app):
+    '''#134: re-registering another participant's sid is a 403 and leaves
+    the existing session (and its credential) untouched.'''
+    plugin = PluginGlobus(endpoint_app)
+    with patch('radical.orbit.plugin_globus.globus_sdk'):
+        await plugin.register_session(
+            _register_request({'access_token': 'tok', 'sid': 's1'}, 'ep1'))
+        session = plugin._sessions['s1']
+        tc      = session._tc
+        with pytest.raises(HTTPException) as exc:
+            await plugin.register_session(
+                _register_request({'access_token': 'evil', 'sid': 's1'},
+                                  'ep2'))
+    assert exc.value.status_code == 403
+    assert plugin._sessions['s1'] is session
+    assert session._tc is tc
+
+
+@pytest.mark.asyncio
+async def test_register_session_policy_conflict(endpoint_app):
+    plugin = PluginGlobus(endpoint_app)
+    with patch('radical.orbit.plugin_globus.globus_sdk'):
+        await plugin.register_session(
+            _register_request({'access_token': 'tok', 'sid': 's1',
+                               'lifetime': 'persistent'}, 'ep1'))
+        with pytest.raises(HTTPException) as exc:
+            await plugin.register_session(
+                _register_request({'access_token': 'tok2', 'sid': 's1'},
+                                  'ep1'))
+    assert exc.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_register_session_same_owner_rotates_credential(endpoint_app):
+    '''A same-owner re-register keeps the session object (tracked tasks,
+    poller) and swaps in the new clients, closing the old ones.'''
+    plugin = PluginGlobus(endpoint_app)
+    with patch('radical.orbit.plugin_globus.globus_sdk') as gs:
+        gs.TransferClient.side_effect = lambda **_: MagicMock()
+        await plugin.register_session(
+            _register_request({'access_token': 'tok', 'sid': 's1',
+                               'local_collection': 'coll-a'}, 'ep1'))
+        session = plugin._sessions['s1']
+        session._tasks['t1'] = {'notified': None}
+        old_tc  = session._tc
+        result  = await plugin.register_session(
+            _register_request({'access_token': 'tok2', 'sid': 's1'}, 'ep1'))
+
+    assert result == {'sid': 's1'}
+    assert plugin._sessions['s1'] is session
+    assert 't1' in session._tasks
+    assert session._tc is not old_tc
+    old_tc.close.assert_called_once()
+    assert session._local_collection == 'coll-a'
+    assert plugin._records['s1'].owner == 'ep1'
+
+
+@pytest.mark.asyncio
+async def test_register_session_concurrent_create_rechecks_owner(
+        endpoint_app, monkeypatch):
+    '''A sid created by another owner while this register's credential was
+    being built is not overwritten; the freshly built clients are closed.'''
+    plugin = PluginGlobus(endpoint_app)
+    built  = []
+    orig   = plugin._create_session
+
+    def _create(sid, **kwargs):
+        session = orig(sid, **kwargs)
+        built.append(session)
+        if len(built) == 1:
+            # a concurrent register by ep1 lands during the build
+            plugin._record_session(sid, _make_session(), 'ephemeral', None,
+                                   'ep1')
+        return session
+
+    monkeypatch.setattr(plugin, '_create_session', _create)
+    with patch('radical.orbit.plugin_globus.globus_sdk'):
+        with pytest.raises(HTTPException) as exc:
+            await plugin.register_session(
+                _register_request({'access_token': 'tok', 'sid': 's1'},
+                                  'ep2'))
+    assert exc.value.status_code == 403
+    assert plugin._sessions['s1'] is not built[0]
+    assert plugin._records['s1'].owner == 'ep1'
+    built[0]._tc.close.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # Route handler delegation
 # ---------------------------------------------------------------------------
