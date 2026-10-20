@@ -1161,6 +1161,7 @@ def test_client_reregister_sends_sid():
     client._http = MagicMock()
     client._url  = lambda path: path
     client._raise = lambda resp: None
+    client._http.post.return_value.status_code = 200
     client._http.post.return_value.json.return_value = {'sid': 's1'}
 
     client.register_session(access_token='tok')
@@ -1221,3 +1222,64 @@ async def test_submit_route(endpoint_app):
     with patch('radical.orbit.plugin_globus.globus_sdk'):
         result = await plugin.submit_transfer(request)
     assert result['task_id'] == 't9'
+
+
+def test_client_reregister_falls_back_on_409():
+    '''An owner-less session (gateway path) refuses rotation with 409; the
+    client then registers a new session, as before rotation existed.'''
+    client = GlobusClient.__new__(GlobusClient)
+    client._sid   = 's1'
+    client._http  = MagicMock()
+    client._url   = lambda path: path
+    client._raise = lambda resp: None
+    refused = MagicMock(status_code=409)
+    fresh   = MagicMock(status_code=200)
+    fresh.json.return_value = {'sid': 's2'}
+    client._http.post.side_effect = [refused, fresh]
+
+    client.register_session(access_token='tok2')
+    first, second = client._http.post.call_args_list
+    assert first.kwargs['json']['sid'] == 's1'
+    assert 'sid' not in second.kwargs['json']
+    assert client._sid == 's2'
+
+
+@pytest.mark.asyncio
+async def test_register_session_expired_sid_is_not_revived(endpoint_app):
+    '''A ttl-expired session the sweeper has not removed yet is dropped and
+    replaced by a fresh one, not rotated back to life.'''
+    plugin = PluginGlobus(endpoint_app)
+    with patch('radical.orbit.plugin_globus.globus_sdk'):
+        await plugin.register_session(
+            _register_request({'access_token': 'tok', 'sid': 's1',
+                               'lifetime': 'ttl', 'ttl': 60}, 'ep1'))
+        old = plugin._sessions['s1']
+        plugin._records['s1'].last_access -= 120
+        await plugin.register_session(
+            _register_request({'access_token': 'tok2', 'sid': 's1',
+                               'lifetime': 'ttl', 'ttl': 60}, 'ep1'))
+    assert plugin._sessions['s1'] is not old
+    assert not plugin._is_expired(plugin._records['s1'], time.time())
+
+
+@pytest.mark.asyncio
+async def test_register_session_non_string_sid(endpoint_app):
+    plugin = PluginGlobus(endpoint_app)
+    with pytest.raises(HTTPException) as exc:
+        await plugin.register_session(
+            _register_request({'access_token': 'tok', 'sid': ['x']}))
+    assert exc.value.status_code == 400
+
+
+def test_rotation_closes_long_idle_retired_clients():
+    session = _make_session()
+    first   = session._tc
+    for _ in range(2):
+        other = _make_session()
+        session.adopt_credential(other, keep_collection=True)
+    first.close.assert_not_called()           # recent: may still be in use
+    session._retired[0] = (session._retired[0][0] - 3600,
+                           session._retired[0][1])
+    session.adopt_credential(_make_session(), keep_collection=True)
+    first.close.assert_called_once()
+    assert len(session._retired) == 2
