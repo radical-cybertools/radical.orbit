@@ -72,9 +72,9 @@ RETURN_VALUE_LIMIT  = FRAME_CAP // BUDGET_RATIO
 # Size bound (UTF-8 bytes) for the stdout and for the stderr a terminal
 # notification carries.  Unlike a return value, output can be shortened
 # meaningfully: a longer stream keeps its tail behind a truncation marker,
-# and the full text stays available via this session's ``get_task``.  Both streams together
-# claim a quarter of the frame, so a payload at the return-value limit still
-# fits one frame.
+# and the full text stays available via this session's ``get_task``.  Both
+# streams together claim a quarter of the frame, so a payload at the
+# return-value limit still fits one frame.
 OUTPUT_RATIO        = 8
 OUTPUT_NOTIFY_LIMIT = FRAME_CAP // OUTPUT_RATIO
 
