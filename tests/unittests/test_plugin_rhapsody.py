@@ -1821,5 +1821,260 @@ def test_frame_budgets_fall_back_to_protocol_cap():
     assert plugin._notify_batch_bytes == prh.NOTIFY_BATCH_BYTES
 
 
+# ---------------------------------------------------------------------------
+# Data backends
+# ---------------------------------------------------------------------------
+
+class _FakeEndpoint:
+    def __init__(self, desc):
+        self._desc = desc
+
+    def serialize(self):
+        return self._desc
+
+
+class _FakeDataBackend:
+    def __init__(self, name, **kwargs):
+        self.name       = name
+        self.kwargs     = kwargs
+        self.state      = MagicMock()
+        self.state.name = 'CREATED'
+        self.endpoints  = []
+        self.shutdown   = AsyncMock()
+        self.gate       = None      # an asyncio.Event to hold start() open
+
+    async def start(self):
+        if self.gate is not None:
+            await self.gate.wait()
+        self.state.name = 'READY'
+        self.endpoints  = [_FakeEndpoint('node1:6379')]
+        return self
+
+
+def _data_session(plugin, client):
+    sid = _register(client, plugin)
+    session = plugin._sessions[sid]
+    session._rh_session = MagicMock()
+    session._rh_session.backends = {'concurrent': MagicMock()}
+    session._rh_session.add_backend = MagicMock(
+        side_effect=lambda b: session._rh_session.backends.__setitem__(b.name, b))
+    return sid, session
+
+
+def _fake_factory(created):
+    def _factory(kind, name=None, **kw):
+        created[name] = _FakeDataBackend(name, **kw)
+        return created[name]
+    return _factory
+
+
+def test_data_start_endpoints_shutdown():
+    _, plugin, client = _make_plugin()
+    sid, session = _data_session(plugin, client)
+    created = {}
+
+    with patch.object(_mock_rh, 'get_data_backend',
+                      side_effect=_fake_factory(created)):
+        resp = client.post(f"{plugin.namespace}/data_start/{sid}",
+                           json={"kind": "redis", "kwargs": {"port": 6379}})
+    assert resp.status_code == 200
+    assert resp.json() == {"name": "redis_data", "kind": "redis",
+                           "state": "READY", "endpoints": ["node1:6379"]}
+    assert created['redis_data'].kwargs == {"port": 6379}
+    assert session._rh_session.backends['redis_data'] is created['redis_data']
+
+    resp = client.get(f"{plugin.namespace}/data_endpoints/{sid}")
+    assert resp.status_code == 200
+    assert resp.json()['backends']['redis_data']['endpoints'] == \
+        ["node1:6379"]
+
+    resp = client.post(f"{plugin.namespace}/data_shutdown/{sid}/redis_data")
+    assert resp.status_code == 200
+    created['redis_data'].shutdown.assert_awaited_once()
+    assert 'redis_data' not in session._rh_session.backends
+    resp = client.get(f"{plugin.namespace}/data_endpoints/{sid}")
+    assert resp.json() == {"backends": {}}
+
+
+def test_data_start_name_collisions():
+    _, plugin, client = _make_plugin()
+    sid, _ = _data_session(plugin, client)
+    url = f"{plugin.namespace}/data_start/{sid}"
+
+    with patch.object(_mock_rh, 'get_data_backend',
+                      side_effect=_fake_factory({})):
+        assert client.post(url, json={"kind": "redis"}).status_code == 200
+        assert client.post(url, json={"kind": "redis"}).status_code == 409
+        assert client.post(url, json={"kind": "redis",
+                                      "name": "r2"}).status_code == 200
+        # an execution backend of the session is never shadowed
+        assert client.post(url, json={"kind": "redis",
+                                      "name": "concurrent"}).status_code == 409
+
+
+def test_data_start_bad_requests():
+    _, plugin, client = _make_plugin()
+    sid, session = _data_session(plugin, client)
+    url = f"{plugin.namespace}/data_start/{sid}"
+
+    with patch.object(_mock_rh, 'get_data_backend',
+                      side_effect=ValueError("Data backend 'x' not found")):
+        assert client.post(url, json={"kind": "x"}).status_code == 400
+    assert client.post(url, json={}).status_code == 400
+    assert client.post(url, json={"kind": "redis",
+                                  "kwargs": [1]}).status_code == 400
+    assert client.post(url, json={"kind": "redis",
+                                  "name": "a/b"}).status_code == 400
+    assert client.post(url, json={"kind": "redis",
+                                  "name": 5}).status_code == 400
+    assert session._data == {}
+
+
+def test_data_start_failure_releases_name():
+    _, plugin, client = _make_plugin()
+    sid, session = _data_session(plugin, client)
+    backend = _FakeDataBackend('redis_data')
+    backend.start = AsyncMock(side_effect=RuntimeError("no redis-server"))
+
+    with patch.object(_mock_rh, 'get_data_backend', return_value=backend):
+        resp = client.post(f"{plugin.namespace}/data_start/{sid}",
+                           json={"kind": "redis"})
+    assert resp.status_code == 500
+    assert session._data == {}
+    backend.shutdown.assert_awaited_once()
+    session._rh_session.add_backend.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_data_start_cancelled_cleans_up():
+    session = RhapsodySession('s1', backend_names=['concurrent'])
+    session._init_ready.set()
+    session._rh_session = MagicMock()
+    session._rh_session.backends = {}
+    backend = _FakeDataBackend('redis_data')
+    backend.gate = asyncio.Event()
+
+    with patch.object(_mock_rh, 'get_data_backend', return_value=backend):
+        task = asyncio.ensure_future(session.data_start('redis'))
+        await asyncio.sleep(0)
+        assert 'redis_data' in session._data
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert session._data == {}
+    backend.shutdown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_data_shutdown_during_start():
+    session = RhapsodySession('s1', backend_names=['concurrent'])
+    session._init_ready.set()
+    session._rh_session = MagicMock()
+    session._rh_session.backends = {}
+    backend = _FakeDataBackend('redis_data')
+    backend.gate = asyncio.Event()
+
+    with patch.object(_mock_rh, 'get_data_backend', return_value=backend):
+        task = asyncio.ensure_future(session.data_start('redis'))
+        await asyncio.sleep(0)
+        await session.data_shutdown('redis_data')
+        backend.gate.set()
+        with pytest.raises(HTTPException) as exc:
+            await task
+    assert exc.value.status_code == 409
+    session._rh_session.add_backend.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_close_stops_data_backend_still_starting():
+    session = RhapsodySession('s1', backend_names=['concurrent'])
+    session._init_ready.set()
+    session._rh_session = MagicMock()
+    session._rh_session.backends = {}
+    session._rh_session.close = AsyncMock()
+    backend = _FakeDataBackend('redis_data')
+    backend.gate = asyncio.Event()
+
+    with patch.object(_mock_rh, 'get_data_backend', return_value=backend):
+        task = asyncio.ensure_future(session.data_start('redis'))
+        await asyncio.sleep(0)
+        await session.close()
+        backend.shutdown.assert_awaited()
+        backend.gate.set()
+        with pytest.raises(HTTPException):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_close_detaches_before_closing_rhapsody_session():
+    session = RhapsodySession('s1', backend_names=['concurrent'])
+    session._init_ready.set()
+    rh_session = MagicMock()
+    rh_session.backends = {}
+    seen = {}
+
+    async def _close():
+        # an in-flight data route resuming now must see a detached session
+        seen['rh_session'] = session._rh_session
+        seen['data'] = dict(session._data)
+
+    rh_session.close = AsyncMock(side_effect=_close)
+    session._rh_session = rh_session
+    session._data = {'redis_data': (_FakeDataBackend('redis_data'), 'redis')}
+    await session.close()
+    assert seen == {'rh_session': None, 'data': {}}
+
+
+@pytest.mark.asyncio
+async def test_data_start_cleanup_failure_keeps_original_error():
+    session = RhapsodySession('s1', backend_names=['concurrent'])
+    session._init_ready.set()
+    session._rh_session = MagicMock()
+    session._rh_session.backends = {}
+    backend = _FakeDataBackend('redis_data')
+    backend.start = AsyncMock(side_effect=ValueError("bad port"))
+    backend.shutdown = AsyncMock(side_effect=RuntimeError("cleanup broke"))
+
+    with patch.object(_mock_rh, 'get_data_backend', return_value=backend):
+        with pytest.raises(ValueError, match="bad port"):
+            await session.data_start('redis')
+
+
+def test_data_shutdown_unknown():
+    _, plugin, client = _make_plugin()
+    sid, _ = _data_session(plugin, client)
+    resp = client.post(f"{plugin.namespace}/data_shutdown/{sid}/nope")
+    assert resp.status_code == 404
+
+
+def test_data_start_old_rhapsody():
+    _, plugin, client = _make_plugin()
+    sid, _ = _data_session(plugin, client)
+    with patch('radical.orbit.plugin_rhapsody.rh', spec=['Session']):
+        resp = client.post(f"{plugin.namespace}/data_start/{sid}",
+                           json={"kind": "redis"})
+    assert resp.status_code == 501
+
+
+def test_client_data_helpers():
+    rc = RhapsodyClient.__new__(RhapsodyClient)
+    rc._sid = 'sid.1'
+    rc._require_session = MagicMock()
+    rc._raise = MagicMock()
+    rc._url = lambda path: f"/rhapsody/{path}"
+    rc._http = MagicMock()
+    rc._http.post.return_value.json.return_value = {"ok": 1}
+    rc._http.get.return_value.json.return_value = {"backends": {}}
+
+    assert rc.data_start('redis', name='r', port=1) == {"ok": 1}
+    rc._http.post.assert_called_with(
+        '/rhapsody/data_start/sid.1',
+        json={"kind": "redis", "name": "r", "kwargs": {"port": 1}})
+    assert rc.data_endpoints() == {"backends": {}}
+    rc._http.get.assert_called_with('/rhapsody/data_endpoints/sid.1')
+    rc.data_shutdown('r')
+    rc._http.post.assert_called_with('/rhapsody/data_shutdown/sid.1/r')
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
