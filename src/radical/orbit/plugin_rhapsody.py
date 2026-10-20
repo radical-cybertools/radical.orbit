@@ -143,6 +143,8 @@ def _json_safe(v):
     or WS frame is dropped.  Falls back through ``to_dict`` / recursion
     / ``str``.
     """
+    if isinstance(v, str):
+        return v                    # always encodable; skip a full dumps
     try:
         json.dumps(v)
         return v
@@ -163,12 +165,17 @@ def _payload_size(payload: dict) -> int:
     A notification payload is flat (see ``_NOTIFICATION_KEYS``), so summing
     key and value lengths bounds the frame accurately enough — and, unlike
     ``len(str(payload))``, it does not copy a multi-MiB encoded return value
-    just to measure it.  Non-string values are small scalars; 16 bytes each
-    covers them with room to spare.
+    just to measure it.  Strings count in UTF-8 bytes (an ASCII string, e.g.
+    an encoded return value, without encoding it); non-string values are
+    small scalars; 16 bytes each covers them with room to spare.
     """
     size = 2
     for k, v in payload.items():
-        size += len(str(k)) + (len(v) if isinstance(v, str) else 16)
+        if isinstance(v, str):
+            size += len(str(k)) + (len(v) if v.isascii()
+                                   else len(v.encode('utf-8', 'replace')))
+        else:
+            size += len(str(k)) + 16
     return size
 
 
@@ -590,7 +597,9 @@ class RhapsodySession(PluginSession):
         """Split notifications into frames under ``_notify_batch_bytes``.
 
         A single payload larger than the budget still ships alone — it is
-        bounded by ``_return_value_limit``, which leaves frame-cap headroom.
+        bounded by ``_return_value_limit`` (half the frame) plus
+        ``_output_notify_limit`` per output stream (an eighth each), which
+        leaves a quarter of the frame for the remaining fields.
         """
         frames: list[list[dict]] = []
         frame:  list[dict]       = []
@@ -819,31 +828,46 @@ class RhapsodySession(PluginSession):
 
         Only essential fields are included to keep WebSocket/SSE
         payloads small.  ``stdout`` / ``stderr`` are kept to their last
-        ``_output_notify_limit`` bytes each (see ``_tail_output``); the
-        full task dict is available via ``GET /task/{sid}/{uid}``.
+        ``_output_notify_limit`` bytes each (see ``_tail_output``); a cut
+        stream is flagged ``stdout_truncated`` / ``stderr_truncated`` and
+        the full task dict is available via ``GET /task/{sid}/{uid}``.
         """
         full    = self._sanitize_task(t)
         payload = {k: v for k, v in full.items()
                    if k in self._NOTIFICATION_KEYS}
         for key in ('stdout', 'stderr'):
             if isinstance(payload.get(key), str):
-                payload[key] = self._tail_output(payload[key])
+                tail = self._tail_output(payload[key])
+                if tail is not None:
+                    payload[key]                = tail
+                    payload[f'{key}_truncated'] = True
         return payload
 
-    def _tail_output(self, text: str) -> str:
-        """Keep the last ``_output_notify_limit`` UTF-8 bytes of ``text``.
+    def _tail_output(self, text: str) -> str | None:
+        """Return the last ``_output_notify_limit`` UTF-8 bytes of ``text``
+        behind a marker naming the dropped size, or ``None`` if ``text``
+        fits.
 
-        A longer stream is cut at the front (the end of a log is where
-        errors are) behind a marker naming the dropped size.
+        The front is cut (the end of a log is where errors are), on a
+        character boundary.  Below 256 bytes of limit there is no room for
+        the marker and the bare tail is returned.
         """
-        raw   = text.encode('utf-8', errors='replace')
         limit = self._output_notify_limit
+        if len(text) * 4 <= limit:                # fits whatever the chars
+            return None
+        raw = text.encode('utf-8', errors='replace')
         if len(raw) <= limit:
-            return text
-        keep   = max(limit - 128, 0)          # 128 bytes room for the marker
-        marker = (f"[... {len(raw) - keep} bytes truncated, full output "
-                  f"via get_task ...]\n")
-        return marker + raw[len(raw) - keep:].decode('utf-8', errors='ignore')
+            return None
+
+        keep  = limit - 128 if limit >= 256 else limit  # 128: marker room
+        start = len(raw) - keep
+        while start < len(raw) and (raw[start] & 0xC0) == 0x80:
+            start += 1                            # skip continuation bytes
+        tail  = raw[start:].decode('utf-8')
+        if limit < 256:
+            return tail
+        return (f"[... {start} bytes truncated, full output via get_task "
+                f"...]\n" + tail)
 
     async def list_tasks(self) -> dict:
         """Return all tasks in this session with current state."""
@@ -1487,9 +1511,9 @@ class PluginRhapsody(Plugin):
         # hosting runtime's *effective* frame cap rather than the protocol
         # default, so a runtime tuned below FRAME_CAP shrinks both budgets
         # instead of letting the transport drop the frames they permit.
-        self._frame_cap          = _resolve_frame_cap(app)
-        self._notify_batch_bytes = self._frame_cap // BUDGET_RATIO
-        self._return_value_limit = self._frame_cap // BUDGET_RATIO
+        self._frame_cap           = _resolve_frame_cap(app)
+        self._notify_batch_bytes  = self._frame_cap // BUDGET_RATIO
+        self._return_value_limit  = self._frame_cap // BUDGET_RATIO
         self._output_notify_limit = self._frame_cap // OUTPUT_RATIO
 
         self.add_route_post(ROUTE_SUBMIT,     self.submit_tasks)
@@ -1598,9 +1622,9 @@ class PluginRhapsody(Plugin):
         svc = getattr(self._app.state, 'endpoint_service', None)
         session._prof = getattr(svc, '_prof', None) or \
                         rprof.Profiler('rhapsody', ns='radical.orbit')
-        session._notify_window      = self._notify_window
-        session._notify_batch_bytes = self._notify_batch_bytes
-        session._return_value_limit = self._return_value_limit
+        session._notify_window       = self._notify_window
+        session._notify_batch_bytes  = self._notify_batch_bytes
+        session._return_value_limit  = self._return_value_limit
         session._output_notify_limit = self._output_notify_limit
         return session
 

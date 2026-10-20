@@ -796,6 +796,14 @@ def test_notification_carries_output_to_sse_wait():
     assert client._completed["task.out001"]["stderr"] == "r0 err\nr1 err"
 
 
+def test_payload_size_counts_utf8_bytes():
+    """Multi-byte output must count in bytes, else frame splitting packs a
+    batch several times past the frame cap."""
+    from radical.orbit.plugin_rhapsody import _payload_size
+    assert _payload_size({"stdout": "\u4e2d" * 100}) \
+        >= _payload_size({"stdout": "x" * 300})
+
+
 def test_notification_output_keeps_tail_under_limit():
     """A stream over the limit keeps its tail behind a marker that names
     the dropped size; the result stays within the limit in UTF-8 bytes."""
@@ -815,6 +823,24 @@ def test_notification_output_keeps_tail_under_limit():
     assert f"{dropped} bytes truncated" in payload["stdout"]
     for key in ("stdout", "stderr"):
         assert len(payload[key].encode("utf-8")) <= 256
+        assert payload[f"{key}_truncated"] is True
+
+    # the cut lands on a character boundary and the count is exact
+    err_tail = payload["stderr"].split("...]\n", 1)[1]
+    assert set(err_tail) == {"\u00e4"}
+    assert (f"{2000 - len(err_tail.encode('utf-8'))} bytes truncated"
+            in payload["stderr"])
+
+    # a stream that fits carries no flag
+    small = session._notification_payload(_output_task("t.s", "ok", ""))
+    assert small["stdout"] == "ok"
+    assert "stdout_truncated" not in small
+
+    # a limit too small for the marker yields the bare tail
+    session._output_notify_limit = 16
+    tiny = session._notification_payload(_output_task("t.t", out, ""))
+    assert tiny["stdout"] == out[-16:]
+    assert tiny["stdout_truncated"] is True
 
     # get_task's view stays complete
     assert session._sanitize_task(

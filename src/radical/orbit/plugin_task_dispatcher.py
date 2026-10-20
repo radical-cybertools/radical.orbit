@@ -106,7 +106,8 @@ ROUTE_SUBMIT_RH = 'submit_rh/{sid}'
 # Keys a rhapsody child notification carries that are worth forwarding to
 # the dispatcher's own subscribers (mirrors plugin_rhapsody's
 # ``_NOTIFICATION_KEYS``): the uid/state pair plus result and error data.
-_RH_FORWARD_KEYS = {'uid', 'state', 'exit_code',
+_RH_FORWARD_KEYS = {'uid', 'state', 'exit_code', 'stdout', 'stderr',
+                    'stdout_truncated', 'stderr_truncated',
                     'return_value', '_return_value_encoding',
                     'error', 'exception', 'traceback'}
 
