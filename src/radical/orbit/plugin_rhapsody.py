@@ -69,6 +69,15 @@ NOTIFY_BATCH_BYTES  = FRAME_CAP // BUDGET_RATIO
 # object.
 RETURN_VALUE_LIMIT  = FRAME_CAP // BUDGET_RATIO
 
+# Size bound (UTF-8 bytes) for the stdout and for the stderr a terminal
+# notification carries.  Unlike a return value, output can be shortened
+# meaningfully: a longer stream keeps its tail behind a truncation marker,
+# and the full text stays available via ``get_task``.  Both streams together
+# claim a quarter of the frame, so a payload at the return-value limit still
+# fits one frame.
+OUTPUT_RATIO        = 8
+OUTPUT_NOTIFY_LIMIT = FRAME_CAP // OUTPUT_RATIO
+
 # Endpoint-level override for the coalescing window above (seconds).  The
 # default trades ~250 ms of completion latency for fewer WS frames; a
 # latency-sensitive endpoint (co-located service, sequential task round
@@ -263,6 +272,7 @@ class RhapsodySession(PluginSession):
         self._notify_window          = NOTIFY_BATCH_WINDOW
         self._notify_batch_bytes     = NOTIFY_BATCH_BYTES
         self._return_value_limit     = RETURN_VALUE_LIMIT
+        self._output_notify_limit    = OUTPUT_NOTIFY_LIMIT
 
         # Cache for deserialized cloudpickle payloads — avoids decoding the
         # same encoded string N times when a batch repeats identical blobs.
@@ -800,7 +810,7 @@ class RhapsodySession(PluginSession):
         if not d.get('error'):
             d['error'] = msg
 
-    _NOTIFICATION_KEYS = {'uid', 'state', 'exit_code',
+    _NOTIFICATION_KEYS = {'uid', 'state', 'exit_code', 'stdout', 'stderr',
                           'return_value', '_return_value_encoding',
                           'error', 'exception', 'traceback'}
 
@@ -808,12 +818,32 @@ class RhapsodySession(PluginSession):
         """Build a minimal notification dict for a completed task.
 
         Only essential fields are included to keep WebSocket/SSE
-        payloads small.  Clients needing the full task dict (e.g.
-        stdout/stderr) can fetch it via ``GET /task/{sid}/{uid}``.
+        payloads small.  ``stdout`` / ``stderr`` are kept to their last
+        ``_output_notify_limit`` bytes each (see ``_tail_output``); the
+        full task dict is available via ``GET /task/{sid}/{uid}``.
         """
-        full = self._sanitize_task(t)
-        return {k: v for k, v in full.items()
-                if k in self._NOTIFICATION_KEYS}
+        full    = self._sanitize_task(t)
+        payload = {k: v for k, v in full.items()
+                   if k in self._NOTIFICATION_KEYS}
+        for key in ('stdout', 'stderr'):
+            if isinstance(payload.get(key), str):
+                payload[key] = self._tail_output(payload[key])
+        return payload
+
+    def _tail_output(self, text: str) -> str:
+        """Keep the last ``_output_notify_limit`` UTF-8 bytes of ``text``.
+
+        A longer stream is cut at the front (the end of a log is where
+        errors are) behind a marker naming the dropped size.
+        """
+        raw   = text.encode('utf-8', errors='replace')
+        limit = self._output_notify_limit
+        if len(raw) <= limit:
+            return text
+        keep   = max(limit - 128, 0)          # 128 bytes room for the marker
+        marker = (f"[... {len(raw) - keep} bytes truncated, full output "
+                  f"via get_task ...]\n")
+        return marker + raw[len(raw) - keep:].decode('utf-8', errors='ignore')
 
     async def list_tasks(self) -> dict:
         """Return all tasks in this session with current state."""
@@ -1460,6 +1490,7 @@ class PluginRhapsody(Plugin):
         self._frame_cap          = _resolve_frame_cap(app)
         self._notify_batch_bytes = self._frame_cap // BUDGET_RATIO
         self._return_value_limit = self._frame_cap // BUDGET_RATIO
+        self._output_notify_limit = self._frame_cap // OUTPUT_RATIO
 
         self.add_route_post(ROUTE_SUBMIT,     self.submit_tasks)
         self.add_route_post(ROUTE_WAIT,       self.wait_tasks)
@@ -1570,6 +1601,7 @@ class PluginRhapsody(Plugin):
         session._notify_window      = self._notify_window
         session._notify_batch_bytes = self._notify_batch_bytes
         session._return_value_limit = self._return_value_limit
+        session._output_notify_limit = self._output_notify_limit
         return session
 
     @staticmethod

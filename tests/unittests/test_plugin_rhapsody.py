@@ -770,6 +770,57 @@ async def test_json_safe_return_value_oversized_reports_error(caplog):
     assert "too large" in caplog.text
 
 
+def _output_task(uid, stdout, stderr):
+    task = MagicMock()
+    task.uid = uid
+    task.state = "DONE"
+    task.to_dict = lambda: {"uid": uid, "state": "DONE", "exit_code": 0,
+                            "stdout": stdout, "stderr": stderr}
+    return task
+
+
+def test_notification_carries_output_to_sse_wait():
+    """stdout/stderr reach the terminal notification, so the client's SSE
+    wait path returns them like the poll path and ``get_task`` do."""
+    session = RhapsodySession("test.out")
+    session._rh_session = MagicMock()
+
+    payload = session._notification_payload(
+        _output_task("task.out001", b"hello\n", ["r0 err", "r1 err"]))
+    assert payload["stdout"] == "hello\n"
+    assert payload["stderr"] == "r0 err\nr1 err"
+
+    client = _make_rhapsody_client()
+    client._on_task_done(None, None, "task_status", payload)
+    assert client._completed["task.out001"]["stdout"] == "hello\n"
+    assert client._completed["task.out001"]["stderr"] == "r0 err\nr1 err"
+
+
+def test_notification_output_keeps_tail_under_limit():
+    """A stream over the limit keeps its tail behind a marker that names
+    the dropped size; the result stays within the limit in UTF-8 bytes."""
+    session = RhapsodySession("test.out.big")
+    session._rh_session = MagicMock()
+    session._output_notify_limit = 256
+
+    out = "x" * 1000 + "THE END"
+    err = "\u00e4" * 1000                     # 2 bytes each: cut mid-char
+    payload = session._notification_payload(
+        _output_task("task.out002", out, err))
+
+    assert payload["stdout"].startswith("[... ")
+    assert payload["stdout"].endswith("THE END")
+    assert "get_task" in payload["stdout"]
+    dropped = len(out) - (256 - 128)
+    assert f"{dropped} bytes truncated" in payload["stdout"]
+    for key in ("stdout", "stderr"):
+        assert len(payload[key].encode("utf-8")) <= 256
+
+    # get_task's view stays complete
+    assert session._sanitize_task(
+        _output_task("task.out002", out, err))["stdout"] == out
+
+
 @pytest.mark.asyncio
 async def test_literal_cloudpickle_string_return_untouched():
     """A result that *is* the string 'cloudpickle::x' is JSON-safe: it gets
@@ -1798,11 +1849,13 @@ def test_frame_budgets_follow_host_runtime_cap():
     assert plugin._frame_cap          == 64 * 1024
     assert plugin._return_value_limit == 32 * 1024
     assert plugin._notify_batch_bytes == 32 * 1024
+    assert plugin._output_notify_limit == 8 * 1024
 
     # every session it creates inherits them
     session = plugin._create_session('sid.cap')
     assert session._return_value_limit == 32 * 1024
     assert session._notify_batch_bytes == 32 * 1024
+    assert session._output_notify_limit == 8 * 1024
 
     # a directly built session keeps the module defaults
     assert RhapsodySession('sid.plain')._return_value_limit \
@@ -1819,6 +1872,7 @@ def test_frame_budgets_fall_back_to_protocol_cap():
     assert plugin._frame_cap          == prh.FRAME_CAP
     assert plugin._return_value_limit == prh.RETURN_VALUE_LIMIT
     assert plugin._notify_batch_bytes == prh.NOTIFY_BATCH_BYTES
+    assert plugin._output_notify_limit == prh.OUTPUT_NOTIFY_LIMIT
 
 
 if __name__ == '__main__':
