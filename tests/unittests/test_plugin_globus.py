@@ -1235,6 +1235,7 @@ def test_client_reregister_falls_back_on_409():
     refused = MagicMock(status_code=409)
     fresh   = MagicMock(status_code=200)
     fresh.json.return_value = {'sid': 's2'}
+    refused.text = 'no owner'
     client._http.post.side_effect = [refused, fresh]
 
     client.register_session(access_token='tok2')
@@ -1271,15 +1272,48 @@ async def test_register_session_non_string_sid(endpoint_app):
     assert exc.value.status_code == 400
 
 
-def test_rotation_closes_long_idle_retired_clients():
+@pytest.mark.asyncio
+async def test_rotation_releases_retired_clients_after_grace(monkeypatch):
+    '''Retired clients stay open while an offloaded call may still use them,
+    then are closed on a timer — not kept until session close.'''
+    monkeypatch.setattr(pg, 'GLOBUS_HTTP_TIMEOUT', 0.002)
     session = _make_session()
     first   = session._tc
-    for _ in range(2):
-        other = _make_session()
-        session.adopt_credential(other, keep_collection=True)
-    first.close.assert_not_called()           # recent: may still be in use
-    session._retired[0] = (session._retired[0][0] - 3600,
-                           session._retired[0][1])
     session.adopt_credential(_make_session(), keep_collection=True)
+    first.close.assert_not_called()
+    await asyncio.sleep(0.1)
     first.close.assert_called_once()
-    assert len(session._retired) == 2
+    assert session._retired == []
+
+
+@pytest.mark.asyncio
+async def test_register_session_empty_sid(endpoint_app):
+    plugin = PluginGlobus(endpoint_app)
+    with pytest.raises(HTTPException) as exc:
+        await plugin.register_session(
+            _register_request({'access_token': 'tok', 'sid': ''}))
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_register_session_cancelled_recheck_closes_clients(
+        endpoint_app, monkeypatch):
+    plugin = PluginGlobus(endpoint_app)
+    built  = []
+    orig   = plugin._create_session
+
+    def _create(sid, **kwargs):
+        built.append(orig(sid, **kwargs))
+        return built[-1]
+
+    async def _cancelled(sid):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(plugin, '_create_session', _create)
+    monkeypatch.setattr(plugin, '_live_session',   _cancelled)
+    with patch('radical.orbit.plugin_globus.globus_sdk'):
+        with pytest.raises(asyncio.CancelledError):
+            await plugin.register_session(
+                _register_request({'access_token': 'tok'}))
+    built[0]._tc.close.assert_called_once()
+    assert not plugin._sessions
