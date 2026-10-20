@@ -236,6 +236,7 @@ class GlobusSession(PluginSession):
         self._local_collection = local_collection or None
         self._tc          = None
         self._auth_client = None
+        self._retired     = []      # rotated-out clients, closed at close()
 
         if not access_token and not (refresh_token and client_id):
             raise ValueError(
@@ -472,20 +473,23 @@ class GlobusSession(PluginSession):
     def adopt_credential(self, other: 'GlobusSession',
                          keep_collection: bool) -> None:
         '''Take over ``other``'s SDK clients (credential rotation on
-        re-register) and close this session's old ones.  Tracked tasks and
-        the status poller stay with this session.  ``other`` is left
-        without clients and must not be used afterwards.'''
-        old = (self._tc, self._auth_client)
+        re-register).  Tracked tasks and the status poller stay with this
+        session.  The old clients are retired, not closed: offloaded calls
+        may still be running on them; ``close()`` releases them.  ``other``
+        is left without clients and must not be used afterwards.'''
+        self._retired.append((self._tc, self._auth_client))
         self._tc,  self._auth_client  = other._tc, other._auth_client
         other._tc, other._auth_client = None, None
         if not keep_collection:
             self._local_collection = other._local_collection
-        self._close_clients(old)
 
     async def close(self) -> Dict[str, Any]:
         # Stop the status poller (base close) before closing its client.
         result = await super().close()
         self._close_clients()
+        for clients in self._retired:
+            self._close_clients(clients)
+        self._retired = []
         return result
 
     # -- background polling -------------------------------------------------
@@ -589,8 +593,11 @@ class GlobusClient(PluginClient):
 
         Supply either ``access_token`` or ``refresh_token`` + ``client_id``.
         ``local_collection`` overrides the endpoint's configured default.
+        Calling it again on a registered client rotates the credential of
+        the same session (its tracked tasks are kept).
         '''
         payload: Dict[str, Any] = {}
+        if self._sid:        payload['sid']              = self._sid
         if access_token:     payload['access_token']     = access_token
         if refresh_token:    payload['refresh_token']    = refresh_token
         if client_id:        payload['client_id']        = client_id
@@ -814,17 +821,25 @@ class PluginGlobus(Plugin):
         ``_normalize_session_policy`` so a globus session gets the same
         lifetime/owner bookkeeping every other plugin's sessions get.
 
-        Re-registering an existing ``sid`` passes the base's owner (403) and
-        policy (409) checks and then rotates the credential in place: the
+        Re-registering an existing ``sid`` passes ``_check_rotation`` (owned
+        sessions only, by their owner, same policy) and then rotates the
+        credential in place: the
         session keeps its tracked tasks and poller, the old SDK clients are
-        closed, and ``local_collection`` changes only when the body gives
-        one.  The reserved ``default`` sid is rejected (400): a globus
+        retired until the session closes, and ``local_collection`` changes
+        only when the body gives one.  The reserved ``default`` sid is rejected (400): a globus
         session needs a caller-supplied credential.
         '''
         try:
             data = await request.json()
         except Exception:
             data = {}
+        if not isinstance(data, dict):
+            data = {}
+        if data.get('sid') == DEFAULT_SID:
+            raise HTTPException(
+                status_code=400,
+                detail=f"sid '{DEFAULT_SID}' is reserved; a globus session "
+                       "needs its own credential")
 
         access_token  = data.get('access_token')
         refresh_token = data.get('refresh_token')
@@ -840,19 +855,13 @@ class PluginGlobus(Plugin):
         self._ensure_cleanup_task()
         owner              = self._request_owner(request)
         sid, lifetime, ttl = self._normalize_session_policy(data)
-        if sid == DEFAULT_SID:
-            raise HTTPException(
-                status_code=400,
-                detail=f"sid '{DEFAULT_SID}' is reserved; a globus session "
-                       "needs its own credential")
         if sid is None:
             sid = f'session.{uuid.uuid4().hex[:8]}'
             while sid in self._sessions:
                 sid = f'session.{uuid.uuid4().hex[:8]}'
-        if sid in self._sessions:
+        elif sid in self._sessions:
             # fail fast, before the credential is exercised
-            self._check_owner(sid, owner)
-            self._check_policy_conflict(sid, lifetime, ttl)
+            self._check_rotation(sid, owner, lifetime, ttl)
 
         kwargs = {'access_token'    : access_token,
                   'refresh_token'   : refresh_token,
@@ -881,8 +890,7 @@ class PluginGlobus(Plugin):
         existing = self._sessions.get(sid)
         if existing is not None:
             try:
-                self._check_owner(sid, owner)
-                self._check_policy_conflict(sid, lifetime, ttl)
+                self._check_rotation(sid, owner, lifetime, ttl)
             except HTTPException:
                 session._close_clients()
                 raise
@@ -895,6 +903,33 @@ class PluginGlobus(Plugin):
         self._record_session(sid, session, lifetime, ttl, owner)
         log.info('[globus] Registered session %s', sid)
         return {'sid': sid}
+
+    def _check_rotation(self, sid: str, owner: Optional[str],
+                        lifetime: str, ttl: Optional[float]) -> None:
+        '''Gate a re-register of an existing ``sid`` (credential rotation).
+
+        Stricter than the base reattach: the base lets anyone reattach an
+        owner-less session, which is harmless for a reattach but would let
+        any caller swap the credential others act under.  An owner-less
+        session therefore cannot rotate (409, register a new session); an
+        owned one only by its owner (403), under the same policy (409).
+        '''
+        record = self._records.get(sid)
+        if record is None or record.owner is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"session {sid} has no owner; its credential cannot "
+                       "be replaced — register a new session")
+        self._check_owner(sid, owner)
+        self._check_policy_conflict(sid, lifetime, ttl)
+
+    async def _ensure_default_session(self):
+        '''A globus session needs a caller credential: there is no shared
+        ``default`` session to create on demand.'''
+        raise HTTPException(
+            status_code=404,
+            detail=f"globus has no '{DEFAULT_SID}' session; register one "
+                   "with a credential")
 
     # -- route handlers -----------------------------------------------------
 

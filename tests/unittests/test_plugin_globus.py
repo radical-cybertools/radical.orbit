@@ -1097,9 +1097,76 @@ async def test_register_session_same_owner_rotates_credential(endpoint_app):
     assert plugin._sessions['s1'] is session
     assert 't1' in session._tasks
     assert session._tc is not old_tc
-    old_tc.close.assert_called_once()
     assert session._local_collection == 'coll-a'
     assert plugin._records['s1'].owner == 'ep1'
+
+    # the old client may still serve an offloaded call: retired, not closed
+    old_tc.close.assert_not_called()
+    await session.close()
+    old_tc.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_register_session_ownerless_cannot_rotate(endpoint_app):
+    '''An owner-less (gateway) session accepts any reattach in the base, so
+    its credential must not be replaceable at all.'''
+    plugin = PluginGlobus(endpoint_app)
+    with patch('radical.orbit.plugin_globus.globus_sdk'):
+        await plugin.register_session(
+            _register_request({'access_token': 'tok', 'sid': 's1'}))
+        session = plugin._sessions['s1']
+        tc      = session._tc
+        with pytest.raises(HTTPException) as exc:
+            await plugin.register_session(
+                _register_request({'access_token': 'evil', 'sid': 's1'},
+                                  'ep2'))
+    assert exc.value.status_code == 409
+    assert session._tc is tc
+
+
+@pytest.mark.asyncio
+async def test_register_session_default_sid_400_before_policy(endpoint_app):
+    '''`default` with a non-persistent lifetime is the documented 400, not
+    the policy normalizer's 409.'''
+    plugin = PluginGlobus(endpoint_app)
+    with pytest.raises(HTTPException) as exc:
+        await plugin.register_session(
+            _register_request({'access_token': 'tok', 'sid': 'default',
+                               'lifetime': 'ephemeral'}))
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_register_session_non_dict_body(endpoint_app):
+    plugin = PluginGlobus(endpoint_app)
+    with pytest.raises(HTTPException) as exc:
+        await plugin.register_session(_register_request(['tok']))
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_routed_call_on_default_sid_is_404(endpoint_app):
+    plugin = PluginGlobus(endpoint_app)
+    with pytest.raises(HTTPException) as exc:
+        await plugin._forward('default', GlobusSession.list_tasks)
+    assert exc.value.status_code == 404
+    assert 'default' not in plugin._sessions
+
+
+def test_client_reregister_sends_sid():
+    '''A second register_session on a client re-sends its sid, so the
+    server rotates the credential instead of minting a new session.'''
+    client = GlobusClient.__new__(GlobusClient)
+    client._sid  = None
+    client._http = MagicMock()
+    client._url  = lambda path: path
+    client._raise = lambda resp: None
+    client._http.post.return_value.json.return_value = {'sid': 's1'}
+
+    client.register_session(access_token='tok')
+    assert 'sid' not in client._http.post.call_args.kwargs['json']
+    client.register_session(access_token='tok2')
+    assert client._http.post.call_args.kwargs['json']['sid'] == 's1'
 
 
 @pytest.mark.asyncio
