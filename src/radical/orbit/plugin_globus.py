@@ -643,11 +643,13 @@ class GlobusClient(PluginClient):
         if local_collection: payload['local_collection'] = local_collection
 
         resp = self._http.post(self._url('register_session'), json=payload)
-        if resp.status_code == 409 and 'sid' in payload \
-                and ROTATION_REFUSED in resp.text:
-            # owner-less session (e.g. via the gateway) cannot rotate:
-            # register a new one.  The old one is left to idle expiry — it
-            # is shared by design, others may still use it.
+        if 'sid' in payload and (
+                resp.status_code == 403 or (
+                resp.status_code == 409 and ROTATION_REFUSED in resp.text)):
+            # owner-less session (e.g. via the gateway) cannot rotate, or
+            # the sid expired and now belongs to another participant:
+            # register a new one.  An owner-less old session is left to idle
+            # expiry — it is shared by design, others may still use it.
             log.warning('[globus] session %s cannot rotate its credential; '
                         'registering a new session — tasks tracked by %s '
                         'are not carried over', self._sid, self._sid)
@@ -873,11 +875,12 @@ class PluginGlobus(Plugin):
 
         Re-registering an existing ``sid`` passes ``_check_rotation`` (owned
         sessions only, by their owner, same policy) and then rotates the
-        credential in place: the
-        session keeps its tracked tasks and poller, the old SDK clients are
-        retired until the session closes, and ``local_collection`` changes
-        only when the body gives one.  The reserved ``default`` sid is rejected (400): a globus
-        session needs a caller-supplied credential.
+        credential in place: the session keeps its tracked tasks and
+        poller, the old SDK clients are retired and released on a timer
+        (see ``GlobusSession.adopt_credential``), and ``local_collection``
+        changes only when the body gives one.  The reserved ``default`` sid
+        is rejected (400): a globus session needs a caller-supplied
+        credential.
         '''
         try:
             data = await request.json()

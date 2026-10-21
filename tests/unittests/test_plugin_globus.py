@@ -1080,7 +1080,7 @@ async def test_register_session_policy_conflict(endpoint_app):
 @pytest.mark.asyncio
 async def test_register_session_same_owner_rotates_credential(endpoint_app):
     '''A same-owner re-register keeps the session object (tracked tasks,
-    poller) and swaps in the new clients, closing the old ones.'''
+    poller) and swaps in the new clients, retiring the old ones.'''
     plugin = PluginGlobus(endpoint_app)
     with patch('radical.orbit.plugin_globus.globus_sdk') as gs:
         gs.TransferClient.side_effect = lambda **_: MagicMock()
@@ -1381,3 +1381,21 @@ async def test_register_session_cancelled_recheck_closes_clients(
                 _register_request({'access_token': 'tok'}))
     built[0]._tc.close.assert_called_once()
     assert not plugin._sessions
+
+
+def test_client_reregister_falls_back_on_403():
+    '''A stale sid (expired, then taken by another participant) must not
+    wedge the client: a 403 on rotation registers a new session.'''
+    client = GlobusClient.__new__(GlobusClient)
+    client._sid   = 's1'
+    client._http  = MagicMock()
+    client._url   = lambda path: path
+    client._raise = lambda resp: None
+    taken = MagicMock(status_code=403, text='owned by another participant')
+    fresh = MagicMock(status_code=200)
+    fresh.json.return_value = {'sid': 's2'}
+    client._http.post.side_effect = [taken, fresh]
+
+    client.register_session(access_token='tok2')
+    assert 'sid' not in client._http.post.call_args.kwargs['json']
+    assert client._sid == 's2'
