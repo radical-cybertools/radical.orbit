@@ -855,6 +855,13 @@ def test_notification_output_keeps_tail_under_limit():
     assert tiny["stdout"] == out[-16:]
     assert tiny["stdout_truncated"] is True
 
+    # a zero limit drops the stream without encoding it
+    session._output_notify_limit = 0
+    zero = session._notification_payload(_output_task("t.z", out, ""))
+    assert zero["stdout"] == ""
+    assert zero["stdout_truncated"] is True
+    assert "stderr_truncated" not in zero
+
     # get_task's view stays complete
     assert session._sanitize_task(
         _output_task("task.out002", out, err))["stdout"] == out

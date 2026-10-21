@@ -861,6 +861,8 @@ class RhapsodySession(PluginSession):
         limit: the last ``limit`` characters always cover the kept bytes.
         """
         limit = self._output_notify_limit
+        if limit <= 0:
+            return '', bool(text)
         if text.isascii():
             if len(text) <= limit:
                 return text, False
