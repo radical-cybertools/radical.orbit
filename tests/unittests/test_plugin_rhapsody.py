@@ -618,6 +618,21 @@ async def test_sanitize_list_stdout():
     assert d["stderr"] == "rank0 err"
 
 
+def test_sanitize_list_of_bytes_stdout():
+    """multi-rank bytes output is decoded, not joined as b'...' reprs."""
+    session = RhapsodySession("test.san4b")
+    session._rh_session = MagicMock()
+
+    task = MagicMock()
+    task.uid = "task.lb001"
+    task.state = "DONE"
+    task.to_dict = lambda: {"uid": "task.lb001", "state": "DONE",
+                            "stdout": [b"rank0 out", b"rank1 \xff"]}
+
+    d = session._sanitize_task(task)
+    assert d["stdout"] == "rank0 out\nrank1 \ufffd"
+
+
 @pytest.mark.asyncio
 async def test_sanitize_preserves_normal_values():
     """Normal JSON-serializable values must pass through unchanged."""
@@ -768,6 +783,114 @@ async def test_json_safe_return_value_oversized_reports_error(caplog):
     assert "_return_value_encoding" not in payload
     assert "too large" in payload["error"]
     assert "too large" in caplog.text
+
+
+def _output_task(uid, stdout, stderr):
+    task = MagicMock()
+    task.uid = uid
+    task.state = "DONE"
+    task.to_dict = lambda: {"uid": uid, "state": "DONE", "exit_code": 0,
+                            "stdout": stdout, "stderr": stderr}
+    return task
+
+
+def test_notification_carries_output_to_sse_wait():
+    """stdout/stderr reach the terminal notification, so the client's SSE
+    wait path returns them like the poll path and ``get_task`` do."""
+    session = RhapsodySession("test.out")
+    session._rh_session = MagicMock()
+
+    payload = session._notification_payload(
+        _output_task("task.out001", b"hello\n", ["r0 err", "r1 err"]))
+    assert payload["stdout"] == "hello\n"
+    assert payload["stderr"] == "r0 err\nr1 err"
+
+    client = _make_rhapsody_client()
+    client._on_task_done(None, None, "task_status", payload)
+    assert client._completed["task.out001"]["stdout"] == "hello\n"
+    assert client._completed["task.out001"]["stderr"] == "r0 err\nr1 err"
+
+
+def test_notification_output_is_valid_utf8():
+    """A lone surrogate (e.g. surrogateescape-decoded output) must not
+    reach the frame: msgpack refuses it and the whole batch is lost."""
+    import msgpack
+    session = RhapsodySession("test.out.sur")
+    session._rh_session = MagicMock()
+
+    payload = session._notification_payload(
+        _output_task("task.sur", "ok \udcff", "\udcfe" * 2000))
+    msgpack.packb(payload)
+    assert payload["stdout"] == "ok ?"
+    assert "stdout_truncated" not in payload
+
+    # any string field, not only the output streams
+    task = MagicMock()
+    task.uid = "task.sur2"
+    task.state = "FAILED"
+    task.to_dict = lambda: {"uid": "task.sur2", "state": "FAILED",
+                            "exception": "no such file b\udcff.dat",
+                            "error": "\udcfe"}
+    payload = session._notification_payload(task)
+    msgpack.packb(payload)
+    assert payload["exception"] == "no such file b?.dat"
+
+
+def test_payload_size_counts_utf8_bytes():
+    """Multi-byte output must count in bytes, else frame splitting packs a
+    batch several times past the frame cap."""
+    from radical.orbit.plugin_rhapsody import _payload_size
+    assert _payload_size({"stdout": "\u4e2d" * 100}) \
+        >= _payload_size({"stdout": "x" * 300})
+
+
+def test_notification_output_keeps_tail_under_limit():
+    """A stream over the limit keeps its tail behind a marker that names
+    the dropped size; the result stays within the limit in UTF-8 bytes."""
+    session = RhapsodySession("test.out.big")
+    session._rh_session = MagicMock()
+    session._output_notify_limit = 256
+
+    out = "x" * 1000 + "THE END"
+    err = "\u00e4" * 1000                     # 2 bytes each: cut mid-char
+    payload = session._notification_payload(
+        _output_task("task.out002", out, err))
+
+    assert payload["stdout"].startswith("[... ")
+    assert payload["stdout"].endswith("THE END")
+    dropped = len(out) - (256 - 128)
+    assert f"{dropped} characters truncated" in payload["stdout"]
+    for key in ("stdout", "stderr"):
+        assert len(payload[key].encode("utf-8")) <= 256
+        assert payload[f"{key}_truncated"] is True
+
+    # the cut lands on a character boundary and the count is exact
+    err_tail = payload["stderr"].split("...]\n", 1)[1]
+    assert set(err_tail) == {"\u00e4"}
+    assert (f"{1000 - len(err_tail)} characters truncated"
+            in payload["stderr"])
+
+    # a stream that fits carries no flag
+    small = session._notification_payload(_output_task("t.s", "ok", ""))
+    assert small["stdout"] == "ok"
+    assert "stdout_truncated" not in small
+
+    # a limit too small for the marker yields the bare tail
+    session._output_notify_limit = 16
+    tiny = session._notification_payload(_output_task("t.t", out, ""))
+    assert tiny["stdout"] == out[-16:]
+    assert tiny["stdout_truncated"] is True
+
+    # a zero limit drops the stream without encoding it
+    session._output_notify_limit = 0
+    zero = session._notification_payload(_output_task("t.z", out, ""))
+    assert zero["stdout"] == ""
+    assert zero["stdout_truncated"] is True
+    assert "stderr_truncated" not in zero
+
+    # get_task's view stays complete
+    assert session._sanitize_task(
+        _output_task("task.out002", out, err))["stdout"] == out
 
 
 @pytest.mark.asyncio
@@ -1798,11 +1921,13 @@ def test_frame_budgets_follow_host_runtime_cap():
     assert plugin._frame_cap          == 64 * 1024
     assert plugin._return_value_limit == 32 * 1024
     assert plugin._notify_batch_bytes == 32 * 1024
+    assert plugin._output_notify_limit == 8 * 1024
 
     # every session it creates inherits them
     session = plugin._create_session('sid.cap')
     assert session._return_value_limit == 32 * 1024
     assert session._notify_batch_bytes == 32 * 1024
+    assert session._output_notify_limit == 8 * 1024
 
     # a directly built session keeps the module defaults
     assert RhapsodySession('sid.plain')._return_value_limit \
@@ -1819,6 +1944,7 @@ def test_frame_budgets_fall_back_to_protocol_cap():
     assert plugin._frame_cap          == prh.FRAME_CAP
     assert plugin._return_value_limit == prh.RETURN_VALUE_LIMIT
     assert plugin._notify_batch_bytes == prh.NOTIFY_BATCH_BYTES
+    assert plugin._output_notify_limit == prh.OUTPUT_NOTIFY_LIMIT
 
 
 if __name__ == '__main__':
