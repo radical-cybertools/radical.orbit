@@ -1302,8 +1302,7 @@ async def test_rotation_releases_retired_clients_after_grace(monkeypatch):
     first.close.assert_not_called()
     await asyncio.sleep(0.1)
     first.close.assert_called_once()
-    assert session._retired == []
-    assert session._timers  == {}           # fired timers are pruned
+    assert session._retired == []           # released entries are pruned
 
 
 @pytest.mark.asyncio
@@ -1311,7 +1310,7 @@ async def test_close_cancels_release_timers():
     session = _make_session()
     first   = session._tc
     session.adopt_credential(_make_session(), keep_collection=True)
-    (timer,) = session._timers.values()
+    ((_, timer),) = session._retired
     await session.close()
     assert timer.cancelled()
     first.close.assert_called_once()

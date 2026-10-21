@@ -244,8 +244,8 @@ class GlobusSession(PluginSession):
         self._local_collection = local_collection or None
         self._tc          = None
         self._auth_client = None
-        self._retired     = []      # rotated-out clients, see adopt_credential
-        self._timers      = {}      # id(retired pair) -> release timer
+        self._retired     = []      # [clients, release timer] per rotated-out
+                                    # pair, see adopt_credential
 
         if not access_token and not (refresh_token and client_id):
             raise ValueError(
@@ -492,8 +492,8 @@ class GlobusSession(PluginSession):
         Rotation refreshes a token; it is not meant to switch Globus
         identity — tasks submitted under the old identity are polled with
         the new credential.  A different identity takes a new session.'''
-        old = (self._tc, self._auth_client)
-        self._retired.append(old)
+        entry = [(self._tc, self._auth_client), None]
+        self._retired.append(entry)
         self._tc,  self._auth_client  = other._tc, other._auth_client
         other._tc, other._auth_client = None, None
         if not keep_collection:
@@ -504,26 +504,24 @@ class GlobusSession(PluginSession):
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return                    # no loop: close() releases them
-        self._timers[id(old)] = loop.call_later(
-            10 * GLOBUS_HTTP_TIMEOUT, self._release_retired, old)
+        entry[1] = loop.call_later(
+            10 * GLOBUS_HTTP_TIMEOUT, self._release_retired, entry)
 
-    def _release_retired(self, clients: tuple) -> None:
+    def _release_retired(self, entry: list) -> None:
         '''Close one retired client pair (no-op once ``close()`` ran).'''
-        self._timers.pop(id(clients), None)
         for i, retired in enumerate(self._retired):
-            if retired is clients:
+            if retired is entry:
                 del self._retired[i]
-                self._close_clients(clients)
+                self._close_clients(entry[0])
                 return
 
     async def close(self) -> Dict[str, Any]:
         # Stop the status poller (base close) before closing its client.
         result = await super().close()
         self._close_clients()
-        for timer in self._timers.values():
-            timer.cancel()
-        self._timers = {}
-        for clients in self._retired:
+        for clients, timer in self._retired:
+            if timer is not None:
+                timer.cancel()
             self._close_clients(clients)
         self._retired = []
         return result
