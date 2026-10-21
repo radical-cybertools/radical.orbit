@@ -74,6 +74,10 @@ ROTATION_REFUSED = 'owner-less session cannot rotate its credential'
 # belongs to another participant.  A Globus-side 403 does not carry it.
 OWNER_REFUSED    = 'owned by another participant'
 
+# 409 detail marker: the session expired or was unregistered before the
+# rotation could land (the client falls back to a new session).
+SESSION_ENDED    = 'ended before its credential could be rotated'
+
 # Background poll interval for active transfer tasks (seconds).
 GLOBUS_POLL_INTERVAL = 10.0
 
@@ -637,9 +641,11 @@ class GlobusClient(PluginClient):
         Calling it again on a registered client rotates the credential of
         the same session (its tracked tasks are kept); where the server
         refuses rotation (owner-less session, or a sid now owned by another
-        participant) a new session is registered.  ``new_session=True``
-        always registers a new one — e.g. to switch Globus identity, which
-        rotation does not support.
+        participant, or one that ended meanwhile) a new session is
+        registered.  ``new_session=True`` always registers a new one — e.g.
+        to switch Globus identity, which rotation does not support.  The old
+        session is not released (it may be shared); call
+        ``unregister_session()`` first to release it.
         '''
         payload: Dict[str, Any] = {}
         if self._sid and not new_session:
@@ -652,7 +658,8 @@ class GlobusClient(PluginClient):
         resp = self._http.post(self._url('register_session'), json=payload)
         if 'sid' in payload and (
                 (resp.status_code == 403 and OWNER_REFUSED in resp.text) or
-                (resp.status_code == 409 and ROTATION_REFUSED in resp.text)):
+                (resp.status_code == 409 and (ROTATION_REFUSED in resp.text or
+                                              SESSION_ENDED in resp.text))):
             # owner-less session (e.g. via the gateway) cannot rotate, or
             # the sid expired and now belongs to another participant:
             # register a new one.  An owner-less old session is left to idle
@@ -664,17 +671,7 @@ class GlobusClient(PluginClient):
             resp    = self._http.post(self._url('register_session'),
                                       json=payload)
         self._raise(resp)
-        old_sid, self._sid = self._sid, resp.json()['sid']
-
-        if new_session and old_sid and old_sid != self._sid:
-            # an explicit switch releases this client's own old session and
-            # the credential it holds
-            try:
-                self._raise(self._http.post(
-                    self._url(f'unregister_session/{old_sid}')))
-            except Exception as exc:
-                log.warning('[globus] releasing session %s failed: %s',
-                            old_sid, exc)
+        self._sid = resp.json()['sid']
 
     def submit_transfer(self, source: str, destination: str,
                        items: List[Dict[str, Any]],
@@ -934,10 +931,13 @@ class PluginGlobus(Plugin):
             sid = f'session.{uuid.uuid4().hex[:8]}'
             while sid in self._sessions:
                 sid = f'session.{uuid.uuid4().hex[:8]}'
-        elif await self._live_session(sid) is not None:
-            # fail fast, before the credential is exercised
-            self._check_rotation(sid, owner, lifetime, ttl)
+        elif sid in self._records:
+            # a known sid (live, or expired but unswept) is a rotation: it
+            # either lands on the live session or is refused, never revived
             rotating = True
+            if await self._live_session(sid) is not None:
+                # fail fast, before the credential is exercised
+                self._check_rotation(sid, owner, lifetime, ttl)
 
         kwargs = {'access_token'    : access_token,
                   'refresh_token'   : refresh_token,
@@ -985,13 +985,13 @@ class PluginGlobus(Plugin):
             return {'sid': sid}
 
         if rotating:
-            # the session ended (expired or unregistered) while the new
-            # credential was built: do not silently recreate it
+            # the session ended (expired or unregistered) before the new
+            # credential could land: do not silently recreate it
             session._close_clients()
             raise HTTPException(
                 status_code=409,
-                detail=f"session {sid} ended during credential rotation — "
-                       "register a new session")
+                detail=f"session {sid} {SESSION_ENDED} — register a new "
+                       "session")
         self._record_session(sid, session, lifetime, ttl, owner)
         log.info('[globus] Registered session %s', sid)
         return {'sid': sid}

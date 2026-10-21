@@ -1266,20 +1266,22 @@ def test_client_reregister_other_409_is_raised():
 
 @pytest.mark.asyncio
 async def test_register_session_expired_sid_is_not_revived(endpoint_app):
-    '''A ttl-expired session the sweeper has not removed yet is dropped and
-    replaced by a fresh one, not rotated back to life.'''
+    '''A ttl-expired session the sweeper has not removed yet is dropped,
+    and the rotation is refused (409) — neither revived nor silently
+    replaced by an empty session under the same sid.'''
     plugin = PluginGlobus(endpoint_app)
     with patch('radical.orbit.plugin_globus.globus_sdk'):
         await plugin.register_session(
             _register_request({'access_token': 'tok', 'sid': 's1',
                                'lifetime': 'ttl', 'ttl': 60}, 'ep1'))
-        old = plugin._sessions['s1']
         plugin._records['s1'].last_access -= 120
-        await plugin.register_session(
-            _register_request({'access_token': 'tok2', 'sid': 's1',
-                               'lifetime': 'ttl', 'ttl': 60}, 'ep1'))
-    assert plugin._sessions['s1'] is not old
-    assert not plugin._is_expired(plugin._records['s1'], time.time())
+        with pytest.raises(HTTPException) as exc:
+            await plugin.register_session(
+                _register_request({'access_token': 'tok2', 'sid': 's1',
+                                   'lifetime': 'ttl', 'ttl': 60}, 'ep1'))
+    assert exc.value.status_code == 409
+    assert pg.SESSION_ENDED in exc.value.detail
+    assert 's1' not in plugin._sessions
 
 
 @pytest.mark.asyncio
@@ -1431,11 +1433,10 @@ def test_client_new_session_sends_no_sid():
     client._http.post.return_value.json.return_value = {'sid': 's2'}
 
     client.register_session(access_token='other-identity', new_session=True)
-    register, release = client._http.post.call_args_list
-    assert 'sid' not in register.kwargs['json']
+    assert 'sid' not in client._http.post.call_args.kwargs['json']
     assert client._sid == 's2'
-    # the client's own old session (and its credential) is released
-    assert release.args[0] == 'unregister_session/s1'
+    # the old session may be shared: it is not released implicitly
+    assert client._http.post.call_count == 1
 
 
 def test_owner_refused_marker_matches_base_detail():
@@ -1475,3 +1476,20 @@ async def test_rotation_refused_when_session_ends_during_build(
     assert exc.value.status_code == 409
     assert 's1' not in plugin._sessions
     built[0]._tc.close.assert_called_once()
+
+
+def test_client_falls_back_when_session_ended():
+    client = GlobusClient.__new__(GlobusClient)
+    client._sid   = 's1'
+    client._http  = MagicMock()
+    client._url   = lambda path: path
+    client._raise = lambda resp: None
+    ended = MagicMock(status_code=409,
+                      text=f'{{"detail": "session s1 {pg.SESSION_ENDED}"}}')
+    fresh = MagicMock(status_code=200)
+    fresh.json.return_value = {'sid': 's2'}
+    client._http.post.side_effect = [ended, fresh]
+
+    client.register_session(access_token='tok2')
+    assert 'sid' not in client._http.post.call_args.kwargs['json']
+    assert client._sid == 's2'
