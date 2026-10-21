@@ -747,7 +747,9 @@ class RhapsodySession(PluginSession):
             if isinstance(val, bytes):
                 d[key] = val.decode('utf-8', errors='replace')
             elif isinstance(val, list):
-                d[key] = '\n'.join(str(v) for v in val)
+                d[key] = '\n'.join(
+                    v.decode('utf-8', errors='replace')
+                    if isinstance(v, bytes) else str(v) for v in val)
 
         # Ensure return_value is JSON-serializable (see _encode_return_value:
         # rich results keep full fidelity, they are not stringified).  A

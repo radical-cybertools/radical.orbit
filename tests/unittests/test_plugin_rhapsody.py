@@ -618,6 +618,21 @@ async def test_sanitize_list_stdout():
     assert d["stderr"] == "rank0 err"
 
 
+def test_sanitize_list_of_bytes_stdout():
+    """multi-rank bytes output is decoded, not joined as b'...' reprs."""
+    session = RhapsodySession("test.san4b")
+    session._rh_session = MagicMock()
+
+    task = MagicMock()
+    task.uid = "task.lb001"
+    task.state = "DONE"
+    task.to_dict = lambda: {"uid": "task.lb001", "state": "DONE",
+                            "stdout": [b"rank0 out", b"rank1 \xff"]}
+
+    d = session._sanitize_task(task)
+    assert d["stdout"] == "rank0 out\nrank1 \ufffd"
+
+
 @pytest.mark.asyncio
 async def test_sanitize_preserves_normal_values():
     """Normal JSON-serializable values must pass through unchanged."""
