@@ -1232,17 +1232,36 @@ def test_client_reregister_falls_back_on_409():
     client._http  = MagicMock()
     client._url   = lambda path: path
     client._raise = lambda resp: None
-    refused = MagicMock(status_code=409)
+    refused = MagicMock(status_code=409, text=f'{{"detail": "session s1: '
+                                              f'{pg.ROTATION_REFUSED}"}}')
     fresh   = MagicMock(status_code=200)
     fresh.json.return_value = {'sid': 's2'}
-    refused.text = 'no owner'
-    client._http.post.side_effect = [refused, fresh]
+    client._http.post.side_effect = [refused, fresh, MagicMock()]
 
     client.register_session(access_token='tok2')
-    first, second = client._http.post.call_args_list
+    first, second, third = client._http.post.call_args_list
     assert first.kwargs['json']['sid'] == 's1'
     assert 'sid' not in second.kwargs['json']
     assert client._sid == 's2'
+    # the old session (and its credential) is released
+    assert third.args[0] == 'unregister_session/s1'
+
+
+def test_client_reregister_other_409_is_raised():
+    '''Only the owner-less refusal falls back; a policy conflict surfaces.'''
+    client = GlobusClient.__new__(GlobusClient)
+    client._sid   = 's1'
+    client._http  = MagicMock()
+    client._url   = lambda path: path
+    raised = []
+    client._raise = lambda resp: raised.append(resp.status_code)
+    conflict = MagicMock(status_code=409, text='different lifetime policy')
+    conflict.json.return_value = {'sid': 's1'}
+    client._http.post.return_value = conflict
+
+    client.register_session(access_token='tok2')
+    assert client._http.post.call_count == 1
+    assert raised == [409]
 
 
 @pytest.mark.asyncio
@@ -1284,6 +1303,50 @@ async def test_rotation_releases_retired_clients_after_grace(monkeypatch):
     await asyncio.sleep(0.1)
     first.close.assert_called_once()
     assert session._retired == []
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_release_timers():
+    session = _make_session()
+    first   = session._tc
+    session.adopt_credential(_make_session(), keep_collection=True)
+    timer   = session._timers[0]
+    await session.close()
+    assert timer.cancelled()
+    first.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_register_session_cancelled_build_closes_clients(
+        endpoint_app, monkeypatch):
+    '''A refresh-token register cancelled mid-build: the offloaded thread
+    finishes, and what it built is closed, not leaked.'''
+    import threading
+    plugin  = PluginGlobus(endpoint_app)
+    release = threading.Event()
+    built   = []
+    orig    = plugin._create_session
+
+    def _create(sid, **kwargs):
+        release.wait(5)
+        built.append(orig(sid, **kwargs))
+        return built[-1]
+
+    monkeypatch.setattr(plugin, '_create_session', _create)
+    with patch('radical.orbit.plugin_globus.globus_sdk'):
+        task = asyncio.ensure_future(plugin.register_session(
+            _register_request({'refresh_token': 'rt', 'client_id': 'c'})))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+        for _ in range(100):
+            if built and built[0]._tc.close.called:
+                break
+            await asyncio.sleep(0.01)
+    built[0]._tc.close.assert_called_once()
+    assert not plugin._sessions
 
 
 @pytest.mark.asyncio

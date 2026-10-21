@@ -66,6 +66,10 @@ except ImportError:
 
 log = logging.getLogger('radical.orbit')
 
+# 409 detail marker: an owner-less session cannot rotate its credential
+# (GlobusClient falls back to a new session on exactly this refusal).
+ROTATION_REFUSED = 'owner-less session cannot rotate its credential'
+
 # Background poll interval for active transfer tasks (seconds).
 GLOBUS_POLL_INTERVAL = 10.0
 
@@ -237,6 +241,7 @@ class GlobusSession(PluginSession):
         self._tc          = None
         self._auth_client = None
         self._retired     = []      # rotated-out clients, see adopt_credential
+        self._timers      = []      # their pending release timers
 
         if not access_token and not (refresh_token and client_id):
             raise ValueError(
@@ -495,7 +500,8 @@ class GlobusSession(PluginSession):
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return                    # no loop: close() releases them
-        loop.call_later(10 * GLOBUS_HTTP_TIMEOUT, self._release_retired, old)
+        self._timers.append(loop.call_later(
+            10 * GLOBUS_HTTP_TIMEOUT, self._release_retired, old))
 
     def _release_retired(self, clients: tuple) -> None:
         '''Close one retired client pair (no-op once ``close()`` ran).'''
@@ -509,6 +515,9 @@ class GlobusSession(PluginSession):
         # Stop the status poller (base close) before closing its client.
         result = await super().close()
         self._close_clients()
+        for timer in self._timers:
+            timer.cancel()
+        self._timers = []
         for clients in self._retired:
             self._close_clients(clients)
         self._retired = []
@@ -599,6 +608,12 @@ class GlobusSession(PluginSession):
         }
 
 
+def _close_built(build: 'asyncio.Future') -> None:
+    '''Close the clients of a session whose register was cancelled.'''
+    if not build.cancelled() and build.exception() is None:
+        build.result()._close_clients()
+
+
 # ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
@@ -627,18 +642,28 @@ class GlobusClient(PluginClient):
         if local_collection: payload['local_collection'] = local_collection
 
         resp = self._http.post(self._url('register_session'), json=payload)
-        if resp.status_code == 409 and 'sid' in payload:
-            # the session cannot rotate (owner-less, e.g. via the gateway,
-            # or a different policy): register a new one instead
-            log.warning('[globus] session %s cannot rotate its credential '
-                        '(%s); registering a new session — tasks tracked '
-                        'by %s are not carried over',
-                        self._sid, resp.text, self._sid)
+        old_sid = None
+        if resp.status_code == 409 and 'sid' in payload \
+                and ROTATION_REFUSED in resp.text:
+            # owner-less session (e.g. via the gateway) cannot rotate:
+            # register a new one, then release the old one and its credential
+            log.warning('[globus] session %s cannot rotate its credential; '
+                        'registering a new session — tasks tracked by %s '
+                        'are not carried over', self._sid, self._sid)
+            old_sid = self._sid
             payload = {k: v for k, v in payload.items() if k != 'sid'}
             resp    = self._http.post(self._url('register_session'),
                                       json=payload)
         self._raise(resp)
         self._sid = resp.json()['sid']
+
+        if old_sid:
+            try:
+                self._raise(self._http.post(
+                    self._url(f'unregister_session/{old_sid}')))
+            except Exception as exc:
+                log.warning('[globus] releasing session %s failed: %s',
+                            old_sid, exc)
 
     def submit_transfer(self, source: str, destination: str,
                        items: List[Dict[str, Any]],
@@ -912,8 +937,14 @@ class PluginGlobus(Plugin):
                 # Offloaded: a refresh-token session fetches its first access
                 # token synchronously, which can take longer than one HTTP
                 # timeout since the SDK transport retries failed requests.
-                session = await asyncio.to_thread(
-                    self._create_session, sid, **kwargs)
+                build = asyncio.ensure_future(asyncio.to_thread(
+                    self._create_session, sid, **kwargs))
+                try:
+                    session = await asyncio.shield(build)
+                except asyncio.CancelledError:
+                    # the thread runs on: close what it builds
+                    build.add_done_callback(_close_built)
+                    raise
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
@@ -964,8 +995,8 @@ class PluginGlobus(Plugin):
         if record is None or record.owner is None:
             raise HTTPException(
                 status_code=409,
-                detail=f"session {sid} has no owner; its credential cannot "
-                       "be replaced — register a new session")
+                detail=f"session {sid}: {ROTATION_REFUSED} — register a "
+                       "new session")
         self._check_owner(sid, owner)
         self._check_policy_conflict(sid, lifetime, ttl)
 
