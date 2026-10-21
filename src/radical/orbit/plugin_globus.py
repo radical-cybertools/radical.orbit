@@ -664,7 +664,17 @@ class GlobusClient(PluginClient):
             resp    = self._http.post(self._url('register_session'),
                                       json=payload)
         self._raise(resp)
-        self._sid = resp.json()['sid']
+        old_sid, self._sid = self._sid, resp.json()['sid']
+
+        if new_session and old_sid and old_sid != self._sid:
+            # an explicit switch releases this client's own old session and
+            # the credential it holds
+            try:
+                self._raise(self._http.post(
+                    self._url(f'unregister_session/{old_sid}')))
+            except Exception as exc:
+                log.warning('[globus] releasing session %s failed: %s',
+                            old_sid, exc)
 
     def submit_transfer(self, source: str, destination: str,
                        items: List[Dict[str, Any]],
@@ -969,14 +979,19 @@ class PluginGlobus(Plugin):
         if existing is not None:
             existing.adopt_credential(
                 session, keep_collection=not data.get('local_collection'))
+            await session.close()         # the emptied carrier
             self._touch(sid)
             log.info('[globus] Rotated credential of session %s', sid)
             return {'sid': sid}
 
         if rotating:
-            log.warning('[globus] session %s expired while its new credential '
-                        'was built; registered a fresh session — its tracked '
-                        'tasks are gone', sid)
+            # the session ended (expired or unregistered) while the new
+            # credential was built: do not silently recreate it
+            session._close_clients()
+            raise HTTPException(
+                status_code=409,
+                detail=f"session {sid} ended during credential rotation — "
+                       "register a new session")
         self._record_session(sid, session, lifetime, ttl, owner)
         log.info('[globus] Registered session %s', sid)
         return {'sid': sid}

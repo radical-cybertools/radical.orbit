@@ -1431,8 +1431,11 @@ def test_client_new_session_sends_no_sid():
     client._http.post.return_value.json.return_value = {'sid': 's2'}
 
     client.register_session(access_token='other-identity', new_session=True)
-    assert 'sid' not in client._http.post.call_args.kwargs['json']
+    register, release = client._http.post.call_args_list
+    assert 'sid' not in register.kwargs['json']
     assert client._sid == 's2'
+    # the client's own old session (and its credential) is released
+    assert release.args[0] == 'unregister_session/s1'
 
 
 def test_owner_refused_marker_matches_base_detail():
@@ -1443,3 +1446,32 @@ def test_owner_refused_marker_matches_base_detail():
     with pytest.raises(HTTPException) as exc:
         plugin._check_owner('s1', 'ep2')
     assert pg.OWNER_REFUSED in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_rotation_refused_when_session_ends_during_build(
+        endpoint_app, monkeypatch):
+    '''An unregister (or expiry) landing while a rotation's credential is
+    built must not be undone by recreating the session.'''
+    plugin = PluginGlobus(endpoint_app)
+    with patch('radical.orbit.plugin_globus.globus_sdk') as gs:
+        gs.TransferClient.side_effect = lambda **_: MagicMock()
+        await plugin.register_session(
+            _register_request({'access_token': 'tok', 'sid': 's1'}, 'ep1'))
+        orig  = plugin._create_session
+        built = []
+
+        def _create(sid, **kwargs):
+            built.append(orig(sid, **kwargs))
+            plugin._sessions.pop(sid)           # unregistered meanwhile
+            plugin._records.pop(sid)
+            return built[-1]
+
+        monkeypatch.setattr(plugin, '_create_session', _create)
+        with pytest.raises(HTTPException) as exc:
+            await plugin.register_session(
+                _register_request({'access_token': 'tok2', 'sid': 's1'},
+                                  'ep1'))
+    assert exc.value.status_code == 409
+    assert 's1' not in plugin._sessions
+    built[0]._tc.close.assert_called_once()
