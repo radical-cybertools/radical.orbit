@@ -1236,15 +1236,15 @@ def test_client_reregister_falls_back_on_409():
                                               f'{pg.ROTATION_REFUSED}"}}')
     fresh   = MagicMock(status_code=200)
     fresh.json.return_value = {'sid': 's2'}
-    client._http.post.side_effect = [refused, fresh, MagicMock()]
+    client._http.post.side_effect = [refused, fresh]
 
     client.register_session(access_token='tok2')
-    first, second, third = client._http.post.call_args_list
+    first, second = client._http.post.call_args_list
     assert first.kwargs['json']['sid'] == 's1'
     assert 'sid' not in second.kwargs['json']
     assert client._sid == 's2'
-    # the old session (and its credential) is released
-    assert third.args[0] == 'unregister_session/s1'
+    # the shared owner-less session is left to idle expiry, not unregistered
+    assert client._http.post.call_count == 2
 
 
 def test_client_reregister_other_409_is_raised():
@@ -1303,6 +1303,7 @@ async def test_rotation_releases_retired_clients_after_grace(monkeypatch):
     await asyncio.sleep(0.1)
     first.close.assert_called_once()
     assert session._retired == []
+    assert session._timers  == {}           # fired timers are pruned
 
 
 @pytest.mark.asyncio
@@ -1310,7 +1311,7 @@ async def test_close_cancels_release_timers():
     session = _make_session()
     first   = session._tc
     session.adopt_credential(_make_session(), keep_collection=True)
-    timer   = session._timers[0]
+    (timer,) = session._timers.values()
     await session.close()
     assert timer.cancelled()
     first.close.assert_called_once()

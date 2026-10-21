@@ -241,7 +241,7 @@ class GlobusSession(PluginSession):
         self._tc          = None
         self._auth_client = None
         self._retired     = []      # rotated-out clients, see adopt_credential
-        self._timers      = []      # their pending release timers
+        self._timers      = {}      # id(retired pair) -> release timer
 
         if not access_token and not (refresh_token and client_id):
             raise ValueError(
@@ -500,11 +500,12 @@ class GlobusSession(PluginSession):
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return                    # no loop: close() releases them
-        self._timers.append(loop.call_later(
-            10 * GLOBUS_HTTP_TIMEOUT, self._release_retired, old))
+        self._timers[id(old)] = loop.call_later(
+            10 * GLOBUS_HTTP_TIMEOUT, self._release_retired, old)
 
     def _release_retired(self, clients: tuple) -> None:
         '''Close one retired client pair (no-op once ``close()`` ran).'''
+        self._timers.pop(id(clients), None)
         for i, retired in enumerate(self._retired):
             if retired is clients:
                 del self._retired[i]
@@ -515,9 +516,9 @@ class GlobusSession(PluginSession):
         # Stop the status poller (base close) before closing its client.
         result = await super().close()
         self._close_clients()
-        for timer in self._timers:
+        for timer in self._timers.values():
             timer.cancel()
-        self._timers = []
+        self._timers = {}
         for clients in self._retired:
             self._close_clients(clients)
         self._retired = []
@@ -642,28 +643,19 @@ class GlobusClient(PluginClient):
         if local_collection: payload['local_collection'] = local_collection
 
         resp = self._http.post(self._url('register_session'), json=payload)
-        old_sid = None
         if resp.status_code == 409 and 'sid' in payload \
                 and ROTATION_REFUSED in resp.text:
             # owner-less session (e.g. via the gateway) cannot rotate:
-            # register a new one, then release the old one and its credential
+            # register a new one.  The old one is left to idle expiry — it
+            # is shared by design, others may still use it.
             log.warning('[globus] session %s cannot rotate its credential; '
                         'registering a new session — tasks tracked by %s '
                         'are not carried over', self._sid, self._sid)
-            old_sid = self._sid
             payload = {k: v for k, v in payload.items() if k != 'sid'}
             resp    = self._http.post(self._url('register_session'),
                                       json=payload)
         self._raise(resp)
         self._sid = resp.json()['sid']
-
-        if old_sid:
-            try:
-                self._raise(self._http.post(
-                    self._url(f'unregister_session/{old_sid}')))
-            except Exception as exc:
-                log.warning('[globus] releasing session %s failed: %s',
-                            old_sid, exc)
 
     def submit_transfer(self, source: str, destination: str,
                        items: List[Dict[str, Any]],
