@@ -1391,7 +1391,9 @@ def test_client_reregister_falls_back_on_403():
     client._http  = MagicMock()
     client._url   = lambda path: path
     client._raise = lambda resp: None
-    taken = MagicMock(status_code=403, text='owned by another participant')
+    taken = MagicMock(status_code=403,
+                      text='{"detail": "session s1 is owned by another '
+                           'participant"}')
     fresh = MagicMock(status_code=200)
     fresh.json.return_value = {'sid': 's2'}
     client._http.post.side_effect = [taken, fresh]
@@ -1399,3 +1401,46 @@ def test_client_reregister_falls_back_on_403():
     client.register_session(access_token='tok2')
     assert 'sid' not in client._http.post.call_args.kwargs['json']
     assert client._sid == 's2'
+
+
+def test_client_globus_403_is_raised_not_fallen_back():
+    '''A Globus-side 403 (credential refused) surfaces; it is not mistaken
+    for the ownership refusal.'''
+    client = GlobusClient.__new__(GlobusClient)
+    client._sid   = 's1'
+    client._http  = MagicMock()
+    client._url   = lambda path: path
+    raised = []
+    client._raise = lambda resp: raised.append(resp.status_code)
+    denied = MagicMock(status_code=403,
+                       text='Globus register_session: forbidden')
+    denied.json.return_value = {'sid': 's1'}
+    client._http.post.return_value = denied
+
+    client.register_session(refresh_token='rt', client_id='c')
+    assert client._http.post.call_count == 1
+    assert raised == [403]
+
+
+def test_client_new_session_sends_no_sid():
+    client = GlobusClient.__new__(GlobusClient)
+    client._sid   = 's1'
+    client._http  = MagicMock()
+    client._url   = lambda path: path
+    client._raise = lambda resp: None
+    client._http.post.return_value = MagicMock(status_code=200)
+    client._http.post.return_value.json.return_value = {'sid': 's2'}
+
+    client.register_session(access_token='other-identity', new_session=True)
+    assert 'sid' not in client._http.post.call_args.kwargs['json']
+    assert client._sid == 's2'
+
+
+def test_owner_refused_marker_matches_base_detail():
+    '''The client's 403 marker must stay in step with the base check.'''
+    from radical.orbit.plugin_base import Plugin, SessionRecord
+    plugin = Plugin.__new__(Plugin)
+    plugin._records = {'s1': SessionRecord('ephemeral', None, 'ep1', 0.0)}
+    with pytest.raises(HTTPException) as exc:
+        plugin._check_owner('s1', 'ep2')
+    assert pg.OWNER_REFUSED in exc.value.detail
