@@ -823,6 +823,12 @@ class RhapsodySession(PluginSession):
                           'return_value', '_return_value_encoding',
                           'error', 'exception', 'traceback'}
 
+    # Every key a terminal notification may carry: the selected task fields
+    # plus the flags ``_notification_payload`` adds (forwarded verbatim by
+    # the task dispatcher).
+    NOTIFICATION_FORWARD_KEYS = frozenset(
+        _NOTIFICATION_KEYS | {'stdout_truncated', 'stderr_truncated'})
+
     def _notification_payload(self, t) -> dict:
         """Build a minimal notification dict for a completed task.
 
