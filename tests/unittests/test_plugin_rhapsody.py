@@ -809,6 +809,17 @@ def test_notification_output_is_valid_utf8():
     assert payload["stdout"] == "ok ?"
     assert "stdout_truncated" not in payload
 
+    # any string field, not only the output streams
+    task = MagicMock()
+    task.uid = "task.sur2"
+    task.state = "FAILED"
+    task.to_dict = lambda: {"uid": "task.sur2", "state": "FAILED",
+                            "exception": "no such file b\udcff.dat",
+                            "error": "\udcfe"}
+    payload = session._notification_payload(task)
+    msgpack.packb(payload)
+    assert payload["exception"] == "no such file b?.dat"
+
 
 def test_payload_size_counts_utf8_bytes():
     """Multi-byte output must count in bytes, else frame splitting packs a

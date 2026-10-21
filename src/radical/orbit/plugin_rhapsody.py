@@ -842,6 +842,13 @@ class RhapsodySession(PluginSession):
         full    = self._sanitize_task(t)
         payload = {k: v for k, v in full.items()
                    if k in self._NOTIFICATION_KEYS}
+        for key, val in payload.items():
+            if isinstance(val, str) and key not in ('stdout', 'stderr') \
+                    and not val.isascii():
+                # lone surrogates (surrogateescape-decoded text in any
+                # field) make msgpack refuse the whole batch frame; the
+                # output streams get the same in _fit_output, bounded
+                payload[key] = val.encode('utf-8', 'replace').decode('utf-8')
         for key in ('stdout', 'stderr'):
             if isinstance(payload.get(key), str):
                 payload[key], cut = self._fit_output(payload[key])
@@ -866,12 +873,14 @@ class RhapsodySession(PluginSession):
         if text.isascii():
             if len(text) <= limit:
                 return text, False
+            raw = text[-limit:].encode('ascii')
         elif len(text) <= limit:
             raw = text.encode('utf-8', errors='replace')
             if len(raw) <= limit:
                 return raw.decode('utf-8'), False
+        else:
+            raw = text[-limit:].encode('utf-8', errors='replace')
 
-        raw   = text[-limit:].encode('utf-8', errors='replace')
         keep  = limit - 128 if limit >= 256 else limit  # 128: marker room
         start = len(raw) - keep
         while start < len(raw) and (raw[start] & 0xC0) == 0x80:
