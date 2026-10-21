@@ -55,7 +55,7 @@ import httpx
 
 from fastapi import FastAPI, HTTPException, Request
 
-from .plugin_base         import Plugin
+from .plugin_base         import Plugin, DEFAULT_SID
 from .plugin_session_base import PluginSession
 from .client              import PluginClient
 
@@ -65,6 +65,18 @@ except ImportError:
     globus_sdk = None
 
 log = logging.getLogger('radical.orbit')
+
+# 409 detail marker: an owner-less session cannot rotate its credential
+# (GlobusClient falls back to a new session on exactly this refusal).
+ROTATION_REFUSED = 'owner-less session cannot rotate its credential'
+
+# 403 detail marker of the base owner check (Plugin._check_owner): the sid
+# belongs to another participant.  A Globus-side 403 does not carry it.
+OWNER_REFUSED    = 'owned by another participant'
+
+# 409 detail marker: the session expired or was unregistered before the
+# rotation could land (the client falls back to a new session).
+SESSION_ENDED    = 'ended before its credential could be rotated'
 
 # Background poll interval for active transfer tasks (seconds).
 GLOBUS_POLL_INTERVAL = 10.0
@@ -236,6 +248,8 @@ class GlobusSession(PluginSession):
         self._local_collection = local_collection or None
         self._tc          = None
         self._auth_client = None
+        self._retired     = []      # [clients, release timer] per rotated-out
+                                    # pair, see adopt_credential
 
         if not access_token and not (refresh_token and client_id):
             raise ValueError(
@@ -452,11 +466,14 @@ class GlobusSession(PluginSession):
 
     # -- lifecycle ------------------------------------------------------------
 
-    def _close_clients(self) -> None:
+    def _close_clients(self, clients: Optional[tuple] = None) -> None:
         '''Release the SDK clients' HTTP connections (``close()`` exists on
-        globus-sdk 4.x clients only).  Best effort: a failing close is
-        logged and does not skip the other client.'''
-        for client in (self._tc, self._auth_client):
+        globus-sdk 4.x clients only) — this session's own, or ``clients``.
+        Best effort: a failing close is logged and does not skip the other
+        client.'''
+        if clients is None:
+            clients = (self._tc, self._auth_client)
+        for client in clients:
             close = getattr(client, 'close', None)
             if close is None:
                 continue
@@ -466,10 +483,51 @@ class GlobusSession(PluginSession):
                 log.debug('[globus] session %s: closing %s failed: %s',
                           self._sid, type(client).__name__, exc)
 
+    def adopt_credential(self, other: 'GlobusSession',
+                         keep_collection: bool) -> None:
+        '''Take over ``other``'s SDK clients (credential rotation on
+        re-register).  Tracked tasks and the status poller stay with this
+        session.  The old clients are retired, not closed: offloaded calls
+        may still be running on them.  They are released once no such call
+        can be left (a generous multiple of the SDK timeout), or at
+        ``close()``.  ``other`` is left without clients and must not be
+        used afterwards.
+
+        Rotation refreshes a token; it is not meant to switch Globus
+        identity — tasks submitted under the old identity are polled with
+        the new credential.  A different identity takes a new session.'''
+        entry = [(self._tc, self._auth_client), None]
+        self._retired.append(entry)
+        self._tc,  self._auth_client  = other._tc, other._auth_client
+        other._tc, other._auth_client = None, None
+        if not keep_collection:
+            self._local_collection = other._local_collection
+
+        # An offloaded call is bounded by the SDK timeout and its retries.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return                    # no loop: close() releases them
+        entry[1] = loop.call_later(
+            10 * GLOBUS_HTTP_TIMEOUT, self._release_retired, entry)
+
+    def _release_retired(self, entry: list) -> None:
+        '''Close one retired client pair (no-op once ``close()`` ran).'''
+        for i, retired in enumerate(self._retired):
+            if retired is entry:
+                del self._retired[i]
+                self._close_clients(entry[0])
+                return
+
     async def close(self) -> Dict[str, Any]:
         # Stop the status poller (base close) before closing its client.
         result = await super().close()
         self._close_clients()
+        for clients, timer in self._retired:
+            if timer is not None:
+                timer.cancel()
+            self._close_clients(clients)
+        self._retired = []
         return result
 
     # -- background polling -------------------------------------------------
@@ -557,6 +615,12 @@ class GlobusSession(PluginSession):
         }
 
 
+def _close_built(build: 'asyncio.Future') -> None:
+    '''Close the clients of a session whose register was cancelled.'''
+    if not build.cancelled() and build.exception() is None:
+        build.result()._close_clients()
+
+
 # ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
@@ -568,19 +632,44 @@ class GlobusClient(PluginClient):
                          access_token: Optional[str]     = None,
                          refresh_token: Optional[str]    = None,
                          client_id: Optional[str]        = None,
-                         local_collection: Optional[str] = None) -> None:
+                         local_collection: Optional[str] = None,
+                         new_session: bool               = False) -> None:
         '''Register a Globus session.
 
         Supply either ``access_token`` or ``refresh_token`` + ``client_id``.
         ``local_collection`` overrides the endpoint's configured default.
+        Calling it again on a registered client rotates the credential of
+        the same session (its tracked tasks are kept); where the server
+        refuses rotation (owner-less session, or a sid now owned by another
+        participant, or one that ended meanwhile) a new session is
+        registered.  ``new_session=True`` always registers a new one — e.g.
+        to switch Globus identity, which rotation does not support.  The old
+        session is not released (it may be shared); call
+        ``unregister_session()`` first to release it.
         '''
         payload: Dict[str, Any] = {}
+        if self._sid and not new_session:
+            payload['sid'] = self._sid
         if access_token:     payload['access_token']     = access_token
         if refresh_token:    payload['refresh_token']    = refresh_token
         if client_id:        payload['client_id']        = client_id
         if local_collection: payload['local_collection'] = local_collection
 
         resp = self._http.post(self._url('register_session'), json=payload)
+        if 'sid' in payload and (
+                (resp.status_code == 403 and OWNER_REFUSED in resp.text) or
+                (resp.status_code == 409 and (ROTATION_REFUSED in resp.text or
+                                              SESSION_ENDED in resp.text))):
+            # owner-less session (e.g. via the gateway) cannot rotate, or
+            # the sid expired and now belongs to another participant:
+            # register a new one.  An owner-less old session is left to idle
+            # expiry — it is shared by design, others may still use it.
+            log.warning('[globus] session %s cannot rotate its credential; '
+                        'registering a new session — tasks tracked by %s '
+                        'are not carried over', self._sid, self._sid)
+            payload = {k: v for k, v in payload.items() if k != 'sid'}
+            resp    = self._http.post(self._url('register_session'),
+                                      json=payload)
         self._raise(resp)
         self._sid = resp.json()['sid']
 
@@ -797,11 +886,31 @@ class PluginGlobus(Plugin):
         records the result through the base's ``_record_session`` /
         ``_normalize_session_policy`` so a globus session gets the same
         lifetime/owner bookkeeping every other plugin's sessions get.
+
+        Re-registering an existing ``sid`` passes ``_check_rotation`` (owned
+        sessions only, by their owner, same policy) and then rotates the
+        credential in place: the session keeps its tracked tasks and
+        poller, the old SDK clients are retired and released on a timer
+        (see ``GlobusSession.adopt_credential``), and ``local_collection``
+        changes only when the body gives one.  The reserved ``default`` sid
+        is rejected (400): a globus session needs a caller-supplied
+        credential.
         '''
         try:
             data = await request.json()
         except Exception:
             data = {}
+        if not isinstance(data, dict):
+            data = {}
+        if data.get('sid') is not None \
+                and (not isinstance(data['sid'], str) or not data['sid']):
+            raise HTTPException(status_code=400,
+                                detail="'sid' must be a non-empty string")
+        if data.get('sid') == DEFAULT_SID:
+            raise HTTPException(
+                status_code=400,
+                detail=f"sid '{DEFAULT_SID}' is reserved; a globus session "
+                       "needs its own credential")
 
         access_token  = data.get('access_token')
         refresh_token = data.get('refresh_token')
@@ -817,8 +926,18 @@ class PluginGlobus(Plugin):
         self._ensure_cleanup_task()
         owner              = self._request_owner(request)
         sid, lifetime, ttl = self._normalize_session_policy(data)
+        rotating = False
         if sid is None:
             sid = f'session.{uuid.uuid4().hex[:8]}'
+            while sid in self._sessions:
+                sid = f'session.{uuid.uuid4().hex[:8]}'
+        elif sid in self._records:
+            # a known sid (live, or expired but unswept) is a rotation: it
+            # either lands on the live session or is refused, never revived
+            rotating = True
+            if await self._live_session(sid) is not None:
+                # fail fast, before the credential is exercised
+                self._check_rotation(sid, owner, lifetime, ttl)
 
         kwargs = {'access_token'    : access_token,
                   'refresh_token'   : refresh_token,
@@ -832,8 +951,14 @@ class PluginGlobus(Plugin):
                 # Offloaded: a refresh-token session fetches its first access
                 # token synchronously, which can take longer than one HTTP
                 # timeout since the SDK transport retries failed requests.
-                session = await asyncio.to_thread(
-                    self._create_session, sid, **kwargs)
+                build = asyncio.ensure_future(asyncio.to_thread(
+                    self._create_session, sid, **kwargs))
+                try:
+                    session = await asyncio.shield(build)
+                except asyncio.CancelledError:
+                    # the thread runs on: close what it builds
+                    build.add_done_callback(_close_built)
+                    raise
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
@@ -842,9 +967,69 @@ class PluginGlobus(Plugin):
                 raise _globus_http_exc(exc, 'register_session') from exc
             raise
 
+        # Re-check after the (possibly offloaded) build: the sid may have
+        # been created meanwhile by a concurrent register.
+        try:
+            existing = await self._live_session(sid)
+            if existing is not None:
+                self._check_rotation(sid, owner, lifetime, ttl)
+        except BaseException:         # incl. cancellation: nothing holds it
+            session._close_clients()
+            raise
+        if existing is not None:
+            existing.adopt_credential(
+                session, keep_collection=not data.get('local_collection'))
+            await session.close()         # the emptied carrier
+            self._touch(sid)
+            log.info('[globus] Rotated credential of session %s', sid)
+            return {'sid': sid}
+
+        if rotating:
+            # the session ended (expired or unregistered) before the new
+            # credential could land: do not silently recreate it
+            session._close_clients()
+            raise HTTPException(
+                status_code=409,
+                detail=f"session {sid} {SESSION_ENDED} — register a new "
+                       "session")
         self._record_session(sid, session, lifetime, ttl, owner)
         log.info('[globus] Registered session %s', sid)
         return {'sid': sid}
+
+    async def _live_session(self, sid: str) -> Optional[GlobusSession]:
+        '''Return the session under ``sid``, dropping it first if it has
+        expired but was not swept yet — a rotation must not revive it.'''
+        record = self._records.get(sid)
+        if record is not None and self._is_expired(record, time.time()):
+            await self._drop_session(sid)
+        return self._sessions.get(sid)
+
+    def _check_rotation(self, sid: str, owner: Optional[str],
+                        lifetime: str, ttl: Optional[float]) -> None:
+        '''Gate a re-register of an existing ``sid`` (credential rotation).
+
+        Stricter than the base reattach: the base lets anyone reattach an
+        owner-less session, which is harmless for a reattach but would let
+        any caller swap the credential others act under.  An owner-less
+        session therefore cannot rotate (409, register a new session); an
+        owned one only by its owner (403), under the same policy (409).
+        '''
+        record = self._records.get(sid)
+        if record is None or record.owner is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"session {sid}: {ROTATION_REFUSED} — register a "
+                       "new session")
+        self._check_owner(sid, owner)
+        self._check_policy_conflict(sid, lifetime, ttl)
+
+    async def _ensure_default_session(self):
+        '''A globus session needs a caller credential: there is no shared
+        ``default`` session to create on demand.'''
+        raise HTTPException(
+            status_code=404,
+            detail=f"globus has no '{DEFAULT_SID}' session; register one "
+                   "with a credential")
 
     # -- route handlers -----------------------------------------------------
 

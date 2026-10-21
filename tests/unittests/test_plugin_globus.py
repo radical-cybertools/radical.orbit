@@ -1024,6 +1024,182 @@ async def test_register_session_records_policy_and_owner(endpoint_app):
     assert plugin._session_last_access[sid] == record.last_access
 
 
+def _register_request(body, src=None):
+    request = MagicMock()
+    request.headers = {'x-orbit-src': src} if src else {}
+    async def _json():
+        return body
+    request.json = _json
+    return request
+
+
+@pytest.mark.asyncio
+async def test_register_session_rejects_default_sid(endpoint_app):
+    plugin = PluginGlobus(endpoint_app)
+    with patch('radical.orbit.plugin_globus.globus_sdk'):
+        with pytest.raises(HTTPException) as exc:
+            await plugin.register_session(
+                _register_request({'access_token': 'tok', 'sid': 'default'}))
+    assert exc.value.status_code == 400
+    assert 'default' not in plugin._sessions
+
+
+@pytest.mark.asyncio
+async def test_register_session_other_owner_cannot_replace(endpoint_app):
+    '''#134: re-registering another participant's sid is a 403 and leaves
+    the existing session (and its credential) untouched.'''
+    plugin = PluginGlobus(endpoint_app)
+    with patch('radical.orbit.plugin_globus.globus_sdk'):
+        await plugin.register_session(
+            _register_request({'access_token': 'tok', 'sid': 's1'}, 'ep1'))
+        session = plugin._sessions['s1']
+        tc      = session._tc
+        with pytest.raises(HTTPException) as exc:
+            await plugin.register_session(
+                _register_request({'access_token': 'evil', 'sid': 's1'},
+                                  'ep2'))
+    assert exc.value.status_code == 403
+    assert plugin._sessions['s1'] is session
+    assert session._tc is tc
+
+
+@pytest.mark.asyncio
+async def test_register_session_policy_conflict(endpoint_app):
+    plugin = PluginGlobus(endpoint_app)
+    with patch('radical.orbit.plugin_globus.globus_sdk'):
+        await plugin.register_session(
+            _register_request({'access_token': 'tok', 'sid': 's1',
+                               'lifetime': 'persistent'}, 'ep1'))
+        with pytest.raises(HTTPException) as exc:
+            await plugin.register_session(
+                _register_request({'access_token': 'tok2', 'sid': 's1'},
+                                  'ep1'))
+    assert exc.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_register_session_same_owner_rotates_credential(endpoint_app):
+    '''A same-owner re-register keeps the session object (tracked tasks,
+    poller) and swaps in the new clients, retiring the old ones.'''
+    plugin = PluginGlobus(endpoint_app)
+    with patch('radical.orbit.plugin_globus.globus_sdk') as gs:
+        gs.TransferClient.side_effect = lambda **_: MagicMock()
+        await plugin.register_session(
+            _register_request({'access_token': 'tok', 'sid': 's1',
+                               'local_collection': 'coll-a'}, 'ep1'))
+        session = plugin._sessions['s1']
+        session._tasks['t1'] = {'notified': None}
+        old_tc  = session._tc
+        result  = await plugin.register_session(
+            _register_request({'access_token': 'tok2', 'sid': 's1'}, 'ep1'))
+
+    assert result == {'sid': 's1'}
+    assert plugin._sessions['s1'] is session
+    assert 't1' in session._tasks
+    assert session._tc is not old_tc
+    assert session._local_collection == 'coll-a'
+    assert plugin._records['s1'].owner == 'ep1'
+
+    # the old client may still serve an offloaded call: retired, not closed
+    old_tc.close.assert_not_called()
+    await session.close()
+    old_tc.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_register_session_ownerless_cannot_rotate(endpoint_app):
+    '''An owner-less (gateway) session accepts any reattach in the base, so
+    its credential must not be replaceable at all.'''
+    plugin = PluginGlobus(endpoint_app)
+    with patch('radical.orbit.plugin_globus.globus_sdk'):
+        await plugin.register_session(
+            _register_request({'access_token': 'tok', 'sid': 's1'}))
+        session = plugin._sessions['s1']
+        tc      = session._tc
+        with pytest.raises(HTTPException) as exc:
+            await plugin.register_session(
+                _register_request({'access_token': 'evil', 'sid': 's1'},
+                                  'ep2'))
+    assert exc.value.status_code == 409
+    assert session._tc is tc
+
+
+@pytest.mark.asyncio
+async def test_register_session_default_sid_400_before_policy(endpoint_app):
+    '''`default` with a non-persistent lifetime is the documented 400, not
+    the policy normalizer's 409.'''
+    plugin = PluginGlobus(endpoint_app)
+    with pytest.raises(HTTPException) as exc:
+        await plugin.register_session(
+            _register_request({'access_token': 'tok', 'sid': 'default',
+                               'lifetime': 'ephemeral'}))
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_register_session_non_dict_body(endpoint_app):
+    plugin = PluginGlobus(endpoint_app)
+    with pytest.raises(HTTPException) as exc:
+        await plugin.register_session(_register_request(['tok']))
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_routed_call_on_default_sid_is_404(endpoint_app):
+    plugin = PluginGlobus(endpoint_app)
+    with pytest.raises(HTTPException) as exc:
+        await plugin._forward('default', GlobusSession.list_tasks)
+    assert exc.value.status_code == 404
+    assert 'default' not in plugin._sessions
+
+
+def test_client_reregister_sends_sid():
+    '''A second register_session on a client re-sends its sid, so the
+    server rotates the credential instead of minting a new session.'''
+    client = GlobusClient.__new__(GlobusClient)
+    client._sid  = None
+    client._http = MagicMock()
+    client._url  = lambda path: path
+    client._raise = lambda resp: None
+    client._http.post.return_value.status_code = 200
+    client._http.post.return_value.json.return_value = {'sid': 's1'}
+
+    client.register_session(access_token='tok')
+    assert 'sid' not in client._http.post.call_args.kwargs['json']
+    client.register_session(access_token='tok2')
+    assert client._http.post.call_args.kwargs['json']['sid'] == 's1'
+
+
+@pytest.mark.asyncio
+async def test_register_session_concurrent_create_rechecks_owner(
+        endpoint_app, monkeypatch):
+    '''A sid created by another owner while this register's credential was
+    being built is not overwritten; the freshly built clients are closed.'''
+    plugin = PluginGlobus(endpoint_app)
+    built  = []
+    orig   = plugin._create_session
+
+    def _create(sid, **kwargs):
+        session = orig(sid, **kwargs)
+        built.append(session)
+        if len(built) == 1:
+            # a concurrent register by ep1 lands during the build
+            plugin._record_session(sid, _make_session(), 'ephemeral', None,
+                                   'ep1')
+        return session
+
+    monkeypatch.setattr(plugin, '_create_session', _create)
+    with patch('radical.orbit.plugin_globus.globus_sdk'):
+        with pytest.raises(HTTPException) as exc:
+            await plugin.register_session(
+                _register_request({'access_token': 'tok', 'sid': 's1'},
+                                  'ep2'))
+    assert exc.value.status_code == 403
+    assert plugin._sessions['s1'] is not built[0]
+    assert plugin._records['s1'].owner == 'ep1'
+    built[0]._tc.close.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # Route handler delegation
 # ---------------------------------------------------------------------------
@@ -1046,3 +1222,274 @@ async def test_submit_route(endpoint_app):
     with patch('radical.orbit.plugin_globus.globus_sdk'):
         result = await plugin.submit_transfer(request)
     assert result['task_id'] == 't9'
+
+
+def test_client_reregister_falls_back_on_409():
+    '''An owner-less session (gateway path) refuses rotation with 409; the
+    client then registers a new session, as before rotation existed.'''
+    client = GlobusClient.__new__(GlobusClient)
+    client._sid   = 's1'
+    client._http  = MagicMock()
+    client._url   = lambda path: path
+    client._raise = lambda resp: None
+    refused = MagicMock(status_code=409, text=f'{{"detail": "session s1: '
+                                              f'{pg.ROTATION_REFUSED}"}}')
+    fresh   = MagicMock(status_code=200)
+    fresh.json.return_value = {'sid': 's2'}
+    client._http.post.side_effect = [refused, fresh]
+
+    client.register_session(access_token='tok2')
+    first, second = client._http.post.call_args_list
+    assert first.kwargs['json']['sid'] == 's1'
+    assert 'sid' not in second.kwargs['json']
+    assert client._sid == 's2'
+    # the shared owner-less session is left to idle expiry, not unregistered
+    assert client._http.post.call_count == 2
+
+
+def test_client_reregister_other_409_is_raised():
+    '''Only the owner-less refusal falls back; a policy conflict surfaces.'''
+    client = GlobusClient.__new__(GlobusClient)
+    client._sid   = 's1'
+    client._http  = MagicMock()
+    client._url   = lambda path: path
+    raised = []
+    client._raise = lambda resp: raised.append(resp.status_code)
+    conflict = MagicMock(status_code=409, text='different lifetime policy')
+    conflict.json.return_value = {'sid': 's1'}
+    client._http.post.return_value = conflict
+
+    client.register_session(access_token='tok2')
+    assert client._http.post.call_count == 1
+    assert raised == [409]
+
+
+@pytest.mark.asyncio
+async def test_register_session_expired_sid_is_not_revived(endpoint_app):
+    '''A ttl-expired session the sweeper has not removed yet is dropped,
+    and the rotation is refused (409) — neither revived nor silently
+    replaced by an empty session under the same sid.'''
+    plugin = PluginGlobus(endpoint_app)
+    with patch('radical.orbit.plugin_globus.globus_sdk'):
+        await plugin.register_session(
+            _register_request({'access_token': 'tok', 'sid': 's1',
+                               'lifetime': 'ttl', 'ttl': 60}, 'ep1'))
+        plugin._records['s1'].last_access -= 120
+        with pytest.raises(HTTPException) as exc:
+            await plugin.register_session(
+                _register_request({'access_token': 'tok2', 'sid': 's1',
+                                   'lifetime': 'ttl', 'ttl': 60}, 'ep1'))
+    assert exc.value.status_code == 409
+    assert pg.SESSION_ENDED in exc.value.detail
+    assert 's1' not in plugin._sessions
+
+
+@pytest.mark.asyncio
+async def test_register_session_non_string_sid(endpoint_app):
+    plugin = PluginGlobus(endpoint_app)
+    with pytest.raises(HTTPException) as exc:
+        await plugin.register_session(
+            _register_request({'access_token': 'tok', 'sid': ['x']}))
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_rotation_releases_retired_clients_after_grace(monkeypatch):
+    '''Retired clients stay open while an offloaded call may still use them,
+    then are closed on a timer — not kept until session close.'''
+    monkeypatch.setattr(pg, 'GLOBUS_HTTP_TIMEOUT', 0.002)
+    session = _make_session()
+    first   = session._tc
+    session.adopt_credential(_make_session(), keep_collection=True)
+    first.close.assert_not_called()
+    await asyncio.sleep(0.1)
+    first.close.assert_called_once()
+    assert session._retired == []           # released entries are pruned
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_release_timers():
+    session = _make_session()
+    first   = session._tc
+    session.adopt_credential(_make_session(), keep_collection=True)
+    ((_, timer),) = session._retired
+    await session.close()
+    assert timer.cancelled()
+    first.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_register_session_cancelled_build_closes_clients(
+        endpoint_app, monkeypatch):
+    '''A refresh-token register cancelled mid-build: the offloaded thread
+    finishes, and what it built is closed, not leaked.'''
+    import threading
+    plugin  = PluginGlobus(endpoint_app)
+    release = threading.Event()
+    built   = []
+    orig    = plugin._create_session
+
+    def _create(sid, **kwargs):
+        release.wait(5)
+        built.append(orig(sid, **kwargs))
+        return built[-1]
+
+    monkeypatch.setattr(plugin, '_create_session', _create)
+    with patch('radical.orbit.plugin_globus.globus_sdk'):
+        task = asyncio.ensure_future(plugin.register_session(
+            _register_request({'refresh_token': 'rt', 'client_id': 'c'})))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+        for _ in range(100):
+            if built and built[0]._tc.close.called:
+                break
+            await asyncio.sleep(0.01)
+    built[0]._tc.close.assert_called_once()
+    assert not plugin._sessions
+
+
+@pytest.mark.asyncio
+async def test_register_session_empty_sid(endpoint_app):
+    plugin = PluginGlobus(endpoint_app)
+    with pytest.raises(HTTPException) as exc:
+        await plugin.register_session(
+            _register_request({'access_token': 'tok', 'sid': ''}))
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_register_session_cancelled_recheck_closes_clients(
+        endpoint_app, monkeypatch):
+    plugin = PluginGlobus(endpoint_app)
+    built  = []
+    orig   = plugin._create_session
+
+    def _create(sid, **kwargs):
+        built.append(orig(sid, **kwargs))
+        return built[-1]
+
+    async def _cancelled(sid):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(plugin, '_create_session', _create)
+    monkeypatch.setattr(plugin, '_live_session',   _cancelled)
+    with patch('radical.orbit.plugin_globus.globus_sdk'):
+        with pytest.raises(asyncio.CancelledError):
+            await plugin.register_session(
+                _register_request({'access_token': 'tok'}))
+    built[0]._tc.close.assert_called_once()
+    assert not plugin._sessions
+
+
+def test_client_reregister_falls_back_on_403():
+    '''A stale sid (expired, then taken by another participant) must not
+    wedge the client: a 403 on rotation registers a new session.'''
+    client = GlobusClient.__new__(GlobusClient)
+    client._sid   = 's1'
+    client._http  = MagicMock()
+    client._url   = lambda path: path
+    client._raise = lambda resp: None
+    taken = MagicMock(status_code=403,
+                      text='{"detail": "session s1 is owned by another '
+                           'participant"}')
+    fresh = MagicMock(status_code=200)
+    fresh.json.return_value = {'sid': 's2'}
+    client._http.post.side_effect = [taken, fresh]
+
+    client.register_session(access_token='tok2')
+    assert 'sid' not in client._http.post.call_args.kwargs['json']
+    assert client._sid == 's2'
+
+
+def test_client_globus_403_is_raised_not_fallen_back():
+    '''A Globus-side 403 (credential refused) surfaces; it is not mistaken
+    for the ownership refusal.'''
+    client = GlobusClient.__new__(GlobusClient)
+    client._sid   = 's1'
+    client._http  = MagicMock()
+    client._url   = lambda path: path
+    raised = []
+    client._raise = lambda resp: raised.append(resp.status_code)
+    denied = MagicMock(status_code=403,
+                       text='Globus register_session: forbidden')
+    denied.json.return_value = {'sid': 's1'}
+    client._http.post.return_value = denied
+
+    client.register_session(refresh_token='rt', client_id='c')
+    assert client._http.post.call_count == 1
+    assert raised == [403]
+
+
+def test_client_new_session_sends_no_sid():
+    client = GlobusClient.__new__(GlobusClient)
+    client._sid   = 's1'
+    client._http  = MagicMock()
+    client._url   = lambda path: path
+    client._raise = lambda resp: None
+    client._http.post.return_value = MagicMock(status_code=200)
+    client._http.post.return_value.json.return_value = {'sid': 's2'}
+
+    client.register_session(access_token='other-identity', new_session=True)
+    assert 'sid' not in client._http.post.call_args.kwargs['json']
+    assert client._sid == 's2'
+    # the old session may be shared: it is not released implicitly
+    assert client._http.post.call_count == 1
+
+
+def test_owner_refused_marker_matches_base_detail():
+    '''The client's 403 marker must stay in step with the base check.'''
+    from radical.orbit.plugin_base import Plugin, SessionRecord
+    plugin = Plugin.__new__(Plugin)
+    plugin._records = {'s1': SessionRecord('ephemeral', None, 'ep1', 0.0)}
+    with pytest.raises(HTTPException) as exc:
+        plugin._check_owner('s1', 'ep2')
+    assert pg.OWNER_REFUSED in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_rotation_refused_when_session_ends_during_build(
+        endpoint_app, monkeypatch):
+    '''An unregister (or expiry) landing while a rotation's credential is
+    built must not be undone by recreating the session.'''
+    plugin = PluginGlobus(endpoint_app)
+    with patch('radical.orbit.plugin_globus.globus_sdk') as gs:
+        gs.TransferClient.side_effect = lambda **_: MagicMock()
+        await plugin.register_session(
+            _register_request({'access_token': 'tok', 'sid': 's1'}, 'ep1'))
+        orig  = plugin._create_session
+        built = []
+
+        def _create(sid, **kwargs):
+            built.append(orig(sid, **kwargs))
+            plugin._sessions.pop(sid)           # unregistered meanwhile
+            plugin._records.pop(sid)
+            return built[-1]
+
+        monkeypatch.setattr(plugin, '_create_session', _create)
+        with pytest.raises(HTTPException) as exc:
+            await plugin.register_session(
+                _register_request({'access_token': 'tok2', 'sid': 's1'},
+                                  'ep1'))
+    assert exc.value.status_code == 409
+    assert 's1' not in plugin._sessions
+    built[0]._tc.close.assert_called_once()
+
+
+def test_client_falls_back_when_session_ended():
+    client = GlobusClient.__new__(GlobusClient)
+    client._sid   = 's1'
+    client._http  = MagicMock()
+    client._url   = lambda path: path
+    client._raise = lambda resp: None
+    ended = MagicMock(status_code=409,
+                      text=f'{{"detail": "session s1 {pg.SESSION_ENDED}"}}')
+    fresh = MagicMock(status_code=200)
+    fresh.json.return_value = {'sid': 's2'}
+    client._http.post.side_effect = [ended, fresh]
+
+    client.register_session(access_token='tok2')
+    assert 'sid' not in client._http.post.call_args.kwargs['json']
+    assert client._sid == 's2'
