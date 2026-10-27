@@ -5,6 +5,7 @@
 
 import json
 import os
+import threading
 import pytest
 
 from unittest.mock import patch, Mock, MagicMock
@@ -461,8 +462,10 @@ class TestParseSqueueJobsExtras:
 class TestCollectAllocations:
 
     def _make_backend(self):
-        backend      = QueueInfoSlurm.__new__(QueueInfoSlurm)
-        backend._env = dict(os.environ)
+        backend                 = QueueInfoSlurm.__new__(QueueInfoSlurm)
+        backend._env            = dict(os.environ)
+        backend._has_accounting = None
+        backend._probe_lock     = threading.Lock()
         return backend
 
     def test_collect_allocations_json(self):
@@ -601,8 +604,9 @@ class TestCollectAllocations:
         assert not any(c[0] == 'sacctmgr' for c in calls)
         assert len(calls) == 1
 
-    def test_sacctmgr_failure_returns_empty(self):
-        """Probe says slurmdbd but sacctmgr fails: empty result, no raise."""
+    def test_sacctmgr_no_accounting_returns_empty(self):
+        """Probe says slurmdbd but sacctmgr reports no accounting plugin:
+        empty result, no raise, later calls skip sacctmgr."""
 
         calls   = []
         backend = self._make_backend()
@@ -613,7 +617,29 @@ class TestCollectAllocations:
             assert backend._collect_allocations('alice') == {'allocations': []}
             assert backend._get_user_partitions('alice') is None
 
-        assert sum(c[0] == 'sacctmgr' for c in calls) == 4
+        assert sum(c[0] == 'sacctmgr' for c in calls) == 2
+        assert backend._has_accounting is False
+
+    def test_sacctmgr_transient_failure_raises(self):
+        """Any other sacctmgr failure propagates, so the base class does
+        not cache an empty result."""
+
+        def side_effect(cmd, **kw):
+            if cmd[0] == 'scontrol':
+                return Mock(returncode=0, stderr='', stdout=(
+                    'AccountingStorageType = accounting_storage/slurmdbd\n'))
+            return Mock(returncode=1, stdout='',
+                        stderr='Unable to connect to database')
+
+        backend = self._make_backend()
+
+        with patch('subprocess.run', side_effect=side_effect):
+            with pytest.raises(RuntimeError, match='Unable to connect'):
+                backend._collect_allocations('alice')
+            with pytest.raises(RuntimeError, match='Unable to connect'):
+                backend._get_user_partitions('alice')
+
+        assert backend._has_accounting is True
 
     def test_scontrol_failure_assumes_accounting(self):
         """An unusable probe falls through to sacctmgr."""
