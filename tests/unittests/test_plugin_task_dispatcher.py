@@ -1191,7 +1191,9 @@ class TestRhapsodyDialect:
                     'return_value': 'cloudpickle::QUJD',
                     '_return_value_encoding': 'cloudpickle'})
                 plugin._handle_task_terminal('t.2.A', TASK_DONE, {
-                    'uid': 't.2.A', 'state': 'DONE', 'exit_code': 0})
+                    'uid': 't.2.A', 'state': 'DONE', 'exit_code': 0,
+                    'stdout': 'out', 'stderr': 'tail',
+                    'stderr_truncated': True})
                 plugin._flush_rh()
                 await asyncio.sleep(0)
                 return persist.call_count
@@ -1208,6 +1210,10 @@ class TestRhapsodyDialect:
         assert [p['uid'] for p in payloads] == ['t.1', 't.2']
         assert payloads[0]['return_value'] == 'cloudpickle::QUJD'
         assert payloads[0]['state'] == TASK_DONE
+        # task output reaches rhapsody-dialect consumers too
+        assert payloads[1]['stdout'] == 'out'
+        assert payloads[1]['stderr'] == 'tail'
+        assert payloads[1]['stderr_truncated'] is True
 
     def test_client_requires_pool_key(self, tmp_path):
         from radical.orbit.plugin_task_dispatcher import TaskDispatcherClient

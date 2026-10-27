@@ -69,6 +69,15 @@ NOTIFY_BATCH_BYTES  = FRAME_CAP // BUDGET_RATIO
 # object.
 RETURN_VALUE_LIMIT  = FRAME_CAP // BUDGET_RATIO
 
+# Size bound (UTF-8 bytes) for the stdout and for the stderr a terminal
+# notification carries.  Unlike a return value, output can be shortened
+# meaningfully: a longer stream keeps its tail behind a truncation marker,
+# and the full text stays available via this session's ``get_task``.  Both
+# streams together claim a quarter of the frame, so a payload at the
+# return-value limit still fits one frame.
+OUTPUT_RATIO        = 8
+OUTPUT_NOTIFY_LIMIT = FRAME_CAP // OUTPUT_RATIO
+
 # Endpoint-level override for the coalescing window above (seconds).  The
 # default trades ~250 ms of completion latency for fewer WS frames; a
 # latency-sensitive endpoint (co-located service, sequential task round
@@ -134,6 +143,8 @@ def _json_safe(v):
     or WS frame is dropped.  Falls back through ``to_dict`` / recursion
     / ``str``.
     """
+    if isinstance(v, str):
+        return v                    # always encodable; skip a full dumps
     try:
         json.dumps(v)
         return v
@@ -154,12 +165,17 @@ def _payload_size(payload: dict) -> int:
     A notification payload is flat (see ``_NOTIFICATION_KEYS``), so summing
     key and value lengths bounds the frame accurately enough — and, unlike
     ``len(str(payload))``, it does not copy a multi-MiB encoded return value
-    just to measure it.  Non-string values are small scalars; 16 bytes each
-    covers them with room to spare.
+    just to measure it.  Strings count in UTF-8 bytes (an ASCII string, e.g.
+    an encoded return value, without encoding it); non-string values are
+    small scalars; 16 bytes each covers them with room to spare.
     """
     size = 2
     for k, v in payload.items():
-        size += len(str(k)) + (len(v) if isinstance(v, str) else 16)
+        if isinstance(v, str):
+            size += len(str(k)) + (len(v) if v.isascii()
+                                   else len(v.encode('utf-8', 'replace')))
+        else:
+            size += len(str(k)) + 16
     return size
 
 
@@ -263,6 +279,7 @@ class RhapsodySession(PluginSession):
         self._notify_window          = NOTIFY_BATCH_WINDOW
         self._notify_batch_bytes     = NOTIFY_BATCH_BYTES
         self._return_value_limit     = RETURN_VALUE_LIMIT
+        self._output_notify_limit    = OUTPUT_NOTIFY_LIMIT
 
         # Cache for deserialized cloudpickle payloads — avoids decoding the
         # same encoded string N times when a batch repeats identical blobs.
@@ -580,7 +597,9 @@ class RhapsodySession(PluginSession):
         """Split notifications into frames under ``_notify_batch_bytes``.
 
         A single payload larger than the budget still ships alone — it is
-        bounded by ``_return_value_limit``, which leaves frame-cap headroom.
+        bounded by ``_return_value_limit`` (half the frame) plus
+        ``_output_notify_limit`` per output stream (an eighth each), which
+        leaves a quarter of the frame for the remaining fields.
         """
         frames: list[list[dict]] = []
         frame:  list[dict]       = []
@@ -728,7 +747,9 @@ class RhapsodySession(PluginSession):
             if isinstance(val, bytes):
                 d[key] = val.decode('utf-8', errors='replace')
             elif isinstance(val, list):
-                d[key] = '\n'.join(str(v) for v in val)
+                d[key] = '\n'.join(
+                    v.decode('utf-8', errors='replace')
+                    if isinstance(v, bytes) else str(v) for v in val)
 
         # Ensure return_value is JSON-serializable (see _encode_return_value:
         # rich results keep full fidelity, they are not stringified).  A
@@ -800,20 +821,77 @@ class RhapsodySession(PluginSession):
         if not d.get('error'):
             d['error'] = msg
 
-    _NOTIFICATION_KEYS = {'uid', 'state', 'exit_code',
+    _NOTIFICATION_KEYS = {'uid', 'state', 'exit_code', 'stdout', 'stderr',
                           'return_value', '_return_value_encoding',
                           'error', 'exception', 'traceback'}
+
+    # Every key a terminal notification may carry: the selected task fields
+    # plus the flags ``_notification_payload`` adds (forwarded verbatim by
+    # the task dispatcher).
+    NOTIFICATION_FORWARD_KEYS = frozenset(
+        _NOTIFICATION_KEYS | {'stdout_truncated', 'stderr_truncated'})
 
     def _notification_payload(self, t) -> dict:
         """Build a minimal notification dict for a completed task.
 
         Only essential fields are included to keep WebSocket/SSE
-        payloads small.  Clients needing the full task dict (e.g.
-        stdout/stderr) can fetch it via ``GET /task/{sid}/{uid}``.
+        payloads small.  ``stdout`` / ``stderr`` are kept to their last
+        ``_output_notify_limit`` bytes each (see ``_fit_output``); a cut
+        stream is flagged ``stdout_truncated`` / ``stderr_truncated``.  On
+        a direct rhapsody session the full task dict is available via
+        ``GET /task/{sid}/{uid}``.
         """
-        full = self._sanitize_task(t)
-        return {k: v for k, v in full.items()
-                if k in self._NOTIFICATION_KEYS}
+        full    = self._sanitize_task(t)
+        payload = {k: v for k, v in full.items()
+                   if k in self._NOTIFICATION_KEYS}
+        for key, val in payload.items():
+            if isinstance(val, str) and key not in ('stdout', 'stderr') \
+                    and not val.isascii():
+                # lone surrogates (surrogateescape-decoded text in any
+                # field) make msgpack refuse the whole batch frame; the
+                # output streams get the same in _fit_output, bounded
+                payload[key] = val.encode('utf-8', 'replace').decode('utf-8')
+        for key in ('stdout', 'stderr'):
+            if isinstance(payload.get(key), str):
+                payload[key], cut = self._fit_output(payload[key])
+                if cut:
+                    payload[f'{key}_truncated'] = True
+        return payload
+
+    def _fit_output(self, text: str) -> tuple[str, bool]:
+        """Fit ``text`` into ``_output_notify_limit`` UTF-8 bytes.
+
+        Returns ``(text, truncated)``.  The result is always valid UTF-8
+        (lone surrogates become ``?``), else msgpack refuses the frame.  A
+        longer stream keeps its tail (the end of a log is where errors are),
+        cut on a character boundary behind a marker naming the dropped
+        character count; below 256 bytes of limit there is no room for the
+        marker and the bare tail is returned.  Encoding is bounded by the
+        limit: the last ``limit`` characters always cover the kept bytes.
+        """
+        limit = self._output_notify_limit
+        if limit <= 0:
+            return '', bool(text)
+        if text.isascii():
+            if len(text) <= limit:
+                return text, False
+            raw = text[-limit:].encode('ascii')
+        elif len(text) <= limit:
+            raw = text.encode('utf-8', errors='replace')
+            if len(raw) <= limit:
+                return raw.decode('utf-8'), False
+        else:
+            raw = text[-limit:].encode('utf-8', errors='replace')
+
+        keep  = limit - 128 if limit >= 256 else limit  # 128: marker room
+        start = len(raw) - keep
+        while start < len(raw) and (raw[start] & 0xC0) == 0x80:
+            start += 1                            # skip continuation bytes
+        tail  = raw[start:].decode('utf-8')
+        if limit < 256:
+            return tail, True
+        return (f"[... {len(text) - len(tail)} characters truncated ...]\n"
+                + tail), True
 
     async def list_tasks(self) -> dict:
         """Return all tasks in this session with current state."""
@@ -1457,9 +1535,10 @@ class PluginRhapsody(Plugin):
         # hosting runtime's *effective* frame cap rather than the protocol
         # default, so a runtime tuned below FRAME_CAP shrinks both budgets
         # instead of letting the transport drop the frames they permit.
-        self._frame_cap          = _resolve_frame_cap(app)
-        self._notify_batch_bytes = self._frame_cap // BUDGET_RATIO
-        self._return_value_limit = self._frame_cap // BUDGET_RATIO
+        self._frame_cap           = _resolve_frame_cap(app)
+        self._notify_batch_bytes  = self._frame_cap // BUDGET_RATIO
+        self._return_value_limit  = self._frame_cap // BUDGET_RATIO
+        self._output_notify_limit = self._frame_cap // OUTPUT_RATIO
 
         self.add_route_post(ROUTE_SUBMIT,     self.submit_tasks)
         self.add_route_post(ROUTE_WAIT,       self.wait_tasks)
@@ -1567,9 +1646,10 @@ class PluginRhapsody(Plugin):
         svc = getattr(self._app.state, 'endpoint_service', None)
         session._prof = getattr(svc, '_prof', None) or \
                         rprof.Profiler('rhapsody', ns='radical.orbit')
-        session._notify_window      = self._notify_window
-        session._notify_batch_bytes = self._notify_batch_bytes
-        session._return_value_limit = self._return_value_limit
+        session._notify_window       = self._notify_window
+        session._notify_batch_bytes  = self._notify_batch_bytes
+        session._return_value_limit  = self._return_value_limit
+        session._output_notify_limit = self._output_notify_limit
         return session
 
     @staticmethod

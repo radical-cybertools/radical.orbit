@@ -56,7 +56,7 @@ from .client                            import PluginClient
 from .plugin_base                       import Plugin
 from .plugin_session_base               import PluginSession
 from .plugin_rhapsody                   import (
-    RhapsodyClient, WS_PAYLOAD_LIMIT, NOTIFY_BATCH_SIZE,
+    RhapsodyClient, RhapsodySession, WS_PAYLOAD_LIMIT, NOTIFY_BATCH_SIZE,
     _payload_size, _resolve_notify_window, _resolve_frame_cap, BUDGET_RATIO,
 )
 from .task_dispatcher_config            import (
@@ -104,11 +104,9 @@ _HANDSHAKE_TIMEOUT_SEC = 300.0
 ROUTE_SUBMIT_RH = 'submit_rh/{sid}'
 
 # Keys a rhapsody child notification carries that are worth forwarding to
-# the dispatcher's own subscribers (mirrors plugin_rhapsody's
-# ``_NOTIFICATION_KEYS``): the uid/state pair plus result and error data.
-_RH_FORWARD_KEYS = {'uid', 'state', 'exit_code',
-                    'return_value', '_return_value_encoding',
-                    'error', 'exception', 'traceback'}
+# the dispatcher's own subscribers: the uid/state pair plus result, output
+# and error data — derived from plugin_rhapsody so new fields follow.
+_RH_FORWARD_KEYS = RhapsodySession.NOTIFICATION_FORWARD_KEYS
 
 
 # ---------------------------------------------------------------------------
