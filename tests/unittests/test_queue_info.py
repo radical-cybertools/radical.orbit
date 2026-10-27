@@ -5,6 +5,7 @@
 
 import json
 import os
+import threading
 import pytest
 
 from unittest.mock import patch, Mock, MagicMock
@@ -461,8 +462,10 @@ class TestParseSqueueJobsExtras:
 class TestCollectAllocations:
 
     def _make_backend(self):
-        backend      = QueueInfoSlurm.__new__(QueueInfoSlurm)
-        backend._env = dict(os.environ)
+        backend                 = QueueInfoSlurm.__new__(QueueInfoSlurm)
+        backend._env            = dict(os.environ)
+        backend._has_accounting = None
+        backend._probe_lock     = threading.Lock()
         return backend
 
     def test_collect_allocations_json(self):
@@ -508,7 +511,8 @@ class TestCollectAllocations:
         call_count = [0]
 
         def side_effect(cmd, **kw):
-            call_count[0] += 1
+            if cmd[0] == 'sacctmgr':
+                call_count[0] += 1
             m = MagicMock()
             m.returncode = 0
 
@@ -568,6 +572,91 @@ class TestCollectAllocations:
         assert isinstance(result['allocations'], list)
         assert len(result['allocations']) == 1
 
+    @staticmethod
+    def _no_slurmdbd(storage, calls):
+        """subprocess.run stand-in: scontrol reports *storage*, sacctmgr
+        fails the way it does without slurmdbd."""
+
+        def side_effect(cmd, **kw):
+            calls.append(cmd)
+            if cmd[:3] == ['scontrol', 'show', 'config']:
+                return Mock(returncode=0, stderr='', stdout=(
+                    'AccountingStorageHost   = (null)\n'
+                    f'AccountingStorageType   = {storage}\n'))
+            return Mock(returncode=1, stdout='', stderr=(
+                'You are not running a supported accounting_storage '
+                'plugin'))
+        return side_effect
+
+    def test_accounting_disabled_skips_sacctmgr(self):
+        """accounting_storage/none: empty allocations, no sacctmgr call,
+        probe runs once."""
+
+        calls   = []
+        backend = self._make_backend()
+
+        with patch('subprocess.run',
+                   side_effect=self._no_slurmdbd('accounting_storage/none',
+                                                 calls)):
+            assert backend._collect_allocations('alice') == {'allocations': []}
+            assert backend._get_user_partitions('alice') is None
+
+        assert not any(c[0] == 'sacctmgr' for c in calls)
+        assert len(calls) == 1
+
+    def test_sacctmgr_no_accounting_returns_empty(self):
+        """Probe says slurmdbd but sacctmgr reports no accounting plugin:
+        empty result, no raise, no -P -n retry."""
+
+        calls   = []
+        backend = self._make_backend()
+
+        with patch('subprocess.run',
+                   side_effect=self._no_slurmdbd(
+                       'accounting_storage/slurmdbd', calls)):
+            assert backend._collect_allocations('alice') == {'allocations': []}
+            assert backend._get_user_partitions('alice') is None
+
+        assert sum(c[0] == 'sacctmgr' for c in calls) == 2
+        assert not any('-P' in c for c in calls)
+
+    def test_sacctmgr_transient_failure_raises(self):
+        """Any other sacctmgr failure propagates, so the base class does
+        not cache an empty result."""
+
+        def side_effect(cmd, **kw):
+            if cmd[0] == 'scontrol':
+                return Mock(returncode=0, stderr='', stdout=(
+                    'AccountingStorageType = accounting_storage/slurmdbd\n'))
+            return Mock(returncode=1, stdout='',
+                        stderr='Unable to connect to database')
+
+        backend = self._make_backend()
+
+        with patch('subprocess.run', side_effect=side_effect):
+            with pytest.raises(RuntimeError, match='Unable to connect'):
+                backend._collect_allocations('alice')
+            with pytest.raises(RuntimeError, match='Unable to connect'):
+                backend._get_user_partitions('alice')
+
+        assert backend._has_accounting is True
+
+    def test_scontrol_failure_assumes_accounting(self):
+        """An unusable probe falls through to sacctmgr."""
+
+        def side_effect(cmd, **kw):
+            if cmd[0] == 'scontrol':
+                raise OSError('no scontrol')
+            return Mock(returncode=0, stdout='{"associations": []}')
+
+        backend = self._make_backend()
+
+        with patch('subprocess.run', side_effect=side_effect):
+            assert backend._accounting_enabled() is True
+            assert backend._collect_allocations(None) == {'allocations': []}
+
+        assert backend._has_accounting is None   # re-probed next call
+
 
 # ---- caching tests ----------------------------------------------------------
 
@@ -576,11 +665,13 @@ class TestCaching:
     def _make_backend(self):
         import threading
 
-        backend             = QueueInfoSlurm.__new__(QueueInfoSlurm)
-        backend._env        = dict(os.environ)
-        backend._cache      = {}
-        backend._cache_time = {}
-        backend._cache_lock = threading.Lock()
+        backend                 = QueueInfoSlurm.__new__(QueueInfoSlurm)
+        backend._env            = dict(os.environ)
+        backend._cache          = {}
+        backend._cache_time     = {}
+        backend._cache_lock     = threading.Lock()
+        backend._has_accounting = None
+        backend._probe_lock     = threading.Lock()
         return backend
 
     def test_cache_returns_cached_value(self):
