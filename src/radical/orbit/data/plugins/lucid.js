@@ -169,7 +169,7 @@ async function load(page, api) {
     fillForm(page, cfg);
     const st  = await api.fetch(`status/${sid}`);
     render(page, api, st);
-    if (st.status === 'running') startPolling(page, api);
+    if (isActive(st)) startPolling(page, api);
   } catch (e) {
     api.flash(`LUCID: ${e.message}`, false);
   }
@@ -295,10 +295,15 @@ function startPolling(page, api) {
       const sid = await getSession(api);
       const st  = await api.fetch(`status/${sid}`);
       render(page, api, st);
-      if (st.status !== 'running') stopPolling(ep, id);
+      if (!isActive(st)) stopPolling(ep, id);
     } catch (e) { /* transient: keep polling */ }
   }, 2000);
   pollers[ep] = {id, page};
+}
+
+// 'new': submitted, run thread not yet reported -- still active
+function isActive(st) {
+  return st && (st.status === 'new' || st.status === 'running');
 }
 
 // Stop the endpoint's poller; with ``id``, only if it is still that one.
@@ -315,7 +320,7 @@ function gb(n) { return `${((n || 0) / 1e9).toFixed(2)} GB`; }
 function render(page, api, st) {
   if (!st || st.status === 'idle' || !st.run_id) return;
 
-  const running = st.status === 'running';
+  const running = isActive(st);
   page.querySelector('.lc-submit').disabled = running;
   if (!running) page.querySelector('.lc-submit-msg').textContent = '';
   page.querySelector('.lc-idle').style.display     = 'none';

@@ -225,6 +225,18 @@ def test_run_partial_task_failure_continues(tmp_path):
     assert 'out/r01c02f01p05' in pkg[0] and 'out/r01c01f01p05' not in pkg[0]
 
 
+def test_run_rides_out_transient_poll_failures(tmp_path):
+    class Flaky(FakeRhapsody):
+        fails = 2
+        def list_tasks(self):
+            if Flaky.fails:
+                Flaky.fails -= 1
+                raise RuntimeError('routed RPC timeout')
+            return super().list_tasks()
+    rt = FakeRuntime(rhapsody=Flaky())
+    assert _run(rt, tmp_path).run()['status'] == 'done'
+
+
 def test_run_all_tasks_failed(tmp_path):
     rt = FakeRuntime(rhapsody=FakeRhapsody(fail_names=['cellprofiler -c -r']))
     st = _run(rt, tmp_path).run()
@@ -389,6 +401,7 @@ def test_preflight_fails_early_without_staging_access(tmp_path):
     {'pipeline_path': '/p;id'},
     {'collection'   : 'not-a-uuid'},
     {'out_base'     : '/'},
+    {'images_path'  : '/P1/Images\n'},                # `$` matches before \n
     {'field'        : 'f01; rm -rf ~'},
     {'run_id'       : 'e2e-1; id'},
 ])

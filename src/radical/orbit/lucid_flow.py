@@ -82,6 +82,7 @@ GLOBUS_TIMEOUT = 2 * 3600       # give up (and cancel) a transfer after this
 PHASES         = ('preflight', 'stage_in', 'compute', 'package', 'stage_out',
                   'fetch')
 N_PREVIEW      = 8
+POLL_RETRIES   = 5               # consecutive failed status polls tolerated
 
 
 class LucidError(RuntimeError):
@@ -127,7 +128,7 @@ _FIELD_RE = re.compile(r'^[a-z0-9]+$')
 
 
 def validate_path(path: str, what: str) -> str:
-    if not isinstance(path, str) or not _PATH_RE.match(path) \
+    if not isinstance(path, str) or not _PATH_RE.fullmatch(path) \
             or '..' in path.split('/') or not path.strip('/'):
         raise LucidError(f'invalid {what}: {path!r} (absolute path of '
                          '[A-Za-z0-9._/-] below / expected)')
@@ -135,7 +136,7 @@ def validate_path(path: str, what: str) -> str:
 
 
 def validate_collection(uuid: str) -> str:
-    if not isinstance(uuid, str) or not _UUID_RE.match(uuid):
+    if not isinstance(uuid, str) or not _UUID_RE.fullmatch(uuid):
         raise LucidError(f'invalid collection id: {uuid!r}')
     return uuid
 
@@ -262,9 +263,9 @@ class LucidRun:
         self._pipe_path = validate_path(pipeline_path, 'pipeline path').rstrip('/') + '/'
         self._img_path  = validate_path(images_path, 'images path').rstrip('/')
         self._out_base  = validate_path(out_base, 'output base').rstrip('/')
-        if not isinstance(field, str) or not _FIELD_RE.match(field):
+        if not isinstance(field, str) or not _FIELD_RE.fullmatch(field):
             raise LucidError(f'invalid field: {field!r}')
-        if run_id is not None and not RUN_ID_RE.match(str(run_id)):
+        if run_id is not None and not RUN_ID_RE.fullmatch(str(run_id)):
             raise LucidError(f'invalid run id: {run_id!r}')
         self._field     = field
         self._backend   = backend
@@ -302,6 +303,18 @@ class LucidRun:
     def _sleep(self):
         if self._cancel.wait(self._poll):
             raise LucidError('run cancelled')
+
+    def _retry(self, call, what: str):
+        '''Run a status poll, riding out a few transient RPC failures (a
+        routed-RPC timeout, a broker reconnect) instead of failing the run.'''
+        for attempt in range(POLL_RETRIES):
+            try:
+                return call()
+            except Exception as e:
+                if attempt == POLL_RETRIES - 1:
+                    raise
+                log.warning('[lucid] %s failed (%s) -- retrying', what, e)
+                self._sleep()
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -385,7 +398,8 @@ class LucidRun:
         end   = time.time() + timeout
         while True:
             # one call returns every task with state and stdout
-            listed = {t['uid']: t for t in rh.list_tasks().get('tasks', [])
+            tasks  = self._retry(rh.list_tasks, 'list_tasks')
+            listed = {t['uid']: t for t in tasks.get('tasks', [])
                       if t.get('uid') in names}
             states = [listed.get(u, {}).get('state') for u in uids]
             if progress:
@@ -419,7 +433,8 @@ class LucidRun:
         end = time.time() + timeout
         try:
             while True:
-                task = globus.get_task(task_id)
+                task = self._retry(lambda: globus.get_task(task_id),
+                                   'globus get_task')
                 with self._lock:
                     self.state['stats'][key] = {
                         'files': task.get('files_transferred') or 0,
