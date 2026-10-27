@@ -172,6 +172,9 @@ class QueueInfoSlurm(QueueInfo):
         try:
             return json_call(user)
         except Exception as exc:
+            if _NO_ACCOUNTING in str(exc):
+                log.warning('SLURM accounting disabled: %s', exc)
+                return None
             log.debug('sacctmgr --json failed, trying -P -n: %s', exc)
 
         try:
@@ -180,7 +183,6 @@ class QueueInfoSlurm(QueueInfo):
             if _NO_ACCOUNTING not in str(exc):
                 raise
             log.warning('SLURM accounting disabled: %s', exc)
-            self._has_accounting = False
             return None
 
 

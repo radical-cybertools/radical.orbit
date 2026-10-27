@@ -606,7 +606,7 @@ class TestCollectAllocations:
 
     def test_sacctmgr_no_accounting_returns_empty(self):
         """Probe says slurmdbd but sacctmgr reports no accounting plugin:
-        empty result, no raise, later calls skip sacctmgr."""
+        empty result, no raise, no -P -n retry."""
 
         calls   = []
         backend = self._make_backend()
@@ -618,7 +618,7 @@ class TestCollectAllocations:
             assert backend._get_user_partitions('alice') is None
 
         assert sum(c[0] == 'sacctmgr' for c in calls) == 2
-        assert backend._has_accounting is False
+        assert not any('-P' in c for c in calls)
 
     def test_sacctmgr_transient_failure_raises(self):
         """Any other sacctmgr failure propagates, so the base class does
