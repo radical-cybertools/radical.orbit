@@ -156,6 +156,12 @@ def test_validate_wells_orders_and_rejects():
         lf.validate_wells(['r09c01'])
 
 
+def test_validate_wells_rejects_non_list():
+    for bad in (5, 'r01c01', None):
+        with pytest.raises(lf.LucidError):
+            lf.validate_wells(bad)
+
+
 def test_get_analysis():
     assert lf.get_analysis('cropped_cells')['pipeline'] == 'cropped_cells.cppipe'
     disabled = next(a['id'] for a in lf.ANALYSES if not a['enabled'])

@@ -99,7 +99,8 @@ def transfer_refresh_token(path: str = TOKEN_FILE) -> str:
             data = json.load(fin)
         return next(t['refresh_token'] for t in data.get('other_tokens', [])
                     if t.get('resource_server') == 'transfer.api.globus.org')
-    except (OSError, ValueError, StopIteration, KeyError) as e:
+    except (OSError, ValueError, StopIteration, KeyError, AttributeError,
+            TypeError) as e:
         raise LucidError(f'no Globus Transfer refresh token in {path} -- '
                          'run get_globus_token.py first') from e
 
@@ -149,6 +150,8 @@ RUN_ID_RE = re.compile(r'^e2e-\d{8}-\d{6}(-[0-9a-f]{4})?$')
 
 
 def validate_wells(wells: List[str]) -> List[str]:
+    if not isinstance(wells, (list, tuple)):
+        raise LucidError(f'wells must be a list, not {type(wells).__name__}')
     bad = [w for w in wells if w not in WELLS]
     if bad:
         raise LucidError(f'invalid wells: {bad[:5]}')
@@ -255,7 +258,7 @@ class LucidRun:
 
         self._rt        = runtime
         self._endpoint  = endpoint
-        self._wells     = validate_wells(list(wells))
+        self._wells     = validate_wells(wells)
         self._analysis  = get_analysis(analysis)
         self._refresh   = refresh_token
         self._local     = Path(local_dir)
@@ -431,7 +434,8 @@ class LucidRun:
         # Globus keeps a task ACTIVE while it retries recoverable errors and
         # turns it INACTIVE when the credential expires -- neither ends on
         # its own, so give up on INACTIVE, on timeout, or on cancel.
-        end = time.time() + timeout
+        end    = time.time() + timeout
+        status = None
         try:
             while True:
                 task = self._retry(lambda: globus.get_task(task_id),
@@ -456,6 +460,8 @@ class LucidRun:
                                      f'{timeout} s (last: {detail})')
                 self._sleep()
         except Exception:
+            if status == 'FAILED':            # terminal: nothing to cancel
+                raise
             try:
                 globus.cancel_task(task_id)
             except Exception as e:

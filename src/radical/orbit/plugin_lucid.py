@@ -225,7 +225,10 @@ class PluginLucid(Plugin):
         # reserve the run slot before the first await: one run at a time
         with self._lock:
             if self._busy:
-                active = self._run.run_id if self._run else 'a run'
+                # the slot may be held by a submit still being validated,
+                # while self._run is the previous (finished) run
+                running = self._thread is not None and self._thread.is_alive()
+                active  = self._run.run_id if running else 'another submit'
                 raise HTTPException(status_code=409,
                                     detail=f'{active} is still active')
             self._busy = True
@@ -250,13 +253,15 @@ class PluginLucid(Plugin):
             kw  = {k: params[k] for k in ('collection', 'pipeline_path',
                                           'images_path', 'analysis')
                    if params.get(k)}
+            rid = lf.new_run_id()
             run = lf.LucidRun(rt, endpoint, params.get('wells') or [],
                               refresh_token=refresh, local_dir=self._imgdir,
+                              run_id=rid,
+                              on_update=lambda st: self._on_update(rid, st),
                               **kw)
         except lf.LucidError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
-        run._on_update = lambda st, rid=run.run_id: self._on_update(rid, st)
         with self._lock:
             prev         = self._run
             self._run    = run
