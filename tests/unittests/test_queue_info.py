@@ -508,7 +508,8 @@ class TestCollectAllocations:
         call_count = [0]
 
         def side_effect(cmd, **kw):
-            call_count[0] += 1
+            if cmd[0] == 'sacctmgr':
+                call_count[0] += 1
             m = MagicMock()
             m.returncode = 0
 
@@ -567,6 +568,66 @@ class TestCollectAllocations:
         assert 'allocations' in result
         assert isinstance(result['allocations'], list)
         assert len(result['allocations']) == 1
+
+    @staticmethod
+    def _no_slurmdbd(storage, calls):
+        """subprocess.run stand-in: scontrol reports *storage*, sacctmgr
+        fails the way it does without slurmdbd."""
+
+        def side_effect(cmd, **kw):
+            calls.append(cmd)
+            if cmd[:3] == ['scontrol', 'show', 'config']:
+                return Mock(returncode=0, stderr='', stdout=(
+                    'AccountingStorageHost   = (null)\n'
+                    f'AccountingStorageType   = {storage}\n'))
+            return Mock(returncode=1, stdout='', stderr=(
+                'You are not running a supported accounting_storage '
+                'plugin'))
+        return side_effect
+
+    def test_accounting_disabled_skips_sacctmgr(self):
+        """accounting_storage/none: empty allocations, no sacctmgr call,
+        probe runs once."""
+
+        calls   = []
+        backend = self._make_backend()
+
+        with patch('subprocess.run',
+                   side_effect=self._no_slurmdbd('accounting_storage/none',
+                                                 calls)):
+            assert backend._collect_allocations('alice') == {'allocations': []}
+            assert backend._get_user_partitions('alice') is None
+
+        assert not any(c[0] == 'sacctmgr' for c in calls)
+        assert len(calls) == 1
+
+    def test_sacctmgr_failure_returns_empty(self):
+        """Probe says slurmdbd but sacctmgr fails: empty result, no raise."""
+
+        calls   = []
+        backend = self._make_backend()
+
+        with patch('subprocess.run',
+                   side_effect=self._no_slurmdbd(
+                       'accounting_storage/slurmdbd', calls)):
+            assert backend._collect_allocations('alice') == {'allocations': []}
+            assert backend._get_user_partitions('alice') is None
+
+        assert sum(c[0] == 'sacctmgr' for c in calls) == 4
+
+    def test_scontrol_failure_assumes_accounting(self):
+        """An unusable probe falls through to sacctmgr."""
+
+        def side_effect(cmd, **kw):
+            if cmd[0] == 'scontrol':
+                raise OSError('no scontrol')
+            return Mock(returncode=0, stdout='{"associations": []}')
+
+        backend = self._make_backend()
+
+        with patch('subprocess.run', side_effect=side_effect):
+            assert backend._accounting_enabled() is True
+            assert backend._collect_allocations(None) == {'allocations': []}
 
 
 # ---- caching tests ----------------------------------------------------------

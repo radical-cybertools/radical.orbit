@@ -2,11 +2,15 @@
 
 import os
 import json
+import logging
 import re
 import time
 
 from .queue_info import QueueInfo
-from .batch_system import run_cmd_strict
+from .batch_system import run_cmd, run_cmd_strict
+
+
+log = logging.getLogger("radical.orbit")
 
 
 # Node states considered unavailable for scheduling (SLURM vocabulary).
@@ -113,6 +117,38 @@ class QueueInfoSlurm(QueueInfo):
         self._env = dict(os.environ)
         if slurm_conf:
             self._env['SLURM_CONF'] = slurm_conf
+
+        self._has_accounting = None     # probed lazily, see _accounting_enabled
+
+
+    def _accounting_enabled(self):
+        """
+        Return False iff ``scontrol show config`` reports an accounting
+        storage plugin other than slurmdbd (sacctmgr then cannot work).
+
+        The probe runs once per backend instance.  If scontrol fails or
+        does not report the setting, accounting is assumed to be enabled
+        and the sacctmgr calls decide.
+        """
+
+        if getattr(self, '_has_accounting', None) is None:
+
+            storage = None
+            stdout  = run_cmd(['scontrol', 'show', 'config'],
+                              timeout=60, env=self._env)
+            for line in (stdout or '').splitlines():
+                key, sep, val = line.partition('=')
+                if sep and key.strip() == 'AccountingStorageType':
+                    storage = val.strip()
+                    break
+
+            self._has_accounting = storage is None or \
+                                   storage == 'accounting_storage/slurmdbd'
+            if not self._has_accounting:
+                log.warning('SLURM accounting disabled (%s): allocation '
+                            'and partition access info unavailable', storage)
+
+        return self._has_accounting
 
 
     def _collect_info(self):
@@ -280,22 +316,41 @@ class QueueInfoSlurm(QueueInfo):
     def _collect_allocations(self, user):
         """
         Collect allocation/association data via sacctmgr show assoc --json.
-        Falls back to sacctmgr -P -n if --json fails.
+        Falls back to sacctmgr -P -n if --json fails.  Returns no
+        allocations if accounting is disabled or both sacctmgr calls fail.
         """
+
+        if not self._accounting_enabled():
+            return {'allocations': []}
 
         try:
             return self._collect_allocations_json(user)
         except Exception:
+            pass
+
+        try:
             return self._collect_allocations_parsable(user)
+        except Exception as exc:
+            log.warning('sacctmgr failed, no allocation info: %s', exc)
+            return {'allocations': []}
 
     def _get_user_partitions(self, user):
         """
-        Return the set of partition names the user has access to.
+        Return the set of partition names the user has access to, or None
+        (no filtering) if the associations cannot be read.
         """
+
+        if not self._accounting_enabled():
+            return None
+
         try:
             partitions = self._collect_user_partitions_json(user)
         except Exception:
-            partitions = self._collect_user_partitions_parsable(user)
+            try:
+                partitions = self._collect_user_partitions_parsable(user)
+            except Exception as exc:
+                log.warning('sacctmgr failed, no partition filter: %s', exc)
+                return None
 
         # None in the set means at least one association grants access to all
         if None in partitions:
