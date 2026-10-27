@@ -2189,7 +2189,6 @@ async def test_requests_during_close_see_closed_session():
 @pytest.mark.asyncio
 async def test_data_start_add_backend_failure_stops_store():
     session = _ready_session()
-    session._rh_session.add_backend = MagicMock(side_effect=AttributeError('old'))
     backend = _FakeDataBackend('redis_data')
 
     def _add(b):
@@ -2215,11 +2214,64 @@ async def test_data_shutdown_failure_keeps_backend_tracked():
 
     with pytest.raises(RuntimeError, match='will not die'):
         await session.data_shutdown('redis_data')
-    # still tracked, and the name still reserved
+    # still tracked and its name reserved; rhapsody's close no longer sees it
     with pytest.raises(HTTPException):
         await session.data_start('redis')
     assert session._data['redis_data'][0] is backend
-    assert session._rh_session.backends['redis_data'] is backend
+    assert 'redis_data' not in session._rh_session.backends
+    assert not session._stopping
+
+
+@pytest.mark.asyncio
+async def test_data_start_gives_up_on_store_shut_down_meanwhile():
+    session = _ready_session()
+    backend = _FakeDataBackend('redis_data')
+    backend.gate = asyncio.Event()
+    stop     = asyncio.Event()
+
+    async def _slow_shutdown():
+        await stop.wait()
+    backend.shutdown = AsyncMock(side_effect=_slow_shutdown)
+
+    with patch.object(_mock_rh, 'get_data_backend', return_value=backend):
+        start = asyncio.ensure_future(session.data_start('redis'))
+        await asyncio.sleep(0)
+        shut  = asyncio.ensure_future(session.data_shutdown('redis_data'))
+        await asyncio.sleep(0)
+        backend.gate.set()                  # start finishes first ...
+        await asyncio.sleep(0)
+        stop.set()                          # ... then the shutdown
+        with pytest.raises(HTTPException) as exc:
+            await start
+        assert exc.value.status_code == 409
+        await shut
+    session._rh_session.add_backend.assert_not_called()
+    assert 'redis_data' not in session._data
+
+
+@pytest.mark.asyncio
+async def test_cancelled_data_shutdown_still_cleans_up():
+    session = _ready_session()
+    backend = _FakeDataBackend('redis_data')
+    stop    = asyncio.Event()
+
+    async def _slow_shutdown():
+        await stop.wait()
+    backend.shutdown = AsyncMock(side_effect=_slow_shutdown)
+    session._data = {'redis_data': (backend, 'redis')}
+    session._rh_session.backends = {'redis_data': backend}
+
+    shut = asyncio.ensure_future(session.data_shutdown('redis_data'))
+    await asyncio.sleep(0)
+    shut.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await shut
+    assert 'redis_data' in session._data          # still going down
+    stop.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert 'redis_data' not in session._data
+    assert not session._stopping
 
 
 @pytest.mark.asyncio

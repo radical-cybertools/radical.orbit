@@ -274,6 +274,7 @@ class RhapsodySession(PluginSession):
         # session close shuts them down; this map is what the data routes
         # report on, and it holds a name reserved while its start runs.
         self._data: dict[str, tuple] = {}         # name -> (backend, kind)
+        self._stopping: set[str]     = set()      # data_shutdown in flight
 
         # Async init tracking
         self._init_ready = threading.Event()
@@ -1027,7 +1028,7 @@ class RhapsodySession(PluginSession):
             raise
 
         # data_shutdown or session close may have run while start awaited
-        if not self._owns(name, backend) or self._rh_session is None:
+        if not self._owns(name, backend):
             await self._shutdown_quietly(backend)
             raise HTTPException(status_code=409,
                                 detail=f"data backend {name!r} was shut "
@@ -1039,14 +1040,17 @@ class RhapsodySession(PluginSession):
             # a store nobody can reach or close must not keep running;
             # rhapsody may have registered it before failing
             del self._data[name]
-            self._rh_session.backends.pop(name, None)
+            if self._rh_session.backends.get(name) is backend:
+                del self._rh_session.backends[name]
             await self._shutdown_quietly(backend)
             raise
         return self._data_info(name)
 
     def _owns(self, name: str, backend) -> bool:
-        """True if ``name`` is still reserved for this very ``backend``."""
-        return self._data.get(name, (None,))[0] is backend
+        """True if ``name`` is still reserved for this very ``backend`` and
+        not being shut down."""
+        return name not in self._stopping \
+            and self._data.get(name, (None,))[0] is backend
 
     async def _shutdown_quietly(self, backend) -> None:
         """Stop a data backend during cleanup.  A failure is logged, not
@@ -1079,14 +1083,31 @@ class RhapsodySession(PluginSession):
         if entry is None:
             raise HTTPException(status_code=404,
                                 detail=f"data backend {name} not found")
-        # stays tracked (and its name reserved) until it is down: a failed
-        # shutdown can be retried and is still seen by session close
-        await asyncio.shield(entry[0].shutdown())
+        if name in self._stopping:
+            raise HTTPException(status_code=409,
+                                detail=f"data backend {name} is shutting down")
+        backend = entry[0]
+        # The entry keeps the name reserved until the store is down, so a
+        # failed shutdown can be retried and session close still stops it.
+        # _stopping makes an in-flight data_start give up on it, and the
+        # rhapsody session lets go now: from here our close loop owns it.
+        self._stopping.add(name)
+        if self._rh_session.backends.get(name) is backend:
+            del self._rh_session.backends[name]
+        fut = asyncio.ensure_future(backend.shutdown())
+        fut.add_done_callback(
+            lambda f: self._shutdown_done(name, entry, f))
+        await asyncio.shield(fut)     # a cancelled caller does not stop it
+        return {"name": name, "status": "shutdown"}
+
+    def _shutdown_done(self, name: str, entry: tuple, fut) -> None:
+        """Book-keeping for a finished data_shutdown, also when its caller
+        was cancelled: drop the entry only if the store went down."""
+        self._stopping.discard(name)
+        if fut.cancelled() or fut.exception() is not None:
+            return                          # stays tracked for retry / close
         if self._data.get(name) is entry:
             del self._data[name]
-            if self._rh_session is not None:
-                self._rh_session.backends.pop(name, None)
-        return {"name": name, "status": "shutdown"}
 
     async def close(self) -> dict:
         """
