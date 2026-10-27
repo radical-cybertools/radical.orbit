@@ -225,6 +225,16 @@ def test_run_partial_task_failure_continues(tmp_path):
     assert 'out/r01c02f01p05' in pkg[0] and 'out/r01c01f01p05' not in pkg[0]
 
 
+def test_run_reports_end_after_sessions_closed(tmp_path):
+    rt   = FakeRuntime()
+    seen = []
+    run  = _run(rt, tmp_path, on_update=lambda st: seen.append(
+                    (st['status'], rt.clients['rhapsody'].closed)))
+    assert run.run()['status'] == 'done'
+    assert seen[-1] == ('done', True)
+    assert all(closed for status, closed in seen if status == 'done')
+
+
 def test_run_rides_out_transient_poll_failures(tmp_path):
     class Flaky(FakeRhapsody):
         fails = 2

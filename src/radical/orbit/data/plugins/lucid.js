@@ -321,6 +321,11 @@ function render(page, api, st) {
   if (!st || st.status === 'idle' || !st.run_id) return;
 
   const running = isActive(st);
+  if (page.dataset.shownRun && page.dataset.shownRun !== st.run_id) {
+    // another run started (e.g. from another tab): drop the old results
+    page.querySelector('.lc-results-card').style.display = 'none';
+    delete page.dataset.shownRun;
+  }
   page.querySelector('.lc-submit').disabled = running;
   if (!running) page.querySelector('.lc-submit-msg').textContent = '';
   page.querySelector('.lc-idle').style.display     = 'none';
@@ -383,8 +388,10 @@ async function showImages(page, api, st) {
   out.innerHTML = '';
   try {
     const sid = await getSession(api);
-    for (const n of st.images) {
-      const img = await api.fetch(`image/${sid}/${encodeURIComponent(st.run_id)}/${encodeURIComponent(n)}`);
+    const imgs = await Promise.all(st.images.map(n => api.fetch(
+        `image/${sid}/${encodeURIComponent(st.run_id)}/${encodeURIComponent(n)}`)));
+    for (const [i, n] of st.images.entries()) {
+      const img = imgs[i];
       const el  = document.createElement('img');
       el.src       = `data:${img.mime};base64,${img.data}`;
       el.title     = n;

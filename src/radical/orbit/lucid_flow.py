@@ -343,6 +343,7 @@ class LucidRun:
         sessions = []
         phase    = None
         t0       = time.time()
+        final    = {'status': 'done'}
         try:
             globus = self._rt.get_plugin(self._endpoint, 'globus',
                                          refresh_token=self._refresh,
@@ -365,13 +366,12 @@ class LucidRun:
                 func(globus, rh, stage)
                 self._phase(phase, 'done', round(time.time() - t0, 1))
             phase = None
-            self._update(status='done')
 
         except Exception as e:
             log.exception('[lucid] run %s failed', self.run_id)
             if phase:
                 self._phase(phase, 'failed', round(time.time() - t0, 1))
-            self._update(status='failed', error=str(e))
+            final = {'status': 'failed', 'error': str(e)}
 
         finally:
             # an open rhapsody session keeps its backend alive on the endpoint
@@ -380,7 +380,8 @@ class LucidRun:
                     s.close()
                 except Exception as e:
                     log.warning('[lucid] session close failed: %s', e)
-            self._update(finished=time.time())
+            # report the end only now: the UI re-enables Submit on it
+            self._update(finished=time.time(), **final)
 
         return self.snapshot()
 
@@ -512,7 +513,7 @@ class LucidRun:
                 continue
             kv = _kv(t.get('stdout') or '')
             nodes.add(kv.get('host'))
-            files += int(kv.get('files', 0))
+            files += int(kv['files']) if kv.get('files', '').isdigit() else 0
         with self._lock:
             self.state['stats']['compute'] = {
                 'tasks': len(res), 'done': len(res) - len(failed),

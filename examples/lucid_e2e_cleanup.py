@@ -56,52 +56,61 @@ def main():
             sys.exit('no endpoint serving globus found')
         globus = rt.get_plugin(eid, 'globus', refresh_token=refresh,
                                client_id=CLIENT_ID)
+        ret = 0
+        try:
+            # only names that look like demo runs: /tmp_radical is shared, and
+            # the names end up in Globus deletes and an ``rm -rf``
+            existing = sorted(e['name'] for e in
+                              globus.ls(LUCID_COLL, OUT_BASE + '/').get('entries', [])
+                              if e.get('type') == 'dir'
+                              and RUN_ID_RE.fullmatch(e.get('name') or ''))
+            runs = existing if args.all else args.runs
+            if not runs:
+                print(f'runs in lucid:{OUT_BASE}/:')
+                for r in existing:
+                    print(f'  {r}')
+                return 0
 
-        # only names that look like demo runs: /tmp_radical is shared, and
-        # the names end up in Globus deletes and an ``rm -rf``
-        existing = sorted(e['name'] for e in
-                          globus.ls(LUCID_COLL, OUT_BASE + '/').get('entries', [])
-                          if e.get('type') == 'dir'
-                          and RUN_ID_RE.fullmatch(e.get('name') or ''))
-        runs = existing if args.all else args.runs
-        if not runs:
-            print(f'runs in lucid:{OUT_BASE}/:')
-            for r in existing:
-                print(f'  {r}')
-            return
+            for r in runs:
+                if r not in existing:
+                    print(f'  {r}: not in lucid:{OUT_BASE}/')
+            paths = [f'{OUT_BASE}/{r}/' for r in runs if r in existing]
+            if paths:
+                sub = globus.delete(LUCID_COLL, paths, recursive=True,
+                                    label='lucid e2e cleanup')
+                # INACTIVE (expired credential) never ends on its own
+                end = time.time() + DELETE_TIMEOUT
+                while True:
+                    task = globus.get_task(sub['task_id'])
+                    if task.get('status') in ('SUCCEEDED', 'FAILED', 'INACTIVE') \
+                            or time.time() > end:
+                        break
+                    time.sleep(3)
+                print(f'  lucid: deleted {len(paths)} run(s): {task.get("status")}')
+                if task.get('status') != 'SUCCEEDED':
+                    ret = 1
 
-        for r in runs:
-            if r not in existing:
-                print(f'  {r}: not in lucid:{OUT_BASE}/')
-        paths = [f'{OUT_BASE}/{r}/' for r in runs if r in existing]
-        if paths:
-            sub = globus.delete(LUCID_COLL, paths, recursive=True,
-                                label='lucid e2e cleanup')
-            # INACTIVE (expired credential) never ends on its own
-            end = time.time() + DELETE_TIMEOUT
-            while True:
-                task = globus.get_task(sub['task_id'])
-                if task.get('status') in ('SUCCEEDED', 'FAILED', 'INACTIVE') \
-                        or time.time() > end:
-                    break
-                time.sleep(3)
-            print(f'  lucid: deleted {len(paths)} run(s): {task.get("status")}')
-
-        # also runs that failed before stage-out: those exist on scratch only
-        if args.nersc and runs:
-            # run ids as positional args, never spliced into the script
-            rh  = rt.get_plugin(eid, 'rhapsody')
-            cmd = 'cd "$SCRATCH/lucid-e2e/runs" && rm -rf -- "$@"'
-            uid = rh.submit_tasks([{'executable': '/bin/bash',
-                                    'arguments' : ['-lc', cmd, 'rm'] + runs}])[0]['uid']
-            rh.wait_tasks([uid], timeout=600)
-            print(f'  nersc: removed {len(runs)} run dir(s): '
-                  f'{rh.get_task(uid).get("state")}')
-            rh.close()
-        globus.close()
+            # also runs that failed before stage-out: those exist on scratch only
+            if args.nersc and runs:
+                # run ids as positional args, never spliced into the script
+                rh  = rt.get_plugin(eid, 'rhapsody')
+                try:
+                    cmd = 'cd "$SCRATCH/lucid-e2e/runs" && rm -rf -- "$@"'
+                    uid = rh.submit_tasks([{'executable': '/bin/bash',
+                                            'arguments' : ['-lc', cmd, 'rm'] + runs}])[0]['uid']
+                    rh.wait_tasks([uid], timeout=600)
+                    state = rh.get_task(uid).get('state')
+                    print(f'  nersc: removed {len(runs)} run dir(s): {state}')
+                    if state != 'DONE':
+                        ret = 1
+                finally:
+                    rh.close()       # an open session keeps its backend alive
+        finally:
+            globus.close()
+        return ret
     finally:
         rt.stop()
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
