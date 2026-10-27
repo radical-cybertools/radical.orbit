@@ -241,6 +241,25 @@ def test_run_reports_end_after_sessions_closed(tmp_path):
     assert all(closed for status, closed in seen if status == 'done')
 
 
+def test_state_normalization():
+    assert lf._state('completed') == 'DONE'
+    assert lf._state('Cancelled') == 'CANCELED'
+    assert lf._state('FAILED')    == 'FAILED'
+    assert lf._state(None) is None
+
+
+def test_run_accepts_completed_state(tmp_path):
+    class Completed(FakeRhapsody):
+        def list_tasks(self):
+            out = super().list_tasks()
+            for t in out['tasks']:
+                if t['state'] == 'DONE':
+                    t['state'] = 'COMPLETED'
+            return out
+    rt = FakeRuntime(rhapsody=Completed())
+    assert _run(rt, tmp_path).run()['status'] == 'done'
+
+
 def test_run_rides_out_transient_poll_failures(tmp_path):
     class Flaky(FakeRhapsody):
         fails = 2

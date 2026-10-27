@@ -160,6 +160,15 @@ def validate_wells(wells: List[str]) -> List[str]:
     return [w for w in WELLS if w in set(wells)]          # plate order
 
 
+def _state(state) -> Optional[str]:
+    '''Task state normalized to rhapsody's terminal vocabulary: upper case,
+    ``COMPLETED`` as ``DONE``, ``CANCELLED`` as ``CANCELED``.'''
+    if not state:
+        return None
+    state = str(state).upper()
+    return {'COMPLETED': 'DONE', 'CANCELLED': 'CANCELED'}.get(state, state)
+
+
 def _kv(text: str) -> Dict[str, str]:
     '''``key=value`` tokens of a task's stdout.'''
     out: Dict[str, str] = {}
@@ -398,13 +407,13 @@ class LucidRun:
                  for cmd in cmds.values()]
         uids  = [t['uid'] for t in rh.submit_tasks(tasks)]
         names = dict(zip(uids, cmds))
-        final = {'DONE', 'FAILED', 'CANCELED', 'CANCELLED'}
+        final = {'DONE', 'FAILED', 'CANCELED'}
         end   = time.time() + timeout
         while True:
             # one call returns every task with state and stdout
             tasks  = self._retry(rh.list_tasks, 'list_tasks')
-            listed = {t['uid']: t for t in tasks.get('tasks', [])
-                      if t.get('uid') in names}
+            listed = {t['uid']: dict(t, state=_state(t.get('state')))
+                      for t in tasks.get('tasks', []) if t.get('uid') in names}
             states = [listed.get(u, {}).get('state') for u in uids]
             if progress:
                 n_run  = sum(1 for s in states if s == 'RUNNING')
@@ -473,6 +482,7 @@ class LucidRun:
     #
     def _preflight(self, globus, rh, stage):
         pre = self._shell(rh, {'pre': f'echo scratch=$SCRATCH\n'
+                                      f'mkdir -p $SCRATCH/lucid-e2e/runs\n'
                                       f'shifterimg lookup {CP_IMAGE} >/dev/null'
                                       f' || shifterimg pull {CP_IMAGE} >/dev/null'},
                           900)['pre']
@@ -482,7 +492,7 @@ class LucidRun:
         # previews come back through staging at the very end: fail now, not
         # after an hour of compute, if it may not read scratch
         try:
-            stage.list(scratch)
+            stage.list(f'{scratch}/lucid-e2e')       # small, unlike $SCRATCH
         except Exception as e:
             raise LucidError(f'staging plugin cannot access {scratch} -- start '
                              'the endpoint with RADICAL_ORBIT_SCRATCH_BASE='
@@ -533,15 +543,17 @@ class LucidRun:
 
     def _package(self, globus, rh, stage):
         # failed wells' partial output must not enter CSV / tarball / previews
+        with self._lock:
+            failed = list(self.state.get('failed_wells', {}))
+            n_done = self.state['stats']['compute']['done']
         drop = ' '.join(f'{self._run_dir}/{d}/{w}{self._field}'
-                        for w in self.state.get('failed_wells', {})
-                        for d in ('out', 'work'))
+                        for w in failed for d in ('out', 'work'))
         pkg = self._shell(rh, {'pkg': PACKAGE.format(
                     drop=f'rm -rf {drop}' if drop else '',
                     run=self._run_dir, run_id=self.run_id, image=CP_IMAGE,
                     pipeline=self._analysis['pipeline'],
                     images_path=self._img_path, field=self._field,
-                    n=self.state['stats']['compute']['done'],
+                    n=n_done,
                     endpoint=self._endpoint, n_prev=N_PREVIEW,
                     preview=PREVIEW)}, 900)['pkg']
         self._check(pkg, 'package')
