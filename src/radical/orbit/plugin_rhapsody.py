@@ -438,6 +438,8 @@ class RhapsodySession(PluginSession):
             raise HTTPException(
                 status_code=500,
                 detail=f"session init failed: {self._init_error}")
+        if self._rh_session is None:          # close() detaches it first
+            raise RuntimeError("session is closed")
 
     def _deserialize_task(self, td: dict) -> dict:
         """Deserialize pickled or import-path function fields in a task dict.
@@ -520,10 +522,13 @@ class RhapsodySession(PluginSession):
         results   = []
         all_tasks = []   # collect for batch watcher
 
+        rh_session = self._rh_session
         for i in range(0, len(task_dicts), _CHUNK):
             chunk = task_dicts[i:i + _CHUNK]
             tasks = await asyncio.to_thread(self._prepare_batch, chunk)
-            await self._rh_session.submit_tasks(tasks)
+            if self._rh_session is not rh_session:   # closed meanwhile
+                raise RuntimeError("session is closed")
+            await rh_session.submit_tasks(tasks)
             for t in tasks:
                 uid_str = str(t.uid)
                 self._tasks[uid_str] = t
@@ -1014,29 +1019,43 @@ class RhapsodySession(PluginSession):
         except BaseException:
             # includes cancellation by the endpoint's call timeout; a failing
             # cleanup must not mask the original error
-            if self._data.get(name, (None,))[0] is backend:
+            if self._owns(name, backend):
                 del self._data[name]
-            try:
-                await asyncio.shield(backend.shutdown())
-            except Exception as e:
-                log.warning("[%s] data backend %s cleanup failed: %s",
-                            self._sid, name, e)
+            await self._shutdown_quietly(backend, shield=True)
             raise
 
         # data_shutdown or session close may have run while start awaited
-        if self._data.get(name, (None,))[0] is not backend \
-                or self._rh_session is None:
-            try:
-                await backend.shutdown()
-            except Exception as e:
-                log.warning("[%s] data backend %s cleanup failed: %s",
-                            self._sid, name, e)
+        if not self._owns(name, backend) or self._rh_session is None:
+            await self._shutdown_quietly(backend)
             raise HTTPException(status_code=409,
                                 detail=f"data backend {name!r} was shut "
                                         "down during start")
 
-        self._rh_session.add_backend(backend)
+        try:
+            self._rh_session.add_backend(backend)
+        except Exception:
+            # a store nobody can reach or close must not keep running
+            del self._data[name]
+            await self._shutdown_quietly(backend)
+            raise
         return self._data_info(name)
+
+    def _owns(self, name: str, backend) -> bool:
+        """True if ``name`` is still reserved for this very ``backend``."""
+        return self._data.get(name, (None,))[0] is backend
+
+    async def _shutdown_quietly(self, backend, shield: bool = False) -> None:
+        """Stop a data backend during cleanup.  A failure is logged, not
+        raised, so it cannot mask the error that triggered the cleanup;
+        ``shield`` keeps the shutdown running if the caller is cancelled."""
+        try:
+            if shield:
+                await asyncio.shield(backend.shutdown())
+            else:
+                await backend.shutdown()
+        except Exception as e:
+            log.warning("[%s] data backend %s cleanup failed: %s",
+                        self._sid, backend.name, e)
 
     def _data_info(self, name: str) -> dict:
         backend, kind = self._data[name]
@@ -1058,9 +1077,16 @@ class RhapsodySession(PluginSession):
         if entry is None:
             raise HTTPException(status_code=404,
                                 detail=f"data backend {name} not found")
-        if self._rh_session is not None:
-            self._rh_session.backends.pop(name, None)
-        await entry[0].shutdown()
+        owned = self._rh_session.backends.pop(name, None)
+        try:
+            await entry[0].shutdown()
+        except BaseException:
+            # keep it reachable for a retry and for session close
+            if self._rh_session is not None and name not in self._data:
+                self._data[name] = entry
+                if owned is not None:
+                    self._rh_session.backends[name] = owned
+            raise
         return {"name": name, "status": "shutdown"}
 
     async def close(self) -> dict:
@@ -1072,6 +1098,9 @@ class RhapsodySession(PluginSession):
         # mutating the backend dict rhapsody's close iterates.
         data, self._data = self._data, {}
         rh_session, self._rh_session = self._rh_session, None
+        # a successful rhapsody close stopped the backends it owned; the
+        # loop below stops the rest (all of them if that close failed)
+        owned = set()
         try:
             if rh_session:
                 # Telemetry is best effort: never let it block teardown.
@@ -1085,18 +1114,17 @@ class RhapsodySession(PluginSession):
                                     self._sid, e)
                 self._telemetry = None
                 await self._unwind_telemetry(rh_session)
+                held = set(rh_session.backends)
                 await rh_session.close()
+                owned = held
         finally:
             self._tasks = {}
 
             # stop data backends the rhapsody session did not own yet (start
-            # still running); shutdown is idempotent for the ones it closed
-            for backend, _ in data.values():
-                try:
-                    await backend.shutdown()
-                except Exception as e:
-                    log.warning("[%s] data backend %s shutdown failed: %s",
-                                self._sid, backend.name, e)
+            # still running, or add_backend not reached)
+            for name, (backend, _) in data.items():
+                if name not in owned:
+                    await self._shutdown_quietly(backend)
             await super().close()
         return {}
 

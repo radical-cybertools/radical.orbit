@@ -91,8 +91,15 @@ async def test_remote_redis_lifecycle():
         await other.shutdown()
 
         await data.shutdown()
-        with pytest.raises(OSError):
-            await asyncio.to_thread(_redis_ping, endpoint.serialize())
+        # redis may take its shutdown grace period to release the port
+        for _ in range(50):
+            try:
+                await asyncio.to_thread(_redis_ping, endpoint.serialize())
+            except OSError:
+                break
+            await asyncio.sleep(0.1)
+        else:
+            pytest.fail('redis still answers 5 s after shutdown')
     finally:
         await data.shutdown()
         await exe.shutdown()
