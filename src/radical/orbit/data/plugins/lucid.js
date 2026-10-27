@@ -12,7 +12,7 @@ export const name = 'lucid';
 
 let escHtml = s => String(s || '');   // replaced by api.escHtml in init()
 
-const pollers   = {};                  // endpointName -> interval id
+const pollers   = {};                  // endpointName -> {id, page}
 
 const PHASES = [
   ['preflight', 'Preflight'],
@@ -287,20 +287,26 @@ async function submit(page, api) {
 // Notifications drive the page; polling is the safety net (e.g. an SSE gap).
 function startPolling(page, api) {
   const ep = api.endpointName;
-  if (pollers[ep]) return;
-  pollers[ep] = setInterval(async () => {
-    if (!page.isConnected) { stopPolling(ep); return; }
+  if (pollers[ep] && pollers[ep].page === page) return;
+  stopPolling(ep);                      // a rebuilt page replaces the old poller
+  const id = setInterval(async () => {
+    if (!page.isConnected) { stopPolling(ep, id); return; }
     try {
       const sid = await getSession(api);
       const st  = await api.fetch(`status/${sid}`);
       render(page, api, st);
-      if (st.status !== 'running') stopPolling(ep);
+      if (st.status !== 'running') stopPolling(ep, id);
     } catch (e) { /* transient: keep polling */ }
   }, 2000);
+  pollers[ep] = {id, page};
 }
 
-function stopPolling(ep) {
-  clearInterval(pollers[ep]);
+// Stop the endpoint's poller; with ``id``, only if it is still that one.
+function stopPolling(ep, id) {
+  const p = pollers[ep];
+  if (!p) return;
+  if (id !== undefined && p.id !== id) { clearInterval(id); return; }
+  clearInterval(p.id);
   delete pollers[ep];
 }
 

@@ -63,6 +63,7 @@ class FakeRhapsody:
     def __init__(self, fail_names=()):
         self.fail_names = set(fail_names)
         self.tasks      = {}
+        self.scripts    = []
         self.closed     = False
 
     def submit_tasks(self, tasks):
@@ -70,13 +71,15 @@ class FakeRhapsody:
         for t in tasks:
             uid    = f'task.{len(self.tasks):04d}'
             script = t['arguments'][1]
+            self.scripts.append(script)
             if 'echo scratch=$SCRATCH' in script:
                 stdout = 'Welcome to the login banner\nscratch=/scratch/me\n'
             elif 'cellprofiler -c -r' in script:
                 stdout = 'host=nid001 files=42\n'
             else:
                 stdout = ''
-            failed = any(n in script for n in self.fail_names)
+            failed = 'cellprofiler -c -r' in script \
+                     and any(n in script for n in self.fail_names)
             self.tasks[uid] = {'uid': uid, 'state': 'FAILED' if failed else 'DONE',
                                'stdout': stdout, 'stderr': 'boom' if failed else ''}
             out.append({'uid': uid})
@@ -217,6 +220,9 @@ def test_run_partial_task_failure_continues(tmp_path):
     assert st['stats']['compute']['failed'] == 1
     assert list(st['failed_wells']) == ['r01c02']
     assert st['tasks']['failed'] == 1
+    pkg = [t for t in rt.clients['rhapsody'].scripts if 'cells_per_well.csv' in t]
+    assert len(pkg) == 1
+    assert 'out/r01c02f01p05' in pkg[0] and 'out/r01c01f01p05' not in pkg[0]
 
 
 def test_run_all_tasks_failed(tmp_path):
@@ -382,6 +388,9 @@ def test_preflight_fails_early_without_staging_access(tmp_path):
     {'images_path'  : 'relative/path'},
     {'pipeline_path': '/p;id'},
     {'collection'   : 'not-a-uuid'},
+    {'out_base'     : '/'},
+    {'field'        : 'f01; rm -rf ~'},
+    {'run_id'       : 'e2e-1; id'},
 ])
 def test_run_rejects_unsafe_inputs(tmp_path, kw):
     with pytest.raises(lf.LucidError):

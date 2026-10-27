@@ -123,13 +123,14 @@ def get_analysis(analysis_id: str) -> Dict[str, Any]:
 # in a remote shell script: accept plain absolute paths and UUIDs only.
 _PATH_RE = re.compile(r'^/[A-Za-z0-9._/-]*$')
 _UUID_RE = re.compile(r'^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$')
+_FIELD_RE = re.compile(r'^[a-z0-9]+$')
 
 
 def validate_path(path: str, what: str) -> str:
     if not isinstance(path, str) or not _PATH_RE.match(path) \
-            or '..' in path.split('/'):
+            or '..' in path.split('/') or not path.strip('/'):
         raise LucidError(f'invalid {what}: {path!r} (absolute path of '
-                         '[A-Za-z0-9._/-] expected)')
+                         '[A-Za-z0-9._/-] below / expected)')
     return path
 
 
@@ -211,6 +212,7 @@ print('montage_well=' + os.path.basename(wells[0].rstrip('/')))
 PACKAGE = '''
 set -e
 R={run}/results; mkdir -p $R; cd {run}/out
+{drop}
 echo well,cropped_cells > $R/cells_per_well.csv
 for d in */; do echo "${{d%/}},$(ls $d | wc -l)" >> $R/cells_per_well.csv; done
 tar czf $R/cropped_cells.tgz */
@@ -260,6 +262,10 @@ class LucidRun:
         self._pipe_path = validate_path(pipeline_path, 'pipeline path').rstrip('/') + '/'
         self._img_path  = validate_path(images_path, 'images path').rstrip('/')
         self._out_base  = validate_path(out_base, 'output base').rstrip('/')
+        if not isinstance(field, str) or not _FIELD_RE.match(field):
+            raise LucidError(f'invalid field: {field!r}')
+        if run_id is not None and not RUN_ID_RE.match(str(run_id)):
+            raise LucidError(f'invalid run id: {run_id!r}')
         self._field     = field
         self._backend   = backend
         self._on_update = on_update
@@ -504,7 +510,12 @@ class LucidRun:
                              f'{self._run_dir}/logs/')
 
     def _package(self, globus, rh, stage):
+        # failed wells' partial output must not enter CSV / tarball / previews
+        drop = ' '.join(f'{self._run_dir}/{d}/{w}{self._field}'
+                        for w in self.state.get('failed_wells', {})
+                        for d in ('out', 'work'))
         pkg = self._shell(rh, {'pkg': PACKAGE.format(
+                    drop=f'rm -rf {drop}' if drop else '',
                     run=self._run_dir, run_id=self.run_id, image=CP_IMAGE,
                     pipeline=self._analysis['pipeline'],
                     images_path=self._img_path, field=self._field,

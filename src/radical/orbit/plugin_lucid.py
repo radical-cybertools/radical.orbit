@@ -68,7 +68,7 @@ class LucidSession(PluginSession):
         return self._plugin._status()
 
     async def get_image(self, run_id: str, name: str) -> dict:
-        return self._plugin._image(run_id, name)
+        return await asyncio.to_thread(self._plugin._image, run_id, name)
 
 
 # ------------------------------------------------------------------------------
@@ -189,7 +189,17 @@ class PluginLucid(Plugin):
                 if self._rt_own is None:
                     from .runtime import EndpointRuntime
                     rt = EndpointRuntime(broker_url=url)
-                    rt.start(wait=True)
+                    try:
+                        rt.start(wait=True)
+                    except Exception as e:
+                        try:
+                            rt.stop()
+                        except Exception:
+                            pass
+                        raise HTTPException(
+                            status_code=503,
+                            detail=f'cannot reach {_BROKER_ENV}={url}: '
+                                   f'{e}') from e
                     self._rt_own = rt
                 return self._rt_own
         rt = getattr(self._app.state, 'endpoint_service', None)
@@ -231,7 +241,7 @@ class PluginLucid(Plugin):
         if not endpoint:
             raise HTTPException(status_code=400, detail='no endpoint selected')
         try:
-            refresh = lf.transfer_refresh_token()
+            refresh = await asyncio.to_thread(lf.transfer_refresh_token)
             rt      = await asyncio.to_thread(self._runtime)
             topo    = await asyncio.to_thread(rt.topology)
             if endpoint not in lf.candidate_endpoints(topo):
@@ -248,12 +258,16 @@ class PluginLucid(Plugin):
 
         run._on_update = lambda st, rid=run.run_id: self._on_update(rid, st)
         with self._lock:
+            prev         = self._run
             self._run    = run
             self._state  = run.snapshot()
             self._thread = threading.Thread(target=self._execute, args=(run,),
                                             daemon=True,
                                             name=f'lucid-{run.run_id}')
             self._thread.start()
+        if prev is not None:                # _image serves the current run only
+            shutil.rmtree(os.path.join(self._imgdir, prev.run_id),
+                          ignore_errors=True)
         log.info('[lucid] started run %s on %s (%d wells)', run.run_id,
                  endpoint, len(run.state['wells']))
         return {'run_id': run.run_id}
