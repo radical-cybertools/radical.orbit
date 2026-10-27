@@ -655,6 +655,8 @@ class TestCollectAllocations:
             assert backend._accounting_enabled() is True
             assert backend._collect_allocations(None) == {'allocations': []}
 
+        assert backend._has_accounting is None   # re-probed next call
+
 
 # ---- caching tests ----------------------------------------------------------
 
@@ -663,11 +665,13 @@ class TestCaching:
     def _make_backend(self):
         import threading
 
-        backend             = QueueInfoSlurm.__new__(QueueInfoSlurm)
-        backend._env        = dict(os.environ)
-        backend._cache      = {}
-        backend._cache_time = {}
-        backend._cache_lock = threading.Lock()
+        backend                 = QueueInfoSlurm.__new__(QueueInfoSlurm)
+        backend._env            = dict(os.environ)
+        backend._cache          = {}
+        backend._cache_time     = {}
+        backend._cache_lock     = threading.Lock()
+        backend._has_accounting = None
+        backend._probe_lock     = threading.Lock()
         return backend
 
     def test_cache_returns_cached_value(self):

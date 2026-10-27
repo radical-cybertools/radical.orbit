@@ -131,20 +131,22 @@ class QueueInfoSlurm(QueueInfo):
         Return False iff ``scontrol show config`` reports an accounting
         storage plugin other than slurmdbd (sacctmgr then cannot work).
 
-        The probe runs once per backend instance (AccountingStorageType
-        only changes with a slurmctld restart).  If scontrol fails or does
-        not report the setting, accounting is assumed to be enabled and
-        the sacctmgr calls decide.
+        A definitive probe result is kept for the life of the backend
+        instance (AccountingStorageType only changes with a slurmctld
+        restart).  If scontrol fails or does not report the setting,
+        accounting is assumed to be enabled for this call, the sacctmgr
+        calls decide, and the next call probes again.
         """
 
         with self._probe_lock:
             if self._has_accounting is None:
                 self._probe_accounting()
-            return self._has_accounting
+            return self._has_accounting is not False
 
 
     def _probe_accounting(self):
-        """Set ``_has_accounting`` from ``scontrol show config``."""
+        """Set ``_has_accounting`` from ``scontrol show config`` (left
+        None if scontrol cannot tell)."""
 
         storage = None
         stdout  = run_cmd(['scontrol', 'show', 'config'],
@@ -155,8 +157,10 @@ class QueueInfoSlurm(QueueInfo):
                 storage = val.strip()
                 break
 
-        self._has_accounting = storage is None or \
-                               storage == 'accounting_storage/slurmdbd'
+        if storage is None:
+            return
+
+        self._has_accounting = storage == 'accounting_storage/slurmdbd'
         if not self._has_accounting:
             log.warning('SLURM accounting disabled (%s): allocation '
                         'and partition access info unavailable', storage)
