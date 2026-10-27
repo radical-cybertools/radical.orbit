@@ -254,7 +254,8 @@ class PluginLucid(Plugin):
                 raise lf.LucidError(f'endpoint {endpoint!r} does not serve '
                                     f'{list(lf.NEEDED_PLUGINS)}')
             kw  = {k: params[k] for k in ('collection', 'pipeline_path',
-                                          'images_path', 'analysis')
+                                          'images_path', 'analysis',
+                                          'field', 'backend')
                    if params.get(k)}
             rid = lf.new_run_id()
             run = lf.LucidRun(rt, endpoint, params.get('wells') or [],

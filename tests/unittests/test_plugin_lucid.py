@@ -439,6 +439,7 @@ def test_preflight_fails_early_without_staging_access(tmp_path):
     {'images_path'  : '/P1/Images\n'},                # `$` matches before \n
     {'field'        : 'f01; rm -rf ~'},
     {'run_id'       : 'e2e-1; id'},
+    {'backend'      : 'dragon; id'},
 ])
 def test_run_rejects_unsafe_inputs(tmp_path, kw):
     with pytest.raises(lf.LucidError):

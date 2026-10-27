@@ -126,6 +126,7 @@ def get_analysis(analysis_id: str) -> Dict[str, Any]:
 _PATH_RE = re.compile(r'^/[A-Za-z0-9._/-]*$')
 _UUID_RE = re.compile(r'^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$')
 _FIELD_RE = re.compile(r'^[a-z0-9]+$')
+_NAME_RE  = re.compile(r'^[a-z0-9_]+$')
 
 
 def validate_path(path: str, what: str) -> str:
@@ -137,9 +138,9 @@ def validate_path(path: str, what: str) -> str:
 
 
 def validate_collection(uuid: str) -> str:
-    if not isinstance(uuid, str) or not _UUID_RE.fullmatch(uuid):
+    if not isinstance(uuid, str) or not _UUID_RE.fullmatch(uuid.lower()):
         raise LucidError(f'invalid collection id: {uuid!r}')
-    return uuid
+    return uuid.lower()
 
 
 def new_run_id() -> str:
@@ -277,6 +278,8 @@ class LucidRun:
         self._out_base  = validate_path(out_base, 'output base').rstrip('/')
         if not isinstance(field, str) or not _FIELD_RE.fullmatch(field):
             raise LucidError(f'invalid field: {field!r}')
+        if not isinstance(backend, str) or not _NAME_RE.fullmatch(backend):
+            raise LucidError(f'invalid backend: {backend!r}')
         if run_id is not None and not RUN_ID_RE.fullmatch(str(run_id)):
             raise LucidError(f'invalid run id: {run_id!r}')
         self._field     = field

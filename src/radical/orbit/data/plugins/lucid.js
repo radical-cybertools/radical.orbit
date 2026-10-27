@@ -148,7 +148,10 @@ export function init(page, api) {
 }
 
 export function onNotification(data, page, api) {
-  if (data.topic === 'run_status') render(page, api, data.data);
+  if (data.topic !== 'run_status') return;
+  render(page, api, data.data);
+  // a run started elsewhere (another tab, the CLI): keep the safety net
+  if (isActive(data.data)) startPolling(page, api);
 }
 
 
