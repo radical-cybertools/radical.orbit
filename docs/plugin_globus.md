@@ -8,7 +8,8 @@ from the byte-streaming `staging` plugin.
 
 The plugin is **endpoint-side** (it is not hosted on the broker) and is only
 enabled when [globus-sdk](https://globus-sdk-python.readthedocs.io/) is
-importable.
+importable. It supports globus-sdk 3.x (from 3.11) and 4.x. It is part of
+the `default` plugin set on `login`, `compute` and `standalone` endpoints.
 
 ## Architecture
 
@@ -76,11 +77,14 @@ from radical.orbit import EndpointRuntime
 
 rt     = EndpointRuntime()
 rt.start(wait=True)
-eid    = next(n for n in rt.topology() if n != 'broker')
-globus = rt.get_plugin(eid, 'globus')
+eid    = next(n for n, info in rt.topology().items()
+              if info.get('role') == 'endpoint'
+              and 'globus' in (info.get('plugins') or {}))
 
+# get_plugin() registers the session, so the credential goes in here:
 # access token, or refresh_token=… + client_id=…
-globus.register_session(access_token='…', local_collection='…')
+globus = rt.get_plugin(eid, 'globus',
+                       access_token='…', local_collection='…')
 
 sub = globus.submit_transfer(
     source='<src-uuid>', destination='local',
@@ -95,7 +99,9 @@ print(globus.get_task(sub['task_id'])['status'])
 Methods:
 
 `register_session(access_token=None, refresh_token=None, client_id=None, local_collection=None)`  
-Open a session with a Globus credential.
+Open a session with a Globus credential. `get_plugin()` calls this with
+its keyword arguments, so pass the credential there; do not call it again
+on that client.
 
 `submit_transfer(source, destination, items, label=None, sync_level=None)`  
 Submit a transfer. `items` is a list of
@@ -103,7 +109,25 @@ Submit a transfer. `items` is a list of
 `{task_id, submission_id, status}`.
 
 `get_task(task_id)` / `task_wait(task_id, timeout=60, polling_interval=10)` / `cancel_task(task_id)` / `list_tasks(limit=100)`  
-Task monitoring and control.
+Task monitoring and control. The client's `task_wait` polls `get_task`
+every `polling_interval` on a fixed schedule up to `timeout` (at least
+once, so `timeout=0` is a status probe), so no routed call blocks near the
+broker's call timeout. It retries transient poll failures (HTTP 504, 503
+and 429, at the next scheduled poll or after a longer `Retry-After`;
+timeouts and connection errors) and returns
+`{task_id, completed}`. Its `completed` is true once the task reports
+`SUCCEEDED`, `FAILED`, `CANCELED` or `INACTIVE` (e.g. an expired
+credential); a missing or unknown status does not count. Use `get_task`
+for the status.
+
+The endpoint's `wait` route, for direct HTTP callers, bounds one wait to
+`GLOBUS_WAIT_SLICE` (10 s) and follows globus-sdk semantics: `completed`
+is true for any non-ACTIVE status.
+
+For status queries (`get_task`, the `wait` route) the endpoint reports a
+Globus network error or Globus 5xx as a retryable 503; mutating calls
+(submit, delete, mkdir, rename, cancel) keep 502, since a retry could
+duplicate their effect.
 
 `ls(collection, path=None)` / `mkdir(collection, path)` / `rename(collection, oldpath, newpath)` / `delete(collection, paths, recursive=False, label=None)`  
 Filesystem operations on a collection (`delete` submits a Globus delete

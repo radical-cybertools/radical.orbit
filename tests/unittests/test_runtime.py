@@ -85,6 +85,7 @@ class _EchoPlugin(Plugin):
         self.add_route_get('notify',      self._notify)
         self.add_route_get('slow/{ms}',   self._slow)
         self.add_route_get('block/{ms}',  self._block)
+        self.add_route_get('busy',        self._busy)
 
     async def _ping(self, request):
         return {'pong': True}
@@ -103,6 +104,12 @@ class _EchoPlugin(Plugin):
         # loop — so admission of further requests still runs (503 fast-fail).
         await asyncio.sleep(int(request.path_params['ms']) / 1000.0)
         return {'slow': True}
+
+    async def _busy(self, request):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=429, detail='slow down',
+                            headers={'Retry-After' : '7',
+                                     'Content-Type': 'text/plain'})
 
     async def _block(self, request):
         # A synchronous sleep pins the WORK loop — the transport thread must
@@ -371,6 +378,23 @@ def test_503_fast_fail_at_concurrency_cap(harness):
     assert resp.status_code == 503
     assert 'retry-after' in {k.lower(): v for k, v in resp.headers.items()}
     t.join(timeout=5.0)
+
+
+def test_served_handler_exception_headers_forwarded(harness):
+    """An HTTPException's headers (e.g. Retry-After) reach the caller."""
+    make_broker, make_runtime = harness
+    srv = make_broker()
+    make_runtime(srv.url, name='epA', plugins=['echo_rt'])
+    b = make_runtime(srv.url, name='epB')
+    assert _wait_topology(b, 'epA', 'echo_rt', timeout=5.0)
+
+    resp = b.call('epA', 'GET', '/echo_rt/busy', timeout=3.0)
+    assert resp.status_code == 429
+    assert resp.headers.get('retry-after') == '7'
+    # the body is the runtime's JSON error, whatever the handler claimed
+    ctypes = [v for k, v in resp.headers.items() if k.lower() == 'content-type']
+    assert ctypes == ['application/json']
+    assert resp.json()
 
 
 # ---------------------------------------------------------------------------

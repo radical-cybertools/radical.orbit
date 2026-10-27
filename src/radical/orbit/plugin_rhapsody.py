@@ -7,11 +7,14 @@ and monitor compute / AI tasks on endpoint nodes.
 
 import asyncio
 import base64
+import functools
 import importlib
+import importlib.util
 import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 import uuid
@@ -38,6 +41,12 @@ ROUTE_LIST_TASKS  = 'list_tasks/{sid}'
 ROUTE_TASK        = 'task/{sid}/{uid}'
 ROUTE_CANCEL      = 'cancel/{sid}/{uid}'
 ROUTE_CANCEL_ALL  = 'cancel_all/{sid}'
+ROUTE_DATA_START     = 'data_start/{sid}'
+ROUTE_DATA_ENDPOINTS = 'data_endpoints/{sid}'
+ROUTE_DATA_SHUTDOWN  = 'data_shutdown/{sid}/{name}'
+
+# data backend names travel as a URL path segment (data_shutdown)
+DATA_NAME_RE = re.compile(r'[A-Za-z0-9_.-]+')
 
 TERMINAL_STATES     = {'DONE', 'FAILED', 'CANCELED', 'COMPLETED'}
 WS_PAYLOAD_LIMIT    = 8 * 1024 * 1024  # target max per batch (conservative)
@@ -67,11 +76,25 @@ NOTIFY_BATCH_BYTES  = FRAME_CAP // BUDGET_RATIO
 # object.
 RETURN_VALUE_LIMIT  = FRAME_CAP // BUDGET_RATIO
 
+# Size bound (UTF-8 bytes) for the stdout and for the stderr a terminal
+# notification carries.  Unlike a return value, output can be shortened
+# meaningfully: a longer stream keeps its tail behind a truncation marker,
+# and the full text stays available via this session's ``get_task``.  Both
+# streams together claim a quarter of the frame, so a payload at the
+# return-value limit still fits one frame.
+OUTPUT_RATIO        = 8
+OUTPUT_NOTIFY_LIMIT = FRAME_CAP // OUTPUT_RATIO
+
 # Endpoint-level override for the coalescing window above (seconds).  The
 # default trades ~250 ms of completion latency for fewer WS frames; a
 # latency-sensitive endpoint (co-located service, sequential task round
 # trips) sets `0` to flush every completion immediately.
 ENV_NOTIFY_WINDOW   = 'RADICAL_ORBIT_RHAPSODY_NOTIFY_WINDOW'
+
+# Endpoint-level telemetry switch: rhapsody session telemetry (when its
+# ``[telemetry]`` extra is installed) is on unless this is set to one of
+# ``0`` / ``false`` / ``no`` / ``off``.  Resolved once per process.
+ENV_TELEMETRY       = 'RADICAL_ORBIT_RHAPSODY_TELEMETRY'
 
 # Guard optional dependencies
 try:
@@ -84,6 +107,39 @@ import msgpack
 from . import _prof as rprof
 
 
+@functools.cache
+def _telemetry_available() -> bool:
+    """Whether rhapsody's ``[telemetry]`` extra (opentelemetry-sdk) is
+    installed.  Probed up front because rhapsody 0.4 fails only inside
+    ``start_telemetry()``, after wiring a half-built manager into the
+    session.  Cached, so the warning is logged once per process.
+    """
+    try:
+        ok = importlib.util.find_spec('opentelemetry.sdk') is not None
+    except ImportError:              # parent package missing
+        ok = False
+    if not ok:
+        log.warning("rhapsody telemetry disabled: opentelemetry-sdk "
+                    "(the rhapsody [telemetry] extra) is not installed")
+    return ok
+
+
+@functools.cache
+def _resolve_telemetry() -> bool:
+    """Whether ``$RADICAL_ORBIT_RHAPSODY_TELEMETRY`` leaves telemetry on.
+
+    Unset means on.  An unrecognised value warns and keeps the default.
+    Cached, so the switch is read (and any warning logged) once per process.
+    """
+    raw = os.environ.get(ENV_TELEMETRY, '').strip().lower()
+    if raw in ('0', 'false', 'no', 'off'):
+        return False
+    if raw not in ('', '1', 'true', 'yes', 'on'):
+        log.warning("[rhapsody] invalid %s=%r — telemetry stays on",
+                    ENV_TELEMETRY, raw)
+    return True
+
+
 def _json_safe(v):
     """Coerce *v* to a JSON-serializable form.
 
@@ -94,6 +150,8 @@ def _json_safe(v):
     or WS frame is dropped.  Falls back through ``to_dict`` / recursion
     / ``str``.
     """
+    if isinstance(v, str):
+        return v                    # always encodable; skip a full dumps
     try:
         json.dumps(v)
         return v
@@ -114,12 +172,17 @@ def _payload_size(payload: dict) -> int:
     A notification payload is flat (see ``_NOTIFICATION_KEYS``), so summing
     key and value lengths bounds the frame accurately enough — and, unlike
     ``len(str(payload))``, it does not copy a multi-MiB encoded return value
-    just to measure it.  Non-string values are small scalars; 16 bytes each
-    covers them with room to spare.
+    just to measure it.  Strings count in UTF-8 bytes (an ASCII string, e.g.
+    an encoded return value, without encoding it); non-string values are
+    small scalars; 16 bytes each covers them with room to spare.
     """
     size = 2
     for k, v in payload.items():
-        size += len(str(k)) + (len(v) if isinstance(v, str) else 16)
+        if isinstance(v, str):
+            size += len(str(k)) + (len(v) if v.isascii()
+                                   else len(v.encode('utf-8', 'replace')))
+        else:
+            size += len(str(k)) + 16
     return size
 
 
@@ -206,6 +269,12 @@ class RhapsodySession(PluginSession):
         self._telemetry          = None
         self._tasks: dict[str, dict] = {}
 
+        # Data backends started via ``data_start``, keyed by name.  Once
+        # started they are also registered with the rhapsody session, so
+        # session close shuts them down; this map is what the data routes
+        # report on, and it holds a name reserved while its start runs.
+        self._data: dict[str, tuple] = {}         # name -> (backend, kind)
+
         # Async init tracking
         self._init_ready = threading.Event()
         self._init_error: str | None = None
@@ -223,6 +292,7 @@ class RhapsodySession(PluginSession):
         self._notify_window          = NOTIFY_BATCH_WINDOW
         self._notify_batch_bytes     = NOTIFY_BATCH_BYTES
         self._return_value_limit     = RETURN_VALUE_LIMIT
+        self._output_notify_limit    = OUTPUT_NOTIFY_LIMIT
 
         # Cache for deserialized cloudpickle payloads — avoids decoding the
         # same encoded string N times when a batch repeats identical blobs.
@@ -248,14 +318,30 @@ class RhapsodySession(PluginSession):
             self._rh_session = await asyncio.to_thread(
                 rh.Session, backends=backends, uid=self._sid)
 
-            # start_telemetry only exists on newer rhapsody; older
-            # installs don't support it. Skip silently if unavailable.
+            # Telemetry is optional: older rhapsody lacks start_telemetry,
+            # it needs the [telemetry] extra, the operator can switch it off,
+            # and a failure to start it must not fail the session.
             self._telemetry = None
             start_telemetry = getattr(self._rh_session, 'start_telemetry', None)
-            if start_telemetry is not None:
-                self._telemetry = await start_telemetry(
-                    resource_poll_interval=0.1,
-                    checkpoint_path="telemetry-output")
+            if start_telemetry is not None and _resolve_telemetry() \
+                    and _telemetry_available():
+                try:
+                    self._telemetry = await start_telemetry(
+                        resource_poll_interval=0.1,
+                        checkpoint_path="telemetry-output")
+                except Exception as e:
+                    log.warning("[%s] telemetry start failed: %r; not "
+                                "reporting telemetry for this session",
+                                self._sid, e)
+                    await self._unwind_telemetry(self._rh_session,
+                                                 failed_start=True)
+                except BaseException:
+                    # cancelled mid-start: unwind and unblock waiters
+                    await self._unwind_telemetry(self._rh_session,
+                                                 failed_start=True)
+                    self._init_error = "session initialization cancelled"
+                    self._init_ready.set()
+                    raise
 
             # Register state-change callbacks for intermediate notifications
             self._notified_states: dict[str, str] = {}
@@ -280,6 +366,36 @@ class RhapsodySession(PluginSession):
             log.error("[%s] Session initialization failed: %s",
                       self._sid, e)
             raise
+
+    async def _unwind_telemetry(self, rh_session,
+                                failed_start: bool = False) -> None:
+        """Stop rhapsody's telemetry manager best effort and detach it.
+
+        Workaround: rhapsody (<= 0.4) ``Session.close()`` stops telemetry
+        before shutting the backends down, so a raising ``stop()`` leaks
+        the backends -- and a failed ``start_telemetry()`` leaves a
+        half-started manager whose ``stop()`` does raise.  Used after a
+        failed start and before every rhapsody close; drop this once
+        rhapsody isolates telemetry failures itself.
+
+        A stop failure is expected after a failed start (logged at debug)
+        and unexpected otherwise (logged as a warning).
+        """
+        tm = getattr(rh_session, '_telemetry', None)
+        if tm is not None:
+            try:
+                await tm.stop()
+            except Exception as e:
+                if failed_start:
+                    log.debug("[%s] stopping half-started telemetry: %r",
+                              self._sid, e)
+                else:
+                    log.warning("[%s] telemetry stop failed: %r",
+                                self._sid, e)
+            rh_session._telemetry = None
+        sm = getattr(rh_session, '_state_manager', None)
+        if hasattr(sm, '_telemetry_observer'):
+            sm._telemetry_observer = None
 
     def _on_task_state_change(self, task, state):
         """Fire notification on intermediate state changes (e.g. RUNNING).
@@ -494,7 +610,9 @@ class RhapsodySession(PluginSession):
         """Split notifications into frames under ``_notify_batch_bytes``.
 
         A single payload larger than the budget still ships alone — it is
-        bounded by ``_return_value_limit``, which leaves frame-cap headroom.
+        bounded by ``_return_value_limit`` (half the frame) plus
+        ``_output_notify_limit`` per output stream (an eighth each), which
+        leaves a quarter of the frame for the remaining fields.
         """
         frames: list[list[dict]] = []
         frame:  list[dict]       = []
@@ -642,7 +760,9 @@ class RhapsodySession(PluginSession):
             if isinstance(val, bytes):
                 d[key] = val.decode('utf-8', errors='replace')
             elif isinstance(val, list):
-                d[key] = '\n'.join(str(v) for v in val)
+                d[key] = '\n'.join(
+                    v.decode('utf-8', errors='replace')
+                    if isinstance(v, bytes) else str(v) for v in val)
 
         # Ensure return_value is JSON-serializable (see _encode_return_value:
         # rich results keep full fidelity, they are not stringified).  A
@@ -714,20 +834,77 @@ class RhapsodySession(PluginSession):
         if not d.get('error'):
             d['error'] = msg
 
-    _NOTIFICATION_KEYS = {'uid', 'state', 'exit_code',
+    _NOTIFICATION_KEYS = {'uid', 'state', 'exit_code', 'stdout', 'stderr',
                           'return_value', '_return_value_encoding',
                           'error', 'exception', 'traceback'}
+
+    # Every key a terminal notification may carry: the selected task fields
+    # plus the flags ``_notification_payload`` adds (forwarded verbatim by
+    # the task dispatcher).
+    NOTIFICATION_FORWARD_KEYS = frozenset(
+        _NOTIFICATION_KEYS | {'stdout_truncated', 'stderr_truncated'})
 
     def _notification_payload(self, t) -> dict:
         """Build a minimal notification dict for a completed task.
 
         Only essential fields are included to keep WebSocket/SSE
-        payloads small.  Clients needing the full task dict (e.g.
-        stdout/stderr) can fetch it via ``GET /task/{sid}/{uid}``.
+        payloads small.  ``stdout`` / ``stderr`` are kept to their last
+        ``_output_notify_limit`` bytes each (see ``_fit_output``); a cut
+        stream is flagged ``stdout_truncated`` / ``stderr_truncated``.  On
+        a direct rhapsody session the full task dict is available via
+        ``GET /task/{sid}/{uid}``.
         """
-        full = self._sanitize_task(t)
-        return {k: v for k, v in full.items()
-                if k in self._NOTIFICATION_KEYS}
+        full    = self._sanitize_task(t)
+        payload = {k: v for k, v in full.items()
+                   if k in self._NOTIFICATION_KEYS}
+        for key, val in payload.items():
+            if isinstance(val, str) and key not in ('stdout', 'stderr') \
+                    and not val.isascii():
+                # lone surrogates (surrogateescape-decoded text in any
+                # field) make msgpack refuse the whole batch frame; the
+                # output streams get the same in _fit_output, bounded
+                payload[key] = val.encode('utf-8', 'replace').decode('utf-8')
+        for key in ('stdout', 'stderr'):
+            if isinstance(payload.get(key), str):
+                payload[key], cut = self._fit_output(payload[key])
+                if cut:
+                    payload[f'{key}_truncated'] = True
+        return payload
+
+    def _fit_output(self, text: str) -> tuple[str, bool]:
+        """Fit ``text`` into ``_output_notify_limit`` UTF-8 bytes.
+
+        Returns ``(text, truncated)``.  The result is always valid UTF-8
+        (lone surrogates become ``?``), else msgpack refuses the frame.  A
+        longer stream keeps its tail (the end of a log is where errors are),
+        cut on a character boundary behind a marker naming the dropped
+        character count; below 256 bytes of limit there is no room for the
+        marker and the bare tail is returned.  Encoding is bounded by the
+        limit: the last ``limit`` characters always cover the kept bytes.
+        """
+        limit = self._output_notify_limit
+        if limit <= 0:
+            return '', bool(text)
+        if text.isascii():
+            if len(text) <= limit:
+                return text, False
+            raw = text[-limit:].encode('ascii')
+        elif len(text) <= limit:
+            raw = text.encode('utf-8', errors='replace')
+            if len(raw) <= limit:
+                return raw.decode('utf-8'), False
+        else:
+            raw = text[-limit:].encode('utf-8', errors='replace')
+
+        keep  = limit - 128 if limit >= 256 else limit  # 128: marker room
+        start = len(raw) - keep
+        while start < len(raw) and (raw[start] & 0xC0) == 0x80:
+            start += 1                            # skip continuation bytes
+        tail  = raw[start:].decode('utf-8')
+        if limit < 256:
+            return tail, True
+        return (f"[... {len(text) - len(tail)} characters truncated ...]\n"
+                + tail), True
 
     async def list_tasks(self) -> dict:
         """Return all tasks in this session with current state."""
@@ -796,20 +973,132 @@ class RhapsodySession(PluginSession):
         results = await asyncio.gather(*[_try_cancel(u) for u in uids])
         return {"canceled": sum(1 for r in results if r)}
 
+    # -- data backends -------------------------------------------------------
+
+    async def data_start(self, kind: str, name: str | None = None,
+                         kwargs: dict | None = None) -> dict:
+        """
+        Start a rhapsody data backend (``redis``, ``dragon``, ...) inside this
+        session, so the store runs next to the session's tasks.
+
+        ``name`` defaults to ``<kind>_data`` and must not collide with any
+        backend of the session, execution backends included.
+
+        Returns the backend's name, kind and serialized endpoints.
+        """
+        self._check_initialized()
+
+        get_data_backend = getattr(rh, 'get_data_backend', None)
+        if get_data_backend is None:
+            raise HTTPException(status_code=501,
+                                detail="installed rhapsody has no data backends")
+
+        name = name or f'{kind}_data'
+        if not DATA_NAME_RE.fullmatch(name):
+            raise HTTPException(status_code=400,
+                                detail=f"invalid data backend name {name!r}")
+        if name in self._data or name in self._rh_session.backends:
+            raise HTTPException(status_code=409,
+                                detail=f"backend {name!r} exists")
+
+        try:
+            backend = get_data_backend(kind, name=name, **(kwargs or {}))
+        except (ValueError, ImportError, TypeError) as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
+        # reserve the name before the (slow) start so a concurrent request
+        # with the same name gets 409, not a second store
+        self._data[name] = (backend, kind)
+        try:
+            await backend.start()
+        except BaseException:
+            # includes cancellation by the endpoint's call timeout; a failing
+            # cleanup must not mask the original error
+            if self._data.get(name, (None,))[0] is backend:
+                del self._data[name]
+            try:
+                await asyncio.shield(backend.shutdown())
+            except Exception as e:
+                log.warning("[%s] data backend %s cleanup failed: %s",
+                            self._sid, name, e)
+            raise
+
+        # data_shutdown or session close may have run while start awaited
+        if self._data.get(name, (None,))[0] is not backend \
+                or self._rh_session is None:
+            try:
+                await backend.shutdown()
+            except Exception as e:
+                log.warning("[%s] data backend %s cleanup failed: %s",
+                            self._sid, name, e)
+            raise HTTPException(status_code=409,
+                                detail=f"data backend {name!r} was shut "
+                                        "down during start")
+
+        self._rh_session.add_backend(backend)
+        return self._data_info(name)
+
+    def _data_info(self, name: str) -> dict:
+        backend, kind = self._data[name]
+        state = backend.state.name
+        eps   = [e.serialize() for e in backend.endpoints] \
+                if state == 'READY' else []
+        return {"name": name, "kind": kind, "state": state, "endpoints": eps}
+
+    async def data_endpoints(self) -> dict:
+        """Report all data backends of this session with their endpoints."""
+        self._check_initialized()
+        return {"backends": {n: self._data_info(n) for n in list(self._data)}}
+
+    async def data_shutdown(self, name: str) -> dict:
+        """Shut down one data backend of this session."""
+        self._check_initialized()
+
+        entry = self._data.pop(name, None)
+        if entry is None:
+            raise HTTPException(status_code=404,
+                                detail=f"data backend {name} not found")
+        if self._rh_session is not None:
+            self._rh_session.backends.pop(name, None)
+        await entry[0].shutdown()
+        return {"name": name, "status": "shutdown"}
+
     async def close(self) -> dict:
         """
         Shutdown RHAPSODY session and clean up.
         """
-        if self._rh_session:
-            if self._telemetry is not None:
-                summary = json.dumps(self._telemetry.summary(), indent=4)
-                log.info(summary)
-                print(summary, flush=True)
+        # Detach before awaiting: a data_start / data_shutdown still in
+        # flight then sees no session and no reservation, instead of
+        # mutating the backend dict rhapsody's close iterates.
+        data, self._data = self._data, {}
+        rh_session, self._rh_session = self._rh_session, None
+        try:
+            if rh_session:
+                # Telemetry is best effort: never let it block teardown.
+                if self._telemetry is not None \
+                        and log.isEnabledFor(logging.INFO):
+                    try:
+                        log.info(json.dumps(self._telemetry.summary(),
+                                            indent=4))
+                    except Exception as e:
+                        log.warning("[%s] telemetry summary failed: %r",
+                                    self._sid, e)
                 self._telemetry = None
-            await self._rh_session.close()
-            self._rh_session = None
-        self._tasks = {}
-        return await super().close()
+                await self._unwind_telemetry(rh_session)
+                await rh_session.close()
+        finally:
+            self._tasks = {}
+
+            # stop data backends the rhapsody session did not own yet (start
+            # still running); shutdown is idempotent for the ones it closed
+            for backend, _ in data.values():
+                try:
+                    await backend.shutdown()
+                except Exception as e:
+                    log.warning("[%s] data backend %s shutdown failed: %s",
+                                self._sid, backend.name, e)
+            await super().close()
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -1271,6 +1560,41 @@ class RhapsodyClient(PluginClient):
         self._raise(resp)
         return resp.json()
 
+    def data_start(self, kind: str, name: str | None = None,
+                   **kwargs) -> dict:
+        """
+        Start a data backend of type ``kind`` in the remote session.
+
+        ``kwargs`` go to the remote data backend's constructor and must be
+        JSON-serializable.  Returns ``{name, kind, state, endpoints}`` with
+        the endpoints serialized as seen from the endpoint's side.
+        """
+        self._require_session()
+
+        url  = self._url(ROUTE_DATA_START.format(sid=self.sid))
+        resp = self._http.post(url, json={"kind": kind, "name": name,
+                                          "kwargs": kwargs})
+        self._raise(resp)
+        return resp.json()
+
+    def data_endpoints(self) -> dict:
+        """Return ``{"backends": {name: {kind, state, endpoints}}}``."""
+        self._require_session()
+
+        url  = self._url(ROUTE_DATA_ENDPOINTS.format(sid=self.sid))
+        resp = self._http.get(url)
+        self._raise(resp)
+        return resp.json()
+
+    def data_shutdown(self, name: str) -> dict:
+        """Shut down the remote data backend ``name``."""
+        self._require_session()
+
+        url  = self._url(ROUTE_DATA_SHUTDOWN.format(sid=self.sid, name=name))
+        resp = self._http.post(url)
+        self._raise(resp)
+        return resp.json()
+
 
 # ---------------------------------------------------------------------------
 # Server-side plugin
@@ -1289,12 +1613,16 @@ class PluginRhapsody(Plugin):
     - GET   /rhapsody/task/{sid}/{uid}       – get single task
     - POST  /rhapsody/cancel/{sid}/{uid}     – cancel single task
     - POST  /rhapsody/cancel_all/{sid}       – cancel all tasks
+    - POST  /rhapsody/data_start/{sid}       – start a data backend
+    - GET   /rhapsody/data_endpoints/{sid}   – list data backends
+    - POST  /rhapsody/data_shutdown/{sid}/{name} – stop a data backend
 
     Notification topics: ``session_status``, ``task_status``,
     ``task_status_batch``.
     '''
 
     plugin_name = "rhapsody"
+    default_roles = ('compute', 'standalone')
     session_class = RhapsodySession
     client_class = RhapsodyClient
     version = '0.0.1'
@@ -1361,9 +1689,10 @@ class PluginRhapsody(Plugin):
         # hosting runtime's *effective* frame cap rather than the protocol
         # default, so a runtime tuned below FRAME_CAP shrinks both budgets
         # instead of letting the transport drop the frames they permit.
-        self._frame_cap          = _resolve_frame_cap(app)
-        self._notify_batch_bytes = self._frame_cap // BUDGET_RATIO
-        self._return_value_limit = self._frame_cap // BUDGET_RATIO
+        self._frame_cap           = _resolve_frame_cap(app)
+        self._notify_batch_bytes  = self._frame_cap // BUDGET_RATIO
+        self._return_value_limit  = self._frame_cap // BUDGET_RATIO
+        self._output_notify_limit = self._frame_cap // OUTPUT_RATIO
 
         self.add_route_post(ROUTE_SUBMIT,     self.submit_tasks)
         self.add_route_post(ROUTE_WAIT,       self.wait_tasks)
@@ -1371,6 +1700,10 @@ class PluginRhapsody(Plugin):
         self.add_route_get (ROUTE_TASK,       self.get_task)
         self.add_route_post(ROUTE_CANCEL,     self.cancel_task)
         self.add_route_post(ROUTE_CANCEL_ALL, self.cancel_all_tasks)
+
+        self.add_route_post(ROUTE_DATA_START,     self.data_start)
+        self.add_route_get (ROUTE_DATA_ENDPOINTS, self.data_endpoints)
+        self.add_route_post(ROUTE_DATA_SHUTDOWN,  self.data_shutdown)
 
     async def register_session(self, request: Request) -> dict:
         """Register a new Rhapsody session.
@@ -1471,9 +1804,10 @@ class PluginRhapsody(Plugin):
         svc = getattr(self._app.state, 'endpoint_service', None)
         session._prof = getattr(svc, '_prof', None) or \
                         rprof.Profiler('rhapsody', ns='radical.orbit')
-        session._notify_window      = self._notify_window
-        session._notify_batch_bytes = self._notify_batch_bytes
-        session._return_value_limit = self._return_value_limit
+        session._notify_window       = self._notify_window
+        session._notify_batch_bytes  = self._notify_batch_bytes
+        session._return_value_limit  = self._return_value_limit
+        session._output_notify_limit = self._output_notify_limit
         return session
 
     @staticmethod
@@ -1572,3 +1906,29 @@ class PluginRhapsody(Plugin):
         sid = request.path_params['sid']
         return await self._forward(sid, RhapsodySession.cancel_all_tasks)
 
+    async def data_start(self, request: Request) -> dict:
+        sid  = request.path_params['sid']
+        data = await request.json()
+        if not isinstance(data, dict) or not isinstance(data.get('kind'), str):
+            raise HTTPException(status_code=400,
+                                detail="body needs a string 'kind'")
+        if not isinstance(data.get('name'), (str, type(None))):
+            raise HTTPException(status_code=400,
+                                detail="'name' must be a string")
+        kwargs = data.get('kwargs') or {}
+        if not isinstance(kwargs, dict):
+            raise HTTPException(status_code=400,
+                                detail="'kwargs' must be an object")
+        return await self._forward(sid, RhapsodySession.data_start,
+                                   kind=data['kind'], name=data.get('name'),
+                                   kwargs=kwargs)
+
+    async def data_endpoints(self, request: Request) -> dict:
+        sid = request.path_params['sid']
+        return await self._forward(sid, RhapsodySession.data_endpoints)
+
+    async def data_shutdown(self, request: Request) -> dict:
+        sid  = request.path_params['sid']
+        name = request.path_params['name']
+        return await self._forward(sid, RhapsodySession.data_shutdown,
+                                   name=name)

@@ -134,6 +134,8 @@ class PluginMyService(Plugin):
 - Give `instance_name` a default so the host can construct the plugin as
   `PluginMyService(app=...)`
 - Set `session_class` to your session class
+- Optionally set `default_roles` (e.g. `('login', 'compute')`) to join
+  those host roles' `--plugins default` set; empty by default
 - Use `self.add_route_post()` / `self.add_route_get()` for routes
 - Use `self._forward(sid, method, **kwargs)` to dispatch to sessions;
   `_forward` handles session lookup, expiry, error wrapping, and the response
@@ -561,6 +563,8 @@ To create a new plugin:
 4.  Add routes in `__init__` using `add_route_post` / `add_route_get`
 5.  Optionally create a `PluginClient` subclass and set `client_class`
 6.  Optionally provide `ui_config` (or `ui_module`) for the Explorer UI
+7.  Optionally set `default_roles` to load the plugin by default on those
+    host roles
 
 See the existing plugins (`plugin_sysinfo.py`, `plugin_psij.py`,
 `plugin_rhapsody.py`) for real-world examples.

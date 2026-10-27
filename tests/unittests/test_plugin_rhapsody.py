@@ -618,6 +618,21 @@ async def test_sanitize_list_stdout():
     assert d["stderr"] == "rank0 err"
 
 
+def test_sanitize_list_of_bytes_stdout():
+    """multi-rank bytes output is decoded, not joined as b'...' reprs."""
+    session = RhapsodySession("test.san4b")
+    session._rh_session = MagicMock()
+
+    task = MagicMock()
+    task.uid = "task.lb001"
+    task.state = "DONE"
+    task.to_dict = lambda: {"uid": "task.lb001", "state": "DONE",
+                            "stdout": [b"rank0 out", b"rank1 \xff"]}
+
+    d = session._sanitize_task(task)
+    assert d["stdout"] == "rank0 out\nrank1 \ufffd"
+
+
 @pytest.mark.asyncio
 async def test_sanitize_preserves_normal_values():
     """Normal JSON-serializable values must pass through unchanged."""
@@ -768,6 +783,114 @@ async def test_json_safe_return_value_oversized_reports_error(caplog):
     assert "_return_value_encoding" not in payload
     assert "too large" in payload["error"]
     assert "too large" in caplog.text
+
+
+def _output_task(uid, stdout, stderr):
+    task = MagicMock()
+    task.uid = uid
+    task.state = "DONE"
+    task.to_dict = lambda: {"uid": uid, "state": "DONE", "exit_code": 0,
+                            "stdout": stdout, "stderr": stderr}
+    return task
+
+
+def test_notification_carries_output_to_sse_wait():
+    """stdout/stderr reach the terminal notification, so the client's SSE
+    wait path returns them like the poll path and ``get_task`` do."""
+    session = RhapsodySession("test.out")
+    session._rh_session = MagicMock()
+
+    payload = session._notification_payload(
+        _output_task("task.out001", b"hello\n", ["r0 err", "r1 err"]))
+    assert payload["stdout"] == "hello\n"
+    assert payload["stderr"] == "r0 err\nr1 err"
+
+    client = _make_rhapsody_client()
+    client._on_task_done(None, None, "task_status", payload)
+    assert client._completed["task.out001"]["stdout"] == "hello\n"
+    assert client._completed["task.out001"]["stderr"] == "r0 err\nr1 err"
+
+
+def test_notification_output_is_valid_utf8():
+    """A lone surrogate (e.g. surrogateescape-decoded output) must not
+    reach the frame: msgpack refuses it and the whole batch is lost."""
+    import msgpack
+    session = RhapsodySession("test.out.sur")
+    session._rh_session = MagicMock()
+
+    payload = session._notification_payload(
+        _output_task("task.sur", "ok \udcff", "\udcfe" * 2000))
+    msgpack.packb(payload)
+    assert payload["stdout"] == "ok ?"
+    assert "stdout_truncated" not in payload
+
+    # any string field, not only the output streams
+    task = MagicMock()
+    task.uid = "task.sur2"
+    task.state = "FAILED"
+    task.to_dict = lambda: {"uid": "task.sur2", "state": "FAILED",
+                            "exception": "no such file b\udcff.dat",
+                            "error": "\udcfe"}
+    payload = session._notification_payload(task)
+    msgpack.packb(payload)
+    assert payload["exception"] == "no such file b?.dat"
+
+
+def test_payload_size_counts_utf8_bytes():
+    """Multi-byte output must count in bytes, else frame splitting packs a
+    batch several times past the frame cap."""
+    from radical.orbit.plugin_rhapsody import _payload_size
+    assert _payload_size({"stdout": "\u4e2d" * 100}) \
+        >= _payload_size({"stdout": "x" * 300})
+
+
+def test_notification_output_keeps_tail_under_limit():
+    """A stream over the limit keeps its tail behind a marker that names
+    the dropped size; the result stays within the limit in UTF-8 bytes."""
+    session = RhapsodySession("test.out.big")
+    session._rh_session = MagicMock()
+    session._output_notify_limit = 256
+
+    out = "x" * 1000 + "THE END"
+    err = "\u00e4" * 1000                     # 2 bytes each: cut mid-char
+    payload = session._notification_payload(
+        _output_task("task.out002", out, err))
+
+    assert payload["stdout"].startswith("[... ")
+    assert payload["stdout"].endswith("THE END")
+    dropped = len(out) - (256 - 128)
+    assert f"{dropped} characters truncated" in payload["stdout"]
+    for key in ("stdout", "stderr"):
+        assert len(payload[key].encode("utf-8")) <= 256
+        assert payload[f"{key}_truncated"] is True
+
+    # the cut lands on a character boundary and the count is exact
+    err_tail = payload["stderr"].split("...]\n", 1)[1]
+    assert set(err_tail) == {"\u00e4"}
+    assert (f"{1000 - len(err_tail)} characters truncated"
+            in payload["stderr"])
+
+    # a stream that fits carries no flag
+    small = session._notification_payload(_output_task("t.s", "ok", ""))
+    assert small["stdout"] == "ok"
+    assert "stdout_truncated" not in small
+
+    # a limit too small for the marker yields the bare tail
+    session._output_notify_limit = 16
+    tiny = session._notification_payload(_output_task("t.t", out, ""))
+    assert tiny["stdout"] == out[-16:]
+    assert tiny["stdout_truncated"] is True
+
+    # a zero limit drops the stream without encoding it
+    session._output_notify_limit = 0
+    zero = session._notification_payload(_output_task("t.z", out, ""))
+    assert zero["stdout"] == ""
+    assert zero["stdout_truncated"] is True
+    assert "stderr_truncated" not in zero
+
+    # get_task's view stays complete
+    assert session._sanitize_task(
+        _output_task("task.out002", out, err))["stdout"] == out
 
 
 @pytest.mark.asyncio
@@ -1091,8 +1214,7 @@ async def test_session_close():
 
     expected = json.dumps(session._telemetry.summary.return_value, indent=4)
 
-    with patch('radical.orbit.plugin_rhapsody.log') as mock_log, \
-         patch('builtins.print') as mock_print:
+    with patch('radical.orbit.plugin_rhapsody.log') as mock_log:
         result = await session.close()
 
     assert result == {}
@@ -1100,7 +1222,83 @@ async def test_session_close():
     assert session._telemetry is None
     mock_rh_session.close.assert_called_once()
     mock_log.info.assert_called_once_with(expected)
-    mock_print.assert_called_once_with(expected, flush=True)
+
+
+@pytest.mark.asyncio
+async def test_session_close_cleans_up_when_rh_close_raises():
+    '''If rhapsody's own close() raises, the session state is still
+    cleared and the base-class close still runs; the error propagates.'''
+    session = RhapsodySession("test.003")
+    mock_rh_session = MagicMock()
+    mock_rh_session.close = AsyncMock(side_effect=RuntimeError("stop"))
+    session._rh_session = mock_rh_session
+    session._tasks = {'t1': {}}
+
+    with pytest.raises(RuntimeError, match="stop"):
+        await session.close()
+
+    assert session._rh_session is None
+    assert session._tasks == {}
+    assert session._active is False
+
+
+@pytest.mark.asyncio
+async def test_session_close_resets_tasks_without_rh_session():
+    '''close() clears the task table even when no rhapsody session
+    was ever built.'''
+    session = RhapsodySession("test.close_no_rh")
+    session._tasks = {'t1': {}}
+
+    assert await session.close() == {}
+    assert session._tasks == {}
+
+
+@pytest.mark.parametrize('failed_start, warned', [(True, False),
+                                                  (False, True)])
+@pytest.mark.asyncio
+async def test_unwind_telemetry_stops_and_detaches(orbit_caplog,
+                                                   failed_start, warned):
+    '''The manager is stopped best effort (a failing stop is tolerated)
+    and detached.  The stop failure is a warning on a normal close and
+    expected (debug only) after a failed start.'''
+    session = RhapsodySession("test.unwind")
+    tm = MagicMock()
+    tm.stop = AsyncMock(side_effect=TypeError("stop broke"))
+    rh_session = MagicMock()
+    rh_session._telemetry = tm
+    rh_session._state_manager._telemetry_observer = tm._on_task_state_change
+
+    await session._unwind_telemetry(rh_session, failed_start=failed_start)
+
+    tm.stop.assert_awaited_once()
+    assert rh_session._telemetry is None
+    assert rh_session._state_manager._telemetry_observer is None
+    assert any('telemetry stop failed' in r.getMessage()
+               for r in orbit_caplog.records) is warned
+
+
+@pytest.mark.asyncio
+async def test_session_close_survives_telemetry_failure():
+    '''A failing telemetry summary must not block the rhapsody teardown.'''
+    session = RhapsodySession("test.telem_summary_fails")
+    mock_rh_session = MagicMock()
+    mock_rh_session.close = AsyncMock()
+    mock_rh_session._telemetry = None       # nothing for the unwind to stop
+    session._rh_session = mock_rh_session
+    telemetry = MagicMock()
+    telemetry.summary.side_effect = RuntimeError("otel broke")
+    session._telemetry = telemetry
+
+    # patched logger: isEnabledFor(INFO) is truthy, so summary() runs
+    with patch('radical.orbit.plugin_rhapsody.log') as mock_log:
+        result = await session.close()
+
+    telemetry.summary.assert_called_once()
+    mock_log.warning.assert_called_once()
+    assert result == {}
+    assert session._telemetry is None
+    assert session._rh_session is None
+    mock_rh_session.close.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1287,7 +1485,8 @@ async def test_cancel_all_skips_terminal():
 
 # ---------------------------------------------------------------------------
 # Regression: RhapsodySession.initialize survives older rhapsody libs that
-# don't expose `Session.start_telemetry`.
+# don't expose `Session.start_telemetry`, and installs without the
+# rhapsody `[telemetry]` extra.
 # ---------------------------------------------------------------------------
 #
 # Bug surfaced during the local e2e smoke (memory/project_broker_dispatcher.md):
@@ -1295,20 +1494,28 @@ async def test_cancel_all_skips_terminal():
 # unconditionally; older rhapsody installs raise AttributeError.  Fix
 # guards the call with `getattr(session, 'start_telemetry', None)`.
 
+@pytest.mark.parametrize('has_method, otel', [
+    (False, True),     # older rhapsody: no Session.start_telemetry
+    (True,  False),    # [telemetry] extra (opentelemetry-sdk) missing
+])
 @pytest.mark.asyncio
-async def test_initialize_without_start_telemetry(monkeypatch):
-    '''Session init must succeed when the rhapsody Session has no
-    ``start_telemetry`` method (older rhapsody installs lack it).
-    Regression for the bug surfaced during the local e2e smoke.'''
+async def test_initialize_without_telemetry(monkeypatch, has_method, otel):
+    '''Session init must succeed without telemetry: when the rhapsody
+    Session has no ``start_telemetry`` method, or when the ``[telemetry]``
+    extra is missing (then ``start_telemetry`` must not even be called:
+    rhapsody 0.4 wires a half-built manager in before it fails).'''
     from radical.orbit import plugin_rhapsody as prh
 
     fake_backend = MagicMock(spec=[])  # no __await__, no register_callback
-    fake_session = MagicMock(spec=[])  # IMPORTANT: spec=[] → no start_telemetry
+    fake_session = MagicMock(spec=['start_telemetry'] if has_method else [])
+    if has_method:
+        fake_session.start_telemetry = AsyncMock()
 
     monkeypatch.setattr(prh.rh, 'get_backend',
                         MagicMock(return_value=fake_backend))
     monkeypatch.setattr(prh.rh, 'Session',
                         MagicMock(return_value=fake_session))
+    monkeypatch.setattr(prh, '_telemetry_available', lambda: otel)
 
     sess = RhapsodySession('sess.no_telem', backend_names=['fake'])
     # _REAL_INITIALIZE was captured at import time, before the autouse
@@ -1316,10 +1523,248 @@ async def test_initialize_without_start_telemetry(monkeypatch):
     # manually to bypass the per-test stub.
     await _REAL_INITIALIZE(sess)
 
+    if has_method:
+        fake_session.start_telemetry.assert_not_awaited()
     assert sess._telemetry is None
     assert sess._rh_session is fake_session
     assert sess._init_error is None
     assert sess._init_ready.is_set()
+
+
+@pytest.fixture
+def orbit_caplog(caplog):
+    '''``caplog`` capturing WARNING+ from the ``radical.orbit`` logger,
+    which may have propagate=False (see test_plugin_psij.py).'''
+    import logging as _logging
+    re_log = _logging.getLogger('radical.orbit')
+    re_log.addHandler(caplog.handler)
+    caplog.set_level(_logging.WARNING, logger='radical.orbit')
+    yield caplog
+    re_log.removeHandler(caplog.handler)
+
+
+@pytest.fixture
+def _fresh_telemetry_switch():
+    '''Clear the per-process telemetry switch cache around a test.'''
+    from radical.orbit import plugin_rhapsody as prh
+    prh._resolve_telemetry.cache_clear()
+    yield prh
+    prh._resolve_telemetry.cache_clear()
+
+
+@pytest.mark.parametrize('env, on', [
+    (None, True), ('1', True), ('on', True), ('YES', True),
+    ('0', False), ('off', False), ('False', False), ('no', False),
+])
+def test_telemetry_switch(monkeypatch, _fresh_telemetry_switch, env, on):
+    '''``$RADICAL_ORBIT_RHAPSODY_TELEMETRY`` switches telemetry off;
+    unset keeps it on.'''
+    prh = _fresh_telemetry_switch
+    if env is None:
+        monkeypatch.delenv(prh.ENV_TELEMETRY, raising=False)
+    else:
+        monkeypatch.setenv(prh.ENV_TELEMETRY, env)
+
+    assert prh._resolve_telemetry() is on
+
+
+def test_telemetry_switch_invalid_warns_once(monkeypatch, orbit_caplog,
+                                             _fresh_telemetry_switch):
+    '''An unrecognised switch value warns once and keeps telemetry on.'''
+    prh = _fresh_telemetry_switch
+
+    monkeypatch.setenv(prh.ENV_TELEMETRY, 'maybe')
+    assert prh._resolve_telemetry() is True
+    assert prh._resolve_telemetry() is True
+    # count distinct records: with propagation on, caplog sees each twice
+    assert len({id(r) for r in orbit_caplog.records
+                if prh.ENV_TELEMETRY in r.getMessage()}) == 1
+
+
+@pytest.mark.asyncio
+async def test_initialize_telemetry_switched_off(monkeypatch):
+    '''A session with telemetry switched off never starts it.'''
+    from radical.orbit import plugin_rhapsody as prh
+
+    fake_session = MagicMock(spec=['start_telemetry'])
+    fake_session.start_telemetry = AsyncMock()
+    monkeypatch.setattr(prh.rh, 'get_backend',
+                        MagicMock(return_value=MagicMock(spec=[])))
+    monkeypatch.setattr(prh.rh, 'Session',
+                        MagicMock(return_value=fake_session))
+    monkeypatch.setattr(prh, '_telemetry_available', lambda: True)
+    monkeypatch.setattr(prh, '_resolve_telemetry', lambda: False)
+
+    sess = RhapsodySession('sess.telem_off', backend_names=['fake'])
+    await _REAL_INITIALIZE(sess)
+
+    fake_session.start_telemetry.assert_not_awaited()
+    assert sess._telemetry is None
+    assert sess._init_error is None
+
+
+@pytest.mark.asyncio
+async def test_initialize_telemetry_start_failure(monkeypatch, orbit_caplog):
+    '''A telemetry start failure (e.g. an unwritable checkpoint dir)
+    disables telemetry instead of failing the session.'''
+    from radical.orbit import plugin_rhapsody as prh
+
+    fake_session = MagicMock(spec=['start_telemetry'])
+    fake_session.start_telemetry = AsyncMock(
+        side_effect=PermissionError("telemetry-output"))
+    monkeypatch.setattr(prh.rh, 'get_backend',
+                        MagicMock(return_value=MagicMock(spec=[])))
+    monkeypatch.setattr(prh.rh, 'Session',
+                        MagicMock(return_value=fake_session))
+    monkeypatch.setattr(prh, '_telemetry_available', lambda: True)
+    monkeypatch.setattr(prh, '_resolve_telemetry', lambda: True)
+
+    sess = RhapsodySession('sess.telem_fail', backend_names=['fake'])
+    await _REAL_INITIALIZE(sess)
+
+    assert any('telemetry start failed' in r.getMessage()
+               for r in orbit_caplog.records)
+    fake_session.start_telemetry.assert_awaited_once()
+    assert sess._telemetry is None
+    assert sess._init_error is None
+    assert sess._init_ready.is_set()
+
+
+@pytest.mark.asyncio
+async def test_initialize_cancelled_during_telemetry_start(monkeypatch):
+    '''A cancel while start_telemetry() is pending unwinds the manager,
+    unblocks init waiters and re-raises the cancellation.'''
+    from radical.orbit import plugin_rhapsody as prh
+
+    in_start = asyncio.Event()
+
+    async def _hang(**kwargs):
+        in_start.set()
+        await asyncio.Event().wait()
+
+    fake_session = MagicMock(spec=['start_telemetry'])
+    fake_session.start_telemetry = AsyncMock(side_effect=_hang)
+    monkeypatch.setattr(prh.rh, 'get_backend',
+                        MagicMock(return_value=MagicMock(spec=[])))
+    monkeypatch.setattr(prh.rh, 'Session',
+                        MagicMock(return_value=fake_session))
+    monkeypatch.setattr(prh, '_telemetry_available', lambda: True)
+    monkeypatch.setattr(prh, '_resolve_telemetry', lambda: True)
+
+    sess = RhapsodySession('sess.telem_cancel', backend_names=['fake'])
+    sess._unwind_telemetry = AsyncMock()
+    init = asyncio.ensure_future(_REAL_INITIALIZE(sess))
+    await in_start.wait()
+    init.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await init
+
+    sess._unwind_telemetry.assert_awaited_once_with(fake_session,
+                                                    failed_start=True)
+    assert sess._init_ready.is_set()
+    assert sess._init_error is not None
+
+
+@pytest.fixture
+def real_rhapsody(monkeypatch, tmp_path):
+    '''The real rhapsody package (this module mocks it) with telemetry
+    forced on, cwd in *tmp_path*, and ``get_backend`` returning a fake
+    backend.  Yields ``(rhapsody module, backend)``.'''
+    import importlib
+    import sys
+    from radical.orbit import plugin_rhapsody as prh
+
+    # re-import the real package (monkeypatch restores the mock afterwards)
+    monkeypatch.delitem(sys.modules, 'rhapsody', raising=False)
+    try:
+        real = importlib.import_module('rhapsody')
+    except ImportError:
+        pytest.skip('needs rhapsody')
+    if not hasattr(real.Session, 'start_telemetry'):
+        pytest.skip('needs rhapsody with Session.start_telemetry')
+    pytest.importorskip('opentelemetry.sdk')
+    monkeypatch.setattr(prh, 'rh', real)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(prh, '_resolve_telemetry', lambda: True)
+    monkeypatch.setattr(prh, '_telemetry_available', lambda: True)
+
+    class _FakeBackend:
+        name = 'fake'
+
+        def __init__(self):
+            self.attached_to = []
+            self.shutdown    = AsyncMock()
+
+        def register_callback(self, cb):
+            pass
+
+    backend = _FakeBackend()
+    monkeypatch.setattr(real, 'get_backend', lambda name: backend)
+    yield real, backend
+
+
+@pytest.mark.asyncio
+async def test_telemetry_stop_failure_does_not_leak_backends(
+        real_rhapsody, monkeypatch):
+    '''With a real rhapsody Session and running telemetry, a raising
+    telemetry stop() must not keep rhapsody's close() from shutting the
+    backends down.'''
+    from rhapsody.telemetry.manager import TelemetryManager
+    _, backend = real_rhapsody
+
+    sess = RhapsodySession('sess.telem_stop', backend_names=['fake'])
+    await _REAL_INITIALIZE(sess)
+    assert sess._telemetry is not None
+
+    monkeypatch.setattr(TelemetryManager, 'stop',
+                        AsyncMock(side_effect=RuntimeError("stop broke")))
+    await sess.close()
+
+    backend.shutdown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_failed_telemetry_start_does_not_leak_backends(
+        real_rhapsody, tmp_path):
+    '''With a real rhapsody Session, a telemetry start that fails half
+    way (checkpoint dir cannot be created) must not keep rhapsody's
+    close() from shutting the backends down.'''
+    _, backend = real_rhapsody
+    # 'telemetry-output' exists as a file, so the checkpoint mkdir fails
+    (tmp_path / 'telemetry-output').write_text('')
+
+    sess = RhapsodySession('sess.telem_real', backend_names=['fake'])
+    await _REAL_INITIALIZE(sess)
+
+    assert sess._init_error is None
+    assert sess._telemetry is None
+    rh_session = sess._rh_session
+    assert rh_session._telemetry is None
+    assert rh_session._state_manager._telemetry_observer is None
+
+    await sess.close()
+
+    backend.shutdown.assert_awaited_once()
+
+
+def test_telemetry_available_without_otel(monkeypatch, orbit_caplog):
+    '''A missing opentelemetry package reads as unavailable (find_spec
+    raises for a dotted name whose parent is absent) and warns once.'''
+    from radical.orbit import plugin_rhapsody as prh
+
+    def _no_parent(name):
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr(prh.importlib.util, 'find_spec', _no_parent)
+    prh._telemetry_available.cache_clear()
+    try:
+        assert prh._telemetry_available() is False
+        assert prh._telemetry_available() is False
+        assert len({id(r) for r in orbit_caplog.records
+                    if 'telemetry disabled' in r.getMessage()}) == 1
+    finally:
+        prh._telemetry_available.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -1351,25 +1796,16 @@ def test_notify_window_from_env(monkeypatch):
 
 
 @pytest.mark.parametrize('raw', ['abc', '-1', '0.1s', 'nan', 'inf', '-inf'])
-def test_notify_window_invalid_falls_back(monkeypatch, caplog, raw):
+def test_notify_window_invalid_falls_back(monkeypatch, orbit_caplog, raw):
     '''A non-numeric, negative or non-finite window warns and keeps the
     default — ``nan`` in particular must not sneak past as a ~0 window.'''
-    import logging as _logging
     from radical.orbit import plugin_rhapsody as prh
 
     monkeypatch.setenv(prh.ENV_NOTIFY_WINDOW, raw)
-    # The radical.orbit logger has propagate=False, so caplog's handler
-    # must be attached to it explicitly (see test_plugin_psij.py).
-    re_log = _logging.getLogger('radical.orbit')
-    re_log.addHandler(caplog.handler)
-    try:
-        caplog.set_level(_logging.WARNING, logger='radical.orbit')
-        _, plugin, _ = _make_plugin()
-    finally:
-        re_log.removeHandler(caplog.handler)
+    _, plugin, _ = _make_plugin()
 
     assert plugin._notify_window == prh.NOTIFY_BATCH_WINDOW
-    assert prh.ENV_NOTIFY_WINDOW in caplog.text
+    assert prh.ENV_NOTIFY_WINDOW in orbit_caplog.text
 
 
 def test_notify_window_zero_flushes_immediately(monkeypatch):
@@ -1485,11 +1921,13 @@ def test_frame_budgets_follow_host_runtime_cap():
     assert plugin._frame_cap          == 64 * 1024
     assert plugin._return_value_limit == 32 * 1024
     assert plugin._notify_batch_bytes == 32 * 1024
+    assert plugin._output_notify_limit == 8 * 1024
 
     # every session it creates inherits them
     session = plugin._create_session('sid.cap')
     assert session._return_value_limit == 32 * 1024
     assert session._notify_batch_bytes == 32 * 1024
+    assert session._output_notify_limit == 8 * 1024
 
     # a directly built session keeps the module defaults
     assert RhapsodySession('sid.plain')._return_value_limit \
@@ -1506,6 +1944,262 @@ def test_frame_budgets_fall_back_to_protocol_cap():
     assert plugin._frame_cap          == prh.FRAME_CAP
     assert plugin._return_value_limit == prh.RETURN_VALUE_LIMIT
     assert plugin._notify_batch_bytes == prh.NOTIFY_BATCH_BYTES
+    assert plugin._output_notify_limit == prh.OUTPUT_NOTIFY_LIMIT
+
+
+# ---------------------------------------------------------------------------
+# Data backends
+# ---------------------------------------------------------------------------
+
+class _FakeEndpoint:
+    def __init__(self, desc):
+        self._desc = desc
+
+    def serialize(self):
+        return self._desc
+
+
+class _FakeDataBackend:
+    def __init__(self, name, **kwargs):
+        self.name       = name
+        self.kwargs     = kwargs
+        self.state      = MagicMock()
+        self.state.name = 'CREATED'
+        self.endpoints  = []
+        self.shutdown   = AsyncMock()
+        self.gate       = None      # an asyncio.Event to hold start() open
+
+    async def start(self):
+        if self.gate is not None:
+            await self.gate.wait()
+        self.state.name = 'READY'
+        self.endpoints  = [_FakeEndpoint('node1:6379')]
+        return self
+
+
+def _data_session(plugin, client):
+    sid = _register(client, plugin)
+    session = plugin._sessions[sid]
+    session._rh_session = MagicMock()
+    session._rh_session.backends = {'concurrent': MagicMock()}
+    session._rh_session.add_backend = MagicMock(
+        side_effect=lambda b: session._rh_session.backends.__setitem__(b.name, b))
+    return sid, session
+
+
+def _fake_factory(created):
+    def _factory(kind, name=None, **kw):
+        created[name] = _FakeDataBackend(name, **kw)
+        return created[name]
+    return _factory
+
+
+def test_data_start_endpoints_shutdown():
+    _, plugin, client = _make_plugin()
+    sid, session = _data_session(plugin, client)
+    created = {}
+
+    with patch.object(_mock_rh, 'get_data_backend',
+                      side_effect=_fake_factory(created)):
+        resp = client.post(f"{plugin.namespace}/data_start/{sid}",
+                           json={"kind": "redis", "kwargs": {"port": 6379}})
+    assert resp.status_code == 200
+    assert resp.json() == {"name": "redis_data", "kind": "redis",
+                           "state": "READY", "endpoints": ["node1:6379"]}
+    assert created['redis_data'].kwargs == {"port": 6379}
+    assert session._rh_session.backends['redis_data'] is created['redis_data']
+
+    resp = client.get(f"{plugin.namespace}/data_endpoints/{sid}")
+    assert resp.status_code == 200
+    assert resp.json()['backends']['redis_data']['endpoints'] == \
+        ["node1:6379"]
+
+    resp = client.post(f"{plugin.namespace}/data_shutdown/{sid}/redis_data")
+    assert resp.status_code == 200
+    created['redis_data'].shutdown.assert_awaited_once()
+    assert 'redis_data' not in session._rh_session.backends
+    resp = client.get(f"{plugin.namespace}/data_endpoints/{sid}")
+    assert resp.json() == {"backends": {}}
+
+
+def test_data_start_name_collisions():
+    _, plugin, client = _make_plugin()
+    sid, _ = _data_session(plugin, client)
+    url = f"{plugin.namespace}/data_start/{sid}"
+
+    with patch.object(_mock_rh, 'get_data_backend',
+                      side_effect=_fake_factory({})):
+        assert client.post(url, json={"kind": "redis"}).status_code == 200
+        assert client.post(url, json={"kind": "redis"}).status_code == 409
+        assert client.post(url, json={"kind": "redis",
+                                      "name": "r2"}).status_code == 200
+        # an execution backend of the session is never shadowed
+        assert client.post(url, json={"kind": "redis",
+                                      "name": "concurrent"}).status_code == 409
+
+
+def test_data_start_bad_requests():
+    _, plugin, client = _make_plugin()
+    sid, session = _data_session(plugin, client)
+    url = f"{plugin.namespace}/data_start/{sid}"
+
+    with patch.object(_mock_rh, 'get_data_backend',
+                      side_effect=ValueError("Data backend 'x' not found")):
+        assert client.post(url, json={"kind": "x"}).status_code == 400
+    assert client.post(url, json={}).status_code == 400
+    assert client.post(url, json={"kind": "redis",
+                                  "kwargs": [1]}).status_code == 400
+    assert client.post(url, json={"kind": "redis",
+                                  "name": "a/b"}).status_code == 400
+    assert client.post(url, json={"kind": "redis",
+                                  "name": 5}).status_code == 400
+    assert session._data == {}
+
+
+def test_data_start_failure_releases_name():
+    _, plugin, client = _make_plugin()
+    sid, session = _data_session(plugin, client)
+    backend = _FakeDataBackend('redis_data')
+    backend.start = AsyncMock(side_effect=RuntimeError("no redis-server"))
+
+    with patch.object(_mock_rh, 'get_data_backend', return_value=backend):
+        resp = client.post(f"{plugin.namespace}/data_start/{sid}",
+                           json={"kind": "redis"})
+    assert resp.status_code == 500
+    assert session._data == {}
+    backend.shutdown.assert_awaited_once()
+    session._rh_session.add_backend.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_data_start_cancelled_cleans_up():
+    session = RhapsodySession('s1', backend_names=['concurrent'])
+    session._init_ready.set()
+    session._rh_session = MagicMock()
+    session._rh_session.backends = {}
+    backend = _FakeDataBackend('redis_data')
+    backend.gate = asyncio.Event()
+
+    with patch.object(_mock_rh, 'get_data_backend', return_value=backend):
+        task = asyncio.ensure_future(session.data_start('redis'))
+        await asyncio.sleep(0)
+        assert 'redis_data' in session._data
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert session._data == {}
+    backend.shutdown.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_data_shutdown_during_start():
+    session = RhapsodySession('s1', backend_names=['concurrent'])
+    session._init_ready.set()
+    session._rh_session = MagicMock()
+    session._rh_session.backends = {}
+    backend = _FakeDataBackend('redis_data')
+    backend.gate = asyncio.Event()
+
+    with patch.object(_mock_rh, 'get_data_backend', return_value=backend):
+        task = asyncio.ensure_future(session.data_start('redis'))
+        await asyncio.sleep(0)
+        await session.data_shutdown('redis_data')
+        backend.gate.set()
+        with pytest.raises(HTTPException) as exc:
+            await task
+    assert exc.value.status_code == 409
+    session._rh_session.add_backend.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_close_stops_data_backend_still_starting():
+    session = RhapsodySession('s1', backend_names=['concurrent'])
+    session._init_ready.set()
+    session._rh_session = MagicMock()
+    session._rh_session.backends = {}
+    session._rh_session.close = AsyncMock()
+    backend = _FakeDataBackend('redis_data')
+    backend.gate = asyncio.Event()
+
+    with patch.object(_mock_rh, 'get_data_backend', return_value=backend):
+        task = asyncio.ensure_future(session.data_start('redis'))
+        await asyncio.sleep(0)
+        await session.close()
+        backend.shutdown.assert_awaited()
+        backend.gate.set()
+        with pytest.raises(HTTPException):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_close_detaches_before_closing_rhapsody_session():
+    session = RhapsodySession('s1', backend_names=['concurrent'])
+    session._init_ready.set()
+    rh_session = MagicMock()
+    rh_session.backends = {}
+    seen = {}
+
+    async def _close():
+        # an in-flight data route resuming now must see a detached session
+        seen['rh_session'] = session._rh_session
+        seen['data'] = dict(session._data)
+
+    rh_session.close = AsyncMock(side_effect=_close)
+    session._rh_session = rh_session
+    session._data = {'redis_data': (_FakeDataBackend('redis_data'), 'redis')}
+    await session.close()
+    assert seen == {'rh_session': None, 'data': {}}
+
+
+@pytest.mark.asyncio
+async def test_data_start_cleanup_failure_keeps_original_error():
+    session = RhapsodySession('s1', backend_names=['concurrent'])
+    session._init_ready.set()
+    session._rh_session = MagicMock()
+    session._rh_session.backends = {}
+    backend = _FakeDataBackend('redis_data')
+    backend.start = AsyncMock(side_effect=ValueError("bad port"))
+    backend.shutdown = AsyncMock(side_effect=RuntimeError("cleanup broke"))
+
+    with patch.object(_mock_rh, 'get_data_backend', return_value=backend):
+        with pytest.raises(ValueError, match="bad port"):
+            await session.data_start('redis')
+
+
+def test_data_shutdown_unknown():
+    _, plugin, client = _make_plugin()
+    sid, _ = _data_session(plugin, client)
+    resp = client.post(f"{plugin.namespace}/data_shutdown/{sid}/nope")
+    assert resp.status_code == 404
+
+
+def test_data_start_old_rhapsody():
+    _, plugin, client = _make_plugin()
+    sid, _ = _data_session(plugin, client)
+    with patch('radical.orbit.plugin_rhapsody.rh', spec=['Session']):
+        resp = client.post(f"{plugin.namespace}/data_start/{sid}",
+                           json={"kind": "redis"})
+    assert resp.status_code == 501
+
+
+def test_client_data_helpers():
+    rc = RhapsodyClient.__new__(RhapsodyClient)
+    rc._sid = 'sid.1'
+    rc._require_session = MagicMock()
+    rc._raise = MagicMock()
+    rc._url = lambda path: f"/rhapsody/{path}"
+    rc._http = MagicMock()
+    rc._http.post.return_value.json.return_value = {"ok": 1}
+    rc._http.get.return_value.json.return_value = {"backends": {}}
+
+    assert rc.data_start('redis', name='r', port=1) == {"ok": 1}
+    rc._http.post.assert_called_with(
+        '/rhapsody/data_start/sid.1',
+        json={"kind": "redis", "name": "r", "kwargs": {"port": 1}})
+    assert rc.data_endpoints() == {"backends": {}}
+    rc._http.get.assert_called_with('/rhapsody/data_endpoints/sid.1')
+    rc.data_shutdown('r')
+    rc._http.post.assert_called_with('/rhapsody/data_shutdown/sid.1/r')
 
 
 if __name__ == '__main__':

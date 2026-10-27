@@ -646,6 +646,7 @@ class PluginPSIJ(Plugin):
     '''
 
     plugin_name = "psij"
+    default_roles = ('login', 'standalone')
     session_class = PSIJSession
     client_class = PSIJClient
     version = '0.0.1'

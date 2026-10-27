@@ -42,8 +42,8 @@ def main():
                              "the role-specific default set).  Special "
                              "tokens: 'default' (role's default set), "
                              "'all' (every registered plugin).  Wildcards "
-                             "allowed: 'iri*'.  Prefix matching supported: "
-                             "'sys'->sysinfo.  Combine, e.g.: '-p default,rose'.")
+                             "allowed: 'iri*'; otherwise names must match "
+                             "exactly.  Combine, e.g.: '-p default,rose'.")
     parser.add_argument("--log-level", "-l",
                         default=(os.environ.get("RADICAL_ORBIT_LOG_LVL")
                                  or os.environ.get("RADICAL_LOG_LVL") or "INFO"),
