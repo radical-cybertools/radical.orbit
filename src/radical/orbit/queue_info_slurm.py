@@ -150,7 +150,7 @@ class QueueInfoSlurm(QueueInfo):
 
         storage = None
         stdout  = run_cmd(['scontrol', 'show', 'config'],
-                          timeout=60, env=self._env)
+                          timeout=10, env=self._env)
         for line in (stdout or '').splitlines():
             key, sep, val = line.partition('=')
             if sep and key.strip() == 'AccountingStorageType':
