@@ -16,7 +16,8 @@ import time
 from radical.orbit            import EndpointRuntime
 from radical.orbit.lucid_flow import (RUN_ID_RE, DEFAULTS, GLOBUS_CLIENT_ID,
                                       LUCID_COLLECTION, TOKEN_FILE,
-                                      LucidError, transfer_refresh_token)
+                                      LucidError, transfer_refresh_token,
+                                      _state)
 
 
 LUCID_COLL     = LUCID_COLLECTION
@@ -51,9 +52,11 @@ def main():
         eid = next((n for n, i in rt.topology().items()
                     if i.get('role') == 'endpoint'
                     and (not args.endpoint or n == args.endpoint)
-                    and 'globus' in (i.get('plugins') or {})), None)
+                    and {'globus'} | ({'rhapsody'} if args.nersc else set())
+                        <= set(i.get('plugins') or {})), None)
         if not eid:
-            sys.exit('no endpoint serving globus found')
+            sys.exit('no endpoint serving globus'
+                     + (' and rhapsody' if args.nersc else '') + ' found')
         globus = rt.get_plugin(eid, 'globus', refresh_token=refresh,
                                client_id=CLIENT_ID)
         ret = 0
@@ -99,7 +102,7 @@ def main():
                     uid = rh.submit_tasks([{'executable': '/bin/bash',
                                             'arguments' : ['-lc', cmd, 'rm'] + runs}])[0]['uid']
                     rh.wait_tasks([uid], timeout=600)
-                    state = rh.get_task(uid).get('state')
+                    state = _state(rh.get_task(uid).get('state'))
                     print(f'  nersc: removed {len(runs)} run dir(s): {state}')
                     if state != 'DONE':
                         ret = 1

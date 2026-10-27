@@ -244,7 +244,10 @@ class PluginLucid(Plugin):
         if not endpoint:
             raise HTTPException(status_code=400, detail='no endpoint selected')
         try:
-            refresh = await asyncio.to_thread(lf.transfer_refresh_token)
+            try:
+                refresh = await asyncio.to_thread(lf.transfer_refresh_token)
+            except lf.LucidError as e:          # portal host config, not the request
+                raise HTTPException(status_code=503, detail=str(e)) from e
             rt      = await asyncio.to_thread(self._runtime)
             topo    = await asyncio.to_thread(rt.topology)
             if endpoint not in lf.candidate_endpoints(topo):
@@ -314,8 +317,12 @@ class PluginLucid(Plugin):
         paths = {os.path.basename(p): p for p in state.get('images', [])}
         if name not in paths:
             raise HTTPException(status_code=404, detail=f'no image {name}')
-        with open(paths[name], 'rb') as fin:
-            data = base64.b64encode(fin.read()).decode()
+        try:
+            with open(paths[name], 'rb') as fin:
+                data = base64.b64encode(fin.read()).decode()
+        except OSError as e:
+            raise HTTPException(status_code=404,
+                                detail=f'image {name} is gone: {e}') from e
         return {'name': name, 'mime': 'image/png', 'data': data}
 
     async def shutdown(self) -> None:
