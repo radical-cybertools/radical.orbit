@@ -2179,10 +2179,11 @@ def _ready_session():
 async def test_requests_during_close_see_closed_session():
     session = _ready_session()
     session._rh_session = None              # close() detached it
-    for call in (session.data_start('redis'), session.cancel_task('t1'),
-                 session.data_shutdown('redis_data')):
+    for call in (lambda: session.data_start('redis'),
+                 lambda: session.cancel_task('t1'),
+                 lambda: session.data_shutdown('redis_data')):
         with pytest.raises(RuntimeError, match='session is closed'):
-            await call
+            await call()
 
 
 @pytest.mark.asyncio
@@ -2191,11 +2192,17 @@ async def test_data_start_add_backend_failure_stops_store():
     session._rh_session.add_backend = MagicMock(side_effect=AttributeError('old'))
     backend = _FakeDataBackend('redis_data')
 
+    def _add(b):
+        session._rh_session.backends[b.name] = b     # registered, then fails
+        raise AttributeError('old')
+    session._rh_session.add_backend = MagicMock(side_effect=_add)
+
     with patch.object(_mock_rh, 'get_data_backend', return_value=backend):
         with pytest.raises(AttributeError):
             await session.data_start('redis')
     backend.shutdown.assert_awaited_once()
     assert 'redis_data' not in session._data
+    assert 'redis_data' not in session._rh_session.backends
 
 
 @pytest.mark.asyncio
@@ -2208,6 +2215,9 @@ async def test_data_shutdown_failure_keeps_backend_tracked():
 
     with pytest.raises(RuntimeError, match='will not die'):
         await session.data_shutdown('redis_data')
+    # still tracked, and the name still reserved
+    with pytest.raises(HTTPException):
+        await session.data_start('redis')
     assert session._data['redis_data'][0] is backend
     assert session._rh_session.backends['redis_data'] is backend
 

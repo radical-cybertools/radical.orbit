@@ -529,6 +529,8 @@ class RhapsodySession(PluginSession):
             if self._rh_session is not rh_session:   # closed meanwhile
                 raise RuntimeError("session is closed")
             await rh_session.submit_tasks(tasks)
+            if self._rh_session is not rh_session:   # closed during submit
+                raise RuntimeError("session is closed")
             for t in tasks:
                 uid_str = str(t.uid)
                 self._tasks[uid_str] = t
@@ -1021,7 +1023,7 @@ class RhapsodySession(PluginSession):
             # cleanup must not mask the original error
             if self._owns(name, backend):
                 del self._data[name]
-            await self._shutdown_quietly(backend, shield=True)
+            await self._shutdown_quietly(backend)
             raise
 
         # data_shutdown or session close may have run while start awaited
@@ -1034,8 +1036,10 @@ class RhapsodySession(PluginSession):
         try:
             self._rh_session.add_backend(backend)
         except Exception:
-            # a store nobody can reach or close must not keep running
+            # a store nobody can reach or close must not keep running;
+            # rhapsody may have registered it before failing
             del self._data[name]
+            self._rh_session.backends.pop(name, None)
             await self._shutdown_quietly(backend)
             raise
         return self._data_info(name)
@@ -1044,15 +1048,13 @@ class RhapsodySession(PluginSession):
         """True if ``name`` is still reserved for this very ``backend``."""
         return self._data.get(name, (None,))[0] is backend
 
-    async def _shutdown_quietly(self, backend, shield: bool = False) -> None:
+    async def _shutdown_quietly(self, backend) -> None:
         """Stop a data backend during cleanup.  A failure is logged, not
-        raised, so it cannot mask the error that triggered the cleanup;
-        ``shield`` keeps the shutdown running if the caller is cancelled."""
+        raised, so it cannot mask the error that triggered the cleanup.
+        Shielded: the store is untracked by now, so a cancelled caller
+        must not leave it half stopped."""
         try:
-            if shield:
-                await asyncio.shield(backend.shutdown())
-            else:
-                await backend.shutdown()
+            await asyncio.shield(backend.shutdown())
         except Exception as e:
             log.warning("[%s] data backend %s cleanup failed: %s",
                         self._sid, backend.name, e)
@@ -1073,20 +1075,17 @@ class RhapsodySession(PluginSession):
         """Shut down one data backend of this session."""
         self._check_initialized()
 
-        entry = self._data.pop(name, None)
+        entry = self._data.get(name)
         if entry is None:
             raise HTTPException(status_code=404,
                                 detail=f"data backend {name} not found")
-        owned = self._rh_session.backends.pop(name, None)
-        try:
-            await entry[0].shutdown()
-        except BaseException:
-            # keep it reachable for a retry and for session close
-            if self._rh_session is not None and name not in self._data:
-                self._data[name] = entry
-                if owned is not None:
-                    self._rh_session.backends[name] = owned
-            raise
+        # stays tracked (and its name reserved) until it is down: a failed
+        # shutdown can be retried and is still seen by session close
+        await asyncio.shield(entry[0].shutdown())
+        if self._data.get(name) is entry:
+            del self._data[name]
+            if self._rh_session is not None:
+                self._rh_session.backends.pop(name, None)
         return {"name": name, "status": "shutdown"}
 
     async def close(self) -> dict:
