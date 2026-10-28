@@ -53,11 +53,20 @@ def _get_endpoint_name():
     return eids[0]
 
 
-def _redis_ping(descriptor: str) -> bytes:
+def _redis_ping(descriptor: str, timeout: float = 5) -> bytes:
     host, port = descriptor.rsplit(':', 1)
-    with socket.create_connection((host, int(port)), timeout=5) as s:
+    with socket.create_connection((host, int(port)), timeout=timeout) as s:
         s.sendall(b'PING\r\n')
         return s.recv(64)
+
+
+def _redis_gone(descriptor: str) -> bool:
+    """True if nothing answers PING (refused, timed out, or accepted and
+    closed during redis's shutdown grace period)."""
+    try:
+        return not _redis_ping(descriptor, timeout=0.5).startswith(b'+PONG')
+    except OSError:
+        return True
 
 
 pytestmark = [
@@ -91,15 +100,14 @@ async def test_remote_redis_lifecycle():
         await other.shutdown()
 
         await data.shutdown()
-        # redis may take its shutdown grace period to release the port
-        for _ in range(50):
-            try:
-                await asyncio.to_thread(_redis_ping, endpoint.serialize())
-            except OSError:
+        # redis may take its shutdown grace period to release the port;
+        # each probe is bounded to 0.5 s, so this gives up after ~5-10 s
+        for _ in range(10):
+            if await asyncio.to_thread(_redis_gone, endpoint.serialize()):
                 break
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.5)
         else:
-            pytest.fail('redis still answers 5 s after shutdown')
+            pytest.fail('redis still answers after shutdown')
     finally:
         await data.shutdown()
         await exe.shutdown()

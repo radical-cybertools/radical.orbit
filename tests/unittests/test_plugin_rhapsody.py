@@ -2122,10 +2122,35 @@ async def test_close_stops_data_backend_still_starting():
     backend.gate = asyncio.Event()
 
     with patch.object(_mock_rh, 'get_data_backend', return_value=backend):
+        task  = asyncio.ensure_future(session.data_start('redis'))
+        await asyncio.sleep(0)
+        close = asyncio.ensure_future(session.close())
+        await asyncio.sleep(0)
+        assert not close.done()             # waits for the start in flight
+        backend.gate.set()
+        with pytest.raises(HTTPException) as exc:
+            await task                      # gives up: session is closing
+        assert exc.value.status_code == 409
+        await close
+    backend.shutdown.assert_awaited()
+    assert session._rh_session is None
+    assert not session.is_active
+
+
+@pytest.mark.asyncio
+async def test_close_drain_is_bounded():
+    from radical.orbit import plugin_rhapsody as prh
+    session = _ready_session()
+    backend = _FakeDataBackend('redis_data')
+    backend.gate = asyncio.Event()          # start never finishes by itself
+
+    with patch.object(_mock_rh, 'get_data_backend', return_value=backend), \
+         patch.object(prh, 'CLOSE_DRAIN_TIMEOUT', 0.05):
         task = asyncio.ensure_future(session.data_start('redis'))
         await asyncio.sleep(0)
-        await session.close()
-        backend.shutdown.assert_awaited()
+        await session.close()               # returns after the drain timeout
+        backend.shutdown.assert_awaited()   # the reserved store is stopped
+        assert not session.is_active
         backend.gate.set()
         with pytest.raises(HTTPException):
             await task
@@ -2181,9 +2206,91 @@ async def test_requests_during_close_see_closed_session():
     session._rh_session = None              # close() detached it
     for call in (lambda: session.data_start('redis'),
                  lambda: session.cancel_task('t1'),
-                 lambda: session.data_shutdown('redis_data')):
-        with pytest.raises(RuntimeError, match='session is closed'):
+                 lambda: session.data_shutdown('redis_data'),
+                 lambda: session.list_tasks(),
+                 lambda: session.data_endpoints()):
+        with pytest.raises(HTTPException) as exc:
             await call()
+        assert exc.value.status_code == 409
+        assert 'closing' in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_closing_flag_turns_requests_away():
+    session = _ready_session()
+    session._closing = True                 # close() started, not detached
+    with pytest.raises(HTTPException) as exc:
+        await session.submit_tasks([{'uid': 't1'}])
+    assert exc.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_still_tears_down():
+    session = _ready_session()
+    stop    = asyncio.Event()
+    slow, fast = _FakeDataBackend('slow'), _FakeDataBackend('fast')
+
+    async def _slow_shutdown():
+        await stop.wait()
+    slow.shutdown = AsyncMock(side_effect=_slow_shutdown)
+    session._data = {'slow': (slow, 'redis'), 'fast': (fast, 'redis')}
+
+    close = asyncio.ensure_future(session.close())
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    close.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await close
+    stop.set()
+    await session._close_task               # teardown kept going
+    slow.shutdown.assert_awaited_once()
+    fast.shutdown.assert_awaited_once()
+    assert not session.is_active
+    await session.close()                   # idempotent
+
+
+@pytest.mark.asyncio
+async def test_close_waits_for_data_shutdown_in_flight():
+    session = _ready_session()
+    backend = _FakeDataBackend('redis_data')
+    stop    = asyncio.Event()
+
+    async def _slow_shutdown():
+        await stop.wait()
+    backend.shutdown = AsyncMock(side_effect=_slow_shutdown)
+    session._data = {'redis_data': (backend, 'redis')}
+    session._rh_session.backends = {'redis_data': backend}
+
+    shut  = asyncio.ensure_future(session.data_shutdown('redis_data'))
+    await asyncio.sleep(0)
+    close = asyncio.ensure_future(session.close())
+    await asyncio.sleep(0)
+    assert not close.done()
+    stop.set()
+    await shut
+    await close
+    backend.shutdown.assert_awaited_once()  # no second, concurrent shutdown
+
+
+@pytest.mark.asyncio
+async def test_failed_shutdown_during_start_never_registers():
+    session = _ready_session()
+    backend = _FakeDataBackend('redis_data')
+    backend.gate = asyncio.Event()
+    backend.shutdown = AsyncMock(side_effect=[RuntimeError('mid-start'), None])
+
+    with patch.object(_mock_rh, 'get_data_backend', return_value=backend):
+        start = asyncio.ensure_future(session.data_start('redis'))
+        await asyncio.sleep(0)
+        with pytest.raises(RuntimeError, match='mid-start'):
+            await session.data_shutdown('redis_data')
+        backend.gate.set()
+        with pytest.raises(HTTPException) as exc:
+            await start
+        assert exc.value.status_code == 409
+    session._rh_session.add_backend.assert_not_called()
+    assert 'redis_data' not in session._data
+    assert backend.shutdown.await_count == 2
 
 
 @pytest.mark.asyncio
