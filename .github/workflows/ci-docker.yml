@@ -41,7 +41,7 @@ jobs:
             BROKER_HOSTNAME=${{ env.RADICAL_ORBIT_BROKER_HOSTNAME }}
             RADICAL_ORBIT_BRANCH=${{ env.RADICAL_ORBIT_BRANCH }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=max,ignore-error=true
 
       - name: Start containers
         run: docker compose up -d --no-build --wait
