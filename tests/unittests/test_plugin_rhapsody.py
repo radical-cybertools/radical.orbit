@@ -2412,6 +2412,7 @@ async def test_close_stops_all_backends_if_rhapsody_close_fails():
     with pytest.raises(RuntimeError, match='boom'):
         await session.close()
     owned.shutdown.assert_awaited_once()
+    await session.close()                   # already torn down: no re-raise
 
 
 @pytest.mark.asyncio

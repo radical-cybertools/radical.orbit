@@ -1239,6 +1239,8 @@ class RhapsodySession(PluginSession):
         does not interrupt, so it always stops every data backend and ends
         with the base class close.
         """
+        if self._close_task is not None and self._close_task.done():
+            return {}                       # torn down; errors reported once
         if self._close_task is None:
             self._closing    = True         # turn new requests away
             self._close_task = asyncio.ensure_future(self._teardown())
@@ -1287,6 +1289,8 @@ class RhapsodySession(PluginSession):
             starting = [(n, e) for n, e in data.items()
                         if n not in owned and e.starting]
             for name, entry in starting:
+                log.warning("[%s] data backend %s still starting at close: "
+                            "stopped when its start returns", self._sid, name)
                 self._stop(name, entry)     # data_start stops it on return
             await asyncio.gather(
                 *(self._stop_quietly(name, entry)
@@ -1476,8 +1480,9 @@ class RhapsodyClient(PluginClient):
             except Exception:
                 status = None                # transient: retry
             if status == 410:
-                # closing or expired; a 404 is not conclusive here: the
-                # session may not be routable yet right after register
+                # closing or expired.  Other statuses end the poll as
+                # before (404 included: it is not conclusive this early);
+                # the next real call reports them
                 raise RuntimeError(f"session {self.sid} is gone (closing "
                                    "or expired)")
             if status is not None and status != 409:
