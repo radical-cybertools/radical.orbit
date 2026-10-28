@@ -2104,12 +2104,17 @@ async def test_data_shutdown_during_start():
     with patch.object(_mock_rh, 'get_data_backend', return_value=backend):
         task = asyncio.ensure_future(session.data_start('redis'))
         await asyncio.sleep(0)
-        await session.data_shutdown('redis_data')
+        shut = asyncio.ensure_future(session.data_shutdown('redis_data'))
+        await asyncio.sleep(0)
+        backend.shutdown.assert_not_awaited()   # not while start runs
         backend.gate.set()
         with pytest.raises(HTTPException) as exc:
             await task
+        await shut
     assert exc.value.status_code == 409
     session._rh_session.add_backend.assert_not_called()
+    backend.shutdown.assert_awaited_once()      # once, after start
+    assert session._data == {}
 
 
 @pytest.mark.asyncio
@@ -2150,11 +2155,12 @@ async def test_close_drain_is_bounded():
         task = asyncio.ensure_future(session.data_start('redis'))
         await asyncio.sleep(0)
         await session.close()               # returns after the drain timeout
-        backend.shutdown.assert_awaited()   # the reserved store is stopped
         assert not session.is_active
+        backend.shutdown.assert_not_awaited()   # start still runs ...
         backend.gate.set()
         with pytest.raises(HTTPException):
             await task
+    backend.shutdown.assert_awaited_once()      # ... data_start stops it
 
 
 @pytest.mark.asyncio
@@ -2274,23 +2280,28 @@ async def test_close_waits_for_data_shutdown_in_flight():
 
 
 @pytest.mark.asyncio
-async def test_failed_shutdown_during_start_never_registers():
+async def test_failed_shutdown_after_start_keeps_store_tracked():
     session = _ready_session()
     backend = _FakeDataBackend('redis_data')
     backend.gate = asyncio.Event()
-    backend.shutdown = AsyncMock(side_effect=[RuntimeError('mid-start'), None])
+    backend.shutdown = AsyncMock(side_effect=[RuntimeError('will not die'),
+                                              None])
 
     with patch.object(_mock_rh, 'get_data_backend', return_value=backend):
         start = asyncio.ensure_future(session.data_start('redis'))
         await asyncio.sleep(0)
-        with pytest.raises(RuntimeError, match='mid-start'):
-            await session.data_shutdown('redis_data')
+        shut  = asyncio.ensure_future(session.data_shutdown('redis_data'))
+        await asyncio.sleep(0)
         backend.gate.set()
         with pytest.raises(HTTPException) as exc:
-            await start
+            await start                     # never registered
         assert exc.value.status_code == 409
+        with pytest.raises(RuntimeError, match='will not die'):
+            await shut
     session._rh_session.add_backend.assert_not_called()
-    assert 'redis_data' not in session._data
+    assert session._data['redis_data'].doomed  # tracked for a retry
+    await session.data_shutdown('redis_data')
+    assert session._data == {}
     assert backend.shutdown.await_count == 2
 
 
@@ -2375,8 +2386,8 @@ async def test_cancelled_data_shutdown_still_cleans_up():
         await shut
     assert 'redis_data' in session._data          # still going down
     stop.set()
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
+    for _ in range(5):                      # shutdown -> settle -> book-keeping
+        await asyncio.sleep(0)
     assert 'redis_data' not in session._data
 
 
@@ -2500,18 +2511,24 @@ async def test_failed_start_and_cleanup_still_release_name():
 
 
 @pytest.mark.asyncio
-async def test_store_up_after_early_shutdown_is_stopped_again():
+async def test_data_shutdown_waits_for_start_and_frees_name_after():
     session = _ready_session()
     backend = _FakeDataBackend('redis_data')
     backend.gate = asyncio.Event()
     with patch.object(_mock_rh, 'get_data_backend', return_value=backend):
         start = asyncio.ensure_future(session.data_start('redis'))
         await asyncio.sleep(0)
-        await session.data_shutdown('redis_data')   # done before start ends
-        backend.gate.set()                  # start brings the store up
+        shut  = asyncio.ensure_future(session.data_shutdown('redis_data'))
+        await asyncio.sleep(0)
+        assert not shut.done()              # no premature success ...
+        with pytest.raises(HTTPException):  # ... and the name stays taken
+            await session.data_start('redis')
+        backend.gate.set()
         with pytest.raises(HTTPException):
             await start
-    assert backend.shutdown.await_count == 2
+        await shut
+    assert session._data == {}
+    backend.shutdown.assert_awaited_once()
 
 
 
