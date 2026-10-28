@@ -2489,11 +2489,30 @@ async def test_failed_start_and_cleanup_still_release_name():
     session = _ready_session()
     backend = _FakeDataBackend('redis_data')
     backend.start    = AsyncMock(side_effect=RuntimeError('port in use'))
-    backend.shutdown = AsyncMock(side_effect=RuntimeError('not running'))
+    backend.shutdown = AsyncMock(side_effect=[RuntimeError('not running'),
+                                              None])
     with patch.object(_mock_rh, 'get_data_backend', return_value=backend):
         with pytest.raises(RuntimeError, match='port in use'):
             await session.data_start('redis')
-    assert session._data == {}
+    assert session._data == {}              # name released ...
+    await session.close()                   # ... and close tries once more
+    assert backend.shutdown.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_store_up_after_early_shutdown_is_stopped_again():
+    session = _ready_session()
+    backend = _FakeDataBackend('redis_data')
+    backend.gate = asyncio.Event()
+    with patch.object(_mock_rh, 'get_data_backend', return_value=backend):
+        start = asyncio.ensure_future(session.data_start('redis'))
+        await asyncio.sleep(0)
+        await session.data_shutdown('redis_data')   # done before start ends
+        backend.gate.set()                  # start brings the store up
+        with pytest.raises(HTTPException):
+            await start
+    assert backend.shutdown.await_count == 2
+
 
 
 @pytest.mark.asyncio

@@ -310,8 +310,11 @@ class RhapsodySession(PluginSession):
         # session close shuts them down; this map is what the data routes
         # report on, and it holds a name reserved while its start runs.
         self._data: dict[str, _DataEntry] = {}
+        # stores whose start failed and whose cleanup failed too: their name
+        # is released, but the session close still tries to stop them
+        self._leftovers: list[_DataEntry] = []
 
-        # Close coordination: ``_closing`` turns new requests away (409),
+        # Close coordination: ``_closing`` turns new requests away (410),
         # tracked routes (``_tracked``) are drained before teardown, and
         # the teardown itself runs as one shielded task.
         self._closing    = False
@@ -357,6 +360,9 @@ class RhapsodySession(PluginSession):
                     b = await b
                 backends.append(b)
 
+            if self._closing:
+                raise RuntimeError("session closed during initialization")
+
             # Offload the blocking ``rh.Session`` construction to a worker
             # thread (the established ``_prepare_batch`` offload pattern) so it
             # keeps the work loop responsive to other requests during init.
@@ -393,6 +399,12 @@ class RhapsodySession(PluginSession):
                     self._init_error = "session initialization cancelled"
                     self._init_ready.set()
                     raise
+            if self._closing:
+                # closed while telemetry started: the teardown has closed
+                # the session already but could not see this manager
+                await self._unwind_telemetry(rh_session, failed_start=True)
+                self._telemetry = None
+                raise RuntimeError("session closed during initialization")
 
             # Register state-change callbacks for intermediate notifications
             self._notified_states: dict[str, str] = {}
@@ -483,6 +495,9 @@ class RhapsodySession(PluginSession):
             RuntimeError:      Session is closed.
         """
         self._check_active()
+        if self._closing:
+            # 410 like an expired session; 409 means "still initializing"
+            raise HTTPException(status_code=410, detail="session is closing")
         if not self._init_ready.is_set():
             raise HTTPException(status_code=409,
                                 detail="session is still initializing")
@@ -490,8 +505,7 @@ class RhapsodySession(PluginSession):
             raise HTTPException(
                 status_code=500,
                 detail=f"session init failed: {self._init_error}")
-        if self._closing or self._rh_session is None:
-            # 410 like an expired session; 409 means "still initializing"
+        if self._rh_session is None:
             raise HTTPException(status_code=410, detail="session is closing")
 
     def _deserialize_task(self, td: dict) -> dict:
@@ -991,6 +1005,8 @@ class RhapsodySession(PluginSession):
         return await self._cancel_one(uid)
 
     async def _cancel_one(self, uid: str) -> dict:
+        if self._rh_session is None:        # torn down after a drain timeout
+            raise HTTPException(status_code=410, detail="session is closing")
         task = self._tasks.get(uid)
         if not task:
             raise HTTPException(status_code=404,
@@ -1074,14 +1090,19 @@ class RhapsodySession(PluginSession):
             # cleanup must not mask the original error
             await self._stop_quietly(name, entry)
             if self._data.get(name) is entry:
-                # never started, and its cleanup failed: still release the
-                # name, or it stays reserved for good
+                # its cleanup failed: release the name (or it stays reserved
+                # for good), but let the session close try once more
                 del self._data[name]
+                self._leftovers.append(entry)
             raise
 
         # data_shutdown (even a failed one) or session close may have run
         # while start awaited: then this store must not be registered
         if self._closing or entry.doomed or self._data.get(name) is not entry:
+            if entry.stop is not None and entry.stop.done():
+                # that shutdown ended before start did: the store is up
+                # again, so it needs a shutdown of its own
+                entry.stop = None
             await self._stop_quietly(name, entry)
             raise HTTPException(status_code=409,
                                 detail=f"data backend {name!r} was shut "
@@ -1169,6 +1190,9 @@ class RhapsodySession(PluginSession):
         if self._close_task is None:
             self._closing    = True         # turn new requests away
             self._close_task = asyncio.ensure_future(self._teardown())
+            # retrieved even if every caller was cancelled
+            self._close_task.add_done_callback(
+                lambda t: t.cancelled() or t.exception())
         await asyncio.shield(self._close_task)
         return {}
 
@@ -1184,6 +1208,7 @@ class RhapsodySession(PluginSession):
                             "flight", self._sid, self._ops)
 
         data, self._data = self._data, {}
+        leftovers, self._leftovers = self._leftovers, []
         rh_session, self._rh_session = self._rh_session, None
         # a successful rhapsody close stopped the backends it owned; the
         # rest is stopped below (all of them if that close failed)
@@ -1206,9 +1231,10 @@ class RhapsodySession(PluginSession):
                 owned = held
         finally:
             self._tasks = {}
-            await asyncio.gather(*(self._stop_quietly(name, entry)
-                                   for name, entry in data.items()
-                                   if name not in owned))
+            await asyncio.gather(
+                *(self._stop_quietly(name, entry)
+                  for name, entry in data.items() if name not in owned),
+                *(self._stop_quietly(e.backend.name, e) for e in leftovers))
             await super().close()
 
 
@@ -1392,6 +1418,8 @@ class RhapsodyClient(PluginClient):
             except Exception:
                 status = None                # transient: retry
             if status == 410:
+                # closing or expired; a 404 is not conclusive here: the
+                # session may not be routable yet right after register
                 raise RuntimeError(f"session {self.sid} is gone (closing "
                                    "or expired)")
             if status is not None and status != 409:
