@@ -52,6 +52,7 @@ TERMINAL_STATES     = {'DONE', 'FAILED', 'CANCELED', 'COMPLETED'}
 WS_PAYLOAD_LIMIT    = 8 * 1024 * 1024  # target max per batch (conservative)
 NOTIFY_BATCH_SIZE   = 1024             # max tasks per bulk notification
 NOTIFY_BATCH_WINDOW = 0.25             # seconds to accumulate before flush
+CLOSE_DRAIN_TIMEOUT = 30.0             # close waits this long for ops in flight
 
 # Both budgets below are halves of the transport frame cap.  The *effective*
 # cap is resolved per plugin from the hosting runtime (see
@@ -238,6 +239,43 @@ def _resolve_notify_window() -> float:
 # Endpoint-side session
 # ---------------------------------------------------------------------------
 
+class _DataEntry:
+    """One data backend of a session: the store, its kind, whether its
+    start is still running, whether it was asked to stop, and the one stop
+    every stopper shares."""
+
+    __slots__ = ('backend', 'kind', 'starting', 'doomed', 'stop')
+
+    def __init__(self, backend, kind: str, starting: bool = False):
+        self.backend  = backend
+        self.kind     = kind
+        self.starting = starting             # only data_start may stop it
+        self.doomed   = False                # never register it any more
+        self.stop: asyncio.Future | None = None
+
+
+def _tracked(func):
+    """Count a state-changing session route as in flight while it runs.
+
+    ``close()`` waits (bounded) until no tracked route is in flight before
+    it tears the rhapsody session down, so such a route never sees a half
+    torn-down session.  Read and wait routes stay untracked: a long
+    ``wait_tasks`` must not hold up a close.
+    """
+    @functools.wraps(func)
+    async def wrapper(self, *args, **kwargs):
+        self._check_initialized()
+        self._ops += 1
+        self._ops_idle.clear()
+        try:
+            return await func(self, *args, **kwargs)
+        finally:
+            self._ops -= 1
+            if not self._ops:
+                self._ops_idle.set()
+    return wrapper
+
+
 class RhapsodySession(PluginSession):
     """
     Rhapsody session (service-side).
@@ -273,7 +311,21 @@ class RhapsodySession(PluginSession):
         # started they are also registered with the rhapsody session, so
         # session close shuts them down; this map is what the data routes
         # report on, and it holds a name reserved while its start runs.
-        self._data: dict[str, tuple] = {}         # name -> (backend, kind)
+        self._data: dict[str, _DataEntry] = {}
+        # stores whose start failed and whose cleanup failed too: their name
+        # is released, but the session close still tries to stop them
+        self._leftovers: list[_DataEntry] = []
+        self._torn_down = False                # teardown took the leftovers
+        self._bg: set[asyncio.Future] = set()  # strong refs to shutdown tasks
+
+        # Close coordination: ``_closing`` turns new requests away (410),
+        # tracked routes (``_tracked``) are drained before teardown, and
+        # the teardown itself runs as one shielded task.
+        self._closing    = False
+        self._ops        = 0
+        self._ops_idle   = asyncio.Event()
+        self._ops_idle.set()
+        self._close_task: asyncio.Future | None = None
 
         # Async init tracking
         self._init_ready = threading.Event()
@@ -312,11 +364,28 @@ class RhapsodySession(PluginSession):
                     b = await b
                 backends.append(b)
 
+            if self._closing:
+                # closed while the backends were created: release them
+                for b in backends:
+                    try:
+                        if hasattr(b, 'shutdown'):
+                            await b.shutdown()
+                    except Exception as e:
+                        log.warning("[%s] backend shutdown failed: %s",
+                                    self._sid, e)
+                raise RuntimeError("session closed during initialization")
+
             # Offload the blocking ``rh.Session`` construction to a worker
             # thread (the established ``_prepare_batch`` offload pattern) so it
             # keeps the work loop responsive to other requests during init.
-            self._rh_session = await asyncio.to_thread(
+            rh_session = await asyncio.to_thread(
                 rh.Session, backends=backends, uid=self._sid)
+            if self._closing:
+                # closed while the session was being built: the teardown
+                # found nothing to close, so this one is ours to close
+                await rh_session.close()
+                raise RuntimeError("session closed during initialization")
+            self._rh_session = rh_session
 
             # Telemetry is optional: older rhapsody lacks start_telemetry,
             # it needs the [telemetry] extra, the operator can switch it off,
@@ -342,6 +411,12 @@ class RhapsodySession(PluginSession):
                     self._init_error = "session initialization cancelled"
                     self._init_ready.set()
                     raise
+            if self._closing:
+                # closed while telemetry started: the teardown has closed
+                # the session already but could not see this manager
+                await self._unwind_telemetry(rh_session, failed_start=True)
+                self._telemetry = None
+                raise RuntimeError("session closed during initialization")
 
             # Register state-change callbacks for intermediate notifications
             self._notified_states: dict[str, str] = {}
@@ -427,10 +502,14 @@ class RhapsodySession(PluginSession):
 
         Raises:
             HTTPException 409: Session is still initializing.
+            HTTPException 410: Session is closing.
             HTTPException 500: Session initialization failed.
             RuntimeError:      Session is closed.
         """
         self._check_active()
+        if self._closing:
+            # 410 like an expired session; 409 means "still initializing"
+            raise HTTPException(status_code=410, detail="session is closing")
         if not self._init_ready.is_set():
             raise HTTPException(status_code=409,
                                 detail="session is still initializing")
@@ -438,6 +517,8 @@ class RhapsodySession(PluginSession):
             raise HTTPException(
                 status_code=500,
                 detail=f"session init failed: {self._init_error}")
+        if self._rh_session is None:
+            raise HTTPException(status_code=410, detail="session is closing")
 
     def _deserialize_task(self, td: dict) -> dict:
         """Deserialize pickled or import-path function fields in a task dict.
@@ -493,6 +574,7 @@ class RhapsodySession(PluginSession):
         deserialized = [self._deserialize_task(td) for td in task_dicts]
         return [rh.BaseTask.from_dict(td) for td in deserialized]
 
+    @_tracked
     async def submit_tasks(self, task_dicts: list[dict]) -> list[dict]:
         """
         Submit a list of tasks.
@@ -509,8 +591,6 @@ class RhapsodySession(PluginSession):
         Returns:
             list[dict]: Minimal ack dicts ``{uid, state}``.
         """
-        self._check_initialized()
-
         batch_n = len(task_dicts)
         bid     = task_dicts[0].get('uid', '?') if task_dicts else '?'
         if self._prof:
@@ -523,6 +603,9 @@ class RhapsodySession(PluginSession):
         for i in range(0, len(task_dicts), _CHUNK):
             chunk = task_dicts[i:i + _CHUNK]
             tasks = await asyncio.to_thread(self._prepare_batch, chunk)
+            if self._rh_session is None:     # torn down after a drain timeout
+                raise HTTPException(status_code=410,
+                                    detail="session is closing")
             await self._rh_session.submit_tasks(tasks)
             for t in tasks:
                 uid_str = str(t.uid)
@@ -926,12 +1009,18 @@ class RhapsodySession(PluginSession):
                                 detail=f"task {uid} not found")
         return self._sanitize_task(task)
 
+    @_tracked
     async def cancel_task(self, uid: str) -> dict:
         """
         Cancel a running task.
         """
-        self._check_initialized()
+        return await self._cancel_one(uid)
 
+    async def _cancel_one(self, uid: str) -> dict:
+        if self._rh_session is None:
+            # cancel_all's gathered cancels can resume after a teardown that
+            # followed a drain timeout
+            raise HTTPException(status_code=410, detail="session is closing")
         task = self._tasks.get(uid)
         if not task:
             raise HTTPException(status_code=404,
@@ -944,6 +1033,7 @@ class RhapsodySession(PluginSession):
 
         return {"uid": uid, "status": "canceled"}
 
+    @_tracked
     async def cancel_all_tasks(self) -> dict:
         """
         Cancel all non-terminal tasks in this session.
@@ -952,8 +1042,6 @@ class RhapsodySession(PluginSession):
         abort running work.  Per-task errors are swallowed.  Cancels are
         issued concurrently via ``asyncio.gather``.
         """
-        self._check_initialized()
-
         uids = []
         for uid, task in list(self._tasks.items()):
             state = str(self._get_attr(task, 'state', '')).upper()
@@ -965,7 +1053,7 @@ class RhapsodySession(PluginSession):
 
         async def _try_cancel(uid):
             try:
-                await self.cancel_task(uid)
+                await self._cancel_one(uid)   # one tracked op for the batch
                 return True
             except Exception:
                 return False
@@ -975,6 +1063,7 @@ class RhapsodySession(PluginSession):
 
     # -- data backends -------------------------------------------------------
 
+    @_tracked
     async def data_start(self, kind: str, name: str | None = None,
                          kwargs: dict | None = None) -> dict:
         """
@@ -986,8 +1075,6 @@ class RhapsodySession(PluginSession):
 
         Returns the backend's name, kind and serialized endpoints.
         """
-        self._check_initialized()
-
         get_data_backend = getattr(rh, 'get_data_backend', None)
         if get_data_backend is None:
             raise HTTPException(status_code=501,
@@ -1008,70 +1095,179 @@ class RhapsodySession(PluginSession):
 
         # reserve the name before the (slow) start so a concurrent request
         # with the same name gets 409, not a second store
-        self._data[name] = (backend, kind)
+        entry = _DataEntry(backend, kind, starting=True)
+        self._data[name] = entry
         try:
             await backend.start()
         except BaseException:
             # includes cancellation by the endpoint's call timeout; a failing
             # cleanup must not mask the original error
-            if self._data.get(name, (None,))[0] is backend:
+            self._start_done(entry)
+            await self._stop_quietly(name, entry)
+            if self._data.get(name) is entry:
+                # its cleanup failed: release the name (or it stays reserved
+                # for good); the session close tries once more, unless it
+                # already ran (after a drain timeout)
                 del self._data[name]
-            try:
-                await asyncio.shield(backend.shutdown())
-            except Exception as e:
-                log.warning("[%s] data backend %s cleanup failed: %s",
-                            self._sid, name, e)
+                if not self._torn_down:
+                    self._leftovers.append(entry)
+                else:
+                    log.warning("[%s] data backend %s may still run: its "
+                                "cleanup failed after session close",
+                                self._sid, name)
             raise
+        self._start_done(entry)
 
-        # data_shutdown or session close may have run while start awaited
-        if self._data.get(name, (None,))[0] is not backend \
-                or self._rh_session is None:
-            try:
-                await backend.shutdown()
-            except Exception as e:
-                log.warning("[%s] data backend %s cleanup failed: %s",
-                            self._sid, name, e)
+        # data_shutdown (even a failed one) or session close may have run
+        # while start awaited: then this store must not be registered
+        if self._closing or entry.doomed or self._data.get(name) is not entry:
+            await self._stop_quietly(name, entry)
             raise HTTPException(status_code=409,
                                 detail=f"data backend {name!r} was shut "
                                         "down during start")
 
-        self._rh_session.add_backend(backend)
+        try:
+            self._rh_session.add_backend(backend)
+        except Exception:
+            # a store nobody can reach or close must not keep running;
+            # rhapsody may have registered it before failing
+            await self._stop_quietly(name, entry)
+            raise
         return self._data_info(name)
 
+    def _stop(self, name: str, entry: _DataEntry) -> asyncio.Future:
+        """The one stop of a data backend; later callers share it.
+
+        Marks the store doomed (an in-flight start gives up on it, also if
+        this stop fails) and detaches it from the rhapsody session, so
+        from here our own close stops it.  A store whose start is still
+        running is not shut down here -- that shutdown would race the
+        start; ``data_start`` runs it once start returns, and the returned
+        future settles then.  The entry (and with it the name) goes away
+        once the store is down; after a failure it stays for a retry or
+        the session close.
+        """
+        entry.doomed = True
+        if entry.stop is None:
+            rhs = self._rh_session
+            if rhs is not None and rhs.backends.get(name) is entry.backend:
+                del rhs.backends[name]
+            entry.stop = asyncio.get_running_loop().create_future()
+            entry.stop.add_done_callback(
+                lambda f: self._stopped(name, entry, f))
+            if not entry.starting:
+                self._shutdown_into(entry)
+        return entry.stop
+
+    def _start_done(self, entry: _DataEntry) -> None:
+        """The start returned (or failed): run a stop requested meanwhile."""
+        entry.starting = False
+        if entry.stop is not None and not entry.stop.done():
+            self._shutdown_into(entry)
+
+    def _shutdown_into(self, entry: _DataEntry) -> None:
+        """Shut the store down and settle ``entry.stop`` with the outcome."""
+        stop = entry.stop
+        bg   = self._bg
+
+        def _settle(t):
+            if stop.done():
+                return
+            if t.cancelled():
+                stop.cancel()
+            elif t.exception() is not None:
+                stop.set_exception(t.exception())
+            else:
+                stop.set_result(None)
+        task = asyncio.ensure_future(entry.backend.shutdown())
+        bg.add(task)                        # the loop keeps tasks weakly
+        task.add_done_callback(bg.discard)
+        task.add_done_callback(_settle)
+
+    def _stopped(self, name: str, entry: _DataEntry, fut) -> None:
+        """Book-keeping for a finished shutdown, also when every caller was
+        cancelled (the shutdown is shielded and runs on)."""
+        if fut.cancelled() or fut.exception() is not None:
+            log.warning("[%s] data backend %s shutdown failed: %s", self._sid,
+                        name, 'cancelled' if fut.cancelled() else fut.exception())
+            entry.stop = None               # a retry starts a new shutdown
+            return
+        if self._data.get(name) is entry:
+            del self._data[name]
+
+    async def _stop_quietly(self, name: str, entry: _DataEntry) -> None:
+        """Shielded stop for cleanup paths: a failure is logged by
+        ``_stopped``, never raised over the error that caused the cleanup."""
+        stop = self._stop(name, entry)
+        try:
+            await asyncio.shield(stop)
+        except asyncio.CancelledError:
+            if not stop.cancelled():
+                raise                       # we were cancelled, not the stop
+        except Exception:
+            pass
+
     def _data_info(self, name: str) -> dict:
-        backend, kind = self._data[name]
-        state = backend.state.name
-        eps   = [e.serialize() for e in backend.endpoints] \
+        entry = self._data[name]
+        state = entry.backend.state.name
+        eps   = [e.serialize() for e in entry.backend.endpoints] \
                 if state == 'READY' else []
-        return {"name": name, "kind": kind, "state": state, "endpoints": eps}
+        return {"name": name, "kind": entry.kind, "state": state,
+                "endpoints": eps}
 
     async def data_endpoints(self) -> dict:
         """Report all data backends of this session with their endpoints."""
         self._check_initialized()
         return {"backends": {n: self._data_info(n) for n in list(self._data)}}
 
+    @_tracked
     async def data_shutdown(self, name: str) -> dict:
         """Shut down one data backend of this session."""
-        self._check_initialized()
-
-        entry = self._data.pop(name, None)
+        entry = self._data.get(name)
         if entry is None:
             raise HTTPException(status_code=404,
                                 detail=f"data backend {name} not found")
-        if self._rh_session is not None:
-            self._rh_session.backends.pop(name, None)
-        await entry[0].shutdown()
+        # shared with any other stopper; a cancelled caller does not stop it
+        await asyncio.shield(self._stop(name, entry))
         return {"name": name, "status": "shutdown"}
 
     async def close(self) -> dict:
         """
         Shutdown RHAPSODY session and clean up.
+
+        Idempotent.  The teardown runs as one task that a cancelled caller
+        does not interrupt, so it always stops every data backend and ends
+        with the base class close.
         """
-        # Detach before awaiting: a data_start / data_shutdown still in
-        # flight then sees no session and no reservation, instead of
-        # mutating the backend dict rhapsody's close iterates.
+        if self._close_task is not None and self._close_task.done():
+            return {}                       # torn down; errors reported once
+        if self._close_task is None:
+            self._closing    = True         # turn new requests away
+            self._close_task = asyncio.ensure_future(self._teardown())
+            # retrieved even if every caller was cancelled
+            self._close_task.add_done_callback(
+                lambda t: t.cancelled() or t.exception())
+        await asyncio.shield(self._close_task)
+        return {}
+
+    async def _teardown(self) -> None:
+        # let tracked routes in flight finish (bounded), so none of them
+        # sees a half torn-down session
+        if self._ops:
+            try:
+                await asyncio.wait_for(self._ops_idle.wait(),
+                                       CLOSE_DRAIN_TIMEOUT)
+            except asyncio.TimeoutError:
+                log.warning("[%s] closing with %d request(s) still in "
+                            "flight", self._sid, self._ops)
+
         data, self._data = self._data, {}
+        leftovers, self._leftovers = self._leftovers, []
+        self._torn_down = True
         rh_session, self._rh_session = self._rh_session, None
+        # a successful rhapsody close stopped the backends it owned; the
+        # rest is stopped below (all of them if that close failed)
+        owned = set()
         try:
             if rh_session:
                 # Telemetry is best effort: never let it block teardown.
@@ -1085,20 +1281,23 @@ class RhapsodySession(PluginSession):
                                     self._sid, e)
                 self._telemetry = None
                 await self._unwind_telemetry(rh_session)
+                held = set(rh_session.backends)
                 await rh_session.close()
+                owned = held
         finally:
             self._tasks = {}
-
-            # stop data backends the rhapsody session did not own yet (start
-            # still running); shutdown is idempotent for the ones it closed
-            for backend, _ in data.values():
-                try:
-                    await backend.shutdown()
-                except Exception as e:
-                    log.warning("[%s] data backend %s shutdown failed: %s",
-                                self._sid, backend.name, e)
+            starting = [(n, e) for n, e in data.items()
+                        if n not in owned and e.starting]
+            for name, entry in starting:
+                log.warning("[%s] data backend %s still starting at close: "
+                            "stopped when its start returns", self._sid, name)
+                self._stop(name, entry)     # data_start stops it on return
+            await asyncio.gather(
+                *(self._stop_quietly(name, entry)
+                  for name, entry in data.items()
+                  if name not in owned and not entry.starting),
+                *(self._stop_quietly(e.backend.name, e) for e in leftovers))
             await super().close()
-        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -1277,10 +1476,17 @@ class RhapsodyClient(PluginClient):
             try:
                 resp = self._http.get(
                     self._url(ROUTE_LIST_TASKS.format(sid=self.sid)))
-                if resp.status_code != 409:
-                    return  # session is ready (or already errored)
+                status = resp.status_code
             except Exception:
-                pass
+                status = None                # transient: retry
+            if status == 410:
+                # closing or expired.  Other statuses end the poll as
+                # before (404 included: it is not conclusive this early);
+                # the next real call reports them
+                raise RuntimeError(f"session {self.sid} is gone (closing "
+                                   "or expired)")
+            if status is not None and status != 409:
+                return  # session is ready (or already errored)
             time.sleep(1.0)
         raise RuntimeError(
             f"Session init timed out after {timeout}s (poll)")
