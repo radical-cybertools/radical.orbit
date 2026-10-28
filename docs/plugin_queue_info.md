@@ -64,7 +64,10 @@ List all of the user's jobs across every partition.
 
 `GET /list_allocations/{cid}?user=<name>&force=true`  
 List SLURM associations (accounts/allocations). Optionally filter by
-user.
+user.  On SLURM without `slurmdbd` accounting (`AccountingStorageType`
+other than `accounting_storage/slurmdbd`, typical for single-node
+installs) the list is empty and `get_info?user=` does not filter
+partitions by user; the endpoint logs a warning.
 
 `POST /cancel/{cid}/{job_id}`  
 Cancel a job via the active batch system (`scancel` / `qdel`).

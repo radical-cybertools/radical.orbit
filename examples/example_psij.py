@@ -121,7 +121,11 @@ def main():
                     attrs["queue_name"] = first_q.get("name") or first_q.get("partition") or first_q
 
         if not attrs.get("account"):
-            allocs = qi.list_allocations()
+            try:
+                allocs = qi.list_allocations()
+            except Exception as e:
+                print(f"Allocation lookup failed, submitting without account: {e}")
+                allocs = {}
             alloc_list = allocs.get("allocations", [])
             accounts = set(a.get("account") for a in alloc_list if a.get("account"))
             if accounts:

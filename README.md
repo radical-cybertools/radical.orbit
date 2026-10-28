@@ -82,9 +82,19 @@ precedence rules (CLI > env > file).
 
 The broker requires a **shared bearer token** on its HTTP ingress and on the
 endpoint `/register` handshake — without it, anyone who can reach the broker
-could drive plugins (submit jobs, stage files). On first start the broker
-**generates a token** and writes it to `~/.radical/orbit/broker.token` (mode
-`0600`); the token itself is never printed — only its source/path is.  Same-host
+could drive plugins (submit jobs, stage files). Like the cert, the token is
+**operator-placed**: the broker never generates it and refuses to start without
+one (unless `--no-auth`).  Create it once on the broker host (the same recipe
+is in `radical-orbit-broker.py --help`):
+
+```sh
+mkdir -p ~/.radical/orbit
+python3 -c "import secrets; print(secrets.token_urlsafe(32))" \
+    > ~/.radical/orbit/broker.token
+chmod 600 ~/.radical/orbit/broker.token
+```
+
+The token itself is never printed — only its source/path is.  Same-host
 endpoints and clients pick that file up automatically; for a remote broker,
 copy the token (like the cert) and set:
 
@@ -100,7 +110,7 @@ cookie thereafter.
 For pure local development you can disable the gate (loud warning):
 
 ```sh
-./bin/radical-orbit-broker.py --no-auth   # or RADICAL_ORBIT_BROKER_NO_AUTH=1
+./bin/radical-orbit-broker.py --no-auth
 ```
 
 ### 2. Starting the Broker

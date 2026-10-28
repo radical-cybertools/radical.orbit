@@ -259,11 +259,10 @@ class TestPluginUIConfigs:
         assert ui["notifications"]["topic"] == "task_status"
 
     def test_lucid_ui_config(self):
-        pytest.importorskip('radical.pilot')
         from radical.orbit.plugin_lucid import PluginLucid
         ui = PluginLucid.ui_config
-        assert ui["icon"] == "🧠"
-        assert ui["stub_message"] is not None
+        assert ui["icon"] == "🔬"
+        assert ui["custom_template"] is True
 
     def test_xgfabric_ui_config(self):
         from radical.orbit.plugin_xgfabric import PluginXGFabric

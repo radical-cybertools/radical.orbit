@@ -115,10 +115,20 @@ DNS:localhost"
 
 The broker gates its HTTP ingress **and** the endpoint `/register` handshake
 with a **shared bearer token** — without it, anyone who can reach the broker
-could drive plugins.  On first start the broker **generates** a token and writes
-it to `~/.radical/orbit/broker.token` (mode `0600`).  The token value is
-**never** printed to stdout (only its source/path is), so it cannot leak into
-captured logs — read it from the file.
+could drive plugins.  Like the cert, the token is **operator-placed**: the
+broker never generates it and refuses to start without one (unless
+`--no-auth`).  Create it once on the broker host (the same recipe is in
+`radical-orbit-broker.py --help`):
+
+```shell
+mkdir -p ~/.radical/orbit
+python3 -c "import secrets; print(secrets.token_urlsafe(32))" \
+    > ~/.radical/orbit/broker.token
+chmod 600 ~/.radical/orbit/broker.token
+```
+
+The token value is **never** printed to stdout (only its source/path is), so it
+cannot leak into captured logs — read it from the file.
 
 Resolution on the client/endpoint side is `--token` >
 `$RADICAL_ORBIT_BROKER_TOKEN` > `~/.radical/orbit/broker.token`.  Same-host
@@ -134,7 +144,7 @@ prompts for it once and then rides an HttpOnly cookie minted by `POST /auth`.
 For pure local development the gate can be disabled (with a loud warning):
 
 ```shell
-./bin/radical-orbit-broker.py --no-auth   # or RADICAL_ORBIT_BROKER_NO_AUTH=1
+./bin/radical-orbit-broker.py --no-auth
 ```
 
 ## 3. Run a demo
@@ -156,8 +166,10 @@ radical-orbit-broker.py            # prints the auth-token source + URL on start
 Example output:
 
 ```text
-[Broker] URL: https://broker.example.org:8000
-[Broker] auth token generated and written to: ~/.radical/orbit/broker.token
+[Broker] using     cert  at ~/.radical/orbit/broker_cert.pem
+[Broker] using     token at ~/.radical/orbit/broker.token
+[Broker] listening       on https://broker.example.org:8000
+...
 INFO:     Uvicorn running on https://0.0.0.0:8000 (Press CTRL+C to quit)
 ```
 
