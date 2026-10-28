@@ -360,8 +360,14 @@ class RhapsodySession(PluginSession):
             # Offload the blocking ``rh.Session`` construction to a worker
             # thread (the established ``_prepare_batch`` offload pattern) so it
             # keeps the work loop responsive to other requests during init.
-            self._rh_session = await asyncio.to_thread(
+            rh_session = await asyncio.to_thread(
                 rh.Session, backends=backends, uid=self._sid)
+            if self._closing:
+                # closed while the session was being built: the teardown
+                # found nothing to close, so this one is ours to close
+                await rh_session.close()
+                raise RuntimeError("session closed during initialization")
+            self._rh_session = rh_session
 
             # Telemetry is optional: older rhapsody lacks start_telemetry,
             # it needs the [telemetry] extra, the operator can switch it off,
@@ -471,7 +477,8 @@ class RhapsodySession(PluginSession):
         """Check that the session is active and fully initialized.
 
         Raises:
-            HTTPException 409: Session is still initializing, or closing.
+            HTTPException 409: Session is still initializing.
+            HTTPException 410: Session is closing.
             HTTPException 500: Session initialization failed.
             RuntimeError:      Session is closed.
         """
@@ -484,7 +491,8 @@ class RhapsodySession(PluginSession):
                 status_code=500,
                 detail=f"session init failed: {self._init_error}")
         if self._closing or self._rh_session is None:
-            raise HTTPException(status_code=409, detail="session is closing")
+            # 410 like an expired session; 409 means "still initializing"
+            raise HTTPException(status_code=410, detail="session is closing")
 
     def _deserialize_task(self, td: dict) -> dict:
         """Deserialize pickled or import-path function fields in a task dict.
@@ -570,7 +578,7 @@ class RhapsodySession(PluginSession):
             chunk = task_dicts[i:i + _CHUNK]
             tasks = await asyncio.to_thread(self._prepare_batch, chunk)
             if self._rh_session is None:     # torn down after a drain timeout
-                raise HTTPException(status_code=409,
+                raise HTTPException(status_code=410,
                                     detail="session is closing")
             await self._rh_session.submit_tasks(tasks)
             for t in tasks:
@@ -1065,6 +1073,10 @@ class RhapsodySession(PluginSession):
             # includes cancellation by the endpoint's call timeout; a failing
             # cleanup must not mask the original error
             await self._stop_quietly(name, entry)
+            if self._data.get(name) is entry:
+                # never started, and its cleanup failed: still release the
+                # name, or it stays reserved for good
+                del self._data[name]
             raise
 
         # data_shutdown (even a failed one) or session close may have run
@@ -1376,14 +1388,14 @@ class RhapsodyClient(PluginClient):
             try:
                 resp = self._http.get(
                     self._url(ROUTE_LIST_TASKS.format(sid=self.sid)))
-                if resp.status_code != 409:
-                    return  # session is ready (or already errored)
-                if 'closing' in resp.text:
-                    raise RuntimeError(f"session {self.sid} is closing")
-            except RuntimeError:
-                raise
+                status = resp.status_code
             except Exception:
-                pass
+                status = None                # transient: retry
+            if status == 410:
+                raise RuntimeError(f"session {self.sid} is gone (closing "
+                                   "or expired)")
+            if status is not None and status != 409:
+                return  # session is ready (or already errored)
             time.sleep(1.0)
         raise RuntimeError(
             f"Session init timed out after {timeout}s (poll)")

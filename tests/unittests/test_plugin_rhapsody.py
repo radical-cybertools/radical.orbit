@@ -2212,7 +2212,7 @@ async def test_requests_during_close_see_closed_session():
                  lambda: session.data_endpoints()):
         with pytest.raises(HTTPException) as exc:
             await call()
-        assert exc.value.status_code == 409
+        assert exc.value.status_code == 410
         assert 'closing' in exc.value.detail
 
 
@@ -2222,7 +2222,7 @@ async def test_closing_flag_turns_requests_away():
     session._closing = True                 # close() started, not detached
     with pytest.raises(HTTPException) as exc:
         await session.submit_tasks([{'uid': 't1'}])
-    assert exc.value.status_code == 409
+    assert exc.value.status_code == 410
 
 
 @pytest.mark.asyncio
@@ -2450,7 +2450,7 @@ async def test_cancel_all_is_one_tracked_op():
 
 
 @pytest.mark.asyncio
-async def test_submit_after_teardown_is_409():
+async def test_submit_after_teardown_is_410():
     session = _ready_session()
 
     def _prepare(chunk):
@@ -2459,18 +2459,61 @@ async def test_submit_after_teardown_is_409():
     with patch.object(session, '_prepare_batch', side_effect=_prepare):
         with pytest.raises(HTTPException) as exc:
             await session.submit_tasks([{'uid': 't1'}])
-    assert exc.value.status_code == 409
+    assert exc.value.status_code == 410
 
 
-def test_client_poll_fails_fast_on_closing_session():
+def test_client_poll_fails_fast_on_gone_session():
     http = MagicMock()
-    http.get.return_value = MagicMock(status_code=409,
-                                      text='{"detail":"session is closing"}')
+    http.get.return_value = MagicMock(status_code=410)
     rc = RhapsodyClient(http, '/rhapsody')
     rc._sid = 'sid.1'
-    with pytest.raises(RuntimeError, match='closing'):
+    with pytest.raises(RuntimeError, match='gone'):
         rc._poll_session_ready(timeout=5)
     assert http.get.call_count == 1
+
+
+def test_client_poll_retries_transient_errors():
+    http = MagicMock()
+    http.get.side_effect = [RuntimeError('reconnecting'),
+                            MagicMock(status_code=409),
+                            MagicMock(status_code=200)]
+    rc = RhapsodyClient(http, '/rhapsody')
+    rc._sid = 'sid.1'
+    with patch('time.sleep'):
+        rc._poll_session_ready(timeout=5)
+    assert http.get.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_failed_start_and_cleanup_still_release_name():
+    session = _ready_session()
+    backend = _FakeDataBackend('redis_data')
+    backend.start    = AsyncMock(side_effect=RuntimeError('port in use'))
+    backend.shutdown = AsyncMock(side_effect=RuntimeError('not running'))
+    with patch.object(_mock_rh, 'get_data_backend', return_value=backend):
+        with pytest.raises(RuntimeError, match='port in use'):
+            await session.data_start('redis')
+    assert session._data == {}
+
+
+@pytest.mark.asyncio
+async def test_close_during_initialize_closes_new_rh_session(monkeypatch):
+    from radical.orbit import plugin_rhapsody as prh
+    fake_session = MagicMock(spec=['close'])
+    fake_session.close = AsyncMock()
+    sess = RhapsodySession('sess.closing', backend_names=['fake'])
+
+    def _build(**kw):
+        sess._closing = True                # close() ran while init built it
+        return fake_session
+    monkeypatch.setattr(prh.rh, 'get_backend',
+                        MagicMock(return_value=MagicMock(spec=[])))
+    monkeypatch.setattr(prh.rh, 'Session', MagicMock(side_effect=_build))
+    with pytest.raises(RuntimeError, match='closed during initialization'):
+        await _REAL_INITIALIZE(sess)
+    fake_session.close.assert_awaited_once()
+    assert sess._rh_session is None
+    assert 'closed during initialization' in sess._init_error
 
 
 def test_data_shutdown_unknown():
