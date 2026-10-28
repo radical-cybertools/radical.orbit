@@ -2552,6 +2552,41 @@ async def test_close_during_initialize_closes_new_rh_session(monkeypatch):
     assert 'closed during initialization' in sess._init_error
 
 
+@pytest.mark.asyncio
+async def test_failed_start_cleanup_during_drain_is_retried_by_close():
+    session = _ready_session()
+    backend = _FakeDataBackend('redis_data')
+    backend.gate = asyncio.Event()
+
+    async def _start():
+        await backend.gate.wait()
+        raise RuntimeError('port in use')
+    backend.start    = AsyncMock(side_effect=_start)
+    backend.shutdown = AsyncMock(side_effect=[RuntimeError('not running'),
+                                              None])
+    with patch.object(_mock_rh, 'get_data_backend', return_value=backend):
+        start = asyncio.ensure_future(session.data_start('redis'))
+        await asyncio.sleep(0)
+        close = asyncio.ensure_future(session.close())   # drains the start
+        await asyncio.sleep(0)
+        backend.gate.set()
+        with pytest.raises(RuntimeError, match='port in use'):
+            await start
+        await close
+    assert backend.shutdown.await_count == 2    # close tried once more
+
+
+@pytest.mark.asyncio
+async def test_cancelled_stop_does_not_abort_teardown():
+    session = _ready_session()
+    a, b = _FakeDataBackend('a'), _FakeDataBackend('b')
+    a.shutdown = AsyncMock(side_effect=asyncio.CancelledError())
+    session._data = {'a': _DataEntry(a, 'redis'), 'b': _DataEntry(b, 'redis')}
+    await session.close()
+    b.shutdown.assert_awaited_once()
+    assert not session.is_active
+
+
 def test_data_shutdown_unknown():
     _, plugin, client = _make_plugin()
     sid, _ = _data_session(plugin, client)

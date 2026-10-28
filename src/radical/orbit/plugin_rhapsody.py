@@ -315,6 +315,8 @@ class RhapsodySession(PluginSession):
         # stores whose start failed and whose cleanup failed too: their name
         # is released, but the session close still tries to stop them
         self._leftovers: list[_DataEntry] = []
+        self._torn_down = False                # teardown took the leftovers
+        self._bg: set[asyncio.Future] = set()  # strong refs to shutdown tasks
 
         # Close coordination: ``_closing`` turns new requests away (410),
         # tracked routes (``_tracked``) are drained before teardown, and
@@ -1015,6 +1017,10 @@ class RhapsodySession(PluginSession):
         return await self._cancel_one(uid)
 
     async def _cancel_one(self, uid: str) -> dict:
+        if self._rh_session is None:
+            # cancel_all's gathered cancels can resume after a teardown that
+            # followed a drain timeout
+            raise HTTPException(status_code=410, detail="session is closing")
         task = self._tasks.get(uid)
         if not task:
             raise HTTPException(status_code=404,
@@ -1103,7 +1109,7 @@ class RhapsodySession(PluginSession):
                 # for good); the session close tries once more, unless it
                 # already ran (after a drain timeout)
                 del self._data[name]
-                if self._close_task is None:
+                if not self._torn_down:
                     self._leftovers.append(entry)
                 else:
                     log.warning("[%s] data backend %s may still run: its "
@@ -1159,10 +1165,10 @@ class RhapsodySession(PluginSession):
         if entry.stop is not None and not entry.stop.done():
             self._shutdown_into(entry)
 
-    @staticmethod
-    def _shutdown_into(entry: _DataEntry) -> None:
+    def _shutdown_into(self, entry: _DataEntry) -> None:
         """Shut the store down and settle ``entry.stop`` with the outcome."""
         stop = entry.stop
+        bg   = self._bg
 
         def _settle(t):
             if stop.done():
@@ -1173,8 +1179,10 @@ class RhapsodySession(PluginSession):
                 stop.set_exception(t.exception())
             else:
                 stop.set_result(None)
-        asyncio.ensure_future(entry.backend.shutdown()).add_done_callback(
-            _settle)
+        task = asyncio.ensure_future(entry.backend.shutdown())
+        bg.add(task)                        # the loop keeps tasks weakly
+        task.add_done_callback(bg.discard)
+        task.add_done_callback(_settle)
 
     def _stopped(self, name: str, entry: _DataEntry, fut) -> None:
         """Book-keeping for a finished shutdown, also when every caller was
@@ -1190,8 +1198,12 @@ class RhapsodySession(PluginSession):
     async def _stop_quietly(self, name: str, entry: _DataEntry) -> None:
         """Shielded stop for cleanup paths: a failure is logged by
         ``_stopped``, never raised over the error that caused the cleanup."""
+        stop = self._stop(name, entry)
         try:
-            await asyncio.shield(self._stop(name, entry))
+            await asyncio.shield(stop)
+        except asyncio.CancelledError:
+            if not stop.cancelled():
+                raise                       # we were cancelled, not the stop
         except Exception:
             pass
 
@@ -1249,6 +1261,7 @@ class RhapsodySession(PluginSession):
 
         data, self._data = self._data, {}
         leftovers, self._leftovers = self._leftovers, []
+        self._torn_down = True
         rh_session, self._rh_session = self._rh_session, None
         # a successful rhapsody close stopped the backends it owned; the
         # rest is stopped below (all of them if that close failed)
