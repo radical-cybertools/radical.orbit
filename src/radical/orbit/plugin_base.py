@@ -298,7 +298,9 @@ class Plugin(object):
 
         # Built-in session management routes
         self.add_route_post('register_session', self.register_session)
-        self.add_route_post('unregister_session/{sid}', self.unregister_session)
+        # closing an expired session is a no-op, not a 410: not an access
+        self.add_route_post('unregister_session/{sid}', self.unregister_session,
+                            access=False)
         self.add_route_post('touch/{sid}', self.touch_session)
         self.add_route_get('version', self.get_version)
         self.add_route_get('list_sessions', self.list_sessions)
@@ -353,13 +355,18 @@ class Plugin(object):
         """Get the unique ID of the plugin instance."""
         return self._uid
 
-    def add_route_post(self, path: str, method: Callable):
-        """Add a POST route to the plugin's namespace."""
-        self._add_route(path, "POST", method)
+    def add_route_post(self, path: str, method: Callable,
+                       access: bool = True):
+        """Add a POST route to the plugin's namespace.  With ``access``
+        (default) a ``{sid}`` path counts each request as an access of that
+        session; see :meth:`_accessing`."""
+        self._add_route(path, "POST", method, access)
 
-    def add_route_get(self, path: str, method: Callable):
-        """Add a GET route to the plugin's namespace."""
-        self._add_route(path, "GET", method)
+    def add_route_get(self, path: str, method: Callable,
+                      access: bool = True):
+        """Add a GET route to the plugin's namespace (``access``: see
+        :meth:`add_route_post`)."""
+        self._add_route(path, "GET", method, access)
 
     def add_route_delete(self, path: str, method: Callable):
         """Add a DELETE route to the plugin's namespace.
@@ -369,14 +376,15 @@ class Plugin(object):
         ``DELETE`` -- so a DELETE route is reachable over every transport
         without further plumbing.
         """
-        self._add_route(path, "DELETE", method)
+        self._add_route(path, "DELETE", method, True)
 
-    def _add_route(self, path: str, verb: str, handler: Callable):
+    def _add_route(self, path: str, verb: str, handler: Callable,
+                   access: bool = True):
         """Register *handler* for *verb* on *path* in the plugin's namespace,
         for both direct dispatch and the ASGI app."""
         full_path = self._namespace + '/' + path
         full_path = full_path.replace('//', '/')
-        if '{sid}' in path and path != 'unregister_session/{sid}':
+        if access and '{sid}' in path:
             handler = self._accessing(handler)
         self._register_direct(full_path, verb, handler)
         self._app.add_route(full_path, self._wrap_handler(handler),
@@ -391,11 +399,7 @@ class Plugin(object):
         async def _accessed(request):
             sid = (getattr(request, 'path_params', None) or {}).get('sid')
             if sid:
-                if sid not in self._sessions:
-                    text = self._expired_detail(sid)
-                    if text:
-                        raise HTTPException(status_code=410, detail=text)
-                self._access(sid)
+                await self._check_session_access(sid)
             return await handler(request)
         return _accessed
 
@@ -624,15 +628,33 @@ class Plugin(object):
         if rec is not None:
             rec.last_access = time.time()
 
-    def _access(self, sid: str) -> None:
-        """A request on *sid*: count it as an access unless the session has
-        expired -- that one is not revived (``_forward`` answers 410 unless
-        it is busy, the sweep drops it).  The busy probe runs in
-        ``_forward`` and the sweep, not here, so a request probes once."""
+    async def _check_session_access(self, sid: str) -> None:
+        """A request on *sid*: an expired session (busy work aside) answers
+        410 with the reason; a live one counts it as an access.  An unknown
+        sid is left to the handler (its own 404)."""
         rec = self._records.get(sid)
-        now = time.time()
-        if rec is not None and not self._is_expired(rec, now):
-            rec.last_access = now
+        if rec is None:
+            text = self._expired_detail(sid)
+            if text:
+                raise HTTPException(status_code=410, detail=text)
+            return
+        text = await self._expire_if_due(sid, rec, time.time())
+        if text:
+            raise HTTPException(status_code=410, detail=text)
+        rec.last_access = time.time()
+
+    async def _expire_if_due(self, sid: str, rec: SessionRecord,
+                             now: float) -> Optional[str]:
+        """The one expiry decision.  A session past its deadline gets the
+        benefit of work in flight (``is_busy``); if still expired it is
+        dropped, logged with its reason, and that reason is returned (the
+        410 detail).  ``None`` when the session lives on."""
+        if not self._is_expired(rec, now):
+            return None
+        self._refresh_if_busy(sid, rec, now)
+        if not self._is_expired(rec, now):
+            return None
+        return await self._expire_session(sid, rec, now)
 
     def _refresh_if_busy(self, sid: str, rec: SessionRecord,
                          now: float) -> None:
@@ -872,10 +894,8 @@ class Plugin(object):
         # Detect expiry of THIS session before the background cleanup removes it
         now = time.time()
         record = self._records.get(sid)
-        if record is not None and self._is_expired(record, now):
-            self._refresh_if_busy(sid, record, now)  # busy is not expired
-        if record is not None and self._is_expired(record, now):
-            text = await self._expire_session(sid, record, now)
+        text   = record and await self._expire_if_due(sid, record, now)
+        if text:
             raise HTTPException(status_code=410, detail=text)
 
         session = self._sessions.get(sid)
@@ -1003,24 +1023,17 @@ class Plugin(object):
         now = time.time()
         expired = []
         for sid, rec in list(self._records.items()):
-            # work in flight counts as access; owner-loss drain still applies
-            self._refresh_if_busy(sid, rec, now)
             if self._is_expired(rec, now):
                 expired.append((sid, rec))
             else:
                 self._warn_possible_leak(sid, rec, now)
         dropped = 0
         for sid, rec in expired:
-            # an earlier close may have yielded long enough for this session
-            # to be used, to become busy, or to be re-registered
-            now = time.time()
-            if self._records.get(sid) is not rec:
-                continue
-            self._refresh_if_busy(sid, rec, now)
-            if not self._is_expired(rec, now):
-                continue
-            await self._expire_session(sid, rec, now)
-            dropped += 1
+            # decided afresh per session: an earlier close may have yielded
+            # long enough for this one to be used, get busy or be reconnected
+            if self._records.get(sid) is rec \
+                    and await self._expire_if_due(sid, rec, time.time()):
+                dropped += 1
         return dropped
 
     def _warn_possible_leak(self, sid: str, rec: SessionRecord,
@@ -1032,6 +1045,9 @@ class Plugin(object):
                 or rec.drain_deadline is not None \
                 or now - rec.last_access < LEAK_WARN_SEC \
                 or rec.leak_warned == rec.last_access:
+            return
+        self._refresh_if_busy(sid, rec, now)     # work in flight: no leak
+        if now - rec.last_access < LEAK_WARN_SEC:
             return
         rec.leak_warned = rec.last_access
         log.warning("[%s] possible session leak: session %s idle for %.0f s "

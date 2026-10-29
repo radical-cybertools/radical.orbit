@@ -211,6 +211,8 @@ class PSIJSession(PluginSession):
         job = self._jobs.get(job_id)
         if job is None:
             return
+        if self._job_states.get(job_id) in TERMINAL_STATES:
+            return      # terminal is final (also a failed submit's FAILED)
         if status is None:
             status = job.status
         state = self._effective_state(job_id, _normalize_state(status.state))

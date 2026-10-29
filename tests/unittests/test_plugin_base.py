@@ -871,10 +871,12 @@ async def test_sid_routes_count_as_access_without_reviving():
     assert time.time() - plugin._records["s1"].last_access < 5
 
     plugin._records["s1"].last_access = time.time() - 61    # expired
-    await handler(_sid_request("s1"))
-    assert time.time() - plugin._records["s1"].last_access > 60
+    with pytest.raises(HTTPException) as exc:               # not served
+        await handler(_sid_request("s1"))
+    assert exc.value.status_code == 410
+    assert "s1" not in plugin._sessions                     # and dropped
     await handler(_sid_request("unknown"))                  # no record: ok
-    assert seen == ["s1", "s1", "unknown"]
+    assert seen == ["s1", "unknown"]
 
 
 @pytest.mark.asyncio

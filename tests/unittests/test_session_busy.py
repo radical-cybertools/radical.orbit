@@ -85,11 +85,34 @@ def test_dispatcher_busy_while_a_task_runs_not_when_queued():
     from radical.orbit.plugin_task_dispatcher import TaskDispatcherSession
     pool   = SimpleNamespace(tasks={'a': SimpleNamespace(state='DONE'),
                                     'b': SimpleNamespace(state='QUEUED')},
-                             pilots={'p': SimpleNamespace(state='ACTIVE')})
+                             pilots={'p': SimpleNamespace(is_terminal=lambda: True)})
     plugin = SimpleNamespace(_pool_states={'sid': {'cpu': pool}})
     s      = SimpleNamespace(_plugin=plugin, _sid='sid')
-    assert not TaskDispatcherSession.is_busy(s)    # queued + idle pilot
+    assert not TaskDispatcherSession.is_busy(s)    # queued, no live pilot
     pool.tasks['b'].state = 'RUNNING'
     assert TaskDispatcherSession.is_busy(s)
     assert not TaskDispatcherSession.is_busy(
         SimpleNamespace(_plugin=plugin, _sid='other'))
+
+
+def test_dispatcher_queued_tasks_busy_only_with_a_live_pilot():
+    from radical.orbit.plugin_task_dispatcher import TaskDispatcherSession
+    pilot  = SimpleNamespace(is_terminal=lambda: False)
+    pool   = SimpleNamespace(tasks={'q': SimpleNamespace(state='QUEUED')},
+                             pilots={'p': pilot})
+    s      = SimpleNamespace(_plugin=SimpleNamespace(
+                                 _pool_states={'sid': {'cpu': pool}}),
+                             _sid='sid')
+    assert TaskDispatcherSession.is_busy(s)          # pilot in batch queue
+    pilot.is_terminal = lambda: True
+    assert not TaskDispatcherSession.is_busy(s)      # queue nobody serves
+
+
+def test_psij_terminal_state_is_final():
+    from radical.orbit.plugin_psij import PSIJSession
+    sent = []
+    s = SimpleNamespace(_jobs={'j': SimpleNamespace(status=None)},
+                        _job_states={'j': 'FAILED'},
+                        notify=lambda *a: sent.append(a))
+    PSIJSession._notify_state(s, 'j', SimpleNamespace(state='NEW'))
+    assert sent == [] and s._job_states['j'] == 'FAILED'
