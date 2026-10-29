@@ -592,8 +592,11 @@ class Gateway:
         # plugin host (the same host-loop crossing ``_dispatch_to_host`` uses)
         # instead of the routing-loop registry, which 404s for ``dst=='broker'``.
         if endpoint_name == BROKER_NAME:
+            # via_gateway as an argument, never as a header: participants
+            # reach the plugin host with headers of their own choosing
             resp = await self._broker.call_host(
-                request.method, forward_path, headers=headers, body=body)
+                request.method, forward_path, headers=headers, body=body,
+                via_gateway=True)
             status, rheaders, rbody = unpack_response_dict(resp)
             return Response(content=rbody, status_code=status,
                             headers=self._clean_response_headers(rheaders))

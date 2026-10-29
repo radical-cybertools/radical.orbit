@@ -1840,7 +1840,7 @@
           // have expired while the stored token is still valid).  ensureAuth
           // only prompts if that POST /auth itself 401s, so we don't bother the
           // user when the token in localStorage still works.
-          if (res.status === 401 && !opts._retried) {
+          if (res.status === 401 && !opts._retried && !opts.background) {
             const ok = await ensureAuth(false);
             if (ok) return await apiFetch(path, { ...opts, _retried: true });
           }
@@ -1888,11 +1888,13 @@
         clearTimeout(timeoutId);
         // Timeout errors
         if (e.name === 'AbortError') {
-          showToast('Request Timeout', `${path}: Request timed out after ${API_TIMEOUT_MS/1000}s`, 'error');
+          if (!opts.background)
+            showToast('Request Timeout', `${path}: Request timed out after ${API_TIMEOUT_MS/1000}s`, 'error');
           throw new Error('Request timed out');
         }
         // Network errors (connection refused, timeout, etc.)
-        if (e.name === 'TypeError' || e.message.includes('Failed to fetch')) {
+        if (!opts.background &&
+            (e.name === 'TypeError' || e.message.includes('Failed to fetch'))) {
           showToast('Network Error', `Failed to reach ${path}. Check connection.`, 'error');
           setConnectionStatus('disconnected');
         }
@@ -1959,8 +1961,10 @@
       for (const s of held) {
         const ns = getNs(s.endpoint, s.plugin);
         if (!ns) continue;
+        // background: no toasts, no connection badge, no auth prompt
         apiFetch(`${ns}/touch/${s.sid}`,
-                 { method: 'POST', quiet: true, _sidRetried: true })
+                 { method: 'POST', quiet: true, background: true,
+                   _sidRetried: true })
           .catch(async (err) => {
             // only a dead sid is dropped: a network blip, a 5xx or an older
             // endpoint without the touch route keep the session as it is

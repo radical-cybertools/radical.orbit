@@ -102,7 +102,8 @@ class BrokerPluginHost(PluginHostBase):
 
     async def handle_request(self, method: str, path: str,
                              headers: dict, body_bytes: bytes,
-                             query_string: str = ''):
+                             query_string: str = '',
+                             via_gateway: bool = False):
 
         import urllib.parse
         query_params = dict(urllib.parse.parse_qsl(query_string)) \
@@ -129,10 +130,11 @@ class BrokerPluginHost(PluginHostBase):
         shim_hdrs    = {}
         if headers.get('x-orbit-client'):
             shim_hdrs['x-orbit-client'] = headers['x-orbit-client']
-        if headers.get('x-orbit-via') == 'gateway':
-            # gateway traffic (the gateway strips client copies of the
-            # marker): owner '@gateway' as on an endpoint -- idle-expiring,
-            # but guarded against a participant's takeover
+        if via_gateway:
+            # gateway traffic -- told by the gateway's own call, never by a
+            # header (a participant routing here picks its headers): owner
+            # '@gateway' as on an endpoint, idle-expiring but guarded
+            # against a participant's takeover
             shim_hdrs.update({'x-orbit-src': 'broker',
                               'x-orbit-via': 'gateway'})
         shim = RequestShim(path_params, query_params, body_bytes, content_type,

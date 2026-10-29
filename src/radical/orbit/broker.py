@@ -929,7 +929,8 @@ class Broker:
 
     async def call_host(self, method: str, path: str, *,
                         headers: Optional[Dict[str, str]] = None,
-                        body: Any = b'') -> Dict[str, Any]:
+                        body: Any = b'',
+                        via_gateway: bool = False) -> Dict[str, Any]:
         """Invoke a broker-hosted plugin route across the thread boundary.
 
         Gateway seam: the HTTP catch-all proxies a ``dst=='broker'`` request
@@ -949,7 +950,8 @@ class Broker:
                     path         = path,
                     headers      = headers or {},
                     body_bytes   = self._as_bytes(body),
-                    query_string = query),
+                    query_string = query,
+                    via_gateway  = via_gateway),
                 self._host_loop)
             resp = await asyncio.wrap_future(cfut)
             return {'status':  resp.status_code,

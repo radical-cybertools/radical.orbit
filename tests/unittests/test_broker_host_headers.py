@@ -58,8 +58,9 @@ async def test_json_body_stays_the_default():
 
 @pytest.mark.asyncio
 async def test_only_session_tags_reach_broker_hosted_plugins():
-    """x-orbit-src from a caller never passes; the gateway marker maps to
-    the trusted owner pair (owner '@gateway'), the client tag passes."""
+    """x-orbit-src from a caller never passes, nor does an x-orbit-via
+    header (participants choose their headers): only the gateway's own call
+    (via_gateway) maps to owner '@gateway'.  The client tag passes."""
     import json
     from radical.orbit.plugin_base import Plugin, GATEWAY_OWNER
 
@@ -77,6 +78,10 @@ async def test_only_session_tags_reach_broker_hosted_plugins():
         headers={'x-orbit-src': 'evil', 'x-orbit-client': 'explorer'})
     assert json.loads(resp.body) == {'owner': None, 'client': 'explorer'}
 
-    resp = await host.handle_request(
+    resp = await host.handle_request(                    # header: spoof
         'POST', '/who', body_bytes=b'{}', headers={'x-orbit-via': 'gateway'})
+    assert json.loads(resp.body)['owner'] is None
+
+    resp = await host.handle_request(                    # gateway's call
+        'POST', '/who', body_bytes=b'{}', headers={}, via_gateway=True)
     assert json.loads(resp.body)['owner'] == GATEWAY_OWNER
