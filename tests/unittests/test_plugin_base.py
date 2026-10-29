@@ -972,10 +972,32 @@ def test_gateway_traffic_is_owner_less_broker_calls_are_not():
     owner-less (idle-expiring); a participant cannot use the marker.'''
     def req(**h):
         return SimpleNamespace(headers=h)
+    from radical.orbit.plugin_base import GATEWAY_OWNER
     own = Plugin._request_owner
-    assert own(req(**{'x-orbit-src': 'broker', 'x-orbit-via': 'gateway'})) is None
+    assert own(req(**{'x-orbit-src': 'broker', 'x-orbit-via': 'gateway'})) \
+        == GATEWAY_OWNER
     assert own(req(**{'x-orbit-src': 'broker'})) == 'broker'
     assert own(req(**{'x-orbit-src': 'epB', 'x-orbit-via': 'gateway'})) == 'epB'
+
+
+@pytest.mark.asyncio
+async def test_gateway_session_idles_out_but_resists_takeover():
+    '''A gateway session idle-expires like an owner-less one, but another
+    participant cannot reattach it (as when it was owned by 'broker').'''
+    plugin = _fresh_plugin()
+    plugin.session_ttl = 60
+    gw = {'x-orbit-src': 'broker', 'x-orbit-via': 'gateway'}
+    req = _owned_request({"sid": "g"})
+    req.headers = dict(gw)
+    await plugin.register_session(req)
+    with pytest.raises(HTTPException) as exc:            # takeover refused
+        await plugin.register_session(_owned_request({"sid": "g"}, "evil"))
+    assert exc.value.status_code == 403
+    again = _owned_request({"sid": "g"})
+    again.headers = dict(gw)
+    await plugin.register_session(again)                 # gateway reattach ok
+    plugin._records["g"].last_access = time.time() - 100
+    assert await plugin._cleanup_expired_sessions() == 1  # idle-expires
 
 
 @pytest.mark.asyncio

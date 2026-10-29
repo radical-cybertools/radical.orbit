@@ -28,6 +28,12 @@ DEFAULT_SID = 'default'
 _REGISTER_CLIENT: contextvars.ContextVar = contextvars.ContextVar(
     'orbit_register_client', default=None)
 
+# Owner recorded for sessions opened through the gateway (HTTP/Explorer):
+# idle-expiring like an owner-less session (the broker only relays them and
+# is never 'lost'), yet reattach stays guarded -- a participant cannot take
+# over a gateway session (e.g. one holding a user's Globus credential).
+GATEWAY_OWNER  = '@gateway'
+
 ISSUES_URL     = 'https://github.com/radical-cybertools/radical.orbit/issues'
 LEAK_WARN_SEC  = 3600     # warn about an owner-bound session idle this long
 EXPIRED_KEEP   = 1000     # remember this many expired sids (for 410) ...
@@ -567,11 +573,10 @@ class Plugin(object):
         except Exception:
             return None
         if owner == 'broker' and via == 'gateway':
-            # an HTTP/Explorer client behind the gateway: the broker only
-            # relays it (and is never 'lost'), so the session is owner-less
-            # (idle-expiring).  Only the broker can be src 'broker', and the
-            # gateway strips client copies of x-orbit-via: not spoofable.
-            return None
+            # an HTTP/Explorer client behind the gateway: see GATEWAY_OWNER.
+            # Only the broker can be src 'broker', and the gateway strips
+            # client copies of x-orbit-via: not spoofable
+            return GATEWAY_OWNER
         return owner if isinstance(owner, str) and owner else None
 
     def _normalize_session_policy(self, data: Dict[str, Any]) -> tuple:
@@ -993,11 +998,17 @@ class Plugin(object):
             return None
         if record.lifetime == 'ttl':
             return record.last_access + record.ttl
-        if record.owner is not None:                       # owner-bound
+        if not self._idle_governed(record):                # owner-bound
             return record.drain_deadline
         if self.session_ttl > 0:                           # owner-less idle
             return self._last_activity(record) + self.session_ttl
         return None
+
+    @staticmethod
+    def _idle_governed(record: SessionRecord) -> bool:
+        """True for sessions governed by the idle timeout rather than by an
+        owner's liveness: owner-less ones and gateway ones."""
+        return record.owner in (None, GATEWAY_OWNER)
 
     @staticmethod
     def _last_activity(record: SessionRecord) -> float:
@@ -1022,7 +1033,7 @@ class Plugin(object):
             return logging.INFO, (
                 f"{head}: lifetime='ttl' session unused for {idle:.0f} s "
                 f"(ttl {rec.ttl:.0f} s).")
-        if rec.owner is not None:
+        if not self._idle_governed(rec):
             return logging.INFO, (
                 f"{head}: its owner '{rec.owner}' was declared lost.")
         if rec.client == 'explorer':
@@ -1093,7 +1104,7 @@ class Plugin(object):
             if self._is_expired(rec, now):
                 expired.append((sid, rec))      # _expire_if_due probes it
                 continue
-            if rec.lifetime == 'ephemeral' and rec.owner is None:
+            if rec.lifetime == 'ephemeral' and self._idle_governed(rec):
                 # every sweep, so last_busy tracks when work ended (to
                 # within a sweep) and the idle clock starts there
                 self._refresh_if_busy(sid, rec, now)
@@ -1114,7 +1125,8 @@ class Plugin(object):
         once per idle stretch, without reclaiming it.  Not for the broker's
         own calls (e.g. task-dispatcher child sessions in a batch
         allocation, which ends them)."""
-        if rec.lifetime != 'ephemeral' or rec.owner in (None, 'broker') \
+        if rec.lifetime != 'ephemeral' or self._idle_governed(rec) \
+                or rec.owner == 'broker' \
                 or rec.drain_deadline is not None \
                 or now - self._last_activity(rec) < LEAK_WARN_SEC \
                 or rec.leak_warned == self._last_activity(rec):

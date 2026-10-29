@@ -623,6 +623,7 @@ class RhapsodySession(PluginSession):
             for t in tasks:
                 uid_str = str(t.uid)
                 self._tasks[uid_str] = t
+                self._idle_at = -1          # may replace a terminal uid
                 results.append({"uid": uid_str,
                                 "state": str(t.get("state"))})
             all_tasks.extend(tasks)

@@ -318,6 +318,7 @@ class PSIJSession(PluginSession):
                 ex.poll_interval = PSIJ_POLL_INTERVAL
 
             self._jobs[job.id] = job
+            self._idle_at = -1
 
             # Store submission metadata for later retrieval
             attribs = job_spec_dict.get('attributes', {})

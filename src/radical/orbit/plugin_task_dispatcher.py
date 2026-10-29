@@ -744,11 +744,16 @@ class TaskDispatcherSession(PluginSession):
         abandoned session (and its pilot attempts) alive.'''
         if self._plugin is None:
             return False
+        pools = (self._plugin._pool_states.get(self._sid) or {}).values()
+        # an idle verdict holds until tasks are added (terminal is final)
+        count = sum(len(ps.tasks) for ps in pools)
+        if count == getattr(self, '_idle_at', -1):
+            return False
         # newest last: live tasks are usually recent, so scan backwards
-        return any(not t.is_terminal()
-                   for ps in (self._plugin._pool_states.get(self._sid)
-                              or {}).values()
-                   for t in reversed(ps.tasks.values()))
+        busy = any(not t.is_terminal()
+                   for ps in pools for t in reversed(ps.tasks.values()))
+        self._idle_at = -1 if busy else count
+        return busy
 
     async def close(self) -> dict:
         '''Tear down this session's pools, then run the base close.'''
@@ -1472,6 +1477,13 @@ class PluginTaskDispatcher(Plugin):
         self._child_clients[key] = client
         return client
 
+    def _task_added(self, sid: str) -> None:
+        '''A task was added (or a terminal one replaced): drop the owning
+        session's cached idle verdict (see TaskDispatcherSession.is_busy).'''
+        session = self._sessions.get(sid)
+        if session is not None:
+            session._idle_at = -1
+
     async def _get_psij_client(self, endpoint_name: str):
         '''Return a caller-backed :class:`PSIJClient` for *endpoint_name*.'''
         if not endpoint_name:
@@ -1962,6 +1974,7 @@ class PluginTaskDispatcher(Plugin):
             arrival_ts   = now,
         )
         pool_state.tasks[task_id] = record
+        self._task_added(pool_state.owning_sid)
         pool_state.persist()
 
         self._dispatch_notify('task_status', self._task_dict(record))
@@ -2138,6 +2151,7 @@ class PluginTaskDispatcher(Plugin):
                 # silent no-op riding the wire.  The record gets the
                 # validated block (with any derived 'cores'), not the raw one.
                 td.pop('requirements', None)
+                self._task_added(sid)
                 pool_state.tasks[uid] = TaskRecord(
                     task_id      = uid,
                     pool         = pool_name,

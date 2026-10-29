@@ -124,3 +124,25 @@ def test_psij_requested_cancel_still_remaps_a_terminal_state():
                                                       exit_code=1))
     assert s._job_states['j'] == 'CANCELED'
     assert sent and sent[-1]['state'] == 'CANCELED'
+
+
+def test_dispatcher_idle_verdict_is_reused_until_a_task_is_added():
+    from radical.orbit.plugin_task_dispatcher import TaskDispatcherSession
+    scans = []
+
+    def task(terminal):
+        def is_terminal():
+            scans.append(1)
+            return terminal
+        return SimpleNamespace(is_terminal=is_terminal)
+    pool = SimpleNamespace(tasks={'a': task(True)}, pilots={})
+    s    = SimpleNamespace(_plugin=SimpleNamespace(
+                               _pool_states={'sid': {'cpu': pool}}),
+                           _sid='sid')
+    assert not TaskDispatcherSession.is_busy(s)
+    n = len(scans)
+    assert not TaskDispatcherSession.is_busy(s)  # cached
+    assert len(scans) == n
+    s._idle_at = -1                              # _task_added on replace
+    pool.tasks['a'] = task(False)
+    assert TaskDispatcherSession.is_busy(s)
