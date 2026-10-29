@@ -157,9 +157,14 @@ class PSIJSession(PluginSession):
     def is_busy(self) -> bool:
         """Busy while any job has not reached a terminal state.  Reaping the
         session would stop its status polling and remove the running jobs'
-        output dir.  A copy: psij threads mutate ``_jobs`` concurrently."""
-        return any(self._job_states.get(j) not in TERMINAL_STATES
+        output dir.  A copy: psij threads mutate ``_jobs`` concurrently.  An
+        idle verdict is reused until a job is added (terminal is final)."""
+        if len(self._jobs) == getattr(self, '_idle_at', -1):
+            return False
+        busy = any(self._job_states.get(j) not in TERMINAL_STATES
                    for j in list(self._jobs))
+        self._idle_at = -1 if busy else len(self._jobs)
+        return busy
 
     def _effective_state(self, job_id: str, raw_state: str) -> str:
         """Map a psij state to what the caller should see.
@@ -207,10 +212,12 @@ class PSIJSession(PluginSession):
         job = self._jobs.get(job_id)
         if job is None:
             return
-        if self._job_states.get(job_id) in TERMINAL_STATES:
-            return      # terminal is final (also a failed submit's FAILED)
         if status is None:
             status = job.status
+        prev = self._job_states.get(job_id)
+        if prev in TERMINAL_STATES and not (
+                job_id in self._cancelled_jobs and prev != 'CANCELED'):
+            return      # terminal is final, except a requested cancel's remap
         state = self._effective_state(job_id, _normalize_state(status.state))
         if state == self._job_states.get(job_id):
             return

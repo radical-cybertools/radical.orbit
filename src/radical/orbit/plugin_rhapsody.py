@@ -499,11 +499,16 @@ class RhapsodySession(PluginSession):
 
     def is_busy(self) -> bool:
         """Busy while any task is not in a terminal state: a client waiting
-        on ``task_status`` notifications sends no requests.  Probed only for
-        a session past its idle deadline; newest tasks first."""
-        return any(str(self._get_attr(t, 'state', '')).upper()
+        on ``task_status`` notifications sends no requests.  Probed every
+        sweep, so: newest tasks first, and an idle verdict is reused until a
+        task is added (a terminal task never becomes live again)."""
+        if len(self._tasks) == getattr(self, '_idle_at', -1):
+            return False
+        busy = any(str(self._get_attr(t, 'state', '')).upper()
                    not in TERMINAL_STATES
                    for t in reversed(self._tasks.values()))
+        self._idle_at = -1 if busy else len(self._tasks)
+        return busy
 
     def _check_initialized(self) -> None:
         """Check that the session is active and fully initialized.

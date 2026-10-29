@@ -75,7 +75,7 @@ def test_psij_terminal_state_is_final():
     from radical.orbit.plugin_psij import PSIJSession
     sent = []
     s = SimpleNamespace(_jobs={'j': SimpleNamespace(status=None)},
-                        _job_states={'j': 'FAILED'},
+                        _job_states={'j': 'FAILED'}, _cancelled_jobs=set(),
                         notify=lambda *a: sent.append(a))
     PSIJSession._notify_state(s, 'j', SimpleNamespace(state='NEW'))
     assert sent == [] and s._job_states['j'] == 'FAILED'
@@ -95,3 +95,32 @@ def test_dispatcher_busy_while_a_task_is_queued_or_running():
     assert not TaskDispatcherSession.is_busy(s)      # idle pilots don't count
     assert not TaskDispatcherSession.is_busy(
         SimpleNamespace(_plugin=plugin, _sid='other'))
+
+
+def test_rhapsody_idle_verdict_is_reused_until_a_task_is_added():
+    from radical.orbit.plugin_rhapsody import RhapsodySession
+    calls = []
+
+    def get_attr(t, k, d=None):
+        calls.append(1)
+        return t.get(k, d)
+    s = SimpleNamespace(_tasks={'a': {'state': 'DONE'}}, _get_attr=get_attr)
+    assert not RhapsodySession.is_busy(s)
+    n = len(calls)
+    assert not RhapsodySession.is_busy(s)       # no rescan
+    assert len(calls) == n
+    s._tasks['b'] = {'state': 'RUNNING'}        # new task: rescan
+    assert RhapsodySession.is_busy(s)
+
+
+def test_psij_requested_cancel_still_remaps_a_terminal_state():
+    from radical.orbit.plugin_psij import PSIJSession
+    sent = []
+    s = SimpleNamespace(_jobs={'j': SimpleNamespace(status=None)},
+                        _job_states={'j': 'FAILED'}, _cancelled_jobs={'j'},
+                        notify=lambda topic, data: sent.append(data))
+    s._effective_state = lambda j, st: PSIJSession._effective_state(s, j, st)
+    PSIJSession._notify_state(s, 'j', SimpleNamespace(state='FAILED',
+                                                      exit_code=1))
+    assert s._job_states['j'] == 'CANCELED'
+    assert sent and sent[-1]['state'] == 'CANCELED'

@@ -1090,14 +1090,14 @@ class Plugin(object):
         now = time.time()
         expired = []
         for sid, rec in list(self._records.items()):
+            if self._is_expired(rec, now):
+                expired.append((sid, rec))      # _expire_if_due probes it
+                continue
             if rec.lifetime == 'ephemeral' and rec.owner is None:
                 # every sweep, so last_busy tracks when work ended (to
                 # within a sweep) and the idle clock starts there
                 self._refresh_if_busy(sid, rec, now)
-            if self._is_expired(rec, now):
-                expired.append((sid, rec))
-            else:
-                self._warn_possible_leak(sid, rec, now)
+            self._warn_possible_leak(sid, rec, now)
         dropped = 0
         for sid, rec in expired:
             # decided afresh per session: an earlier close may have yielded
