@@ -788,7 +788,8 @@ async def test_busy_session_is_not_idle_and_clock_starts_when_work_ends():
     assert await plugin._cleanup_expired_sessions() == 0     # busy
     sess.busy = False
     assert await plugin._cleanup_expired_sessions() == 0     # just went idle
-    plugin._records["b"].last_access = time.time() - 61
+    assert time.time() - plugin._records["b"].last_access > 900  # honest
+    plugin._records["b"].last_busy = time.time() - 61
     assert await plugin._cleanup_expired_sessions() == 1
 
 
@@ -943,6 +944,25 @@ async def test_sweep_rechecks_before_each_drop():
     assert await plugin._cleanup_expired_sessions() == 1   # only "a"
     assert "b" in plugin._sessions                         # reconnected
     assert time.time() - plugin._records["b"].last_access < 5
+
+
+@pytest.mark.asyncio
+async def test_explorer_session_expiry_is_info_not_misuse(caplog):
+    plugin = _fresh_plugin()
+    plugin.session_ttl = 60
+    await plugin.register_session(_owned_request({"sid": "e1"}))
+
+    async def direct(request):
+        return {}
+    req = _sid_request("e1")
+    req.headers = {"x-orbit-client": "explorer"}
+    await plugin._accessing(direct)(req)
+    plugin._records["e1"].last_access = time.time() - 100
+    with caplog.at_level(logging.INFO, logger="radical.orbit"):
+        assert await plugin._cleanup_expired_sessions() == 1
+    rec = caplog.records[-1]
+    assert rec.levelno == logging.INFO
+    assert "Explorer" in rec.getMessage() and "misuse" not in rec.getMessage()
 
 
 @pytest.mark.asyncio

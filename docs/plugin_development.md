@@ -228,8 +228,10 @@ The three lifetimes:
   hold an owner-less session through long idle phases, call
   `PluginClient.touch()` (route `touch/{sid}`) now and then, or register
   with `lifetime='ttl'`.  An expiry is logged with its reason (for an idle
-  one: likely API misuse, or a missed use case to report); later calls on
-  that session get **410** with the same explanation.
+  one: likely API misuse, or a missed use case to report -- a session the
+  Explorer used, marked by its `X-Orbit-Client: explorer` header, is logged
+  at INFO as the normal end of a browser tab); later calls on that session
+  get **410** with the same explanation.
 - `ttl` — expires once `now - last_access` exceeds `ttl` seconds (requires
   a positive `ttl`); never touched by owner loss.
 - `persistent` — never expires; reclaimed only by explicit operator action.

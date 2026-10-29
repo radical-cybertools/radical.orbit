@@ -736,7 +736,8 @@ class TaskDispatcherSession(PluginSession):
     '''
 
     def is_busy(self) -> bool:
-        '''Busy while one of this session's tasks is queued or running: a
+        '''Busy while one of this session's pool tasks is queued or running
+        (endpoint-mode tasks are not tied to a session): a
         client following tasks via notifications sends no requests, and the
         policy replaces pilots as needed.  Idle pilots without tasks do not
         count.  Known limit: a queue that can never be served keeps an

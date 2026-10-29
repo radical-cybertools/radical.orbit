@@ -45,6 +45,8 @@ class SessionRecord:
     drain_deadline: Optional[float] = None    # set on owner 'lost'
     leak_warned:    Optional[float] = None    # last_access at the leak warning
     inflight:       int             = 0       # {sid} requests still running
+    last_busy:      Optional[float] = None    # last time work was in flight
+    client:         Optional[str]   = None    # X-Orbit-Client (e.g. explorer)
 
 
 class _LastAccessView:
@@ -137,7 +139,7 @@ class Plugin(object):
     persistent      any          never (explicit unregister only)
     ttl             any          ``now - last_access > ttl``
     ephemeral       bound        owner ``lost`` + ``reclaim_drain`` grace
-    ephemeral       owner-less   ``now - last_access > session_ttl`` (idle)
+    ephemeral       owner-less   idle ``> session_ttl`` (see below)
     (record-less)   —            treated as owner-less ephemeral
     ==============  ===========  ========================================
 
@@ -147,8 +149,9 @@ class Plugin(object):
     ``close()``), not reclaimed.  Every request on a ``{sid}`` route counts
     as an access.  A session whose :meth:`PluginSession.is_busy` reports
     work in flight (running tasks, jobs, transfers, a workflow) counts as
-    active: the sweep refreshes its ``last_access``, so the idle clock only
-    starts once that work ends.  Known limit: work that never reaches a
+    active (``last_busy``), so the idle clock -- the later of the last
+    request and the last work in flight -- only starts once that work
+    ends.  Known limit: work that never reaches a
     final state keeps its session busy, and alive, for good.  An expired
     session is logged with its reason, and later requests on it get 410
     with the same explanation (not a bare 404).
@@ -405,6 +408,10 @@ class Plugin(object):
             rec = self._records.get(sid)
             if rec is None:
                 return await handler(request)
+            client = (getattr(request, 'headers', None) or {}).get(
+                'x-orbit-client')
+            if client:
+                rec.client = client
             # a request still running is activity too (e.g. a long staging
             # put), for every plugin -- with or without its own is_busy
             rec.inflight += 1
@@ -675,7 +682,7 @@ class Plugin(object):
         if rec.lifetime != 'ephemeral':     # ttl is a hard, time-only bound
             return
         if rec.inflight > 0:                # a request is still running
-            rec.last_access = now
+            rec.last_busy = now
             return
         session = self._sessions.get(sid)
         if session is None:
@@ -687,7 +694,7 @@ class Plugin(object):
                         "%s", self.instance_name, sid, e)
             busy = True
         if busy:
-            rec.last_access = now
+            rec.last_busy = now
 
     def _record_session(self, sid: str, session: PluginSession,
                         lifetime: str, ttl: Optional[float],
@@ -948,8 +955,8 @@ class Plugin(object):
         - ``ttl``                      -> ``last_access + ttl``.
         - ``ephemeral`` owner-bound    -> ``drain_deadline`` (``None`` until
           the owner is declared ``lost``; liveness-governed, never idle).
-        - ``ephemeral`` owner-less     -> ``last_access + session_ttl`` (idle),
-          or ``None`` when ``session_ttl == 0``.
+        - ``ephemeral`` owner-less     -> last activity (request or work in
+          flight) ``+ session_ttl``, or ``None`` when ``session_ttl == 0``.
         """
         if record.lifetime == 'persistent':
             return None
@@ -958,8 +965,14 @@ class Plugin(object):
         if record.owner is not None:                       # owner-bound
             return record.drain_deadline
         if self.session_ttl > 0:                           # owner-less idle
-            return record.last_access + self.session_ttl
+            return self._last_activity(record) + self.session_ttl
         return None
+
+    @staticmethod
+    def _last_activity(record: SessionRecord) -> float:
+        """The later of the last request and the last time work was in
+        flight -- the idle clock of an ephemeral session."""
+        return max(record.last_access, record.last_busy or 0.0)
 
     def _is_expired(self, record: SessionRecord, now: float) -> bool:
         """True once *record* has passed its expiry deadline."""
@@ -971,6 +984,8 @@ class Plugin(object):
         """``(level, text)`` explaining why *rec* expired -- for the endpoint
         log and, verbatim, for the 410 a later request on it gets."""
         idle = now - rec.last_access
+        work = f", work ended {now - rec.last_busy:.0f} s ago" \
+               if rec.last_busy else ""
         head = f"[{self.instance_name}] session {sid} expired"
         if rec.lifetime == 'ttl':
             return logging.INFO, (
@@ -979,15 +994,18 @@ class Plugin(object):
         if rec.owner is not None:
             return logging.INFO, (
                 f"{head}: its owner '{rec.owner}' was declared lost.")
+        if rec.client == 'explorer':
+            return logging.INFO, (
+                f"{head}: Explorer session unused for {idle:.0f} s{work} "
+                f"(idle timeout {self.session_ttl} s) -- the normal end of a "
+                f"closed or abandoned browser tab.")
         return logging.WARNING, (
-            f"{head} after {idle:.0f} s without requests and with no work in "
-            f"flight (owner-less client, e.g. gateway/HTTP; idle timeout "
-            f"{self.session_ttl} s).  From an Explorer/browser tab that was "
-            f"closed or left alone, this is the normal end of the session.  "
-            f"From a script or SDK client it is likely API misuse: the client "
+            f"{head} after {idle:.0f} s without requests{work} and with no "
+            f"work in flight (owner-less client, e.g. gateway/HTTP; idle "
+            f"timeout {self.session_ttl} s).  Likely API misuse: the client "
             f"did not close() the session -- keep a session across idle "
-            f"phases with touch() or lifetime='ttl'.  If this is a legitimate "
-            f"use case, please open an issue: {ISSUES_URL}")
+            f"phases with touch() or lifetime='ttl'.  If this is a "
+            f"legitimate use case, please open an issue: {ISSUES_URL}")
 
     async def _expire_session(self, sid: str, rec: SessionRecord,
                               now: float) -> str:
@@ -1061,20 +1079,20 @@ class Plugin(object):
         once per idle stretch, without reclaiming it."""
         if rec.lifetime != 'ephemeral' or rec.owner is None \
                 or rec.drain_deadline is not None \
-                or now - rec.last_access < LEAK_WARN_SEC \
-                or rec.leak_warned == rec.last_access:
+                or now - self._last_activity(rec) < LEAK_WARN_SEC \
+                or rec.leak_warned == self._last_activity(rec):
             return
         self._refresh_if_busy(sid, rec, now)     # work in flight: no leak
-        if now - rec.last_access < LEAK_WARN_SEC:
+        if now - self._last_activity(rec) < LEAK_WARN_SEC:
             return
-        rec.leak_warned = rec.last_access
+        rec.leak_warned = self._last_activity(rec)
         log.warning("[%s] possible session leak: session %s idle for %.0f s "
                     "while its owner '%s' is still connected and no work is "
                     "in flight -- did the client forget close()?  (Not "
                     "reclaimed: owner-bound sessions live while their owner "
                     "does.)  If this is a legitimate use case, please open "
                     "an issue: %s", self.instance_name, sid,
-                    now - rec.last_access, rec.owner, ISSUES_URL)
+                    now - self._last_activity(rec), rec.owner, ISSUES_URL)
 
     def _ensure_cleanup_task(self) -> None:
         """Start the background session-cleanup task if not already running."""

@@ -1820,7 +1820,10 @@
           ...opts,
           credentials: 'include',
           signal: controller.signal,
-          headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) }
+          // X-Orbit-Client: endpoints log an idle-expired Explorer session
+          // as the normal end of a closed tab, not as API misuse
+          headers: { 'Content-Type': 'application/json',
+                     'X-Orbit-Client': 'explorer', ...(opts.headers || {}) }
         });
         clearTimeout(timeoutId);
 
