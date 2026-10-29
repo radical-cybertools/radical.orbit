@@ -1167,6 +1167,9 @@
     let BROKER = '';
     let eventSource = null;
     let sessions = {};   // key: "endpointName/pluginName" -> sid
+    // sessions a panel registered outside the cache (e.g. globus, which
+    // carries a credential): "endpoint/plugin/sid" -> {endpoint, plugin, sid}
+    let keptSessions = {};
     let sessionRegBodies = {};   // key -> last register_session body (for auto-recovery re-register)
     let healingSessions  = {};   // key -> in-flight re-register promise (single-flight heal)
     let endpointData = {};   // endpointName -> plugin info from /endpoint/list
@@ -1272,6 +1275,11 @@
         // Session management
         async getSession(plugin = pluginName, regBody = {}) {
           return await registerSession(endpointName, plugin, regBody);
+        },
+        // keep a session the panel registered itself alive while open
+        keepSession(sid, plugin = pluginName) {
+          keptSessions[`${endpointName}/${plugin}/${sid}`] =
+              { endpoint: endpointName, plugin, sid };
         },
 
         // API calls - ns computed dynamically to ensure endpointData is populated
@@ -1931,6 +1939,31 @@
       sessions[key] = promise;     // store promise immediately
       return promise;
     }
+
+    // Endpoints idle-expire gateway sessions after 15 min without requests
+    // (closed tabs must not leak them).  While this tab is open, touch every
+    // session it holds, so an idle panel (e.g. globus with its credential)
+    // keeps its session.  An expired one is dropped from the cache.
+    const SESSION_KEEPALIVE_MS = 5 * 60 * 1000;
+    setInterval(() => {
+      const held = [];
+      for (const [key, sid] of Object.entries(sessions)) {
+        if (typeof sid !== 'string') continue;        // registration in flight
+        const [endpoint, plugin] = key.split('/');
+        held.push({ endpoint, plugin, sid, key });
+      }
+      for (const [key, s] of Object.entries(keptSessions)) held.push({ ...s, key, kept: true });
+      for (const s of held) {
+        const ns = getNs(s.endpoint, s.plugin);
+        if (!ns) continue;
+        apiFetch(`${ns}/touch/${s.sid}`,
+                 { method: 'POST', quiet: true, _sidRetried: true })
+          .catch(() => {
+            if (s.kept) delete keptSessions[s.key];
+            else if (sessions[s.key] === s.sid) invalidateSession(s.endpoint, s.plugin);
+          });
+      }
+    }, SESSION_KEEPALIVE_MS);
 
     function getNs(endpointName, pluginName) {
       return endpointData[endpointName]?.plugins?.[pluginName]?.namespace;

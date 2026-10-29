@@ -235,6 +235,7 @@ async function connect(page, api, silent = false) {
       body  : JSON.stringify(payload),
     });
     state[endpoint].sid = data.sid;
+    api.keepSession?.(data.sid);    // keep it (and its credential) while open
 
     if (page.querySelector('.globus-remember').checked) saveTokens(endpoint, payload);
 

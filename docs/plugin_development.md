@@ -230,8 +230,9 @@ The three lifetimes:
   with `lifetime='ttl'`.  An expiry is logged with its reason (for an idle
   one: likely API misuse, or a missed use case to report -- a session the
   Explorer used, marked by its `X-Orbit-Client: explorer` header, is logged
-  at INFO as the normal end of a browser tab); later calls on that session
-  get **410** with the same explanation.
+  at INFO as the normal end of a browser tab -- an open tab touches its
+  sessions every 5 min); later calls on that session get **410** with the
+  same explanation.
 - `ttl` — expires once `now - last_access` exceeds `ttl` seconds (requires
   a positive `ttl`); never touched by owner loss.
 - `persistent` — never expires; reclaimed only by explicit operator action.

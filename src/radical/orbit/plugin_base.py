@@ -8,7 +8,6 @@ import functools
 import time
 
 from dataclasses import dataclass
-import contextvars
 from collections import OrderedDict
 from typing import Type, Optional, Dict, Callable, Any, Union
 from fastapi import FastAPI, HTTPException, Request
@@ -23,10 +22,6 @@ log = logging.getLogger("radical.orbit")
 # Reserved session ID.  The 'default' session is persistent and per plugin
 # instance — a `rhapsody` default and a `psij` default are distinct sessions.
 DEFAULT_SID = 'default'
-
-# X-Orbit-Client of the register_session request being served (see _add_route)
-_REGISTER_CLIENT: contextvars.ContextVar = contextvars.ContextVar(
-    'orbit_register_client', default=None)
 
 # Owner recorded for sessions opened through the gateway (HTTP/Explorer):
 # idle-expiring like an owner-less session (the broker only relays them and
@@ -666,20 +661,19 @@ class Plugin(object):
         if rec is not None:
             rec.last_access = time.time()
 
-    @staticmethod
-    def _tagging_client(handler: Callable) -> Callable:
+    def _tagging_client(self, handler: Callable) -> Callable:
         """Wrap register_session (plugins override it) so the session it
-        records carries the caller's X-Orbit-Client tag (see
-        :meth:`_record_session`)."""
+        returns carries the caller's X-Orbit-Client tag."""
         @functools.wraps(handler)
         async def _tagged(request):
+            result = await handler(request)
             client = (getattr(request, 'headers', None) or {}).get(
                 'x-orbit-client')
-            token = _REGISTER_CLIENT.set(client)
-            try:
-                return await handler(request)
-            finally:
-                _REGISTER_CLIENT.reset(token)
+            sid = result.get('sid') if isinstance(result, dict) else None
+            rec = self._records.get(sid) if (client and sid) else None
+            if rec is not None:
+                rec.client = client
+            return result
         return _tagged
 
     async def _check_session_access(self, sid: str) -> None:
@@ -740,8 +734,7 @@ class Plugin(object):
         gateway sessions and for the shared ``default`` session).
         """
         self._sessions[sid] = session
-        self._records[sid]  = SessionRecord(lifetime, ttl, owner, time.time(),
-                                            client=_REGISTER_CLIENT.get())
+        self._records[sid]  = SessionRecord(lifetime, ttl, owner, time.time())
         self._expired.pop(sid, None)        # a re-registered sid is live again
 
     def _check_owner(self, sid: str, owner: Optional[str]) -> None:
@@ -1136,8 +1129,8 @@ class Plugin(object):
             return
         rec.leak_warned = self._last_activity(rec)
         log.warning("[%s] possible session leak: session %s idle for %.0f s "
-                    "while its owner '%s' is still connected and no work is "
-                    "in flight -- did the client forget close()?  (Not "
+                    "while its owner '%s' was not declared lost and no work "
+                    "is in flight -- did the client forget close()?  (Not "
                     "reclaimed: owner-bound sessions live while their owner "
                     "does.)  If this is a legitimate use case, please open "
                     "an issue: %s", self.instance_name, sid,
