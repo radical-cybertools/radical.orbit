@@ -736,12 +736,14 @@ class TaskDispatcherSession(PluginSession):
 
     def is_busy(self) -> bool:
         '''Probed at the idle deadline: busy while one of this session's
-        pool tasks is queued or running (the dispatcher notifies at plugin
-        level, so task events do not reset the idle clock themselves).'''
+        pool tasks runs (the dispatcher notifies at plugin level, so task
+        events do not reset the idle clock themselves).  Queued tasks do
+        not count: an abandoned pool whose tasks never get placed would
+        otherwise keep submitting pilots forever.'''
         if self._plugin is None:
             return False
         pools = self._plugin._pool_states.get(self._sid) or {}
-        return any(not t.is_terminal()
+        return any(t.state == TASK_RUNNING
                    for ps in pools.values() for t in ps.tasks.values())
 
     async def close(self) -> dict:
@@ -779,12 +781,7 @@ class TaskDispatcherClient(PluginClient):
         body: dict = {}
         if pools is not None:
             body['pools'] = pools
-        if sid is not None:
-            body['sid'] = sid
-        if lifetime is not None:
-            body['lifetime'] = lifetime
-        if ttl is not None:
-            body['ttl'] = ttl
+        body.update(self._session_payload(sid, lifetime, ttl) or {})
         resp = self._http.post(self._url('register_session'), json=body)
         self._raise(resp)
         self._sid = resp.json()['sid']

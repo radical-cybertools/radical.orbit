@@ -45,9 +45,10 @@ TOKEN_FILE       = '~/.globus/auth_tokens.json'
 CP_IMAGE         = 'docker:cellprofiler/cellprofiler:4.2.6'
 
 # Idle timeout of the run's endpoint sessions (s).  They are opened up front
-# and some idle while others work (rhapsody and staging during stage-in), so
-# the plugins' 900 s default is too short; a run closes them when it ends.
-SESSION_TTL      = 4 * 3600
+# and idle while others work (rhapsody and staging during stage-in, globus
+# and staging during compute), so it must outlast the longest phase; the
+# plugins' 900 s default is too short.  A run closes them when it ends.
+SESSION_TTL      = 24 * 3600
 
 DEFAULTS = {
     'collection'   : LUCID_COLLECTION,

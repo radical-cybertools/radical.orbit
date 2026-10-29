@@ -3594,17 +3594,18 @@ def test_last_pilot_error_stops_at_the_newest_healthy_pilot():
     assert P._last_pilot_error([]) is None
 
 
-def test_dispatcher_session_is_busy_while_a_pool_task_is_open():
+def test_dispatcher_session_is_busy_while_a_pool_task_runs():
     from types import SimpleNamespace
     from radical.orbit.plugin_task_dispatcher import TaskDispatcherSession
 
-    task  = SimpleNamespace(done=False)
-    task.is_terminal = lambda: task.done
+    task  = SimpleNamespace(state='QUEUED')
     pools = {'cpu': SimpleNamespace(tasks={'t.1': task})}
 
     session = TaskDispatcherSession('s1')
     assert session.is_busy() is False              # no plugin
     session._plugin = SimpleNamespace(_pool_states={'s1': pools})
+    assert session.is_busy() is False              # queued: not pinning
+    task.state = 'RUNNING'
     assert session.is_busy() is True
-    task.done = True
+    task.state = 'DONE'
     assert session.is_busy() is False
