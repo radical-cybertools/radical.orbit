@@ -504,11 +504,19 @@ class RhapsodySession(PluginSession):
         task is added (a terminal task never becomes live again)."""
         if len(self._tasks) == getattr(self, '_idle_at', -1):
             return False
-        busy = any(str(self._get_attr(t, 'state', '')).upper()
-                   not in TERMINAL_STATES
-                   for t in reversed(self._tasks.values()))
-        self._idle_at = -1 if busy else len(self._tasks)
-        return busy
+        # a task found live last time is checked first: an old long-running
+        # task behind many finished ones must not cost a rescan every sweep
+        hint = self._tasks.get(getattr(self, '_live_hint', None))
+        if hint is not None and str(self._get_attr(hint, 'state', '')).upper() \
+                not in TERMINAL_STATES:
+            return True
+        for uid in reversed(self._tasks):
+            if str(self._get_attr(self._tasks[uid], 'state', '')).upper() \
+                    not in TERMINAL_STATES:
+                self._live_hint = uid
+                return True
+        self._idle_at = len(self._tasks)
+        return False
 
     def _check_initialized(self) -> None:
         """Check that the session is active and fully initialized.

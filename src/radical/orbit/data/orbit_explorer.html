@@ -1878,7 +1878,10 @@
             }
           }
 
-          throw new Error(errMsg);
+          const err  = new Error(errMsg);
+          err.status = res.status;          // callers can tell a stale sid
+          err.detail = t;                   // (su.isStaleSession) from others
+          throw err;
         }
         return res.json();
       } catch (e) {
@@ -1958,7 +1961,11 @@
         if (!ns) continue;
         apiFetch(`${ns}/touch/${s.sid}`,
                  { method: 'POST', quiet: true, _sidRetried: true })
-          .catch(() => {
+          .catch(async (err) => {
+            // only a dead sid is dropped: a network blip, a 5xx or an older
+            // endpoint without the touch route keep the session as it is
+            const su = await ensureSU();
+            if (!su.isStaleSession(err.status, err.detail)) return;
             if (s.kept) delete keptSessions[s.key];
             else if (sessions[s.key] === s.sid) invalidateSession(s.endpoint, s.plugin);
           });

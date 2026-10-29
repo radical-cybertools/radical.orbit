@@ -126,9 +126,17 @@ class BrokerPluginHost(PluginHostBase):
         # Only the X-Orbit-Client tag passes: it merely sets how an idle
         # expiry is logged (an Explorer tab's end is not API misuse).
         content_type = headers.get('content-type', 'application/json')
-        client       = headers.get('x-orbit-client')
+        shim_hdrs    = {}
+        if headers.get('x-orbit-client'):
+            shim_hdrs['x-orbit-client'] = headers['x-orbit-client']
+        if headers.get('x-orbit-via') == 'gateway':
+            # gateway traffic (the gateway strips client copies of the
+            # marker): owner '@gateway' as on an endpoint -- idle-expiring,
+            # but guarded against a participant's takeover
+            shim_hdrs.update({'x-orbit-src': 'broker',
+                              'x-orbit-via': 'gateway'})
         shim = RequestShim(path_params, query_params, body_bytes, content_type,
-                           {'x-orbit-client': client} if client else None)
+                           shim_hdrs or None)
 
         try:
             result = await handler(shim)

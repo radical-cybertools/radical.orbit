@@ -146,3 +146,29 @@ def test_dispatcher_idle_verdict_is_reused_until_a_task_is_added():
     s._idle_at = -1                              # _task_added on replace
     pool.tasks['a'] = task(False)
     assert TaskDispatcherSession.is_busy(s)
+
+
+def test_rhapsody_old_live_task_is_found_without_a_rescan():
+    from radical.orbit.plugin_rhapsody import RhapsodySession
+    calls = []
+
+    def get_attr(t, k, d=None):
+        calls.append(1)
+        return t.get(k, d)
+    tasks = {'old': {'state': 'RUNNING'}}
+    tasks.update({f't{i}': {'state': 'DONE'} for i in range(100)})
+    s = SimpleNamespace(_tasks=tasks, _get_attr=get_attr)
+    assert RhapsodySession.is_busy(s)          # one scan finds 'old'
+    calls.clear()
+    assert RhapsodySession.is_busy(s)          # hint: a single check
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_psij_cancel_of_a_finished_job_keeps_its_state():
+    from radical.orbit.plugin_psij import PSIJSession
+    job = SimpleNamespace(cancel=lambda: None)
+    s = SimpleNamespace(_jobs={'j': job}, _job_states={'j': 'COMPLETED'},
+                        _cancelled_jobs=set())
+    await PSIJSession.cancel_job(s, 'j')
+    assert 'j' not in s._cancelled_jobs

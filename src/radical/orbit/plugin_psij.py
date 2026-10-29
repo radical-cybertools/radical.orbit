@@ -438,8 +438,10 @@ class PSIJSession(PluginSession):
             raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
 
         # Record intent *before* calling cancel() so any status update
-        # that races with qdel gets mapped through _effective_state.
-        self._cancelled_jobs.add(job_id)
+        # that races with qdel gets mapped through _effective_state -- but
+        # not for a job already finished: its final state stands
+        if self._job_states.get(job_id) not in TERMINAL_STATES:
+            self._cancelled_jobs.add(job_id)
         try:
             job.cancel()
             return {"job_id": job_id, "status": "canceled"}
