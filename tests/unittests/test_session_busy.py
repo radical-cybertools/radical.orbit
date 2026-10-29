@@ -15,11 +15,14 @@ from radical.orbit.plugin_task_dispatcher import (TaskDispatcherSession,
 
 def test_psij_busy_while_a_job_is_not_terminal():
     s = SimpleNamespace(_jobs={'j1': object(), 'j2': object()},
+                        _live={'j1', 'j2'},
                         _job_states={'j1': 'COMPLETED', 'j2': 'ACTIVE'})
     assert PSIJSession.is_busy(s)
+    assert s._live == {'j2'}                 # terminal ones pruned
     s._job_states['j2'] = 'FAILED'
     assert not PSIJSession.is_busy(s)
     s._jobs['j3'] = object()                 # submitted, no state yet
+    s._live.add('j3')
     assert PSIJSession.is_busy(s)
 
 

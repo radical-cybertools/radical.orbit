@@ -852,7 +852,7 @@ class Plugin(object):
         # Detect expiry of THIS session before the background cleanup removes it
         now = time.time()
         record = self._records.get(sid)
-        if record is not None:
+        if record is not None and self._is_expired(record, now):
             self._refresh_if_busy(sid, record, now)  # busy is not expired
         if record is not None and self._is_expired(record, now):
             await self._drop_session(sid)
