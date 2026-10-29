@@ -1281,6 +1281,9 @@
           keptSessions[`${endpointName}/${plugin}/${sid}`] =
               { endpoint: endpointName, plugin, sid };
         },
+        releaseSession(sid, plugin = pluginName) {
+          delete keptSessions[`${endpointName}/${plugin}/${sid}`];
+        },
 
         // API calls - ns computed dynamically to ensure endpointData is populated
         async fetch(endpoint, options = {}) {
@@ -1954,8 +1957,9 @@
       const held = [];
       for (const [key, sid] of Object.entries(sessions)) {
         if (typeof sid !== 'string') continue;        // registration in flight
-        const [endpoint, plugin] = key.split('/');
-        held.push({ endpoint, plugin, sid, key });
+        const i = key.indexOf('/');                    // "endpoint/plugin"
+        held.push({ endpoint: key.slice(0, i), plugin: key.slice(i + 1),
+                    sid, key });
       }
       for (const [key, s] of Object.entries(keptSessions)) held.push({ ...s, key, kept: true });
       for (const s of held) {
@@ -1971,7 +1975,9 @@
             const su = await ensureSU();
             if (!su.isStaleSession(err.status, err.detail)) return;
             if (s.kept) delete keptSessions[s.key];
-            else if (sessions[s.key] === s.sid) invalidateSession(s.endpoint, s.plugin);
+            // drop the sid only: keep the register body, so the next use
+            // re-registers the same session (e.g. rhapsody backends)
+            else if (sessions[s.key] === s.sid) delete sessions[s.key];
           });
       }
     }, SESSION_KEEPALIVE_MS);

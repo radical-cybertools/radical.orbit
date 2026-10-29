@@ -234,6 +234,8 @@ async function connect(page, api, silent = false) {
       method: 'POST',
       body  : JSON.stringify(payload),
     });
+    // the previous session (and its credential) is no longer kept alive
+    if (state[endpoint].sid) api.releaseSession?.(state[endpoint].sid);
     state[endpoint].sid = data.sid;
     api.keepSession?.(data.sid);    // keep it (and its credential) while open
 
@@ -244,6 +246,7 @@ async function connect(page, api, silent = false) {
     label.style.color = 'var(--success)';
     if (!silent) api.flash('Globus connected');
   } catch (e) {
+    if (state[endpoint].sid) api.releaseSession?.(state[endpoint].sid);
     state[endpoint].sid = null;
     label.textContent = 'not connected';
     label.style.color = 'var(--muted)';

@@ -918,7 +918,8 @@ class Broker:
         resp = await self.call_host(
             raw.get('method', 'GET'),
             self._strip_broker_prefix(raw.get('path', '/')),
-            headers=raw.get('headers', {}), body=raw.get('body', b''))
+            headers=raw.get('headers', {}), body=raw.get('body', b''),
+            owner=src_name)
         out = protocol.Response(
             src=BROKER_NAME, dst=src_name, status=int(resp['status']),
             headers={k: v for k, v in (resp['headers'] or {}).items()},
@@ -930,7 +931,8 @@ class Broker:
     async def call_host(self, method: str, path: str, *,
                         headers: Optional[Dict[str, str]] = None,
                         body: Any = b'',
-                        via_gateway: bool = False) -> Dict[str, Any]:
+                        via_gateway: bool = False,
+                        owner: Optional[str] = None) -> Dict[str, Any]:
         """Invoke a broker-hosted plugin route across the thread boundary.
 
         Gateway seam: the HTTP catch-all proxies a ``dst=='broker'`` request
@@ -951,7 +953,8 @@ class Broker:
                     headers      = headers or {},
                     body_bytes   = self._as_bytes(body),
                     query_string = query,
-                    via_gateway  = via_gateway),
+                    via_gateway  = via_gateway,
+                    owner        = owner),
                 self._host_loop)
             resp = await asyncio.wrap_future(cfut)
             return {'status':  resp.status_code,

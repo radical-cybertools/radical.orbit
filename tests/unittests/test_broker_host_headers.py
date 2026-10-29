@@ -85,3 +85,8 @@ async def test_only_session_tags_reach_broker_hosted_plugins():
     resp = await host.handle_request(                    # gateway's call
         'POST', '/who', body_bytes=b'{}', headers={}, via_gateway=True)
     assert json.loads(resp.body)['owner'] == GATEWAY_OWNER
+
+    resp = await host.handle_request(                    # routed participant
+        'POST', '/who', body_bytes=b'{}', headers={'x-orbit-src': 'evil'},
+        owner='epA')
+    assert json.loads(resp.body)['owner'] == 'epA'      # broker-stamped wins
