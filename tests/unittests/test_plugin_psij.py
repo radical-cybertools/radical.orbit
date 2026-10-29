@@ -627,3 +627,15 @@ def test_psij_cancel_of_a_finished_job_keeps_its_state(mock_psij):
     sess._notify_state('job.1', _status('COMPLETED'))
     assert sess._job_states['job.1'] == 'COMPLETED'
     assert 'job.1' not in sess._cancelled_jobs
+
+
+def test_psij_cancel_racing_a_recorded_completion_keeps_it(mock_psij):
+    '''A job recorded COMPLETED stays COMPLETED even if a cancel lands in
+    _cancelled_jobs afterwards (race with the status callback).'''
+    sess, sent = _psij_session(mock_psij)
+    sess._jobs['job.1'] = MagicMock()
+    sess._notify_state('job.1', _status('COMPLETED'))
+    sess._cancelled_jobs.add('job.1')
+    sess._notify_state('job.1', _status('COMPLETED'))
+    assert sess._job_states['job.1'] == 'COMPLETED'
+    assert [d['state'] for d in sent] == ['COMPLETED']

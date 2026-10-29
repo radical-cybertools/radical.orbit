@@ -1389,7 +1389,8 @@ class RhapsodyClient(PluginClient):
     def register_session(self, backends: list[str] | None = None,
                          init_timeout: float = 120,
                          sid: str | None = None,
-                         ttl: float | None = None):
+                         ttl: float | None = None,
+                         lifetime: str | None = None):
         """
         Register a session, optionally specifying backend names.
 
@@ -1408,6 +1409,8 @@ class RhapsodyClient(PluginClient):
             ttl:      Idle timeout in seconds, fixed at creation (``0``:
                       never expires); default: the plugin's (900 s).  Set it
                       for sessions reconnected to after long idle phases.
+            lifetime: Legacy policy name (``'ephemeral'`` / ``'persistent'``);
+                      prefer *ttl*.
         """
         has_sse = (self._bc is not None and
                    self._endpoint_id is not None and
@@ -1432,7 +1435,7 @@ class RhapsodyClient(PluginClient):
             self.register_notification_callback(_on_session_status,
                                                 topic="session_status")
 
-        payload = self._session_payload(sid, None, ttl) or {}
+        payload = self._session_payload(sid, lifetime, ttl) or {}
         if backends:
             payload['backends'] = backends
         resp = self._http.post(self._url('register_session'), json=payload)

@@ -209,10 +209,9 @@ class PSIJSession(PluginSession):
             return
         if status is None:
             status = job.status
-        prev = self._job_states.get(job_id)
-        if prev in TERMINAL_STATES and not (
-                job_id in self._cancelled_jobs and prev != 'CANCELED'):
-            return      # terminal is final, except a requested cancel's remap
+        if self._job_states.get(job_id) in TERMINAL_STATES:
+            return      # terminal is final (a requested cancel remaps a
+                        # racing end before it is recorded: _effective_state)
         state = self._effective_state(job_id, _normalize_state(status.state))
         if state == self._job_states.get(job_id):
             return
