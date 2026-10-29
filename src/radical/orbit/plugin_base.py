@@ -411,14 +411,24 @@ class Plugin(object):
     @staticmethod
     def _tag_client(rec: SessionRecord, request) -> None:
         """Record the ``X-Orbit-Client`` header (client-supplied: it only
-        selects how an idle expiry is logged, never expiry itself)."""
+        selects how an idle expiry is logged, never expiry itself).  A
+        session accessed by different clients (e.g. the Explorer and a
+        script) is tagged ``mixed``, so it is never logged as the Explorer's
+        alone."""
         try:
-            client = (getattr(request, 'headers', None) or {}).get(
-                'x-orbit-client')
+            headers = getattr(request, 'headers', None) or {}
+            client  = headers.get('x-orbit-client')
+            if client is None and isinstance(headers, dict):
+                client = next((v for k, v in headers.items()
+                               if k.lower() == 'x-orbit-client'), None)
         except Exception:
             client = None
-        if isinstance(client, str) and client:
+        if not (isinstance(client, str) and client):
+            client = 'other'
+        if rec.client is None or rec.client == client:
             rec.client = client
+        else:
+            rec.client = 'mixed'
 
     @staticmethod
     def _wrap_handler(handler: Callable) -> Callable:
@@ -512,7 +522,8 @@ class Plugin(object):
         - ``sid`` names an existing session  -> *reconnect* (by any client):
           an access; the same ``sid`` is returned.  The timeout was fixed at
           creation: ``ttl`` / ``lifetime`` of a reconnect are ignored.
-        - ``sid`` names an ended session     -> 410 with the reason.
+        - ``sid`` names an ended session     -> 410 with the reason (an
+          ended sid is not reused while the process runs; use a new one).
         - ``sid`` names no session           -> a session is created under
           exactly that ID.
 

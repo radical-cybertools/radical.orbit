@@ -828,6 +828,25 @@ async def test_explorer_expiry_is_info(caplog):
     assert rec.levelno == logging.INFO and "Explorer" in rec.getMessage()
 
 
+
+@pytest.mark.asyncio
+async def test_session_shared_with_a_script_is_not_logged_as_explorer(caplog):
+    '''The Explorer tag is case-insensitive and does not stick to a
+    session a script also uses.'''
+    plugin = _fresh_plugin()
+    plugin.session_ttl = 60
+    handler = plugin._tagging_client(plugin.register_session)
+    request = _owned_request({"sid": "e1"})
+    request.headers = {"X-Orbit-Client": "explorer"}
+    await handler(request)
+    assert plugin._records["e1"].client == "explorer"
+    await handler(_owned_request({"sid": "e1"}))            # a script attaches
+    assert plugin._records["e1"].client == "mixed"
+    plugin._records["e1"].last_access = time.time() - 100
+    with caplog.at_level(logging.INFO, logger="radical.orbit"):
+        assert await plugin._cleanup_expired_sessions() == 1
+    assert caplog.records[-1].levelno == logging.WARNING
+
 @pytest.mark.asyncio
 async def test_unregistered_session_answers_410_closed():
     plugin = _fresh_plugin()

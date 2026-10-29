@@ -209,7 +209,8 @@ session's idle timeout and, for reconnect, a client-supplied session id:
 - `sid` names an existing session → *reconnect*: any client holding the sid
   can attach (several clients can share one session); `ttl` is ignored.
 - `sid` names no session → a session is created under exactly that id.
-- `sid` names an ended session → **410** with the reason (see below).
+- `sid` names an ended session → **410** with the reason (see below);
+  an ended sid is not reused while the process runs.
 
 A session expires once it was idle for longer than its timeout.  The
 timeout is fixed at creation: `ttl` seconds, `0` for never; omitted, the
