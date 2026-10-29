@@ -725,10 +725,14 @@ class Plugin(object):
     async def touch_session(self, request: Request) -> dict:
         """Count as an access of the session, so it does not idle-expire.
 
-        No other effect: 404 for an unknown, 410 for an ended session.
+        No other effect: 404 for an unknown, 410 for an ended session.  The
+        persistent ``default`` session never expires: touching it is a
+        no-op (and never creates it).
         """
-        return await self._forward(request.path_params['sid'],
-                                   PluginSession.ping)
+        sid = request.path_params['sid']
+        if sid == DEFAULT_SID:
+            return {}
+        return await self._forward(sid, PluginSession.ping)
 
     async def get_version(self, request: Request) -> dict:
         """Return the plugin version."""

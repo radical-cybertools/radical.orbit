@@ -941,3 +941,11 @@ async def test_malformed_register_does_not_end_a_session():
         await plugin.register_session(_owned_request({"sid": "s1", "ttl": -1}))
     assert exc.value.status_code == 409
     assert "s1" in plugin._sessions
+
+
+@pytest.mark.asyncio
+async def test_touching_default_does_not_create_it():
+    from radical.orbit.plugin_base import DEFAULT_SID
+    plugin = _fresh_plugin()
+    assert await plugin.touch_session(_sid_request(DEFAULT_SID)) == {}
+    assert DEFAULT_SID not in plugin._sessions
