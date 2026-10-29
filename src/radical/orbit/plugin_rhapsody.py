@@ -503,7 +503,7 @@ class RhapsodySession(PluginSession):
         a session past its idle deadline; newest tasks first."""
         return any(str(self._get_attr(t, 'state', '')).upper()
                    not in TERMINAL_STATES
-                   for t in reversed(list(self._tasks.values())))
+                   for t in reversed(self._tasks.values()))
 
     def _check_initialized(self) -> None:
         """Check that the session is active and fully initialized.

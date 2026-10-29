@@ -672,3 +672,15 @@ def test_read_body_capped_accepts_within_cap():
     req = _make_stream_request({'content-length': '6'}, [b'abc', b'def'])
     body = asyncio.run(Gateway._read_body_capped(req, 4 * 1024 * 1024))
     assert body == b'abcdef'
+
+
+def test_strip_headers_drops_client_x_orbit_via():
+    """x-orbit-via marks gateway traffic; a client copy must never pass."""
+    from types import SimpleNamespace
+    from radical.orbit.gateway import Gateway
+    req = SimpleNamespace(headers={'X-Orbit-Via': 'gateway',
+                                   'X-Orbit-Client': 'explorer',
+                                   'Content-Type': 'application/json'})
+    out = {k.lower() for k in Gateway._strip_headers(req)}
+    assert 'x-orbit-via' not in out
+    assert {'x-orbit-client', 'content-type'} <= out

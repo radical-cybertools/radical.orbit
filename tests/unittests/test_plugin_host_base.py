@@ -2,6 +2,7 @@
 
 # pylint: disable=protected-access,unused-import
 
+import inspect
 import pytest
 
 from fastapi import FastAPI
@@ -460,15 +461,16 @@ async def test_deregister_strips_direct_routes():
     p1 = await host.register_dynamic_plugin(_DummyPlugin, 'dummy.one')
     p1.add_route_get('probe', lambda req: {'ok': 1})
     routes_after_register = list(app.state.direct_routes)
-    assert any(entry[3].__self__ is p1 for entry in routes_after_register), \
+    # routes may be wrapped (session access): unwrap to the bound method
+    assert any(getattr(inspect.unwrap(entry[3]), '__self__', None) is p1
+               for entry in routes_after_register), \
         "test setup: expected at least one route bound to the new plugin"
 
     await host.deregister_dynamic_plugin('dummy.one')
 
     # No surviving route should be bound to the deregistered instance.
-    assert not any(entry[3].__self__ is p1
-                   for entry in app.state.direct_routes
-                   if hasattr(entry[3], '__self__')), \
+    assert not any(getattr(inspect.unwrap(entry[3]), '__self__', None) is p1
+                   for entry in app.state.direct_routes), \
         "stale routes for deregistered plugin remained in direct_routes"
 
 

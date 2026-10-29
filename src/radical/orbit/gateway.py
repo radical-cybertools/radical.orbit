@@ -369,8 +369,8 @@ class Gateway:
         headers: Dict[str, str] = {}
         for k, v in request.headers.items():
             k_lower = k.lower()
-            if k_lower in _HOP_BY_HOP:
-                continue
+            if k_lower in _HOP_BY_HOP or k_lower == 'x-orbit-via':
+                continue        # x-orbit-via is ours to set, never the client's
             if k_lower == "cookie":
                 kept = [c.strip() for c in v.split(";")
                         if c.strip()
@@ -584,6 +584,9 @@ class Gateway:
 
         body    = await self._read_body_capped(request, protocol.FRAME_CAP)
         headers = self._strip_headers(request)
+        # mark gateway traffic: on an endpoint it arrives with src 'broker'
+        # like the broker's own calls, and plugin_base must tell them apart
+        headers['x-orbit-via'] = 'gateway'
 
         # dst == the broker's own hosted-plugin participant: route into the
         # plugin host (the same host-loop crossing ``_dispatch_to_host`` uses)

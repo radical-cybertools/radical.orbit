@@ -21,6 +21,7 @@ import uuid
 import logging
 import time
 import pytest
+from types import SimpleNamespace
 
 
 def test_plugin_init_subclass_collision(caplog):
@@ -963,6 +964,58 @@ async def test_explorer_session_expiry_is_info_not_misuse(caplog):
     rec = caplog.records[-1]
     assert rec.levelno == logging.INFO
     assert "Explorer" in rec.getMessage() and "misuse" not in rec.getMessage()
+
+
+def test_gateway_traffic_is_owner_less_broker_calls_are_not():
+    '''On an endpoint, gateway-relayed requests arrive with src 'broker'
+    like the broker's own calls: only the gateway marker makes them
+    owner-less (idle-expiring); a participant cannot use the marker.'''
+    def req(**h):
+        return SimpleNamespace(headers=h)
+    own = Plugin._request_owner
+    assert own(req(**{'x-orbit-src': 'broker', 'x-orbit-via': 'gateway'})) is None
+    assert own(req(**{'x-orbit-src': 'broker'})) == 'broker'
+    assert own(req(**{'x-orbit-src': 'epB', 'x-orbit-via': 'gateway'})) == 'epB'
+
+
+@pytest.mark.asyncio
+async def test_register_records_the_client_tag():
+    plugin = _fresh_plugin()
+    handler = plugin._tagging_client(plugin.register_session)
+    request = _owned_request({"sid": "e1"})
+    request.headers = {"x-orbit-client": "explorer"}
+    await handler(request)
+    assert plugin._records["e1"].client == "explorer"
+    await plugin.register_session(_owned_request({"sid": "s2"}))
+    assert plugin._records["s2"].client is None
+
+
+@pytest.mark.asyncio
+async def test_idle_clock_starts_when_work_ends_not_at_the_deadline():
+    '''Owner-less sessions are probed every sweep, so last_busy tracks the
+    end of work and the session lives session_ttl beyond it.'''
+    plugin = _fresh_plugin()
+    plugin.session_class = _BusySession
+    plugin.session_ttl   = 60
+    await plugin.register_session(_owned_request({"sid": "b"}))
+    plugin._records["b"].last_access = time.time() - 50   # not yet expired
+    assert await plugin._cleanup_expired_sessions() == 0
+    assert time.time() - plugin._records["b"].last_busy < 5   # probed
+    plugin._sessions["b"].busy = False
+    plugin._records["b"].last_access = time.time() - 100
+    assert await plugin._cleanup_expired_sessions() == 0  # work just ended
+
+
+@pytest.mark.asyncio
+async def test_broker_owned_sessions_get_no_leak_warning(caplog):
+    from radical.orbit import plugin_base as pb
+    plugin = _fresh_plugin()
+    await plugin.register_session(_owned_request({"sid": "c"}, "broker"))
+    plugin._records["c"].last_access = time.time() - pb.LEAK_WARN_SEC - 1
+    with caplog.at_level(logging.WARNING, logger="radical.orbit"):
+        assert await plugin._cleanup_expired_sessions() == 0
+    assert not [r for r in caplog.records
+                if "possible session leak" in r.getMessage()]
 
 
 @pytest.mark.asyncio

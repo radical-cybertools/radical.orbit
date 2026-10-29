@@ -8,6 +8,7 @@ import functools
 import time
 
 from dataclasses import dataclass
+import contextvars
 from collections import OrderedDict
 from typing import Type, Optional, Dict, Callable, Any, Union
 from fastapi import FastAPI, HTTPException, Request
@@ -22,6 +23,10 @@ log = logging.getLogger("radical.orbit")
 # Reserved session ID.  The 'default' session is persistent and per plugin
 # instance — a `rhapsody` default and a `psij` default are distinct sessions.
 DEFAULT_SID = 'default'
+
+# X-Orbit-Client of the register_session request being served (see _add_route)
+_REGISTER_CLIENT: contextvars.ContextVar = contextvars.ContextVar(
+    'orbit_register_client', default=None)
 
 ISSUES_URL     = 'https://github.com/radical-cybertools/radical.orbit/issues'
 LEAK_WARN_SEC  = 3600     # warn about an owner-bound session idle this long
@@ -390,6 +395,8 @@ class Plugin(object):
         full_path = full_path.replace('//', '/')
         if access and '{sid}' in path:
             handler = self._accessing(handler)
+        elif path == 'register_session':
+            handler = self._tagging_client(handler)
         self._register_direct(full_path, verb, handler)
         self._app.add_route(full_path, self._wrap_handler(handler),
                             methods=[verb])
@@ -556,7 +563,14 @@ class Plugin(object):
             return None
         try:
             owner = headers.get('x-orbit-src')
+            via   = headers.get('x-orbit-via')
         except Exception:
+            return None
+        if owner == 'broker' and via == 'gateway':
+            # an HTTP/Explorer client behind the gateway: the broker only
+            # relays it (and is never 'lost'), so the session is owner-less
+            # (idle-expiring).  Only the broker can be src 'broker', and the
+            # gateway strips client copies of x-orbit-via: not spoofable.
             return None
         return owner if isinstance(owner, str) and owner else None
 
@@ -647,6 +661,22 @@ class Plugin(object):
         if rec is not None:
             rec.last_access = time.time()
 
+    @staticmethod
+    def _tagging_client(handler: Callable) -> Callable:
+        """Wrap register_session (plugins override it) so the session it
+        records carries the caller's X-Orbit-Client tag (see
+        :meth:`_record_session`)."""
+        @functools.wraps(handler)
+        async def _tagged(request):
+            client = (getattr(request, 'headers', None) or {}).get(
+                'x-orbit-client')
+            token = _REGISTER_CLIENT.set(client)
+            try:
+                return await handler(request)
+            finally:
+                _REGISTER_CLIENT.reset(token)
+        return _tagged
+
     async def _check_session_access(self, sid: str) -> None:
         """A request on *sid*: an expired session (busy work aside) answers
         410 with the reason; a live one counts it as an access.  An unknown
@@ -705,7 +735,8 @@ class Plugin(object):
         gateway sessions and for the shared ``default`` session).
         """
         self._sessions[sid] = session
-        self._records[sid]  = SessionRecord(lifetime, ttl, owner, time.time())
+        self._records[sid]  = SessionRecord(lifetime, ttl, owner, time.time(),
+                                            client=_REGISTER_CLIENT.get())
         self._expired.pop(sid, None)        # a re-registered sid is live again
 
     def _check_owner(self, sid: str, owner: Optional[str]) -> None:
@@ -1059,6 +1090,10 @@ class Plugin(object):
         now = time.time()
         expired = []
         for sid, rec in list(self._records.items()):
+            if rec.lifetime == 'ephemeral' and rec.owner is None:
+                # every sweep, so last_busy tracks when work ended (to
+                # within a sweep) and the idle clock starts there
+                self._refresh_if_busy(sid, rec, now)
             if self._is_expired(rec, now):
                 expired.append((sid, rec))
             else:
@@ -1076,8 +1111,10 @@ class Plugin(object):
                             now: float) -> None:
         """Owner-bound sessions are not idle-expired (owner liveness governs
         them), so a connected owner that never closes one leaks it: say so,
-        once per idle stretch, without reclaiming it."""
-        if rec.lifetime != 'ephemeral' or rec.owner is None \
+        once per idle stretch, without reclaiming it.  Not for the broker's
+        own calls (e.g. task-dispatcher child sessions in a batch
+        allocation, which ends them)."""
+        if rec.lifetime != 'ephemeral' or rec.owner in (None, 'broker') \
                 or rec.drain_deadline is not None \
                 or now - self._last_activity(rec) < LEAK_WARN_SEC \
                 or rec.leak_warned == self._last_activity(rec):
