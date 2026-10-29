@@ -221,7 +221,10 @@ The three lifetimes:
   transfers, a workflow) counts as active, so a client that only waits on
   notifications keeps it; the idle clock starts when that work ends.  Work
   that never reaches a final state (a stuck task or a psij job whose state
-  is never updated) keeps its session alive — a known limit.
+  is never updated) keeps its session alive — a known limit.  A client
+  that holds a session through long idle phases calls
+  `PluginClient.touch()` now and then, or registers with `lifetime='ttl'`;
+  a call on an expired session gets **410**.
 - `ttl` — expires once `now - last_access` exceeds `ttl` seconds (requires
   a positive `ttl`); never touched by owner loss.
 - `persistent` — never expires; reclaimed only by explicit operator action.

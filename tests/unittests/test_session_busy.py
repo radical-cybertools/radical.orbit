@@ -91,6 +91,7 @@ async def test_dispatcher_child_call_evicts_and_retries_a_gone_session():
     old   = Client(_err(410, 'session expired: s1'))
     fresh = Client(None)
     key   = ('child', 'rhapsody', 'dragon_v3')
+    old._orbit_cache_key = fresh._orbit_cache_key = key
     seen  = {}
 
     async def _get(dst, backend):
@@ -108,6 +109,7 @@ async def test_dispatcher_child_call_evicts_and_retries_a_gone_session():
 
     # a task-level 404 is not a gone session: no eviction, error propagates
     task404 = Client(_err(404, 'task t9 not found'))
+    task404._orbit_cache_key = key
     d._child_clients = {key: task404}
     with pytest.raises(RuntimeError, match='t9'):
         await PluginTaskDispatcher._call_child(d, task404, 'submit_tasks',
@@ -119,7 +121,59 @@ def test_rhapsody_session_busy_while_a_task_is_not_terminal():
     from radical.orbit.plugin_rhapsody import RhapsodySession
     s = SimpleNamespace(_tasks={'a': {'state': 'DONE'},
                                 'b': {'state': 'running'}},
+                        _live={'a', 'b'},
                         _get_attr=lambda t, k, d=None: t.get(k, d))
     assert RhapsodySession.is_busy(s)
+    assert s._live == {'b'}                  # terminal ones pruned
     s._tasks['b']['state'] = 'completed'
     assert not RhapsodySession.is_busy(s)
+    assert s._live == set()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_child_call_does_not_retry_a_closing_session():
+    from radical.orbit.plugin_task_dispatcher import PluginTaskDispatcher
+
+    class Client:
+        _orbit_cache_key = ('child', 'rhapsody', None)
+
+        def submit_tasks(self, tasks):
+            raise _err(410, 'session is closing')
+
+    async def _get(dst, backend):            # must not be called
+        raise AssertionError('retried')
+
+    c = Client()
+    d = SimpleNamespace(_child_clients={Client._orbit_cache_key: c},
+                        instance_name='td', _get_rhapsody_client=_get)
+    with pytest.raises(RuntimeError, match='closing'):
+        await PluginTaskDispatcher._call_child(d, c, 'submit_tasks', ['t'],
+                                               retry=True)
+    assert d._child_clients == {}            # evicted, not retried
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_second_stale_caller_retries_on_the_fresh_session():
+    from radical.orbit.plugin_task_dispatcher import PluginTaskDispatcher
+
+    key = ('child', 'rhapsody', None)
+
+    class Client:
+        def __init__(self, fail):
+            self.fail, self._orbit_cache_key = fail, key
+
+        def submit_tasks(self, tasks):
+            if self.fail:
+                raise _err(410, 'session expired: s1')
+            return tasks
+
+    stale, fresh = Client(True), Client(False)
+
+    async def _get(dst, backend):
+        return d._child_clients.setdefault(key, fresh)
+
+    d = SimpleNamespace(_child_clients={key: fresh},   # A already replaced it
+                        instance_name='td', _get_rhapsody_client=_get)
+    assert await PluginTaskDispatcher._call_child(
+        d, stale, 'submit_tasks', ['t'], retry=True) == ['t']
+    assert d._child_clients[key] is fresh             # not evicted by B

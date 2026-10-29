@@ -55,6 +55,9 @@ class FakeGlobus:
     def cancel_task(self, task_id):
         self.cancelled.append(task_id)
 
+    def touch(self):
+        self.touched = getattr(self, 'touched', 0) + 1
+
     def close(self):
         self.closed = True
 
@@ -88,6 +91,9 @@ class FakeRhapsody:
     def list_tasks(self):
         return {'tasks': list(self.tasks.values())}
 
+    def touch(self):
+        self.touched = getattr(self, 'touched', 0) + 1
+
     def close(self):
         self.closed = True
 
@@ -109,6 +115,9 @@ class FakeStaging:
         self.got.append(src)
         with open(dst, 'wb') as fout:
             fout.write(PNG)
+
+    def touch(self):
+        self.touched = getattr(self, 'touched', 0) + 1
 
     def close(self):
         self.closed = True
@@ -214,9 +223,7 @@ def test_run_success(tmp_path):
            ['montage.png', 'cell_00.png', 'cell_01.png']
     assert rt.kwargs['globus'] == {'refresh_token': 'rt',
                                    'client_id': lf.GLOBUS_CLIENT_ID}
-    assert rt.kwargs['rhapsody'] == {'backends': ['dragon_v3'],
-                                     'lifetime': 'ttl',
-                                     'ttl': lf.GLOBUS_TIMEOUT + 2 * 3600}
+    assert rt.kwargs['rhapsody'] == {'backends': ['dragon_v3']}
     assert all(c.closed for c in rt.clients.values())
     assert updates and updates[-1]['finished']
 
@@ -260,6 +267,17 @@ def test_run_accepts_completed_state(tmp_path):
             return out
     rt = FakeRuntime(rhapsody=Completed())
     assert _run(rt, tmp_path).run()['status'] == 'done'
+
+
+def test_run_touches_its_sessions(tmp_path, monkeypatch):
+    rt  = FakeRuntime()
+    run = _run(rt, tmp_path)
+    assert run.run()['status'] == 'done'      # fakes never reach _sleep
+    run._keepalive()                          # not due yet
+    assert not any(getattr(c, 'touched', 0) for c in rt.clients.values())
+    monkeypatch.setattr(lf, 'KEEPALIVE', 0)
+    run._keepalive()                          # due: all three sessions
+    assert all(getattr(c, 'touched', 0) == 1 for c in rt.clients.values())
 
 
 def test_run_rides_out_transient_poll_failures(tmp_path):

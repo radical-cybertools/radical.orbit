@@ -274,7 +274,9 @@ you; the plugin helper's `register_session` accepts a lifetime policy:
 - `lifetime='ephemeral'` (default) — expires after 15 minutes without
   requests (the plugin idle timeout) unless it has work in flight (running
   tasks, jobs, transfers); an owner-bound one is also reclaimed a grace
-  period after its owning participant is declared `lost`.
+  period after its owning participant is declared `lost`.  To keep an
+  otherwise idle session, call `client.touch()` now and then (or use
+  `lifetime='ttl'`); a call on an expired session fails with HTTP 410.
 - `lifetime='ttl', ttl=<seconds>` — expires `ttl` seconds after the last access
   (time-driven; requires a positive `ttl`).
 - `lifetime='persistent'` — never expires; reclaimed only by explicit operator

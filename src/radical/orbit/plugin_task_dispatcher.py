@@ -1074,6 +1074,7 @@ class PluginTaskDispatcher(Plugin):
         # over the caller), keyed (dst, plugin, backend).  Invalidated for a
         # dst when it goes ``lost``.
         self._child_clients: dict[tuple, Any] = {}
+        self._child_locks:   dict[tuple, asyncio.Lock] = {}
 
         # endpoint_name → set of loaded plugin names, refreshed on every
         # topology change.  Used to auto-resolve a pool's endpoint_name and to
@@ -1465,39 +1466,47 @@ class PluginTaskDispatcher(Plugin):
         client = self._child_clients.get(key)
         if client is not None:
             return client
-        client = self._make_child_client(cls, plugin, dst)
-        try:
-            await asyncio.to_thread(client.register_session,
-                                    **register_kwargs)
-        except Exception as e:
-            log.warning('[%s] %s session unavailable on %s: %s',
-                        self.instance_name, plugin, dst, e)
-            return None
-        self._child_clients[key] = client
-        return client
+        # one registration per key: concurrent callers share it
+        async with self._child_locks.setdefault(key, asyncio.Lock()):
+            client = self._child_clients.get(key)
+            if client is not None:
+                return client
+            client = self._make_child_client(cls, plugin, dst)
+            try:
+                await asyncio.to_thread(client.register_session,
+                                        **register_kwargs)
+            except Exception as e:
+                log.warning('[%s] %s session unavailable on %s: %s',
+                            self.instance_name, plugin, dst, e)
+                return None
+            client._orbit_cache_key = key
+            self._child_clients[key] = client
+            return client
 
     async def _call_child(self, client, method: str, *args,
                           retry: bool = False):
         '''Run *method* of a cached child client off the loop.
 
-        A child session that is gone (expired: 410, or 404 "unknown
-        session") is evicted from the cache, so the next use re-registers.
-        With *retry* the call is re-run once on a fresh session -- safe,
-        since those errors are raised before the session method runs.
+        A child session that is gone (410, or 404 "unknown session") is
+        evicted from the cache, so the next use re-registers.  With *retry*
+        the call is re-run once on a fresh session, but only when the error
+        came from the plugin's session lookup ("expired" / "unknown") and
+        thus before the session method ran; a "closing" session may have
+        taken part of the call already.
         '''
         try:
             return await asyncio.to_thread(getattr(client, method), *args)
         except Exception as e:
             if not _child_session_gone(e):
                 raise
-            key = next((k for k, c in self._child_clients.items()
-                        if c is client), None)
+            key = getattr(client, '_orbit_cache_key', None)
             if key is None:
                 raise
-            self._child_clients.pop(key, None)
-            log.info('[%s] %s session on %s is gone (%s): evicted',
-                     self.instance_name, key[1], key[0], e)
-            if not retry:
+            if self._child_clients.get(key) is client:
+                self._child_clients.pop(key, None)
+                log.info('[%s] %s session on %s is gone (%s): evicted',
+                         self.instance_name, key[1], key[0], e)
+            if not retry or 'closing' in str(e):
                 raise
             dst, plugin, backend = key
             if plugin == 'rhapsody':

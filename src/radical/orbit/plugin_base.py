@@ -885,7 +885,13 @@ class Plugin(object):
         for sid, rec in list(self._records.items()):
             if rec.lifetime == 'ephemeral':
                 session = self._sessions.get(sid)
-                if session is not None and session.is_busy():
+                try:
+                    busy = session is not None and session.is_busy()
+                except Exception as e:
+                    log.warning("[%s] is_busy of session %s failed: %s",
+                                self.instance_name, sid, e)
+                    busy = False
+                if busy:
                     # work in flight counts as access; owner-loss drain
                     # still applies below
                     rec.last_access = now

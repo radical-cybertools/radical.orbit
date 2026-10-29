@@ -306,6 +306,7 @@ class RhapsodySession(PluginSession):
         self._rh_session         = None
         self._telemetry          = None
         self._tasks: dict[str, dict] = {}
+        self._live:  set[str]        = set()    # uids maybe not terminal yet
 
         # Data backends started via ``data_start``, keyed by name.  Once
         # started they are also registered with the rhapsody session, so
@@ -499,9 +500,15 @@ class RhapsodySession(PluginSession):
 
     def is_busy(self) -> bool:
         """Busy while any task is not in a terminal state: a client waiting
-        on ``task_status`` notifications sends no requests."""
-        return any(str(self._get_attr(t, 'state', '')).upper()
-                   not in TERMINAL_STATES for t in self._tasks.values())
+        on ``task_status`` notifications sends no requests.  Scans only the
+        tasks not yet seen terminal (``_live``), pruning as they finish, so
+        the sweep's cost does not grow with the session's task history."""
+        for uid in list(self._live):
+            task = self._tasks.get(uid)
+            if task is None or str(self._get_attr(task, 'state', '')).upper() \
+                    in TERMINAL_STATES:
+                self._live.discard(uid)
+        return bool(self._live)
 
     def _check_initialized(self) -> None:
         """Check that the session is active and fully initialized.
@@ -616,6 +623,7 @@ class RhapsodySession(PluginSession):
             for t in tasks:
                 uid_str = str(t.uid)
                 self._tasks[uid_str] = t
+                self._live.add(uid_str)
                 results.append({"uid": uid_str,
                                 "state": str(t.get("state"))})
             all_tasks.extend(tasks)

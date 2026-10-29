@@ -329,7 +329,13 @@ class PSIJSession(PluginSession):
 
             job.set_job_status_callback(_on_status)
 
-            ex.submit(job)
+            try:
+                ex.submit(job)
+            except Exception:
+                # never submitted: no state will ever arrive (is_busy)
+                self._jobs.pop(job.id, None)
+                self._job_meta.pop(job.id, None)
+                raise
 
             # Start background polling for job status updates
             self._start_polling()
