@@ -4,6 +4,7 @@ import uuid
 import asyncio
 import inspect
 import logging
+import functools
 import time
 
 from dataclasses import dataclass
@@ -373,6 +374,7 @@ class Plugin(object):
         that session -- also for plugins that look sessions up directly
         instead of through :meth:`_forward`.  An expired session is not
         revived: it is left for ``_forward`` (410) or the sweep."""
+        @functools.wraps(handler)
         async def _accessed(request):
             sid = (getattr(request, 'path_params', None) or {}).get('sid')
             if sid:
@@ -607,14 +609,12 @@ class Plugin(object):
 
     def _access(self, sid: str) -> None:
         """A request on *sid*: count it as an access unless the session has
-        expired -- that one is not revived (``_forward`` answers 410, the
-        sweep drops it).  Work in flight keeps it alive (``is_busy``)."""
+        expired -- that one is not revived (``_forward`` answers 410 unless
+        it is busy, the sweep drops it).  The busy probe runs in
+        ``_forward`` and the sweep, not here, so a request probes once."""
         rec = self._records.get(sid)
-        if rec is None:
-            return
         now = time.time()
-        self._refresh_if_busy(sid, rec, now)
-        if not self._is_expired(rec, now):
+        if rec is not None and not self._is_expired(rec, now):
             rec.last_access = now
 
     def _refresh_if_busy(self, sid: str, rec: SessionRecord,

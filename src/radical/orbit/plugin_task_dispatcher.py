@@ -1390,8 +1390,15 @@ class PluginTaskDispatcher(Plugin):
         gone is evicted (``_call_child``); after a broker restart nothing
         touches them and the endpoints reclaim them.'''
         async def _one(client):
+            # a touch blocked on a wedged child keeps its worker thread
+            # (to_thread is not cancellable): never stack another on it
+            prev = getattr(client, '_orbit_touch', None)
+            if prev is not None and not prev.done():
+                return
+            client._orbit_touch = asyncio.ensure_future(
+                self._call_child(client, 'touch'))
             try:
-                await asyncio.wait_for(self._call_child(client, 'touch'),
+                await asyncio.wait_for(asyncio.shield(client._orbit_touch),
                                        _CHILD_TOUCH_SEC / 2)
             except Exception as e:
                 log.debug('[%s] child session touch failed: %s',

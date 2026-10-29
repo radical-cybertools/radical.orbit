@@ -356,6 +356,7 @@ class GlobusSession(PluginSession):
                 detail='Globus submit_transfer: missing task_id in response')
 
         self._tasks[task_id] = {'status': 'ACTIVE', 'label': label or ''}
+        self._status_ok = time.time()   # a fresh transfer pins at once
         self._start_polling()
 
         log.info('[globus] session %s: submitted transfer %s (%s -> %s)',
@@ -447,6 +448,7 @@ class GlobusSession(PluginSession):
         task_id = res.get('task_id')
         if task_id:
             self._tasks[task_id] = {'status': 'ACTIVE', 'label': label or ''}
+            self._status_ok = time.time()   # a fresh transfer pins at once
             self._start_polling()
         return {'task_id'      : task_id,
                 'submission_id': res.get('submission_id'),

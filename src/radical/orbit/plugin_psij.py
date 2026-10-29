@@ -158,8 +158,9 @@ class PSIJSession(PluginSession):
         """Busy while any job has not reached a terminal state.  Reaping the
         session would stop its status polling and remove the running jobs'
         output dir."""
+        # copy: psij callbacks and submit threads mutate _jobs concurrently
         return any(self._job_states.get(j) not in TERMINAL_STATES
-                   for j in self._jobs)
+                   for j in list(self._jobs))
 
     def _effective_state(self, job_id: str, raw_state: str) -> str:
         """Map a psij state to what the caller should see.
