@@ -534,8 +534,10 @@ class GlobusSession(PluginSession):
 
     def is_busy(self) -> bool:
         """Busy while any transfer has not been reported terminal: clients
-        wait on ``transfer_status`` notifications without polling."""
-        return any(meta.get('notified') not in GLOBUS_TERMINAL
+        wait on ``transfer_status`` notifications without polling.  An
+        INACTIVE transfer (e.g. expired credential) does not count: it does
+        not end on its own, so it must not pin the session and token."""
+        return any(meta.get('notified') not in GLOBUS_WAIT_DONE
                    for meta in self._tasks.values())
 
     def _start_polling(self) -> None:

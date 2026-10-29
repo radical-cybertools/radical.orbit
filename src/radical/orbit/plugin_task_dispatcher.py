@@ -750,8 +750,11 @@ class TaskDispatcherSession(PluginSession):
         '''Busy while one of this session's pools has a non-terminal task:
         clients follow tasks via notifications.  Live pilots alone do not
         count -- an abandoned session must not hold its allocations.'''
-        pools = (self._plugin._pool_states.get(self._sid)
-                 if self._plugin is not None else None) or {}
+        if self._plugin is None:
+            return False
+        if self._plugin._endpoint_mode_tasks:
+            return True     # endpoint-mode tasks are not tied to a session
+        pools = self._plugin._pool_states.get(self._sid) or {}
         return any(not t.is_terminal()
                    for ps in pools.values() for t in ps.tasks.values())
 
@@ -1076,6 +1079,7 @@ class PluginTaskDispatcher(Plugin):
         # dst when it goes ``lost``.
         self._child_clients: dict[tuple, Any] = {}
         self._child_locks:   dict[tuple, asyncio.Lock] = {}
+        self._touch_task:    asyncio.Task | None       = None
 
         # endpoint_name → set of loaded plugin names, refreshed on every
         # topology change.  Used to auto-resolve a pool's endpoint_name and to
@@ -1350,9 +1354,12 @@ class PluginTaskDispatcher(Plugin):
             try:
                 await asyncio.sleep(_TICK_INTERVAL_SEC)
                 now = time.time()
-                if now - last_touch >= _CHILD_TOUCH_SEC:
+                if now - last_touch >= _CHILD_TOUCH_SEC and \
+                        (self._touch_task is None or self._touch_task.done()):
                     last_touch = now
-                    await self._touch_child_sessions()
+                    # off the tick: a wedged child must not stall the pools
+                    self._touch_task = asyncio.ensure_future(
+                        self._touch_child_sessions())
                 for ps in list(self._all_pools()):
                     if ps.owning_sid not in self._sessions:
                         continue                 # replayed, owner-less pool
@@ -1374,12 +1381,15 @@ class PluginTaskDispatcher(Plugin):
         results and pilots' backends between bursts.  A session that is
         gone is evicted (``_call_child``); after a broker restart nothing
         touches them and the endpoints reclaim them.'''
-        for client in list(self._child_clients.values()):
+        async def _one(client):
             try:
-                await self._call_child(client, 'touch')
+                await asyncio.wait_for(self._call_child(client, 'touch'),
+                                       _CHILD_TOUCH_SEC / 2)
             except Exception as e:
                 log.debug('[%s] child session touch failed: %s',
                           self.instance_name, e)
+        await asyncio.gather(*(_one(c)
+                               for c in list(self._child_clients.values())))
 
     async def shutdown(self) -> None:
         '''Cancel the housekeeping loop and drop the event tap, then base close.'''
@@ -2548,7 +2558,8 @@ class PluginTaskDispatcher(Plugin):
                 # reconnecting one re-registers fresh.
                 for key in [k for k in self._child_clients if k[0] == name]:
                     self._child_clients.pop(key, None)
-                for key in [k for k in self._child_locks if k[0] == name]:
+                for key in [k for k, lk in self._child_locks.items()
+                            if k[0] == name and not lk.locked()]:
                     self._child_locks.pop(key, None)
                 continue
             plugins = (info or {}).get('plugins', {})

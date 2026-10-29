@@ -106,8 +106,8 @@ class Plugin(object):
 
         client_class: The local helper class for the application-side client.
         version: The version string for the plugin.
-        session_ttl: Idle timeout in seconds for owner-less ephemeral sessions
-            (default: 3600 = 1 hour, 0 = no timeout).
+        session_ttl: Idle timeout in seconds for ephemeral sessions, owner-
+            bound or not (default: 900 = 15 min, 0 = no timeout).
         reclaim_drain: Grace, in seconds, between an owner being declared
             ``lost`` and its owner-bound ephemeral sessions being reclaimed
             (default: 300).  Injectable per instance for tests.
@@ -362,9 +362,25 @@ class Plugin(object):
         for both direct dispatch and the ASGI app."""
         full_path = self._namespace + '/' + path
         full_path = full_path.replace('//', '/')
+        if '{sid}' in path:
+            handler = self._accessing(handler)
         self._register_direct(full_path, verb, handler)
         self._app.add_route(full_path, self._wrap_handler(handler),
                             methods=[verb])
+
+    def _accessing(self, handler: Callable) -> Callable:
+        """Wrap a ``{sid}`` route so every request counts as an access of
+        that session -- also for plugins that look sessions up directly
+        instead of through :meth:`_forward`.  An expired session is not
+        revived: it is left for ``_forward`` (410) or the sweep."""
+        async def _accessed(request):
+            sid = (getattr(request, 'path_params', None) or {}).get('sid')
+            rec = self._records.get(sid) if sid else None
+            now = time.time()
+            if rec is not None and not self._is_expired(rec, now):
+                rec.last_access = now
+            return await handler(request)
+        return _accessed
 
     @staticmethod
     def _wrap_handler(handler: Callable) -> Callable:

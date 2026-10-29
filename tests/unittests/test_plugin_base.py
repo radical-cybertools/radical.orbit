@@ -830,6 +830,31 @@ async def test_touch_session_counts_as_access_only():
 
 
 @pytest.mark.asyncio
+async def test_sid_routes_count_as_access_without_reviving():
+    '''Any {sid} route touches its session, also when the plugin looks the
+    session up directly instead of through _forward.'''
+    plugin = _fresh_plugin()
+    plugin.session_ttl = 60
+    seen = []
+
+    async def direct(request):
+        seen.append(request.path_params['sid'])
+        return {}
+    handler = plugin._accessing(direct)
+    await plugin.register_session(_owned_request({"sid": "s1"}, "epB"))
+
+    plugin._records["s1"].last_access = time.time() - 50
+    await handler(_sid_request("s1"))
+    assert time.time() - plugin._records["s1"].last_access < 5
+
+    plugin._records["s1"].last_access = time.time() - 61    # expired
+    await handler(_sid_request("s1"))
+    assert time.time() - plugin._records["s1"].last_access > 60
+    await handler(_sid_request("unknown"))                  # no record: ok
+    assert seen == ["s1", "s1", "unknown"]
+
+
+@pytest.mark.asyncio
 async def test_failing_is_busy_keeps_the_session():
     plugin = _fresh_plugin()
 

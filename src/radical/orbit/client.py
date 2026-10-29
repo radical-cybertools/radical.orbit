@@ -179,9 +179,8 @@ class PluginClient:
         raises (HTTP 410), it is not re-created.  For callers that hold a
         session through long phases without other requests.
         """
-        if not self._sid:
-            raise RuntimeError("no active session")
-        resp = self._http.post(self._url(f'touch/{self._sid}'))
+        self._require_session()
+        resp = self._request("POST", self._url(f"touch/{self._sid}"))
         self._raise(resp)
 
     def unregister_session(self) -> None:

@@ -27,7 +27,7 @@ def test_globus_busy_while_a_transfer_is_not_reported_terminal():
     s = SimpleNamespace(_tasks={'t1': {'notified': 'SUCCEEDED'},
                                 't2': {'status': 'ACTIVE'}})
     assert GlobusSession.is_busy(s)
-    s._tasks['t2']['notified'] = 'FAILED'
+    s._tasks['t2']['notified'] = 'INACTIVE'  # expired credential: no pin
     assert not GlobusSession.is_busy(s)
 
 
@@ -47,7 +47,8 @@ def test_dispatcher_busy_while_a_pool_has_unfinished_tasks():
     def rec(terminal):
         return SimpleNamespace(is_terminal=lambda: terminal)
     pool   = SimpleNamespace(pilots={'p': rec(True)}, tasks={'t': rec(False)})
-    plugin = SimpleNamespace(_pool_states={'sid': {'cpu': pool}})
+    plugin = SimpleNamespace(_pool_states={'sid': {'cpu': pool}},
+                             _endpoint_mode_tasks={})
     s      = SimpleNamespace(_plugin=plugin, _sid='sid')
     assert TaskDispatcherSession.is_busy(s)
     pool.tasks['t'] = rec(True)
@@ -55,6 +56,9 @@ def test_dispatcher_busy_while_a_pool_has_unfinished_tasks():
     pool.pilots['p2'] = rec(False)          # a live pilot alone: not busy
     assert not TaskDispatcherSession.is_busy(s)
     assert not TaskDispatcherSession.is_busy(
+        SimpleNamespace(_plugin=plugin, _sid='other'))
+    plugin._endpoint_mode_tasks['e1'] = 'ep'  # not tied to a session
+    assert TaskDispatcherSession.is_busy(
         SimpleNamespace(_plugin=plugin, _sid='other'))
 
 
@@ -210,6 +214,8 @@ def test_client_touch_uses_the_touch_route():
     http = MagicMock()
     http.post.return_value = MagicMock(status_code=200, is_error=False)
     c = PluginClient(http, '/psij')
+    with pytest.raises(RuntimeError, match='No active session'):
+        c.touch()
     c._sid = 'sid.1'
     c.touch()
     url = http.post.call_args.args[0]
