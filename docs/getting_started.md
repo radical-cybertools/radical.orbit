@@ -269,27 +269,22 @@ reflects the broker's snapshot at registration time — so an immediate
 ### Session lifetimes
 
 `get_plugin(endpoint, plugin, **session_kwargs)` calls `register_session` for
-you; the plugin helper's `register_session` accepts a lifetime policy:
-
-- `lifetime='ephemeral'` (default) — an owner-bound session, reclaimed a grace
-  period after its owning participant is declared `lost`; an owner-less one
-  (gateway/HTTP caller) falls back to the plugin idle timeout.
-- `lifetime='ttl', ttl=<seconds>` — expires `ttl` seconds after the last access
-  (time-driven; requires a positive `ttl`).
-- `lifetime='persistent'` — never expires; reclaimed only by explicit operator
-  action.
-- `sid='default'` — the reserved, shared, persistent session (one per plugin
-  instance).
+you.  A session expires once it was idle longer than its timeout, set at
+creation: the plugin's default (900 s for most plugins), or
+`ttl=<seconds>` (`0`: never expires).
 
 ```python
-psij = rt.get_plugin('my-endpoint', 'psij', lifetime='ttl', ttl=3600)
+psij = rt.get_plugin('my-endpoint', 'psij', ttl=4 * 3600)
+psij.touch()        # counts as an access, nothing else
 ```
 
-Reattach is **owner-checked**: reconnecting to an existing session whose recorded
-owner differs from the caller's identity is rejected (HTTP 403).  Recovery goes
-through re-registering the **same** participant name — so a serving endpoint (or
-any consumer that needs its sessions back) should pass a stable ``name=`` rather
-than accept the auto-generated ``consumer.<uuid8>``.
+Requests, notifications and running work (a job or task not yet finished)
+count as activity.  Any client holding a sid can reconnect to its session
+(`sid=<sid>`), for example a portal and a command line tool sharing one
+session.  Call `close()` when done; a session that ends otherwise logs a
+warning on the endpoint, and a later request on it raises HTTP 410 with the
+reason.  `sid='default'` is the reserved, shared, persistent session (one
+per plugin instance).
 
 ## 5. Notifications
 

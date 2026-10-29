@@ -58,3 +58,15 @@ def test_plugin_client_close_with_session_calls_unregister():
     client.close()
     # unregister_session should have been called (POST to unregister)
     mock_http.post.assert_called_once()
+
+
+def test_plugin_client_touch_posts_the_touch_route():
+    mock_http = MagicMock()
+    mock_http.post.return_value = MagicMock(is_error=False)
+    client = PluginClient(mock_http, "/base",
+                          endpoint_id="e1", plugin_name="p1")
+    with pytest.raises(Exception):
+        client.touch()                      # no session yet
+    client._sid = "sid-abc"
+    client.touch()
+    assert mock_http.post.call_args[0][0].endswith("touch/sid-abc")

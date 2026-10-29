@@ -514,10 +514,10 @@ def test_owner_channel_broker_stamped_not_spoofable(harness):
 
 # ---------------------------------------------------------------------------
 # runtime wires on_topology_change to served plugins incl. synthesized 'lost';
-# an owner-bound ephemeral session is reclaimed after the drain
+# the session survives its owner's loss (clients may reconnect later)
 # ---------------------------------------------------------------------------
 
-def test_served_plugin_observes_lost_and_reclaims(harness):
+def test_served_plugin_observes_lost_and_keeps_session(harness):
     make_broker, make_runtime = harness
     # Aggressive broker keepalive + tiny grace so a hard-dropped consumer
     # reaches suspect then lost within the test window.
@@ -530,7 +530,6 @@ def test_served_plugin_observes_lost_and_reclaims(harness):
     assert _wait_topology(b, 'epA', 'liveness_rt', timeout=5.0)
 
     plugin = a._plugins['liveness_rt']
-    plugin.reclaim_drain = 0.2
 
     # B registers an owner-bound ephemeral session on epA's plugin.
     resp = b.call('epA', 'POST', '/liveness_rt/register_session', body=b'{}')
@@ -555,8 +554,9 @@ def test_served_plugin_observes_lost_and_reclaims(harness):
     assert _wait(lambda: ('epB', 'suspect') in plugin.observed, timeout=5.0)
     assert _wait(lambda: ('epB', 'lost')    in plugin.observed, timeout=5.0)
 
-    # The owner-bound ephemeral session is reclaimed after the drain.
-    assert _wait(lambda: sid not in plugin._sessions, timeout=5.0)
+    # Owner loss does not end the session: a client may reconnect later.
+    time.sleep(0.5)
+    assert sid in plugin._sessions
 
 
 # ---------------------------------------------------------------------------

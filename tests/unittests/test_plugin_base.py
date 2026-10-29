@@ -18,6 +18,7 @@ from starlette.requests import Request
 from unittest.mock import Mock
 import asyncio
 import uuid
+import logging
 import time
 import pytest
 
@@ -396,16 +397,15 @@ async def test_session_mint_when_sid_omitted():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("payload", [
     {"lifetime": "ttl"},                       # ttl lifetime, no ttl
-    {"lifetime": "ttl", "ttl": 0},             # ttl not > 0
-    {"lifetime": "ttl", "ttl": -5},            # ttl not > 0
+    {"lifetime": "ttl", "ttl": -5},            # negative ttl
+    {"ttl": -1},                               # negative ttl
     {"lifetime": "ttl", "ttl": float('nan')},  # NaN ttl (JSON NaN) — not finite
     {"lifetime": "ttl", "ttl": float('inf')},  # non-finite ttl
-    {"lifetime": "persistent", "ttl": 10},     # ttl with non-ttl lifetime
-    {"lifetime": "ephemeral", "ttl": 10},      # ttl with non-ttl lifetime
+    {"ttl": "60"},                             # not a number
     {"lifetime": "forever"},                   # unknown lifetime
 ])
 async def test_session_incoherent_policy_409(payload):
-    '''Incoherent lifetime/ttl pairs and unknown lifetimes map to HTTP 409.'''
+    '''Invalid ttls and unknown lifetimes map to HTTP 409.'''
     app = FastAPI()
     plugin = Plugin(app, "test_plugin")
     plugin.session_class = PluginSession
@@ -416,31 +416,19 @@ async def test_session_incoherent_policy_409(payload):
 
 
 @pytest.mark.asyncio
-async def test_session_reconnect_policy_conflict_409():
-    '''Reconnecting to a sid with a different lifetime/ttl is a 409.'''
+async def test_session_reconnect_keeps_the_timeout_set_at_creation():
+    '''A reconnect ignores ttl/lifetime: the timeout was fixed at creation
+    (federation re-registers 'persistent', clients replay their body).'''
     app = FastAPI()
     plugin = Plugin(app, "test_plugin")
     plugin.session_class = PluginSession
 
     await plugin.register_session(
         _body_request({"sid": "s1", "lifetime": "ttl", "ttl": 10}))
-
-    # Different lifetime
-    with pytest.raises(HTTPException) as exc_info:
-        await plugin.register_session(
-            _body_request({"sid": "s1", "lifetime": "persistent"}))
-    assert exc_info.value.status_code == 409
-
-    # Different ttl
-    with pytest.raises(HTTPException) as exc_info:
-        await plugin.register_session(
-            _body_request({"sid": "s1", "lifetime": "ttl", "ttl": 20}))
-    assert exc_info.value.status_code == 409
-
-    # Same policy reconnects cleanly
     data = await plugin.register_session(
-        _body_request({"sid": "s1", "lifetime": "ttl", "ttl": 10}))
+        _body_request({"sid": "s1", "lifetime": "persistent"}))
     assert data['sid'] == "s1"
+    assert plugin._timeout(plugin._records["s1"]) == 10
 
 
 @pytest.mark.asyncio
@@ -545,8 +533,8 @@ def test_plugin_session_ttl_default():
     app = FastAPI()
     plugin = Plugin(app, "test_plugin")
 
-    # Default should be 3600 (1 hour)
-    assert plugin.session_ttl == 3600
+    # Default should be 900 (15 min)
+    assert plugin.session_ttl == 900
 
 
 @pytest.mark.asyncio
@@ -656,18 +644,16 @@ async def test_session_same_owner_reattach_ok():
 
 
 @pytest.mark.asyncio
-async def test_session_different_owner_reattach_403():
-    '''Reattach by a different owner (or none) to a bound session -> 403.'''
+async def test_session_any_client_can_attach():
+    '''Any client holding the sid can attach (a portal and a CLI share a
+    session); attachment security is out of scope for now.'''
     plugin = _fresh_plugin()
     await plugin.register_session(_owned_request({"sid": "s1"}, "epB"))
-
-    with pytest.raises(HTTPException) as exc:
-        await plugin.register_session(_owned_request({"sid": "s1"}, "attacker"))
-    assert exc.value.status_code == 403
-
-    with pytest.raises(HTTPException) as exc:
-        await plugin.register_session(_owned_request({"sid": "s1"}))  # no owner
-    assert exc.value.status_code == 403
+    for other in ("cli", None):
+        data = await plugin.register_session(_owned_request({"sid": "s1"},
+                                                            other))
+        assert data['sid'] == "s1"
+    assert plugin._records["s1"].owner == "epB"        # diagnostics only
 
 
 @pytest.mark.asyncio
@@ -689,98 +675,210 @@ async def test_default_session_owner_none_even_with_header():
 
 
 # ---------------------------------------------------------------------------
-# Owner-liveness driven ephemeral reclaim: suspect never arms the drain, lost
-# stamps a drain deadline the sweep enforces, owner return clears it,
-# ttl/persistent survive.
+# Session lifetime: one idle timeout per session, fixed at creation; owners
+# do not matter; activity = requests (while running), notifications, and --
+# at the deadline -- is_busy; ended sessions answer 410 with the reason.
 # ---------------------------------------------------------------------------
 
-def _drain_deadline(plugin, sid):
-    return plugin._records[sid].drain_deadline
+def _sid_request(sid, headers=None):
+    request = Mock(spec=Request)
+    request.path_params = {'sid': sid}
+    request.headers     = headers or {}
+    return request
+
+
+class _BusySession(PluginSession):
+    busy = True
+
+    def is_busy(self):
+        return self.busy
 
 
 @pytest.mark.asyncio
-async def test_suspect_does_not_arm_drain():
-    '''A blip reaching 'suspect' must NOT stamp a reclaim-drain deadline.'''
+async def test_owner_loss_does_not_reclaim():
+    '''A client may disconnect and reconnect later: owner liveness never
+    ends a session.'''
     plugin = _fresh_plugin()
     await plugin.register_session(_owned_request({"sid": "s1"}, "epB"))
-    await plugin.on_topology_change({"epB": {"liveness": "suspect"}})
-    assert _drain_deadline(plugin, "s1") is None        # nothing armed
-    assert await plugin._cleanup_expired_sessions() == 0
-    assert "s1" in plugin._sessions                     # session survives
-
-
-@pytest.mark.asyncio
-async def test_lost_arms_drain_and_reclaims_ephemeral():
-    '''An owner declared 'lost' stamps a drain deadline; once it passes, the
-    sweep reclaims the ephemeral session; a persistent one survives.'''
-    plugin = _fresh_plugin()
-    await plugin.register_session(_owned_request({"sid": "s1"}, "epB"))
-    await plugin.register_session(
-        _owned_request({"sid": "p1", "lifetime": "persistent"}, "epB"))
-
     await plugin.on_topology_change({"epB": {"liveness": "lost"}})
-    assert _drain_deadline(plugin, "s1") is not None    # armed
-    assert _drain_deadline(plugin, "p1") is None        # persistent untouched
+    assert await plugin._cleanup_expired_sessions() == 0
+    assert "s1" in plugin._sessions
 
-    # Backdate the deadline into the past and sweep (no real wait).
-    plugin._records["s1"].drain_deadline = time.time() - 1
+
+@pytest.mark.asyncio
+async def test_idle_timeout_applies_to_every_session():
+    plugin = _fresh_plugin()
+    plugin.session_ttl = 1
+    await plugin.register_session(_owned_request({"sid": "bound"}, "epB"))
+    await plugin.register_session(_owned_request({"sid": "free"}))
+    await plugin.register_session(_owned_request({"sid": "long", "ttl": 3600}))
+    await plugin.register_session(_owned_request({"sid": "never", "ttl": 0}))
+    for sid in ("bound", "free", "long", "never"):
+        plugin._records[sid].last_access = time.time() - 100
+    assert await plugin._cleanup_expired_sessions() == 2
+    assert set(plugin._sessions) == {"long", "never"}
+
+
+@pytest.mark.asyncio
+async def test_legacy_lifetime_maps_onto_the_timeout():
+    plugin = _fresh_plugin()
+    await plugin.register_session(_owned_request({"sid": "p",
+                                                  "lifetime": "persistent"}))
+    await plugin.register_session(_owned_request({"sid": "e",
+                                                  "lifetime": "ephemeral"}))
+    await plugin.register_session(_owned_request({"sid": "x", "ttl": 30,
+                                                  "lifetime": "persistent"}))
+    assert plugin._timeout(plugin._records["p"]) == 0
+    assert plugin._timeout(plugin._records["e"]) == plugin.session_ttl
+    assert plugin._timeout(plugin._records["x"]) == 30   # explicit ttl wins
+
+
+@pytest.mark.asyncio
+async def test_notification_is_activity():
+    plugin = _fresh_plugin()
+    plugin.session_ttl = 60
+    await plugin.register_session(_owned_request({"sid": "s1"}))
+    plugin._records["s1"].last_access = time.time() - 100
+    plugin._sessions["s1"].notify("task_status", {"uid": "t1"})
+    assert time.time() - plugin._records["s1"].last_access < 5
+    assert await plugin._cleanup_expired_sessions() == 0
+
+
+@pytest.mark.asyncio
+async def test_busy_at_the_deadline_keeps_the_session():
+    plugin = _fresh_plugin()
+    plugin.session_class = _BusySession
+    plugin.session_ttl   = 60
+    await plugin.register_session(_owned_request({"sid": "b"}))
+    plugin._records["b"].last_access = time.time() - 100
+    assert await plugin._cleanup_expired_sessions() == 0     # busy
+    plugin._sessions["b"].busy = False
+    assert await plugin._cleanup_expired_sessions() == 0     # clock reset
+    plugin._records["b"].last_access = time.time() - 100
     assert await plugin._cleanup_expired_sessions() == 1
 
-    assert "s1" not in plugin._sessions
-    assert "s1" not in plugin._records
-    assert "p1" in plugin._sessions                     # persistent survives
-
 
 @pytest.mark.asyncio
-async def test_owner_return_cancels_drain():
-    '''An owner seen 'present' again clears its drain deadline.'''
+async def test_failing_is_busy_keeps_the_session():
     plugin = _fresh_plugin()
-    await plugin.register_session(_owned_request({"sid": "s1"}, "epB"))
 
-    await plugin.on_topology_change({"epB": {"liveness": "lost"}})
-    assert _drain_deadline(plugin, "s1") is not None
-    await plugin.on_topology_change({"epB": {"liveness": "present"}})
-    assert _drain_deadline(plugin, "s1") is None
-
+    class Broken(PluginSession):
+        def is_busy(self):
+            raise RuntimeError('probe broke')
+    plugin.session_class = Broken
+    plugin.session_ttl   = 1
+    await plugin.register_session(_owned_request({"sid": "b"}))
+    plugin._records["b"].last_access = time.time() - 100
     assert await plugin._cleanup_expired_sessions() == 0
-    assert "s1" in plugin._sessions                     # not reclaimed
 
 
 @pytest.mark.asyncio
-async def test_owner_bound_ephemeral_not_idle_expired():
-    '''An owner-bound ephemeral session is governed by liveness, not the idle
-    timeout; an owner-less one still idle-expires (old-stack behavior).'''
+async def test_a_running_request_keeps_its_session():
     plugin = _fresh_plugin()
-    plugin.session_ttl = 1                             # tiny idle timeout
+    plugin.session_ttl = 60
+    await plugin.register_session(_owned_request({"sid": "s1"}))
+    gate, started = asyncio.Event(), asyncio.Event()
 
-    await plugin.register_session(_owned_request({"sid": "bound"}, "epB"))
-    await plugin.register_session(_owned_request({"sid": "free"}))   # owner None
-
-    # Backdate both well past the idle timeout.
-    plugin._records["bound"].last_access = time.time() - 100
-    plugin._records["free"].last_access  = time.time() - 100
-
-    cleaned = await plugin._cleanup_expired_sessions()
-    assert cleaned == 1
-    assert "bound" in plugin._sessions                 # liveness-governed
-    assert "free" not in plugin._sessions              # idle-expired
-
-
-@pytest.mark.asyncio
-async def test_ttl_and_persistent_never_armed_by_owner_loss():
-    '''An owner with only ttl/persistent sessions arms no drain on loss.'''
-    plugin = _fresh_plugin()
-    await plugin.register_session(
-        _owned_request({"sid": "t1", "lifetime": "ttl", "ttl": 100}, "epB"))
-    await plugin.register_session(
-        _owned_request({"sid": "p1", "lifetime": "persistent"}, "epB"))
-
-    await plugin.on_topology_change({"epB": {"liveness": "lost"}})
-    assert _drain_deadline(plugin, "t1") is None
-    assert _drain_deadline(plugin, "p1") is None
+    async def slow(request):
+        started.set()
+        await gate.wait()
+        return {}
+    call = asyncio.ensure_future(plugin._accessing(slow)(_sid_request("s1")))
+    await started.wait()
+    plugin._records["s1"].last_access = time.time() - 100
     assert await plugin._cleanup_expired_sessions() == 0
-    assert "t1" in plugin._sessions
-    assert "p1" in plugin._sessions
+    gate.set()
+    assert await call == {}
+    assert plugin._records["s1"].inflight == 0
+
+
+@pytest.mark.asyncio
+async def test_expiry_is_explained_and_answered_with_410(caplog):
+    from radical.orbit import plugin_base as pb
+    plugin = _fresh_plugin()
+    plugin.session_ttl = 60
+    await plugin.register_session(_owned_request({"sid": "s1"}))
+    plugin._records["s1"].last_access = time.time() - 100
+    with caplog.at_level(logging.WARNING, logger="radical.orbit"):
+        assert await plugin._cleanup_expired_sessions() == 1
+    msg = caplog.records[-1].getMessage()
+    assert caplog.records[-1].levelno == logging.WARNING
+    assert "s1" in msg and "ttl=" in msg and pb.ISSUES_URL in msg
+
+    for call in (lambda: plugin._forward("s1", PluginSession.ping),
+                 lambda: plugin._accessing(Mock())(_sid_request("s1")),
+                 lambda: plugin.register_session(_owned_request({"sid": "s1"}))):
+        with pytest.raises(HTTPException) as exc:
+            await call()
+        assert exc.value.status_code == 410 and exc.value.detail == msg
+
+
+@pytest.mark.asyncio
+async def test_explorer_expiry_is_info(caplog):
+    plugin = _fresh_plugin()
+    plugin.session_ttl = 60
+    handler = plugin._tagging_client(plugin.register_session)
+    request = _owned_request({"sid": "e1"})
+    request.headers = {"x-orbit-client": "explorer"}
+    await handler(request)
+    plugin._records["e1"].last_access = time.time() - 100
+    with caplog.at_level(logging.INFO, logger="radical.orbit"):
+        assert await plugin._cleanup_expired_sessions() == 1
+    rec = caplog.records[-1]
+    assert rec.levelno == logging.INFO and "Explorer" in rec.getMessage()
+
+
+@pytest.mark.asyncio
+async def test_unregistered_session_answers_410_closed():
+    plugin = _fresh_plugin()
+    await plugin.register_session(_owned_request({"sid": "s1"}))
+    assert await plugin.unregister_session(_sid_request("s1")) == {"ok": True}
+    assert await plugin.unregister_session(_sid_request("s1")) == {"ok": True}
+    with pytest.raises(HTTPException) as exc:
+        await plugin.register_session(_owned_request({"sid": "s1"}))
+    assert exc.value.status_code == 410 and "closed" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_persistent_sessions_are_not_remembered():
+    '''Unregistering 'default' (persistent) forgets it: it is recreated on
+    demand as before.'''
+    plugin = _fresh_plugin()
+    await plugin.register_session(_owned_request({"sid": "default"}))
+    await plugin.unregister_session(_sid_request("default"))
+    assert "default" not in plugin._ended
+    assert await plugin._forward("default", PluginSession.ping) == {}
+
+
+@pytest.mark.asyncio
+async def test_ended_record_is_bounded(monkeypatch):
+    from radical.orbit import plugin_base as pb
+    monkeypatch.setattr(pb, 'ENDED_KEEP', 3)
+    plugin = _fresh_plugin()
+    for i in range(5):
+        await plugin.register_session(_owned_request({"sid": f"s{i}"}))
+        await plugin._end_session(f"s{i}", 'expired', time.time())
+    assert list(plugin._ended) == ["s2", "s3", "s4"]
+
+
+@pytest.mark.asyncio
+async def test_touch_route_is_an_access_only():
+    plugin = _fresh_plugin()
+    plugin.session_ttl = 60
+    await plugin.register_session(_owned_request({"sid": "s1"}))
+    plugin._records["s1"].last_access = time.time() - 50
+    assert await plugin.touch_session(_sid_request("s1")) == {}
+    assert time.time() - plugin._records["s1"].last_access < 5
+    with pytest.raises(HTTPException) as exc:
+        await plugin.touch_session(_sid_request("nope"))
+    assert exc.value.status_code == 404 and "nope" not in plugin._sessions
+
+
+def test_last_access_shim_does_not_revive_an_ended_sid():
+    plugin = _fresh_plugin()
+    plugin._ended["gone"] = (time.time(), 'expired', 60, 100, None)
+    plugin._session_last_access["gone"] = time.time()
+    assert "gone" not in plugin._records
 
 
 if __name__ == '__main__':

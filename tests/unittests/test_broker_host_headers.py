@@ -54,3 +54,29 @@ async def test_json_body_stays_the_default():
 
     import json
     assert json.loads(resp.body)['echoed'] == {'a': 1}
+
+
+@pytest.mark.asyncio
+async def test_only_the_explorer_client_tag_reaches_the_plugin():
+    '''X-Orbit-Client passes (it selects the expiry log level); no other
+    client header -- in particular no x-orbit-src owner -- does.'''
+    async def noop_broadcast(*_a, **_k):
+        return None
+
+    host = BrokerPluginHost(plugin_names=[], broadcast_fn=noop_broadcast)
+
+    async def headers(request):
+        return {'headers': dict(request.headers)}
+
+    host._direct_routes.append(
+        ('POST', re.compile(r'^/hdr$'), (), headers))
+
+    import json
+    resp = await host.handle_request(
+        'POST', '/hdr', body_bytes=b'{}',
+        headers={'X-Orbit-Client': 'explorer', 'x-orbit-src': 'spoof'})
+    assert json.loads(resp.body)['headers'] == {'x-orbit-client': 'explorer'}
+
+    resp = await host.handle_request('POST', '/hdr', body_bytes=b'{}',
+                                     headers={'x-orbit-src': 'spoof'})
+    assert json.loads(resp.body)['headers'] == {}

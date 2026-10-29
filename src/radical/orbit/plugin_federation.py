@@ -43,7 +43,7 @@ Why it is built this way
 - **Dispatcher sessions expire.**  A session registered through the
   in-process host path carries no ``x-orbit-src`` owner, so it is an
   owner-less *ephemeral* session and the base sweep drops it
-  ``session_ttl`` (3600 s) after its last access — and dropping a dispatcher
+  its idle timeout after its last access — and dropping a dispatcher
   session cancels its pools and pilots.  Dispatcher routes do not bump
   ``last_access``.  Therefore every session the federation creates is
   registered ``lifetime='persistent'`` and released explicitly on ``leave``.
@@ -425,6 +425,7 @@ class PluginFederation(Plugin):
     session_class = FederationSession
     client_class  = FederationClient
     version       = '0.0.1'
+    session_ttl   = 0       # broker-hosted federation state: until closed
     ui_module     = os.path.join(os.path.dirname(__file__),
                                  'data', 'plugins', 'federation.js')
 

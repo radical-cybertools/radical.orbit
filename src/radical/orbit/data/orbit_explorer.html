@@ -1167,6 +1167,9 @@
     let BROKER = '';
     let eventSource = null;
     let sessions = {};   // key: "endpointName/pluginName" -> sid
+    // sessions a panel registered outside the cache (e.g. globus, which
+    // carries a credential): "endpoint/plugin/sid" -> {endpoint, plugin, sid}
+    let keptSessions = {};
     let sessionRegBodies = {};   // key -> last register_session body (for auto-recovery re-register)
     let healingSessions  = {};   // key -> in-flight re-register promise (single-flight heal)
     let endpointData = {};   // endpointName -> plugin info from /endpoint/list
@@ -1272,6 +1275,14 @@
         // Session management
         async getSession(plugin = pluginName, regBody = {}) {
           return await registerSession(endpointName, plugin, regBody);
+        },
+        // keep a session the panel registered itself alive while open
+        keepSession(sid, plugin = pluginName) {
+          keptSessions[`${endpointName}/${plugin}/${sid}`] =
+              { endpoint: endpointName, plugin, sid };
+        },
+        releaseSession(sid, plugin = pluginName) {
+          delete keptSessions[`${endpointName}/${plugin}/${sid}`];
         },
 
         // API calls - ns computed dynamically to ensure endpointData is populated
@@ -1820,7 +1831,10 @@
           ...opts,
           credentials: 'include',
           signal: controller.signal,
-          headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) }
+          // X-Orbit-Client: endpoints log an idle-expired Explorer session
+          // as the normal end of a closed tab, not as API misuse
+          headers: { 'Content-Type': 'application/json',
+                     'X-Orbit-Client': 'explorer', ...(opts.headers || {}) }
         });
         clearTimeout(timeoutId);
 
@@ -1829,7 +1843,7 @@
           // have expired while the stored token is still valid).  ensureAuth
           // only prompts if that POST /auth itself 401s, so we don't bother the
           // user when the token in localStorage still works.
-          if (res.status === 401 && !opts._retried) {
+          if (res.status === 401 && !opts._retried && !opts.background) {
             const ok = await ensureAuth(false);
             if (ok) return await apiFetch(path, { ...opts, _retried: true });
           }
@@ -1867,18 +1881,23 @@
             }
           }
 
-          throw new Error(errMsg);
+          const err  = new Error(errMsg);
+          err.status = res.status;          // callers can tell a stale sid
+          err.detail = t;                   // (su.isStaleSession) from others
+          throw err;
         }
         return res.json();
       } catch (e) {
         clearTimeout(timeoutId);
         // Timeout errors
         if (e.name === 'AbortError') {
-          showToast('Request Timeout', `${path}: Request timed out after ${API_TIMEOUT_MS/1000}s`, 'error');
+          if (!opts.background)
+            showToast('Request Timeout', `${path}: Request timed out after ${API_TIMEOUT_MS/1000}s`, 'error');
           throw new Error('Request timed out');
         }
         // Network errors (connection refused, timeout, etc.)
-        if (e.name === 'TypeError' || e.message.includes('Failed to fetch')) {
+        if (!opts.background &&
+            (e.name === 'TypeError' || e.message.includes('Failed to fetch'))) {
           showToast('Network Error', `Failed to reach ${path}. Check connection.`, 'error');
           setConnectionStatus('disconnected');
         }
@@ -1928,6 +1947,39 @@
       sessions[key] = promise;     // store promise immediately
       return promise;
     }
+
+    // Sessions idle-expire after their timeout (15 min by default on
+    // endpoints), so closed tabs do not leak them.  While this tab is open,
+    // touch every session it holds, so an idle panel (e.g. globus with its
+    // credential) keeps its session.  Only a dead sid is forgotten; its
+    // register body is kept, so the next use re-registers the same way.
+    const SESSION_KEEPALIVE_MS = 5 * 60 * 1000;
+    setInterval(() => {
+      const held = [];
+      for (const [key, sid] of Object.entries(sessions)) {
+        if (typeof sid !== 'string') continue;        // registration in flight
+        const i = key.indexOf('/');                    // "endpoint/plugin"
+        held.push({ endpoint: key.slice(0, i), plugin: key.slice(i + 1),
+                    sid, key });
+      }
+      for (const [key, s] of Object.entries(keptSessions)) held.push({ ...s, key, kept: true });
+      for (const s of held) {
+        const ns = getNs(s.endpoint, s.plugin);
+        if (!ns) continue;
+        // background: no toasts, no connection badge, no auth prompt
+        apiFetch(`${ns}/touch/${s.sid}`,
+                 { method: 'POST', quiet: true, background: true,
+                   _sidRetried: true })
+          .catch(async (err) => {
+            // a network blip, a 5xx or an older endpoint without the touch
+            // route ("No route" 404) keep the session as it is
+            const su = await ensureSU();
+            if (!su.isStaleSession(err.status, err.detail)) return;
+            if (s.kept) delete keptSessions[s.key];
+            else if (sessions[s.key] === s.sid) delete sessions[s.key];
+          });
+      }
+    }, SESSION_KEEPALIVE_MS);
 
     function getNs(endpointName, pluginName) {
       return endpointData[endpointName]?.plugins?.[pluginName]?.namespace;

@@ -2626,3 +2626,12 @@ def test_client_data_helpers():
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
+
+
+def test_rhapsody_is_busy_while_a_task_is_not_terminal():
+    session = RhapsodySession("test.busy")
+    assert session.is_busy() is False
+    session._tasks['t.1'] = {'uid': 't.1', 'state': 'DONE'}
+    assert session.is_busy() is False
+    session._tasks['t.2'] = {'uid': 't.2', 'state': 'RUNNING'}
+    assert session.is_busy() is True

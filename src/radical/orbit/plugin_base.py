@@ -3,10 +3,12 @@ import math
 import uuid
 import asyncio
 import inspect
+import functools
 import logging
 import time
 
 from dataclasses import dataclass
+from collections import OrderedDict
 from typing import Type, Optional, Dict, Callable, Any, Union
 from fastapi import FastAPI, HTTPException, Request
 from starlette.responses import JSONResponse
@@ -21,21 +23,23 @@ log = logging.getLogger("radical.orbit")
 # instance — a `rhapsody` default and a `psij` default are distinct sessions.
 DEFAULT_SID = 'default'
 
+ISSUES_URL  = 'https://github.com/radical-cybertools/radical.orbit/issues'
+ENDED_KEEP  = 100_000     # ended sids remembered (for the 410), oldest dropped
+
 
 @dataclass
 class SessionRecord:
     """Lifetime bookkeeping for one session (see the policy table on `Plugin`).
 
     The session *object* lives in ``Plugin._sessions[sid]``; this record holds
-    only the fields the expiry sweep needs.  ``drain_deadline`` is stamped when
-    the owning participant is declared ``lost`` and cleared when it returns
-    ``present`` (see :meth:`Plugin.on_topology_change`).
+    only the fields the expiry sweep needs.
     """
     lifetime:       str                       # 'ephemeral' | 'ttl' | 'persistent'
     ttl:            Optional[float]            # seconds, for lifetime == 'ttl'
-    owner:          Optional[str]             # trusted x-orbit-src, or None
+    owner:          Optional[str]             # x-orbit-src (diagnostics only)
     last_access:    float
-    drain_deadline: Optional[float] = None    # set on owner 'lost'
+    client:         Optional[str]   = None    # X-Orbit-Client (e.g. explorer)
+    inflight:       int             = 0       # {sid} requests still running
 
 
 class _LastAccessView:
@@ -48,12 +52,16 @@ class _LastAccessView:
     Remove once those plugins record last_access on the record directly.
     """
 
-    def __init__(self, records: Dict[str, "SessionRecord"]):
+    def __init__(self, records: Dict[str, "SessionRecord"],
+                 ended: Optional[Dict[str, tuple]] = None):
         self._records = records
+        self._ended   = ended if ended is not None else {}
 
     def __setitem__(self, sid: str, ts: float) -> None:
         rec = self._records.get(sid)
         if rec is None:
+            if sid in self._ended:          # never revive an ended session
+                return
             self._records[sid] = SessionRecord('ephemeral', None, None, ts)
         else:
             rec.last_access = ts
@@ -106,37 +114,35 @@ class Plugin(object):
 
         client_class: The local helper class for the application-side client.
         version: The version string for the plugin.
-        session_ttl: Idle timeout in seconds for owner-less ephemeral sessions
-            (default: 3600 = 1 hour, 0 = no timeout).
-        reclaim_drain: Grace, in seconds, between an owner being declared
-            ``lost`` and its owner-bound ephemeral sessions being reclaimed
-            (default: 300).  Injectable per instance for tests.
+        session_ttl: Default idle timeout in seconds of this plugin's
+            sessions (default: 900 = 15 min, 0 = never expire); a session
+            can set its own at creation (``register_session(ttl=...)``).
         ui_config: UI configuration dict for portal rendering (see ui_schema.py)
 
     Session lifetime policy
     -----------------------
-    ``register_session`` records each session as a :class:`SessionRecord`
-    (``lifetime``, ``ttl``, ``owner``, ``last_access``, ``drain_deadline``).
-    The ``owner`` is the trusted ``x-orbit-src`` header the serving runtime
-    injects from the broker-stamped src (``None`` for old-stack / gateway
-    requests, which carry no participant identity).  A single 5-second sweep
-    (:meth:`_cleanup_loop`) enforces every policy via :meth:`_expiry_deadline`:
+    Every session has one **idle timeout**, fixed when it is created:
+    ``register_session(ttl=<seconds>)``, ``ttl=0`` for never, else the
+    plugin's ``session_ttl``.  (The legacy ``lifetime`` field maps onto it:
+    ``persistent`` -> never, ``ephemeral`` -> the plugin default; an explicit
+    ``ttl`` wins.)  A session expires once idle for longer than its timeout.
+    Activity is every request on a ``{sid}`` route (for as long as it runs),
+    every notification the session emits, and -- probed only at the
+    deadline -- :meth:`PluginSession.is_busy` (work in flight that emits no
+    events).  Known limit: work that never reaches a final state keeps its
+    session alive.
 
-    ==============  ===========  ========================================
-    lifetime        owner        expires when
-    ==============  ===========  ========================================
-    persistent      any          never (explicit unregister only)
-    ttl             any          ``now - last_access > ttl``
-    ephemeral       bound        owner ``lost`` + ``reclaim_drain`` grace
-    ephemeral       owner-less   ``now - last_access > session_ttl`` (idle)
-    (record-less)   —            treated as owner-less ephemeral
-    ==============  ===========  ========================================
+    Any client holding the sid can attach to a session (reconnect, share it
+    between e.g. a portal and a CLI); owners are recorded for diagnostics
+    only and never govern lifetime or attachment.  The reserved ``default``
+    session is persistent and per plugin instance.
 
-    Reattach is owner-checked: reconnecting to a session whose recorded owner
-    is non-``None`` and differs from the caller is rejected (403); recovery
-    goes through re-registering the same participant name.  The reserved
-    ``default`` session is always persistent, shared per plugin instance, and
-    records owner ``None``.
+    An expiry is logged with its reason (an idle one as likely API misuse,
+    naming the remedy and the issue tracker; for an Explorer session, tagged
+    by its ``X-Orbit-Client: explorer`` header, as the normal end of a
+    browser tab).  Ended sids -- expired or unregistered, unless persistent
+    -- are remembered for the process lifetime: any later request on one,
+    including a reconnect, gets 410 with that explanation.
 
     Notifications
     -------------
@@ -148,9 +154,8 @@ class Plugin(object):
     Topology updates
     ----------------
     The serving runtime delivers the rich topology (``name -> {role, plugins,
-    liveness}``) on every change.  The base ``on_topology_change`` drives
-    owner-bound ephemeral-session reclaim; override it to also react to
-    connect/disconnect/liveness, calling ``super()`` to keep the drain::
+    liveness}``) on every change.  The base ``on_topology_change`` is a no-op
+    hook; override it to react to connect/disconnect/liveness::
 
         async def on_topology_change(self, participants: dict):
             for name, info in participants.items():
@@ -162,8 +167,7 @@ class Plugin(object):
     session_class: Optional[Type[PluginSession]] = None
     client_class: Optional[Type] = None
     version: str = '0.0.1'
-    session_ttl: int = 3600  # Default: 1 hour session timeout
-    reclaim_drain: float = 300  # 'lost' owner -> ephemeral-session reclaim grace
+    session_ttl: int = 900  # default idle timeout (s) of a session; 0: never
     ui_config: Union[Dict, UIConfig, None] = None  # UI configuration for portal
     ui_module: Optional[str] = None  # Absolute path to JS plugin module, or None
     # Host roles (``utils.HOST_ROLES``) whose ``default`` plugin set
@@ -251,7 +255,10 @@ class Plugin(object):
         # Single source of truth for lifetime bookkeeping, keyed by sid.
         self._records: Dict[str, SessionRecord] = {}
         # Backward-compat mapping shim over record.last_access (see class).
-        self._session_last_access = _LastAccessView(self._records)
+        # sid -> (time, reason, timeout, client) of ended sessions, for the
+        # 410 a later request on them gets (see _end_session)
+        self._ended: 'OrderedDict[str, tuple]' = OrderedDict()
+        self._session_last_access = _LastAccessView(self._records, self._ended)
         # Guards on-demand creation of the reserved 'default' session so two
         # concurrent first requests cannot double-create it.
         self._default_lock = asyncio.Lock()
@@ -276,6 +283,7 @@ class Plugin(object):
         # Built-in session management routes
         self.add_route_post('register_session', self.register_session)
         self.add_route_post('unregister_session/{sid}', self.unregister_session)
+        self.add_route_post('touch/{sid}', self.touch_session)
         self.add_route_get('version', self.get_version)
         self.add_route_get('list_sessions', self.list_sessions)
         self.add_route_get('health', self.health_check)
@@ -352,9 +360,65 @@ class Plugin(object):
         for both direct dispatch and the ASGI app."""
         full_path = self._namespace + '/' + path
         full_path = full_path.replace('//', '/')
+        if path == 'register_session':
+            handler = self._tagging_client(handler)
+        elif '{sid}' in path and path != 'unregister_session/{sid}':
+            handler = self._accessing(handler)
         self._register_direct(full_path, verb, handler)
         self._app.add_route(full_path, self._wrap_handler(handler),
                             methods=[verb])
+
+    def _accessing(self, handler: Callable) -> Callable:
+        """Wrap a ``{sid}`` route: an ended or expired session answers 410
+        with its reason; otherwise the request is an access of the session,
+        for as long as it runs (also for plugins that look sessions up
+        directly instead of through :meth:`_forward`)."""
+        @functools.wraps(handler)
+        async def _accessed(request):
+            sid = (getattr(request, 'path_params', None) or {}).get('sid')
+            rec = self._records.get(sid) if sid else None
+            if sid and rec is None:
+                text = self._ended_detail(sid)
+                if text:
+                    raise HTTPException(status_code=410, detail=text)
+            if rec is None:
+                return await handler(request)
+            text = await self._expire_if_due(sid, rec, time.time())
+            if text:
+                raise HTTPException(status_code=410, detail=text)
+            self._tag_client(rec, request)
+            rec.inflight += 1
+            try:
+                return await handler(request)
+            finally:
+                rec.inflight   -= 1
+                rec.last_access = time.time()
+        return _accessed
+
+    def _tagging_client(self, handler: Callable) -> Callable:
+        """Wrap register_session (plugins override it): the session it
+        returns records the caller's ``X-Orbit-Client`` tag."""
+        @functools.wraps(handler)
+        async def _tagged(request):
+            result = await handler(request)
+            sid = result.get('sid') if isinstance(result, dict) else None
+            rec = self._records.get(sid) if sid else None
+            if rec is not None:
+                self._tag_client(rec, request)
+            return result
+        return _tagged
+
+    @staticmethod
+    def _tag_client(rec: SessionRecord, request) -> None:
+        """Record the ``X-Orbit-Client`` header (client-supplied: it only
+        selects how an idle expiry is logged, never expiry itself)."""
+        try:
+            client = (getattr(request, 'headers', None) or {}).get(
+                'x-orbit-client')
+        except Exception:
+            client = None
+        if isinstance(client, str) and client:
+            rec.client = client
 
     @staticmethod
     def _wrap_handler(handler: Callable) -> Callable:
@@ -445,22 +509,21 @@ class Plugin(object):
              "ttl": <seconds>}
 
         - ``sid`` omitted                    -> a fresh session ID is minted.
-        - ``sid`` names an existing session  -> *reconnect*: its last-access
-          time is bumped and the same ``sid`` is returned (409 if the supplied
-          lifetime/ttl differs from the one it was created with).
+        - ``sid`` names an existing session  -> *reconnect* (by any client):
+          an access; the same ``sid`` is returned.  The timeout was fixed at
+          creation: ``ttl`` / ``lifetime`` of a reconnect are ignored.
+        - ``sid`` names an ended session     -> 410 with the reason.
         - ``sid`` names no session           -> a session is created under
           exactly that ID.
 
-        See the lifetime-policy table on :class:`Plugin` for how ``lifetime``,
-        ``ttl`` and ``owner`` govern expiry.  The reserved ``default`` session
-        is per plugin instance, always persistent, and records owner ``None``.
+        ``ttl`` is the session's idle timeout in seconds (``0``: never); see
+        the lifetime policy on :class:`Plugin`.  The reserved ``default``
+        session is per plugin instance and persistent.
 
         Raises:
-            HTTPException 403: a reattach to an existing session from a
-                different owner than the one recorded at create.
-            HTTPException 409: an incoherent lifetime/ttl pair, an unknown
-                lifetime value, or a reconnect whose policy conflicts with the
-                existing session.
+            HTTPException 409: a negative/non-numeric ttl, ``lifetime='ttl'``
+                without a ttl, or an unknown lifetime value.
+            HTTPException 410: ``sid`` names a session that has ended.
         """
         self._ensure_cleanup_task()
         try:
@@ -498,19 +561,26 @@ class Plugin(object):
         """Validate the session-policy fields of a register_session body.
 
         Returns the normalized ``(sid, lifetime, ttl)`` triple; ``sid`` may be
-        ``None`` (the caller mints one).  The reserved ``default`` session is
-        special-cased *before* lifetime validation, so a bare
-        ``register_session(sid='default')`` — where ``lifetime`` still carries
-        its ``'ephemeral'`` default — resolves to the persistent default rather
-        than being rejected; only an *explicitly* non-persistent policy for
-        ``default`` is incoherent.
+        ``None`` (the caller mints one).  An explicit ``ttl`` wins: ``0`` ->
+        ``persistent``, ``> 0`` -> ``ttl``; otherwise ``lifetime`` decides
+        (``ephemeral``: the plugin default).  The reserved ``default`` session
+        is special-cased *before* lifetime validation.  Every register path
+        (base and plugin overrides) calls this, so an ended ``sid`` is refused
+        here for all of them.
 
         Raises:
-            HTTPException 409: incoherent lifetime/ttl pair or unknown lifetime.
+            HTTPException 409: invalid ttl, ``lifetime='ttl'`` without a ttl,
+                or an unknown lifetime.
+            HTTPException 410: ``sid`` names a session that has ended.
         """
         sid      = data.get('sid')
         lifetime = data.get('lifetime', 'ephemeral')
         ttl      = data.get('ttl')
+
+        if sid is not None and sid not in self._records:
+            text = self._ended_detail(sid)
+            if text:
+                raise HTTPException(status_code=410, detail=text)
 
         if sid == DEFAULT_SID:
             if 'lifetime' in data and data['lifetime'] != 'persistent':
@@ -528,29 +598,31 @@ class Plugin(object):
                 status_code=409,
                 detail=f"unknown session lifetime: {lifetime!r}")
 
-        if lifetime == 'ttl':
+        if ttl is not None:
             if not isinstance(ttl, (int, float)) or isinstance(ttl, bool) \
-                    or not math.isfinite(ttl) or ttl <= 0:
+                    or not math.isfinite(ttl) or ttl < 0:
                 raise HTTPException(
                     status_code=409,
-                    detail="lifetime='ttl' requires a positive ttl")
-            ttl = float(ttl)
-        elif ttl is not None:
+                    detail="ttl must be a number of seconds >= 0 (0: never)")
+            if ttl == 0:
+                return sid, 'persistent', None
+            return sid, 'ttl', float(ttl)
+
+        if lifetime == 'ttl':
             raise HTTPException(
                 status_code=409,
-                detail=f"ttl is incoherent with lifetime={lifetime!r}")
+                detail="lifetime='ttl' requires a positive ttl")
 
-        return sid, lifetime, ttl
+        return sid, lifetime, None
 
     async def _open_session(self, sid: Optional[str], lifetime: str,
                             ttl: Optional[float],
                             owner: Optional[str] = None) -> str:
         """Create-or-reconnect a session under the given policy.
 
-        ``sid=None`` mints a fresh ID; an existing ``sid`` reconnects (after an
-        owner check then a policy-conflict check); the reserved ``default`` is
-        created on demand under a lock and is shared (owner ``None``).  Returns
-        the resolved session ID.
+        ``sid=None`` mints a fresh ID; an existing ``sid`` reconnects (any
+        client; the timeout set at creation stays); the reserved ``default``
+        is created on demand under a lock.  Returns the resolved session ID.
         """
         if sid == DEFAULT_SID:
             await self._ensure_default_session()
@@ -563,8 +635,6 @@ class Plugin(object):
                 sid = f"session.{uuid.uuid4().hex[:8]}"
 
         if sid in self._sessions:
-            self._check_owner(sid, owner)
-            self._check_policy_conflict(sid, lifetime, ttl)
             self._touch(sid)
             log.info("[%s] Reconnected session %s", self.instance_name, sid)
             return sid
@@ -586,51 +656,18 @@ class Plugin(object):
                         owner: Optional[str] = None) -> None:
         """Store a session object and its :class:`SessionRecord`.
 
-        ``owner`` is the trusted participant identity (``None`` for old-stack /
-        gateway sessions and for the shared ``default`` session).
+        ``owner`` is the requesting participant (diagnostics only).
         """
         self._sessions[sid] = session
         self._records[sid]  = SessionRecord(lifetime, ttl, owner, time.time())
-
-    def _check_owner(self, sid: str, owner: Optional[str]) -> None:
-        """Reject a reattach from a different owner than recorded at create.
-
-        A session created with a non-``None`` owner may only be reattached by
-        that same identity — session recovery goes through re-registering the
-        same participant name.  Owner-less sessions (``None`` recorded — old
-        stack / gateway) accept any reattach; there is no identity to guard.
-        """
-        record = self._records.get(sid)
-        if record is None:
-            return
-        if record.owner is not None and record.owner != owner:
-            raise HTTPException(
-                status_code=403,
-                detail=f"session {sid} is owned by another participant")
-
-    def _check_policy_conflict(self, sid: str, lifetime: str,
-                               ttl: Optional[float]) -> None:
-        """Reject a reconnect whose policy differs from the live session's.
-
-        Sessions created outside the policy model (no record — e.g. a plugin
-        that builds sessions directly) accept any reconnect; there is nothing
-        to conflict with.
-        """
-        record = self._records.get(sid)
-        if record is None:
-            return
-        if record.lifetime != lifetime or record.ttl != ttl:
-            raise HTTPException(
-                status_code=409,
-                detail=f"session {sid} exists with a different lifetime policy")
 
     async def _ensure_default_session(self) -> PluginSession:
         """Return the reserved ``default`` session, creating it on demand.
 
         ``default`` is persistent and per plugin instance.  Creation is guarded
         by a lock so two concurrent first requests cannot double-create it.
-        Persistent-default-owned resources have no liveness reclaim — they are
-        released only by explicit operator action (e.g. ``cancel_all``).
+        Persistent-default-owned resources are released only by explicit
+        operator action (e.g. ``cancel_all``).
         """
         session = self._sessions.get(DEFAULT_SID)
         if session is not None:
@@ -645,15 +682,29 @@ class Plugin(object):
             return session
 
     async def unregister_session(self, request: Request) -> dict:
-        """Unregister a session by its session ID and close it."""
+        """Unregister a session by its session ID and close it.
+
+        A session that has already ended is a no-op; any later request on
+        the sid gets 410 (closed).
+        """
         sid = request.path_params['sid']
         if sid not in self._sessions and sid not in self._records:
+            if self._ended_detail(sid):
+                return {"ok": True}         # already ended
             raise HTTPException(status_code=404,
                                 detail=f"unknown session id: {sid}")
 
-        await self._drop_session(sid)
+        await self._end_session(sid, 'closed', time.time())
         log.info("[%s] Unregistered session %s", self.instance_name, sid)
         return {"ok": True}
+
+    async def touch_session(self, request: Request) -> dict:
+        """Count as an access of the session, so it does not idle-expire.
+
+        No other effect: 404 for an unknown, 410 for an ended session.
+        """
+        return await self._forward(request.path_params['sid'],
+                                   PluginSession.ping)
 
     async def get_version(self, request: Request) -> dict:
         """Return the plugin version."""
@@ -735,33 +786,15 @@ class Plugin(object):
         'lost'`` entry for a participant that vanishes after the broker's
         grace (the wire carries no tombstone).
 
-        The default implementation drives owner-bound ephemeral-session
-        reclaim by stamping a ``drain_deadline`` on the affected records: an
-        owner declared ``lost`` stamps ``now + reclaim_drain`` (the 5-second
-        sweep drops them once it passes); an owner seen ``present`` again
-        clears the stamp.  A ``suspect`` owner does **not** arm the drain — a
-        transient blip reaches ``suspect`` at most and must never reclaim.
-
-        Subclasses may override to react to topology changes; overriders that
-        also want the reclaim behavior call ``super()``.
+        The default implementation does nothing: sessions are not tied to a
+        participant's liveness (a client may disconnect and reconnect later;
+        see the lifetime policy on :class:`Plugin`).  Subclasses override it
+        to react to topology changes.
 
         Args:
             participants: Dict mapping participant names to their rich info
                 (``{role, plugins, liveness}``).
         """
-        now = time.time()
-        for name, info in (participants or {}).items():
-            liveness = (info or {}).get('liveness')
-            if liveness not in ('lost', 'present'):
-                continue  # 'suspect' (or unknown) never arms/clears the drain
-            for rec in self._records.values():
-                if rec.owner != name or rec.lifetime != 'ephemeral':
-                    continue
-                if liveness == 'lost':
-                    if rec.drain_deadline is None:
-                        rec.drain_deadline = now + self.reclaim_drain
-                else:  # 'present'
-                    rec.drain_deadline = None
 
     async def _forward(self, sid: str, func: Callable, *args: Any, **kwargs: Any) -> dict:
         """
@@ -778,8 +811,8 @@ class Plugin(object):
 
         Raises:
             HTTPException 404: Session ID not found.
-            HTTPException 410: Session has expired (TTL exceeded); the session
-                has already been cleaned up before this is raised.
+            HTTPException 410: Session has ended (expired or unregistered);
+                the detail says why and what to change.
             HTTPException 500: Unexpected error inside the session method.
         """
         # On-demand creation of the reserved persistent 'default' session.
@@ -787,14 +820,16 @@ class Plugin(object):
             await self._ensure_default_session()
 
         # Detect expiry of THIS session before the background cleanup removes it
-        now = time.time()
         record = self._records.get(sid)
-        if record is not None and self._is_expired(record, now):
-            await self._drop_session(sid)
-            raise HTTPException(status_code=410, detail=f"session expired: {sid}")
+        text   = record and await self._expire_if_due(sid, record, time.time())
+        if text:
+            raise HTTPException(status_code=410, detail=text)
 
         session = self._sessions.get(sid)
         if not session:
+            text = self._ended_detail(sid)
+            if text:
+                raise HTTPException(status_code=410, detail=text)
             raise HTTPException(status_code=404, detail=f"unknown session id: {sid}")
 
         # Update last access time
@@ -815,32 +850,97 @@ class Plugin(object):
 
     def _expiry_deadline(self, record: SessionRecord,
                          now: float) -> Optional[float]:
-        """Absolute time at which *record* expires, or ``None`` for never.
+        """Absolute time at which *record* expires, or ``None`` for never:
+        ``last_access`` plus the session's idle timeout."""
+        timeout = self._timeout(record)
+        return record.last_access + timeout if timeout > 0 else None
 
-        One function for every row of the lifetime-policy table on
-        :class:`Plugin`:
-
-        - ``persistent``               -> ``None``.
-        - ``ttl``                      -> ``last_access + ttl``.
-        - ``ephemeral`` owner-bound    -> ``drain_deadline`` (``None`` until
-          the owner is declared ``lost``; liveness-governed, never idle).
-        - ``ephemeral`` owner-less     -> ``last_access + session_ttl`` (idle),
-          or ``None`` when ``session_ttl == 0``.
-        """
+    def _timeout(self, record: SessionRecord) -> float:
+        """The idle timeout of a session (``0``: never), fixed at creation."""
         if record.lifetime == 'persistent':
-            return None
+            return 0
         if record.lifetime == 'ttl':
-            return record.last_access + record.ttl
-        if record.owner is not None:                       # owner-bound
-            return record.drain_deadline
-        if self.session_ttl > 0:                           # owner-less idle
-            return record.last_access + self.session_ttl
-        return None
+            return record.ttl
+        return self.session_ttl
 
     def _is_expired(self, record: SessionRecord, now: float) -> bool:
         """True once *record* has passed its expiry deadline."""
         deadline = self._expiry_deadline(record, now)
         return deadline is not None and now > deadline
+
+    def _is_busy(self, sid: str, rec: SessionRecord) -> bool:
+        """Work in flight: a request still running, or the session's own
+        :meth:`PluginSession.is_busy`.  A failing probe counts as busy --
+        never reap work over a broken probe."""
+        if rec.inflight > 0:
+            return True
+        session = self._sessions.get(sid)
+        if session is None:
+            return False
+        try:
+            return bool(session.is_busy())
+        except Exception as e:
+            log.warning("[%s] is_busy of session %s failed (kept as busy): "
+                        "%s", self.instance_name, sid, e)
+            return True
+
+    async def _expire_if_due(self, sid: str, rec: SessionRecord,
+                             now: float) -> Optional[str]:
+        """The one expiry decision (sweep, ``_forward``, ``{sid}`` routes).
+
+        A session past its deadline gets the benefit of work in flight
+        (probed only here, at the deadline): busy counts as an access.  An
+        idle one ends: it is dropped, its reason logged and remembered, and
+        that reason returned (the 410 detail).  ``None`` if it lives on.
+        """
+        if not self._is_expired(rec, now):
+            return None
+        if self._is_busy(sid, rec):
+            rec.last_access = now
+            return None
+        return await self._end_session(sid, 'expired', now)
+
+    async def _end_session(self, sid: str, reason: str, now: float) -> str:
+        """End a session (``reason``: ``'expired'`` or ``'closed'``): log,
+        remember (unless persistent -- e.g. ``default`` is recreated on
+        demand) and drop it.  Returns the explanation."""
+        rec = self._records.get(sid)
+        if rec is not None and self._timeout(rec) > 0:
+            self._ended[sid] = (now, reason, self._timeout(rec),
+                                now - rec.last_access, rec.client)
+            self._ended.move_to_end(sid)
+            while len(self._ended) > ENDED_KEEP:
+                self._ended.popitem(last=False)
+            text = self._ended_detail(sid)
+            if reason == 'expired':
+                log.log(logging.INFO if rec.client == 'explorer'
+                        else logging.WARNING, text)
+        else:
+            text = f"[{self.instance_name}] session {sid} has ended"
+        await self._drop_session(sid)
+        return text
+
+    def _ended_detail(self, sid: str) -> Optional[str]:
+        """Why *sid* ended (the 410 detail), or ``None`` if it did not."""
+        entry = self._ended.get(sid) if sid else None
+        if entry is None:
+            return None
+        _, reason, timeout, idle, client = entry
+        head = f"[{self.instance_name}] session {sid}"
+        if reason == 'closed':
+            return f"{head} was closed (unregister_session)."
+        if client == 'explorer':
+            return (f"{head} expired: Explorer session unused for "
+                    f"{idle:.0f} s (idle timeout {timeout:.0f} s) -- the "
+                    f"normal end of a closed or abandoned browser tab.")
+        return (f"{head} expired after {idle:.0f} s without requests or work "
+                f"in flight (idle timeout {timeout:.0f} s, set when the "
+                f"session was created).  Likely API misuse: the client did "
+                f"not close() the session.  To reconnect after longer idle "
+                f"phases, create the session with register_session(ttl=<s>) "
+                f"(ttl=0: never expires) or call touch() now and then.  If "
+                f"this is a legitimate use case, please open an issue: "
+                f"{ISSUES_URL}")
 
     async def _drop_session(self, sid: str) -> bool:
         """Close and forget one session (record + object).  Idempotent.
@@ -860,22 +960,22 @@ class Plugin(object):
         return True
 
     async def _cleanup_expired_sessions(self) -> int:
-        """Close and drop every session past its lifetime policy.
-
-        Enforces ttl expiry, ephemeral idle timeout, and owner-loss drain in
-        one pass; ``persistent`` sessions are never touched.
+        """End every session idle past its timeout (see
+        :meth:`_expire_if_due`).  Each candidate is decided afresh: an
+        earlier close may have yielded long enough for it to be used.
 
         Returns:
-            Number of sessions cleaned up.
+            Number of sessions ended.
         """
         now = time.time()
-        expired_sids = [sid for sid, rec in list(self._records.items())
-                        if self._is_expired(rec, now)]
-        for sid in expired_sids:
-            await self._drop_session(sid)
-            log.info("[%s] Cleaned up expired session %s",
-                     self.instance_name, sid)
-        return len(expired_sids)
+        due = [(sid, rec) for sid, rec in list(self._records.items())
+               if self._is_expired(rec, now)]
+        ended = 0
+        for sid, rec in due:
+            if self._records.get(sid) is rec \
+                    and await self._expire_if_due(sid, rec, time.time()):
+                ended += 1
+        return ended
 
     def _ensure_cleanup_task(self) -> None:
         """Start the background session-cleanup task if not already running."""

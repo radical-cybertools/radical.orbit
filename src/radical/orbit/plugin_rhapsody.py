@@ -497,6 +497,13 @@ class RhapsodySession(PluginSession):
             "state": state_str,
         })
 
+    def is_busy(self) -> bool:
+        """Probed at the idle deadline: busy while a task is not terminal
+        (a long task emits no events between RUNNING and its end)."""
+        return any(str(self._get_attr(t, 'state', '')).upper()
+                   not in TERMINAL_STATES
+                   for t in reversed(list(self._tasks.values())))
+
     def _check_initialized(self) -> None:
         """Check that the session is active and fully initialized.
 
@@ -1957,14 +1964,11 @@ class PluginRhapsody(Plugin):
             while sid in self._sessions:
                 sid = f"session.{uuid.uuid4().hex[:8]}"
 
-        # Reconnect to an existing session — do not rebuild it.  Owner check
-        # first (bug A5: a session created with an owner must not be hijacked
-        # by another participant).  Report the session's real status: its init
-        # may have long completed, and the reconnecting client would otherwise
-        # wait for a `session_status` notification emitted before it attached.
+        # Reconnect to an existing session (any client) — do not rebuild it.
+        # Report the session's real status: its init may have long completed,
+        # and the reconnecting client would otherwise wait for a
+        # `session_status` notification emitted before it attached.
         if sid in self._sessions:
-            self._check_owner(sid, owner)
-            self._check_policy_conflict(sid, lifetime, ttl)
             self._touch(sid)
             log.info("[%s] Reconnected session %s", self.instance_name, sid)
             return {"sid": sid,

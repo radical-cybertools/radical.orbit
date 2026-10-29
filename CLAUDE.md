@@ -139,6 +139,7 @@ The gateway preserves these HTTP paths for the Explorer and other HTTP clients:
 ### Plugin system
 
 - **Base class**: `src/radical/orbit/plugin_base.py` – provides namespace isolation, session management, route-registration helpers, and notification support.
+- **Session lifetime**: one idle timeout per session, fixed at `register_session(ttl=<s>)` (`0` = never; default: the plugin's `session_ttl` class attribute, 900 s; task dispatcher 86400 s; xgfabric/federation 0). Activity: `{sid}` requests (while in flight), session notifications (`PluginSession.notify`), `touch/{sid}` (`PluginClient.touch()`), and `PluginSession.is_busy()` probed at the deadline. Any client holding a sid can attach (sharing; attachment security deferred to SwarmSlicer); owner/participant loss does not end sessions. Ended sids (expired or unregistered) are remembered for the process lifetime (capped 100k) and answer 410 with the reason; an idle expiry logs WARNING (likely missing `close()`), or INFO for Explorer sessions (`X-Orbit-Client: explorer`). The Explorer touches its sessions every 5 min.
 - **Session base**: `src/radical/orbit/plugin_session_base.py` – per-client session state management.
 - **Client API**: `src/radical/orbit/client.py` – Python client for broker/endpoint interaction with notification callback support.
 

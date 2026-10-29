@@ -28,13 +28,12 @@ handed to the transport loop's :class:`asyncio.Queue` the same way.  Strict
 request backpressure is the 503 fast-fail at the concurrency cap.
 
 **Naming / session recovery.**  A zero-plugin consumer with no name given is
-auto-named ``consumer.<uuid8>`` — fine for fire-and-forget consumers.  Session
-reattach needs a *stable, client-supplied* name: reattach is owner-checked, so
-an auto-named restart cannot recover its sessions by design.  A ``name-in-use``
+auto-named ``consumer.<uuid8>`` — fine for fire-and-forget consumers.  Sessions
+do not depend on the name: any participant holding a sid can reattach to it
+(``register_session(sid=...)``) until it idle-expires.  A ``name-in-use``
 register is retried with capped exponential backoff until the stale
 registration passes ``lost`` — a crashed predecessor holds no resume key, and
-under the fast keepalive the name frees in seconds — so "restart with the same
-name → sessions come back" is automatic from the application's view.
+under the fast keepalive the name frees in seconds.
 """
 
 # pylint: disable=protected-access
@@ -1015,8 +1014,8 @@ class EndpointRuntime(PluginHostBase):
             cbs = list(self._topology_callbacks)
         for cb in cbs:
             self._cb.submit(cb, participants)
-        # Served plugins react to the rich topology (owner-liveness → session
-        # reclaim-drain in plugin_base).  Consumers have no served plugins.
+        # Served plugins react to the rich topology (e.g. the dispatcher's
+        # child-endpoint liveness).  Consumers have no served plugins.
         if self._plugins:
             for plugin in list(self._plugins.values()):
                 self._work_loop.create_task(

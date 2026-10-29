@@ -198,46 +198,56 @@ class PluginMyService(Plugin):
 
 ## Sessions
 
-### Lifetime policies
+### Session lifetime
 
-`register_session` accepts a JSON body (all fields optional) selecting a
-lifetime policy and, for reconnect, a client-supplied session id:
+`register_session` accepts a JSON body (all fields optional) setting the
+session's idle timeout and, for reconnect, a client-supplied session id:
 
-    {"sid": <str>, "lifetime": "ephemeral"|"ttl"|"persistent", "ttl": <seconds>}
+    {"sid": <str>, "ttl": <seconds>}
 
 - `sid` omitted → a fresh session id is minted.
-- `sid` names an existing session → *reconnect* (its last-access is bumped),
-  subject to the owner and policy checks below.
+- `sid` names an existing session → *reconnect*: any client holding the sid
+  can attach (several clients can share one session); `ttl` is ignored.
 - `sid` names no session → a session is created under exactly that id.
+- `sid` names an ended session → **410** with the reason (see below).
 
-The three lifetimes:
+A session expires once it was idle for longer than its timeout.  The
+timeout is fixed at creation: `ttl` seconds, `0` for never; omitted, the
+plugin's `session_ttl` class attribute applies (900 s by default; the task
+dispatcher uses 86400 s, broker-hosted state plugins such as xgfabric and
+federation use 0).  Set `ttl` for sessions that are reconnected to after long
+idle phases.  The legacy `lifetime` field stays accepted: `persistent` means
+`ttl=0`, `ephemeral` the plugin default; an explicit `ttl` wins.
 
-- `ephemeral` (default) — an owner-bound ephemeral session is reclaimed a
-  reclaim-drain grace after its owner is declared `lost` (see
-  [Topology and liveness](#topology-and-liveness)); an owner-less one falls back to the plugin idle
-  timeout (`session_ttl`, default 1 hour) so it is not leaked.
-- `ttl` — expires once `now - last_access` exceeds `ttl` seconds (requires
-  a positive `ttl`); never touched by owner loss.
-- `persistent` — never expires; reclaimed only by explicit operator action.
+Activity restarts the idle clock:
+
+- every request on a `{sid}` route, for as long as it runs;
+- every notification the session emits (`PluginSession.notify`);
+- `touch/{sid}` (`PluginClient.touch()`), which does nothing else;
+- at the deadline only, `PluginSession.is_busy()` -- override it in sessions
+  that run long work without emitting events (rhapsody, psij, globus and the
+  task dispatcher do).  A probe that raises counts as busy.
+
+The owner identity (the trusted `x-orbit-src` header the serving runtime
+injects) is recorded for diagnostics only; it governs neither attachment nor
+lifetime.  Session attachment is capability-style within the token trust
+domain.
+
+An ended session -- expired, or closed by `unregister_session` -- is
+remembered for the process lifetime (the most recent 100k).  Any request on
+it answers **410** with an explanation; `unregister_session` of it is a
+no-op.  An idle expiry logs one line with sid, idle time and the timeout:
+WARNING (likely API misuse: a client that never called `close()`; the
+remedy is `ttl=` at creation or `touch()`; a missed use case is worth an
+issue), or INFO for sessions of the Explorer (`X-Orbit-Client: explorer`
+request header), whose closed tab is the normal end.
 
 The reserved `default` session id is always persistent, shared, and per plugin
 *instance* (a `rhapsody` default and a `psij` default are distinct); it is
-created on demand and records owner `None`.
+created on demand.  Persistent sessions are not remembered once ended.
 
-### Owner binding
-
-The serving runtime injects the broker-stamped participant identity as the
-trusted `x-orbit-src` request header (overwriting any client-supplied copy).
-`register_session` records it as the session `owner`. Reattach is
-**owner-checked**: reconnecting to a session whose recorded owner is not `None`
-and differs from the caller is rejected with **HTTP 403** — recovery goes
-through re-registering the same participant name. Requests arriving through the
-broker gateway carry no participant identity, so their sessions are owner-less
-(`None`) and stay capability-style within the token trust domain.
-
-Status codes: **403** on a cross-owner reattach, **409** on an incoherent or
-conflicting lifetime/ttl, **410** on a session that has passed its TTL, **404**
-on an unknown session id.
+Status codes: **409** on an invalid `ttl`/`lifetime`, **410** on an ended
+session, **404** on an unknown session id.
 
 ### Session teardown
 
@@ -257,12 +267,11 @@ broker stamps each event with an authoritative `seq`/`ts` on ingest.
 From a session:
 
 ``` python
-# In your PluginSession subclass method:
-if self._plugin:
-    self._plugin._dispatch_notify("job_status", {
-        "job_id": "abc123",
-        "state":  "RUNNING"
-    })
+# In your PluginSession subclass method (also counts as session activity):
+self.notify("job_status", {
+    "job_id": "abc123",
+    "state":  "RUNNING"
+})
 ```
 
 From a plugin (async context):
@@ -287,7 +296,7 @@ class PluginMyService(Plugin):
     async def on_topology_change(self, participants: dict):
         for name, info in participants.items():
             print(f"{name}: {info.get('liveness')}")
-        await super().on_topology_change(participants)  # keep reclaim-drain
+        await super().on_topology_change(participants)
 ```
 
 `participants` maps each participant name to its rich info:
@@ -300,17 +309,14 @@ class PluginMyService(Plugin):
 tombstone — the broker broadcasts `suspect` on a socket drop and simply drops
 the participant once its grace elapses — so the host **synthesizes** a
 `liveness='lost'` entry for a participant that vanishes after being seen, and
-delivers it exactly once. The base `on_topology_change` uses this to drive
-owner-bound ephemeral-session reclaim: a `lost` owner arms its reclaim-drain
-timer; a `present` owner cancels it (a transient `suspect` never reclaims).
-Overriders that want that behavior call `super()`.
+delivers it exactly once. The base `on_topology_change` is a no-op hook;
+participant loss does not end sessions (a client can reconnect later).
 
 ## Plugin Shutdown
 
 Override `shutdown` for orderly teardown on host shutdown. The base
-implementation cancels the background session-cleanup task and any pending
-reclaim-drain timers (awaiting each so no task is destroyed while pending) and
-then closes every open session. A plugin that spawns extra background tasks
+implementation cancels the background session-cleanup task (awaiting it so
+no task is destroyed while pending) and then closes every open session. A plugin that spawns extra background tasks
 cancels them first, then calls `super().shutdown()`:
 
 ``` python
