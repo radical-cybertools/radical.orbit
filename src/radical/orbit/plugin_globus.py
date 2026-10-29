@@ -1017,8 +1017,11 @@ class PluginGlobus(Plugin):
         '''Return the session under ``sid``, dropping it first if it has
         expired but was not swept yet — a rotation must not revive it.'''
         record = self._records.get(sid)
-        if record is not None and self._is_expired(record, time.time()):
-            await self._drop_session(sid)
+        now    = time.time()
+        if record is not None and self._is_expired(record, now):
+            self._refresh_if_busy(sid, record, now)  # busy is not expired
+        if record is not None and self._is_expired(record, now):
+            await self._expire_session(sid, record, now)
         return self._sessions.get(sid)
 
     def _check_rotation(self, sid: str, owner: Optional[str],

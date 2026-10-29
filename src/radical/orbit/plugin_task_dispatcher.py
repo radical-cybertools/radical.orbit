@@ -735,6 +735,19 @@ class TaskDispatcherSession(PluginSession):
     lifetime policy.
     '''
 
+    def is_busy(self) -> bool:
+        '''Busy while one of this session's tasks runs: a client following
+        tasks via notifications sends no requests.  Queued tasks and idle
+        pilots do not count -- an abandoned session whose queue is never
+        served must not hold its allocations.'''
+        if self._plugin is None:
+            return False
+        pools = self._plugin._pool_states.get(self._sid) or {}
+        # newest last: running tasks are usually recent, so scan backwards
+        return any(t.state == TASK_RUNNING
+                   for ps in pools.values()
+                   for t in reversed(ps.tasks.values()))
+
     async def close(self) -> dict:
         '''Tear down this session's pools, then run the base close.'''
         if self._plugin is not None:

@@ -376,7 +376,7 @@ class Plugin(object):
         for both direct dispatch and the ASGI app."""
         full_path = self._namespace + '/' + path
         full_path = full_path.replace('//', '/')
-        if '{sid}' in path:
+        if '{sid}' in path and path != 'unregister_session/{sid}':
             handler = self._accessing(handler)
         self._register_direct(full_path, verb, handler)
         self._app.add_route(full_path, self._wrap_handler(handler),
@@ -720,6 +720,8 @@ class Plugin(object):
         """Unregister a session by its session ID and close it."""
         sid = request.path_params['sid']
         if sid not in self._sessions and sid not in self._records:
+            if self._expired.pop(sid, None):
+                return {"ok": True}         # already ended: closing is a no-op
             raise HTTPException(status_code=404,
                                 detail=f"unknown session id: {sid}")
 
@@ -1007,9 +1009,19 @@ class Plugin(object):
                 expired.append((sid, rec))
             else:
                 self._warn_possible_leak(sid, rec, now)
+        dropped = 0
         for sid, rec in expired:
+            # an earlier close may have yielded long enough for this session
+            # to be used, to become busy, or to be re-registered
+            now = time.time()
+            if self._records.get(sid) is not rec:
+                continue
+            self._refresh_if_busy(sid, rec, now)
+            if not self._is_expired(rec, now):
+                continue
             await self._expire_session(sid, rec, now)
-        return len(expired)
+            dropped += 1
+        return dropped
 
     def _warn_possible_leak(self, sid: str, rec: SessionRecord,
                             now: float) -> None:

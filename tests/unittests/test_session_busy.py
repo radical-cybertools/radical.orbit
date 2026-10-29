@@ -79,3 +79,17 @@ def test_client_touch_uses_the_touch_route():
     url = http.post.call_args.args[0]
     assert url.endswith('/psij/touch/sid.1')
     assert 'json' not in http.post.call_args.kwargs
+
+
+def test_dispatcher_busy_while_a_task_runs_not_when_queued():
+    from radical.orbit.plugin_task_dispatcher import TaskDispatcherSession
+    pool   = SimpleNamespace(tasks={'a': SimpleNamespace(state='DONE'),
+                                    'b': SimpleNamespace(state='QUEUED')},
+                             pilots={'p': SimpleNamespace(state='ACTIVE')})
+    plugin = SimpleNamespace(_pool_states={'sid': {'cpu': pool}})
+    s      = SimpleNamespace(_plugin=plugin, _sid='sid')
+    assert not TaskDispatcherSession.is_busy(s)    # queued + idle pilot
+    pool.tasks['b'].state = 'RUNNING'
+    assert TaskDispatcherSession.is_busy(s)
+    assert not TaskDispatcherSession.is_busy(
+        SimpleNamespace(_plugin=plugin, _sid='other'))

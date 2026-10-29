@@ -907,6 +907,41 @@ async def test_idle_expiry_is_explained_in_log_and_later_410(caplog):
 
 
 @pytest.mark.asyncio
+async def test_unregister_of_an_expired_session_is_a_no_op():
+    plugin = _fresh_plugin()
+    plugin.session_ttl = 60
+    await plugin.register_session(_owned_request({"sid": "s1"}))
+    plugin._records["s1"].last_access = time.time() - 100
+    await plugin._cleanup_expired_sessions()
+    assert await plugin.unregister_session(_sid_request("s1")) == {"ok": True}
+    with pytest.raises(HTTPException) as exc:     # once: then unknown
+        await plugin.unregister_session(_sid_request("s1"))
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_sweep_rechecks_before_each_drop():
+    '''A session reconnected while an earlier one closes is not dropped.'''
+    plugin = _fresh_plugin()
+    plugin.session_ttl = 60
+
+    class SlowClose(PluginSession):
+        async def close(self):
+            # while this closes, "b" is reconnected (same sid)
+            await plugin.register_session(_owned_request({"sid": "b"}))
+            return await super().close()
+    plugin.session_class = SlowClose
+    await plugin.register_session(_owned_request({"sid": "a"}))
+    plugin.session_class = PluginSession
+    await plugin.register_session(_owned_request({"sid": "b"}))
+    plugin._records["a"].last_access = time.time() - 100
+    plugin._records["b"].last_access = time.time() - 99   # also a candidate
+    assert await plugin._cleanup_expired_sessions() == 1   # only "a"
+    assert "b" in plugin._sessions                         # reconnected
+    assert time.time() - plugin._records["b"].last_access < 5
+
+
+@pytest.mark.asyncio
 async def test_owner_loss_expiry_is_not_called_misuse(caplog):
     plugin = _fresh_plugin()
     await plugin.register_session(_owned_request({"sid": "b"}, "epB"))

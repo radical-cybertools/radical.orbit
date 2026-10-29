@@ -340,9 +340,9 @@ class PSIJSession(PluginSession):
             try:
                 ex.submit(job)
             except Exception:
-                # never submitted: no state will ever arrive (is_busy)
-                self._jobs.pop(job.id, None)
-                self._job_meta.pop(job.id, None)
+                # never submitted: no state will arrive from psij, so record
+                # it as FAILED (stays visible) and stop it pinning (is_busy)
+                self._job_states.setdefault(job.id, 'FAILED')
                 self._live.discard(job.id)
                 raise
 
