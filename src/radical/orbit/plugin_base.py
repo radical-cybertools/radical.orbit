@@ -660,7 +660,7 @@ class Plugin(object):
                          now: float) -> None:
         """Count work in flight as access (see :meth:`PluginSession.is_busy`).
         A failing probe counts as busy: never reap work over a broken probe."""
-        if rec.lifetime == 'persistent':
+        if rec.lifetime != 'ephemeral':     # ttl is a hard, time-only bound
             return
         session = self._sessions.get(sid)
         if session is None:
@@ -742,7 +742,8 @@ class Plugin(object):
         """Unregister a session by its session ID and close it."""
         sid = request.path_params['sid']
         if sid not in self._sessions and sid not in self._records:
-            if self._expired.pop(sid, None):
+            if self._expired_detail(sid):
+                self._expired.pop(sid, None)
                 return {"ok": True}         # already ended: closing is a no-op
             raise HTTPException(status_code=404,
                                 detail=f"unknown session id: {sid}")
@@ -966,10 +967,12 @@ class Plugin(object):
         return logging.WARNING, (
             f"{head} after {idle:.0f} s without requests and with no work in "
             f"flight (owner-less client, e.g. gateway/HTTP; idle timeout "
-            f"{self.session_ttl} s).  Likely API misuse: the client did not "
-            f"close() the session.  Keep a session across idle phases with "
-            f"touch() or lifetime='ttl'.  If this is a legitimate use case, "
-            f"please open an issue: {ISSUES_URL}")
+            f"{self.session_ttl} s).  From an Explorer/browser tab that was "
+            f"closed or left alone, this is the normal end of the session.  "
+            f"From a script or SDK client it is likely API misuse: the client "
+            f"did not close() the session -- keep a session across idle "
+            f"phases with touch() or lifetime='ttl'.  If this is a legitimate "
+            f"use case, please open an issue: {ISSUES_URL}")
 
     async def _expire_session(self, sid: str, rec: SessionRecord,
                               now: float) -> str:

@@ -144,7 +144,6 @@ class PSIJSession(PluginSession):
     def __init__(self, sid: str, **kwargs: Any):
         super().__init__(sid)
         self._jobs: Dict[str, Any] = {}       # job_id -> psij.Job
-        self._live: set = set()               # job_ids maybe not terminal yet
         self._job_meta: Dict[str, dict] = {}  # job_id -> submission metadata
         self._job_states: Dict[str, str] = {}  # track last known state per job
         self._cancelled_jobs: set = set()      # job_ids the user asked to cancel
@@ -158,15 +157,9 @@ class PSIJSession(PluginSession):
     def is_busy(self) -> bool:
         """Busy while any job has not reached a terminal state.  Reaping the
         session would stop its status polling and remove the running jobs'
-        output dir."""
-        # only jobs not yet seen terminal, pruned as they finish, so the
-        # sweep's cost does not grow with the session's job history; a copy,
-        # since psij callbacks and submit threads mutate it concurrently
-        for j in list(self._live):
-            if j not in self._jobs or \
-                    self._job_states.get(j) in TERMINAL_STATES:
-                self._live.discard(j)
-        return bool(self._live)
+        output dir.  A copy: psij threads mutate ``_jobs`` concurrently."""
+        return any(self._job_states.get(j) not in TERMINAL_STATES
+                   for j in list(self._jobs))
 
     def _effective_state(self, job_id: str, raw_state: str) -> str:
         """Map a psij state to what the caller should see.
@@ -315,7 +308,6 @@ class PSIJSession(PluginSession):
                 ex.poll_interval = PSIJ_POLL_INTERVAL
 
             self._jobs[job.id] = job
-            self._live.add(job.id)
 
             # Store submission metadata for later retrieval
             attribs = job_spec_dict.get('attributes', {})
@@ -341,11 +333,13 @@ class PSIJSession(PluginSession):
 
             try:
                 ex.submit(job)
-            except Exception:
-                # never submitted: no state will arrive from psij, so record
-                # it as FAILED (stays visible) and stop it pinning (is_busy)
-                self._job_states.setdefault(job.id, 'FAILED')
-                self._live.discard(job.id)
+            except Exception as e:
+                # never submitted: no further state will arrive from psij.
+                # Record and notify FAILED (stays visible, stops pinning)
+                self._job_states[job.id] = 'FAILED'
+                self.notify("job_status", {
+                    "job_id": job.id, "state": 'FAILED', "exit_code": None,
+                    "stdout": "", "stderr": f"submit failed: {e}"})
                 raise
 
             # Start background polling for job status updates

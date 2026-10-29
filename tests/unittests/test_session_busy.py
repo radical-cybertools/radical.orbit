@@ -13,14 +13,11 @@ from radical.orbit.plugin_xgfabric      import XGFabricSession
 
 def test_psij_busy_while_a_job_is_not_terminal():
     s = SimpleNamespace(_jobs={'j1': object(), 'j2': object()},
-                        _live={'j1', 'j2'},
                         _job_states={'j1': 'COMPLETED', 'j2': 'ACTIVE'})
     assert PSIJSession.is_busy(s)
-    assert s._live == {'j2'}                 # terminal ones pruned
     s._job_states['j2'] = 'FAILED'
     assert not PSIJSession.is_busy(s)
     s._jobs['j3'] = object()                 # submitted, no state yet
-    s._live.add('j3')
     assert PSIJSession.is_busy(s)
 
 
@@ -54,13 +51,10 @@ def test_rhapsody_session_busy_while_a_task_is_not_terminal():
     from radical.orbit.plugin_rhapsody import RhapsodySession
     s = SimpleNamespace(_tasks={'a': {'state': 'DONE'},
                                 'b': {'state': 'running'}},
-                        _live={'a', 'b'},
                         _get_attr=lambda t, k, d=None: t.get(k, d))
     assert RhapsodySession.is_busy(s)
-    assert s._live == {'b'}                  # terminal ones pruned
     s._tasks['b']['state'] = 'completed'
     assert not RhapsodySession.is_busy(s)
-    assert s._live == set()
 
 
 @pytest.mark.asyncio

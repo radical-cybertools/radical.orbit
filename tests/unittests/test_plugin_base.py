@@ -793,13 +793,15 @@ async def test_busy_session_is_not_idle_and_clock_starts_when_work_ends():
 
 
 @pytest.mark.asyncio
-async def test_busy_ttl_session_is_kept():
+async def test_ttl_session_is_time_bound_even_when_busy():
+    '''lifetime='ttl' is a hard, time-only bound: work in flight does not
+    extend it (only ephemeral sessions get the busy benefit).'''
     plugin = _fresh_plugin()
     plugin.session_class = _BusySession
     await plugin.register_session(
         _owned_request({"sid": "t", "lifetime": "ttl", "ttl": 60}))
     plugin._records["t"].last_access = time.time() - 1000
-    assert await plugin._cleanup_expired_sessions() == 0
+    assert await plugin._cleanup_expired_sessions() == 1
 
 
 @pytest.mark.asyncio
