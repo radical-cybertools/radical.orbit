@@ -651,7 +651,7 @@ class RhapsodySession(PluginSession):
             window   = self._notify_window
             now      = window <= 0 \
                        or len(self._notify_buf) >= NOTIFY_BATCH_SIZE \
-                       or self._notify_bytes >= self._notify_batch_bytes
+                       or self._notify_bytes >= self._frame_budget()
             schedule = not now and not self._flush_scheduled
             if schedule:
                 self._flush_scheduled = True
@@ -702,6 +702,11 @@ class RhapsodySession(PluginSession):
             else:
                 self.notify("task_status_batch", {"tasks": frame})
 
+    def _frame_budget(self) -> int:
+        """Bytes available for task payloads per frame: ``notify`` adds the
+        session id to each frame after the split."""
+        return self._notify_batch_bytes - _payload_size({'sid': self.sid})
+
     def _split_frames(self, batch: list[dict]) -> list[list[dict]]:
         """Split notifications into frames under ``_notify_batch_bytes``.
 
@@ -713,8 +718,7 @@ class RhapsodySession(PluginSession):
         frames: list[list[dict]] = []
         frame:  list[dict]       = []
         nbytes                   = 0
-        # ``notify`` adds the session id to each frame after the split
-        budget = self._notify_batch_bytes - _payload_size({'sid': self.sid})
+        budget = self._frame_budget()
 
         for payload in batch:
             size = _payload_size(payload)
@@ -1370,8 +1374,8 @@ class RhapsodyClient(PluginClient):
                 if uid and state in TERMINAL_STATES:
                     # stored without the envelope's sid: a completion looks
                     # the same whether it came alone or in a batch frame
-                    self._completed[uid] = {k: v for k, v in t.items()
-                                            if k != 'sid'}
+                    self._completed[uid] = t if 'sid' not in t else \
+                        {k: v for k, v in t.items() if k != 'sid'}
                     changed = True
 
             if changed:
@@ -1455,7 +1459,7 @@ class RhapsodyClient(PluginClient):
         resp = self._http.post(self._url('register_session'), json=payload)
         self._raise(resp)
 
-        data      = resp.json()
+        data   = resp.json()
         status = data.get('status')
 
         # Switch to the new session and reset the session-wide completion
