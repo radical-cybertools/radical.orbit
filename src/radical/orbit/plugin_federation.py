@@ -44,8 +44,8 @@ Why it is built this way
   in-process host path carries no ``x-orbit-src`` owner, so it is an
   owner-less *ephemeral* session and the base sweep drops it
   ``session_ttl`` (900 s) after its last access — and dropping a dispatcher
-  session cancels its pools and pilots.  Dispatcher routes do not bump
-  ``last_access``.  Therefore every session the federation creates is
+  session cancels its pools and pilots.  A federation session can sit
+  without requests for long stretches.  Therefore every session the federation creates is
   registered ``lifetime='persistent'`` and released explicitly on ``leave``.
   The federation's *own* routes all run on the reserved ``default`` session,
   which is always persistent.

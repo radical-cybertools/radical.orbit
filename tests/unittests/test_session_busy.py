@@ -24,9 +24,14 @@ def test_psij_busy_while_a_job_is_not_terminal():
 
 
 def test_globus_busy_while_a_transfer_is_not_reported_terminal():
+    import time
     s = SimpleNamespace(_tasks={'t1': {'notified': 'SUCCEEDED'},
-                                't2': {'status': 'ACTIVE'}})
+                                't2': {'status': 'ACTIVE'}},
+                        _status_ok=time.time())
     assert GlobusSession.is_busy(s)
+    s._status_ok = time.time() - 3600       # status unfetchable for long
+    assert not GlobusSession.is_busy(s)
+    s._status_ok = time.time()
     s._tasks['t2']['notified'] = 'INACTIVE'  # expired credential: no pin
     assert not GlobusSession.is_busy(s)
 
@@ -43,22 +48,21 @@ async def test_xgfabric_busy_while_its_workflow_runs():
     assert not XGFabricSession.is_busy(s)
 
 
-def test_dispatcher_busy_while_a_pool_has_unfinished_tasks():
+def test_dispatcher_busy_only_for_owner_bound_sessions():
     def rec(terminal):
         return SimpleNamespace(is_terminal=lambda: terminal)
     pool   = SimpleNamespace(pilots={'p': rec(True)}, tasks={'t': rec(False)})
     plugin = SimpleNamespace(_pool_states={'sid': {'cpu': pool}},
-                             _endpoint_mode_tasks={})
+                             _records={'sid': SimpleNamespace(owner='ep')})
     s      = SimpleNamespace(_plugin=plugin, _sid='sid')
     assert TaskDispatcherSession.is_busy(s)
     pool.tasks['t'] = rec(True)
     assert not TaskDispatcherSession.is_busy(s)
-    pool.pilots['p2'] = rec(False)          # a live pilot alone: not busy
+    pool.pilots['p2'] = rec(False)          # a pilot waiting in the queue
+    assert TaskDispatcherSession.is_busy(s)
+    plugin._records['sid'].owner = None     # owner-less: never busy
     assert not TaskDispatcherSession.is_busy(s)
     assert not TaskDispatcherSession.is_busy(
-        SimpleNamespace(_plugin=plugin, _sid='other'))
-    plugin._endpoint_mode_tasks['e1'] = 'ep'  # not tied to a session
-    assert TaskDispatcherSession.is_busy(
         SimpleNamespace(_plugin=plugin, _sid='other'))
 
 

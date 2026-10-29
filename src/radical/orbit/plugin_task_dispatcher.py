@@ -747,16 +747,23 @@ class TaskDispatcherSession(PluginSession):
     '''
 
     def is_busy(self) -> bool:
-        '''Busy while one of this session's pools has a non-terminal task:
-        clients follow tasks via notifications.  Live pilots alone do not
-        count -- an abandoned session must not hold its allocations.'''
+        '''Busy while an owner-bound session's pools have a live pilot or an
+        unfinished task: such a client waits on notifications (pilots in the
+        batch queue, long tasks), and if it goes away, owner loss reclaims
+        the session.  An owner-less (gateway / Explorer) session is never
+        busy: nothing would reclaim an abandoned one, and a client that is
+        still there keeps it alive through its requests.'''
         if self._plugin is None:
             return False
-        if self._plugin._endpoint_mode_tasks:
-            return True     # endpoint-mode tasks are not tied to a session
+        rec = self._plugin._records.get(self._sid)
+        if rec is None or rec.owner is None:
+            return False
         pools = self._plugin._pool_states.get(self._sid) or {}
-        return any(not t.is_terminal()
-                   for ps in pools.values() for t in ps.tasks.values())
+        # newest last: live records are usually recent, so scan backwards
+        return any(not r.is_terminal()
+                   for ps in pools.values()
+                   for recs in (ps.tasks, ps.pilots)
+                   for r in reversed(recs.values()))
 
     async def close(self) -> dict:
         '''Tear down this session's pools, then run the base close.'''
@@ -1395,6 +1402,8 @@ class PluginTaskDispatcher(Plugin):
         '''Cancel the housekeeping loop and drop the event tap, then base close.'''
         # anything still coalescing gets its persist and its notification now
         self._flush_rh()
+        if self._touch_task is not None and not self._touch_task.done():
+            self._touch_task.cancel()
         if self._housekeeping_task is not None \
                 and not self._housekeeping_task.done():
             self._housekeeping_task.cancel()

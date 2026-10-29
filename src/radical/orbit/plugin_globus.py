@@ -93,6 +93,7 @@ GLOBUS_TERMINAL = {'SUCCEEDED', 'FAILED', 'CANCELED', 'CANCELLED'}
 # Statuses that end ``task_wait``: the task has left ACTIVE.  INACTIVE
 # (e.g. an expired credential) is not terminal but needs intervention.
 GLOBUS_WAIT_DONE = GLOBUS_TERMINAL | {'INACTIVE'}
+STATUS_STALE     = 1800    # s without a status fetch: transfers stop pinning
 
 # Local-collection config file (lowest-priority auto-detection source).
 GLOBUS_CONFIG_FILE = '~/.radical/orbit/globus.json'
@@ -276,6 +277,7 @@ class GlobusSession(PluginSession):
 
         # task_id -> {status, label}
         self._tasks: Dict[str, Dict[str, Any]] = {}
+        self._status_ok = time.time()   # last successful Globus status fetch
 
     # -- helpers ------------------------------------------------------------
 
@@ -535,8 +537,12 @@ class GlobusSession(PluginSession):
     def is_busy(self) -> bool:
         """Busy while any transfer has not been reported terminal: clients
         wait on ``transfer_status`` notifications without polling.  An
-        INACTIVE transfer (e.g. expired credential) does not count: it does
-        not end on its own, so it must not pin the session and token."""
+        INACTIVE transfer (e.g. expired credential) does not count, nor do
+        transfers whose status could not be fetched for STATUS_STALE seconds
+        (e.g. an expired access token): they do not end on their own, so
+        they must not pin the session and its credential."""
+        if time.time() - self._status_ok > STATUS_STALE:
+            return False
         return any(meta.get('notified') not in GLOBUS_WAIT_DONE
                    for meta in self._tasks.values())
 
@@ -564,6 +570,7 @@ class GlobusSession(PluginSession):
         if not self._terminal_pending(meta):
             res    = _as_dict(await asyncio.to_thread(self._tc.get_task,
                                                       task_id))
+            self._status_ok = time.time()
             status = res.get('status')
             if not status:
                 return None

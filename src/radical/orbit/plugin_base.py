@@ -133,7 +133,7 @@ class Plugin(object):
     (record-less)   —            treated as owner-less ephemeral
     ==============  ===========  ========================================
 
-    An ephemeral session whose :meth:`PluginSession.is_busy` reports work in
+    An ephemeral or ttl session whose :meth:`PluginSession.is_busy` reports work in
     flight (running tasks, jobs, transfers, a workflow) counts as active: the
     sweep refreshes its ``last_access``, so the idle clock only starts once
     that work ends.  A client waiting on notifications thus keeps its session
@@ -909,7 +909,7 @@ class Plugin(object):
         now = time.time()
         expired = []
         for sid, rec in list(self._records.items()):
-            if rec.lifetime == 'ephemeral':
+            if rec.lifetime != 'persistent':
                 session = self._sessions.get(sid)
                 try:
                     busy = session is not None and session.is_busy()

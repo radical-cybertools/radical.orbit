@@ -792,6 +792,16 @@ async def test_busy_session_is_not_idle_and_clock_starts_when_work_ends():
 
 
 @pytest.mark.asyncio
+async def test_busy_ttl_session_is_kept():
+    plugin = _fresh_plugin()
+    plugin.session_class = _BusySession
+    await plugin.register_session(
+        _owned_request({"sid": "t", "lifetime": "ttl", "ttl": 60}))
+    plugin._records["t"].last_access = time.time() - 1000
+    assert await plugin._cleanup_expired_sessions() == 0
+
+
+@pytest.mark.asyncio
 async def test_busy_session_still_reclaimed_on_owner_loss():
     plugin = _fresh_plugin()
     plugin.session_class = _BusySession
