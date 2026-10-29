@@ -271,12 +271,13 @@ reflects the broker's snapshot at registration time — so an immediate
 `get_plugin(endpoint, plugin, **session_kwargs)` calls `register_session` for
 you; the plugin helper's `register_session` accepts a lifetime policy:
 
-- `lifetime='ephemeral'` (default) — expires after 15 minutes without
-  requests (the plugin idle timeout) unless it has work in flight (running
-  tasks, jobs, transfers); an owner-bound one is also reclaimed a grace
-  period after its owning participant is declared `lost`.  To keep an
-  otherwise idle session, call `client.touch()` now and then (or use
-  `lifetime='ttl'`); a call on an expired session fails with HTTP 410.
+- `lifetime='ephemeral'` (default) — an owner-bound session (opened through
+  `EndpointRuntime`) lives while its owner is connected and is reclaimed a
+  grace period after the owner is declared `lost`; close it when done.  An
+  owner-less one (gateway/HTTP caller) expires after 15 minutes without
+  requests unless it has work in flight (running tasks, jobs, transfers);
+  call `client.touch()` now and then (or use `lifetime='ttl'`) to keep it.
+  A call on an expired session fails with HTTP 410 and says why.
 - `lifetime='ttl', ttl=<seconds>` — expires `ttl` seconds after the last access
   (time-driven; requires a positive `ttl`).
 - `lifetime='persistent'` — never expires; reclaimed only by explicit operator

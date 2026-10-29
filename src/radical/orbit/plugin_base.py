@@ -8,6 +8,7 @@ import functools
 import time
 
 from dataclasses import dataclass
+from collections import OrderedDict
 from typing import Type, Optional, Dict, Callable, Any, Union
 from fastapi import FastAPI, HTTPException, Request
 from starlette.responses import JSONResponse
@@ -21,6 +22,11 @@ log = logging.getLogger("radical.orbit")
 # Reserved session ID.  The 'default' session is persistent and per plugin
 # instance — a `rhapsody` default and a `psij` default are distinct sessions.
 DEFAULT_SID = 'default'
+
+ISSUES_URL     = 'https://github.com/radical-cybertools/radical.orbit/issues'
+LEAK_WARN_SEC  = 3600     # warn about an owner-bound session idle this long
+EXPIRED_KEEP   = 1000     # remember this many expired sids (for 410) ...
+EXPIRED_KEEP_S = 86400    # ... for this long
 
 
 @dataclass
@@ -37,6 +43,7 @@ class SessionRecord:
     owner:          Optional[str]             # trusted x-orbit-src, or None
     last_access:    float
     drain_deadline: Optional[float] = None    # set on owner 'lost'
+    leak_warned:    Optional[float] = None    # last_access at the leak warning
 
 
 class _LastAccessView:
@@ -107,8 +114,8 @@ class Plugin(object):
 
         client_class: The local helper class for the application-side client.
         version: The version string for the plugin.
-        session_ttl: Idle timeout in seconds for ephemeral sessions, owner-
-            bound or not (default: 900 = 15 min, 0 = no timeout).
+        session_ttl: Idle timeout in seconds for owner-less ephemeral
+            sessions (default: 900 = 15 min, 0 = no timeout).
         reclaim_drain: Grace, in seconds, between an owner being declared
             ``lost`` and its owner-bound ephemeral sessions being reclaimed
             (default: 300).  Injectable per instance for tests.
@@ -128,19 +135,22 @@ class Plugin(object):
     ==============  ===========  ========================================
     persistent      any          never (explicit unregister only)
     ttl             any          ``now - last_access > ttl``
-    ephemeral       bound        idle ``> session_ttl``, or owner ``lost`` +
-                                 ``reclaim_drain`` grace (whichever first)
+    ephemeral       bound        owner ``lost`` + ``reclaim_drain`` grace
     ephemeral       owner-less   ``now - last_access > session_ttl`` (idle)
     (record-less)   —            treated as owner-less ephemeral
     ==============  ===========  ========================================
 
-    An ephemeral or ttl session whose :meth:`PluginSession.is_busy` reports work in
-    flight (running tasks, jobs, transfers, a workflow) counts as active: the
-    sweep refreshes its ``last_access``, so the idle clock only starts once
-    that work ends.  A client waiting on notifications thus keeps its session
-    without sending requests.  Known limit: work that never reaches a final
-    state (a task or job whose state is never updated again) keeps its
-    session busy, and alive, for good.
+    Owner-bound sessions are governed by owner liveness (the transport
+    keepalive), never by idling; one idle for ``LEAK_WARN_SEC`` while its
+    owner stays connected is logged as a possible leak (a missing
+    ``close()``), not reclaimed.  Every request on a ``{sid}`` route counts
+    as an access.  A session whose :meth:`PluginSession.is_busy` reports
+    work in flight (running tasks, jobs, transfers, a workflow) counts as
+    active: the sweep refreshes its ``last_access``, so the idle clock only
+    starts once that work ends.  Known limit: work that never reaches a
+    final state keeps its session busy, and alive, for good.  An expired
+    session is logged with its reason, and later requests on it get 410
+    with the same explanation (not a bare 404).
 
     Reattach is owner-checked: reconnecting to a session whose recorded owner
     is non-``None`` and differs from the caller is rejected (403); recovery
@@ -172,7 +182,7 @@ class Plugin(object):
     session_class: Optional[Type[PluginSession]] = None
     client_class: Optional[Type] = None
     version: str = '0.0.1'
-    session_ttl: int = 900  # ephemeral idle timeout (s); 0: no idle expiry
+    session_ttl: int = 900  # owner-less ephemeral idle timeout (s); 0: none
     reclaim_drain: float = 300  # 'lost' owner -> ephemeral-session reclaim grace
     ui_config: Union[Dict, UIConfig, None] = None  # UI configuration for portal
     ui_module: Optional[str] = None  # Absolute path to JS plugin module, or None
@@ -260,6 +270,9 @@ class Plugin(object):
         self._sessions: Dict[str, PluginSession] = {}
         # Single source of truth for lifetime bookkeeping, keyed by sid.
         self._records: Dict[str, SessionRecord] = {}
+        # sid -> (expired at, explanation): a later request on an expired
+        # session gets 410 and the reason, not a bare 404
+        self._expired: 'OrderedDict[str, tuple]' = OrderedDict()
         # Backward-compat mapping shim over record.last_access (see class).
         self._session_last_access = _LastAccessView(self._records)
         # Guards on-demand creation of the reserved 'default' session so two
@@ -378,6 +391,10 @@ class Plugin(object):
         async def _accessed(request):
             sid = (getattr(request, 'path_params', None) or {}).get('sid')
             if sid:
+                if sid not in self._sessions:
+                    text = self._expired_detail(sid)
+                    if text:
+                        raise HTTPException(status_code=410, detail=text)
                 self._access(sid)
             return await handler(request)
         return _accessed
@@ -645,6 +662,7 @@ class Plugin(object):
         """
         self._sessions[sid] = session
         self._records[sid]  = SessionRecord(lifetime, ttl, owner, time.time())
+        self._expired.pop(sid, None)        # a re-registered sid is live again
 
     def _check_owner(self, sid: str, owner: Optional[str]) -> None:
         """Reject a reattach from a different owner than recorded at create.
@@ -855,11 +873,14 @@ class Plugin(object):
         if record is not None and self._is_expired(record, now):
             self._refresh_if_busy(sid, record, now)  # busy is not expired
         if record is not None and self._is_expired(record, now):
-            await self._drop_session(sid)
-            raise HTTPException(status_code=410, detail=f"session expired: {sid}")
+            text = await self._expire_session(sid, record, now)
+            raise HTTPException(status_code=410, detail=text)
 
         session = self._sessions.get(sid)
         if not session:
+            text = self._expired_detail(sid)
+            if text:
+                raise HTTPException(status_code=410, detail=text)
             raise HTTPException(status_code=404, detail=f"unknown session id: {sid}")
 
         # Update last access time
@@ -887,28 +908,69 @@ class Plugin(object):
 
         - ``persistent``               -> ``None``.
         - ``ttl``                      -> ``last_access + ttl``.
-        - ``ephemeral`` owner-bound    -> the earlier of ``drain_deadline``
-          (set once the owner is declared ``lost``) and the idle deadline.
-        - ``ephemeral`` owner-less     -> the idle deadline.
-
-        The idle deadline is ``last_access + session_ttl``, or ``None`` when
-        ``session_ttl == 0``.
+        - ``ephemeral`` owner-bound    -> ``drain_deadline`` (``None`` until
+          the owner is declared ``lost``; liveness-governed, never idle).
+        - ``ephemeral`` owner-less     -> ``last_access + session_ttl`` (idle),
+          or ``None`` when ``session_ttl == 0``.
         """
         if record.lifetime == 'persistent':
             return None
         if record.lifetime == 'ttl':
             return record.last_access + record.ttl
-        idle = record.last_access + self.session_ttl \
-               if self.session_ttl > 0 else None
-        if record.owner is not None and record.drain_deadline is not None:
-            return record.drain_deadline if idle is None \
-                   else min(record.drain_deadline, idle)
-        return idle
+        if record.owner is not None:                       # owner-bound
+            return record.drain_deadline
+        if self.session_ttl > 0:                           # owner-less idle
+            return record.last_access + self.session_ttl
+        return None
 
     def _is_expired(self, record: SessionRecord, now: float) -> bool:
         """True once *record* has passed its expiry deadline."""
         deadline = self._expiry_deadline(record, now)
         return deadline is not None and now > deadline
+
+    def _expiry_reason(self, sid: str, rec: SessionRecord,
+                       now: float) -> tuple:
+        """``(level, text)`` explaining why *rec* expired -- for the endpoint
+        log and, verbatim, for the 410 a later request on it gets."""
+        idle = now - rec.last_access
+        head = f"[{self.instance_name}] session {sid} expired"
+        if rec.lifetime == 'ttl':
+            return logging.INFO, (
+                f"{head}: lifetime='ttl' session unused for {idle:.0f} s "
+                f"(ttl {rec.ttl:.0f} s).")
+        if rec.owner is not None:
+            return logging.INFO, (
+                f"{head}: its owner '{rec.owner}' was declared lost.")
+        return logging.WARNING, (
+            f"{head} after {idle:.0f} s without requests and with no work in "
+            f"flight (owner-less client, e.g. gateway/HTTP; idle timeout "
+            f"{self.session_ttl} s).  Likely API misuse: the client did not "
+            f"close() the session.  Keep a session across idle phases with "
+            f"touch() or lifetime='ttl'.  If this is a legitimate use case, "
+            f"please open an issue: {ISSUES_URL}")
+
+    async def _expire_session(self, sid: str, rec: SessionRecord,
+                              now: float) -> str:
+        """Drop an expired session; log and remember why.  Returns the
+        explanation (also served as the 410 detail of later requests)."""
+        level, text = self._expiry_reason(sid, rec, now)
+        log.log(level, text)
+        self._expired[sid] = (now, text)
+        self._expired.move_to_end(sid)
+        while len(self._expired) > EXPIRED_KEEP:
+            self._expired.popitem(last=False)
+        await self._drop_session(sid)
+        return text
+
+    def _expired_detail(self, sid: str) -> Optional[str]:
+        """The explanation for a recently expired *sid*, or ``None``."""
+        entry = self._expired.get(sid)
+        if entry is None:
+            return None
+        if time.time() - entry[0] > EXPIRED_KEEP_S:
+            self._expired.pop(sid, None)
+            return None
+        return entry[1]
 
     async def _drop_session(self, sid: str) -> bool:
         """Close and forget one session (record + object).  Idempotent.
@@ -943,12 +1005,30 @@ class Plugin(object):
             self._refresh_if_busy(sid, rec, now)
             if self._is_expired(rec, now):
                 expired.append((sid, rec))
+            else:
+                self._warn_possible_leak(sid, rec, now)
         for sid, rec in expired:
-            await self._drop_session(sid)
-            log.info("[%s] Cleaned up expired session %s (lifetime %s, "
-                     "owner %s, idle %.0f s)", self.instance_name, sid,
-                     rec.lifetime, rec.owner, now - rec.last_access)
+            await self._expire_session(sid, rec, now)
         return len(expired)
+
+    def _warn_possible_leak(self, sid: str, rec: SessionRecord,
+                            now: float) -> None:
+        """Owner-bound sessions are not idle-expired (owner liveness governs
+        them), so a connected owner that never closes one leaks it: say so,
+        once per idle stretch, without reclaiming it."""
+        if rec.lifetime != 'ephemeral' or rec.owner is None \
+                or rec.drain_deadline is not None \
+                or now - rec.last_access < LEAK_WARN_SEC \
+                or rec.leak_warned == rec.last_access:
+            return
+        rec.leak_warned = rec.last_access
+        log.warning("[%s] possible session leak: session %s idle for %.0f s "
+                    "while its owner '%s' is still connected and no work is "
+                    "in flight -- did the client forget close()?  (Not "
+                    "reclaimed: owner-bound sessions live while their owner "
+                    "does.)  If this is a legitimate use case, please open "
+                    "an issue: %s", self.instance_name, sid,
+                    now - rec.last_access, rec.owner, ISSUES_URL)
 
     def _ensure_cleanup_task(self) -> None:
         """Start the background session-cleanup task if not already running."""

@@ -212,20 +212,23 @@ lifetime policy and, for reconnect, a client-supplied session id:
 
 The three lifetimes:
 
-- `ephemeral` (default) — expires after the plugin idle timeout
-  (`session_ttl`, default 900 s; `0` disables it), so a client that never
-  closes its session does not leak it; an owner-bound one is also reclaimed
-  a reclaim-drain grace after its owner is declared `lost` (see
-  [Topology and liveness](#topology-and-liveness)), whichever comes first.
-  A session whose `is_busy()` reports work in flight (running tasks, jobs,
-  transfers, a workflow) counts as active, so a client that only waits on
-  notifications keeps it; the idle clock starts when that work ends.  Work
-  that never reaches a final state (a stuck task or a psij job whose state
-  is never updated) keeps its session alive — a known limit.  A client
-  that holds a session through long idle phases calls
-  `PluginClient.touch()` (route `touch/{sid}`) now and then, or registers
-  with `lifetime='ttl'`;
-  a call on an expired session gets **410**.
+- `ephemeral` (default) — an owner-bound session lives while its owner
+  does: it is reclaimed a reclaim-drain grace after its owner is declared
+  `lost` (the transport keepalive; see
+  [Topology and liveness](#topology-and-liveness)), never for idling.  One
+  idle for an hour while its owner stays connected is logged as a
+  *possible session leak* (a forgotten `close()`), not reclaimed.  An
+  owner-less one (gateway/HTTP caller) idle-expires after the plugin's
+  `session_ttl` (default 900 s; `0` disables it).  Every request on a
+  `{sid}` route counts as an access, and a session whose `is_busy()`
+  reports work in flight (running tasks, jobs, transfers, a workflow)
+  counts as active — the idle clock starts when that work ends.  Work that
+  never reaches a final state keeps its session alive (a known limit).  To
+  hold an owner-less session through long idle phases, call
+  `PluginClient.touch()` (route `touch/{sid}`) now and then, or register
+  with `lifetime='ttl'`.  An expiry is logged with its reason (for an idle
+  one: likely API misuse, or a missed use case to report); later calls on
+  that session get **410** with the same explanation.
 - `ttl` — expires once `now - last_access` exceeds `ttl` seconds (requires
   a positive `ttl`); never touched by owner loss.
 - `persistent` — never expires; reclaimed only by explicit operator action.

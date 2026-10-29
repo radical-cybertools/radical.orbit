@@ -82,7 +82,6 @@ GLOBUS_TIMEOUT = 2 * 3600       # give up (and cancel) a transfer after this
 PHASES         = ('preflight', 'stage_in', 'compute', 'package', 'stage_out',
                   'fetch')
 N_PREVIEW      = 8
-KEEPALIVE      = 300             # touch the run's sessions this often (s)
 POLL_RETRIES   = 5               # consecutive failed status polls tolerated
 
 
@@ -287,8 +286,6 @@ class LucidRun:
         self._backend   = backend
         self._on_update = on_update
         self._poll      = poll
-        self._sessions: list = []
-        self._touched   = time.time()
         self._lock      = threading.Lock()
         self._cancel    = threading.Event()
 
@@ -321,21 +318,6 @@ class LucidRun:
     def _sleep(self):
         if self._cancel.wait(self._poll):
             raise LucidError('run cancelled')
-        self._keepalive()
-
-    def _keepalive(self):
-        '''Touch the run's sessions every KEEPALIVE seconds: phases leave
-        some of them unused for longer than the endpoint's idle timeout
-        (e.g. staging between preflight and fetch).  They stay owner-bound,
-        so a crashed portal's sessions are still reclaimed.'''
-        if time.time() - self._touched < KEEPALIVE:
-            return
-        self._touched = time.time()
-        for s in self._sessions:
-            try:
-                s.touch()
-            except Exception as e:
-                log.warning('[lucid] session keepalive failed: %s', e)
 
     def _retry(self, call, what: str):
         '''Run a status poll, riding out a few transient RPC failures (a
@@ -373,7 +355,7 @@ class LucidRun:
     #
     def run(self) -> dict:
         self._update(status='running', started=time.time())
-        sessions = self._sessions = []
+        sessions = []
         phase    = None
         t0       = time.time()
         final    = {'status': 'done'}

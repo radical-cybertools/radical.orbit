@@ -18,6 +18,7 @@ from starlette.requests import Request
 from unittest.mock import Mock
 import asyncio
 import uuid
+import logging
 import time
 import pytest
 
@@ -747,9 +748,9 @@ async def test_owner_return_cancels_drain():
 
 
 @pytest.mark.asyncio
-async def test_owner_bound_ephemeral_idle_expires():
-    '''Owner-bound and owner-less ephemeral sessions both idle-expire: a
-    present owner that never closes its session must not leak it.'''
+async def test_owner_bound_ephemeral_not_idle_expired():
+    '''An owner-bound ephemeral session is governed by liveness, not the idle
+    timeout; an owner-less one idle-expires.'''
     plugin = _fresh_plugin()
     plugin.session_ttl = 1                             # tiny idle timeout
 
@@ -761,8 +762,8 @@ async def test_owner_bound_ephemeral_idle_expires():
     plugin._records["free"].last_access  = time.time() - 100
 
     cleaned = await plugin._cleanup_expired_sessions()
-    assert cleaned == 2
-    assert "bound" not in plugin._sessions             # idle-expired too
+    assert cleaned == 1
+    assert "bound" in plugin._sessions                 # liveness-governed
     assert "free" not in plugin._sessions              # idle-expired
 
 
@@ -780,7 +781,7 @@ async def test_busy_session_is_not_idle_and_clock_starts_when_work_ends():
     plugin = _fresh_plugin()
     plugin.session_class = _BusySession
     plugin.session_ttl   = 60
-    await plugin.register_session(_owned_request({"sid": "b"}, "epB"))
+    await plugin.register_session(_owned_request({"sid": "b"}))
     sess = plugin._sessions["b"]
     plugin._records["b"].last_access = time.time() - 1000
 
@@ -807,7 +808,7 @@ async def test_forward_does_not_drop_a_busy_session():
     plugin = _fresh_plugin()
     plugin.session_class = _BusySession
     plugin.session_ttl   = 1
-    await plugin.register_session(_owned_request({"sid": "b"}, "epB"))
+    await plugin.register_session(_owned_request({"sid": "b"}))
     plugin._records["b"].last_access = time.time() - 100
     assert await plugin._forward("b", PluginSession.ping) == {}
     assert "b" in plugin._sessions
@@ -834,7 +835,7 @@ def _sid_request(sid):
 async def test_touch_session_counts_as_access_only():
     plugin = _fresh_plugin()
     plugin.session_ttl = 60
-    await plugin.register_session(_owned_request({"sid": "s1"}, "epB"))
+    await plugin.register_session(_owned_request({"sid": "s1"}))
     plugin._records["s1"].last_access = time.time() - 50
     assert await plugin.touch_session(_sid_request("s1")) == {}
     assert time.time() - plugin._records["s1"].last_access < 5
@@ -863,7 +864,7 @@ async def test_sid_routes_count_as_access_without_reviving():
         seen.append(request.path_params['sid'])
         return {}
     handler = plugin._accessing(direct)
-    await plugin.register_session(_owned_request({"sid": "s1"}, "epB"))
+    await plugin.register_session(_owned_request({"sid": "s1"}))
 
     plugin._records["s1"].last_access = time.time() - 50
     await handler(_sid_request("s1"))
@@ -874,6 +875,77 @@ async def test_sid_routes_count_as_access_without_reviving():
     assert time.time() - plugin._records["s1"].last_access > 60
     await handler(_sid_request("unknown"))                  # no record: ok
     assert seen == ["s1", "s1", "unknown"]
+
+
+@pytest.mark.asyncio
+async def test_idle_expiry_is_explained_in_log_and_later_410(caplog):
+    '''An owner-less idle expiry logs a WARNING naming the likely misuse and
+    the issue tracker; later requests get 410 with that text, not 404.'''
+    from radical.orbit import plugin_base as pb
+    plugin = _fresh_plugin()
+    plugin.session_ttl = 60
+    await plugin.register_session(_owned_request({"sid": "s1"}))
+    plugin._records["s1"].last_access = time.time() - 100
+    with caplog.at_level(logging.WARNING, logger="radical.orbit"):
+        assert await plugin._cleanup_expired_sessions() == 1
+    msg = caplog.records[-1].getMessage()
+    assert caplog.records[-1].levelno == logging.WARNING
+    assert "s1" in msg and "close()" in msg and pb.ISSUES_URL in msg
+
+    with pytest.raises(HTTPException) as exc:         # via _forward
+        await plugin._forward("s1", PluginSession.ping)
+    assert exc.value.status_code == 410 and exc.value.detail == msg
+
+    async def direct(request):                        # direct-lookup plugin
+        return {}
+    with pytest.raises(HTTPException) as exc:
+        await plugin._accessing(direct)(_sid_request("s1"))
+    assert exc.value.status_code == 410
+
+    await plugin.register_session(_owned_request({"sid": "s1"}))
+    assert await plugin._forward("s1", PluginSession.ping) == {}  # live again
+
+
+@pytest.mark.asyncio
+async def test_owner_loss_expiry_is_not_called_misuse(caplog):
+    plugin = _fresh_plugin()
+    await plugin.register_session(_owned_request({"sid": "b"}, "epB"))
+    await plugin.on_topology_change({"epB": {"liveness": "lost"}})
+    plugin._records["b"].drain_deadline = time.time() - 1
+    with caplog.at_level(logging.INFO, logger="radical.orbit"):
+        assert await plugin._cleanup_expired_sessions() == 1
+    msg = caplog.records[-1].getMessage()
+    assert caplog.records[-1].levelno == logging.INFO
+    assert "declared lost" in msg and "misuse" not in msg
+
+
+@pytest.mark.asyncio
+async def test_connected_idle_owner_is_warned_once_not_reaped(caplog):
+    from radical.orbit import plugin_base as pb
+    plugin = _fresh_plugin()
+    await plugin.register_session(_owned_request({"sid": "b"}, "epB"))
+    plugin._records["b"].last_access = time.time() - pb.LEAK_WARN_SEC - 1
+    with caplog.at_level(logging.WARNING, logger="radical.orbit"):
+        assert await plugin._cleanup_expired_sessions() == 0
+        assert await plugin._cleanup_expired_sessions() == 0
+    leaks = [r for r in caplog.records if "possible session leak" in
+             r.getMessage()]
+    assert len(leaks) == 1                             # once per idle stretch
+    assert "close()" in leaks[0].getMessage()
+    assert "b" in plugin._sessions                     # not reclaimed
+
+
+def test_expired_record_is_bounded():
+    from radical.orbit import plugin_base as pb
+    plugin = _fresh_plugin()
+    for i in range(pb.EXPIRED_KEEP + 5):
+        plugin._expired[f"s{i}"] = (time.time(), "x")
+        plugin._expired.move_to_end(f"s{i}")
+        while len(plugin._expired) > pb.EXPIRED_KEEP:
+            plugin._expired.popitem(last=False)
+    assert len(plugin._expired) == pb.EXPIRED_KEEP
+    plugin._expired["old"] = (time.time() - pb.EXPIRED_KEEP_S - 1, "x")
+    assert plugin._expired_detail("old") is None and "old" not in plugin._expired
 
 
 @pytest.mark.asyncio
@@ -895,7 +967,7 @@ async def test_failing_is_busy_keeps_the_session():
 async def test_session_ttl_zero_disables_idle_expiry():
     plugin = _fresh_plugin()
     plugin.session_ttl = 0
-    await plugin.register_session(_owned_request({"sid": "bound"}, "epB"))
+    await plugin.register_session(_owned_request({"sid": "bound"}))
     plugin._records["bound"].last_access = time.time() - 10 ** 6
     assert await plugin._cleanup_expired_sessions() == 0
 

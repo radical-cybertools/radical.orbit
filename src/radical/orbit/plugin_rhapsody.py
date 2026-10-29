@@ -1394,10 +1394,7 @@ class RhapsodyClient(PluginClient):
         del t['_return_value_encoding']
 
     def register_session(self, backends: list[str] | None = None,
-                         init_timeout: float = 120,
-                         sid: str | None = None,
-                         lifetime: str | None = None,
-                         ttl: float | None = None):
+                         init_timeout: float = 120):
         """
         Register a session, optionally specifying backend names.
 
@@ -1411,11 +1408,6 @@ class RhapsodyClient(PluginClient):
             backends: List of backend names (e.g. ``['dragon_v3']``).
                       Defaults to ``['dragon_v3']`` on the server side.
             init_timeout: Seconds to wait for session init (default 120).
-            sid, lifetime, ttl: Session policy, as for
-                      :meth:`PluginClient.register_session`.  An ephemeral
-                      session expires after the plugin's idle timeout once
-                      no task is running; pass ``lifetime='ttl'`` with a
-                      ``ttl`` to keep it through longer idle phases.
         """
         has_sse = (self._bc is not None and
                    self._endpoint_id is not None and
@@ -1440,7 +1432,7 @@ class RhapsodyClient(PluginClient):
             self.register_notification_callback(_on_session_status,
                                                 topic="session_status")
 
-        payload = self._session_payload(sid, lifetime, ttl) or {}
+        payload = {}
         if backends:
             payload['backends'] = backends
         resp = self._http.post(self._url('register_session'), json=payload)
