@@ -1242,7 +1242,8 @@ class PluginTaskDispatcher(Plugin):
         Scan ``<state_root>/<sid>/<pool>__<endpoint>/state.json``, reload each
         pool's config, and re-materialise its :class:`PoolState` (which loads
         the pilot/task maps).  Owner reconnection then reconciles naturally; a
-        pool whose owner never returns is drained by the idle-expiry path.
+        pool whose owner never returns stays dormant (housekeeping ticks only
+        pools of live sessions).
         '''
         if not self._state_root.exists():
             return
@@ -1454,6 +1455,11 @@ class PluginTaskDispatcher(Plugin):
         *register_kwargs* to ``register_session``, and caches the client
         under *key*.  Returns ``None`` when no caller is wired or *dst* /
         its *plugin* is unreachable.
+
+        The session never idle-expires (``ttl=0``): the client stays cached
+        across arbitrarily long idle phases of the pools that use it.  It is
+        bounded by its endpoint -- a pilot's child endpoint ends with its
+        batch job, and the cache entry is dropped when *dst* is lost.
         '''
         if self._broker_caller is None:
             return None
@@ -1462,7 +1468,7 @@ class PluginTaskDispatcher(Plugin):
             return client
         client = self._make_child_client(cls, plugin, dst)
         try:
-            await asyncio.to_thread(client.register_session,
+            await asyncio.to_thread(client.register_session, ttl=0,
                                     **register_kwargs)
         except Exception as e:
             log.warning('[%s] %s session unavailable on %s: %s',

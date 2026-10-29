@@ -534,7 +534,7 @@ class Plugin(object):
             data = {}
 
         owner              = self._request_owner(request)
-        sid, lifetime, ttl = self._normalize_session_policy(data)
+        sid, lifetime, ttl = await self._normalize_session_policy(data)
         sid = await self._open_session(sid, lifetime, ttl, owner)
         return {"sid": sid}
 
@@ -557,7 +557,7 @@ class Plugin(object):
             return None
         return owner if isinstance(owner, str) and owner else None
 
-    def _normalize_session_policy(self, data: Dict[str, Any]) -> tuple:
+    async def _normalize_session_policy(self, data: Dict[str, Any]) -> tuple:
         """Validate the session-policy fields of a register_session body.
 
         Returns the normalized ``(sid, lifetime, ttl)`` triple; ``sid`` may be
@@ -565,7 +565,8 @@ class Plugin(object):
         ``persistent``, ``> 0`` -> ``ttl``; otherwise ``lifetime`` decides
         (``ephemeral``: the plugin default).  The reserved ``default`` session
         is special-cased *before* lifetime validation.  Every register path
-        (base and plugin overrides) calls this, so an ended ``sid`` is refused
+        (base and plugin overrides) calls this, so an ended ``sid`` -- also one
+        past its deadline that the sweep has not reached yet -- is refused
         here for all of them.
 
         Raises:
@@ -577,6 +578,9 @@ class Plugin(object):
         lifetime = data.get('lifetime', 'ephemeral')
         ttl      = data.get('ttl')
 
+        rec = self._records.get(sid) if sid is not None else None
+        if rec is not None:
+            await self._expire_if_due(sid, rec, time.time())
         if sid is not None and sid not in self._records:
             text = self._ended_detail(sid)
             if text:

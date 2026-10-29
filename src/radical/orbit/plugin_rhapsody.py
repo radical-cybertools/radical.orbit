@@ -1387,7 +1387,9 @@ class RhapsodyClient(PluginClient):
         del t['_return_value_encoding']
 
     def register_session(self, backends: list[str] | None = None,
-                         init_timeout: float = 120):
+                         init_timeout: float = 120,
+                         sid: str | None = None,
+                         ttl: float | None = None):
         """
         Register a session, optionally specifying backend names.
 
@@ -1401,6 +1403,11 @@ class RhapsodyClient(PluginClient):
             backends: List of backend names (e.g. ``['dragon_v3']``).
                       Defaults to ``['dragon_v3']`` on the server side.
             init_timeout: Seconds to wait for session init (default 120).
+            sid:      Reconnect to (or create) this session id; any client
+                      holding a sid can reconnect to it.
+            ttl:      Idle timeout in seconds, fixed at creation (``0``:
+                      never expires); default: the plugin's (900 s).  Set it
+                      for sessions reconnected to after long idle phases.
         """
         has_sse = (self._bc is not None and
                    self._endpoint_id is not None and
@@ -1425,7 +1432,7 @@ class RhapsodyClient(PluginClient):
             self.register_notification_callback(_on_session_status,
                                                 topic="session_status")
 
-        payload = {}
+        payload = self._session_payload(sid, None, ttl) or {}
         if backends:
             payload['backends'] = backends
         resp = self._http.post(self._url('register_session'), json=payload)
@@ -1947,7 +1954,7 @@ class PluginRhapsody(Plugin):
                 detail="'backends' must be a list of backend names")
 
         owner              = self._request_owner(request)
-        sid, lifetime, ttl = self._normalize_session_policy(data)
+        sid, lifetime, ttl = await self._normalize_session_policy(data)
         backend_names      = self._backend_names(backends)
 
         self._ensure_cleanup_task()

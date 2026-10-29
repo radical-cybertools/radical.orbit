@@ -234,8 +234,13 @@ async function connect(page, api, silent = false) {
       method: 'POST',
       body  : JSON.stringify(payload),
     });
-    // the previous session (and its credential) is no longer kept alive
-    if (state[endpoint].sid) api.releaseSession?.(state[endpoint].sid);
+    // release the previous session and its credential: the panel drops it
+    const old = state[endpoint].sid;
+    if (old && old !== data.sid) {
+      api.releaseSession?.(old);
+      api.fetch(`unregister_session/${old}`, {method: 'POST', background: true})
+         .catch(() => {});
+    }
     state[endpoint].sid = data.sid;
     api.keepSession?.(data.sid);    // keep it (and its credential) while open
 

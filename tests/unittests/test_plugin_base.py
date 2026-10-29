@@ -375,11 +375,11 @@ async def test_session_create_or_reconnect():
     obj = plugin._sessions["s1"]
 
     # Reconnect: same sid returned, last_access bumped, session not rebuilt
-    plugin._session_last_access["s1"] = 0.0
+    plugin._session_last_access["s1"] = time.time() - 10
     data = await plugin.register_session(_body_request({"sid": "s1"}))
     assert data['sid'] == "s1"
     assert plugin._sessions["s1"] is obj              # not rebuilt
-    assert plugin._session_last_access["s1"] > 0.0    # bumped
+    assert time.time() - plugin._session_last_access["s1"] < 5   # bumped
 
 
 @pytest.mark.asyncio
@@ -896,3 +896,17 @@ if __name__ == '__main__':
 
 
 
+
+
+@pytest.mark.asyncio
+async def test_reconnect_past_the_deadline_answers_410_before_the_sweep():
+    '''A reconnect must not revive a session whose timeout has passed but
+    which the sweep has not reached yet.'''
+    plugin = _fresh_plugin()
+    plugin.session_ttl = 60
+    await plugin.register_session(_owned_request({"sid": "s1"}))
+    plugin._records["s1"].last_access = time.time() - 100
+    with pytest.raises(HTTPException) as exc:
+        await plugin.register_session(_owned_request({"sid": "s1"}))
+    assert exc.value.status_code == 410
+    assert "s1" not in plugin._sessions

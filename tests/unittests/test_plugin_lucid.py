@@ -213,8 +213,10 @@ def test_run_success(tmp_path):
     assert [p.split('/')[-1] for p in st['images']] == \
            ['montage.png', 'cell_00.png', 'cell_01.png']
     assert rt.kwargs['globus'] == {'refresh_token': 'rt',
-                                   'client_id': lf.GLOBUS_CLIENT_ID}
-    assert rt.kwargs['rhapsody'] == {'backends': ['dragon_v3']}
+                                   'client_id': lf.GLOBUS_CLIENT_ID,
+                                   'ttl': lf.SESSION_TTL}
+    assert rt.kwargs['rhapsody'] == {'backends': ['dragon_v3'],
+                                     'ttl': lf.SESSION_TTL}
     assert all(c.closed for c in rt.clients.values())
     assert updates and updates[-1]['finished']
 

@@ -44,6 +44,11 @@ GLOBUS_CLIENT_ID = '8b84fc2d-49e9-49ea-b54d-b3a29a70cf31'  # get_globus_token.py
 TOKEN_FILE       = '~/.globus/auth_tokens.json'
 CP_IMAGE         = 'docker:cellprofiler/cellprofiler:4.2.6'
 
+# Idle timeout of the run's endpoint sessions (s).  They are opened up front
+# and some idle while others work (rhapsody and staging during stage-in), so
+# the plugins' 900 s default is too short; a run closes them when it ends.
+SESSION_TTL      = 4 * 3600
+
 DEFAULTS = {
     'collection'   : LUCID_COLLECTION,
     'pipeline_path': '/example_pipeline/',
@@ -362,12 +367,15 @@ class LucidRun:
         try:
             globus = self._rt.get_plugin(self._endpoint, 'globus',
                                          refresh_token=self._refresh,
-                                         client_id=GLOBUS_CLIENT_ID)
+                                         client_id=GLOBUS_CLIENT_ID,
+                                         ttl=SESSION_TTL)
             sessions.append(globus)
             rh     = self._rt.get_plugin(self._endpoint, 'rhapsody',
-                                         backends=[self._backend])
+                                         backends=[self._backend],
+                                         ttl=SESSION_TTL)
             sessions.append(rh)
-            stage  = self._rt.get_plugin(self._endpoint, 'staging')
+            stage  = self._rt.get_plugin(self._endpoint, 'staging',
+                                         ttl=SESSION_TTL)
             sessions.append(stage)
 
             for phase, func in (('preflight', self._preflight),

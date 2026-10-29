@@ -790,6 +790,16 @@ class TestPilotSubmitTransport:
         assert asyncio.run(plugin._get_psij_client('someone')) is None
         assert asyncio.run(plugin._get_rhapsody_client('someone')) is None
 
+    def test_child_sessions_never_idle_expire(self, tmp_path):
+        """Child sessions are cached across arbitrarily long pool idle
+        phases, so they are registered with ttl=0."""
+        _, plugin = _make_plugin(tmp_path, broker_caller=MagicMock())
+        client = MagicMock()
+        with patch.object(plugin, '_make_child_client', return_value=client):
+            got = asyncio.run(plugin._get_psij_client('ep'))
+        assert got is client
+        assert client.register_session.call_args.kwargs['ttl'] == 0
+
 
 # ---------------------------------------------------------------------------
 # Endpoint-mode submit (transparent proxy to a target endpoint's rhapsody)

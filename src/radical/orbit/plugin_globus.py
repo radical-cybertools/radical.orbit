@@ -82,6 +82,10 @@ GLOBUS_TERMINAL = {'SUCCEEDED', 'FAILED', 'CANCELED', 'CANCELLED'}
 # (e.g. an expired credential) is not terminal but needs intervention.
 GLOBUS_WAIT_DONE = GLOBUS_TERMINAL | {'INACTIVE'}
 
+# A transfer whose status could not be fetched for this long (seconds; e.g.
+# an expired access token) no longer keeps its session busy.
+GLOBUS_STALE_STATUS = 1800
+
 # Local-collection config file (lowest-priority auto-detection source).
 GLOBUS_CONFIG_FILE = '~/.radical/orbit/globus.json'
 
@@ -341,7 +345,8 @@ class GlobusSession(PluginSession):
                 status_code=502,
                 detail='Globus submit_transfer: missing task_id in response')
 
-        self._tasks[task_id] = {'status': 'ACTIVE', 'label': label or ''}
+        self._tasks[task_id] = {'status': 'ACTIVE', 'label': label or '',
+                                'seen': time.time()}
         self._start_polling()
 
         log.info('[globus] session %s: submitted transfer %s (%s -> %s)',
@@ -432,7 +437,8 @@ class GlobusSession(PluginSession):
             self._tc.submit_delete, ddata, context='submit_delete'))
         task_id = res.get('task_id')
         if task_id:
-            self._tasks[task_id] = {'status': 'ACTIVE', 'label': label or ''}
+            self._tasks[task_id] = {'status': 'ACTIVE', 'label': label or '',
+                                    'seen': time.time()}
             self._start_polling()
         return {'task_id'      : task_id,
                 'submission_id': res.get('submission_id'),
@@ -524,8 +530,12 @@ class GlobusSession(PluginSession):
         """Probed at the idle deadline: busy while a transfer is not yet
         reported terminal.  INACTIVE does not count: it waits on a human
         (consent, expired credential) and must not pin the session and its
-        credential."""
+        credential -- nor does a transfer whose status has not been fetched
+        for ``GLOBUS_STALE_STATUS`` (e.g. the poll fails on an expired
+        token)."""
+        cutoff = time.time() - GLOBUS_STALE_STATUS
         return any(meta.get('notified') not in GLOBUS_WAIT_DONE
+                   and meta.get('seen', 0) > cutoff
                    for meta in list(self._tasks.values()))
 
     def _start_polling(self) -> None:
@@ -590,6 +600,7 @@ class GlobusSession(PluginSession):
         status = res.get('status')
         if not status:
             return
+        meta['seen'] = time.time()
         if meta.get('status') in GLOBUS_TERMINAL \
                 and status not in GLOBUS_TERMINAL:
             return
@@ -629,7 +640,8 @@ class GlobusClient(PluginClient):
                          refresh_token: Optional[str]    = None,
                          client_id: Optional[str]        = None,
                          local_collection: Optional[str] = None,
-                         new_session: bool               = False) -> None:
+                         new_session: bool               = False,
+                         ttl: Optional[float]            = None) -> None:
         '''Register a Globus session.
 
         Supply either ``access_token`` or ``refresh_token`` + ``client_id``.
@@ -640,7 +652,9 @@ class GlobusClient(PluginClient):
         reason); ``new_session=True`` registers a new one -- also the way to
         switch Globus identity, which rotation does not support.  The old
         session is not released (it may be shared); call
-        ``unregister_session()`` first to release it.
+        ``unregister_session()`` first to release it.  ``ttl`` is the idle
+        timeout in seconds of a new session (``0``: never expires; ignored
+        on rotation).
         '''
         payload: Dict[str, Any] = {}
         if self._sid and not new_session:
@@ -649,6 +663,7 @@ class GlobusClient(PluginClient):
         if refresh_token:    payload['refresh_token']    = refresh_token
         if client_id:        payload['client_id']        = client_id
         if local_collection: payload['local_collection'] = local_collection
+        if ttl is not None:  payload['ttl']              = ttl
 
         resp = self._http.post(self._url('register_session'), json=payload)
         self._raise(resp)
@@ -906,7 +921,7 @@ class PluginGlobus(Plugin):
 
         self._ensure_cleanup_task()
         owner              = self._request_owner(request)
-        sid, lifetime, ttl = self._normalize_session_policy(data)
+        sid, lifetime, ttl = await self._normalize_session_policy(data)
         rotating = False
         if sid is None:
             sid = f'session.{uuid.uuid4().hex[:8]}'

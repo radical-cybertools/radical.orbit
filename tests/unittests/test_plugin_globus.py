@@ -645,6 +645,7 @@ async def test_poller_drops_result_after_terminal_notification():
     session._tasks['t1'] = meta
     session._tc.get_task.return_value = {'task_id': 't1', 'status': 'FAILED'}
     assert await session._fetch_task_status('t1', meta) is not None
+    meta.pop('seen')
     assert meta == {'status': 'FAILED', 'notified': 'FAILED', 'label': ''}
 
     await session.get_task('t1')                # a later client poll
@@ -657,6 +658,7 @@ async def test_cache_keeps_result_only_for_terminal():
     session._tasks['t1'] = {'status': 'ACTIVE', 'label': ''}
     session._tc.get_task.return_value = {'task_id': 't1', 'status': 'INACTIVE'}
     await session.get_task('t1')
+    session._tasks['t1'].pop('seen')
     assert session._tasks['t1'] == {'status': 'INACTIVE', 'label': ''}
 
     session._tc.get_task.return_value = {'task_id': 't1', 'status': 'FAILED'}
@@ -1415,11 +1417,26 @@ async def test_globus_is_busy_until_a_transfer_is_reported_done():
     session = GlobusSession('s1', access_token='tok')
     try:
         assert session.is_busy() is False
-        session._tasks['t1'] = {'notified': 'ACTIVE'}
+        session._tasks['t1'] = {'notified': 'ACTIVE', 'seen': time.time()}
         assert session.is_busy() is True
         session._tasks['t1'] = {'notified': 'INACTIVE'}
         assert session.is_busy() is False
         session._tasks['t1'] = {'notified': 'SUCCEEDED'}
+        assert session.is_busy() is False
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_globus_stale_status_does_not_keep_the_session_busy(monkeypatch):
+    '''A transfer whose status has not been fetched for GLOBUS_STALE_STATUS
+    (e.g. the poll fails on an expired token) does not pin the session.'''
+    pytest.importorskip('globus_sdk')
+    session = GlobusSession('s1', access_token='tok')
+    try:
+        session._tasks['t1'] = {'notified': 'ACTIVE', 'seen': time.time()}
+        assert session.is_busy() is True
+        session._tasks['t1']['seen'] = time.time() - pg.GLOBUS_STALE_STATUS - 1
         assert session.is_busy() is False
     finally:
         await session.close()
