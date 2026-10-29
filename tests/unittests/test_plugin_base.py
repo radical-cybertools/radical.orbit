@@ -929,3 +929,15 @@ async def test_reconnect_past_the_deadline_answers_410_before_the_sweep():
         await plugin.register_session(_owned_request({"sid": "s1"}))
     assert exc.value.status_code == 410
     assert "s1" not in plugin._sessions
+
+
+@pytest.mark.asyncio
+async def test_malformed_register_does_not_end_a_session():
+    plugin = _fresh_plugin()
+    plugin.session_ttl = 60
+    await plugin.register_session(_owned_request({"sid": "s1"}))
+    plugin._records["s1"].last_access = time.time() - 100
+    with pytest.raises(HTTPException) as exc:
+        await plugin.register_session(_owned_request({"sid": "s1", "ttl": -1}))
+    assert exc.value.status_code == 409
+    assert "s1" in plugin._sessions

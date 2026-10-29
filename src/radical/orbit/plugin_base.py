@@ -585,17 +585,24 @@ class Plugin(object):
                 or an unknown lifetime.
             HTTPException 410: ``sid`` names a session that has ended.
         """
-        sid      = data.get('sid')
-        lifetime = data.get('lifetime', 'ephemeral')
-        ttl      = data.get('ttl')
-
-        rec = self._records.get(sid) if sid is not None else None
+        policy = self._validate_session_policy(data)     # 409 first
+        sid    = policy[0]
+        rec    = self._records.get(sid) if sid is not None else None
         if rec is not None:
             await self._expire_if_due(sid, rec, time.time())
         if sid is not None and sid not in self._records:
             text = self._ended_detail(sid)
             if text:
                 raise HTTPException(status_code=410, detail=text)
+        return policy
+
+    @staticmethod
+    def _validate_session_policy(data: Dict[str, Any]) -> tuple:
+        """The validation half of :meth:`_normalize_session_policy`: no side
+        effects, so a malformed request never ends a session."""
+        sid      = data.get('sid')
+        lifetime = data.get('lifetime', 'ephemeral')
+        ttl      = data.get('ttl')
 
         if sid == DEFAULT_SID:
             if 'lifetime' in data and data['lifetime'] != 'persistent':
