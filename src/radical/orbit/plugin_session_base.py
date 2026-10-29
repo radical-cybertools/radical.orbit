@@ -69,6 +69,11 @@ class PluginSession:
         """Return whether the session is active."""
         return self._active
 
+    async def ping(self) -> dict:
+        """No-op session call: ``touch/{sid}`` forwards it to count as an
+        access without any other effect."""
+        return {}
+
     def is_busy(self) -> bool:
         """Return whether the session has work in flight.
 

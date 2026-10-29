@@ -43,7 +43,7 @@ async def test_xgfabric_busy_while_its_workflow_runs():
     assert not XGFabricSession.is_busy(s)
 
 
-def test_dispatcher_busy_while_a_pool_has_live_pilots_or_tasks():
+def test_dispatcher_busy_while_a_pool_has_unfinished_tasks():
     def rec(terminal):
         return SimpleNamespace(is_terminal=lambda: terminal)
     pool   = SimpleNamespace(pilots={'p': rec(True)}, tasks={'t': rec(False)})
@@ -52,8 +52,8 @@ def test_dispatcher_busy_while_a_pool_has_live_pilots_or_tasks():
     assert TaskDispatcherSession.is_busy(s)
     pool.tasks['t'] = rec(True)
     assert not TaskDispatcherSession.is_busy(s)
-    pool.pilots['p2'] = rec(False)
-    assert TaskDispatcherSession.is_busy(s)
+    pool.pilots['p2'] = rec(False)          # a live pilot alone: not busy
+    assert not TaskDispatcherSession.is_busy(s)
     assert not TaskDispatcherSession.is_busy(
         SimpleNamespace(_plugin=plugin, _sid='other'))
 
@@ -177,3 +177,41 @@ async def test_dispatcher_second_stale_caller_retries_on_the_fresh_session():
     assert await PluginTaskDispatcher._call_child(
         d, stale, 'submit_tasks', ['t'], retry=True) == ['t']
     assert d._child_clients[key] is fresh             # not evicted by B
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_touches_child_sessions_and_evicts_gone_ones():
+    from radical.orbit.plugin_task_dispatcher import PluginTaskDispatcher
+
+    class Client:
+        def __init__(self, key, fail=None):
+            self._orbit_cache_key, self.fail, self.touched = key, fail, 0
+
+        def touch(self):
+            self.touched += 1
+            if self.fail:
+                raise self.fail
+
+    live = Client(('a', 'rhapsody', None))
+    gone = Client(('b', 'psij', None), _err(410, 'session expired: s2'))
+    d = SimpleNamespace(_child_clients={live._orbit_cache_key: live,
+                                        gone._orbit_cache_key: gone},
+                        instance_name='td')
+    d._call_child = lambda c, m, *a, **k: PluginTaskDispatcher._call_child(
+        d, c, m, *a, **k)
+    await PluginTaskDispatcher._touch_child_sessions(d)
+    assert live.touched == gone.touched == 1
+    assert list(d._child_clients) == [live._orbit_cache_key]
+
+
+def test_client_touch_uses_the_touch_route():
+    from unittest.mock import MagicMock
+    from radical.orbit.client import PluginClient
+    http = MagicMock()
+    http.post.return_value = MagicMock(status_code=200, is_error=False)
+    c = PluginClient(http, '/psij')
+    c._sid = 'sid.1'
+    c.touch()
+    url = http.post.call_args.args[0]
+    assert url.endswith('/psij/touch/sid.1')
+    assert 'json' not in http.post.call_args.kwargs

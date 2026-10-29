@@ -801,6 +801,49 @@ async def test_busy_session_still_reclaimed_on_owner_loss():
     assert await plugin._cleanup_expired_sessions() == 1
 
 
+def _sid_request(sid):
+    request = Mock(spec=Request)
+    request.path_params = {'sid': sid}
+    request.headers     = {}
+    return request
+
+
+@pytest.mark.asyncio
+async def test_touch_session_counts_as_access_only():
+    plugin = _fresh_plugin()
+    plugin.session_ttl = 60
+    await plugin.register_session(_owned_request({"sid": "s1"}, "epB"))
+    plugin._records["s1"].last_access = time.time() - 50
+    assert await plugin.touch_session(_sid_request("s1")) == {}
+    assert time.time() - plugin._records["s1"].last_access < 5
+
+    with pytest.raises(HTTPException) as exc:     # unknown: not created
+        await plugin.touch_session(_sid_request("nope"))
+    assert exc.value.status_code == 404
+    assert "nope" not in plugin._sessions
+
+    plugin._records["s1"].last_access = time.time() - 61
+    with pytest.raises(HTTPException) as exc:     # expired: not revived
+        await plugin.touch_session(_sid_request("s1"))
+    assert exc.value.status_code == 410
+    assert "s1" not in plugin._sessions
+
+
+@pytest.mark.asyncio
+async def test_failing_is_busy_keeps_the_session():
+    plugin = _fresh_plugin()
+
+    class Broken(PluginSession):
+        def is_busy(self):
+            raise RuntimeError('probe broke')
+    plugin.session_class = Broken
+    plugin.session_ttl   = 1
+    await plugin.register_session(_owned_request({"sid": "b"}))
+    plugin._records["b"].last_access = time.time() - 100
+    assert await plugin._cleanup_expired_sessions() == 0
+    assert "b" in plugin._sessions
+
+
 @pytest.mark.asyncio
 async def test_session_ttl_zero_disables_idle_expiry():
     plugin = _fresh_plugin()

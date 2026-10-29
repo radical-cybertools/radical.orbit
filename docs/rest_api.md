@@ -92,6 +92,7 @@ Every plugin automatically registers these routes under its namespace
 | `POST` | `register_session` | Create or reconnect to a session. Body (optional):
 `{sid, lifetime, ttl}`. Returns `{"sid": "<session_id>"}`. |
 | `POST` | `unregister_session/{sid}` | Close and remove a session. Returns `{"ok": true}` |
+| `POST` | `touch/{sid}` | Count as an access so the session does not idle-expire; no other effect (404 unknown, 410 expired). Returns `{}` |
 | `GET` | `version` | Plugin version. Returns `{"version": "x.y.z"}` |
 | `GET` | `list_sessions` | Active session IDs. Returns `{"sessions": [...]}` |
 | `GET` | `health` | Health check. Returns status, uptime, active session count |

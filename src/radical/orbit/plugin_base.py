@@ -285,6 +285,7 @@ class Plugin(object):
         # Built-in session management routes
         self.add_route_post('register_session', self.register_session)
         self.add_route_post('unregister_session/{sid}', self.unregister_session)
+        self.add_route_post('touch/{sid}', self.touch_session)
         self.add_route_get('version', self.get_version)
         self.add_route_get('list_sessions', self.list_sessions)
         self.add_route_get('health', self.health_check)
@@ -664,6 +665,15 @@ class Plugin(object):
         log.info("[%s] Unregistered session %s", self.instance_name, sid)
         return {"ok": True}
 
+    async def touch_session(self, request: Request) -> dict:
+        """Mark a session as used, so it does not idle-expire.
+
+        No other effect: an unknown session answers 404 and an expired one
+        410 (it is dropped), exactly like any other session route.
+        """
+        return await self._forward(request.path_params['sid'],
+                                   PluginSession.ping)
+
     async def get_version(self, request: Request) -> dict:
         """Return the plugin version."""
         return {"version": self.version}
@@ -888,9 +898,10 @@ class Plugin(object):
                 try:
                     busy = session is not None and session.is_busy()
                 except Exception as e:
-                    log.warning("[%s] is_busy of session %s failed: %s",
-                                self.instance_name, sid, e)
-                    busy = False
+                    # never reap work in flight over a broken probe
+                    log.warning("[%s] is_busy of session %s failed (kept "
+                                "as busy): %s", self.instance_name, sid, e)
+                    busy = True
                 if busy:
                     # work in flight counts as access; owner-loss drain
                     # still applies below

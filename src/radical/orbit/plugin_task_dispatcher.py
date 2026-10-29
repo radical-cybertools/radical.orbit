@@ -93,6 +93,7 @@ _PRUNE_INTERVAL_SEC  = 86400.0   # stale-dir pruning: once a day
 
 # Housekeeping tick frequency.
 _TICK_INTERVAL_SEC = 5.0
+_CHILD_TOUCH_SEC   = 300.0  # keep cached child sessions from idling out
 
 # Handshake timeout — a pilot that hasn't handshaken in this long is
 # reconciled against psij job state.
@@ -746,13 +747,13 @@ class TaskDispatcherSession(PluginSession):
     '''
 
     def is_busy(self) -> bool:
-        '''Busy while one of this session's pools has a live pilot or a
-        non-terminal task: clients follow tasks via notifications.'''
+        '''Busy while one of this session's pools has a non-terminal task:
+        clients follow tasks via notifications.  Live pilots alone do not
+        count -- an abandoned session must not hold its allocations.'''
         pools = (self._plugin._pool_states.get(self._sid)
                  if self._plugin is not None else None) or {}
-        return any(not r.is_terminal()
-                   for ps in pools.values()
-                   for r in (*ps.pilots.values(), *ps.tasks.values()))
+        return any(not t.is_terminal()
+                   for ps in pools.values() for t in ps.tasks.values())
 
     async def close(self) -> dict:
         '''Tear down this session's pools, then run the base close.'''
@@ -1344,10 +1345,14 @@ class PluginTaskDispatcher(Plugin):
         exception to it.
         '''
         last_prune = time.time()
+        last_touch = time.time()
         while True:
             try:
                 await asyncio.sleep(_TICK_INTERVAL_SEC)
                 now = time.time()
+                if now - last_touch >= _CHILD_TOUCH_SEC:
+                    last_touch = now
+                    await self._touch_child_sessions()
                 for ps in list(self._all_pools()):
                     if ps.owning_sid not in self._sessions:
                         continue                 # replayed, owner-less pool
@@ -1362,6 +1367,19 @@ class PluginTaskDispatcher(Plugin):
             except Exception as e:
                 log.exception('[%s] housekeeping error: %s',
                               self.instance_name, e)
+
+    async def _touch_child_sessions(self) -> None:
+        '''Keep the cached child sessions from idle-expiring on their
+        endpoints while this dispatcher runs: they hold endpoint-mode task
+        results and pilots' backends between bursts.  A session that is
+        gone is evicted (``_call_child``); after a broker restart nothing
+        touches them and the endpoints reclaim them.'''
+        for client in list(self._child_clients.values()):
+            try:
+                await self._call_child(client, 'touch')
+            except Exception as e:
+                log.debug('[%s] child session touch failed: %s',
+                          self.instance_name, e)
 
     async def shutdown(self) -> None:
         '''Cancel the housekeeping loop and drop the event tap, then base close.'''
@@ -2530,6 +2548,8 @@ class PluginTaskDispatcher(Plugin):
                 # reconnecting one re-registers fresh.
                 for key in [k for k in self._child_clients if k[0] == name]:
                     self._child_clients.pop(key, None)
+                for key in [k for k in self._child_locks if k[0] == name]:
+                    self._child_locks.pop(key, None)
                 continue
             plugins = (info or {}).get('plugins', {})
             if isinstance(plugins, dict):
@@ -3262,17 +3282,17 @@ class PluginTaskDispatcher(Plugin):
                                         Path(task.cwd) / name)
                 elif task.spooled:
                     for name in task.spooled:
-                        await asyncio.to_thread(
-                            stg.put, str(spool / name),
-                            str(Path(task.cwd) / name), True)
+                        await self._call_child(
+                            stg, 'put', str(spool / name),
+                            str(Path(task.cwd) / name), True, retry=True)
                 elif task.task_dict is None:
                     marker = spool / _CWD_MARKER
                     marker.parent.mkdir(parents=True, exist_ok=True)
                     # 1 byte, not 0: older endpoints' staging 400s an empty put
                     marker.write_bytes(b'\n')
-                    await asyncio.to_thread(
-                        stg.put, str(marker),
-                        str(Path(task.cwd) / _CWD_MARKER), True)
+                    await self._call_child(
+                        stg, 'put', str(marker),
+                        str(Path(task.cwd) / _CWD_MARKER), True, retry=True)
             except Exception as e:
                 log.warning('[%s] input placement failed for task %s: %s',
                             self.instance_name, task.task_id, e)

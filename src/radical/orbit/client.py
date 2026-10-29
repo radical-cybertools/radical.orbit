@@ -175,14 +175,13 @@ class PluginClient:
     def touch(self) -> None:
         """Mark the session as used, so it does not idle-expire.
 
-        Re-registers with the current ``sid``, which the plugin treats as a
-        reconnect (owner- and policy-checked) and an access.  For callers
-        that hold a session through long phases without other requests.
+        Counts as an access and has no other effect; an expired session
+        raises (HTTP 410), it is not re-created.  For callers that hold a
+        session through long phases without other requests.
         """
         if not self._sid:
             raise RuntimeError("no active session")
-        resp = self._http.post(self._url('register_session'),
-                               json={'sid': self._sid})
+        resp = self._http.post(self._url(f'touch/{self._sid}'))
         self._raise(resp)
 
     def unregister_session(self) -> None:
