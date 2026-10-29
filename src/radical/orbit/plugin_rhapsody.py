@@ -343,6 +343,7 @@ class RhapsodySession(PluginSession):
         self._flush_scheduled        = False
         self._notify_window          = NOTIFY_BATCH_WINDOW
         self._notify_batch_bytes     = NOTIFY_BATCH_BYTES
+        self._sid_bytes: int | None  = None
         self._return_value_limit     = RETURN_VALUE_LIMIT
         self._output_notify_limit    = OUTPUT_NOTIFY_LIMIT
 
@@ -705,7 +706,9 @@ class RhapsodySession(PluginSession):
     def _frame_budget(self) -> int:
         """Bytes available for task payloads per frame: ``notify`` adds the
         session id to each frame after the split."""
-        return self._notify_batch_bytes - _payload_size({'sid': self.sid})
+        if self._sid_bytes is None:             # constant for the session
+            self._sid_bytes = _payload_size({'sid': self.sid})
+        return self._notify_batch_bytes - self._sid_bytes
 
     def _split_frames(self, batch: list[dict]) -> list[list[dict]]:
         """Split notifications into frames under ``_notify_batch_bytes``.
