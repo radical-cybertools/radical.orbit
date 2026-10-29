@@ -545,8 +545,8 @@ def test_plugin_session_ttl_default():
     app = FastAPI()
     plugin = Plugin(app, "test_plugin")
 
-    # Default should be 3600 (1 hour)
-    assert plugin.session_ttl == 3600
+    # Default should be 900 (15 minutes)
+    assert plugin.session_ttl == 900
 
 
 @pytest.mark.asyncio
@@ -747,9 +747,9 @@ async def test_owner_return_cancels_drain():
 
 
 @pytest.mark.asyncio
-async def test_owner_bound_ephemeral_not_idle_expired():
-    '''An owner-bound ephemeral session is governed by liveness, not the idle
-    timeout; an owner-less one still idle-expires (old-stack behavior).'''
+async def test_owner_bound_ephemeral_idle_expires():
+    '''Owner-bound and owner-less ephemeral sessions both idle-expire: a
+    present owner that never closes its session must not leak it.'''
     plugin = _fresh_plugin()
     plugin.session_ttl = 1                             # tiny idle timeout
 
@@ -761,9 +761,53 @@ async def test_owner_bound_ephemeral_not_idle_expired():
     plugin._records["free"].last_access  = time.time() - 100
 
     cleaned = await plugin._cleanup_expired_sessions()
-    assert cleaned == 1
-    assert "bound" in plugin._sessions                 # liveness-governed
+    assert cleaned == 2
+    assert "bound" not in plugin._sessions             # idle-expired too
     assert "free" not in plugin._sessions              # idle-expired
+
+
+class _BusySession(PluginSession):
+    busy = True
+
+    def is_busy(self):
+        return self.busy
+
+
+@pytest.mark.asyncio
+async def test_busy_session_is_not_idle_and_clock_starts_when_work_ends():
+    '''A busy session counts as active (its idle clock is refreshed); once
+    work ends it survives the next sweep and expires session_ttl later.'''
+    plugin = _fresh_plugin()
+    plugin.session_class = _BusySession
+    plugin.session_ttl   = 60
+    await plugin.register_session(_owned_request({"sid": "b"}, "epB"))
+    sess = plugin._sessions["b"]
+    plugin._records["b"].last_access = time.time() - 1000
+
+    assert await plugin._cleanup_expired_sessions() == 0     # busy
+    sess.busy = False
+    assert await plugin._cleanup_expired_sessions() == 0     # just went idle
+    plugin._records["b"].last_access = time.time() - 61
+    assert await plugin._cleanup_expired_sessions() == 1
+
+
+@pytest.mark.asyncio
+async def test_busy_session_still_reclaimed_on_owner_loss():
+    plugin = _fresh_plugin()
+    plugin.session_class = _BusySession
+    await plugin.register_session(_owned_request({"sid": "b"}, "epB"))
+    await plugin.on_topology_change({"epB": {"liveness": "lost"}})
+    plugin._records["b"].drain_deadline = time.time() - 1
+    assert await plugin._cleanup_expired_sessions() == 1
+
+
+@pytest.mark.asyncio
+async def test_session_ttl_zero_disables_idle_expiry():
+    plugin = _fresh_plugin()
+    plugin.session_ttl = 0
+    await plugin.register_session(_owned_request({"sid": "bound"}, "epB"))
+    plugin._records["bound"].last_access = time.time() - 10 ** 6
+    assert await plugin._cleanup_expired_sessions() == 0
 
 
 @pytest.mark.asyncio

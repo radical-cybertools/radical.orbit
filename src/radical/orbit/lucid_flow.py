@@ -364,8 +364,12 @@ class LucidRun:
                                          refresh_token=self._refresh,
                                          client_id=GLOBUS_CLIENT_ID)
             sessions.append(globus)
+            # stage-in leaves rhapsody idle for up to GLOBUS_TIMEOUT: outlast
+            # the plugin's idle expiry (closed in `finally` anyway)
             rh     = self._rt.get_plugin(self._endpoint, 'rhapsody',
-                                         backends=[self._backend])
+                                         backends=[self._backend],
+                                         lifetime='ttl',
+                                         ttl=GLOBUS_TIMEOUT + 2 * 3600)
             sessions.append(rh)
             stage  = self._rt.get_plugin(self._endpoint, 'staging')
             sessions.append(stage)

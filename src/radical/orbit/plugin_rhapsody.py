@@ -497,6 +497,12 @@ class RhapsodySession(PluginSession):
             "state": state_str,
         })
 
+    def is_busy(self) -> bool:
+        """Busy while any task is not in a terminal state: a client waiting
+        on ``task_status`` notifications sends no requests."""
+        return any(str(self._get_attr(t, 'state', '')).upper()
+                   not in TERMINAL_STATES for t in self._tasks.values())
+
     def _check_initialized(self) -> None:
         """Check that the session is active and fully initialized.
 
@@ -1380,7 +1386,10 @@ class RhapsodyClient(PluginClient):
         del t['_return_value_encoding']
 
     def register_session(self, backends: list[str] | None = None,
-                         init_timeout: float = 120):
+                         init_timeout: float = 120,
+                         sid: str | None = None,
+                         lifetime: str | None = None,
+                         ttl: float | None = None):
         """
         Register a session, optionally specifying backend names.
 
@@ -1394,6 +1403,11 @@ class RhapsodyClient(PluginClient):
             backends: List of backend names (e.g. ``['dragon_v3']``).
                       Defaults to ``['dragon_v3']`` on the server side.
             init_timeout: Seconds to wait for session init (default 120).
+            sid, lifetime, ttl: Session policy, as for
+                      :meth:`PluginClient.register_session`.  An ephemeral
+                      session expires after the plugin's idle timeout once
+                      no task is running; pass ``lifetime='ttl'`` with a
+                      ``ttl`` to keep it through longer idle phases.
         """
         has_sse = (self._bc is not None and
                    self._endpoint_id is not None and
@@ -1418,7 +1432,7 @@ class RhapsodyClient(PluginClient):
             self.register_notification_callback(_on_session_status,
                                                 topic="session_status")
 
-        payload = {}
+        payload = self._session_payload(sid, lifetime, ttl) or {}
         if backends:
             payload['backends'] = backends
         resp = self._http.post(self._url('register_session'), json=payload)

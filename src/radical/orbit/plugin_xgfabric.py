@@ -228,6 +228,11 @@ class XGFabricSession(PluginSession):
                 return path
         return path.replace('~', self._homedir_cache[endpoint_name], 1)
 
+    def is_busy(self) -> bool:
+        """Busy while a workflow runs (the UI follows it over SSE)."""
+        return self._workflow_task is not None \
+            and not self._workflow_task.done()
+
     def update_connected_endpoints(self, endpoints: Dict[str, Any]):
         """Update the cached list of connected endpoints."""
         log.debug("[XGFabric] Session %s: topology update — %d endpoints: %s",

@@ -532,6 +532,12 @@ class GlobusSession(PluginSession):
 
     # -- background polling -------------------------------------------------
 
+    def is_busy(self) -> bool:
+        """Busy while any transfer has not been reported terminal: clients
+        wait on ``transfer_status`` notifications without polling."""
+        return any(meta.get('notified') not in GLOBUS_TERMINAL
+                   for meta in self._tasks.values())
+
     def _start_polling(self) -> None:
         '''(Re)start the shared status poller for the session's active tasks.'''
         self.start_status_poller(

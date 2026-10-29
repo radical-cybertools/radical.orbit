@@ -154,6 +154,13 @@ class PSIJSession(PluginSession):
         self._cleanup_stale_output()
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
+    def is_busy(self) -> bool:
+        """Busy while any job has not reached a terminal state.  Reaping the
+        session would stop its status polling and remove the running jobs'
+        output dir."""
+        return any(self._job_states.get(j) not in TERMINAL_STATES
+                   for j in self._jobs)
+
     def _effective_state(self, job_id: str, raw_state: str) -> str:
         """Map a psij state to what the caller should see.
 

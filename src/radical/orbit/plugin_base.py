@@ -127,10 +127,19 @@ class Plugin(object):
     ==============  ===========  ========================================
     persistent      any          never (explicit unregister only)
     ttl             any          ``now - last_access > ttl``
-    ephemeral       bound        owner ``lost`` + ``reclaim_drain`` grace
+    ephemeral       bound        idle ``> session_ttl``, or owner ``lost`` +
+                                 ``reclaim_drain`` grace (whichever first)
     ephemeral       owner-less   ``now - last_access > session_ttl`` (idle)
     (record-less)   —            treated as owner-less ephemeral
     ==============  ===========  ========================================
+
+    An ephemeral session whose :meth:`PluginSession.is_busy` reports work in
+    flight (running tasks, jobs, transfers, a workflow) counts as active: the
+    sweep refreshes its ``last_access``, so the idle clock only starts once
+    that work ends.  A client waiting on notifications thus keeps its session
+    without sending requests.  Known limit: work that never reaches a final
+    state (a task or job whose state is never updated again) keeps its
+    session busy, and alive, for good.
 
     Reattach is owner-checked: reconnecting to a session whose recorded owner
     is non-``None`` and differs from the caller is rejected (403); recovery
@@ -162,7 +171,7 @@ class Plugin(object):
     session_class: Optional[Type[PluginSession]] = None
     client_class: Optional[Type] = None
     version: str = '0.0.1'
-    session_ttl: int = 3600  # Default: 1 hour session timeout
+    session_ttl: int = 900  # ephemeral idle timeout (s); 0: no idle expiry
     reclaim_drain: float = 300  # 'lost' owner -> ephemeral-session reclaim grace
     ui_config: Union[Dict, UIConfig, None] = None  # UI configuration for portal
     ui_module: Optional[str] = None  # Absolute path to JS plugin module, or None
@@ -822,20 +831,23 @@ class Plugin(object):
 
         - ``persistent``               -> ``None``.
         - ``ttl``                      -> ``last_access + ttl``.
-        - ``ephemeral`` owner-bound    -> ``drain_deadline`` (``None`` until
-          the owner is declared ``lost``; liveness-governed, never idle).
-        - ``ephemeral`` owner-less     -> ``last_access + session_ttl`` (idle),
-          or ``None`` when ``session_ttl == 0``.
+        - ``ephemeral`` owner-bound    -> the earlier of ``drain_deadline``
+          (set once the owner is declared ``lost``) and the idle deadline.
+        - ``ephemeral`` owner-less     -> the idle deadline.
+
+        The idle deadline is ``last_access + session_ttl``, or ``None`` when
+        ``session_ttl == 0``.
         """
         if record.lifetime == 'persistent':
             return None
         if record.lifetime == 'ttl':
             return record.last_access + record.ttl
-        if record.owner is not None:                       # owner-bound
-            return record.drain_deadline
-        if self.session_ttl > 0:                           # owner-less idle
-            return record.last_access + self.session_ttl
-        return None
+        idle = record.last_access + self.session_ttl \
+               if self.session_ttl > 0 else None
+        if record.owner is not None and record.drain_deadline is not None:
+            return record.drain_deadline if idle is None \
+                   else min(record.drain_deadline, idle)
+        return idle
 
     def _is_expired(self, record: SessionRecord, now: float) -> bool:
         """True once *record* has passed its expiry deadline."""
@@ -869,13 +881,22 @@ class Plugin(object):
             Number of sessions cleaned up.
         """
         now = time.time()
-        expired_sids = [sid for sid, rec in list(self._records.items())
-                        if self._is_expired(rec, now)]
-        for sid in expired_sids:
+        expired = []
+        for sid, rec in list(self._records.items()):
+            if rec.lifetime == 'ephemeral':
+                session = self._sessions.get(sid)
+                if session is not None and session.is_busy():
+                    # work in flight counts as access; owner-loss drain
+                    # still applies below
+                    rec.last_access = now
+            if self._is_expired(rec, now):
+                expired.append((sid, rec))
+        for sid, rec in expired:
             await self._drop_session(sid)
-            log.info("[%s] Cleaned up expired session %s",
-                     self.instance_name, sid)
-        return len(expired_sids)
+            log.info("[%s] Cleaned up expired session %s (lifetime %s, "
+                     "owner %s, idle %.0f s)", self.instance_name, sid,
+                     rec.lifetime, rec.owner, now - rec.last_access)
+        return len(expired)
 
     def _ensure_cleanup_task(self) -> None:
         """Start the background session-cleanup task if not already running."""

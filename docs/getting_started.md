@@ -271,9 +271,10 @@ reflects the broker's snapshot at registration time — so an immediate
 `get_plugin(endpoint, plugin, **session_kwargs)` calls `register_session` for
 you; the plugin helper's `register_session` accepts a lifetime policy:
 
-- `lifetime='ephemeral'` (default) — an owner-bound session, reclaimed a grace
-  period after its owning participant is declared `lost`; an owner-less one
-  (gateway/HTTP caller) falls back to the plugin idle timeout.
+- `lifetime='ephemeral'` (default) — expires after 15 minutes without
+  requests (the plugin idle timeout) unless it has work in flight (running
+  tasks, jobs, transfers); an owner-bound one is also reclaimed a grace
+  period after its owning participant is declared `lost`.
 - `lifetime='ttl', ttl=<seconds>` — expires `ttl` seconds after the last access
   (time-driven; requires a positive `ttl`).
 - `lifetime='persistent'` — never expires; reclaimed only by explicit operator

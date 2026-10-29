@@ -139,7 +139,7 @@ The gateway preserves these HTTP paths for the Explorer and other HTTP clients:
 ### Plugin system
 
 - **Base class**: `src/radical/orbit/plugin_base.py` – provides namespace isolation, session management, route-registration helpers, and notification support.
-- **Session base**: `src/radical/orbit/plugin_session_base.py` – per-client session state management.
+- **Session base**: `src/radical/orbit/plugin_session_base.py` – per-client session state management. Ephemeral sessions (the default) idle-expire after the plugin's `session_ttl` (900 s; `0` disables), owner-bound ones also a `reclaim_drain` after their owner is declared `lost`; a session whose `is_busy()` reports work in flight (rhapsody tasks, psij jobs, globus transfers, xgfabric workflows, task-dispatcher pools) is not idle — the idle clock starts when the work ends.  Work that never reaches a final state keeps its session alive (known limit).  The task dispatcher evicts a cached child session that is gone (410 / 404 "unknown session") and retries submits once on a fresh one.
 - **Client API**: `src/radical/orbit/client.py` – Python client for broker/endpoint interaction with notification callback support.
 
 **Available plugins:**

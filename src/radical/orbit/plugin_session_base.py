@@ -69,6 +69,16 @@ class PluginSession:
         """Return whether the session is active."""
         return self._active
 
+    def is_busy(self) -> bool:
+        """Return whether the session has work in flight.
+
+        The plugin's expiry sweep treats a busy ephemeral session as active,
+        so a client that only waits on notifications is not idle-expired.
+        Override in sessions that run long background work (tasks, jobs,
+        transfers); keep it cheap, it runs every sweep.
+        """
+        return False
+
     def notify(self, topic: str, data: dict) -> None:
         """Send a notification to consumers via the parent plugin.
 

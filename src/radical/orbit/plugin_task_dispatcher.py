@@ -724,6 +724,16 @@ class PoolState:
 # Session — thin identity handle
 # ---------------------------------------------------------------------------
 
+def _child_session_gone(exc: Exception) -> bool:
+    '''True if a child-client error means its session no longer exists:
+    410, or a 404 about the session -- not a 404 about a task or job.'''
+    status = getattr(exc, 'status_code', None)
+    if status == 410:
+        return True
+    return status == 404 and ('unknown session id' in str(exc)
+                              or 'Unknown session' in str(exc))
+
+
 class TaskDispatcherSession(PluginSession):
     '''Session handle — owns this session's pools by lifetime.
 
@@ -734,6 +744,15 @@ class TaskDispatcherSession(PluginSession):
     and marking the durable store — so a pool's pilots follow the session
     lifetime policy.
     '''
+
+    def is_busy(self) -> bool:
+        '''Busy while one of this session's pools has a live pilot or a
+        non-terminal task: clients follow tasks via notifications.'''
+        pools = (self._plugin._pool_states.get(self._sid)
+                 if self._plugin is not None else None) or {}
+        return any(not r.is_terminal()
+                   for ps in pools.values()
+                   for r in (*ps.pilots.values(), *ps.tasks.values()))
 
     async def close(self) -> dict:
         '''Tear down this session's pools, then run the base close.'''
@@ -1457,6 +1476,40 @@ class PluginTaskDispatcher(Plugin):
         self._child_clients[key] = client
         return client
 
+    async def _call_child(self, client, method: str, *args,
+                          retry: bool = False):
+        '''Run *method* of a cached child client off the loop.
+
+        A child session that is gone (expired: 410, or 404 "unknown
+        session") is evicted from the cache, so the next use re-registers.
+        With *retry* the call is re-run once on a fresh session -- safe,
+        since those errors are raised before the session method runs.
+        '''
+        try:
+            return await asyncio.to_thread(getattr(client, method), *args)
+        except Exception as e:
+            if not _child_session_gone(e):
+                raise
+            key = next((k for k, c in self._child_clients.items()
+                        if c is client), None)
+            if key is None:
+                raise
+            self._child_clients.pop(key, None)
+            log.info('[%s] %s session on %s is gone (%s): evicted',
+                     self.instance_name, key[1], key[0], e)
+            if not retry:
+                raise
+            dst, plugin, backend = key
+            if plugin == 'rhapsody':
+                fresh = await self._get_rhapsody_client(dst, backend)
+            elif plugin == 'psij':
+                fresh = await self._get_psij_client(dst)
+            else:
+                fresh = await self._get_staging_client(dst)
+            if fresh is None:
+                raise
+            return await asyncio.to_thread(getattr(fresh, method), *args)
+
     async def _get_psij_client(self, endpoint_name: str):
         '''Return a caller-backed :class:`PSIJClient` for *endpoint_name*.'''
         if not endpoint_name:
@@ -2022,7 +2075,8 @@ class PluginTaskDispatcher(Plugin):
         self._endpoint_mode_tasks[task_id] = target_endpoint
         self._persist_endpoint_mode()
         try:
-            result = await asyncio.to_thread(rh.submit_tasks, [task_dict])
+            result = await self._call_child(rh, 'submit_tasks', [task_dict],
+                                            retry=True)
         except Exception as e:
             log.exception('[%s] endpoint-mode submit to %s failed: %s',
                           self.instance_name, target_endpoint, e)
@@ -2159,7 +2213,7 @@ class PluginTaskDispatcher(Plugin):
                     status_code=503,
                     detail=f'rhapsody client unavailable on {endpoint_name}')
             try:
-                info = await asyncio.to_thread(rh.get_task, task_id)
+                info = await self._call_child(rh, 'get_task', task_id)
             except Exception as e:
                 raise HTTPException(
                     status_code=502,
@@ -2190,7 +2244,7 @@ class PluginTaskDispatcher(Plugin):
                     status_code=503,
                     detail=f'rhapsody client unavailable on {endpoint_name}')
             try:
-                info = await asyncio.to_thread(rh.cancel_task, task_id)
+                info = await self._call_child(rh, 'cancel_task', task_id)
             except Exception as e:
                 raise HTTPException(
                     status_code=502,
@@ -2832,8 +2886,9 @@ class PluginTaskDispatcher(Plugin):
         try:
             from .batch_system import detect_batch_system
             executor = detect_batch_system().psij_executor
-            result   = await asyncio.to_thread(
-                psij_c.submit_tunneled, job_spec, executor, 'none')
+            result   = await self._call_child(
+                psij_c, 'submit_tunneled', job_spec, executor, 'none',
+                retry=True)
         except Exception as e:
             log.exception('[%s] psij submit_tunneled failed for %s: %s',
                           self.instance_name, record.pid, e)
@@ -2854,7 +2909,7 @@ class PluginTaskDispatcher(Plugin):
                         self.instance_name, record.pid, record.state, job_id)
             if job_id:
                 try:
-                    await asyncio.to_thread(psij_c.cancel_job, job_id)
+                    await self._call_child(psij_c, 'cancel_job', job_id)
                 except Exception as e:
                     log.warning('[%s] psij cancel failed for %s: %s',
                                 self.instance_name, record.pid, e)
@@ -2932,7 +2987,7 @@ class PluginTaskDispatcher(Plugin):
             self._mark_pilot_failed(pool_state, record, 'cancel requested')
             return
         try:
-            await asyncio.to_thread(psij_c.cancel_job, record.psij_job_id)
+            await self._call_child(psij_c, 'cancel_job', record.psij_job_id)
         except Exception as e:
             log.warning('[%s] psij cancel failed for %s: %s',
                         self.instance_name, record.pid, e)
@@ -2962,8 +3017,8 @@ class PluginTaskDispatcher(Plugin):
         if psij_c is None:
             return
         try:
-            status = await asyncio.to_thread(
-                psij_c.get_job_status, record.psij_job_id)
+            status = await self._call_child(
+                psij_c, 'get_job_status', record.psij_job_id)
         except Exception as e:
             log.warning('[%s] psij get_job_status failed for %s: %s',
                         self.instance_name, record.pid, e)
@@ -3299,7 +3354,8 @@ class PluginTaskDispatcher(Plugin):
                                              task.task_id)
 
         try:
-            await asyncio.to_thread(rh.submit_tasks, [f for _, f in fwds])
+            await self._call_child(rh, 'submit_tasks', [f for _, f in fwds],
+                                   retry=True)
             self._mark_dirty(pool_state)
         except Exception as e:
             log.exception('[%s] rhapsody submit failed for %d task(s): %s',
@@ -3542,7 +3598,7 @@ class PluginTaskDispatcher(Plugin):
             return
         for uid in uids:
             try:
-                await asyncio.to_thread(rh.cancel_task, uid)
+                await self._call_child(rh, 'cancel_task', uid)
             except Exception as e:
                 log.warning('[%s] rhapsody cancel_task failed: %s',
                             self.instance_name, e)

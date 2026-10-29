@@ -214,7 +214,9 @@ def test_run_success(tmp_path):
            ['montage.png', 'cell_00.png', 'cell_01.png']
     assert rt.kwargs['globus'] == {'refresh_token': 'rt',
                                    'client_id': lf.GLOBUS_CLIENT_ID}
-    assert rt.kwargs['rhapsody'] == {'backends': ['dragon_v3']}
+    assert rt.kwargs['rhapsody'] == {'backends': ['dragon_v3'],
+                                     'lifetime': 'ttl',
+                                     'ttl': lf.GLOBUS_TIMEOUT + 2 * 3600}
     assert all(c.closed for c in rt.clients.values())
     assert updates and updates[-1]['finished']
 

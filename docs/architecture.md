@@ -49,8 +49,9 @@ A consumer opens a session on a plugin with `register_session` (create or
 reconnect), which selects a lifetime policy (`ephemeral` / `ttl` /
 `persistent`) and records the trusted owner identity; it releases it with
 `unregister_session`. Reattach is owner-checked; TTL and idle policies expire
-sessions on time; owner-bound ephemeral sessions are reclaimed a grace period
-after their owner is declared `lost`. See [Plugin Development](plugin_development.md) for the
+sessions on time (ephemeral sessions idle out after `session_ttl`, 900 s by
+default, unless busy with work in flight); owner-bound ephemeral sessions are
+also reclaimed a grace period after their owner is declared `lost`. See [Plugin Development](plugin_development.md) for the
 full model.
 
 

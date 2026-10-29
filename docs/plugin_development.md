@@ -212,10 +212,16 @@ lifetime policy and, for reconnect, a client-supplied session id:
 
 The three lifetimes:
 
-- `ephemeral` (default) — an owner-bound ephemeral session is reclaimed a
-  reclaim-drain grace after its owner is declared `lost` (see
-  [Topology and liveness](#topology-and-liveness)); an owner-less one falls back to the plugin idle
-  timeout (`session_ttl`, default 1 hour) so it is not leaked.
+- `ephemeral` (default) — expires after the plugin idle timeout
+  (`session_ttl`, default 900 s; `0` disables it), so a client that never
+  closes its session does not leak it; an owner-bound one is also reclaimed
+  a reclaim-drain grace after its owner is declared `lost` (see
+  [Topology and liveness](#topology-and-liveness)), whichever comes first.
+  A session whose `is_busy()` reports work in flight (running tasks, jobs,
+  transfers, a workflow) counts as active, so a client that only waits on
+  notifications keeps it; the idle clock starts when that work ends.  Work
+  that never reaches a final state (a stuck task or a psij job whose state
+  is never updated) keeps its session alive — a known limit.
 - `ttl` — expires once `now - last_access` exceeds `ttl` seconds (requires
   a positive `ttl`); never touched by owner loss.
 - `persistent` — never expires; reclaimed only by explicit operator action.
