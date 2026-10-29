@@ -2670,6 +2670,18 @@ def test_client_ignores_other_session_task_notifications():
                          {"uid": "task.000003", "state": "DONE"})
     assert client._completed["task.000001"]["return_value"] == "ours"
     assert "task.000003" in client._completed
+    assert "sid" not in client._completed["task.000001"]   # same shape as batch
+
+
+def test_split_frames_reserves_room_for_sid():
+    """Frames stay within the budget after notify() adds the session id."""
+    from radical.orbit.plugin_rhapsody import _payload_size
+
+    session = RhapsodySession("test.scope.budget")
+    one = {"uid": "task.000001", "state": "DONE", "stdout": "x" * 60}
+    session._notify_batch_bytes = 2 * _payload_size(one)   # two fit without sid
+    frames = session._split_frames([dict(one), dict(one)])
+    assert len(frames) == 2                     # but not once sid is counted
 
 
 def test_client_wait_tasks_rejects_uid_only_seen_from_other_session():
@@ -2682,8 +2694,7 @@ def test_client_wait_tasks_rejects_uid_only_seen_from_other_session():
         client.wait_tasks(["task.000009"])
 
 
-@pytest.mark.asyncio
-async def test_two_sessions_with_colliding_uids_get_their_own_results():
+def test_two_sessions_with_colliding_uids_get_their_own_results():
     """Broadcast notifications of two sessions reach both clients; each
     client keeps only its own session's result for the shared uid."""
     sessions, sent = [], []

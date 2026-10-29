@@ -713,10 +713,12 @@ class RhapsodySession(PluginSession):
         frames: list[list[dict]] = []
         frame:  list[dict]       = []
         nbytes                   = 0
+        # ``notify`` adds the session id to each frame after the split
+        budget = self._notify_batch_bytes - _payload_size({'sid': self.sid})
 
         for payload in batch:
             size = _payload_size(payload)
-            if frame and nbytes + size > self._notify_batch_bytes:
+            if frame and nbytes + size > budget:
                 frames.append(frame)
                 frame  = []
                 nbytes = 0
@@ -1333,6 +1335,7 @@ class RhapsodyClient(PluginClient):
         # UIDs submitted via this client — lets wait_tasks() reject UIDs that
         # were never submitted instead of blocking on them forever.
         self._submitted: set[str] = set()
+        self._warned_no_sid = False
 
     def _on_task_done(self, endpoint, plugin, topic, data):
         """Persistent SSE callback: accumulate terminal task states.
@@ -1344,8 +1347,11 @@ class RhapsodyClient(PluginClient):
         A notification without ``sid`` (older endpoint) is accepted.
         """
         sid = data.get('sid')
-        if sid is not None and sid != self.sid:
-            return
+        if sid is None and not self._warned_no_sid:
+            self._warned_no_sid = True
+            log.warning("[rhapsody] endpoint sends task notifications without "
+                        "a session id: results of other sessions with the "
+                        "same task uids cannot be told apart")
 
         if topic == 'task_status_batch':
             tasks = data.get('tasks', [])
@@ -1353,6 +1359,8 @@ class RhapsodyClient(PluginClient):
             tasks = [data]
 
         with self._cond:
+            if sid is not None and sid != self.sid:
+                return
             changed = False
             for t in tasks:
                 self._decode_return_value(t)
@@ -1360,7 +1368,10 @@ class RhapsodyClient(PluginClient):
                 uid   = t.get('uid')
                 state = str(t.get('state', '')).upper()
                 if uid and state in TERMINAL_STATES:
-                    self._completed[uid] = t
+                    # stored without the envelope's sid: a completion looks
+                    # the same whether it came alone or in a batch frame
+                    self._completed[uid] = {k: v for k, v in t.items()
+                                            if k != 'sid'}
                     changed = True
 
             if changed:
@@ -1445,11 +1456,13 @@ class RhapsodyClient(PluginClient):
         self._raise(resp)
 
         data      = resp.json()
-        self._sid = data['sid']
-        status    = data.get('status')
+        status = data.get('status')
 
-        # Reset the session-wide task completion accumulator
+        # Switch to the new session and reset the session-wide completion
+        # accumulator in one step, so a late notification of the old session
+        # cannot pass the sid check and land after the reset.
         with self._cond:
+            self._sid = data['sid']
             self._completed.clear()
 
         if status == 'ready':
