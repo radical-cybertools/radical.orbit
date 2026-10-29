@@ -169,7 +169,15 @@ class PluginClient:
     @staticmethod
     def _session_payload(sid: Optional[str], lifetime: Optional[str],
                          ttl: Optional[float]):
-        """Build the ``register_session`` request body (``None`` when empty)."""
+        """Build the ``register_session`` request body (``None`` when empty).
+
+        A bare ``ttl`` is sent in the legacy form endpoints of the previous
+        release accept too: ``lifetime='persistent'`` for ``0``, else
+        ``lifetime='ttl'`` plus the ttl.
+        """
+        if ttl is not None and lifetime is None:
+            if ttl == 0: lifetime, ttl = 'persistent', None
+            else:        lifetime      = 'ttl'
         payload = {}
         if sid      is not None: payload['sid']      = sid
         if lifetime is not None: payload['lifetime'] = lifetime

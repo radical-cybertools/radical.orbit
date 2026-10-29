@@ -663,7 +663,7 @@ class GlobusClient(PluginClient):
         if refresh_token:    payload['refresh_token']    = refresh_token
         if client_id:        payload['client_id']        = client_id
         if local_collection: payload['local_collection'] = local_collection
-        if ttl is not None:  payload['ttl']              = ttl
+        payload.update(self._session_payload(None, None, ttl) or {})
 
         resp = self._http.post(self._url('register_session'), json=payload)
         self._raise(resp)

@@ -1925,9 +1925,11 @@
       if (sessions[key]) return sessions[key];
 
       // Remember the register body so a stale-session re-register (see
-      // apiFetch auto-recovery) reproduces the same session (e.g. rhapsody
-      // backends) rather than silently falling back to defaults.
-      sessionRegBodies[key] = body;
+      // apiFetch auto-recovery and the keepalive) reproduces the same
+      // session (e.g. rhapsody backends) rather than silently falling back
+      // to defaults: a caller passing no body reuses the remembered one.
+      if (Object.keys(body).length) sessionRegBodies[key] = body;
+      else body = sessionRegBodies[key] || body;
 
       const nsData = endpointData[endpointName]?.plugins?.[pluginName];
       if (!nsData) throw new Error(`Plugin ${pluginName} not found on ${endpointName}`);

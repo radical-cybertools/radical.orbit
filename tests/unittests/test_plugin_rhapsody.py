@@ -2645,4 +2645,5 @@ def test_rhapsody_client_register_session_passes_sid_and_ttl():
     client = RhapsodyClient(http, '/rhapsody')
     client._start_task_listener = lambda: None
     client.register_session(sid='s1', ttl=7200)
-    assert http.post.call_args.kwargs['json'] == {'sid': 's1', 'ttl': 7200}
+    assert http.post.call_args.kwargs['json'] == {'sid': 's1', 'ttl': 7200,
+                                                  'lifetime': 'ttl'}

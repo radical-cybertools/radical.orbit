@@ -70,3 +70,13 @@ def test_plugin_client_touch_posts_the_touch_route():
     client._sid = "sid-abc"
     client.touch()
     assert mock_http.post.call_args[0][0].endswith("touch/sid-abc")
+
+
+def test_plugin_client_ttl_is_sent_in_the_legacy_form_too():
+    '''Endpoints of the previous release accept ttl only with
+    lifetime='ttl', and ttl=0 only as lifetime='persistent'.'''
+    assert PluginClient._session_payload(None, None, 60) == \
+        {'lifetime': 'ttl', 'ttl': 60}
+    assert PluginClient._session_payload(None, None, 0) == \
+        {'lifetime': 'persistent'}
+    assert PluginClient._session_payload('s', None, None) == {'sid': 's'}

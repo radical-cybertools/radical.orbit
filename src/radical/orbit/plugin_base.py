@@ -415,16 +415,7 @@ class Plugin(object):
         session accessed by different clients (e.g. the Explorer and a
         script) is tagged ``mixed``, so it is never logged as the Explorer's
         alone."""
-        try:
-            headers = getattr(request, 'headers', None) or {}
-            client  = headers.get('x-orbit-client')
-            if client is None and isinstance(headers, dict):
-                client = next((v for k, v in headers.items()
-                               if k.lower() == 'x-orbit-client'), None)
-        except Exception:
-            client = None
-        if not (isinstance(client, str) and client):
-            client = 'other'
+        client = Plugin._request_header(request, 'x-orbit-client') or 'other'
         if rec.client is None or rec.client == client:
             rec.client = client
         else:
@@ -559,14 +550,25 @@ class Plugin(object):
         Robust to header containers that are not plain mappings (e.g. test
         mocks): a non-string value resolves to ``None``.
         """
+        return Plugin._request_header(request, 'x-orbit-src')
+
+    @staticmethod
+    def _request_header(request, name: str) -> Optional[str]:
+        """A non-empty string header *name* (lower case) of *request*, else
+        ``None``.  Case-insensitive also for plain-dict headers (runtime
+        path); robust to header containers that are not mappings (e.g. test
+        mocks)."""
         headers = getattr(request, 'headers', None)
         if headers is None:
             return None
         try:
-            owner = headers.get('x-orbit-src')
+            value = headers.get(name)
+            if value is None and isinstance(headers, dict):
+                value = next((v for k, v in headers.items()
+                              if k.lower() == name), None)
         except Exception:
             return None
-        return owner if isinstance(owner, str) and owner else None
+        return value if isinstance(value, str) and value else None
 
     async def _normalize_session_policy(self, data: Dict[str, Any]) -> tuple:
         """Validate the session-policy fields of a register_session body.
