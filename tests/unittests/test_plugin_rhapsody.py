@@ -1824,7 +1824,8 @@ def test_notify_window_zero_flushes_immediately(monkeypatch):
     payload = {'uid': 'task.nw001', 'state': 'DONE'}
     session._queue_notification(payload)
 
-    plugin._dispatch_notify.assert_called_once_with('task_status', payload)
+    plugin._dispatch_notify.assert_called_once_with(
+        'task_status', {**payload, 'sid': sid})
     assert session._notify_buf == []
     assert not session._flush_scheduled
 
@@ -2622,6 +2623,92 @@ def test_client_data_helpers():
     rc._http.get.assert_called_with('/rhapsody/data_endpoints/sid.1')
     rc.data_shutdown('r')
     rc._http.post.assert_called_with('/rhapsody/data_shutdown/sid.1/r')
+
+
+# ---------------------------------------------------------------------------
+# Session scoping of task notifications
+# ---------------------------------------------------------------------------
+
+def test_session_notify_stamps_sid_on_task_topics():
+    """Task notifications carry the session id; the payload is a copy."""
+    session = RhapsodySession("test.scope.1")
+    session._plugin = MagicMock()
+
+    single = {"uid": "task.000001", "state": "DONE"}
+    batch  = {"tasks": [{"uid": "task.000002", "state": "DONE"}]}
+    session.notify("task_status", single)
+    session.notify("task_status_batch", batch)
+    session.notify("session_status", {"state": "ready"})
+
+    calls = session._plugin._dispatch_notify.call_args_list
+    assert calls[0].args == ("task_status",
+                             {"uid": "task.000001", "state": "DONE",
+                              "sid": "test.scope.1"})
+    assert calls[1].args[1]["sid"] == "test.scope.1"
+    assert calls[1].args[1]["tasks"] == batch["tasks"]
+    assert "sid" not in calls[2].args[1]          # other topics unchanged
+    assert "sid" not in single and "sid" not in batch   # not mutated
+
+
+def test_client_ignores_other_session_task_notifications():
+    """Foreign-sid completions are dropped; own and sid-less are kept."""
+    client = _make_rhapsody_client()                # sid-rh
+
+    client._on_task_done(None, None, "task_status",
+                         {"uid": "task.000001", "state": "DONE",
+                          "return_value": "theirs", "sid": "sid-other"})
+    client._on_task_done(None, None, "task_status_batch",
+                         {"sid": "sid-other", "tasks": [
+                             {"uid": "task.000002", "state": "DONE"}]})
+    assert "task.000001" not in client._completed
+    assert "task.000002" not in client._completed
+
+    client._on_task_done(None, None, "task_status",
+                         {"uid": "task.000001", "state": "DONE",
+                          "return_value": "ours", "sid": "sid-rh"})
+    client._on_task_done(None, None, "task_status",          # older endpoint
+                         {"uid": "task.000003", "state": "DONE"})
+    assert client._completed["task.000001"]["return_value"] == "ours"
+    assert "task.000003" in client._completed
+
+
+def test_client_wait_tasks_rejects_uid_only_seen_from_other_session():
+    """A uid completed by another session is not known to this client."""
+    client = _make_rhapsody_client()
+    client._on_task_done(None, None, "task_status",
+                         {"uid": "task.000009", "state": "DONE",
+                          "sid": "sid-other"})
+    with pytest.raises(ValueError, match="unknown task UID"):
+        client.wait_tasks(["task.000009"])
+
+
+@pytest.mark.asyncio
+async def test_two_sessions_with_colliding_uids_get_their_own_results():
+    """Broadcast notifications of two sessions reach both clients; each
+    client keeps only its own session's result for the shared uid."""
+    sessions, sent = [], []
+    for sid in ("sid-a", "sid-b"):
+        s = RhapsodySession(sid)
+        s._rh_session = MagicMock()
+        s._plugin = MagicMock()
+        s._plugin._dispatch_notify.side_effect = \
+            lambda topic, data: sent.append((topic, data))
+        sessions.append(s)
+
+    for s, value in zip(sessions, ("from-a", "from-b")):
+        s.notify("task_status",
+                 s._notification_payload(_done_task("task.000001", value)))
+
+    clients = []
+    for sid in ("sid-a", "sid-b"):
+        c = _make_rhapsody_client()
+        c._sid = sid
+        for topic, data in sent:                  # the broadcast
+            c._on_task_done(None, None, topic, data)
+        clients.append(c)
+
+    assert clients[0]._completed["task.000001"]["return_value"] == "from-a"
+    assert clients[1]._completed["task.000001"]["return_value"] == "from-b"
 
 
 if __name__ == '__main__':

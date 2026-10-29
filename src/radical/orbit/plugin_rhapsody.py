@@ -354,6 +354,19 @@ class RhapsodySession(PluginSession):
         # the endpoint runtime); ``None`` for sessions built directly in tests.
         self._prof: rprof.Profiler | None = None
 
+    # task notifications carry the session id: they are broadcast to every
+    # consumer of the plugin, and task uids are only unique per client
+    _SCOPED_TOPICS = ('task_status', 'task_status_batch')
+
+    def notify(self, topic: str, data: dict) -> None:
+        """Send a notification; task notifications get this session's ``sid``.
+
+        The payload is copied, so buffered task dicts are not modified.
+        """
+        if topic in self._SCOPED_TOPICS:
+            data = {**data, 'sid': self.sid}
+        super().notify(topic, data)
+
     async def initialize(self) -> None:
         """Asynchronously initialize the session and its backends."""
         try:
@@ -1325,8 +1338,15 @@ class RhapsodyClient(PluginClient):
         """Persistent SSE callback: accumulate terminal task states.
 
         Handles both single ``task_status`` and bulk
-        ``task_status_batch`` notifications.
+        ``task_status_batch`` notifications.  Notifications of other
+        sessions (a different ``sid``) are ignored: they are broadcast to
+        every consumer of the plugin and their uids can collide with ours.
+        A notification without ``sid`` (older endpoint) is accepted.
         """
+        sid = data.get('sid')
+        if sid is not None and sid != self.sid:
+            return
+
         if topic == 'task_status_batch':
             tasks = data.get('tasks', [])
         else:
