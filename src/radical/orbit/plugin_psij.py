@@ -172,6 +172,9 @@ class PSIJSession(PluginSession):
         """
         if job_id in self._cancelled_jobs and raw_state in ('COMPLETED', 'FAILED'):
             return 'CANCELED'
+        known = self._job_states.get(job_id)
+        if known in TERMINAL_STATES and raw_state not in TERMINAL_STATES:
+            return known    # e.g. a failed submit: psij still says NEW
         return raw_state
 
     def _cleanup_stale_output(self) -> None:
@@ -335,11 +338,14 @@ class PSIJSession(PluginSession):
                 ex.submit(job)
             except Exception as e:
                 # never submitted: no further state will arrive from psij.
-                # Record and notify FAILED (stays visible, stops pinning)
-                self._job_states[job.id] = 'FAILED'
-                self.notify("job_status", {
-                    "job_id": job.id, "state": 'FAILED', "exit_code": None,
-                    "stdout": "", "stderr": f"submit failed: {e}"})
+                # Record and notify FAILED (stays visible, stops pinning) --
+                # unless psij's callback already reported a terminal state
+                if self._job_states.get(job.id) not in TERMINAL_STATES:
+                    self._job_states[job.id] = 'FAILED'
+                    self.notify("job_status", {
+                        "job_id": job.id, "state": 'FAILED',
+                        "exit_code": None, "stdout": "",
+                        "stderr": f"submit failed: {e}"})
                 raise
 
             # Start background polling for job status updates

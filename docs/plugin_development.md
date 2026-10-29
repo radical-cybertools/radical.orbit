@@ -220,7 +220,8 @@ The three lifetimes:
   *possible session leak* (a forgotten `close()`), not reclaimed.  An
   owner-less one (gateway/HTTP caller) idle-expires after the plugin's
   `session_ttl` (default 900 s; `0` disables it).  Every request on a
-  `{sid}` route counts as an access, and a session whose `is_busy()`
+  `{sid}` route counts as an access (a long one for as long as it runs),
+  and a session whose `is_busy()`
   reports work in flight (running tasks, jobs, transfers, a workflow)
   counts as active — the idle clock starts when that work ends.  Work that
   never reaches a final state keeps its session alive (a known limit).  To

@@ -974,17 +974,41 @@ async def test_connected_idle_owner_is_warned_once_not_reaped(caplog):
     assert "b" in plugin._sessions                     # not reclaimed
 
 
-def test_expired_record_is_bounded():
+@pytest.mark.asyncio
+async def test_expired_record_is_bounded(monkeypatch):
     from radical.orbit import plugin_base as pb
+    monkeypatch.setattr(pb, 'EXPIRED_KEEP', 3)
     plugin = _fresh_plugin()
-    for i in range(pb.EXPIRED_KEEP + 5):
-        plugin._expired[f"s{i}"] = (time.time(), "x")
-        plugin._expired.move_to_end(f"s{i}")
-        while len(plugin._expired) > pb.EXPIRED_KEEP:
-            plugin._expired.popitem(last=False)
-    assert len(plugin._expired) == pb.EXPIRED_KEEP
-    plugin._expired["old"] = (time.time() - pb.EXPIRED_KEEP_S - 1, "x")
-    assert plugin._expired_detail("old") is None and "old" not in plugin._expired
+    for i in range(5):
+        await plugin.register_session(_owned_request({"sid": f"s{i}"}))
+        await plugin._expire_session(f"s{i}", plugin._records[f"s{i}"],
+                                     time.time())
+    assert list(plugin._expired) == ["s2", "s3", "s4"]    # oldest evicted
+    plugin._expired["s4"] = (time.time() - pb.EXPIRED_KEEP_S - 1, "x")
+    assert plugin._expired_detail("s4") is None and "s4" not in plugin._expired
+
+
+@pytest.mark.asyncio
+async def test_a_running_request_keeps_its_session():
+    '''A request still running is activity, also for plugins without
+    is_busy (e.g. a long staging transfer).'''
+    plugin = _fresh_plugin()
+    plugin.session_ttl = 60
+    await plugin.register_session(_owned_request({"sid": "s1"}))
+    gate, started = asyncio.Event(), asyncio.Event()
+
+    async def slow(request):
+        started.set()
+        await gate.wait()
+        return {}
+    call = asyncio.ensure_future(plugin._accessing(slow)(_sid_request("s1")))
+    await started.wait()
+    plugin._records["s1"].last_access = time.time() - 100
+    assert await plugin._cleanup_expired_sessions() == 0
+    gate.set()
+    assert await call == {}
+    assert plugin._records["s1"].inflight == 0
+    assert time.time() - plugin._records["s1"].last_access < 5
 
 
 @pytest.mark.asyncio

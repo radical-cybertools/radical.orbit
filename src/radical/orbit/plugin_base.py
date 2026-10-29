@@ -44,6 +44,7 @@ class SessionRecord:
     last_access:    float
     drain_deadline: Optional[float] = None    # set on owner 'lost'
     leak_warned:    Optional[float] = None    # last_access at the leak warning
+    inflight:       int             = 0       # {sid} requests still running
 
 
 class _LastAccessView:
@@ -398,9 +399,20 @@ class Plugin(object):
         @functools.wraps(handler)
         async def _accessed(request):
             sid = (getattr(request, 'path_params', None) or {}).get('sid')
-            if sid:
-                await self._check_session_access(sid)
-            return await handler(request)
+            if not sid:
+                return await handler(request)
+            await self._check_session_access(sid)
+            rec = self._records.get(sid)
+            if rec is None:
+                return await handler(request)
+            # a request still running is activity too (e.g. a long staging
+            # put), for every plugin -- with or without its own is_busy
+            rec.inflight += 1
+            try:
+                return await handler(request)
+            finally:
+                rec.inflight   -= 1
+                rec.last_access = time.time()
         return _accessed
 
     @staticmethod
@@ -661,6 +673,9 @@ class Plugin(object):
         """Count work in flight as access (see :meth:`PluginSession.is_busy`).
         A failing probe counts as busy: never reap work over a broken probe."""
         if rec.lifetime != 'ephemeral':     # ttl is a hard, time-only bound
+            return
+        if rec.inflight > 0:                # a request is still running
+            rec.last_access = now
             return
         session = self._sessions.get(sid)
         if session is None:

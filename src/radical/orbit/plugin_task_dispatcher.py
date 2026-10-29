@@ -736,21 +736,18 @@ class TaskDispatcherSession(PluginSession):
     '''
 
     def is_busy(self) -> bool:
-        '''Busy while one of this session's tasks runs, or waits in a pool
-        that has a live pilot (e.g. one in the batch queue): a client
-        following tasks via notifications sends no requests.  A queue with
-        no live pilot, or idle pilots without tasks, do not count -- an
-        abandoned session must not hold its allocations.'''
+        '''Busy while one of this session's tasks is queued or running: a
+        client following tasks via notifications sends no requests, and the
+        policy replaces pilots as needed.  Idle pilots without tasks do not
+        count.  Known limit: a queue that can never be served keeps an
+        abandoned session (and its pilot attempts) alive.'''
         if self._plugin is None:
             return False
-        for ps in (self._plugin._pool_states.get(self._sid) or {}).values():
-            served = any(not p.is_terminal() for p in ps.pilots.values())
-            # newest last: live tasks are usually recent, so scan backwards
-            for t in reversed(ps.tasks.values()):
-                if t.state == TASK_RUNNING or \
-                        (served and t.state == TASK_QUEUED):
-                    return True
-        return False
+        # newest last: live tasks are usually recent, so scan backwards
+        return any(not t.is_terminal()
+                   for ps in (self._plugin._pool_states.get(self._sid)
+                              or {}).values()
+                   for t in reversed(ps.tasks.values()))
 
     async def close(self) -> dict:
         '''Tear down this session's pools, then run the base close.'''

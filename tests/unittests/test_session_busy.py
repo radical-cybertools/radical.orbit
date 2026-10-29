@@ -46,7 +46,6 @@ async def test_xgfabric_busy_while_its_workflow_runs():
     assert not XGFabricSession.is_busy(s)
 
 
-@pytest.mark.asyncio
 def test_rhapsody_session_busy_while_a_task_is_not_terminal():
     from radical.orbit.plugin_rhapsody import RhapsodySession
     s = SimpleNamespace(_tasks={'a': {'state': 'DONE'},
@@ -57,9 +56,6 @@ def test_rhapsody_session_busy_while_a_task_is_not_terminal():
     assert not RhapsodySession.is_busy(s)
 
 
-@pytest.mark.asyncio
-@pytest.mark.asyncio
-@pytest.mark.asyncio
 def test_client_touch_uses_the_touch_route():
     from unittest.mock import MagicMock
     from radical.orbit.client import PluginClient
@@ -75,33 +71,6 @@ def test_client_touch_uses_the_touch_route():
     assert 'json' not in http.post.call_args.kwargs
 
 
-def test_dispatcher_busy_while_a_task_runs_not_when_queued():
-    from radical.orbit.plugin_task_dispatcher import TaskDispatcherSession
-    pool   = SimpleNamespace(tasks={'a': SimpleNamespace(state='DONE'),
-                                    'b': SimpleNamespace(state='QUEUED')},
-                             pilots={'p': SimpleNamespace(is_terminal=lambda: True)})
-    plugin = SimpleNamespace(_pool_states={'sid': {'cpu': pool}})
-    s      = SimpleNamespace(_plugin=plugin, _sid='sid')
-    assert not TaskDispatcherSession.is_busy(s)    # queued, no live pilot
-    pool.tasks['b'].state = 'RUNNING'
-    assert TaskDispatcherSession.is_busy(s)
-    assert not TaskDispatcherSession.is_busy(
-        SimpleNamespace(_plugin=plugin, _sid='other'))
-
-
-def test_dispatcher_queued_tasks_busy_only_with_a_live_pilot():
-    from radical.orbit.plugin_task_dispatcher import TaskDispatcherSession
-    pilot  = SimpleNamespace(is_terminal=lambda: False)
-    pool   = SimpleNamespace(tasks={'q': SimpleNamespace(state='QUEUED')},
-                             pilots={'p': pilot})
-    s      = SimpleNamespace(_plugin=SimpleNamespace(
-                                 _pool_states={'sid': {'cpu': pool}}),
-                             _sid='sid')
-    assert TaskDispatcherSession.is_busy(s)          # pilot in batch queue
-    pilot.is_terminal = lambda: True
-    assert not TaskDispatcherSession.is_busy(s)      # queue nobody serves
-
-
 def test_psij_terminal_state_is_final():
     from radical.orbit.plugin_psij import PSIJSession
     sent = []
@@ -110,3 +79,19 @@ def test_psij_terminal_state_is_final():
                         notify=lambda *a: sent.append(a))
     PSIJSession._notify_state(s, 'j', SimpleNamespace(state='NEW'))
     assert sent == [] and s._job_states['j'] == 'FAILED'
+
+
+def test_dispatcher_busy_while_a_task_is_queued_or_running():
+    from radical.orbit.plugin_task_dispatcher import TaskDispatcherSession
+
+    def task(terminal):
+        return SimpleNamespace(is_terminal=lambda: terminal)
+    pool   = SimpleNamespace(tasks={'a': task(True), 'b': task(False)},
+                             pilots={})
+    plugin = SimpleNamespace(_pool_states={'sid': {'cpu': pool}})
+    s      = SimpleNamespace(_plugin=plugin, _sid='sid')
+    assert TaskDispatcherSession.is_busy(s)          # queued or running
+    pool.tasks['b'] = task(True)
+    assert not TaskDispatcherSession.is_busy(s)      # idle pilots don't count
+    assert not TaskDispatcherSession.is_busy(
+        SimpleNamespace(_plugin=plugin, _sid='other'))
