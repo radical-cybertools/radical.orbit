@@ -200,16 +200,25 @@ async def test_dispatcher_touches_child_sessions_and_evicts_gone_ones():
             if self.fail:
                 raise self.fail
 
+    import time
     live = Client(('a', 'rhapsody', None))
     gone = Client(('b', 'psij', None), _err(410, 'session expired: s2'))
+    old  = Client(('c', 'staging', None))
+    live._orbit_used = gone._orbit_used = time.time()
+    old._orbit_used  = time.time() - 7200      # unused: left to idle out
     d = SimpleNamespace(_child_clients={live._orbit_cache_key: live,
-                                        gone._orbit_cache_key: gone},
+                                        gone._orbit_cache_key: gone,
+                                        old._orbit_cache_key:  old},
                         instance_name='td')
     d._call_child = lambda c, m, *a, **k: PluginTaskDispatcher._call_child(
         d, c, m, *a, **k)
+    used = live._orbit_used
     await PluginTaskDispatcher._touch_child_sessions(d)
     assert live.touched == gone.touched == 1
-    assert list(d._child_clients) == [live._orbit_cache_key]
+    assert old.touched == 0
+    assert live._orbit_used == used            # a touch is not a use
+    assert list(d._child_clients) == [live._orbit_cache_key,
+                                      old._orbit_cache_key]
 
 
 def test_client_touch_uses_the_touch_route():

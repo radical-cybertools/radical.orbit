@@ -93,7 +93,8 @@ _PRUNE_INTERVAL_SEC  = 86400.0   # stale-dir pruning: once a day
 
 # Housekeeping tick frequency.
 _TICK_INTERVAL_SEC = 5.0
-_CHILD_TOUCH_SEC   = 300.0  # keep cached child sessions from idling out
+_CHILD_TOUCH_SEC   = 300.0   # keep cached child sessions from idling out
+_CHILD_KEEP_SEC    = 3600.0  # ... unless unused by the dispatcher this long
 
 # Handshake timeout — a pilot that hasn't handshaken in this long is
 # reconciled against psij job state.
@@ -1395,8 +1396,13 @@ class PluginTaskDispatcher(Plugin):
             except Exception as e:
                 log.debug('[%s] child session touch failed: %s',
                           self.instance_name, e)
+        # only children used recently: one unused for _CHILD_KEEP_SEC is
+        # left to idle out on its endpoint (and re-registered on next use)
+        now = time.time()
         await asyncio.gather(*(_one(c)
-                               for c in list(self._child_clients.values())))
+                               for c in list(self._child_clients.values())
+                               if now - getattr(c, '_orbit_used', now)
+                               < _CHILD_KEEP_SEC))
 
     async def shutdown(self) -> None:
         '''Cancel the housekeeping loop and drop the event tap, then base close.'''
@@ -1517,6 +1523,7 @@ class PluginTaskDispatcher(Plugin):
                             self.instance_name, plugin, dst, e)
                 return None
             client._orbit_cache_key = key
+            client._orbit_used      = time.time()
             self._child_clients[key] = client
             return client
 
@@ -1531,6 +1538,8 @@ class PluginTaskDispatcher(Plugin):
         thus before the session method ran; a "closing" session may have
         taken part of the call already.
         '''
+        if method != 'touch':               # keepalive is not a use
+            client._orbit_used = time.time()
         try:
             return await asyncio.to_thread(getattr(client, method), *args)
         except Exception as e:

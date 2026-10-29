@@ -802,6 +802,18 @@ async def test_busy_ttl_session_is_kept():
 
 
 @pytest.mark.asyncio
+async def test_forward_does_not_drop_a_busy_session():
+    '''A request between sweeps must not 410 a session the sweep keeps.'''
+    plugin = _fresh_plugin()
+    plugin.session_class = _BusySession
+    plugin.session_ttl   = 1
+    await plugin.register_session(_owned_request({"sid": "b"}, "epB"))
+    plugin._records["b"].last_access = time.time() - 100
+    assert await plugin._forward("b", PluginSession.ping) == {}
+    assert "b" in plugin._sessions
+
+
+@pytest.mark.asyncio
 async def test_busy_session_still_reclaimed_on_owner_loss():
     plugin = _fresh_plugin()
     plugin.session_class = _BusySession

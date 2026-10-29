@@ -375,10 +375,8 @@ class Plugin(object):
         revived: it is left for ``_forward`` (410) or the sweep."""
         async def _accessed(request):
             sid = (getattr(request, 'path_params', None) or {}).get('sid')
-            rec = self._records.get(sid) if sid else None
-            now = time.time()
-            if rec is not None and not self._is_expired(rec, now):
-                rec.last_access = now
+            if sid:
+                self._access(sid)
             return await handler(request)
         return _accessed
 
@@ -607,6 +605,36 @@ class Plugin(object):
         if rec is not None:
             rec.last_access = time.time()
 
+    def _access(self, sid: str) -> None:
+        """A request on *sid*: count it as an access unless the session has
+        expired -- that one is not revived (``_forward`` answers 410, the
+        sweep drops it).  Work in flight keeps it alive (``is_busy``)."""
+        rec = self._records.get(sid)
+        if rec is None:
+            return
+        now = time.time()
+        self._refresh_if_busy(sid, rec, now)
+        if not self._is_expired(rec, now):
+            rec.last_access = now
+
+    def _refresh_if_busy(self, sid: str, rec: SessionRecord,
+                         now: float) -> None:
+        """Count work in flight as access (see :meth:`PluginSession.is_busy`).
+        A failing probe counts as busy: never reap work over a broken probe."""
+        if rec.lifetime == 'persistent':
+            return
+        session = self._sessions.get(sid)
+        if session is None:
+            return
+        try:
+            busy = session.is_busy()
+        except Exception as e:
+            log.warning("[%s] is_busy of session %s failed (kept as busy): "
+                        "%s", self.instance_name, sid, e)
+            busy = True
+        if busy:
+            rec.last_access = now
+
     def _record_session(self, sid: str, session: PluginSession,
                         lifetime: str, ttl: Optional[float],
                         owner: Optional[str] = None) -> None:
@@ -824,6 +852,8 @@ class Plugin(object):
         # Detect expiry of THIS session before the background cleanup removes it
         now = time.time()
         record = self._records.get(sid)
+        if record is not None:
+            self._refresh_if_busy(sid, record, now)  # busy is not expired
         if record is not None and self._is_expired(record, now):
             await self._drop_session(sid)
             raise HTTPException(status_code=410, detail=f"session expired: {sid}")
@@ -909,19 +939,8 @@ class Plugin(object):
         now = time.time()
         expired = []
         for sid, rec in list(self._records.items()):
-            if rec.lifetime != 'persistent':
-                session = self._sessions.get(sid)
-                try:
-                    busy = session is not None and session.is_busy()
-                except Exception as e:
-                    # never reap work in flight over a broken probe
-                    log.warning("[%s] is_busy of session %s failed (kept "
-                                "as busy): %s", self.instance_name, sid, e)
-                    busy = True
-                if busy:
-                    # work in flight counts as access; owner-loss drain
-                    # still applies below
-                    rec.last_access = now
+            # work in flight counts as access; owner-loss drain still applies
+            self._refresh_if_busy(sid, rec, now)
             if self._is_expired(rec, now):
                 expired.append((sid, rec))
         for sid, rec in expired:
