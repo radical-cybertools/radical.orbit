@@ -978,6 +978,40 @@ class TestEndpointMode:
         assert 'too big' in r.json()['detail']
         assert 't.1' not in plugin._endpoint_mode_tasks
 
+    def _endpoint_mode_submit(self, tmp_path, exc):
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _register(client, plugin, body={'sid': 'A',
+                                              'lifetime': 'persistent'})
+        self._seed_topology(plugin, {'ep': ['rhapsody']})
+        rh_mock = MagicMock()
+        rh_mock.submit_tasks = MagicMock(side_effect=exc)
+        with patch.object(plugin, '_get_rhapsody_client',
+                          new=AsyncMock(return_value=rh_mock)):
+            r = client.post(f'{plugin.namespace}/submit/{sid}', json={
+                'endpoint': 'ep', 'task_id': 't.1',
+                'cmd': ['/bin/true'], 'cwd': '/tmp'})
+        return plugin, r
+
+    def test_endpoint_mode_uncertain_submit_is_504_and_stays_mapped(
+            self, tmp_path):
+        from radical.orbit.plugin_rhapsody import PartialSubmitError
+        plugin, r = self._endpoint_mode_submit(tmp_path, PartialSubmitError(
+            'timed out', uncertain=['t.1']))
+        assert r.status_code == 504, r.text
+        assert 'outcome unknown' in r.json()['detail']
+        assert 'before resubmitting' in r.json()['detail']
+        # the task may run: its events must stay routable
+        assert plugin._endpoint_mode_tasks.get('t.1') == 'ep'
+
+    def test_endpoint_mode_rejected_submit_unmaps(self, tmp_path):
+        from radical.orbit.plugin_rhapsody import PartialSubmitError
+        plugin, r = self._endpoint_mode_submit(tmp_path, PartialSubmitError(
+            'HTTP 400 — cannot resolve function', status_code=400,
+            rejected=['t.1']))
+        assert r.status_code == 400, r.text
+        assert 't.1' not in plugin._endpoint_mode_tasks
+
     def test_terminal_batch_event_is_handled(self, tmp_path):
         '''Several completions in one frame arrive as task_status_batch.'''
         _, plugin = _make_plugin(tmp_path)

@@ -24,8 +24,8 @@ from fastapi import FastAPI, HTTPException, Request
 from .plugin_session_base import PluginSession
 from .plugin_base import Plugin, DEFAULT_SID
 from .client import PluginClient
-from .protocol import FRAME_CAP
-from .runtime_client import pack_batches, transport_max_body
+from .protocol import FRAME_CAP, RequestNotSent
+from .runtime_client import max_body_of, pack_batches
 
 log = logging.getLogger("radical.orbit")
 
@@ -226,19 +226,27 @@ def _submit_budget(http) -> int:
     clamps it to what a default-cap peer accepts (read at call time, so an
     override still applies).
     """
-    return min(transport_max_body(http) // BUDGET_RATIO, WS_PAYLOAD_LIMIT)
+    return min(max_body_of(http) // BUDGET_RATIO, WS_PAYLOAD_LIMIT)
 
 
 class PartialSubmitError(RuntimeError):
     """A batched submit failed part-way: each task's fate, by uid.
 
     ``accepted``  the endpoint acknowledged these; they run.
-    ``uncertain`` the failing batch, when the endpoint may have taken it
-                  (timeout, transport error, 5xx, unreadable ack).
-    ``rejected``  the failing batch on a 4xx, plus every batch never sent.
+    ``uncertain`` the failing batch, when the endpoint may have taken some
+                  or all of it: a timeout or transport error after the
+                  request was sent, a 5xx, a 4xx other than a validation
+                  refusal (e.g. 404/409/410, possible mid-submit), or an
+                  unreadable ack.
+    ``rejected``  the failing batch when it provably was not taken (a
+                  validation refusal -- 400/413/422, raised by the endpoint
+                  before it submits any task of the request -- or a
+                  :class:`~radical.orbit.protocol.RequestNotSent`), plus
+                  every batch never sent.
 
     ``results`` holds the accepted tasks' submit results; ``status_code``
-    is the failed batch's HTTP status, when it had one.
+    is the failed batch's HTTP error status, ``None`` when there was none
+    (transport failure, or an unreadable ack on a 2xx).
     """
 
     def __init__(self, msg: str = '', accepted=(), results=(),
@@ -255,6 +263,22 @@ class PartialSubmitError(RuntimeError):
                              self.status_code, self.uncertain, self.rejected))
 
 
+# Submit statuses that mean the endpoint took no task of the request: it
+# validates the whole request before submitting any of it.
+_REFUSED_STATUS = (400, 413, 422)
+
+
+def _error_status(exc: BaseException, status: int | None) -> int | None:
+    """The HTTP error status of a failed submit batch, ``None`` if none.
+
+    A 2xx whose ack cannot be read is no error status: ``None``.
+    """
+    code = getattr(exc, 'status_code', None)
+    if code is None and isinstance(status, int) and status >= 400:
+        code = status
+    return code
+
+
 def _submit_batches(client, url: str, task_dicts: list[dict],
                     on_packed=None) -> list[dict]:
     """Post *task_dicts* to *url* in frame-bounded msgpack batches.
@@ -268,7 +292,7 @@ def _submit_batches(client, url: str, task_dicts: list[dict],
     """
     http    = client._http
     batches = pack_batches(task_dicts, _submit_budget(http),
-                           transport_max_body(http))
+                           max_body_of(http))
     if on_packed is not None:
         on_packed()
     results:  list[dict] = []
@@ -283,8 +307,10 @@ def _submit_batches(client, url: str, task_dicts: list[dict],
             client._raise(resp, f"submit {len(batch)} task(s)")
             acks   = resp.json()
         except Exception as e:
-            # a 4xx refused the batch; anything else may have delivered it
-            refused   = isinstance(status, int) and 400 <= status < 500
+            # only a validation refusal or a provably unsent request means
+            # nothing of this batch was taken; anything else may have been
+            refused   = isinstance(e, RequestNotSent) \
+                        or status in _REFUSED_STATUS
             unsent    = [str(td['uid'])
                          for td in task_dicts[len(accepted) + len(uids):]]
             uncertain = [] if refused else uids
@@ -293,7 +319,7 @@ def _submit_batches(client, url: str, task_dicts: list[dict],
                 f"{e} — of {len(task_dicts)} task(s): {len(accepted)} "
                 f"accepted, {len(uncertain)} uncertain, {len(rejected)} "
                 f"rejected", accepted, results,
-                getattr(e, 'status_code', status), uncertain, rejected) from e
+                _error_status(e, status), uncertain, rejected) from e
         accepted.extend(uids)
         results.extend(acks)
     return results
@@ -671,10 +697,13 @@ class RhapsodySession(PluginSession):
         ``BaseTask.from_dict()``.  Function fields encoded as cloudpickle
         blobs or import-path strings are deserialized first.
 
-        Large submissions are processed one chunk at a time: the CPU-bound
-        deserialization is offloaded to a worker thread, then the chunk is
-        handed to the backend.  Both the ``to_thread`` offload and the
-        ``await`` on the backend keep the work loop responsive.
+        Large submissions are processed in chunks: the CPU-bound
+        deserialization of every chunk is offloaded to a worker thread
+        first, and only once the whole request has been prepared are the
+        chunks handed to the backend.  So a validation error (HTTP 400,
+        e.g. an unresolvable function) means no task of the request was
+        submitted.  Both the ``to_thread`` offload and the ``await`` on the
+        backend keep the work loop responsive.
 
         Returns:
             list[dict]: Minimal ack dicts ``{uid, state}``.
@@ -688,9 +717,14 @@ class RhapsodySession(PluginSession):
         results   = []
         all_tasks = []   # collect for batch watcher
 
+        # validate the whole request before submitting any of it
+        prepared = []
         for i in range(0, len(task_dicts), _CHUNK):
             chunk = task_dicts[i:i + _CHUNK]
-            tasks = await asyncio.to_thread(self._prepare_batch, chunk)
+            prepared.append(
+                await asyncio.to_thread(self._prepare_batch, chunk))
+
+        for tasks in prepared:
             if self._rh_session is None:     # torn down after a drain timeout
                 raise HTTPException(status_code=410,
                                     detail="session is closing")
@@ -1761,14 +1795,7 @@ class RhapsodyClient(PluginClient):
         deadline = (time.time() + timeout) if timeout is not None else None
         with self._cond:
             while not all(uid in self._completed for uid in uids):
-                # a failed submit withdrew these: they will never complete
-                dropped = [u for u in uids
-                           if u not in self._submitted
-                           and u not in self._completed]
-                if dropped:
-                    raise ValueError(
-                        "wait_tasks: task UID(s) rejected by a failed "
-                        f"submit: {dropped}")
+                self._raise_withdrawn(uids)
                 remaining = None
                 if deadline is not None:
                     remaining = deadline - time.time()
@@ -1779,6 +1806,19 @@ class RhapsodyClient(PluginClient):
             return [self._completed.get(uid, {"uid": uid,
                                               "state": "UNKNOWN"})
                     for uid in uids]
+
+    def _raise_withdrawn(self, uids: list[str]) -> None:
+        """Raise if a failed submit withdrew any of *uids* (hold ``_cond``).
+
+        A rejected task never reached the endpoint, so it will never
+        complete: both wait paths fail instead of waiting it out.
+        """
+        dropped = [u for u in uids
+                   if u not in self._submitted and u not in self._completed]
+        if dropped:
+            raise ValueError(
+                f"wait_tasks: task UID(s) rejected by a failed submit: "
+                f"{dropped}")
 
     def _wait_tasks_poll(self, uids: list[str],
                          timeout: float | None = None) -> list[dict]:
@@ -1796,7 +1836,13 @@ class RhapsodyClient(PluginClient):
         deadline = (time.time() + timeout) if timeout else None
 
         while True:
+            with self._cond:
+                self._raise_withdrawn(uids)
             resp = self._http.post(url, json=payload)
+            # the endpoint omits uids it never received: a submit failing
+            # meanwhile may have withdrawn some -- raise, not a short list
+            with self._cond:
+                self._raise_withdrawn(uids)
             self._raise(resp, f"wait {len(uids)} task(s)")
             tasks = resp.json()
 

@@ -2011,12 +2011,29 @@ class PluginTaskDispatcher(Plugin):
         except Exception as e:
             log.exception('[%s] endpoint-mode submit to %s failed: %s',
                           self.instance_name, target_endpoint, e)
+            if isinstance(e, PartialSubmitError) and e.uncertain:
+                # The endpoint may run the task: keep it mapped so its
+                # events stay routable, and tell the caller the outcome is
+                # unknown -- a blind resubmit could run it twice.
+                raise HTTPException(
+                    status_code=504,
+                    detail=f'rhapsody submit outcome unknown on '
+                           f'{target_endpoint}: task {task_id!r} may be '
+                           f'running; check its status before '
+                           f'resubmitting ({e})') from e
             if self._endpoint_mode_tasks.pop(task_id, None):
                 self._persist_endpoint_mode()
             if isinstance(e, PayloadTooLarge):
                 # the task itself is too large: the caller's error, not
                 # the pilot's
                 raise HTTPException(status_code=413, detail=str(e)) from e
+            status = getattr(e, 'status_code', None)
+            if status in (400, 413, 422):
+                # the endpoint refused the task as invalid
+                raise HTTPException(
+                    status_code=status,
+                    detail=f'rhapsody submit refused on '
+                           f'{target_endpoint}: {e}') from e
             raise HTTPException(
                 status_code=502,
                 detail=f'rhapsody submit failed on '

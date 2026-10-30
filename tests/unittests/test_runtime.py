@@ -946,3 +946,35 @@ def test_emit_oversized_event_stays_lenient(harness):
                         data={'x': 'y' * 128 * 1024})
     a._emit(ev)                                    # must not raise
     assert a.call('broker', 'GET', '/nope').status_code in (404, 503)
+
+
+def test_call_not_sent_fails_fast_as_request_not_sent(harness, monkeypatch):
+    """A request that provably never left -- transport down, unpackable --
+    raises ``RequestNotSent`` at once instead of waiting out the timeout."""
+    from radical.orbit import protocol
+    make_broker, make_runtime = harness
+    srv = make_broker()
+    a = make_runtime(srv.url, name='epA', plugins=['echo_rt'])
+    assert a.wait_registered(timeout=5.0)
+    b = make_runtime(srv.url, name='epB')
+    assert _wait_topology(b, 'epA', 'echo_rt', timeout=5.0)
+
+    outbox    = b._outbox
+    b._outbox = None                                 # transport not up
+    try:
+        t0 = time.time()
+        with pytest.raises(protocol.RequestNotSent, match='not up'):
+            b.call('epA', 'GET', '/echo_rt/ping', timeout=30.0)
+        assert time.time() - t0 < 1.0
+        assert b._pending == {}
+    finally:
+        b._outbox = outbox
+
+    def _bad_pack(msg):
+        raise protocol.ProtocolError('failed to pack')
+
+    monkeypatch.setattr(b, '_pack', _bad_pack)
+    with pytest.raises(protocol.RequestNotSent, match='failed to pack'):
+        b.call('epA', 'GET', '/echo_rt/ping', timeout=30.0)
+    monkeypatch.undo()
+    assert b.call('epA', 'GET', '/echo_rt/ping').status_code == 200

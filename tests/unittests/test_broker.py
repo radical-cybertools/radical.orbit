@@ -1084,3 +1084,20 @@ async def test_dispatch_to_host_oversized_response_is_500(make_broker,
     assert msg.status  == 500
     assert msg.corr_id == 'c9'
     assert msg.dst     == 'e1'
+
+
+@pytest.mark.asyncio
+async def test_broker_call_unsent_raises_request_not_sent(make_broker):
+    """Unknown dst and the in-flight cap fail before anything is sent:
+    ``RequestNotSent`` (still a ``RuntimeError``, as before)."""
+    broker = make_broker(call_cap=0)
+    await broker.startup()
+    try:
+        with pytest.raises(protocol.RequestNotSent, match='at cap'):
+            await broker.caller.call('e2', 'GET', '/p', timeout=5.0)
+        broker._call_cap = 8
+        with pytest.raises(protocol.RequestNotSent, match='unknown'):
+            await broker.caller.call('nope', 'GET', '/p', timeout=5.0)
+        assert issubclass(protocol.RequestNotSent, RuntimeError)
+    finally:
+        await broker.shutdown()

@@ -12,9 +12,9 @@ WebSocket **unchanged**:
 * :class:`_RuntimeHTTP` — a minimal ``httpx.Client``-shaped adapter bound to
   ``(runtime, dst)`` installed as the helper's ``self._http``.  Its verbs are
   sync (user-thread callers); each rides ``EndpointRuntime.call``.
-* :func:`transport_max_body` / :func:`pack_batches` — the request-body
-  budget of a transport, and the byte-bounded split of a list into msgpack
-  bodies that fit it.
+* :func:`max_body_of` / :func:`pack_batches` — the request-body limit of
+  a transport, and the byte-bounded split of a list into msgpack bodies
+  that fit it.
 
 ``EndpointRuntime.get_plugin`` constructs a helper directly with a
 :class:`_RuntimeHTTP` transport and ``broker_client=`` the runtime itself, so the
@@ -53,29 +53,22 @@ class PayloadTooLarge(RuntimeError):
 
 
 def max_body_of(holder) -> int:
-    """Return the request-body limit of a frame-cap *holder*.
+    """Return the request-body limit of a transport or frame-cap *holder*.
 
-    The holder (an :class:`~radical.orbit.runtime.EndpointRuntime` or the
-    broker's ``BrokerCaller``) publishes its cap as ``frame_cap``; anything
-    else gets the protocol default.
+    One lookup for every caller: a transport's own ``max_body`` (the
+    runtime and broker-caller transports), else a holder's published
+    ``frame_cap`` (``EndpointRuntime``, ``BrokerCaller``) through
+    :func:`protocol.max_body`, else the protocol default — which is what a
+    plain httpx client (gateway HTTP) gets, and what the gateway enforces
+    on its ingress.
     """
+    val = getattr(holder, 'max_body', None)
+    if isinstance(val, int) and val > 0:
+        return val
     cap = getattr(holder, 'frame_cap', None)
     if not (isinstance(cap, int) and cap > 0):
         cap = protocol.FRAME_CAP
     return protocol.max_body(cap)
-
-
-def transport_max_body(http) -> int:
-    """Return the request-body budget of the plugin-client transport *http*.
-
-    The runtime and broker-caller transports report the budget of their own
-    frame cap as ``max_body``; a plain httpx client (gateway HTTP) gets the
-    protocol default, which the gateway enforces on its ingress.
-    """
-    val = getattr(http, 'max_body', None)
-    if isinstance(val, int) and val > 0:
-        return val
-    return protocol.max_body(protocol.FRAME_CAP)
 
 
 def pack_batches(items: List[Any], budget: int, limit: int,
@@ -90,8 +83,11 @@ def pack_batches(items: List[Any], budget: int, limit: int,
     when an item cannot fit *limit* (the transport's hard body limit):
     :class:`PayloadTooLarge` names all such items instead.
 
-    Returns an iterator of ``(batch_items, body_bytes)``; the bodies are
-    built lazily, one at a time, so a submission is not held twice.
+    Returns an iterator of ``(batch_items, body_bytes)``.  Memory: the
+    packed parts of *all* items are kept until the last batch is yielded
+    (the up-front size check needs them, and each body is joined from
+    them), alongside the caller's *items*; the bodies themselves are built
+    lazily, so at most one assembled body exists at a time on top of that.
     """
     head  = msgpack.packb({key: []}, use_bin_type=True)[:-1]   # minus [] hdr
     parts = [msgpack.packb(it, use_bin_type=True) for it in items]

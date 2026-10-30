@@ -187,8 +187,9 @@ class BrokerCaller:
                    timeout: Optional[float]          = None) -> Dict[str, Any]:
         """Send a ``request`` to *dst* and await its ``response`` (as a dict).
 
-        Raises ``RuntimeError`` immediately when broker-originated in-flight
-        calls are at the cap, or on an unroutable ``dst``; raises
+        Raises ``protocol.RequestNotSent`` (a ``RuntimeError``) immediately
+        when broker-originated in-flight calls are at the cap, or on an
+        unroutable ``dst``; raises
         ``asyncio.TimeoutError`` if *timeout* elapses first.  A request too
         large for the frame cap is answered with a 413 dict, nothing sent.
         """
@@ -882,7 +883,7 @@ class Broker:
         # Cap on broker-originated calls — overflow raises at the caller.
         n_broker = sum(1 for c in self._calls.values() if c.future is not None)
         if n_broker >= self._call_cap:
-            raise RuntimeError(
+            raise protocol.RequestNotSent(
                 f"broker in-flight calls at cap ({self._call_cap}): too many "
                 "broker-originated calls")
 
@@ -891,7 +892,7 @@ class Broker:
         corr_id = req.corr_id
         target  = self.registry.get(dst)
         if target is None:
-            raise RuntimeError(f"endpoint {dst!r} unknown")
+            raise protocol.RequestNotSent(f"endpoint {dst!r} unknown")
 
         # An oversized request is answered with a 413 like every other
         # transport (runtime ``_call``, gateway ingress), not raised raw.

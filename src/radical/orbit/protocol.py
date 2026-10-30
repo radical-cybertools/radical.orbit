@@ -78,6 +78,17 @@ class FrameTooLarge(ProtocolError):
     """Raised by ``pack_message`` when the packed frame exceeds the cap."""
 
 
+class RequestNotSent(RuntimeError):
+    """A call failed before its request frame left this process.
+
+    Raised by the call transports (``EndpointRuntime.call``, the broker
+    caller) when the request provably never reached the wire: unknown
+    destination, in-flight cap, transport not up, unpackable request.  The
+    callee cannot have seen it, so a retry is safe.  A ``RuntimeError``, as
+    those failures were before.
+    """
+
+
 def max_body(cap: int = FRAME_CAP) -> int:
     """Return the largest ``body`` a request/response frame under *cap* fits.
 

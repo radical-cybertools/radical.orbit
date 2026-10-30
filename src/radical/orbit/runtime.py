@@ -752,13 +752,17 @@ class EndpointRuntime(PluginHostBase):
         """Pack an envelope against this runtime's frame cap (may raise)."""
         return protocol.pack_message(msg, cap=self._frame_cap)
 
-    def _enqueue(self, data: bytes, kind: str) -> None:
-        """Hand a packed frame to the transport loop (thread-safe)."""
+    def _enqueue(self, data: bytes, kind: str) -> bool:
+        """Hand a packed frame to the transport loop (thread-safe).
+
+        Returns whether the frame was queued (False: transport not up).
+        """
         loop = self._transport_loop
         if loop is None or self._outbox is None:
             log.warning("[Runtime] dropping %s: transport not up yet", kind)
-            return
+            return False
         loop.call_soon_threadsafe(self._outbox.put_nowait, data)
+        return True
 
     # ── inbound dispatch (work loop) ───────────────────────────────────
 
@@ -882,9 +886,16 @@ class EndpointRuntime(PluginHostBase):
                 413, {'content-type': 'application/json'},
                 error_body(413, f"request body of {len(body or b'')} bytes "
                                 f"too large for {dst!r}: {e}"))
+        except protocol.ProtocolError as e:
+            raise protocol.RequestNotSent(
+                f"request to {dst!r} not sent: {e}") from e
         fut = self._work_loop.create_future()
         self._pending[req.corr_id] = fut
-        self._enqueue(data, req.kind)
+        if not self._enqueue(data, req.kind):
+            # never queued: fail now, not after the call timeout
+            self._pending.pop(req.corr_id, None)
+            raise protocol.RequestNotSent(
+                f"request to {dst!r} not sent: transport not up")
         try:
             resp = await asyncio.wait_for(fut, timeout=timeout)
         except Exception:

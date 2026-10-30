@@ -377,6 +377,27 @@ async def test_submit_tasks():
     assert data[0]['uid'] == 'task.000001'
 
 
+@pytest.mark.asyncio
+async def test_submit_validates_whole_request_before_any_chunk():
+    """A validation error in a later 4096-task chunk is a 400 with nothing
+    submitted: the client may treat a 400 as 'no task of it was taken'."""
+    _, plugin, client = _make_plugin()
+    sid = _register(client, plugin)
+    session = plugin._sessions[sid]
+    session._rh_session = MagicMock()
+    session._rh_session.submit_tasks = AsyncMock()
+
+    tasks = [{"executable": "/bin/true", "uid": f"task.{i:06d}"}
+             for i in range(4097)]
+    tasks[-1] = {"function": "no_such_module_xyz:fn", "uid": "task.bad"}
+    resp = client.post(f"{plugin.namespace}/submit/{sid}",
+                       json={"tasks": tasks})
+    assert resp.status_code == 400
+    assert 'cannot resolve function' in resp.json()['detail']
+    session._rh_session.submit_tasks.assert_not_called()
+    assert session._tasks == {}
+
+
 # ---------------------------------------------------------------------------
 # Wait tasks
 # ---------------------------------------------------------------------------
@@ -2861,10 +2882,69 @@ def test_submit_partial_ambiguous_batch_is_uncertain(kind):
     assert err.uncertain == second
     assert err.rejected  == [td['uid']
                              for td in tasks[len(first) + len(second):]]
-    if kind == '5xx':
-        assert err.status_code == 503
+    # an unreadable ack on a 200 reports no error status, not 200
+    assert err.status_code == {'5xx': 503, 'timeout': None,
+                               'badjson': None}[kind]
     # the endpoint may run the uncertain ones: they stay waitable
     assert client._submitted == set(first) | set(second)
+
+
+@pytest.mark.parametrize('status,fate', [(400, 'rejected'),
+                                         (413, 'rejected'),
+                                         (422, 'rejected'),
+                                         (404, 'uncertain'),
+                                         (409, 'uncertain'),
+                                         (410, 'uncertain')])
+def test_submit_partial_only_validation_4xx_rejects(status, fate):
+    """400/413/422 are refused before the endpoint submits any task of the
+    request; other 4xx (e.g. 410 'session is closing') can come mid-submit."""
+    tasks       = _tasks(200, pad=100)
+    http        = _RecordingHTTP(max_body=8 * 1024, fail_at=1,
+                                 fail_status=status)
+    client, err = _partial(http, tasks)
+    second = [td['uid'] for td in _sent_tasks(http.bodies[1])]
+    assert err.status_code == status
+    if fate == 'rejected':
+        assert err.uncertain == []
+        assert err.rejected[:len(second)] == second
+        assert not set(second) & client._submitted
+    else:
+        assert err.uncertain == second
+        assert set(second) <= client._submitted
+
+
+def test_submit_partial_request_not_sent_is_rejected():
+    """A transport that provably never sent the request (unknown dst,
+    in-flight cap, transport down) rejects the batch: no guessing."""
+    from radical.orbit.protocol import RequestNotSent
+    tasks       = _tasks(200, pad=100)
+    http        = _RecordingHTTP(max_body=8 * 1024, fail_at=1,
+                                 fail_exc=RequestNotSent('transport not up'))
+    client, err = _partial(http, tasks)
+    second = [td['uid'] for td in _sent_tasks(http.bodies[1])]
+    assert err.status_code is None
+    assert err.uncertain   == []
+    assert err.rejected[:len(second)] == second
+    assert client._submitted == set(err.accepted)
+
+
+def test_wait_poll_raises_for_uid_withdrawn_meanwhile():
+    """The poll fallback (no SSE) raises for a uid a concurrently failing
+    submit withdrew, instead of returning the endpoint's shorter list."""
+    from radical.orbit.runtime_client import RuntimeResponse
+
+    client = _rh_client(MagicMock())
+    client._submitted.update({'t.a', 't.b'})
+
+    def _post(url, json=None, **kw):
+        with client._cond:                 # the failing submit withdraws
+            client._submitted.discard('t.b')
+        return RuntimeResponse(
+            200, {}, b'[{"uid": "t.a", "state": "DONE"}]')
+
+    client._http.post = _post
+    with pytest.raises(ValueError, match='rejected by a failed submit'):
+        client.wait_tasks(['t.a', 't.b'], timeout=5)
 
 
 def test_submit_first_batch_failure_rejects_everything():
