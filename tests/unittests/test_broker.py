@@ -15,6 +15,8 @@ import asyncio
 import threading
 import time
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from starlette.websockets import WebSocketDisconnect
@@ -509,6 +511,60 @@ async def test_event_seq_stamping_session_and_global(make_broker):
         assert global_seq  == [0, 1]
     finally:
         await broker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_event_session_seq_keyed_by_src_plugin_session(make_broker):
+    """The session seq is numbered per (src, plugin, session): two plugins'
+    'default' sessions and one sid on two endpoints are independent."""
+    broker = make_broker()
+    await broker.startup()
+    try:
+        cons = FakeWS()
+        await _register(broker, 'c1', cons)
+        broker._events.update_subscription('c1', {'patterns': [{}]}, True)
+        cons.sent.clear()
+
+        for src, plugin, sid in [('e1', 'psij', 'default'),
+                                 ('e1', 'rh',   'default'),
+                                 ('e1', 'psij', 'default'),
+                                 ('e1', 'rh',   'sid-x'),
+                                 ('e2', 'rh',   'sid-x'),
+                                 ('e1', 'rh',   'sid-x')]:
+            await broker._route_frame(
+                src, _event_bytes(src, plugin, 't', session=sid))
+        await asyncio.sleep(0.02)
+
+        got = [(e.src, e.plugin, e.session, e.seq) for e in cons.msgs()]
+        assert got == [('e1', 'psij', 'default', 0),
+                       ('e1', 'rh',   'default', 0),
+                       ('e1', 'psij', 'default', 1),
+                       ('e1', 'rh',   'sid-x',   0),
+                       ('e2', 'rh',   'sid-x',   0),
+                       ('e1', 'rh',   'sid-x',   1)]
+    finally:
+        await broker.shutdown()
+
+
+def test_event_session_seq_table_bounded():
+    """The per-session seq table is LRU-bounded; a pruned stream restarts."""
+    from radical.orbit.broker_events import EventRouter
+
+    router = EventRouter({}, lambda *a: None, MagicMock(), 8,
+                         lambda: None)
+    router._session_seq_max = 3
+
+    def _seq(sid):
+        raw = {'kind': 'event', 'plugin': 'p', 'topic': 't',
+               'session': sid, 'data': {}}
+        router.ingest('e1', raw)
+        return raw['seq']
+
+    assert [_seq('a'), _seq('b'), _seq('a'), _seq('c')] == [0, 0, 1, 0]
+    assert _seq('d') == 0                     # evicts 'b' (least recent)
+    assert len(router._session_seq) == 3
+    assert _seq('a') == 2                     # 'a' was kept (recently used)
+    assert _seq('b') == 0                     # 'b' restarts
 
 
 @pytest.mark.asyncio

@@ -317,10 +317,22 @@ Pass ``with_meta=True`` to also receive the broker-stamped envelope metadata —
 the callback is then invoked as ``(endpoint, plugin, topic, data, meta)`` where
 ``meta = {'seq': int, 'ts': float, 'session': str | None}``.  The ``seq`` is the
 authoritative broker sequence number, which lets live delivery deduplicate
-against the ``replay`` plugin's retained stream:
+against the ``replay`` plugin's retained stream.  The broker numbers each
+session's events on their own — per ``(endpoint, plugin, session)`` — and the
+session-less events globally, so ``seq`` alone is not unique: dedup on
+``(endpoint, plugin, meta['session'], meta['seq'])``.  The replay plugin keeps
+session events per ``(endpoint, plugin, session)`` too
+(``replay_iter(session=..., endpoint=..., plugin=...)``); its global ring holds
+only session-less events.
 
 ```python
+seen = set()
+
 def on_job_status(endpoint, plugin, topic, data, meta):
+    key = (endpoint, plugin, meta['session'], meta['seq'])
+    if key in seen:
+        return
+    seen.add(key)
     print(meta['seq'], data['state'])
 
 rt.register_callback(endpoint_id='my-endpoint', plugin_name='psij',

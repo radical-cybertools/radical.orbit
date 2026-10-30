@@ -119,10 +119,10 @@ def test_retention_session_vs_global_split():
     p._on_event(_ev(0, session='s2'))
 
     assert p._global.stats()['retained'] == 3
-    assert p._session_buffers['s1'].stats()['retained'] == 2
-    assert p._session_buffers['s2'].stats()['retained'] == 1
+    assert p._session_buffers[('ep', 'rh', 's1')].stats()['retained'] == 2
+    assert p._session_buffers[('ep', 'rh', 's2')].stats()['retained'] == 1
     # session buffers are isolated: s2 is not in s1's bookkeeping.
-    assert set(p._session_buffers) == {'s1', 's2'}
+    assert set(p._session_buffers) == {('ep', 'rh', 's1'), ('ep', 'rh', 's2')}
 
 
 def test_non_event_and_seqless_ignored():
@@ -143,15 +143,15 @@ def test_age_eviction_and_dropped_counter():
 
     p._on_event(_ev(0, session='s', ts=1000.0))
     p._on_event(_ev(1, session='s', ts=1000.0))
-    assert p._session_buffers['s'].stats()['retained'] == 2
+    assert p._session_buffers[('ep', 'rh', 's')].stats()['retained'] == 2
 
     # jump past the age bound and force a lazy sweep
-    buf = p._session_buffers['s']
+    buf = p._session_buffers[('ep', 'rh', 's')]
     clock['t'] = 1000.0 + 601.0
     p._evict_aged(clock['t'])
     # A fully-aged per-session buffer is pruned so a long-lived broker does not
     # accumulate empty buffers forever (the counters live on the dropped ref).
-    assert 's' not in p._session_buffers
+    assert ('ep', 'rh', 's') not in p._session_buffers
     st = buf.stats()
     assert st['retained'] == 0
     assert st['dropped']  == 2
@@ -169,7 +169,7 @@ def test_stats_shape():
                       'highest_seq'}
     assert g['lowest_seq'] == 5 and g['highest_seq'] == 7
     assert g['retained'] == 2 and g['bytes'] > 0
-    assert st['sessions']['s']['retained'] == 1
+    assert st['sessions']['ep/rh/s']['retained'] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -198,10 +198,10 @@ def test_size_eviction_per_session_isolated():
     for i in range(1):
         p._on_event(_ev(i, session='s2'))
     # s1 is chatty and self-evicts; s2 keeps its single event untouched.
-    assert p._session_buffers['s1'].stats()['dropped']  == 2
-    assert p._session_buffers['s1'].stats()['retained'] == 2
-    assert p._session_buffers['s2'].stats()['dropped']  == 0
-    assert p._session_buffers['s2'].stats()['retained'] == 1
+    assert p._session_buffers[('ep', 'rh', 's1')].stats()['dropped']  == 2
+    assert p._session_buffers[('ep', 'rh', 's1')].stats()['retained'] == 2
+    assert p._session_buffers[('ep', 'rh', 's2')].stats()['dropped']  == 0
+    assert p._session_buffers[('ep', 'rh', 's2')].stats()['retained'] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +312,7 @@ def test_gap_true_after_eviction():
     p = _make_plugin(session_max_age=10 ** 9, session_max_bytes=two)
     for i in range(5):
         p._on_event(_ev(i, session='s'))
-    buf = p._session_buffers['s']
+    buf = p._session_buffers[('ep', 'rh', 's')]
     assert buf.lowest_seq == 3 and buf.stats()['dropped'] == 3
 
     # a fresh after_seq=-1 sits below the lowest retained seq -> gap
@@ -341,7 +341,7 @@ def test_gap_reported_on_empty_buffer_after_full_eviction():
     r = _run(p._route_fetch(_shim({'session': 's', 'after_seq': -1})))
     assert r['events'] == []
     assert r['gap'] is True                    # last_dropped_seq (1) > -1
-    assert p._session_buffers['s'].last_dropped_seq == 1
+    assert p._session_buffers[('ep', 'rh', 's')].last_dropped_seq == 1
 
 
 def test_no_gap_on_contiguous_stream():
@@ -356,6 +356,62 @@ def test_fetch_unknown_session_empty_no_gap():
     p = _make_plugin()
     r = _run(p._route_fetch(_shim({'session': 'ghost'})))
     assert r['events'] == [] and r['gap'] is False
+
+
+def test_session_buffers_keyed_by_src_plugin_session():
+    """Two plugins' 'default' sessions and one sid on two endpoints get
+    independent buffers; a fetch names the endpoint and plugin."""
+    p = _make_plugin()
+    p._on_event(_ev(0, session='default', plugin='psij'))
+    p._on_event(_ev(0, session='default', plugin='rh'))
+    p._on_event(_ev(1, session='default', plugin='rh'))
+    p._on_event(_ev(0, session='sid-x', src='ep1'))
+    p._on_event(_ev(0, session='sid-x', src='ep2'))
+    assert set(p._session_buffers) == {('ep',  'psij', 'default'),
+                                       ('ep',  'rh',   'default'),
+                                       ('ep1', 'rh',   'sid-x'),
+                                       ('ep2', 'rh',   'sid-x')}
+
+    r = _run(p._route_fetch(_shim({'session': 'default', 'endpoint': 'ep',
+                                   'plugin': 'rh'})))
+    assert [(e['plugin'], e['seq']) for e in r['events']] \
+        == [('rh', 0), ('rh', 1)]
+    r = _run(p._route_fetch(_shim({'session': 'sid-x', 'endpoint': 'ep2'})))
+    assert [e['src'] for e in r['events']] == ['ep2']
+
+    # the sid alone is ambiguous here: rejected rather than mixed
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc:
+        _run(p._route_fetch(_shim({'session': 'sid-x'})))
+    assert exc.value.status_code == 400
+
+    st = _run(p._route_stats(_shim({})))
+    assert set(st['sessions']) == {'ep/psij/default', 'ep/rh/default',
+                                   'ep1/rh/sid-x', 'ep2/rh/sid-x'}
+
+
+def test_dedup_recipe_on_src_plugin_session_seq():
+    """The splice recipe keys its seen-set on (src, plugin, session, seq):
+    equal seqs of different streams are all kept, re-reads are dropped."""
+    p = _make_plugin()
+    for src in ('ep1', 'ep2'):
+        for i in range(3):
+            p._on_event(_ev(i, session='s', src=src))
+    c = _client(p)
+
+    seen, handled = set(), []
+    for _ in range(2):                          # second pass re-reads all
+        for src in ('ep1', 'ep2'):
+            for e in c.replay_iter(session='s', endpoint=src, plugin='rh'):
+                key = (e['src'], e['plugin'], e['session'], e['seq'])
+                if key in seen:
+                    continue
+                seen.add(key)
+                handled.append(key)
+    assert len(handled) == 6
+    assert sorted(handled) == sorted((src, 'rh', 's', i)
+                                     for src in ('ep1', 'ep2')
+                                     for i in range(3))
 
 
 # ---------------------------------------------------------------------------
