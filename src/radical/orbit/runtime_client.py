@@ -120,9 +120,10 @@ class _RuntimeHTTP:
                         params=params, headers=headers, timeout=timeout)
 
     def request(self, method: str, url: str, *, json=None, content=None,
-                data=None, params=None, headers=None, **kw) -> RuntimeResponse:
+                data=None, params=None, headers=None, timeout=None, **kw
+                ) -> RuntimeResponse:
         return self._do(method, url, json=json, content=content, data=data,
-                        params=params, headers=headers)
+                        params=params, headers=headers, timeout=timeout)
 
     def _do(self, method, url, json=None, content=None, data=None,
             params=None, headers=None, timeout=None) -> RuntimeResponse:

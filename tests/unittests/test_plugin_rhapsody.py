@@ -2963,6 +2963,14 @@ class _SessionHTTP:
                 return self._resp(e.status_code, {'detail': e.detail})
         return self._resp(200, body)
 
+    def get(self, url, **kwargs):
+        uid = url.rsplit('/', 1)[-1]
+        try:
+            body = asyncio.run(self.session.get_task(uid))
+        except HTTPException as e:
+            return self._resp(e.status_code, {'detail': e.detail})
+        return self._resp(200, body)
+
     @staticmethod
     def _resp(status, body):
         resp = MagicMock()
@@ -3600,7 +3608,7 @@ def test_all_topics_callbacks_go_through_the_fan_out():
         assert _until(lambda: len(got) == 2)    # live ones first
         client._redeliver('sid-rh', [{'uid': 't.1', 'state': 'DONE'},
                                      {'uid': 't.2', 'state': 'DONE'}],
-                          threading.Event())
+                          threading.Event(), None)
         assert _until(lambda: len(got) == 3)
         time.sleep(0.05)
         assert sorted(got, key=str) == sorted([
@@ -3702,16 +3710,16 @@ def test_reconcile_chunks_by_bytes_and_splits_on_413():
     try:
         from radical.orbit.plugin_rhapsody import NOTIFY_BATCH_BYTES
         assert all(_task_states_fits(c, NOTIFY_BATCH_BYTES // 2)
-                   for c in client._uid_chunks(uids))
-        client._states_limit = 32 * 1024       # client: assumes more
-        assert len(client._uid_chunks(uids)) == 1
+                   for c in client._uid_chunks('sid-bytes', uids))
+        client._states_budget = 64 * 1024      # client: assumes more
+        assert len(client._uid_chunks('sid-bytes', uids)) == 1
         _track(client, uids)
         client._reconcile_wake.set()
         assert len(client.wait_tasks(uids, timeout=10)) == 60
         assert len(http.threads) > 2           # 413s, then split calls
         # learned: the next pass sizes its requests to what was accepted
         assert all(_task_states_fits(c, session._frame_budget())
-                   for c in client._uid_chunks(uids))
+                   for c in client._uid_chunks('sid-bytes', uids))
     finally:
         client.close()
         rt._cb.stop()
@@ -3946,7 +3954,7 @@ def test_failed_chunk_does_not_abort_the_pass_and_retries_soon():
     rt      = _FakeRuntime()
     rt._cb.start()
     client, http = _reconciling_client(rt, session)
-    client._states_limit = _uid_bytes_for(uids[:2])    # 3 chunks
+    client._states_budget = 2 * _uid_bytes_for(uids[:2])   # 3 chunks
     client._reconcile_retry = 0.05
     orig, calls = http.post, []
 
@@ -4068,6 +4076,190 @@ def test_close_unregisters_after_the_session_close():
     client.close()
     assert got == [('task_status', 'CANCELED')]
     assert rt.callbacks == []
+
+
+
+# ---------------------------------------------------------------------------
+# Code-review round 4
+# ---------------------------------------------------------------------------
+
+def test_state_never_goes_backwards_within_a_frame():
+    """A non-terminal item of a task with a terminal item in the same frame
+    is dropped, before or after it; the endpoint stops sending
+    intermediate changes once a task was notified terminal."""
+    client = _sse_client(MagicMock(), rt=_FakeRuntime())
+    got = []
+    client.register_notification_callback(
+        lambda e, p, t, d: got.extend((x['uid'], x['state'])
+                                      for x in d['tasks']),
+        topic='task_status_batch')
+    client._fan_out('ep', 'rhapsody', 'task_status_batch', {
+        'sid': 'sid-rh', 'tasks': [
+            {'uid': 't.1', 'state': 'DONE'}, {'uid': 't.1', 'state': 'RUNNING'},
+            {'uid': 't.2', 'state': 'RUNNING'}, {'uid': 't.2', 'state': 'FAILED'},
+            {'uid': 't.3', 'state': 'RUNNING'}]})
+    assert got == [('t.1', 'DONE'), ('t.2', 'FAILED'), ('t.3', 'RUNNING')]
+
+    session = RhapsodySession('test.backwards')
+    session._notified_states = {}
+    session._notified_lock   = threading.Lock()
+    queued = []
+    session._queue_notification = queued.append
+    session._mark_terminal('t.9', 'DONE')
+    session._on_task_state_change({'uid': 't.9'}, 'RUNNING')
+    session._on_task_state_change({'uid': 't.8'}, 'DONE')     # via callback
+    session._on_task_state_change({'uid': 't.8'}, 'RUNNING')
+    assert queued == []
+
+
+def test_uncertain_grace_defaults_to_the_call_timeout():
+    """The grace is the runtime's call timeout (the submit's bound)."""
+    from radical.orbit.plugin_rhapsody import RECONCILE_GRACE
+
+    rt = _FakeRuntime()
+    rt._call_timeout = 123.0
+    assert _sse_client(MagicMock(), rt=rt)._uncertain_grace == 123.0
+    assert _sse_client(MagicMock())._uncertain_grace == RECONCILE_GRACE \
+        == 600.0
+
+
+class _PaceClient:
+    _reconcile_idle, _reconcile_idle_max = 1.0, 100.0
+    _reconcile_retry, _reconcile_settle  = 0.5, 0.25
+
+
+def test_pace_backs_off_failing_and_fruitless_passes():
+    """Failing passes back the retry off (from the second on); drop passes
+    that recover nothing double the minimum gap; a recovery resets."""
+    from radical.orbit.plugin_rhapsody import _ReconcilePace
+
+    pace = _ReconcilePace(_PaceClient())
+    pace.passed(0, True, False)
+    assert pace.wait(True) == 0.5
+    pace.passed(0, True, False)
+    pace.passed(0, True, False)
+    assert pace.wait(True) == 2.0
+    pace.passed(0, False, False)
+    assert pace.wait(True) == 0.5 and pace.wait(False) == 2.0
+
+    pace.passed(0, False, True)
+    pace.passed(0, False, True)
+    assert pace.gap == 1.0
+    assert pace.drop_delay() == 0.25           # first: the settle time
+    assert 1.2 < pace.drop_delay() <= 1.25     # then: a gap after it
+    pace.passed(3, False, True)
+    assert pace.gap == 0.25 and pace.wait(False) == 1.0
+
+
+def test_reconcile_stops_for_good_on_404():
+    """An older endpoint (no task_states route) or a gone session: the
+    reconcile thread ends instead of retrying forever."""
+    session = _done_session('sid-404', ['task.x'])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session)
+    http.post = lambda url, json=None, **kw: _SessionHTTP._resp(
+        404, {'detail': 'no route'})
+    try:
+        _track(client, ['task.x'])
+        thread = client._reconcile_thread
+        client._reconcile_wake.set()
+        thread.join(5)
+        assert not thread.is_alive()
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
+def test_task_states_entry_alone_and_too_large():
+    """A first entry that does not fit next to the uid lists is sent
+    alone (earlier unknown uids move to remaining); one exceeding even the
+    frame is reported too_large, and the reconcile fetches it via
+    get_task."""
+    session = _done_session('sid-big', [])
+    session._notify_batch_bytes = 6000         # frame cap 12000
+    session._output_notify_limit = 100_000     # big output tails survive
+    session._tasks['t.mid'] = _output_task('t.mid', 'm' * 7000, '')
+    session._tasks['t.big'] = _output_task('t.big', 'b' * 20000, '')
+
+    body = asyncio.run(session.task_states(['t.u', 't.mid', 't.next']))
+    assert [t['uid'] for t in body['tasks']] == ['t.mid']
+    assert body['unknown'] == [] and body['remaining'] == ['t.u', 't.next']
+
+    body = asyncio.run(session.task_states(['t.big', 't.next']))
+    assert body['tasks'] == [] and body['too_large'] == ['t.big']
+    assert body['remaining'] == ['t.next']
+
+    rt = _FakeRuntime()
+    rt._cb.start()
+    client, _ = _reconciling_client(rt, session)
+    try:
+        _track(client, ['t.big'])
+        client._reconcile_wake.set()
+        done = client.wait_tasks(['t.big'], timeout=5)
+        assert done[0]['state'] == 'DONE'
+        assert len(done[0]['stdout']) == 20000
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
+def test_nothing_is_delivered_after_close():
+    """A recovered event queued before close() is not delivered once the
+    dispatcher gets to it."""
+    session = _done_session('sid-late', ['task.l1'])
+    rt      = _FakeRuntime()                   # dispatcher not started
+    client, _ = _reconciling_client(rt, session)
+    got = []
+    client.register_notification_callback(
+        lambda *a: got.append(a), topic='task_status_batch')
+    _track(client, ['task.l1'])
+    client._reconcile_wake.set()
+    assert _until(lambda: rt._cb._q.qsize() > 0)
+    client.close()
+    rt._cb.start()
+    time.sleep(0.1)
+    assert got == [] and not client._completed
+    rt._cb.stop()
+
+
+@pytest.mark.asyncio
+async def test_notifications_from_another_loop_are_handed_off():
+    """A notification queued on a loop other than the plugin's is handed
+    to the plugin's loop too."""
+    session, _ = _watched_session('test.otherloop')
+    session._plugin._main_loop = asyncio.get_running_loop()
+    flushed_on = []
+    session._plugin._dispatch_notify.side_effect = \
+        lambda topic, data: flushed_on.append(threading.get_ident())
+
+    async def _elsewhere():
+        session._queue_notification({'uid': 't.o', 'state': 'DONE'})
+
+    await asyncio.to_thread(asyncio.run, _elsewhere())
+    for _ in range(50):
+        if flushed_on:
+            break
+        await asyncio.sleep(0.01)
+    assert flushed_on == [threading.get_ident()]
+
+
+def test_all_topics_registration_survives_close_and_reregister():
+    """After close() and a new session, the all-topics registration is
+    made again."""
+    rt     = _FakeRuntime()
+    client = _sse_client(_ack_http(), rt=rt)
+    client.register_notification_callback(lambda *a: None)
+    client._start_task_listener()
+    client.close()
+    assert rt.callbacks == []
+    client._sid = 'sid-again'
+    client._start_task_listener()
+    try:
+        assert sorted(str(t) for t, _ in rt.callbacks) \
+            == ['None', 'task_status', 'task_status_batch']
+    finally:
+        client.close()
 
 
 _TIMERS: list = []
