@@ -41,6 +41,7 @@ ROUTE_LIST_TASKS  = 'list_tasks/{sid}'
 ROUTE_TASK        = 'task/{sid}/{uid}'
 ROUTE_CANCEL      = 'cancel/{sid}/{uid}'
 ROUTE_CANCEL_ALL  = 'cancel_all/{sid}'
+ROUTE_TASK_STATES = 'task_states/{sid}'
 ROUTE_DATA_START     = 'data_start/{sid}'
 ROUTE_DATA_ENDPOINTS = 'data_endpoints/{sid}'
 ROUTE_DATA_SHUTDOWN  = 'data_shutdown/{sid}/{name}'
@@ -1039,6 +1040,41 @@ class RhapsodySession(PluginSession):
                                 detail=f"task {uid} not found")
         return self._sanitize_task(task)
 
+    async def task_states(self, uids: list[str]) -> dict:
+        """
+        Return the current state of each task in *uids*, frame-bounded.
+
+        Each known task is reported with the payload its terminal
+        notification carries (``_notification_payload``: output tails,
+        bounded return value), so a client can recover a lost notification
+        from it.  The payloads are packed within this session's
+        notification byte budget; uids not reached are returned under
+        ``remaining`` for a follow-up call.  Uids this session does not know
+        are listed under ``unknown`` instead of failing the call.
+
+        Returns:
+            dict: ``{"tasks": [...], "remaining": [...], "unknown": [...]}``.
+        """
+        self._check_initialized()
+
+        budget  = self._frame_budget()
+        nbytes  = 0
+        tasks   = []
+        unknown = []
+        for i, uid in enumerate(uids):
+            task = self._tasks.get(uid)
+            if task is None:
+                unknown.append(uid)
+                continue
+            payload = self._notification_payload(task)
+            size    = _payload_size(payload)
+            if tasks and nbytes + size > budget:
+                return {"tasks": tasks, "remaining": uids[i:],
+                        "unknown": unknown}
+            tasks.append(payload)
+            nbytes += size
+        return {"tasks": tasks, "remaining": [], "unknown": unknown}
+
     @_tracked
     async def cancel_task(self, uid: str) -> dict:
         """
@@ -1885,6 +1921,7 @@ class PluginRhapsody(Plugin):
     - GET   /rhapsody/task/{sid}/{uid}       – get single task
     - POST  /rhapsody/cancel/{sid}/{uid}     – cancel single task
     - POST  /rhapsody/cancel_all/{sid}       – cancel all tasks
+    - POST  /rhapsody/task_states/{sid}      – task states (frame-bounded)
     - POST  /rhapsody/data_start/{sid}       – start a data backend
     - GET   /rhapsody/data_endpoints/{sid}   – list data backends
     - POST  /rhapsody/data_shutdown/{sid}/{name} – stop a data backend
@@ -1972,6 +2009,7 @@ class PluginRhapsody(Plugin):
         self.add_route_get (ROUTE_TASK,       self.get_task)
         self.add_route_post(ROUTE_CANCEL,     self.cancel_task)
         self.add_route_post(ROUTE_CANCEL_ALL, self.cancel_all_tasks)
+        self.add_route_post(ROUTE_TASK_STATES, self.task_states)
 
         self.add_route_post(ROUTE_DATA_START,     self.data_start)
         self.add_route_get (ROUTE_DATA_ENDPOINTS, self.data_endpoints)
@@ -2177,6 +2215,17 @@ class PluginRhapsody(Plugin):
     async def cancel_all_tasks(self, request: Request) -> dict:
         sid = request.path_params['sid']
         return await self._forward(sid, RhapsodySession.cancel_all_tasks)
+
+    async def task_states(self, request: Request) -> dict:
+        sid  = request.path_params['sid']
+        data = await request.json()
+        uids = data.get('uids') if isinstance(data, dict) else None
+        if not isinstance(uids, list) or \
+                not all(isinstance(u, str) for u in uids):
+            raise HTTPException(status_code=400,
+                                detail="body needs a list of string 'uids'")
+        return await self._forward(sid, RhapsodySession.task_states,
+                                   uids=uids)
 
     async def data_start(self, request: Request) -> dict:
         sid  = request.path_params['sid']

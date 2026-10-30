@@ -2745,6 +2745,77 @@ def test_client_data_helpers():
 
 
 # ---------------------------------------------------------------------------
+# task_states route — frame-bounded state fetch for lost notifications
+# ---------------------------------------------------------------------------
+
+def _states_session(plugin, client, tasks):
+    sid = _register(client, plugin)
+    session = plugin._sessions[sid]
+    session._rh_session = MagicMock()
+    for t in tasks:
+        session._tasks[t.uid] = t
+    return sid, session
+
+
+def test_task_states_reports_unknown_uids():
+    """Unknown uids are listed, not a 404; known ones carry the payload of
+    their terminal notification."""
+    _, plugin, client = _make_plugin()
+    sid, _ = _states_session(plugin, client, [_done_task("task.k1", 7)])
+
+    resp = client.post(f"{plugin.namespace}/task_states/{sid}",
+                       json={"uids": ["task.k1", "task.nope"]})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["unknown"]   == ["task.nope"]
+    assert body["remaining"] == []
+    assert body["tasks"]     == [{"uid": "task.k1", "state": "DONE",
+                                  "return_value": 7}]
+
+    resp = client.post(f"{plugin.namespace}/task_states/{sid}",
+                       json={"uids": "task.k1"})
+    assert resp.status_code == 400
+
+
+def test_task_states_truncates_output():
+    """Large stdout is cut like in the terminal notification."""
+    _, plugin, client = _make_plugin()
+    sid, session = _states_session(
+        plugin, client, [_output_task("task.big", "x" * 100_000, "")])
+    session._output_notify_limit = 1024
+
+    resp = client.post(f"{plugin.namespace}/task_states/{sid}",
+                       json={"uids": ["task.big"]})
+    task = resp.json()["tasks"][0]
+    assert task["stdout_truncated"] is True
+    assert len(task["stdout"]) <= 1024
+
+
+def test_task_states_splits_large_uid_lists():
+    """Payloads are packed within the frame budget; the rest comes back as
+    ``remaining`` and a follow-up call picks it up."""
+    from radical.orbit.plugin_rhapsody import _payload_size
+
+    _, plugin, client = _make_plugin()
+    tasks = [_output_task(f"task.s{i:02d}", "y" * 300, "") for i in range(20)]
+    sid, session = _states_session(plugin, client, tasks)
+    session._notify_batch_bytes = 2048
+
+    todo, seen, calls = [t.uid for t in tasks], [], 0
+    while todo:
+        resp = client.post(f"{plugin.namespace}/task_states/{sid}",
+                           json={"uids": todo})
+        body = resp.json()
+        assert sum(_payload_size(t) for t in body["tasks"]) \
+            <= session._frame_budget()
+        seen.extend(t["uid"] for t in body["tasks"])
+        todo   = body["remaining"]
+        calls += 1
+    assert calls > 1
+    assert seen == [t.uid for t in tasks]
+
+
+# ---------------------------------------------------------------------------
 # Session scoping of task notifications
 # ---------------------------------------------------------------------------
 

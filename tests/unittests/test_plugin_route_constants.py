@@ -44,6 +44,7 @@ RHAPSODY_ROUTES = [
     ('GET',  '/rhapsody/' + R.ROUTE_TASK.format(sid='sid.def', uid='t.001')),
     ('POST', '/rhapsody/' + R.ROUTE_CANCEL.format(sid='sid.def', uid='t.001')),
     ('POST', '/rhapsody/' + R.ROUTE_CANCEL_ALL.format(sid='sid.def')),
+    ('POST', '/rhapsody/' + R.ROUTE_TASK_STATES.format(sid='sid.def')),
 ]
 
 
