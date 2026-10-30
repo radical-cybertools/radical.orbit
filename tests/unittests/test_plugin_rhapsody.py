@@ -953,6 +953,7 @@ def test_notification_callbacks_fire_in_registration_order():
     rt = EndpointRuntime.__new__(EndpointRuntime)
     rt._callbacks = {}
     rt._cb_lock   = _threading.Lock()
+    rt._session_routed = set()
     rt._name      = 'test-consumer'
     rt._emit      = MagicMock()
 
@@ -3075,6 +3076,7 @@ def test_fan_out_one_runtime_callback_per_topic():
     rt = EndpointRuntime.__new__(EndpointRuntime)
     rt._callbacks = {}
     rt._cb_lock   = _threading.Lock()
+    rt._session_routed = set()
     rt._name      = 'test-consumer'
     rt._emit      = MagicMock()
     queued: list  = []
@@ -3120,6 +3122,40 @@ def test_fan_out_one_runtime_callback_per_topic():
         assert client._fanout['task_status'] == [_backend_cb]
     finally:
         client._stop_reconcile()
+
+
+def test_session_patterns_follow_reregister_and_close():
+    """With broker session routing on, the client's registration subscribes
+    its session at the broker; a session switch subscribes the new one and
+    withdraws the old, and closing withdraws the last."""
+    import threading as _threading
+
+    from radical.orbit.runtime import EndpointRuntime
+
+    rt = EndpointRuntime.__new__(EndpointRuntime)
+    rt._callbacks = {}
+    rt._cb_lock   = _threading.Lock()
+    rt._session_routed = {('ep', 'rhapsody')}
+    rt._name      = 'test-consumer'
+    rt._emit      = MagicMock()
+
+    client = RhapsodyClient(MagicMock(), '/rhapsody', broker_client=rt,
+                            endpoint_id='ep', plugin_name='rhapsody')
+    try:
+        for sid in ('sid-a', 'sid-b'):
+            client._sid = sid
+            client._ensure_fan_out()
+        client._drop_fan_out()
+    finally:
+        client._stop_reconcile()
+
+    sent = [(m.kind, [p.session for p in m.patterns])
+            for m in (c.args[0] for c in rt._emit.call_args_list)]
+    assert sent == [('subscribe',   ['sid-a']),
+                    ('subscribe',   ['sid-b']),
+                    ('unsubscribe', ['sid-a']),
+                    ('unsubscribe', ['sid-b'])]
+    assert rt._callbacks == {}
 
 
 def test_reconcile_after_client_drop():
@@ -3918,6 +3954,7 @@ def _bare_runtime(maxlen=1024):
     rt._name      = 'consumer'
     rt._callbacks = {}
     rt._cb_lock   = threading.Lock()
+    rt._session_routed = set()
     rt._emit      = MagicMock()
     rt._cb        = CallbackDispatcher(maxlen=maxlen)
     return rt
