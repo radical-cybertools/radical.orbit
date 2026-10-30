@@ -907,6 +907,153 @@ def test_subscription_refcounted_per_pattern():
     assert _kinds() == ['Subscribe', 'Unsubscribe']
 
 
+def _outbox_runtime():
+    """A bare runtime whose _emit really packs into an outbox on a loop of
+    its own (no socket)."""
+    from radical.orbit.runtime import EndpointRuntime
+    from radical.orbit import protocol
+    from radical.orbit.runtime_support import CallbackDispatcher
+
+    rt = EndpointRuntime.__new__(EndpointRuntime)
+    rt._name           = 'consumer'
+    rt._callbacks      = {}
+    rt._cb_lock        = threading.Lock()
+    rt._cb             = CallbackDispatcher()
+    rt._frame_cap      = protocol.FRAME_CAP
+    rt._transport_loop = asyncio.new_event_loop()
+    rt._outbox         = asyncio.Queue()
+    rt._sub_epoch      = 0
+    rt._session_routed  = set()
+    rt._session_capable = set()
+    rt._wire_count      = Counter()
+    rt._topology           = {}
+    rt._topology_callbacks = []
+    rt._plugins            = {}
+    rt._topology_ready     = threading.Event()
+    return rt
+
+
+def _drain_outbox(rt):
+    """Run the loop's pending puts, then return the messages the sender
+    would send (it drops subscriptions queued before a resync)."""
+    from radical.orbit import protocol
+    from radical.orbit.runtime import _SUB_KINDS
+    rt._transport_loop.run_until_complete(asyncio.sleep(0))
+    out = []
+    while not rt._outbox.empty():
+        kind, epoch, data = rt._outbox.get_nowait()
+        if kind in _SUB_KINDS and epoch != rt._sub_epoch:
+            continue
+        out.append(protocol.parse_message(data))
+    return out
+
+
+def _apply(router, msgs):
+    for m in msgs:
+        router.update_subscription(
+            'consumer', {'patterns': [p.model_dump() for p in m.patterns]},
+            m.kind == 'subscribe')
+
+
+def test_resync_after_reconnect_holds_each_pattern_once():
+    """Subscribe/unsubscribe frames queued before a (re)connect's resync
+    are dropped (even one whose put is still pending), and the resync
+    sends one subscribe per key: a fresh
+    registration with a queued subscribe ends with exactly one copy, and a
+    subscribe lost before a resume (the broker clears on resume) is
+    restored."""
+    from unittest.mock import MagicMock
+    from radical.orbit.broker_events import EventRouter
+
+    rt = _outbox_runtime()
+    try:
+        router = EventRouter({}, lambda *a: None, MagicMock(), 8,
+                             lambda: None)
+        cb = lambda *a: None                          # noqa: E731
+
+        # connected: key A subscribed and applied at the broker
+        rt.register_callback(endpoint_id='epA', callback=cb)
+        router.clear_subscriptions('consumer')
+        _apply(router, _drain_outbox(rt))
+
+        # disconnected: key B registered, its subscribe queued (or lost)
+        rt.register_callback(endpoint_id='epB', callback=cb)
+        rt._transport_loop.run_until_complete(asyncio.sleep(0))
+
+        # resume: the broker clears, the runtime resyncs
+        router.clear_subscriptions('consumer')
+        rt._resync_subscriptions()
+        _apply(router, _drain_outbox(rt))
+        pats = sorted(p.endpoint for p in router._subscriptions['consumer'])
+        assert pats == ['epA', 'epB']
+
+        # fresh registration with a subscribe still queued: one copy each
+        rt.register_callback(endpoint_id='epC', callback=cb)
+        router.clear_subscriptions('consumer')
+        rt._resync_subscriptions()
+        _apply(router, _drain_outbox(rt))
+        pats = sorted(p.endpoint for p in router._subscriptions['consumer'])
+        assert pats == ['epA', 'epB', 'epC']
+
+        # the last unsubscribe of a key really removes it
+        rt.unregister_callback(endpoint_id='epC', callback=cb)
+        _apply(router, _drain_outbox(rt))
+        pats = sorted(p.endpoint for p in router._subscriptions['consumer'])
+        assert pats == ['epA', 'epB']
+    finally:
+        rt._transport_loop.close()
+
+
+def test_stale_session_subscribe_after_reconnect_holds_one_copy():
+    """A session subscribe queued on the old connection is dropped by the
+    reconnect's resync, which sends the v1 form; the new connection's
+    topology re-scopes it: the broker ends with exactly one copy of the
+    session pattern and no v1 pattern."""
+    from unittest.mock import MagicMock
+    from radical.orbit.broker_events import EventRouter
+
+    rt = _outbox_runtime()
+    try:
+        router = EventRouter({}, lambda *a: None, MagicMock(), 8,
+                             lambda: None)
+        rt._on_topology(_topo_msg(), gen=rt._sub_epoch)
+        cb = lambda *a: None                          # noqa: E731
+        rt.register_callback(endpoint_id='ep', plugin_name='rh', callback=cb,
+                             session='sid-a')         # session form, queued
+        rt._transport_loop.run_until_complete(asyncio.sleep(0))
+
+        router.clear_subscriptions('consumer')        # reconnect
+        rt._resync_subscriptions()
+        sent = _drain_outbox(rt)
+        assert [[p.session for p in m.patterns] for m in sent] == [[None]]
+        _apply(router, sent)
+
+        rt._on_topology(_topo_msg(), gen=rt._sub_epoch)
+        _apply(router, _drain_outbox(rt))
+        assert [p.model_dump() for p in router._subscriptions['consumer']] \
+            == [_SID_A]
+
+        rt.unregister_callback(endpoint_id='ep', plugin_name='rh',
+                               callback=cb, session='sid-a')
+        _apply(router, _drain_outbox(rt))
+        assert router._subscriptions['consumer'] == []
+    finally:
+        rt._transport_loop.close()
+
+
+def test_resync_drops_only_stale_subscriptions():
+    from radical.orbit import protocol
+
+    rt = _outbox_runtime()
+    try:
+        rt.register_callback(endpoint_id='epA', callback=lambda *a: None)
+        rt._emit(protocol.Event(src='consumer', plugin='p', topic='t'))
+        rt._resync_subscriptions()
+        assert [m.kind for m in _drain_outbox(rt)] == ['event', 'subscribe']
+    finally:
+        rt._transport_loop.close()
+
+
 def test_unregister_callback_bound_method():
     """A bound method is a new object on each access: it unregisters by
     equality."""
@@ -947,7 +1094,7 @@ def _topo_runtime():
     rt._topology_callbacks = []
     rt._plugins            = {}
     rt._topology_ready     = threading.Event()
-    rt._conn_gen           = 0
+    rt._sub_epoch          = 0
     return rt
 
 
@@ -1001,9 +1148,9 @@ def test_session_subscription_wildcards_stay_local():
 def test_session_subscription_follows_topology_and_resync():
     """The capability appearing re-scopes registered session callbacks:
     each new wire pattern is subscribed once, each one no registration uses
-    any more unsubscribed once; one still shared stays.  A fresh reconnect
-    resyncs the v1 forms and the next topology re-scopes; a resumed one
-    rebalances the forms the broker kept."""
+    any more unsubscribed once; one still shared stays.  A reconnect (fresh
+    or resumed: the broker clears either way) resyncs the v1 forms and the
+    next topology re-scopes."""
     rt = _topo_runtime()
     rt._on_topology(_topo_msg(ep_caps=False))         # old endpoint
     a1, a2, other = [(lambda *a: None) for _ in range(3)]
@@ -1023,13 +1170,7 @@ def test_session_subscription_follows_topology_and_resync():
                            session='sid-a')
     assert _emitted(rt) == [('unsubscribe', [_PLAIN])]
 
-    rt._resumed = True                                # same broker
-    rt._resync_subscriptions()
-    assert _emitted(rt) == [('subscribe', [_SID_A]),
-                            ('unsubscribe', [_SID_A])]
-
-    rt._resumed = False                               # fresh broker
-    rt._resync_subscriptions()
+    rt._resync_subscriptions()                        # reconnect
     assert _emitted(rt) == [('subscribe', [_PLAIN])]
     rt._on_topology(_topo_msg())
     assert _emitted(rt) == [('subscribe', [_SID_A]),
@@ -1103,16 +1244,16 @@ def test_stale_topology_does_not_rescope_after_resync():
     """A topology frame of the previous connection, processed after the
     reconnect's resync, does not turn session routing back on."""
     rt = _topo_runtime()
-    rt._on_topology(_topo_msg(), gen=rt._conn_gen)
+    rt._on_topology(_topo_msg(), gen=rt._sub_epoch)
     cb = lambda *a: None                              # noqa: E731
     rt.register_callback(endpoint_id='ep', plugin_name='rh', callback=cb,
                          session='sid-a')
-    old_gen = rt._conn_gen
+    old_gen = rt._sub_epoch
     rt._resync_subscriptions()                        # fresh reconnect
     _emitted(rt)
     rt._on_topology(_topo_msg(), gen=old_gen)         # stale frame
     assert _emitted(rt) == [] and rt._session_routed == set()
-    rt._on_topology(_topo_msg(), gen=rt._conn_gen)    # the new broker's
+    rt._on_topology(_topo_msg(), gen=rt._sub_epoch)    # the new broker's
     assert _emitted(rt) == [('subscribe', [_SID_A]),
                             ('unsubscribe', [_PLAIN])]
 

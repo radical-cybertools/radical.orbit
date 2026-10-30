@@ -667,8 +667,7 @@ class XGFabricSession(PluginSession):
                  self._state.phase, self._state.status,
                  [c['name'] for c in self._state.immediate_clusters],
                  [c['name'] for c in self._state.allocate_clusters])
-        if self._plugin:
-            self._plugin._dispatch_notify('workflow_status', asdict(self._state))
+        self.notify('workflow_status', asdict(self._state))
 
     async def _is_endpoint_online(self, cluster: Dict) -> bool:
         """Check if cluster's child endpoint is online."""
@@ -1279,6 +1278,7 @@ class PluginXGFabric(Plugin):
     session_class = XGFabricSession
     client_class = XGFabricClient
     version = '0.1.0'
+    session_events = True       # all its events are session events
 
     ui_config = {
         "icon":            "🌊",

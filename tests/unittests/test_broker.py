@@ -865,6 +865,26 @@ async def test_suspect_then_lost_cascade(make_broker):
 
 
 @pytest.mark.asyncio
+async def test_resume_clears_subscriptions(make_broker):
+    """A resumed registration starts with no patterns: the participant
+    resyncs its full interest set right after."""
+    broker = make_broker()
+    await broker.startup()
+    try:
+        ws1 = FakeWS()
+        await _register(broker, 'e1', ws1)
+        key = protocol.parse_message(ws1.sent[0]).resume_key
+        broker._events.update_subscription('e1', {'patterns': [{}]}, True)
+        await broker._on_socket_drop('e1', ws1, clean=False)
+
+        ok, _ = await _register(broker, 'e1', FakeWS(), resume_key=key)
+        assert ok is True
+        assert broker._events._subscriptions['e1'] == []
+    finally:
+        await broker.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_reregister_cancels_grace(make_broker):
     broker = make_broker()
     await broker.startup()

@@ -73,6 +73,8 @@ from .runtime_support   import CallbackDispatcher
 from .ui_schema         import ui_config_to_dict
 
 
+_SUB_KINDS = ('subscribe', 'unsubscribe')
+
 log = logging.getLogger("radical.orbit.runtime")
 
 # ── Runtime tunables (defaults) ────────────────────────────────────────────
@@ -194,7 +196,7 @@ class EndpointRuntime(PluginHostBase):
         self._name: str = name or ('consumer.%s' % uuid.uuid4().hex[:8])
         self._role_override = role
         self._resume_key: Optional[str] = resume_key
-        self._resumed    = False      # last registration resumed (see resync)
+        self._sub_epoch  = 0          # bumped by each subscription resync
 
         # ── Tunnel ─────────────────────────────────────────────────────
         self._tunnel     = tunnel
@@ -286,12 +288,11 @@ class EndpointRuntime(PluginHostBase):
         # session pattern — emptied on a fresh (not resumed) registration
         # until that broker's topology.  ``_wire_count`` counts registrations
         # per wire pattern ``(endpoint, plugin, topic, session-or-None)``;
-        # ``_conn_gen`` numbers connections, so a topology frame of an
-        # earlier one cannot re-scope after a resync.
+        # topology frames carry the ``_sub_epoch`` of their connection, so
+        # one of an earlier connection cannot re-scope after a resync.
         self._session_capable: set = set()
         self._session_routed:  set = set()
         self._wire_count:  Counter = Counter()
-        self._conn_gen:        int = 0
 
         # rich topology snapshot (name -> {role, plugins, liveness})
         self._topology: Dict[str, Dict[str, Any]] = {}
@@ -700,10 +701,6 @@ class EndpointRuntime(PluginHostBase):
             else:
                 self._set_fatal(f"register rejected: {ack.reason}")
             return False
-        # the broker hands the same key back on a resume (it then keeps this
-        # participant's subscriptions), a new one on a fresh registration
-        self._resumed    = bool(self._resume_key) \
-            and ack.resume_key == self._resume_key
         self._resume_key = ack.resume_key
         log.info("[Runtime] registered as %r (role=%s, plugins=%s)",
                  self._name, self._role(), list(self._plugins))
@@ -734,7 +731,7 @@ class EndpointRuntime(PluginHostBase):
 
     async def _serve_ws(self, ws) -> None:
         sender = asyncio.ensure_future(self._sender(ws))
-        gen    = self._conn_gen         # set by this connection's resync
+        gen    = self._sub_epoch        # set by this connection's resync
         try:
             while not self._stopping:
                 data = await ws.recv()
@@ -752,7 +749,10 @@ class EndpointRuntime(PluginHostBase):
         """Drain the outbound queue onto the socket (transport loop)."""
         try:
             while True:
-                await ws.send(await self._outbox.get())
+                kind, epoch, data = await self._outbox.get()
+                if kind in _SUB_KINDS and epoch != self._sub_epoch:
+                    continue            # queued before a resync: stale
+                await ws.send(data)
         except asyncio.CancelledError:
             return
         except Exception as e:
@@ -769,7 +769,10 @@ class EndpointRuntime(PluginHostBase):
         if loop is None or self._outbox is None:
             log.warning("[Runtime] dropping %s: transport not up yet", msg.kind)
             return
-        loop.call_soon_threadsafe(self._outbox.put_nowait, data)
+        # subscribe/unsubscribe are emitted under ``_cb_lock`` and carry the
+        # resync epoch: the sender drops those queued before a resync
+        loop.call_soon_threadsafe(self._outbox.put_nowait,
+                                  (msg.kind, self._sub_epoch, data))
 
     # ── inbound dispatch (work loop) ───────────────────────────────────
 
@@ -982,10 +985,11 @@ class EndpointRuntime(PluginHostBase):
         By default the callback is invoked as
         ``callback(endpoint, plugin, topic, data)``.  With *with_meta* it is
         invoked as ``callback(endpoint, plugin, topic, data, meta)`` where
-        ``meta = {'seq': int, 'ts': float, 'session': str | None}`` carries the
-        broker-stamped envelope metadata (additive; the wire is unchanged).  The
-        broker ``seq`` is the same authoritative value the replay plugin
-        retains, so live delivery can dedup on it.
+        ``meta = {'seq': int, 'ts': float, 'session': str | None, 'id': str}``
+        carries the broker-stamped envelope metadata (additive; the wire is
+        unchanged).  The broker ``seq`` is the same authoritative value the
+        replay plugin retains, so live delivery can dedup on it; ``id`` is the
+        event's envelope id, the same for every callback the event reaches.
         """
         if callback is None:
             raise ValueError("callback is required")
@@ -1079,7 +1083,7 @@ class EndpointRuntime(PluginHostBase):
                    or {}).get(protocol.BROKER_CAPS) or {})
         routed = capable if bcaps.get('session_events') else set()
         with self._cb_lock:
-            if gen is not None and gen != self._conn_gen:
+            if gen is not None and gen != self._sub_epoch:
                 return                          # an earlier connection's
             flipped = routed ^ self._session_routed
             self._session_capable = capable
@@ -1122,30 +1126,29 @@ class EndpointRuntime(PluginHostBase):
     def _resync_subscriptions(self) -> None:
         """Re-send the full interest set after a (re)connect (state re-sync).
 
-        One pattern per wire pattern.  A fresh registration holds no
-        patterns: they are subscribed, in the v1 form — the broker may be
-        another one now, and an older broker drops the socket on a session
-        pattern — and its first topology re-scopes the session registrations
-        (:meth:`_rescope_sessions`).  A resumed one is with the same broker,
-        which kept its patterns, session ones included: they are subscribed
-        and then unsubscribed once, which leaves one copy and never drops to
-        none in between.  Either way the broker holds each pattern once (the
-        reference count of :meth:`register_callback`), so the final
-        ``unsubscribe`` of a pattern really removes it.
+        One ``subscribe`` per wire pattern, all in the v1 form: the broker
+        starts every registration — fresh or resumed — with no patterns, and
+        it may be another, older one now, which drops the socket on a
+        session pattern.  The new connection's first topology re-scopes the
+        session registrations (:meth:`_rescope_sessions`); topology frames
+        of earlier connections cannot (they carry an older ``_sub_epoch``).
+        The ``subscribe`` / ``unsubscribe`` frames queued before this resync,
+        session ones included, are dropped by the sender (an older
+        ``_sub_epoch`` too), so the broker holds each pattern once (the
+        reference count of :meth:`register_callback`) and the final
+        ``unsubscribe`` of a pattern really removes it.  Events the broker
+        routes between a resume and this resync are not delivered: a
+        consumer that can recover them sees the loss as a ``seq`` gap
+        (rhapsody's reconcile).
         """
         with self._cb_lock:
-            # topology frames of the previous connection must not re-scope
-            self._conn_gen = getattr(self, '_conn_gen', 0) + 1
-            if not getattr(self, '_resumed', False):
-                self._session_routed = set()
+            self._sub_epoch += 1
+            self._session_routed = set()
             self._wire_count = self._count_wire_keys(self._session_routed)
             if not self._wire_count:
                 return
             patterns = self._patterns(self._wire_count)
             self._emit(protocol.Subscribe(src=self._name, patterns=patterns))
-            if getattr(self, '_resumed', False):
-                self._emit(protocol.Unsubscribe(src=self._name,
-                                                patterns=patterns))
 
     def _on_event(self, ev: protocol.Event) -> None:
         endpoint, plugin, topic = ev.src, ev.plugin, ev.topic
@@ -1169,7 +1172,8 @@ class EndpointRuntime(PluginHostBase):
         for cb, with_meta in matched:
             if with_meta:
                 if meta is None:
-                    meta = {'seq': ev.seq, 'ts': ev.ts, 'session': ev.session}
+                    meta = {'seq': ev.seq, 'ts': ev.ts,
+                            'session': ev.session, 'id': ev.id}
                 self._cb.submit(cb, endpoint, plugin, topic, data, meta)
             else:
                 self._cb.submit(cb, endpoint, plugin, topic, data)
