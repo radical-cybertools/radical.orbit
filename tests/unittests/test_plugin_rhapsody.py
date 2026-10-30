@@ -437,13 +437,15 @@ async def test_submit_failure_mid_submit_is_500_and_watches_submitted():
     resp = client.post(f"{plugin.namespace}/submit/{sid}",
                        json={"tasks": tasks})
     assert resp.status_code == 500
-    assert 'after 4096 of 4097' in resp.json()['detail']
+    # the interrupted chunk counts: no rhapsody registry in this mock, so
+    # its task may have reached the backend
+    assert 'after 4097 of 4097' in resp.json()['detail']
     assert len(session._tasks) == 4097     # the interrupted one, too
-    # the submitted chunk is watched; the interrupted one too (its tasks
+    # one watcher: the submitted chunk and the interrupted one (its tasks
     # may have reached the backend: no rhapsody registry in this mock)
     watched = sorted(len(c.args[0])
                      for c in session._watch_batch.call_args_list)
-    assert watched == [1, 4096]
+    assert watched == [4097]
 
 
 @pytest.mark.asyncio
@@ -2968,13 +2970,42 @@ def test_submit_429_is_retried_honouring_retry_after():
     assert http.bodies[2] == http.bodies[1]
 
 
-def test_submit_resend_carries_retry_header():
-    http   = _RecordingHTTP(max_body=8 * 1024, fail_at=1, fail_status=503)
+def test_submit_id_is_per_batch_and_kept_on_resend():
+    from radical.orbit.plugin_rhapsody import SUBMIT_ID_HEADER
+    http = _RecordingHTTP(max_body=8 * 1024, fail_at=1, fail_status=503)
     _rh_client(http).submit_tasks(_tasks(200, pad=100))
-    from radical.orbit.plugin_rhapsody import SUBMIT_RETRY_HEADER
-    assert SUBMIT_RETRY_HEADER not in http.headers[0]
-    assert SUBMIT_RETRY_HEADER not in http.headers[1]
-    assert http.headers[2][SUBMIT_RETRY_HEADER] == '1'
+    ids = [h[SUBMIT_ID_HEADER] for h in http.headers]
+    assert ids[2] == ids[1]                     # the resend of batch 2
+    assert len(set(ids)) == len(http.bodies) - 1  # else one per batch
+
+
+@pytest.mark.parametrize('first,last,refused,not_sent', [
+    ('503', 400, False, False),      # possibly taken first: unconfirmed
+    ('not_sent', 400, True, False),  # nothing reached: a real refusal
+    ('503', 'not_sent', False, False),
+    ('not_sent', 'not_sent', False, True)])
+def test_submit_error_flags_consider_every_attempt(monkeypatch, first, last,
+                                                   refused, not_sent):
+    from radical.orbit import plugin_rhapsody as prh
+    from radical.orbit.protocol import RequestNotSent
+    from radical.orbit.runtime_client import RuntimeResponse
+    monkeypatch.setattr(prh, 'SUBMIT_MAX_RETRIES', 1)
+
+    def _answer(kind):
+        if kind == 'not_sent':
+            raise RequestNotSent('transport not up')
+        return RuntimeResponse(int(kind), {}, b'{"detail": "x"}')
+
+    answers = iter([first, last])
+
+    class _HTTP:
+        max_body = 8 * 1024
+
+        def post(self, url, data=None, headers=None, **kw):
+            return _answer(next(answers))
+
+    client, err = _partial(None, _tasks(3), _rh_client(_HTTP()))
+    assert (err.refused, err.not_sent) == (refused, not_sent)
 
 
 def test_submit_retry_window_follows_transport_call_timeout(monkeypatch):
@@ -3206,6 +3237,26 @@ def test_wait_poll_keeps_waiting_on_a_short_reply(monkeypatch):
     assert http.post.call_count == 3
 
 
+def test_wait_poll_none_found_is_bounded(monkeypatch):
+    """'none of the requested tasks found' means 'not yet' only for a
+    bounded while (the transport's call timeout); then it raises."""
+    import time as _time
+    from radical.orbit import plugin_rhapsody as prh
+    from radical.orbit.runtime_client import RuntimeResponse
+    real_sleep = _time.sleep
+    monkeypatch.setattr(prh.time, 'sleep', lambda s: real_sleep(0.02))
+    http              = MagicMock()
+    http.call_timeout = 0.1
+    http.post         = MagicMock(return_value=RuntimeResponse(
+        404, {}, b'{"detail": "none of the requested tasks found"}'))
+    client = _rh_client(http)
+    client._submitted.add('t.a')
+    with pytest.raises(RuntimeError) as exc:
+        client.wait_tasks(['t.a'], timeout=60)
+    assert exc.value.status_code == 404
+    assert 2 <= http.post.call_count < 50
+
+
 def test_wait_poll_unknown_session_404_raises():
     from radical.orbit.runtime_client import RuntimeResponse
     http      = MagicMock()
@@ -3362,10 +3413,10 @@ async def test_dedup_reservation_released_after_presubmit_failure():
 
 
 @pytest.mark.asyncio
-async def test_dedup_inflight_duplicate_reports_owner_refusal():
+async def test_dedup_inflight_duplicate_takes_over_a_refused_uid():
     """A retry arriving while the original request is still preparing
-    waits for it, then reports the original's refusal -- no blind ack, no
-    hang."""
+    waits for it (no blind ack, no hang); the original is refused and
+    releases the uid untaken, so the retry submits it itself."""
     import time as _time
     session = _dedup_session()
 
@@ -3380,13 +3431,51 @@ async def test_dedup_inflight_duplicate_reports_owner_refusal():
     session._prepare_batch = lambda chunk: [_FakeTask(td) for td in chunk]
     dup   = asyncio.ensure_future(session.submit_tasks([_td('t1'),
                                                         _td('t2')]))
-    for fut in (owner, dup):
-        with pytest.raises(HTTPException) as exc:
-            await asyncio.wait_for(fut, 5)
-        assert exc.value.status_code == 400
-    assert 'cannot resolve function' in exc.value.detail
-    session._rh_session.submit_tasks.assert_not_awaited()
+    with pytest.raises(HTTPException) as exc:
+        await asyncio.wait_for(owner, 5)
+    assert exc.value.status_code == 400
+    acks = await asyncio.wait_for(dup, 5)
+    assert [(a['uid'], a['state']) for a in acks] == \
+        [('t1', 'RUNNING'), ('t2', 'RUNNING')]
+    sent = [t.uid for c in session._rh_session.submit_tasks.await_args_list
+            for t in c.args[0]]
+    assert sorted(sent) == ['t1', 't2']
     assert session._reserved == {}
+
+
+@pytest.mark.asyncio
+async def test_dedup_crossing_requests_do_not_deadlock():
+    """Requests holding each other's uids: each submits its own first,
+    then awaits the others -- all finish, every uid runs once."""
+    async def _slow(tasks):
+        await asyncio.sleep(0.02)
+        for t in tasks:
+            t['state'] = 'RUNNING'
+
+    session = _dedup_session(_slow)
+    reqs    = [['a', 'b'], ['b', 'c'], ['c', 'a'], ['b', 'a']]
+    acks    = await asyncio.wait_for(asyncio.gather(
+        *[session.submit_tasks([_td(u) for u in r]) for r in reqs]), 5)
+    assert [[a['uid'] for a in ack] for ack in acks] == reqs
+    sent = [t.uid for c in session._rh_session.submit_tasks.await_args_list
+            for t in c.args[0]]
+    assert sorted(sent) == ['a', 'b', 'c']
+
+
+@pytest.mark.asyncio
+async def test_duplicate_acks_stay_within_the_frame_budget():
+    session = _dedup_session()
+    session._notify_batch_bytes = 600
+    await session.submit_tasks([_td(f't{i}') for i in range(10)])
+    for i in range(10):
+        session._tasks[f't{i}'].update(state='DONE', exit_code=0,
+                                       stdout='x' * 200)
+    acks = await session.submit_tasks([_td(f't{i}') for i in range(10)])
+    assert all(a['duplicate'] and a['state'] == 'DONE' for a in acks)
+    assert acks[0]['stdout'] == 'x' * 200          # full while room is left
+    assert 'stdout' not in acks[-1]                # then stripped
+    assert acks[-1]['error'] == 'result too large for ack; use get_task'
+    assert acks[-1]['exit_code'] == 0
 
 
 @pytest.mark.asyncio
@@ -3414,24 +3503,28 @@ async def test_dedup_terminal_duplicate_ack_carries_payload():
 
 
 @pytest.mark.asyncio
-async def test_cancel_mid_chunk_fails_unregistered_keeps_registered():
+async def test_cancel_mid_chunk_releases_unregistered_keeps_registered():
     """The handler is cancelled while the backend submit is open.  A task
     the rhapsody session registered may have reached its backend: it stays
     recorded (SUBMITTING) and watched, so a real completion still arrives.
-    One it never registered provably did not: FAILED and notified.  A
-    retry runs nothing twice."""
+    One it never registered provably did not: it is released, and the
+    resend submits it -- nothing runs twice."""
     started = asyncio.Event()
+    calls   = []
 
-    async def _hang(tasks):
-        session._rh_session._tasks['t1'] = tasks[0]   # registered t1 only
-        started.set()
-        await asyncio.Event().wait()
+    async def _backend(tasks):
+        calls.append([t.uid for t in tasks])
+        if len(calls) == 1:
+            session._rh_session._tasks['t1'] = tasks[0]   # registered t1
+            started.set()
+            await asyncio.Event().wait()
+        for t in tasks:
+            t['state'] = 'RUNNING'
 
-    session = _dedup_session(_hang)
+    session = _dedup_session(_backend)
     session._rh_session._tasks  = {}
     session._plugin             = MagicMock()
     session._watch_batch        = AsyncMock()
-    session._queue_notification = MagicMock()
     owner = asyncio.ensure_future(session.submit_tasks([_td('t1'),
                                                         _td('t2')]))
     await started.wait()
@@ -3440,11 +3533,7 @@ async def test_cancel_mid_chunk_fails_unregistered_keeps_registered():
         await owner
     await asyncio.sleep(0)
 
-    assert session._tasks['t2']['state'] == 'FAILED'
-    note = session._queue_notification.call_args.args[0]
-    assert note['uid'] == 't2' and note['state'] == 'FAILED'
-    assert 'submit interrupted' in note['exception']
-    assert 'state' not in session._tasks['t1']           # not failed
+    assert 't2' not in session._tasks                     # released
     assert session._sanitize_task(session._tasks['t1'])['state'] == \
         'SUBMITTING'
     watched = session._watch_batch.call_args.args[0]
@@ -3452,9 +3541,9 @@ async def test_cancel_mid_chunk_fails_unregistered_keeps_registered():
     assert session._reserved == {}
 
     acks = await session.submit_tasks([_td('t1'), _td('t2')])
-    assert session._rh_session.submit_tasks.await_count == 1
-    assert [(a['uid'], a['state'], a['duplicate']) for a in acks] == \
-        [('t1', 'SUBMITTING', True), ('t2', 'FAILED', True)]
+    assert calls == [['t1', 't2'], ['t2']]
+    assert [(a['uid'], a['state'], a.get('duplicate')) for a in acks] == \
+        [('t1', 'SUBMITTING', True), ('t2', 'RUNNING', None)]
 
 
 @pytest.mark.asyncio
@@ -3471,7 +3560,7 @@ async def test_submit_malformed_request_is_400_without_side_effects(tasks):
 
 
 @pytest.mark.asyncio
-async def test_spec_hashes_off_the_loop_and_bounded(monkeypatch):
+async def test_spec_hashed_only_for_duplicates_off_the_loop(monkeypatch):
     import threading
     from radical.orbit import plugin_rhapsody as prh
     monkeypatch.setattr(prh, 'SPEC_MEMORY', 2)
@@ -3485,8 +3574,10 @@ async def test_spec_hashes_off_the_loop_and_bounded(monkeypatch):
     monkeypatch.setattr(prh, '_spec_hash', _spy)
     session = _dedup_session()
     await session.submit_tasks([_td('t1'), _td('t2'), _td('t3')])
+    assert threads == []                           # no duplicate: no hash
+    assert list(session._spec) == ['t2', 't3']     # bounded, newest
+    await session.submit_tasks([_td('t3', arguments=['x'])])
     assert threads and threading.main_thread() not in threads
-    assert list(session._spec) == ['t2', 't3']          # bounded, newest
 
 
 if __name__ == '__main__':

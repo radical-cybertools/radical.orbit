@@ -37,6 +37,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import collections
+import concurrent.futures
+import functools
 import logging
 import math
 import os
@@ -57,7 +59,7 @@ from .plugin_session_base               import PluginSession
 from .plugin_rhapsody                   import (
     RhapsodyClient, RhapsodySession, NOTIFY_BATCH_SIZE,
     _payload_size, _resolve_notify_window, _resolve_frame_cap, BUDGET_RATIO,
-    _submit_batches, PartialSubmitError, SUBMIT_RETRY_HEADER,
+    _submit_batches, PartialSubmitError, SUBMIT_ID_HEADER,
 )
 from .runtime_client                    import PayloadTooLarge, max_body_of, \
                                                call_timeout_of
@@ -180,13 +182,13 @@ _RH_TERMINAL = {
 # Bound on the endpoint-mode attempt memory (oldest forgotten first).
 _ENDPOINT_ATTEMPTS_MAX = 65536
 
+# Bound on the remembered rhapsody-dialect submit ids.
+_SUBMIT_IDS_MAX        = 4096
 
-def _is_submit_retry(request) -> bool:
-    '''Whether a submit request is a client's resend of a batch.'''
-    for k, v in (getattr(request, 'headers', None) or {}).items():
-        if k.lower() == SUBMIT_RETRY_HEADER.lower():
-            return str(v) not in ('', '0')
-    return False
+# rhapsody submits to pilots: retry window, and threads of the dedicated
+# submit pool (endpoint mode derives its window from the relay timeout).
+_POOL_SUBMIT_WINDOW    = 120.0
+_SUBMIT_THREADS        = 8
 
 
 def _rhapsody_uid(task: TaskRecord) -> str:
@@ -568,16 +570,17 @@ class _CallerSyncHTTP:
         return self._timeout or call_timeout_of(self._caller)
 
     def request(self, method: str, url: str, *, json=None, content=None,
-                data=None, params=None, headers=None, **_kw):
+                data=None, params=None, headers=None, timeout=None, **_kw):
         from .runtime_client import (
             _pack_request, unpack_response_dict, RuntimeResponse)
         path, body, hdrs = _pack_request(
             method, url, json=json, content=content, data=data,
             params=params, headers=headers)
+        timeout = self._timeout if timeout is None else timeout
         fut  = self._caller.call_threadsafe(
             self._dst, method, path, body=body, headers=hdrs,
-            timeout=self._timeout)
-        resp = fut.result(self._timeout)
+            timeout=timeout)
+        resp = fut.result(timeout)
         status, rhdrs, rbody = unpack_response_dict(resp)
         return RuntimeResponse(status, rhdrs, rbody)
 
@@ -1102,32 +1105,46 @@ class PluginTaskDispatcher(Plugin):
         # by exactly the rule the topology hook applies.
         self._participants: dict[str, dict] = {}
 
-        # Endpoint-mode task tracking: task_id → target_endpoint_name.
-        # Endpoint mode bypasses pool state — the dispatcher is a transparent
-        # proxy to the target endpoint's rhapsody.  Backed by one atomic
-        # ``endpoint_mode.json`` so an in-flight task survives a broker restart.
-        # The target session sees the task under a namespaced uid (see
-        # ``_endpoint_mode_uid``): task_id → (uid, attempt key), and the
-        # reverse uid → task_id the event tap needs.  A ledger entry written
-        # before namespacing is a bare endpoint name: its uid is the task_id.
+        # Endpoint-mode task tracking, keyed by f'{task_id}.{sid}' (so two
+        # sessions' same task_id never clobber each other): key → target
+        # endpoint, key → (uid the target session sees, task_id), and the
+        # reverse uid → key the event tap needs.  Endpoint mode bypasses
+        # pool state — the dispatcher is a transparent proxy to the target
+        # endpoint's rhapsody.  Backed by one atomic ``endpoint_mode.json``
+        # so an in-flight task survives a broker restart.  Older ledgers
+        # load too: a bare endpoint name keyed by task_id (uid = task_id),
+        # or ``{endpoint, uid, base}`` keyed by task_id.
         self._endpoint_mode_path = self._state_root / 'endpoint_mode.json'
-        self._endpoint_mode_tasks: dict[str, str]               = {}
-        self._endpoint_mode_uids:  dict[str, tuple[str, str]]   = {}
-        self._endpoint_mode_by_uid: dict[str, str]              = {}
-        for task_id, ent in (read_json(self._endpoint_mode_path,
-                                       default={}) or {}).items():
-            if isinstance(ent, dict):
-                self._em_map(task_id, ent.get('endpoint'),
-                             ent.get('uid') or task_id,
-                             ent.get('base') or task_id)
-            else:
-                self._em_map(task_id, ent, task_id, task_id)
+        self._endpoint_mode_tasks:  dict[str, str]             = {}
+        self._endpoint_mode_uids:   dict[str, tuple[str, str]] = {}
+        self._endpoint_mode_by_uid: dict[str, str]             = {}
+        for key, ent in (read_json(self._endpoint_mode_path,
+                                   default={}) or {}).items():
+            if not isinstance(ent, dict):
+                ent = {'endpoint': ent}
+            task_id = ent.get('task_id') or key
+            if 'task_id' not in ent:
+                key = ent.get('base') or key
+            self._em_map(key, ent.get('endpoint'),
+                         ent.get('uid') or task_id, task_id)
         # attempt key → re-executions after FAILED/CANCELED (bounded, in
         # memory: dedup is per target session, and a broker restart starts
         # new sessions anyway)
         self._endpoint_mode_attempts: collections.OrderedDict[str, int] = \
             collections.OrderedDict()
         self._evictions: set = set()           # strong refs: unregister tasks
+
+        # Submit ids (``SUBMIT_ID_HEADER``) of rhapsody-dialect submits
+        # already processed: a resend of one is acked from what it created,
+        # never re-executed (bounded, oldest forgotten first).
+        self._submit_ids: collections.OrderedDict[str, None] = \
+            collections.OrderedDict()
+
+        # rhapsody submits to pilots / endpoints block a thread for up to
+        # their retry window: a dedicated, bounded pool, so they cannot
+        # starve the default executor the rest of the plugin uses.
+        self._submit_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=_SUBMIT_THREADS, thread_name_prefix='td-submit')
 
         # rhapsody-task-uid → (owning_sid, pool_name, task_id) so the event tap
         # can find the right TaskRecord when a pilot reports completion.
@@ -1414,6 +1431,7 @@ class PluginTaskDispatcher(Plugin):
             except Exception:
                 pass
             self._untap = None
+        self._submit_pool.shutdown(wait=False, cancel_futures=True)
         await super().shutdown()
 
     async def _reconcile_overdue_pilots(self, now: float) -> None:
@@ -2066,7 +2084,9 @@ class PluginTaskDispatcher(Plugin):
                 status_code=503,
                 detail=f'rhapsody client unavailable on {target_endpoint}')
 
-        uid, base = self._endpoint_mode_uid(sid, task_id)
+        key   = f'{task_id}.{sid}'
+        prior = key in self._endpoint_mode_tasks   # a resubmit in flight
+        uid   = self._endpoint_mode_uid(key)
         task_dict = {
             'uid'       : uid,
             'executable': cmd[0] if cmd else '',
@@ -2076,14 +2096,16 @@ class PluginTaskDispatcher(Plugin):
         }
         # map before submitting, as in pool mode: the task can finish before
         # the threaded submit call returns
-        self._em_map(task_id, target_endpoint, uid, base)
+        self._em_map(key, target_endpoint, uid, task_id)
         self._persist_endpoint_mode()
         try:
-            result = await asyncio.to_thread(rh.submit_tasks, [task_dict])
+            result = await self._rh_submit(rh, [task_dict],
+                                           self._endpoint_submit_window())
         except Exception as e:
             log.exception('[%s] endpoint-mode submit to %s failed: %s',
                           self.instance_name, target_endpoint, e)
-            if self._em_unmap(task_id):
+            # a failed resubmit never unmaps a still-running original
+            if not prior and self._em_unmap(key):
                 self._persist_endpoint_mode()
             raise self._endpoint_submit_error(target_endpoint, task_id,
                                               e) from e
@@ -2121,17 +2143,20 @@ class PluginTaskDispatcher(Plugin):
         notifications under this plugin's namespace — the same consumer
         contract as plugin_rhapsody.
 
-        A client **retry** (header ``X-Orbit-Submit-Retry``, set by the
-        client on a resend of an unconfirmed batch) is idempotent: a uid
-        the dispatcher already holds is acked as a duplicate in any state,
-        never re-executed.  A fresh submit keeps the documented resubmit
-        semantics (FAILED/CANCELED re-execute).
+        A client **resend** is idempotent: every attempt of a client batch
+        carries the same submit id (``SUBMIT_ID_HEADER``), and a request
+        whose id was processed before acks a uid the dispatcher holds as a
+        duplicate in any state, never re-executing it.  An unseen id is a
+        fresh submit -- also the resend of an attempt that never reached
+        this handler -- with the documented resubmit semantics
+        (FAILED/CANCELED re-execute).
         '''
         sid = request.path_params['sid']
         self._require_known_session(sid)
         data       = await request.json()
         task_dicts = data.get('tasks', [])
-        retry      = _is_submit_retry(request)
+        submit_id  = request.headers.get(SUBMIT_ID_HEADER)
+        retry      = submit_id is not None and submit_id in self._submit_ids
 
         # validate the whole batch before touching any state
         grouped: dict[str, list[tuple]] = {}
@@ -2219,6 +2244,11 @@ class PluginTaskDispatcher(Plugin):
                 pool_state.persist()          # once per pool, not per task
                 self._drain_pending(pool_state)
 
+        if submit_id is not None:
+            self._submit_ids[submit_id] = None
+            self._submit_ids.move_to_end(submit_id)
+            while len(self._submit_ids) > _SUBMIT_IDS_MAX:
+                self._submit_ids.popitem(last=False)
         return acks
 
     async def _route_get_task(self, request: Request) -> dict:
@@ -2228,7 +2258,8 @@ class PluginTaskDispatcher(Plugin):
         task_id = request.path_params['task_id']
 
         # Endpoint mode: forward to the target endpoint's rhapsody.
-        endpoint_name = self._endpoint_mode_tasks.get(task_id)
+        key           = self._em_key(sid, task_id)
+        endpoint_name = self._endpoint_mode_tasks.get(key)
         if endpoint_name is not None:
             rh = await self._get_rhapsody_client(endpoint_name)
             if rh is None:
@@ -2236,8 +2267,7 @@ class PluginTaskDispatcher(Plugin):
                     status_code=503,
                     detail=f'rhapsody client unavailable on {endpoint_name}')
             try:
-                info = await asyncio.to_thread(
-                    rh.get_task, self._em_uid(task_id))
+                info = await asyncio.to_thread(rh.get_task, self._em_uid(key))
             except Exception as e:
                 raise HTTPException(
                     status_code=502,
@@ -2260,7 +2290,8 @@ class PluginTaskDispatcher(Plugin):
         task_id = request.path_params['task_id']
 
         # Endpoint mode: forward cancel to the target endpoint's rhapsody.
-        endpoint_name = self._endpoint_mode_tasks.get(task_id)
+        key           = self._em_key(sid, task_id)
+        endpoint_name = self._endpoint_mode_tasks.get(key)
         if endpoint_name is not None:
             rh = await self._get_rhapsody_client(endpoint_name)
             if rh is None:
@@ -2268,8 +2299,8 @@ class PluginTaskDispatcher(Plugin):
                     status_code=503,
                     detail=f'rhapsody client unavailable on {endpoint_name}')
             try:
-                info = await asyncio.to_thread(
-                    rh.cancel_task, self._em_uid(task_id))
+                info = await asyncio.to_thread(rh.cancel_task,
+                                               self._em_uid(key))
             except Exception as e:
                 raise HTTPException(
                     status_code=502,
@@ -2413,7 +2444,7 @@ class PluginTaskDispatcher(Plugin):
         task_id = request.path_params['task_id']
         body    = await request.json()
 
-        if task_id in self._endpoint_mode_tasks:
+        if self._em_key(sid, task_id) in self._endpoint_mode_tasks:
             raise HTTPException(
                 status_code=400,
                 detail='stage_in/stage_out not supported for '
@@ -2478,7 +2509,7 @@ class PluginTaskDispatcher(Plugin):
         task_id  = request.path_params['task_id']
         filename = request.path_params['filename']
 
-        if task_id in self._endpoint_mode_tasks:
+        if self._em_key(sid, task_id) in self._endpoint_mode_tasks:
             raise HTTPException(
                 status_code=400,
                 detail='stage_in/stage_out not supported for '
@@ -3379,8 +3410,8 @@ class PluginTaskDispatcher(Plugin):
 
         try:
             try:
-                acks = await asyncio.to_thread(rh.submit_tasks,
-                                               [f for _, f in fwds])
+                acks = await self._rh_submit(rh, [f for _, f in fwds],
+                                             _POOL_SUBMIT_WINDOW)
             except PayloadTooLarge as e:
                 # Nothing was sent.  Fail only the tasks no frame carries
                 # and submit their co-claimed peers.
@@ -3397,8 +3428,8 @@ class PluginTaskDispatcher(Plugin):
                 fwds = [(t, f) for t, f in fwds if f['uid'] not in too_big]
                 acks = []
                 if fwds:
-                    acks = await asyncio.to_thread(rh.submit_tasks,
-                                                   [f for _, f in fwds])
+                    acks = await self._rh_submit(rh, [f for _, f in fwds],
+                                                 _POOL_SUBMIT_WINDOW)
             self._mark_dirty(pool_state)
             self._apply_duplicate_acks(acks)
         except Exception as e:
@@ -3470,18 +3501,17 @@ class PluginTaskDispatcher(Plugin):
         # Endpoint-mode tasks: forget the mapping and re-emit the terminal
         # status under the dispatcher's plugin name so consumers filtering on
         # plugin='task_dispatcher' still see the event.
-        task_id = self._endpoint_mode_by_uid.get(uid)
-        if task_id is None and uid in self._endpoint_mode_tasks:
-            task_id = uid                     # a pre-namespacing entry
-        if task_id is not None:
-            base          = self._endpoint_mode_uids.get(task_id,
-                                                         (uid, uid))[1]
-            endpoint_name = self._em_unmap(task_id)
+        key = self._endpoint_mode_by_uid.get(uid)
+        if key is None and uid in self._endpoint_mode_tasks:
+            key = uid                         # mapped without a uid entry
+        if key is not None:
+            task_id       = self._endpoint_mode_uids.get(key, (uid, uid))[1]
+            endpoint_name = self._em_unmap(key)
             self._persist_endpoint_mode()
             if target_state in (TASK_FAILED, TASK_CANCELED):
                 # the target never re-runs a uid: a resubmit re-executes
                 # under the next attempt's uid
-                self._bump_endpoint_mode_attempt(base)
+                self._bump_endpoint_mode_attempt(key)
             self._dispatch_notify('task_status', {
                 'task_id'  : task_id,
                 'endpoint' : endpoint_name,
@@ -3766,61 +3796,81 @@ class PluginTaskDispatcher(Plugin):
             if isinstance(ack, dict) and ack.get('duplicate'):
                 self._on_task_status(ack)      # acts on terminal acks only
 
-    def _endpoint_mode_uid(self, sid: str, task_id: str) -> tuple[str, str]:
-        '''Return ``(uid, attempt key)`` an endpoint-mode task goes out as.
+    def _endpoint_mode_uid(self, key: str) -> str:
+        '''Return the uid an endpoint-mode task (*key*
+        ``f'{task_id}.{sid}'``) goes out as.
 
-        Namespaced like a pool task (``f'{task_id}.{sid}'``), so a task_id
-        reused by another session or process is not taken for a duplicate
-        by the target session, plus ``.{attempt}`` once a previous run of
-        it FAILED or was CANCELED (the target never re-runs a uid).  A task
-        still mapped (a resubmit while in flight) keeps its uid: the target
-        deduplicates it.
+        Namespaced like a pool task, so a task_id reused by another session
+        or process is not taken for a duplicate by the target session, plus
+        ``.{attempt}`` once a previous run of it FAILED or was CANCELED (the
+        target never re-runs a uid).  A task still mapped (a resubmit while
+        in flight) keeps its uid: the target deduplicates it.
         '''
-        base = f'{task_id}.{sid}'
-        uid, mapped_base = self._endpoint_mode_uids.get(task_id, (None, None))
-        if uid is not None and mapped_base == base:
-            return uid, base
-        attempt = self._endpoint_mode_attempts.get(base, 0)
-        return (f'{base}.{attempt}' if attempt else base), base
+        if key in self._endpoint_mode_uids:
+            return self._endpoint_mode_uids[key][0]
+        attempt = self._endpoint_mode_attempts.get(key, 0)
+        return f'{key}.{attempt}' if attempt else key
 
-    def _bump_endpoint_mode_attempt(self, base: str) -> None:
+    def _bump_endpoint_mode_attempt(self, key: str) -> None:
         attempts = self._endpoint_mode_attempts
-        attempts[base] = attempts.get(base, 0) + 1
-        attempts.move_to_end(base)
+        attempts[key] = attempts.get(key, 0) + 1
+        attempts.move_to_end(key)
         while len(attempts) > _ENDPOINT_ATTEMPTS_MAX:
             attempts.popitem(last=False)
 
-    def _em_map(self, task_id: str, endpoint: str, uid: str,
-                base: str) -> None:
-        self._em_unmap(task_id)
-        self._endpoint_mode_tasks[task_id]  = endpoint
-        self._endpoint_mode_uids[task_id]   = (uid, base)
-        self._endpoint_mode_by_uid[uid]     = task_id
+    def _em_key(self, sid: str, task_id: str) -> str:
+        '''The endpoint-mode key of *task_id* in *sid* (or its key in a
+        ledger from before keys carried the session).'''
+        key = f'{task_id}.{sid}'
+        if key not in self._endpoint_mode_tasks \
+                and task_id in self._endpoint_mode_tasks:
+            return task_id
+        return key
 
-    def _em_unmap(self, task_id: str) -> str | None:
+    def _em_map(self, key: str, endpoint: str, uid: str,
+                task_id: str) -> None:
+        self._em_unmap(key)
+        self._endpoint_mode_tasks[key]  = endpoint
+        self._endpoint_mode_uids[key]   = (uid, task_id)
+        self._endpoint_mode_by_uid[uid] = key
+
+    def _em_unmap(self, key: str) -> str | None:
         '''Forget an endpoint-mode task; returns its endpoint, if mapped.'''
-        uid, _ = self._endpoint_mode_uids.pop(task_id, (None, None))
+        uid, _ = self._endpoint_mode_uids.pop(key, (None, None))
         if uid is not None:
             self._endpoint_mode_by_uid.pop(uid, None)
-        return self._endpoint_mode_tasks.pop(task_id, None)
+        return self._endpoint_mode_tasks.pop(key, None)
 
-    def _em_uid(self, task_id: str) -> str:
-        return self._endpoint_mode_uids.get(task_id, (task_id, None))[0]
+    def _em_uid(self, key: str) -> str:
+        return self._endpoint_mode_uids.get(key, (key, None))[0]
 
     def _persist_endpoint_mode(self) -> None:
         '''Rewrite the endpoint-mode ledger atomically:
-        ``task_id → {endpoint, uid, base}``.'''
+        ``f'{task_id}.{sid}' → {endpoint, uid, task_id}``.'''
         ledger = {}
-        for task_id, endpoint in self._endpoint_mode_tasks.items():
-            uid, base = self._endpoint_mode_uids.get(task_id,
-                                                     (task_id, task_id))
-            ledger[task_id] = {'endpoint': endpoint, 'uid': uid,
-                               'base': base}
+        for key, endpoint in self._endpoint_mode_tasks.items():
+            uid, task_id = self._endpoint_mode_uids.get(key, (key, key))
+            ledger[key] = {'endpoint': endpoint, 'uid': uid,
+                           'task_id': task_id}
         try:
             write_json_atomic(self._endpoint_mode_path, ledger)
         except OSError as e:
             log.warning('[%s] could not persist endpoint-mode ledger: %s',
                         self.instance_name, e)
+
+    async def _rh_submit(self, rh, dicts: list, window: float) -> list:
+        '''Run a child ``submit_tasks`` on the dedicated submit pool,
+        retrying within *window* (each attempt bounded by it too).'''
+        return await asyncio.get_running_loop().run_in_executor(
+            self._submit_pool, functools.partial(
+                rh.submit_tasks, dicts, window=window, timeout=window))
+
+    def _endpoint_submit_window(self) -> float:
+        '''Retry window of an endpoint-mode submit: half the broker relay
+        timeout, so the caller -- whose own call the broker reaps at that
+        timeout -- gets the 503 in time.'''
+        relay = call_timeout_of(self._broker_caller) or _POOL_SUBMIT_WINDOW
+        return max(1.0, relay / 2)
 
     def _require_known_session(self, sid: str) -> None:
         '''Raise 404 unless *sid* is a known session.'''
