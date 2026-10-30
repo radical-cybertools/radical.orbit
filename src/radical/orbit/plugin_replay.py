@@ -188,13 +188,16 @@ def _gap(buf: _RingBuffer, lower: int, from_zero: bool = True) -> bool:
         (buf.last_dropped_seq is not None and buf.last_dropped_seq > lower)
 
 
-def _stream_matches(patterns: List[dict], src: Any, plugin: Any) -> bool:
-    '''True if a stream of *src*'s *plugin* can hold events matching any of
-    *patterns* (their ``topic`` is left to the per-event match).'''
+def _stream_matches(patterns: List[dict], src: Any, plugin: Any,
+                    session: Any) -> bool:
+    '''True if the stream of *src*'s *plugin* *session* can hold events
+    matching any of *patterns* (their ``topic`` is left to the per-event
+    match).'''
     if not patterns:
         return True
     return any(p.get('endpoint') in (None, src) and
-               p.get('plugin') in (None, plugin) for p in patterns)
+               p.get('plugin')   in (None, plugin) and
+               p.get('session')  in (None, session) for p in patterns)
 
 
 # ---------------------------------------------------------------------------
@@ -204,8 +207,9 @@ def _stream_matches(patterns: List[dict], src: Any, plugin: Any) -> bool:
 def _event_matches(patterns: List[dict], event: Dict[str, Any]) -> bool:
     '''True if *event* matches any of *patterns* (empty/None -> match all).
 
-    A pattern is ``{endpoint?, plugin?, topic?}``; a ``None``/absent field is a
-    wildcard.  ``endpoint`` matches the event's broker-stamped ``src``.  This is
+    A pattern is ``{endpoint?, plugin?, topic?, session?}``; a ``None``/absent
+    field is a wildcard.  ``endpoint`` matches the event's broker-stamped
+    ``src``; a ``session`` matches only that session's events.  This is
     the same OR-of-patterns, AND-of-fields rule the broker's subscription
     registry and the client callback registry use.
     '''
@@ -214,12 +218,15 @@ def _event_matches(patterns: List[dict], event: Dict[str, Any]) -> bool:
     src   = event.get('src')
     plug  = event.get('plugin')
     topic = event.get('topic')
+    session = event.get('session')
     for p in patterns:
         if p.get('endpoint') is not None and p['endpoint'] != src:
             continue
         if p.get('plugin')   is not None and p['plugin']   != plug:
             continue
         if p.get('topic')    is not None and p['topic']    != topic:
+            continue
+        if p.get('session')  is not None and p['session']  != session:
             continue
         return True
     return False
@@ -593,7 +600,7 @@ class PluginReplay(Plugin):
         for key, buf in list(self._session_buffers.items()):
             if max_events <= 0 or max_bytes <= 0:
                 break
-            if not _stream_matches(patterns, key[0], key[1]):
+            if not _stream_matches(patterns, *key):
                 continue
             res = self._select(buf, after.get(key, -1), patterns, max_events,
                                max_bytes, now, from_zero=False)
@@ -621,7 +628,7 @@ class PluginReplay(Plugin):
         found = [buf for (src, plg, sid), buf in self._session_buffers.items()
                  if sid == session
                  and endpoint in (None, src) and plugin in (None, plg)
-                 and _stream_matches(patterns or [], src, plg)]
+                 and _stream_matches(patterns or [], src, plg, sid)]
         if len(found) > 1:
             raise HTTPException(
                 status_code=400,

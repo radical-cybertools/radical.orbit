@@ -1278,6 +1278,7 @@ class PluginXGFabric(Plugin):
     session_class = XGFabricSession
     client_class = XGFabricClient
     version = '0.1.0'
+    session_events = True       # all its events are session events
 
     ui_config = {
         "icon":            "🌊",

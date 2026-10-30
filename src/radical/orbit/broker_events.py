@@ -31,7 +31,7 @@ import logging
 import time
 
 from collections import OrderedDict
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import msgpack
 
@@ -69,6 +69,13 @@ class EventRouter:
         self._host_loop   = host_loop_getter
 
         self._subscriptions: Dict[str, List[protocol.SubscribePattern]] = {}
+        # Per subscriber, its patterns as matched on ingest: session patterns
+        # naming endpoint and plugin indexed by their (endpoint, plugin,
+        # session) stream, all others in a list.  An event then checks the
+        # list plus its own stream's patterns, not every session pattern.
+        # Rebuilt from ``_subscriptions`` on each change (``_reindex``).
+        self._index: Dict[str, Tuple[List[protocol.SubscribePattern],
+                                     Dict[tuple, list]]] = {}
         self._out:           Dict[str, BoundedDropOldestQueue] = {}
         self._senders:       Dict[str, asyncio.Task] = {}
         # One monotone seq counter per ``(src, plugin, session)``.  Counters
@@ -91,11 +98,13 @@ class EventRouter:
 
     def add_endpoint(self, name: str) -> None:
         self._subscriptions.setdefault(name, [])
+        self._reindex(name)
         self._out[name] = BoundedDropOldestQueue(self._event_queue)
         self.restart_sender(name)
 
     def remove_endpoint(self, name: str) -> None:
         self._subscriptions.pop(name, None)
+        self._index.pop(name, None)
         self._out.pop(name, None)
         self.pause_sender(name)
         self._senders.pop(name, None)
@@ -141,10 +150,25 @@ class EventRouter:
     def clear_subscriptions(self, name: str) -> None:
         """Forget *name*'s patterns (a resumed registration resyncs them)."""
         self._subscriptions[name] = []
+        self._reindex(name)
 
     def update_subscription(self, name: str, raw: dict, add: bool) -> None:
-        patterns = [protocol.SubscribePattern(**p)
-                    for p in raw.get('patterns', [])]
+        """Add (or remove) *name*'s interest patterns.
+
+        A malformed pattern is logged and skipped: it rejects that one
+        pattern, never the subscriber's socket.
+        """
+        patterns = []
+        try:
+            for p in raw.get('patterns') or []:
+                try:
+                    patterns.append(protocol.SubscribePattern(**p))
+                except (TypeError, ValueError) as e:
+                    log.warning("[Broker] %s: rejected %s pattern %r: %s",
+                                name, raw.get('kind'), p, e)
+        except TypeError as e:
+            log.warning("[Broker] %s: rejected %s patterns %r: %s",
+                        name, raw.get('kind'), raw.get('patterns'), e)
         cur = self._subscriptions.setdefault(name, [])
         if add:
             cur.extend(patterns)
@@ -152,17 +176,33 @@ class EventRouter:
             for p in patterns:
                 if p in cur:
                     cur.remove(p)
+        self._reindex(name)
+
+    def _reindex(self, name: str) -> None:
+        """Rebuild *name*'s ingest index from its pattern list."""
+        rest: List[protocol.SubscribePattern] = []
+        streams: Dict[tuple, list] = {}
+        for p in self._subscriptions.get(name, []):
+            if p.session is not None and p.endpoint is not None \
+                    and p.plugin is not None:
+                streams.setdefault((p.endpoint, p.plugin, p.session),
+                                   []).append(p)
+            else:
+                rest.append(p)
+        self._index[name] = (rest, streams)
 
     @staticmethod
     def _matches(patterns: List[protocol.SubscribePattern],
                  endpoint: str, plugin: Optional[str],
-                 topic: Optional[str]) -> bool:
+                 topic: Optional[str], session: Optional[str] = None) -> bool:
         for p in patterns:
             if p.endpoint is not None and p.endpoint != endpoint:
                 continue
             if p.plugin   is not None and p.plugin   != plugin:
                 continue
             if p.topic    is not None and p.topic    != topic:
+                continue
+            if p.session  is not None and p.session  != session:
                 continue
             return True
         return False
@@ -225,8 +265,12 @@ class EventRouter:
         packed = msgpack.packb(raw, use_bin_type=True)
         plugin = raw.get('plugin')
         topic  = raw.get('topic')
-        for sub_name, patterns in self._subscriptions.items():
-            if self._matches(patterns, src_name, plugin, topic):
+        stream = (src_name, plugin, session)
+        for sub_name, (rest, streams) in self._index.items():
+            if self._matches(rest, src_name, plugin, topic, session) or \
+               (session is not None and
+                    self._matches(streams.get(stream, ()), src_name,
+                                  plugin, topic, session)):
                 oq = self._out.get(sub_name)
                 if oq is not None:
                     oq.push(packed)

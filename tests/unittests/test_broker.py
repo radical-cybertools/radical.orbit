@@ -646,6 +646,196 @@ async def test_subscribe_filtering_exact_wildcard_unsubscribe(make_broker):
 
 
 @pytest.mark.asyncio
+async def test_subscribe_session_pattern(make_broker):
+    """A session pattern gets only its session's events of that endpoint
+    plugin (not session-less ones, not the same sid elsewhere); a wildcard
+    pattern gets all; unsubscribing the session pattern removes it."""
+    broker = make_broker()
+    await broker.startup()
+    try:
+        c_sid, c_wild = FakeWS(), FakeWS()
+        await _register(broker, 'c_sid',  c_sid)
+        await _register(broker, 'c_wild', c_wild)
+        sid_pat = {'endpoint': 'e1', 'plugin': 'rh', 'session': 'a'}
+        await broker._route_frame('c_sid',  _subscribe_bytes('c_sid',
+                                                             [sid_pat]))
+        await broker._route_frame('c_wild', _subscribe_bytes('c_wild', [{}]))
+        for ws in (c_sid, c_wild):
+            ws.sent.clear()
+
+        sent = [('e1', 'rh', 'a'), ('e1', 'rh', 'b'), ('e1', 'rh', None),
+                ('e1', 'px', 'a'), ('e2', 'rh', 'a'), ('e1', 'rh', 'a')]
+        for src, plugin, sid in sent:
+            await broker._route_frame(
+                src, _event_bytes(src, plugin, 't', session=sid))
+        await asyncio.sleep(0.02)
+
+        evs = c_sid.msgs()
+        assert [(e.src, e.plugin, e.session) for e in evs] \
+            == [('e1', 'rh', 'a')] * 2
+        assert evs[1].seq == evs[0].seq + 1
+        assert [(e.src, e.plugin, e.session) for e in c_wild.msgs()] == sent
+
+        unsub = protocol.Unsubscribe(
+            src='c_sid', patterns=[protocol.SubscribePattern(**sid_pat)])
+        await broker._route_frame('c_sid', protocol.pack_message(unsub))
+        assert broker._events._subscriptions['c_sid'] == []
+    finally:
+        await broker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_two_clients_receive_only_their_session(make_broker):
+    """Two clients of one endpoint plugin, one session each: each socket
+    carries only its own session's event frames."""
+    broker = make_broker()
+    await broker.startup()
+    try:
+        ws = {'c1': FakeWS(), 'c2': FakeWS()}
+        for name, sid in (('c1', 'sid-1'), ('c2', 'sid-2')):
+            await _register(broker, name, ws[name])
+            await broker._route_frame(name, _subscribe_bytes(name, [
+                {'endpoint': 'ep', 'plugin': 'rhapsody', 'session': sid}]))
+        for w in ws.values():
+            w.sent.clear()
+
+        for i in range(50):
+            sid = 'sid-1' if i % 5 else 'sid-2'           # 40 vs 10
+            await broker._route_frame('ep', _event_bytes(
+                'ep', 'rhapsody', 'task_status', session=sid))
+        await asyncio.sleep(0.05)
+
+        for name, sid, n in (('c1', 'sid-1', 40), ('c2', 'sid-2', 10)):
+            evs = [m for m in ws[name].msgs() if m.kind == 'event']
+            assert len(ws[name].sent) == len(evs) == n
+            assert {e.session for e in evs} == {sid}
+            seqs = [e.seq for e in evs]                     # no gaps
+            assert seqs == list(range(seqs[0], seqs[0] + n))
+    finally:
+        await broker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_malformed_subscribe_pattern_rejects_pattern_not_socket(
+        make_broker):
+    """A pattern the broker cannot parse is skipped (logged), the frame's
+    valid patterns still apply, and the frame never escapes _route_frame
+    (which would close the subscriber's socket)."""
+    import msgpack
+    broker = make_broker()
+    await broker.startup()
+    try:
+        cons = FakeWS()
+        await _register(broker, 'c1', cons)
+        for patterns in ([{'plugin': 'p', 'bogus': 1}, {'plugin': 'q'}],
+                         [{'session': ['not', 'a', 'str']}, 'x'],
+                         7):
+            raw = {'kind': 'subscribe', 'version': protocol.PROTOCOL_VERSION,
+                   'id': 'i', 'src': 'c1', 'patterns': patterns}
+            await broker._route_frame('c1', msgpack.packb(raw))
+        raw['kind'] = 'unsubscribe'
+        raw['patterns'] = [{'topic': 't', 'nope': True}]
+        await broker._route_frame('c1', msgpack.packb(raw))
+
+        assert broker._events._subscriptions['c1'] \
+            == [protocol.SubscribePattern(plugin='q')]
+        assert cons.closed is None
+    finally:
+        await broker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_broker_topology_advertises_session_events(make_broker):
+    """The broker advertises its own ``session_events`` under the reserved
+    key of its topology entry — with no hosted plugins too — and keeps the
+    key out of the snapshot (the gateway and host source); plugins carry
+    their own flag."""
+    for spec in ('', 'sysinfo'):
+        broker = make_broker(plugins=spec)
+        await broker.startup()
+        try:
+            ws1 = FakeWS()
+            await _register(broker, 'e1', ws1, plugins=[
+                {'name': 'rh', 'namespace': '/rh', 'session_events': True}])
+            topo = [m for m in ws1.msgs() if m.kind == 'topology'][-1]
+            bplugins = topo.participants['broker'].plugins
+            caps = bplugins[protocol.BROKER_CAPS]
+            assert caps['session_events'] is True
+            # well-formed for older consumers, which list it as a plugin
+            assert caps['namespace'] == '/broker/_broker'
+            assert caps['enabled'] is False and caps['version']
+            assert 'ui_config' in caps and caps['ui_config'] is None
+            assert topo.participants['e1'].plugins['rh']['session_events']
+            snap = broker.topology_snapshot()
+            assert protocol.BROKER_CAPS not in snap['broker']['plugins']
+            assert sorted(snap['broker']['plugins']) \
+                == ([] if not spec else ['sysinfo'])
+            if spec:
+                assert snap['broker']['plugins']['sysinfo'][
+                    'session_events'] is False
+        finally:
+            await broker.shutdown()
+
+
+def test_session_patterns_indexed_per_stream(monkeypatch):
+    """A subscriber's session patterns are indexed by (endpoint, plugin,
+    session): an event checks the wildcard list plus its own stream's
+    patterns, not all N session patterns; matching is unchanged."""
+    from radical.orbit.broker_events import EventRouter
+
+    router = EventRouter({}, lambda *a: None, MagicMock(), 8, lambda: None)
+    router.add_endpoint('c')
+    n = 200
+    router.update_subscription('c', {'patterns': [
+        {'endpoint': 'ep', 'plugin': 'rh', 'session': 's%d' % i}
+        for i in range(n)] + [{'plugin': 'other'}]}, True)
+    rest, streams = router._index['c']
+    assert len(rest) == 1 and len(streams) == n
+
+    checked = []
+    real = EventRouter._matches
+
+    def _counting(patterns, *args):
+        checked.append(len(patterns))
+        return real(patterns, *args)
+    monkeypatch.setattr(EventRouter, '_matches', staticmethod(_counting))
+
+    def _delivered(src, plugin, session):
+        before = len(router._out['c'].buf)
+        router.ingest(src, {'kind': 'event', 'plugin': plugin, 'topic': 't',
+                            'session': session, 'data': {}})
+        return len(router._out['c'].buf) > before
+
+    assert not _delivered('ep', 'rh', 'unrelated')
+    assert sum(checked) <= 1                     # O(1), not O(n)
+    assert _delivered('ep', 'rh', 's7')
+    assert not _delivered('ep2', 'rh', 's7')     # stream includes endpoint
+    assert not _delivered('ep', 'rh', None)      # session-less: no match
+    assert _delivered('ep', 'other', None)       # wildcard list still works
+
+    router.update_subscription('c', {'patterns': [
+        {'endpoint': 'ep', 'plugin': 'rh', 'session': 's7'}]}, False)
+    assert not _delivered('ep', 'rh', 's7')
+    assert len(router._index['c'][1]) == n - 1
+
+
+@pytest.mark.asyncio
+async def test_registered_reserved_plugin_name_dropped(make_broker):
+    """A participant registering a plugin under a reserved name ('_...')
+    does not get it into topology (it could pose as broker capabilities)."""
+    broker = make_broker()
+    await broker.startup()
+    try:
+        await _register(broker, 'e1', FakeWS(), plugins=[
+            {'name': '_broker', 'session_events': True},
+            {'name': 'rh', 'namespace': '/rh'}])
+        parts = broker._participants_for_topology()
+        assert list(parts['e1'].plugins) == ['rh']
+    finally:
+        await broker.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_event_queue_drop_oldest_with_counter(make_broker):
     broker = make_broker(event_queue=2)
     await broker.startup()

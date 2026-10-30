@@ -41,7 +41,8 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 import msgpack
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (BaseModel, ConfigDict, Field, ValidationError,
+                      model_serializer)
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +54,49 @@ PROTOCOL_VERSION = 1
 # Default frame-size cap in bytes -- see the module docstring for the
 # design inequality and the GIL-hold rationale.
 FRAME_CAP = 4 * 1024 * 1024
+
+# The name the broker reserves for itself: its participant entry in topology
+# (its hosted plugins) and the ``src``/``dst`` of broker-originated frames.
+BROKER_NAME = 'broker'
+
+# Keys of a topology ``plugins`` dict that start with ``_`` are reserved
+# (``is_reserved``): they carry participant-level information, not plugins;
+# plugin listings skip them (``public_plugins``) and no plugin instance may
+# take such a name.  The broker's entry carries ``BROKER_CAPS`` with its own
+# capabilities, e.g. ``session_events`` (it routes session subscription
+# patterns), shaped as a disabled plugin so that older consumers, which list
+# it as one, find the usual fields.
+BROKER_CAPS = '_broker'
+
+
+def is_reserved(name: Any) -> bool:
+    """Whether *name* is a reserved (non-plugin) key of a ``plugins`` dict."""
+    return str(name).startswith('_')
+
+
+def broker_caps_entry() -> Dict[str, Any]:
+    """The broker's ``BROKER_CAPS`` entry in its topology ``plugins``."""
+    return {'name':           BROKER_CAPS,
+            'type':           BROKER_CAPS,
+            'namespace':      '/' + BROKER_NAME + '/' + BROKER_CAPS,
+            'version':        str(PROTOCOL_VERSION),
+            'enabled':        False,
+            'ui_config':      None,
+            'session_events': True}
+
+
+def public_plugins(plugins: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The plugins of a topology ``plugins`` dict, reserved keys dropped."""
+    return {k: v for k, v in (plugins or {}).items() if not is_reserved(k)}
+
+
+def public_topology(topo: Dict[str, Dict[str, Any]]
+                    ) -> Dict[str, Dict[str, Any]]:
+    """A ``{name: {role, plugins, liveness}}`` topology dict with every
+    participant's reserved plugin keys dropped (copies, not views)."""
+    return {name: dict(info or {},
+                       plugins=public_plugins((info or {}).get('plugins')))
+            for name, info in topo.items()}
 
 
 class ProtocolError(Exception):
@@ -99,12 +143,29 @@ class SubscribePattern(BaseModel):
 
     A ``None`` field is a wildcard -- mirrors the client callback-registry
     tuples (``endpoint_id``/``plugin_name``/``topic`` all optional).
+
+    ``session`` narrows the pattern to the events of one session (the
+    event's ``session``; session-less events do not match).  Like the
+    broker's seq key ``(src, plugin, session)``, it is meant together with
+    ``endpoint`` and ``plugin``: a sid alone names no stream.  It is only
+    on the wire when set, so a session-less pattern packs exactly as in v1
+    -- an older broker rejects the unknown field, so a client sends it only
+    when the broker and the endpoint plugin advertise ``session_events`` in
+    topology.
     """
     model_config = ConfigDict(extra='forbid')
 
     endpoint: Optional[str] = None
     plugin:   Optional[str] = None
     topic:    Optional[str] = None
+    session:  Optional[str] = None
+
+    @model_serializer(mode='wrap')
+    def _dump(self, handler):
+        data = handler(self)
+        if data.get('session') is None:
+            data.pop('session', None)
+        return data
 
 
 class ParticipantInfo(BaseModel):

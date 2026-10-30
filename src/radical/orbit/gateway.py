@@ -90,10 +90,8 @@ log = logging.getLogger("radical.orbit.gateway")
 # genuinely takes this long.
 REQUEST_TIMEOUT = 600
 
-# The name the broker reserves for its own hosted-plugin participant.  Kept in
-# sync with :data:`radical.orbit.broker.BROKER_NAME`; duplicated here to avoid a
-# module import cycle (broker imports gateway).
-BROKER_NAME = 'broker'
+# The name the broker reserves for its own hosted-plugin participant.
+BROKER_NAME = protocol.BROKER_NAME
 
 # Allowed CORS origins.  LUCID needs credentials; browsers reject credentials +
 # wildcard origin, so the allow-list is explicit.

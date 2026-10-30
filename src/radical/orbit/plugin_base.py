@@ -11,6 +11,7 @@ from typing import Type, Optional, Dict, Callable, Any, Union
 from fastapi import FastAPI, HTTPException, Request
 from starlette.responses import JSONResponse
 
+from . import protocol
 from .plugin_session_base import PluginSession
 from .ui_schema import UIConfig, ui_config_to_dict
 from .utils import HOST_ROLES
@@ -169,6 +170,11 @@ class Plugin(object):
     reclaim_drain: float = 300  # 'lost' owner -> ephemeral-session reclaim grace
     ui_config: Union[Dict, UIConfig, None] = None  # UI configuration for portal
     ui_module: Optional[str] = None  # Absolute path to JS plugin module, or None
+    # Every event about one session carries that session (it is sent via
+    # ``PluginSession.notify`` or with ``session=``): advertised in topology
+    # as ``session_events``, it lets a consumer subscribe to one session at
+    # the broker.  False for plugins that send session events session-less.
+    session_events: bool = False
     # Host roles (``utils.HOST_ROLES``) whose ``default`` plugin set
     # includes this plugin.  An own declaration wins; otherwise a class
     # inherits its parent's roles only under the same identity (the
@@ -241,6 +247,10 @@ class Plugin(object):
         if not instance_name:
             raise ValueError("instance_name is required "
                              "(no class plugin_name to default to)")
+        if protocol.is_reserved(instance_name):
+            raise ValueError(f"plugin instance name {instance_name!r} is "
+                             f"reserved: names starting with '_' are not "
+                             f"plugins in topology")
 
         self._app: FastAPI = app
         self._instance_name: str = instance_name
