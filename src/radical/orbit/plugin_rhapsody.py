@@ -100,7 +100,7 @@ OUTPUT_NOTIFY_LIMIT = FRAME_CAP // OUTPUT_RATIO
 # Endpoint-level override for the coalescing window above (seconds).  The
 # default trades ~250 ms of completion latency for fewer WS frames; a
 # latency-sensitive endpoint (co-located service, sequential task round
-# trips) sets `0` to flush every completion immediately.
+# trips) sets `0` to flush on the next loop iteration.
 ENV_NOTIFY_WINDOW   = 'RADICAL_ORBIT_RHAPSODY_NOTIFY_WINDOW'
 
 # Endpoint-level telemetry switch: rhapsody session telemetry (when its
@@ -227,7 +227,7 @@ def _resolve_notify_window() -> float:
 
     Honours ``$RADICAL_ORBIT_RHAPSODY_NOTIFY_WINDOW`` so the endpoint
     operator can pick the latency / frame-count trade-off at service launch
-    (``0`` flushes every completion immediately).  Read once per plugin, not
+    (``0`` flushes on the next loop iteration).  Read once per plugin, not
     per flush.  A non-numeric, negative or non-finite value warns and falls
     back to ``NOTIFY_BATCH_WINDOW`` — ``nan`` would otherwise pass every
     comparison and silently act as a zero window.
