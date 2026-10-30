@@ -490,6 +490,8 @@ class RhapsodySession(PluginSession):
         """Fire notification on intermediate state changes (e.g. RUNNING).
 
         Called from backend threads — uses lock for _notified_states access.
+        The notification goes through the batch buffer like a completion, so
+        a burst of state changes is coalesced instead of sent per task.
         """
         uid = self._get_attr(task, 'uid')
         uid_str = str(uid) if uid else '?'
@@ -506,7 +508,7 @@ class RhapsodySession(PluginSession):
         if state_str.upper() in TERMINAL_STATES:
             return
 
-        self.notify("task_status", {
+        self._queue_notification({
             "uid":   uid_str,
             "state": state_str,
         })
@@ -640,18 +642,19 @@ class RhapsodySession(PluginSession):
         """Add a task notification to the batch buffer and ensure a
         flush is scheduled.
 
-        Thread-safe — called from watcher coroutines.  A buffer full by count
-        or by bytes — or a zero coalescing window (latency-sensitive
-        endpoint) — flushes immediately; otherwise a single delayed flush is
-        scheduled (and only one is ever pending at a time).
+        Thread-safe — called from watcher coroutines and backend threads.  A
+        buffer full by count or by bytes flushes immediately; otherwise a
+        single flush is scheduled (and only one is ever pending at a time).
+        A zero coalescing window (latency-sensitive endpoint) schedules that
+        flush without delay: it runs on the next loop iteration, so the
+        completions a watcher drains in one pass still share one frame.
         """
         size = _payload_size(payload)
         with self._notify_lock:
             self._notify_buf.append(payload)
             self._notify_bytes += size
-            window   = self._notify_window
-            now      = window <= 0 \
-                       or len(self._notify_buf) >= NOTIFY_BATCH_SIZE \
+            window   = max(self._notify_window, 0)
+            now      = len(self._notify_buf) >= NOTIFY_BATCH_SIZE \
                        or self._notify_bytes >= self._frame_budget()
             schedule = not now and not self._flush_scheduled
             if schedule:
@@ -680,6 +683,10 @@ class RhapsodySession(PluginSession):
                     self._plugin._main_loop:
                 asyncio.run_coroutine_threadsafe(
                     _do_flush(), self._plugin._main_loop)
+            else:
+                # no loop to flush on: flush here rather than leave the
+                # buffer behind a flush that never runs
+                self._flush_notifications()
 
     def _flush_notifications(self) -> None:
         """Flush the notification buffer as one or more bulk messages.

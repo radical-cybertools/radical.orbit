@@ -1811,8 +1811,9 @@ def test_notify_window_invalid_falls_back(monkeypatch, orbit_caplog, raw):
     assert prh.ENV_NOTIFY_WINDOW in orbit_caplog.text
 
 
-def test_notify_window_zero_flushes_immediately(monkeypatch):
-    '''A window of 0 delivers each completion inline — no delayed flush.'''
+def test_notify_window_zero_flushes_without_delay(monkeypatch):
+    '''A window of 0 schedules one flush without delay (it runs on the next
+    loop iteration) instead of flushing every completion inline.'''
     from radical.orbit import plugin_rhapsody as prh
 
     monkeypatch.setenv(prh.ENV_NOTIFY_WINDOW, '0')
@@ -1823,13 +1824,129 @@ def test_notify_window_zero_flushes_immediately(monkeypatch):
     assert session._notify_window == 0
 
     plugin._dispatch_notify = MagicMock()
-    payload = {'uid': 'task.nw001', 'state': 'DONE'}
-    session._queue_notification(payload)
+    with patch.object(session, '_schedule_flush') as sched:
+        session._queue_notification({'uid': 'task.nw001', 'state': 'DONE'})
+        session._queue_notification({'uid': 'task.nw003', 'state': 'DONE'})
 
-    plugin._dispatch_notify.assert_called_once_with(
-        'task_status', {**payload, 'sid': sid})
-    assert session._notify_buf == []
-    assert not session._flush_scheduled
+    sched.assert_called_once_with(delay=0)
+    plugin._dispatch_notify.assert_not_called()
+    assert len(session._notify_buf) == 2
+    assert session._flush_scheduled
+
+
+def _watched_session(sid, window=0):
+    """A plugin-attached session whose task futures the test resolves."""
+    session = RhapsodySession(sid)
+    session._plugin         = MagicMock()
+    session._notify_window  = window
+    session._rh_session     = MagicMock()
+    futs: dict = {}
+    session._rh_session._state_manager.get_wait_future = \
+        lambda uid, t: futs.setdefault(
+            uid, asyncio.get_running_loop().create_future())
+    return session, futs
+
+
+def _sent_frames(session):
+    """The task lists of every notification frame the session sent."""
+    frames = []
+    for call in session._plugin._dispatch_notify.call_args_list:
+        topic, data = call.args
+        frames.append(data['tasks'] if topic == 'task_status_batch'
+                      else [data])
+    return frames
+
+
+async def _ticks(n=3):
+    for _ in range(n):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_window_zero_coalesces_completions_of_one_tick():
+    '''With window 0, completions drained in one watcher pass go out in one
+    batch frame; a lone completion still flushes without a timer.'''
+    session, futs = _watched_session('test.nw0.tick')
+    tasks   = [_done_task(f'task.c{i:03d}', i) for i in range(20)]
+    watcher = asyncio.ensure_future(session._watch_batch(tasks))
+    await _ticks(1)
+    for fut in futs.values():
+        fut.set_result(None)
+    await asyncio.wait_for(watcher, 5)
+    await _ticks()
+
+    frames = _sent_frames(session)
+    assert len(frames) == 1
+    assert sorted(t['uid'] for t in frames[0]) == [t.uid for t in tasks]
+
+    session, futs = _watched_session('test.nw0.lone')
+    watcher = asyncio.ensure_future(
+        session._watch_batch([_done_task('task.lone', 1)]))
+    await _ticks(1)
+    futs['task.lone'].set_result(None)
+    await asyncio.wait_for(watcher, 5)
+    await _ticks()                         # no sleep: no timer involved
+    session._plugin._dispatch_notify.assert_called_once()
+    assert session._plugin._dispatch_notify.call_args.args[0] \
+        == 'task_status'
+
+
+@pytest.mark.asyncio
+async def test_window_zero_completions_across_ticks_all_delivered():
+    '''Completions spread over loop iterations go out in several frames,
+    each exactly once.'''
+    session, futs = _watched_session('test.nw0.ticks')
+    tasks   = [_done_task(f'task.x{i:03d}', i) for i in range(10)]
+    watcher = asyncio.ensure_future(session._watch_batch(tasks))
+    await _ticks(1)
+    for i, fut in enumerate(futs.values()):
+        fut.set_result(None)
+        if i % 3 == 2:
+            await _ticks()
+    await asyncio.wait_for(watcher, 5)
+    await _ticks()
+
+    frames = _sent_frames(session)
+    assert len(frames) > 1
+    assert sorted(t['uid'] for f in frames for t in f) \
+        == sorted(t.uid for t in tasks)
+
+
+@pytest.mark.asyncio
+async def test_running_state_changes_are_batched():
+    '''RUNNING changes go through the batch buffer: a burst is one frame,
+    not one frame per task — also when reported from a backend thread.'''
+    session, _ = _watched_session('test.running')
+    session._notified_states = {}
+    session._notified_lock   = threading.Lock()
+
+    for i in range(50):
+        session._on_task_state_change({'uid': f'task.r{i}'}, 'RUNNING')
+    session._plugin._dispatch_notify.assert_not_called()
+    await _ticks()
+    frames = _sent_frames(session)
+    assert len(frames) == 1
+    assert len(frames[0]) == 50
+    assert {t['state'] for t in frames[0]} == {'RUNNING'}
+    # sid is stamped on the frame by notify()
+    assert session._plugin._dispatch_notify.call_args.args[1]['sid'] \
+        == 'test.running'
+
+    # from a backend thread: flushed on the plugin's loop
+    session._plugin._dispatch_notify.reset_mock()
+    session._plugin._main_loop = asyncio.get_running_loop()
+
+    def _burst():
+        for i in range(50, 100):
+            session._on_task_state_change({'uid': f'task.r{i}'}, 'RUNNING')
+
+    await asyncio.to_thread(_burst)
+    deadline = time.monotonic() + 5
+    while sum(map(len, _sent_frames(session))) < 50 \
+            and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert sorted(t['uid'] for f in _sent_frames(session) for t in f) \
+        == sorted(f'task.r{i}' for i in range(50, 100))
 
 
 def test_notify_window_defers_flush(monkeypatch):
