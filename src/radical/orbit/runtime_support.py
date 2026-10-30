@@ -59,13 +59,19 @@ class CallbackDispatcher:
         self._thread.start()
 
     def add_drop_hook(self, hook: Callable) -> None:
-        """Call ``hook(fn)`` whenever a submission of ``fn`` is dropped."""
+        """Call ``hook(fn)`` whenever a submission of ``fn`` is dropped (and
+        ``hook(None)`` on ``signal_loss``)."""
         with self._hlock:
             self._hooks.append(hook)
 
     def remove_drop_hook(self, hook: Callable) -> None:
         with self._hlock:
             self._hooks = [h for h in self._hooks if h != hook]
+
+    def signal_loss(self) -> None:
+        """Tell the drop hooks that events may have been lost without a
+        drop here (a reconnect): they are called with ``None``."""
+        self._run_hooks(None)
 
     def submit(self, fn: Callable, *args: Any) -> None:
         try:
@@ -74,13 +80,16 @@ class CallbackDispatcher:
             self.dropped += 1
             log.warning("[Runtime] callback queue full; dropping callback %r",
                         getattr(fn, '__name__', fn))
-            with self._hlock:
-                hooks = list(self._hooks)
-            for hook in hooks:
-                try:
-                    hook(fn)
-                except Exception as e:
-                    log.error("[Runtime] drop hook failed: %r", e, exc_info=e)
+            self._run_hooks(fn)
+
+    def _run_hooks(self, fn) -> None:
+        with self._hlock:
+            hooks = list(self._hooks)
+        for hook in hooks:
+            try:
+                hook(fn)
+            except Exception as e:
+                log.error("[Runtime] drop hook failed: %r", e, exc_info=e)
 
     def submit_blocking(self, fn: Callable, *args: Any,
                         timeout: Optional[float] = None) -> bool:

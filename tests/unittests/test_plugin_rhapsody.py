@@ -954,6 +954,8 @@ def test_notification_callbacks_fire_in_registration_order():
     rt = EndpointRuntime.__new__(EndpointRuntime)
     rt._callbacks = {}
     rt._cb_lock   = _threading.Lock()
+    rt._unsubscribed = set()
+    rt._sub_epoch   = 0
     rt._name      = 'test-consumer'
     rt._emit      = MagicMock()
 
@@ -2967,9 +2969,20 @@ class _FakeRuntime:
         self.callbacks.append((topic, callback, with_meta, session))
 
     def unregister_callback(self, endpoint_id=None, plugin_name=None,
-                            topic=None, callback=None, session=None):
+                            topic=None, callback=None, session='*any*'):
         self.callbacks = [c for c in self.callbacks
-                          if (c[0], c[1], c[3]) != (topic, callback, session)]
+                          if (c[0], c[1]) != (topic, callback)
+                          or session not in ('*any*', c[3])]
+
+    def rescope_callback(self, endpoint_id=None, plugin_name=None,
+                         topic=None, callback=None, session=None,
+                         new_session=None):
+        hit = [i for i, c in enumerate(self.callbacks)
+               if (c[0], c[1], c[3]) == (topic, callback, session)]
+        for i in hit:
+            t, cb, m, _ = self.callbacks[i]
+            self.callbacks[i] = (t, cb, m, new_session)
+        return bool(hit)
 
     def deliver(self, topic, data, session=None, seq=0):
         """An event as the broker sends it; ``session=None`` is an older
@@ -3086,6 +3099,8 @@ def test_fan_out_one_runtime_callback_per_topic():
     rt = EndpointRuntime.__new__(EndpointRuntime)
     rt._callbacks = {}
     rt._cb_lock   = _threading.Lock()
+    rt._unsubscribed = set()
+    rt._sub_epoch   = 0
     rt._name      = 'test-consumer'
     rt._emit      = MagicMock()
     queued: list  = []
@@ -3848,7 +3863,15 @@ def test_ensure_fan_out_failed_registration_changes_nothing():
             raise RuntimeError('register failed')
         orig(**kw)
 
+    orig_move = rt.rescope_callback
+
+    def _flaky_move(**kw):
+        if fail[0]:
+            raise RuntimeError('register failed')
+        return orig_move(**kw)
+
     rt.register_callback = _flaky
+    rt.rescope_callback  = _flaky_move
     client = _sse_client(MagicMock(), rt=rt)
     with pytest.raises(RuntimeError, match='register failed'):
         client._ensure_fan_out()
@@ -3949,9 +3972,10 @@ def _bare_runtime(maxlen=1024):
     rt._name      = 'consumer'
     rt._callbacks = {}
     rt._cb_lock   = threading.Lock()
+    rt._unsubscribed = set()
+    rt._sub_epoch   = 0
     rt._emit      = MagicMock()
     rt._cb        = CallbackDispatcher(maxlen=maxlen)
-    rt._sub_epoch = 0
     return rt
 
 
@@ -4024,47 +4048,43 @@ def test_seq_tracker_starts_at_first_seen_and_gap_wakes_reconcile():
 
 
 def test_seq_tracker_backwards_is_a_restart():
-    """Duplicates are told by id, so any seq at or below the last one is a
-    broker restart: the baseline moves to it at once, an equal seq is
-    delivered, and a loss right after the restart is a gap."""
+    """Any seq at or below the last one is a broker restart: the baseline
+    moves to it at once, the event is delivered, the reconcile wakes (the
+    restart may have lost events), and a loss right after it is a gap."""
     client = _tracking_client()
     got = []
     client._fanout['task_status'].append(lambda *a: got.append(a[3]['uid']))
     for seq in (40, 41):
         _feed(client, seq)
-    assert _feed(client, 41) is False            # restart at an equal seq
+    assert _feed(client, 41) is True             # restart at an equal seq
     assert got == ['x', 'x', 'x']                # ... a new event: delivered
-    assert _feed(client, 0) is False             # restart lower
+    assert _feed(client, 0) is True              # restart lower
     assert client._seq_last == 0
-    assert _feed(client, 2) is True              # seq 1 lost after it
+    assert _feed(client, 1) is False
+    assert _feed(client, 3) is True              # seq 2 lost after it
 
 
-def test_duplicate_across_scope_move_deduped_by_id():
-    """During a scope move one event matches both registrations (here the
-    unscoped one and the new sid's): it reaches the fan-out once."""
+def test_scope_move_is_atomic():
+    """A session switch moves the one registration in a single runtime
+    step: an event of the new session is queued once."""
     from radical.orbit import protocol
 
     rt     = _bare_runtime()
     client = RhapsodyClient(MagicMock(), '/rhapsody', broker_client=rt,
                             endpoint_id='ep', plugin_name='rhapsody')
-    got = []
-    client.register_notification_callback(
-        lambda *a: got.append(a[3]['uid']), topic='task_status')
+    client._sid = 'sid-a'
+    client._ensure_fan_out()
     client._sid = 'sid-m'
-    # the new scope is registered before the old one goes: simulate an
-    # event arriving in between
-    rt.register_callback(endpoint_id='ep', plugin_name='rhapsody',
-                         callback=client._on_plugin_event, with_meta=True,
-                         session='sid-m')
+    client._ensure_fan_out()
+    assert [s for _, _, s in rt._callbacks[('ep', 'rhapsody', None)]] \
+        == ['sid-m']
+    kinds = [type(c.args[0]).__name__ for c in rt._emit.call_args_list]
+    assert kinds == ['Subscribe']               # the move is local only
     rt._on_event(protocol.Event(src='ep', plugin='rhapsody',
                                 topic='task_status', session='sid-m', seq=5,
                                 ts=0.0, data={'uid': 'x', 'state': 'RUNNING',
                                               'sid': 'sid-m'}))
-    assert rt._cb._q.qsize() == 2               # both registrations matched
-    while rt._cb._q.qsize():
-        fn, args = rt._cb._q.get_nowait()
-        fn(*args)
-    assert got == ['x']
+    assert rt._cb._q.qsize() == 1
 
 
 def test_seq_tracker_reset():
@@ -4210,6 +4230,59 @@ def test_close_drain_is_bounded():
         rt._cb.stop()
 
 
+def test_close_drain_skips_uncertain_and_failed_unregister():
+    """The drain does not wait for uncertain uids (their submit failed: no
+    final state may ever come), nor at all when unregister_session failed
+    (the session did not close)."""
+    session = _done_session('sid-drain3', [])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    try:
+        client, _ = _reconciling_client(rt, session)
+        client._close_drain = 5.0
+        with client._cond:
+            client._pending['task.unsure'] = time.monotonic()
+            client._uncertain['task.unsure'] = time.monotonic()
+        t0 = time.monotonic()
+        client.close()
+        assert time.monotonic() - t0 < 1.0
+
+        client, http = _reconciling_client(rt, session)
+        client._close_drain = 5.0
+        _track(client, ['task.open'])
+        orig = http.post
+
+        def _fail(url, json=None, **kw):
+            if 'unregister_session' in url:
+                return _SessionHTTP._resp(500, {'detail': 'boom'})
+            return orig(url, json=json, **kw)
+
+        http.post = _fail
+        t0 = time.monotonic()
+        client.close()
+        assert time.monotonic() - t0 < 1.0
+        assert rt.callbacks == []
+    finally:
+        rt._cb.stop()
+
+
+def test_reconnect_wakes_the_reconcile():
+    """The runtime's loss signal on a resync (drop hooks with None) wakes
+    the reconcile at once."""
+    session = _done_session('sid-recon', ['task.r1'])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session, idle=60.0)
+    try:
+        _track(client, ['task.r1'])
+        rt._cb.signal_loss()
+        assert client.wait_tasks(['task.r1'], timeout=10)
+        assert http.threads == ['orbit-rh-reconcile']
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
 def test_reregister_and_close_leave_no_stale_callbacks():
     """A session switch moves the one runtime callback to the new sid;
     close() removes it — no local callbacks or patterns pile up."""
@@ -4269,8 +4342,9 @@ def test_two_clients_share_the_subscription_across_resync():
     _apply()
     assert len(router._subscriptions['consumer']) == 1
 
-    for _ in range(2):                          # resumed or fresh: the
-        router.clear_subscriptions('consumer')  # broker starts from none
+    for fresh in (False, True):                 # resumed: patterns kept;
+        if fresh:                               # fresh: none at the broker
+            router._subscriptions['consumer'] = []
         rt._resync_subscriptions()
         _apply()
         assert len(router._subscriptions['consumer']) == 1

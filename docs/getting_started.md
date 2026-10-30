@@ -315,12 +315,14 @@ psij.register_notification_callback(on_job_status, topic='job_status')
 
 Pass ``with_meta=True`` to also receive the broker-stamped envelope metadata —
 the callback is then invoked as ``(endpoint, plugin, topic, data, meta)`` where
-``meta = {'seq': int, 'ts': float, 'session': str | None}``.  The ``seq`` is the
-authoritative broker sequence number, which lets live delivery deduplicate
-against the ``replay`` plugin's retained stream.  The broker numbers each
-session's events on their own — per ``(endpoint, plugin, session)`` — and the
-session-less events globally, so ``seq`` alone is not unique: dedup on
-``(endpoint, plugin, meta['session'], meta['seq'])``.  The replay plugin keeps
+``meta = {'seq': int, 'ts': float, 'session': str | None, 'id': str}``.  The
+``id`` is the event's envelope id, unique per event and the same in the
+``replay`` plugin's retained copy (``event['id']``): dedup live and replayed
+delivery on it, with a bounded set of recent ids.  The ``seq`` is the
+authoritative broker sequence number: the broker numbers each session's events
+on their own — per ``(endpoint, plugin, session)`` — and the session-less
+events globally, so ``seq`` alone is not unique (and restarts with the
+broker); it serves gap detection, not dedup.  The replay plugin keeps
 session events per ``(endpoint, plugin, session)`` too
 (``replay_iter(session=..., endpoint=..., plugin=...)``).  Its global ring holds
 only session-less events; a fetch without ``session`` also returns the session
@@ -329,13 +331,16 @@ and ``replay_iter(patterns=...)`` drains them all.  A session stream's ``seq``
 need not start at 0.
 
 ```python
-seen = set()
+from collections import OrderedDict
+
+seen = OrderedDict()                 # recent event ids, bounded
 
 def on_job_status(endpoint, plugin, topic, data, meta):
-    key = (endpoint, plugin, meta['session'], meta['seq'])
-    if key in seen:
+    if meta['id'] in seen:
         return
-    seen.add(key)
+    seen[meta['id']] = None
+    if len(seen) > 4096:
+        seen.popitem(last=False)
     print(meta['seq'], data['state'])
 
 rt.register_callback(endpoint_id='my-endpoint', plugin_name='psij',

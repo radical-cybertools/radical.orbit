@@ -738,9 +738,9 @@ async def test_suspect_then_lost_cascade(make_broker):
 
 
 @pytest.mark.asyncio
-async def test_resume_clears_subscriptions(make_broker):
-    """A resumed registration starts with no patterns: the participant
-    resyncs its full interest set right after."""
+async def test_resume_keeps_subscriptions_and_add_is_idempotent(make_broker):
+    """A resumed registration keeps its patterns (no loss window before the
+    resync), and the resync's re-sent subscribe does not duplicate them."""
     broker = make_broker()
     await broker.startup()
     try:
@@ -752,7 +752,34 @@ async def test_resume_clears_subscriptions(make_broker):
 
         ok, _ = await _register(broker, 'e1', FakeWS(), resume_key=key)
         assert ok is True
+        assert len(broker._events._subscriptions['e1']) == 1
+        broker._events.update_subscription(
+            'e1', {'patterns': [{}, {'plugin': 'p'}, {}]}, True)
+        assert len(broker._events._subscriptions['e1']) == 2
+        broker._events.update_subscription('e1', {'patterns': [{}]}, False)
+        assert [p.plugin for p in broker._events._subscriptions['e1']] \
+            == ['p']
+    finally:
+        await broker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_frames_of_a_superseded_socket_are_dropped(make_broker):
+    """After a resume, a late frame read from the old socket is ignored."""
+    broker = make_broker()
+    await broker.startup()
+    try:
+        ws1 = FakeWS()
+        await _register(broker, 'e1', ws1)
+        key = protocol.parse_message(ws1.sent[0]).resume_key
+        ws2 = FakeWS()
+        ok, _ = await _register(broker, 'e1', ws2, resume_key=key)
+        assert ok is True
+
+        await broker._route_frame_of('e1', ws1, _subscribe_bytes('e1', [{}]))
         assert broker._events._subscriptions['e1'] == []
+        await broker._route_frame_of('e1', ws2, _subscribe_bytes('e1', [{}]))
+        assert len(broker._events._subscriptions['e1']) == 1
     finally:
         await broker.shutdown()
 

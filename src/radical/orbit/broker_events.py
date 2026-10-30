@@ -138,16 +138,15 @@ class EventRouter:
 
     # ── subscriptions ─────────────────────────────────────────────────
 
-    def clear_subscriptions(self, name: str) -> None:
-        """Forget *name*'s patterns (a resumed registration resyncs them)."""
-        self._subscriptions[name] = []
-
     def update_subscription(self, name: str, raw: dict, add: bool) -> None:
+        """Add or remove *name*'s patterns.  A participant holds a pattern
+        at most once: adding is idempotent (a resync re-sends them all), and
+        one removal drops it."""
         patterns = [protocol.SubscribePattern(**p)
                     for p in raw.get('patterns', [])]
         cur = self._subscriptions.setdefault(name, [])
         if add:
-            cur.extend(patterns)
+            cur.extend(p for p in patterns if p not in cur)
         else:
             for p in patterns:
                 if p in cur:

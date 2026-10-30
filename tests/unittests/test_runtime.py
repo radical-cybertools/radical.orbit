@@ -825,6 +825,8 @@ def _bare_runtime(maxlen=1024):
     rt._name      = 'consumer'
     rt._callbacks = {}
     rt._cb_lock   = threading.Lock()
+    rt._unsubscribed = set()
+    rt._sub_epoch   = 0
     rt._emit      = MagicMock()
     rt._cb        = CallbackDispatcher(maxlen=maxlen)
     return rt
@@ -864,42 +866,80 @@ def test_session_callback_local_routing():
 
 
 def test_session_callback_unregister():
-    """Unregister removes the registration of that session only; the last
-    one removes the pattern from the resync set."""
+    """With a session, unregister removes that session's registrations
+    (``None``: the unscoped ones); without one, all of the callback's; the
+    last one removes the pattern from the resync set."""
     rt = _bare_runtime()
     cb = lambda *a: None                              # noqa: E731
-    for sid in ('sid-a', 'sid-b'):
+    for sid in ('sid-a', 'sid-b', None):
         rt.register_callback(endpoint_id='ep', plugin_name='rh',
                              callback=cb, session=sid)
     rt.unregister_callback(endpoint_id='ep', plugin_name='rh',
                            callback=cb, session='sid-a')
-    assert rt._callbacks[('ep', 'rh', None)] == [(cb, False, 'sid-b')]
-    rt.unregister_callback(endpoint_id='ep', plugin_name='rh', callback=cb)
-    assert rt._callbacks[('ep', 'rh', None)] == [(cb, False, 'sid-b')]
     rt.unregister_callback(endpoint_id='ep', plugin_name='rh',
-                           callback=cb, session='sid-b')
+                           callback=cb, session=None)
+    assert rt._callbacks[('ep', 'rh', None)] == [(cb, False, 'sid-b')]
+    for sid in ('sid-c', 'sid-c'):
+        rt.register_callback(endpoint_id='ep', plugin_name='rh',
+                             callback=cb, session=sid)
+    rt.unregister_callback(endpoint_id='ep', plugin_name='rh', callback=cb)
     assert rt._callbacks == {}
 
 
 def test_subscription_refcounted_per_pattern():
-    """Subscribe on the first registration of a pattern, unsubscribe on its
-    last; a callback registered twice counts twice."""
+    """Subscribe on the first registration of a pattern, unsubscribe when
+    its last is gone: another callback keeps it; unregistering a callback
+    removes all its registrations."""
     rt = _bare_runtime()
     cb = lambda *a: None                              # noqa: E731
+    other = lambda *a: None                           # noqa: E731
 
     def _kinds():
         return [type(c.args[0]).__name__ for c in rt._emit.call_args_list]
 
     rt.register_callback(endpoint_id='ep', callback=cb)
     rt.register_callback(endpoint_id='ep', callback=cb)
+    rt.register_callback(endpoint_id='ep', callback=other)
     assert _kinds() == ['Subscribe']
     rt.unregister_callback(endpoint_id='ep', callback=cb)
-    assert _kinds() == ['Subscribe']                  # one registration left
+    assert _kinds() == ['Subscribe']                  # the other keeps it
     assert len(rt._callbacks[('ep', None, None)]) == 1
-    rt.unregister_callback(endpoint_id='ep', callback=cb)
+    rt.unregister_callback(endpoint_id='ep', callback=other)
     assert _kinds() == ['Subscribe', 'Unsubscribe']
     rt.unregister_callback(endpoint_id='ep', callback=cb)   # unknown: no-op
     assert _kinds() == ['Subscribe', 'Unsubscribe']
+
+
+def test_rescope_callback_is_atomic():
+    """A registration moves to a new session in one step: an event of the
+    new session is queued once, one of the old not at all."""
+    from radical.orbit import protocol
+
+    rt = _bare_runtime()
+    cb = lambda *a: None                              # noqa: E731
+    rt.register_callback(endpoint_id='ep', callback=cb, with_meta=True,
+                         session='old')
+    assert rt.rescope_callback(endpoint_id='ep', callback=cb,
+                               session='old', new_session='new')
+    assert rt._callbacks[('ep', None, None)] == [(cb, True, 'new')]
+    assert len(rt._emit.call_args_list) == 1          # wire untouched
+    for sid in ('old', 'new'):
+        rt._on_event(protocol.Event(src='ep', plugin='p', topic='t',
+                                    session=sid, seq=0, ts=0.0, data={}))
+    assert rt._cb._q.qsize() == 1
+    assert not rt.rescope_callback(endpoint_id='ep', callback=cb,
+                                   session='old', new_session='x')
+
+
+def test_resync_signals_loss_to_drop_hooks():
+    """A resync tells the dispatcher's drop hooks (with None), so a
+    consumer that can recover lost events does at once."""
+    rt  = _bare_runtime()
+    got = []
+    rt._cb.add_drop_hook(got.append)
+    rt.register_callback(endpoint_id='ep', callback=lambda *a: None)
+    rt._resync_subscriptions()
+    assert got == [None]
 
 
 def _outbox_runtime():
@@ -913,11 +953,12 @@ def _outbox_runtime():
     rt._name           = 'consumer'
     rt._callbacks      = {}
     rt._cb_lock        = threading.Lock()
+    rt._unsubscribed   = set()
+    rt._sub_epoch      = 0
     rt._cb             = CallbackDispatcher()
     rt._frame_cap      = protocol.FRAME_CAP
     rt._transport_loop = asyncio.new_event_loop()
     rt._outbox         = asyncio.Queue()
-    rt._sub_epoch      = 0
     return rt
 
 
@@ -944,12 +985,11 @@ def _apply(router, msgs):
 
 
 def test_resync_after_reconnect_holds_each_pattern_once():
-    """Subscribe/unsubscribe frames queued before a (re)connect's resync
-    are dropped (even one whose put is still pending), and the resync
-    sends one subscribe per key: a fresh
-    registration with a queued subscribe ends with exactly one copy, and a
-    subscribe lost before a resume (the broker clears on resume) is
-    restored."""
+    """The broker keeps a resumed participant's patterns and holds each
+    once; the resync re-sends a subscribe for every live key and an
+    unsubscribe for every key dropped since the last resync.  A subscribe
+    or unsubscribe lost while disconnected is thus restored, and a
+    subscribe still queued at a fresh registration leaves one copy."""
     from unittest.mock import MagicMock
     from radical.orbit.broker_events import EventRouter
 
@@ -957,37 +997,42 @@ def test_resync_after_reconnect_holds_each_pattern_once():
     try:
         router = EventRouter({}, lambda *a: None, MagicMock(), 8,
                              lambda: None)
+        router._subscriptions['consumer'] = []
         cb = lambda *a: None                          # noqa: E731
 
-        # connected: key A subscribed and applied at the broker
+        def _pats():
+            return sorted(p.endpoint
+                          for p in router._subscriptions['consumer'])
+
+        # connected: keys A and D subscribed at the broker
         rt.register_callback(endpoint_id='epA', callback=cb)
-        router.clear_subscriptions('consumer')
+        rt.register_callback(endpoint_id='epD', callback=cb)
         _apply(router, _drain_outbox(rt))
+        assert _pats() == ['epA', 'epD']
 
-        # disconnected: key B registered, its subscribe queued (or lost)
+        # disconnected: B registered and D dropped, both frames lost
         rt.register_callback(endpoint_id='epB', callback=cb)
+        rt.unregister_callback(endpoint_id='epD', callback=cb)
         rt._transport_loop.run_until_complete(asyncio.sleep(0))
+        while not rt._outbox.empty():
+            rt._outbox.get_nowait()
 
-        # resume: the broker clears, the runtime resyncs
-        router.clear_subscriptions('consumer')
+        # resume (the broker kept A and D): the resync fixes both
         rt._resync_subscriptions()
         _apply(router, _drain_outbox(rt))
-        pats = sorted(p.endpoint for p in router._subscriptions['consumer'])
-        assert pats == ['epA', 'epB']
+        assert _pats() == ['epA', 'epB']
 
         # fresh registration with a subscribe still queued: one copy each
         rt.register_callback(endpoint_id='epC', callback=cb)
-        router.clear_subscriptions('consumer')
+        router._subscriptions['consumer'] = []
         rt._resync_subscriptions()
         _apply(router, _drain_outbox(rt))
-        pats = sorted(p.endpoint for p in router._subscriptions['consumer'])
-        assert pats == ['epA', 'epB', 'epC']
+        assert _pats() == ['epA', 'epB', 'epC']
 
         # the last unsubscribe of a key really removes it
         rt.unregister_callback(endpoint_id='epC', callback=cb)
         _apply(router, _drain_outbox(rt))
-        pats = sorted(p.endpoint for p in router._subscriptions['consumer'])
-        assert pats == ['epA', 'epB']
+        assert _pats() == ['epA', 'epB']
     finally:
         rt._transport_loop.close()
 

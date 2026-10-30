@@ -718,7 +718,7 @@ class Broker:
 
                 while True:
                     data = await ws.receive_bytes()
-                    await self_._route_frame(name, data)
+                    await self_._route_frame_of(name, ws, data)
 
             except WebSocketDisconnect as e:
                 clean = e.code in (1000, 1001)
@@ -768,9 +768,8 @@ class Broker:
                 self._participants[name]['role'] = msg.role
                 self._participants[name]['plugins'] = \
                     self._plugins_list_to_dict(msg.plugins)
-                # the participant resyncs its full interest set after a
-                # resume: start it from none, so each pattern is held once
-                self._events.clear_subscriptions(name)
+                # subscriptions are kept: the participant's resync after
+                # the resume is idempotent (a pattern is held once)
                 self._events.restart_sender(name)
                 await self._send(ws, self._ack(True, self._resume_keys[name]))
                 # Close the old socket; its teardown no-ops via the guard.
@@ -807,6 +806,16 @@ class Broker:
             cap=self._frame_cap)
 
     # ── frame routing (the lean loop) ─────────────────────────────────
+
+    async def _route_frame_of(self, name: str, ws, data: bytes) -> None:
+        """Route a frame read from *ws* — unless *ws* is no longer *name*'s
+        registered socket (superseded by a resume): a late frame of the old
+        socket must not touch the new registration's state."""
+        if self.registry.get(name) is not ws:
+            log.debug("[Broker] dropping a frame of %s's superseded socket",
+                      name)
+            return
+        await self._route_frame(name, data)
 
     async def _route_frame(self, name: str, data: bytes) -> None:
         """Dispatch one inbound frame.  Pure msgpack dict ops — the forwarding

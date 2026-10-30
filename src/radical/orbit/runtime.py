@@ -73,6 +73,7 @@ from .ui_schema         import ui_config_to_dict
 
 
 _SUB_KINDS = ('subscribe', 'unsubscribe')
+_ANY = object()               # unregister_callback: any session
 
 log = logging.getLogger("radical.orbit.runtime")
 
@@ -196,6 +197,7 @@ class EndpointRuntime(PluginHostBase):
         self._role_override = role
         self._resume_key: Optional[str] = resume_key
         self._sub_epoch  = 0          # bumped by each subscription resync
+        self._unsubscribed: set = set()   # keys dropped since the resync
 
         # ── Tunnel ─────────────────────────────────────────────────────
         self._tunnel     = tunnel
@@ -970,6 +972,7 @@ class EndpointRuntime(PluginHostBase):
             self._callbacks.setdefault(key, []).append(
                 (callback, with_meta, session))
             if first:
+                self._unsubscribed.discard(key)
                 # under the lock: subscribe/unsubscribe go out in the order
                 # the registry changed
                 self._emit(protocol.Subscribe(
@@ -982,30 +985,57 @@ class EndpointRuntime(PluginHostBase):
                             plugin_name: Optional[str] = None,
                             topic: Optional[str] = None,
                             callback: Callable = None,
-                            session: Optional[str] = None) -> None:
-        """Unregister *callback* registered for this pattern and *session*.
+                            session: Any = _ANY) -> None:
+        """Unregister every registration of *callback* for this pattern —
+        of any session, or only of *session* when it is given (``None``:
+        the unscoped ones).
 
         Callbacks match by equality, so a bound method (a new object on
-        every attribute access) unregisters as passed at registration.  One
-        call removes one registration (the latest); the broker
-        ``unsubscribe`` goes out only when the pattern's last one is gone.
+        every attribute access) unregisters as passed at registration.  The
+        broker ``unsubscribe`` goes out when the pattern's last registration
+        is gone.
         """
         key = (endpoint_id, plugin_name, topic)
         with self._cb_lock:
             cbs = self._callbacks.get(key)
-            hit = [i for i, (cb, _, s) in enumerate(cbs or [])
-                   if cb == callback and s == session]
-            if not hit:
+            if not cbs:
                 return
-            del cbs[hit[-1]]
-            if cbs:
+            keep = [(cb, m, s) for (cb, m, s) in cbs
+                    if cb != callback or (session is not _ANY
+                                          and s != session)]
+            if keep:
+                self._callbacks[key] = keep
                 return
-            # no resync of a pattern nobody listens to any more
+            # no resync of a pattern nobody listens to any more (and an
+            # unsubscribe of it with the next resync, should this one be
+            # lost while disconnected)
             del self._callbacks[key]
+            self._unsubscribed.add(key)
             self._emit(protocol.Unsubscribe(
                 src=self._name,
                 patterns=[protocol.SubscribePattern(
                     endpoint=endpoint_id, plugin=plugin_name, topic=topic)]))
+
+    def rescope_callback(self, endpoint_id: Optional[str] = None,
+                         plugin_name: Optional[str] = None,
+                         topic: Optional[str] = None,
+                         callback: Callable = None,
+                         session: Optional[str] = None,
+                         new_session: Optional[str] = None) -> bool:
+        """Move the registrations of *callback* for this pattern from
+        *session* to *new_session*, atomically: no event finds both scopes
+        or neither.  The broker subscription is not touched.  Returns
+        ``False`` when there was nothing to move."""
+        key = (endpoint_id, plugin_name, topic)
+        with self._cb_lock:
+            cbs   = self._callbacks.get(key) or []
+            moved = [(cb, m, new_session if cb == callback and s == session
+                      else s) for (cb, m, s) in cbs]
+            if moved == cbs:
+                return any(cb == callback and s == session
+                           for (cb, _, s) in cbs)
+            self._callbacks[key] = moved
+            return True
 
     def register_topology_callback(self, callback: Callable) -> None:
         with self._cb_lock:
@@ -1019,25 +1049,36 @@ class EndpointRuntime(PluginHostBase):
     def _resync_subscriptions(self) -> None:
         """Re-send the full interest set after a (re)connect (state re-sync).
 
-        One ``subscribe`` per key.  The broker starts every registration —
-        fresh or resumed — with no patterns, and the ``subscribe`` /
-        ``unsubscribe`` frames queued before this resync are dropped by the
-        sender (they carry an older ``_sub_epoch``), so the broker holds each
-        pattern once (the reference count of
-        :meth:`register_callback`) and the final ``unsubscribe`` of a key
-        really removes it.  Events the broker routes between a resume and
-        this resync are not delivered: a consumer that can recover them sees
-        the loss as a ``seq`` gap (rhapsody's reconcile).
+        The broker holds a participant's pattern at most once and keeps
+        them across a resume, so the resync is idempotent: a ``subscribe``
+        of every live key, and an ``unsubscribe`` of every key dropped since
+        the last resync (its own ``unsubscribe`` may have been lost while
+        disconnected).  The ``subscribe`` / ``unsubscribe`` frames queued
+        before the resync are dropped by the sender (an older
+        ``_sub_epoch``).  Events may still have been lost while disconnected:
+        the dispatcher's drop hooks are told (``signal_loss``), so a
+        consumer that can recover them (rhapsody's reconcile) does at once.
         """
         with self._cb_lock:
             self._sub_epoch += 1
+            gone = list(self._unsubscribed)
+            self._unsubscribed.clear()
             keys = list(self._callbacks.keys())
-            if not keys:
-                return
-            patterns = [protocol.SubscribePattern(endpoint=e, plugin=p,
-                                                  topic=t)
-                        for (e, p, t) in keys]
-            self._emit(protocol.Subscribe(src=self._name, patterns=patterns))
+            if gone:
+                self._emit(protocol.Unsubscribe(
+                    src=self._name,
+                    patterns=[protocol.SubscribePattern(endpoint=e, plugin=p,
+                                                        topic=t)
+                              for (e, p, t) in gone]))
+            if keys:
+                self._emit(protocol.Subscribe(
+                    src=self._name,
+                    patterns=[protocol.SubscribePattern(endpoint=e, plugin=p,
+                                                        topic=t)
+                              for (e, p, t) in keys]))
+        signal = getattr(self._cb, 'signal_loss', None)
+        if keys and callable(signal):
+            signal()
 
     def _on_event(self, ev: protocol.Event) -> None:
         endpoint, plugin, topic = ev.src, ev.plugin, ev.topic

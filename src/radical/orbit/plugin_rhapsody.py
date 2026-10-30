@@ -7,7 +7,6 @@ and monitor compute / AI tasks on endpoint nodes.
 
 import asyncio
 import base64
-import collections
 import contextlib
 import functools
 import importlib
@@ -69,7 +68,6 @@ RECONCILE_TIMEOUT   = 10.0             # bound of one task_states call
 RECONCILE_JOIN      = 2.0              # close() waits this long for it
 CLOSE_NOTIFY_DRAIN  = 2.0              # close() waits this long for the
                                        # last states of its tasks
-DEDUP_IDS           = 1024             # recent event ids kept for dedup
 RECONCILE_RETRY     = 5.0              # next pass after a failed call,
                                        # doubling while calls keep failing
 # An uid whose submit POST failed may still reach the endpoint: unknown to
@@ -1674,10 +1672,8 @@ class RhapsodyClient(PluginClient):
         # Seq gap detection on this client's one stream — its endpoint's
         # plugin, its sid: the last broker seq seen (``None``: not started).
         # A gap is a lost event of this session and wakes the reconcile.
-        # Duplicates are told by event id (the last ``DEDUP_IDS`` ids).  All
-        # reads and writes under ``_deliver_lock``.
+        # All reads and writes under ``_deliver_lock``.
         self._seq_last : int | None = None
-        self._seen_ids : collections.OrderedDict = collections.OrderedDict()
 
         # close(): the sid being closed, whose last states are still taken
         # (for up to ``_close_drain`` seconds) after unregister_session
@@ -1775,15 +1771,18 @@ class RhapsodyClient(PluginClient):
             sid = self.sid
             if self._fanout_on and self._fanout_sid == sid:
                 return
-            # register the new scope before dropping the old one, so no
-            # event finds no callback in between (an event both match is
-            # deduplicated by its id)
-            self._bc.register_callback(
+            # a session switch moves the registration atomically (no event
+            # finds both scopes, or neither); a first one registers
+            moved = self._fanout_on and self._bc.rescope_callback(
                 endpoint_id=self._endpoint_id, plugin_name=self._plugin_name,
-                topic=None, callback=self._on_plugin_event, with_meta=True,
-                session=sid)
-            if self._fanout_on:
-                self._unregister_runtime(self._fanout_sid)
+                topic=None, callback=self._on_plugin_event,
+                session=self._fanout_sid, new_session=sid)
+            if not moved:
+                self._bc.register_callback(
+                    endpoint_id=self._endpoint_id,
+                    plugin_name=self._plugin_name, topic=None,
+                    callback=self._on_plugin_event, with_meta=True,
+                    session=sid)
             self._fanout_on  = True
             self._fanout_sid = sid
 
@@ -1827,8 +1826,6 @@ class RhapsodyClient(PluginClient):
         track the session's seq, then hand the event to the fan-out
         (serialized with recovered deliveries)."""
         with self._delivering():
-            if self._duplicate(meta):
-                return                  # the same event twice (scope move)
             self._track_seq(meta)
             if topic in self._FANOUT_TOPICS:
                 self._fan_out(endpoint, plugin, topic, data)
@@ -1844,20 +1841,6 @@ class RhapsodyClient(PluginClient):
         for cb in cbs:
             self._call(cb, endpoint, plugin, topic, data)
 
-    def _duplicate(self, meta) -> bool:
-        """True for an event seen already, by its envelope id: while the
-        callback moves scope both registrations may match one event.
-        Caller holds ``_deliver_lock``."""
-        eid = meta.get('id') if meta else None
-        if eid is None:
-            return False
-        if eid in self._seen_ids:
-            return True
-        self._seen_ids[eid] = None
-        if len(self._seen_ids) > DEDUP_IDS:
-            self._seen_ids.popitem(last=False)
-        return False
-
     def _mine(self, sid) -> bool:
         """Whether *sid* is this client's session — or the one it is
         closing, whose last states are still taken."""
@@ -1870,10 +1853,11 @@ class RhapsodyClient(PluginClient):
         The broker numbers this client's stream — its endpoint's plugin,
         its sid — and a stream's seq never goes backwards while the broker
         runs.  The tracker starts at the first seq it sees (a session can be
-        joined mid-stream).  Duplicates are dropped by id before this, so a
-        seq at or below the last one is a broker restart: the tracker
-        restarts from it.  A forward jump by more than one is a gap and
-        wakes the reconcile at once.  Drops before the broker numbers an
+        joined mid-stream).  An event reaches this callback once (a scope
+        move is atomic), so a seq at or below the last one is a broker
+        restart: the tracker restarts from it, and the reconcile wakes (the
+        restart may have lost events).  A forward jump by more than one is
+        a gap and wakes the reconcile at once.  Drops before the broker numbers an
         event (endpoint side) leave no gap: the reconcile's idle timer
         still covers those.  Caller holds ``_deliver_lock``.
         """
@@ -1886,8 +1870,9 @@ class RhapsodyClient(PluginClient):
             return
         if seq <= last:
             log.info("[rhapsody] seq of session %s went back from %d to %d "
-                     "(broker restart): tracking restarts", session, last,
-                     seq)
+                     "(broker restart): tracking restarts, reconciling",
+                     session, last, seq)
+            self._reconcile_wake.set()
         elif seq > last + 1:
             log.info("[rhapsody] %d event(s) of session %s lost (seq %d "
                      "after %d): reconciling", seq - last - 1, session, seq,
@@ -2194,7 +2179,7 @@ class RhapsodyClient(PluginClient):
     def _on_drop(self, fn) -> None:
         """Dispatcher drop hook.  Runs on the runtime's work loop: it must
         not block, so it only wakes the reconcile thread."""
-        if fn == self._on_plugin_event:
+        if fn is None or fn == self._on_plugin_event:   # None: reconnect
             self._reconcile_wake.set()
 
     def _outstanding(self, older: float | None = None) -> list[str]:
@@ -2429,7 +2414,9 @@ class RhapsodyClient(PluginClient):
             super().close()
         finally:
             try:
-                if self._fanout_on and not inside:
+                # no drain when unregister_session failed (it keeps _sid):
+                # the session did not close, nothing more will come
+                if self._fanout_on and not inside and self._sid is None:
                     self._drain_close()
             finally:
                 self._drop_fan_out()
@@ -2447,14 +2434,20 @@ class RhapsodyClient(PluginClient):
             (isinstance(disp, CallbackDispatcher) and disp.ident == me)
 
     def _drain_close(self) -> None:
-        """Wait until no task is outstanding, at most ``_close_drain``."""
+        """Wait until no task is outstanding, at most ``_close_drain``.
+        Uncertain uids (their submit failed: maybe never on the endpoint,
+        so no final state may come) are not waited for."""
         deadline = time.monotonic() + self._close_drain
         with self._cond:
-            while self._pending:
+            while True:
+                waiting = [u for u in self._pending
+                           if u not in self._uncertain]
+                if not waiting:
+                    return
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     log.info("[rhapsody] %d task(s) of %s without a final "
-                             "state at close", len(self._pending),
+                             "state at close", len(waiting),
                              self._closing_sid)
                     return
                 self._cond.wait(remaining)

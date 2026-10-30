@@ -53,10 +53,12 @@ effectively-once**: ``fetch`` is stateless — the consumer passes its own
 from __future__ import annotations
 
 import asyncio
+import bisect
+import itertools
 import logging
 import time
 
-from collections import deque
+from collections import OrderedDict, deque
 from typing      import Any, Callable, Dict, List, Optional
 
 import msgpack
@@ -80,6 +82,7 @@ _GLOBAL_MAX_BYTES  = 16 * 1024 * 1024   # global session-less ring bound (bytes)
 _FETCH_MAX_EVENTS  = 256                # default per-fetch event cap
 _FETCH_MAX_BYTES   = 1024 * 1024        # default per-fetch byte cap
 _SWEEP_INTERVAL    = 30.0              # background age-eviction sweep cadence (s)
+_TOMBSTONES_MAX    = 4096              # evicted session streams remembered
 
 
 # ---------------------------------------------------------------------------
@@ -161,9 +164,12 @@ class _RingBuffer:
         '''
         out: List[Dict[str, Any]] = []
         nbytes = 0
-        for seq, _ts, size, event in self.events:
-            if seq <= after_exclusive:
-                continue
+        # seq ascends within a buffer: start at the first one past the
+        # position instead of scanning from the head
+        start = bisect.bisect_right(self.events, after_exclusive,
+                                    key=lambda e: e[0])
+        for seq, _ts, size, event in itertools.islice(self.events, start,
+                                                      None):
             if not _event_matches(patterns, event):
                 continue
             if out and (len(out) >= max_events or nbytes + size > max_bytes):
@@ -246,20 +252,18 @@ class ReplayClient(PluginClient):
        plugin, session)``; the global ring (``session=None``) holds only
        session-less events, and a session-less fetch also returns the
        matching session streams, grouped (``replay_iter`` drains them all).
-    3. **Dedup by ``(src, plugin, session, seq)``.**  The broker numbers each
-       session's stream on its own (and the session-less stream globally), so
-       ``seq`` alone is not unique: key the seen-set on the full tuple and skip
-       any already seen.  Replayed events carry ``src``, ``plugin``,
-       ``session`` and ``seq``; live delivery exposes the same broker-stamped
-       values too: register the live callback with
-       ``runtime.register_callback(..., with_meta=True)`` and key on
-       ``(endpoint, plugin, meta['session'], meta['seq'])`` (the identical
-       authoritative values this plugin retains) — no application key
-       needed.
+    3. **Dedup by event id.**  Every event carries its envelope ``id``,
+       unique per event: replayed events as ``event['id']``, live delivery
+       as ``meta['id']`` (register the live callback with
+       ``runtime.register_callback(..., with_meta=True)``).  Keep a bounded
+       set of recent ids and skip any already seen — no application key
+       needed.  (``seq`` is not unique on its own: the broker numbers each
+       ``(src, plugin, session)`` stream separately, and the session-less
+       stream globally; it serves positions and gaps.)
 
     Because live delivery starts *before* replay finishes, the two streams
-    overlap around the join point; the ``seq`` dedup discards the duplicates, so
-    the handler observes each event once — at-least-once on the wire + ``seq``
+    overlap around the join point; the id dedup discards the duplicates, so
+    the handler observes each event once — at-least-once on the wire + id
     dedup = effectively-once.  A ``fetch`` reporting ``gap=True`` means retained
     events were evicted before ``after_seq`` reached them: the consumer re-syncs
     state (topology + state-mirroring recover on reconnect regardless) instead
@@ -326,7 +330,7 @@ class ReplayClient(PluginClient):
         its own position to the batch's ``next_seq``, and stops when a batch
         comes back empty.  This is the drain step of the splice recipe (see the
         class docstring): register the live callback first, then drive this
-        generator, deduping by ``(src, plugin, session, seq)``.  Defaults
+        generator, deduping by event ``id``.  Defaults
         to ``after_seq=-1`` (whole retained buffer).  Without *session* it
         drains the global ring and the matching session streams, each from
         its own position (the session streams from their start).
@@ -413,6 +417,10 @@ class PluginReplay(Plugin):
         self._global = _RingBuffer(self.global_max_bytes)
         # Session buffers are keyed ``(src, plugin, session)``.
         self._session_buffers: Dict[tuple, _RingBuffer] = {}
+        # Streams whose buffer aged out entirely: key -> its highest evicted
+        # seq, so a consumer positioned on one still learns about the gap
+        # (bounded, oldest first out).
+        self._tombstones: 'OrderedDict[tuple, int]' = OrderedDict()
 
         # Subscribe to the raw event tap NOW so retention starts at load time
         # (a late consumer must find events already buffered).  Absent (None)
@@ -458,6 +466,8 @@ class PluginReplay(Plugin):
             buf = self._session_buffers.get(key)
             if buf is None:
                 buf = _RingBuffer(self.session_max_bytes, self.session_max_age)
+                # a stream that comes back keeps reporting its old gap
+                buf.last_dropped_seq = self._tombstones.pop(key, None)
                 self._session_buffers[key] = buf
         else:
             buf = self._global
@@ -474,6 +484,11 @@ class PluginReplay(Plugin):
             # saw.  A later event for the same session recreates it on demand.
             if not buf.events:
                 del self._session_buffers[key]
+                if buf.last_dropped_seq is not None:
+                    self._tombstones[key] = buf.last_dropped_seq
+                    self._tombstones.move_to_end(key)
+                    if len(self._tombstones) > _TOMBSTONES_MAX:
+                        self._tombstones.popitem(last=False)
 
     def _maybe_start_sweeper(self) -> None:
         if self._sweeper is not None:
@@ -558,7 +573,10 @@ class PluginReplay(Plugin):
         buf = self._session_buffer(session, body.get('endpoint'),
                                    body.get('plugin'), patterns)
         if buf is None:
-            return {'events': [], 'next_seq': lower, 'gap': False}
+            gone = self._tombstone(session, body.get('endpoint'),
+                                   body.get('plugin'), patterns)
+            return {'events': [], 'next_seq': lower,
+                    'gap': gone is not None and gone > lower}
         res = self._select(buf, lower, patterns, max_events, max_bytes, now,
                            from_zero=False)
         res.pop('_bytes')
@@ -590,12 +608,24 @@ class PluginReplay(Plugin):
                     detail="session_after_seq takes [endpoint, plugin, "
                            "session, after_seq] entries")
         out = []
+        for key, lower in after.items():           # streams evicted since
+            gone = self._tombstones.get(key)
+            if key not in self._session_buffers and gone is not None \
+                    and gone > lower:
+                out.append({'endpoint': key[0], 'plugin': key[1],
+                            'session': key[2], 'events': [],
+                            'next_seq': lower, 'gap': True})
         for key, buf in list(self._session_buffers.items()):
             if max_events <= 0 or max_bytes <= 0:
                 break
             if not _stream_matches(patterns, key[0], key[1]):
                 continue
-            res = self._select(buf, after.get(key, -1), patterns, max_events,
+            lower = after.get(key, -1)
+            buf.evict_aged(now)
+            if buf.highest_seq is not None and buf.highest_seq <= lower \
+                    and not _gap(buf, lower, from_zero=False):
+                continue                       # nothing new for it
+            res = self._select(buf, lower, patterns, max_events,
                                max_bytes, now, from_zero=False)
             max_events -= len(res['events'])
             max_bytes  -= res.pop('_bytes')
@@ -603,6 +633,18 @@ class PluginReplay(Plugin):
                 out.append({'endpoint': key[0], 'plugin': key[1],
                             'session': key[2], **res})
         return out
+
+    def _tombstone(self, session: str, endpoint: Optional[str],
+                   plugin: Optional[str],
+                   patterns: Optional[List[dict]] = None) -> Optional[int]:
+        '''The highest evicted seq of *session*'s stream if its buffer aged
+        out entirely (matched like ``_session_buffer``; ``None`` if unknown
+        or ambiguous).'''
+        found = [seq for (src, plg, sid), seq in self._tombstones.items()
+                 if sid == session
+                 and endpoint in (None, src) and plugin in (None, plg)
+                 and _stream_matches(patterns or [], src, plg)]
+        return found[0] if len(found) == 1 else None
 
     def _session_buffer(self, session: str, endpoint: Optional[str],
                         plugin: Optional[str],

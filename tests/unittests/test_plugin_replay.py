@@ -65,7 +65,7 @@ def _ev(seq, session=None, topic='t', src='ep', plugin='rh', ts=None,
     # Default to a fresh timestamp so session buffers (age-bounded) don't
     # age-evict under the real clock; age tests pass an explicit ts + fake now.
     return {'kind': 'event', 'seq': seq, 'session': session, 'plugin': plugin,
-            'topic': topic, 'src': src,
+            'topic': topic, 'src': src, 'id': f'{src}/{plugin}/{session}/{seq}',
             'ts': time.time() if ts is None else ts, 'data': data or {}}
 
 
@@ -438,28 +438,90 @@ def test_bare_default_sid_disambiguated_by_patterns():
     assert r['gap'] is False                     # stream starts at 1
 
 
-def test_dedup_recipe_on_src_plugin_session_seq():
-    """The splice recipe keys its seen-set on (src, plugin, session, seq):
-    equal seqs of different streams are all kept, re-reads are dropped."""
+def test_dedup_recipe_on_event_id():
+    """The splice recipe dedups on the event id with a bounded set: equal
+    seqs of different streams are all kept, re-reads are dropped."""
+    from collections import OrderedDict
+
     p = _make_plugin()
     for src in ('ep1', 'ep2'):
         for i in range(3):
             p._on_event(_ev(i, session='s', src=src))
     c = _client(p)
 
-    seen, handled = set(), []
+    seen, handled = OrderedDict(), []
     for _ in range(2):                          # second pass re-reads all
         for src in ('ep1', 'ep2'):
             for e in c.replay_iter(session='s', endpoint=src, plugin='rh'):
-                key = (e['src'], e['plugin'], e['session'], e['seq'])
-                if key in seen:
+                if e['id'] in seen:
                     continue
-                seen.add(key)
-                handled.append(key)
-    assert len(handled) == 6
-    assert sorted(handled) == sorted((src, 'rh', 's', i)
-                                     for src in ('ep1', 'ep2')
+                seen[e['id']] = None
+                if len(seen) > 4096:
+                    seen.popitem(last=False)
+                handled.append((e['src'], e['seq']))
+    assert sorted(handled) == sorted((src, i) for src in ('ep1', 'ep2')
                                      for i in range(3))
+
+
+def test_select_starts_past_the_position():
+    """select bisects to the first seq past the position; a positioned
+    session-less fetch skips a stream with nothing new."""
+    from unittest.mock import patch
+
+    buf = _RingBuffer(10 ** 9)
+    for i in range(100, 200):
+        buf.append(i, 0.0, 10, {'seq': i, 'src': 'ep', 'plugin': 'rh',
+                                'topic': 't'}, 0.0)
+    events, nbytes = buf.select(149, [], 3, 10 ** 9)
+    assert [e['seq'] for e in events] == [150, 151, 152] and nbytes == 30
+    assert buf.select(199, [], 3, 10 ** 9) == ([], 0)
+
+    p = _make_plugin()
+    for i in range(3):
+        p._on_event(_ev(10 + i, session='s1'))
+        p._on_event(_ev(20 + i, session='s2'))
+    calls = []
+    orig  = PluginReplay._select
+
+    def _spy(buf, lower, *a, **kw):
+        calls.append(lower)
+        return orig(buf, lower, *a, **kw)
+
+    with patch.object(PluginReplay, '_select', staticmethod(_spy)):
+        r = _run(p._route_fetch(_shim({'session_after_seq': [
+            ['ep', 'rh', 's1', 12], ['ep', 'rh', 's2', 20]]})))
+    assert [(st['session'], [e['seq'] for e in st['events']])
+            for st in r['sessions']] == [('s2', [21, 22])]
+    assert 12 not in calls                       # s1 skipped
+
+
+def test_evicted_stream_keeps_a_tombstone():
+    """A session stream that aged out entirely still reports gap=True to a
+    consumer positioned on it, and keeps reporting it if it comes back."""
+    clock = {'t': 1000.0}
+    p = _make_plugin(session_max_age=100.0, session_max_bytes=10 ** 9)
+    p._now = lambda: clock['t']
+    for i in range(3):
+        p._on_event(_ev(i, session='s', ts=1000.0))
+    clock['t'] = 1200.0
+    p._evict_aged(clock['t'])
+    assert ('ep', 'rh', 's') not in p._session_buffers
+
+    r = _run(p._route_fetch(_shim({'session': 's', 'endpoint': 'ep',
+                                   'plugin': 'rh', 'after_seq': 0})))
+    assert r['gap'] is True and r['events'] == []
+    r = _run(p._route_fetch(_shim({'session': 's', 'endpoint': 'ep',
+                                   'plugin': 'rh', 'after_seq': 2})))
+    assert r['gap'] is False                     # nothing lost past 2
+    r = _run(p._route_fetch(_shim({
+        'session_after_seq': [['ep', 'rh', 's', 0]]})))
+    assert [(st['session'], st['gap']) for st in r['sessions']] \
+        == [('s', True)]
+
+    p._on_event(_ev(3, session='s', ts=1200.0))  # the stream comes back
+    r = _run(p._route_fetch(_shim({'session': 's', 'endpoint': 'ep',
+                                   'plugin': 'rh', 'after_seq': 0})))
+    assert r['gap'] is True and [e['seq'] for e in r['events']] == [3]
 
 
 # ---------------------------------------------------------------------------
