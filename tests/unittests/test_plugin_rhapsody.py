@@ -377,6 +377,92 @@ async def test_submit_tasks():
     assert data[0]['uid'] == 'task.000001'
 
 
+@pytest.mark.asyncio
+async def test_submit_validates_whole_request_before_any_chunk():
+    """A validation error in a later 4096-task chunk is a 400 with nothing
+    submitted: the client may treat a 400 as 'no task of it was taken'."""
+    _, plugin, client = _make_plugin()
+    sid = _register(client, plugin)
+    session = plugin._sessions[sid]
+    session._rh_session = MagicMock()
+    session._rh_session.submit_tasks = AsyncMock()
+
+    tasks = [{"executable": "/bin/true", "uid": f"task.{i:06d}"}
+             for i in range(4097)]
+    tasks[-1] = {"function": "no_such_module_xyz:fn", "uid": "task.bad"}
+    resp = client.post(f"{plugin.namespace}/submit/{sid}",
+                       json={"tasks": tasks})
+    assert resp.status_code == 400
+    assert 'cannot resolve function' in resp.json()['detail']
+    session._rh_session.submit_tasks.assert_not_called()
+    assert session._tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_submit_prepare_exception_is_400_nothing_submitted():
+    """Any error preparing a task (unpicklable blob, bad dict) is a refusal:
+    400, not a 500 the client would have to treat as uncertain."""
+    _, plugin, client = _make_plugin()
+    sid = _register(client, plugin)
+    session = plugin._sessions[sid]
+    session._rh_session = MagicMock()
+    session._rh_session.submit_tasks = AsyncMock()
+
+    def _bad(chunk):
+        raise ModuleNotFoundError("No module named 'gone'")
+
+    session._prepare_batch = _bad
+    resp = client.post(f"{plugin.namespace}/submit/{sid}", json={
+        "tasks": [{"executable": "/bin/true", "uid": "task.x"}]})
+    assert resp.status_code == 400
+    assert "No module named 'gone'" in resp.json()['detail']
+    session._rh_session.submit_tasks.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_submit_failure_mid_submit_is_500_and_watches_submitted():
+    """A backend failure after a chunk was submitted is a 500 (retryable
+    for the client, never a refusal status); every task is recorded, the
+    submitted chunk is watched, so its tasks still report."""
+    _, plugin, client = _make_plugin()
+    sid = _register(client, plugin)
+    session = plugin._sessions[sid]
+    session._rh_session = MagicMock()
+    session._rh_session.submit_tasks = AsyncMock(
+        side_effect=[None, ValueError('backend full')])
+    session._watch_batch = AsyncMock()
+
+    tasks = [{"executable": "/bin/true", "uid": f"task.{i:06d}"}
+             for i in range(4097)]
+    resp = client.post(f"{plugin.namespace}/submit/{sid}",
+                       json={"tasks": tasks})
+    assert resp.status_code == 500
+    assert 'after 4096 of 4097' in resp.json()['detail']
+    assert len(session._tasks) == 4097     # the interrupted one, too
+    # the submitted chunk is watched; the interrupted one too (its tasks
+    # may have reached the backend: no rhapsody registry in this mock)
+    watched = sorted(len(c.args[0])
+                     for c in session._watch_batch.call_args_list)
+    assert watched == [1, 4096]
+
+
+@pytest.mark.asyncio
+async def test_submit_closed_before_first_chunk_stays_410():
+    _, plugin, client = _make_plugin()
+    sid = _register(client, plugin)
+    session = plugin._sessions[sid]
+    session._rh_session = MagicMock()
+
+    def _prepare(chunk):                     # torn down while preparing
+        session._rh_session = None
+        return []
+
+    session._prepare_batch = _prepare
+    resp = client.post(f"{plugin.namespace}/submit/{sid}", json={
+        "tasks": [{"executable": "/bin/true", "uid": "task.x"}]})
+    assert resp.status_code == 410
+
+
 # ---------------------------------------------------------------------------
 # Wait tasks
 # ---------------------------------------------------------------------------
@@ -1348,7 +1434,7 @@ def test_rhapsody_client_wait_tasks():
 
 
 def test_rhapsody_client_wait_tasks_with_timeout():
-    client = _make_rhapsody_client([])
+    client = _make_rhapsody_client([{"uid": "t.001", "state": "DONE"}])
     client._submitted.add("t.001")
     client.wait_tasks(["t.001"], timeout=30.0)
     mock_call = client._http.post.call_args
@@ -1916,7 +2002,7 @@ def test_frame_budgets_follow_host_runtime_cap():
     from radical.orbit import plugin_rhapsody as prh
 
     app = FastAPI()
-    app.state.endpoint_service = MagicMock(_frame_cap=64 * 1024)
+    app.state.endpoint_service = MagicMock(frame_cap=64 * 1024)
     plugin = PluginRhapsody(app)
 
     assert plugin._frame_cap          == 64 * 1024
@@ -2622,6 +2708,785 @@ def test_client_data_helpers():
     rc._http.get.assert_called_with('/rhapsody/data_endpoints/sid.1')
     rc.data_shutdown('r')
     rc._http.post.assert_called_with('/rhapsody/data_shutdown/sid.1/r')
+
+
+# ---------------------------------------------------------------------------
+# Submit batching: frame budget, fail-fast, partial submission
+# ---------------------------------------------------------------------------
+
+
+class _RecordingHTTP:
+    """Fake transport: records each submit body.  At post *fail_at*
+    (0-based; or any post index in a set/range) it fails: with *fail_status* as the response status, or by
+    raising *fail_exc*, or (``fail_status='badjson'``) with a 200 whose body
+    is not JSON.  *on_post(idx)* runs at the start of every post.
+    ``max_body`` is set only when given, so the default exercises the
+    protocol-default fallback."""
+
+    def __init__(self, max_body=None, fail_at=None, fail_status=503,
+                 fail_exc=None, on_post=None, fail_headers=None):
+        if max_body is not None:
+            self.max_body = max_body
+        self.bodies      = []
+        self.headers     = []
+        self.fail_headers = fail_headers or {}
+        self.fail_at     = fail_at
+        self.fail_status = fail_status
+        self.fail_exc    = fail_exc
+        self.on_post     = on_post
+
+    def post(self, url, data=None, headers=None, **kw):
+        import msgpack
+        from radical.orbit.runtime_client import RuntimeResponse
+        idx = len(self.bodies)
+        self.bodies.append(data)
+        self.headers.append(dict(headers or {}))
+        if self.on_post is not None:
+            self.on_post(idx)
+        fail = self.fail_at
+        if idx == fail or (isinstance(fail, (set, frozenset, range))
+                           and idx in fail):
+            if self.fail_exc is not None:
+                raise self.fail_exc
+            if self.fail_status == 'badjson':
+                return RuntimeResponse(200, {}, b'not json')
+            return RuntimeResponse(self.fail_status, self.fail_headers,
+                                   b'{"detail": "nope"}')
+        tasks = msgpack.unpackb(data, raw=False)['tasks']
+        acks  = [{'uid': td['uid'], 'state': 'SUBMITTED'} for td in tasks]
+        return RuntimeResponse(200, {}, json.dumps(acks).encode())
+
+
+def _rh_client(http):
+    client = RhapsodyClient(http, '/rhapsody')
+    client._sid = 'sid-rh'
+    return client
+
+
+def _sent_tasks(body):
+    import msgpack
+    return msgpack.unpackb(body, raw=False)['tasks']
+
+
+def _tasks(n, pad=0, prefix='t'):
+    return [{'uid': f'{prefix}.{i:05d}', 'executable': '/bin/echo',
+             'arguments': ['x' * pad]} for i in range(n)]
+
+
+def test_pack_batches_bodies_are_exact_and_bounded():
+    import msgpack
+    from radical.orbit.runtime_client import pack_batches
+    items   = _tasks(300, pad=40)
+    batches = list(pack_batches(items, 4096, 8192))
+    assert len(batches) > 1
+    assert [td for b, _ in batches for td in b] == items      # order kept
+    for batch, body in batches:
+        # same bytes the old per-batch ``packb`` produced: no wire change
+        assert body == msgpack.packb({'tasks': batch}, use_bin_type=True)
+        assert len(body) <= 4096
+
+
+def test_pack_batches_builds_bodies_lazily():
+    """The size check is eager, the bodies are not: they are assembled one
+    at a time as the caller sends, so a submission is not held twice."""
+    import inspect
+    from unittest.mock import patch as _patch
+    from radical.orbit import runtime_client as rc
+    items = _tasks(300, pad=40)
+    with _patch.object(rc, '_assemble', wraps=rc._assemble) as asm:
+        batches = rc.pack_batches(items, 4096, 8192)
+        assert inspect.isgenerator(batches)
+        assert asm.call_count == 0
+        next(batches)
+        assert asm.call_count == 1
+        rest = list(batches)
+        assert asm.call_count == 1 + len(rest)
+
+
+def test_pack_batches_item_over_budget_travels_alone():
+    from radical.orbit.runtime_client import pack_batches
+    items   = _tasks(2) + _tasks(1, pad=6000, prefix='big') + _tasks(2)
+    batches = list(pack_batches(items, 4096, 8192))
+    assert [len(b) for b, _ in batches] == [2, 1, 2]
+
+
+def test_pack_batches_item_over_limit_is_413_before_any_batch():
+    from radical.orbit.runtime_client import PayloadTooLarge, pack_batches
+    items = (_tasks(2) + _tasks(1, pad=9000, prefix='big')
+             + _tasks(1) + _tasks(1, pad=9000, prefix='huge'))
+    with pytest.raises(PayloadTooLarge) as exc:
+        pack_batches(items, 4096, 8192)            # raises at the call
+    assert exc.value.status_code == 413
+    assert exc.value.indices     == [2, 4]
+    assert exc.value.uids        == ['big.00000', 'huge.00000']
+    assert 'item 2' in str(exc.value)
+
+
+def test_submit_errors_survive_pickle():
+    import copy
+    import pickle
+    from radical.orbit import plugin_rhapsody as prh
+    from radical.orbit.runtime_client import PayloadTooLarge
+    err = prh.PartialSubmitError('boom', ['a'], [{'uid': 'a'}], 503,
+                                 ['b'], ['c'], refused=False, not_sent=True)
+    for clone in (pickle.loads(pickle.dumps(err)), copy.copy(err)):
+        assert str(clone) == 'boom'
+        assert (clone.accepted, clone.results, clone.status_code,
+                clone.failed, clone.unsent, clone.refused,
+                clone.not_sent) == \
+               (['a'], [{'uid': 'a'}], 503, ['b'], ['c'], False, True)
+    big   = PayloadTooLarge('too big', [3], ['t.3'])
+    clone = pickle.loads(pickle.dumps(big))
+    assert (str(clone), clone.indices, clone.uids, clone.status_code) == \
+           ('too big', [3], ['t.3'], 413)
+
+
+def test_submit_8192_tasks_at_default_cap_splits_under_frame_cap():
+    """Regression (overnight F2): 8192 tasks overran the 4 MiB frame in one
+    8 MiB batch, the frame was dropped and the client hung."""
+    from radical.orbit import protocol
+    http   = _RecordingHTTP()                       # protocol-default budget
+    client = _rh_client(http)
+    tasks  = _tasks(8192, pad=600)
+    result = client.submit_tasks(tasks)
+
+    assert len(result) == 8192
+    assert len(http.bodies) >= 2
+    for body in http.bodies:
+        req = protocol.make_request(
+            'client', 'ep', 'POST', '/rhapsody/submit/sid-rh', body=body,
+            headers={'Content-Type': 'application/msgpack'})
+        assert len(protocol.pack_message(req)) <= protocol.FRAME_CAP
+    assert client._submitted == {td['uid'] for td in tasks}
+
+
+def test_submit_budget_is_half_the_transport_body_limit():
+    http   = _RecordingHTTP(max_body=16 * 1024)
+    client = _rh_client(http)
+    client.submit_tasks(_tasks(200, pad=100))
+    assert len(http.bodies) > 1
+    assert all(len(b) <= 8 * 1024 for b in http.bodies)
+
+
+def test_submit_budget_default_clamp_is_default_peer_safe():
+    """A raised local cap does not raise the batch budget past what a
+    default-cap peer accepts (peer caps are not advertised)."""
+    from radical.orbit import plugin_rhapsody as prh
+    from radical.orbit import protocol
+    assert prh.WS_PAYLOAD_LIMIT == protocol.FRAME_CAP // prh.BUDGET_RATIO
+    big = _RecordingHTTP(max_body=protocol.max_body(4 * protocol.FRAME_CAP))
+    assert prh._submit_budget(big) == prh.WS_PAYLOAD_LIMIT
+
+
+def test_submit_ws_payload_limit_still_clamps(monkeypatch):
+    from radical.orbit import plugin_rhapsody as prh
+    monkeypatch.setattr(prh, 'WS_PAYLOAD_LIMIT', 2048)
+    http = _RecordingHTTP(max_body=1024 * 1024)
+    _rh_client(http).submit_tasks(_tasks(200, pad=100))
+    assert all(len(b) <= 2048 for b in http.bodies)
+
+
+def test_submit_oversized_task_413_sends_nothing():
+    from radical.orbit.runtime_client import PayloadTooLarge
+    http   = _RecordingHTTP(max_body=8 * 1024)
+    client = _rh_client(http)
+    with pytest.raises(PayloadTooLarge) as exc:
+        client.submit_tasks(_tasks(3) + _tasks(1, pad=9000, prefix='big'))
+    assert exc.value.status_code == 413
+    assert exc.value.uids        == ['big.00000']
+    assert http.bodies       == []
+    assert client._submitted == set()
+
+
+def test_submit_registers_all_uids_before_first_post():
+    """A concurrent ``wait_tasks`` on a client-assigned uid is valid as soon
+    as the submit starts sending, not only once its batch is acked."""
+    tasks = _tasks(200, pad=100)
+    seen  = []
+    http  = _RecordingHTTP(max_body=8 * 1024)
+    client = _rh_client(http)
+    http.on_post = lambda idx: seen.append(set(client._submitted))
+    client.submit_tasks(tasks)
+    assert len(seen) > 1
+    assert seen[0] == {td['uid'] for td in tasks}
+
+
+def _partial(http, tasks, client=None):
+    from radical.orbit import plugin_rhapsody as prh
+    client = client or _rh_client(http)
+    with pytest.raises(prh.PartialSubmitError) as exc:
+        client.submit_tasks(tasks)
+    return client, exc.value
+
+
+def _uids(body):
+    return [td['uid'] for td in _sent_tasks(body)]
+
+
+@pytest.mark.parametrize('status', [400, 404, 409, 410, 413, 422])
+def test_submit_refusal_is_final_not_retried(status):
+    """A refused batch took nothing: no retry, its uids and the unsent
+    rest are withdrawn."""
+    tasks       = _tasks(200, pad=100)
+    http        = _RecordingHTTP(max_body=8 * 1024, fail_at=1,
+                                 fail_status=status)
+    client, err = _partial(http, tasks)
+    first, second = _uids(http.bodies[0]), _uids(http.bodies[1])
+    assert len(http.bodies) == 2                       # not retried
+    assert err.refused and not err.not_sent
+    assert err.status_code == status
+    assert err.accepted == first
+    assert [r['uid'] for r in err.results] == first
+    assert err.failed   == second
+    assert err.unsent   == [td['uid']
+                            for td in tasks[len(first) + len(second):]]
+    assert client._submitted == set(first)
+    with pytest.raises(ValueError, match='unknown task UID'):
+        client.wait_tasks([tasks[-1]['uid']], timeout=0.1)
+
+
+@pytest.mark.parametrize('status', [401, 403, 405, 418])
+def test_submit_other_4xx_is_a_final_refusal(status):
+    tasks       = _tasks(200, pad=100)
+    http        = _RecordingHTTP(max_body=8 * 1024, fail_at=1,
+                                 fail_status=status)
+    client, err = _partial(http, tasks)
+    assert len(http.bodies) == 2
+    assert err.refused and err.status_code == status
+    assert client._submitted == set(err.accepted)
+
+
+def test_submit_429_is_retried_honouring_retry_after():
+    from radical.orbit import plugin_rhapsody as prh
+    http   = _RecordingHTTP(max_body=8 * 1024, fail_at=1, fail_status=429,
+                            fail_headers={'Retry-After': '7'})
+    client = _rh_client(http)
+    slept  = []
+    prh._submit_batches(client, '/rhapsody/submit/sid-rh',
+                        _tasks(200, pad=100), sleep=slept.append)
+    assert slept == [7.0]
+    assert http.bodies[2] == http.bodies[1]
+
+
+def test_submit_resend_carries_retry_header():
+    http   = _RecordingHTTP(max_body=8 * 1024, fail_at=1, fail_status=503)
+    _rh_client(http).submit_tasks(_tasks(200, pad=100))
+    from radical.orbit.plugin_rhapsody import SUBMIT_RETRY_HEADER
+    assert SUBMIT_RETRY_HEADER not in http.headers[0]
+    assert SUBMIT_RETRY_HEADER not in http.headers[1]
+    assert http.headers[2][SUBMIT_RETRY_HEADER] == '1'
+
+
+def test_submit_retry_window_follows_transport_call_timeout(monkeypatch):
+    """Resends continue until a window that covers the transport's call
+    timeout closes (so a long endpoint submit outliving the broker's relay
+    504s is eventually confirmed); without one, SUBMIT_RETRY_WINDOW."""
+    from radical.orbit import plugin_rhapsody as prh
+    monkeypatch.setattr(prh, 'SUBMIT_MAX_RETRIES', None)
+
+    def _posts(call_timeout):
+        now = [0.0]
+
+        def _clock():
+            now[0] += 50.0                    # each read: 50 s later
+            return now[0]
+
+        monkeypatch.setattr(prh, '_clock', _clock)
+        http = _RecordingHTTP(max_body=8 * 1024, fail_at=range(99),
+                              fail_status=504)
+        if call_timeout:
+            http.call_timeout = call_timeout
+        with pytest.raises(prh.PartialSubmitError):
+            prh._submit_batches(_rh_client(http), '/x', _tasks(3),
+                                sleep=lambda s: None)
+        return len(http.bodies)
+
+    # window 660 s (default) vs. 1000 + 60 s: one clock read per failure,
+    # 50 s apart -- 13 resends vs. 21
+    assert _posts(None) == 1 + 13
+    assert _posts(1000) == 1 + 21
+
+
+@pytest.mark.parametrize('kind', ['503', '500', '502', 'timeout',
+                                  'badjson', 'not_sent'])
+def test_submit_retryable_failure_is_resent_with_same_uids(kind):
+    """A transient failure (incl. the runtime's admission 503) is resent
+    with the same uids, and the submit succeeds."""
+    from radical.orbit.protocol import RequestNotSent
+    kw = {'503':      dict(fail_status=503),
+          '500':      dict(fail_status=500),
+          '502':      dict(fail_status=502),
+          'timeout':  dict(fail_exc=TimeoutError('no answer')),
+          'badjson':  dict(fail_status='badjson'),
+          'not_sent': dict(fail_exc=RequestNotSent('transport not up'))}
+    tasks  = _tasks(200, pad=100)
+    http   = _RecordingHTTP(max_body=8 * 1024, fail_at=1, **kw[kind])
+    client = _rh_client(http)
+    result = client.submit_tasks(tasks)
+    assert [r['uid'] for r in result] == [td['uid'] for td in tasks]
+    assert http.bodies[2] == http.bodies[1]            # same batch again
+    assert client._submitted == {td['uid'] for td in tasks}
+
+
+def test_submit_retries_exhausted_withdraws_failed_and_unsent():
+    from radical.orbit import plugin_rhapsody as prh
+    tasks       = _tasks(200, pad=100)
+    http        = _RecordingHTTP(max_body=8 * 1024, fail_at=range(1, 99),
+                                 fail_status=503)
+    client, err = _partial(http, tasks)
+    first, second = _uids(http.bodies[0]), _uids(http.bodies[1])
+    assert len(http.bodies) == 2 + prh.SUBMIT_MAX_RETRIES
+    assert all(b == http.bodies[1] for b in http.bodies[2:])
+    assert not err.refused and not err.not_sent
+    assert err.status_code == 503
+    assert err.failed == second
+    assert 'resubmitting the same uids is safe' in str(err)
+    # without a reconcile path, failed and unsent are withdrawn
+    assert client._submitted == set(first)
+
+
+def test_submit_not_sent_exhausted_says_not_taken():
+    from radical.orbit.protocol import RequestNotSent
+    tasks       = _tasks(200, pad=100)
+    http        = _RecordingHTTP(max_body=8 * 1024, fail_at=range(1, 99),
+                                 fail_exc=RequestNotSent('endpoint unknown'))
+    client, err = _partial(http, tasks)
+    assert err.not_sent and err.status_code is None
+    assert 'were not taken' in str(err)
+
+
+def test_submit_can_reconcile_keeps_failed_pending():
+    """With a reconcile path (task state query) the client keeps the
+    unconfirmed uids pending; the unsent ones are still withdrawn."""
+    tasks  = _tasks(200, pad=100)
+    http   = _RecordingHTTP(max_body=8 * 1024, fail_at=range(1, 99),
+                            fail_status=503)
+    client = _rh_client(http)
+    client._can_reconcile = lambda: True
+    client, err = _partial(http, tasks, client)
+    assert client._submitted == set(err.accepted) | set(err.failed)
+    assert not set(err.unsent) & client._submitted
+
+
+def test_submit_withdraws_only_uids_this_call_added():
+    """A uid an earlier submit registered stays waitable when a later
+    submit that repeats it fails."""
+    tasks   = _tasks(200, pad=100)
+    http    = _RecordingHTTP(max_body=8 * 1024, fail_at=1, fail_status=400)
+    client  = _rh_client(http)
+    earlier = tasks[-1]['uid']
+    client._submitted.add(earlier)
+    client, err = _partial(http, tasks, client)
+    assert earlier in err.unsent
+    assert earlier in client._submitted
+    assert not (set(err.failed) | set(err.unsent)) - {earlier} \
+        & client._submitted
+
+
+def test_submit_registers_uids_before_packing(monkeypatch):
+    """uids are waitable before packing starts; on a 413 the ones this call
+    added are withdrawn again, an earlier one stays."""
+    from radical.orbit import plugin_rhapsody as prh
+    from radical.orbit.runtime_client import PayloadTooLarge
+    http    = _RecordingHTTP(max_body=8 * 1024)
+    client  = _rh_client(http)
+    tasks   = _tasks(3) + _tasks(1, pad=9000, prefix='big')
+    client._submitted.add('t.00000')               # an earlier submit's
+    seen    = []
+    real    = prh.pack_batches
+
+    def _spy(*a, **kw):
+        seen.append(set(client._submitted))
+        return real(*a, **kw)
+
+    monkeypatch.setattr(prh, 'pack_batches', _spy)
+    with pytest.raises(PayloadTooLarge):
+        client.submit_tasks(tasks)
+    assert seen == [{td['uid'] for td in tasks}]
+    assert client._submitted == {'t.00000'}
+
+
+def test_submit_pack_type_error_withdraws_uids(monkeypatch):
+    """Any pre-send failure (here a msgpack TypeError) withdraws the uids
+    this call registered."""
+    from radical.orbit import plugin_rhapsody as prh
+
+    def _boom(*a, **kw):
+        raise TypeError("can not serialize 'set' object")
+
+    monkeypatch.setattr(prh, 'pack_batches', _boom)
+    http   = _RecordingHTTP(max_body=8 * 1024)
+    client = _rh_client(http)
+    with pytest.raises(TypeError):
+        client.submit_tasks(_tasks(3))
+    assert client._submitted == set()
+    assert http.bodies == []
+
+
+def test_submit_terminal_duplicate_ack_wakes_waiter():
+    """A resubmit of a finished uid is acked with its terminal payload and
+    no new event follows: the ack itself completes the waiter."""
+    import threading
+    import time as _time
+    from radical.orbit.runtime_client import RuntimeResponse
+
+    client = _rh_client(None)
+    client._bc, client._endpoint_id, client._plugin_name = \
+        MagicMock(), 'ep', 'rhapsody'
+    out    = {}
+
+    def _wait():
+        out['res'] = client.wait_tasks(['t.1'], timeout=10)
+
+    waiter = threading.Thread(target=_wait, daemon=True)
+
+    class _HTTP:
+        def post(self, url, data=None, headers=None, **kw):
+            waiter.start()                    # t.1 is registered by now
+            _time.sleep(0.2)                  # let it block
+            return RuntimeResponse(200, {}, json.dumps([
+                {'uid': 't.1', 'state': 'DONE', 'exit_code': 0,
+                 'stdout': 'hi', 'duplicate': True}]).encode())
+
+    client._http = _HTTP()
+    client.submit_tasks([{'uid': 't.1', 'executable': '/bin/true'}])
+    waiter.join(5)
+    assert not waiter.is_alive()
+    assert out['res'][0]['state'] == 'DONE'
+    assert out['res'][0]['stdout'] == 'hi'
+
+
+def test_submit_timeout_then_retry_runs_once_end_to_end():
+    """The first ack is lost (timeout) after the endpoint took the batch;
+    the resend is deduplicated by the endpoint session: one backend run,
+    the retry's acks are marked duplicate."""
+    from radical.orbit.runtime_client import RuntimeResponse
+    session = _dedup_session()
+    posts   = []
+
+    class _HTTP:
+        max_body = 8 * 1024
+
+        def post(self, url, data=None, headers=None, **kw):
+            import msgpack
+            tds  = msgpack.unpackb(data, raw=False)['tasks']
+            acks = asyncio.run(session.submit_tasks(tds))
+            posts.append(acks)
+            if len(posts) == 1:
+                raise TimeoutError('ack lost')
+            return RuntimeResponse(200, {}, json.dumps(acks).encode())
+
+    client = _rh_client(_HTTP())
+    result = client.submit_tasks([{'uid': 't.1', 'executable': '/bin/true'},
+                                  {'uid': 't.2', 'executable': '/bin/true'}])
+    assert session._rh_session.submit_tasks.await_count == 1
+    assert len(posts) == 2
+    assert all(a.get('duplicate') for a in result)
+    assert [a['uid'] for a in result] == ['t.1', 't.2']
+
+
+def test_wait_poll_keeps_waiting_on_a_short_reply(monkeypatch):
+    """The poll fallback treats a short reply (or the endpoint's 404 for
+    'none known yet') as not done, and returns once every uid is in."""
+    from radical.orbit import plugin_rhapsody as prh
+    from radical.orbit.runtime_client import RuntimeResponse
+    monkeypatch.setattr(prh.time, 'sleep', lambda s: None)
+    replies = [
+        RuntimeResponse(200, {}, b'[{"uid": "t.a", "state": "DONE"}]'),
+        RuntimeResponse(404, {}, b'{"detail": "none of the requested '
+                                 b'tasks found"}'),
+        RuntimeResponse(200, {}, b'[{"uid": "t.a", "state": "DONE"}, '
+                                 b'{"uid": "t.b", "state": "DONE"}]')]
+    http        = MagicMock()
+    http.post   = MagicMock(side_effect=replies)
+    client      = _rh_client(http)
+    client._submitted.update({'t.a', 't.b'})
+    res = client.wait_tasks(['t.a', 't.b'], timeout=60)
+    assert {t['uid'] for t in res} == {'t.a', 't.b'}
+    assert http.post.call_count == 3
+
+
+def test_wait_poll_unknown_session_404_raises():
+    from radical.orbit.runtime_client import RuntimeResponse
+    http      = MagicMock()
+    http.post = MagicMock(return_value=RuntimeResponse(
+        404, {}, b'{"detail": "unknown session id: sid-rh"}'))
+    client    = _rh_client(http)
+    client._submitted.add('t.a')
+    with pytest.raises(RuntimeError) as exc:
+        client.wait_tasks(['t.a'], timeout=60)
+    assert exc.value.status_code == 404
+    assert http.post.call_count == 1
+
+
+def test_wait_poll_raises_for_uid_withdrawn_meanwhile():
+    """The poll fallback (no SSE) raises for a uid a concurrently failing
+    submit withdrew, instead of returning the endpoint's shorter list."""
+    from radical.orbit.runtime_client import RuntimeResponse
+
+    client = _rh_client(MagicMock())
+    client._submitted.update({'t.a', 't.b'})
+
+    def _post(url, json=None, **kw):
+        with client._cond:                 # the failing submit withdraws
+            client._submitted.discard('t.b')
+        return RuntimeResponse(
+            200, {}, b'[{"uid": "t.a", "state": "DONE"}]')
+
+    client._http.post = _post
+    with pytest.raises(ValueError, match='rejected by a failed submit'):
+        client.wait_tasks(['t.a', 't.b'], timeout=5)
+
+
+def test_submit_failure_wakes_concurrent_waiter_on_withdrawn_uid():
+    """A waiter blocked (SSE path) on a uid that the failed submit
+    withdraws is woken and raises, instead of hanging until its timeout."""
+    import threading
+    import time as _time
+    tasks  = _tasks(200, pad=100)
+    last   = tasks[-1]['uid']
+    out    = {}
+    http   = _RecordingHTTP(max_body=8 * 1024, fail_at=1, fail_status=400)
+    client = _rh_client(http)
+    client._bc, client._endpoint_id, client._plugin_name = \
+        MagicMock(), 'ep', 'rhapsody'
+
+    def _wait():
+        try:
+            client.wait_tasks([last], timeout=30)
+        except ValueError as e:
+            out['err'] = e
+
+    waiter = threading.Thread(target=_wait, daemon=True)
+
+    def _on_post(idx):
+        if idx == 0:                       # uid registered: wait is valid
+            waiter.start()
+            _time.sleep(0.2)               # let it block on the condition
+
+    http.on_post = _on_post
+    t0 = _time.time()
+    with pytest.raises(RuntimeError):
+        client.submit_tasks(tasks)
+    waiter.join(5)
+    assert not waiter.is_alive()
+    assert _time.time() - t0 < 5
+    assert 'rejected' in str(out['err'])
+
+
+# ---------------------------------------------------------------------------
+# Endpoint session: idempotent submit by uid
+# ---------------------------------------------------------------------------
+
+class _FakeTask(dict):
+    """A minimal BaseTask stand-in: a dict with ``uid``/``state`` views."""
+
+    @property
+    def uid(self):
+        return self['uid']
+
+    @property
+    def state(self):
+        return self.get('state')
+
+
+def _dedup_session(submit=None):
+    """A ready session whose prepare builds _FakeTasks and whose backend
+    submit marks them RUNNING (or runs *submit*)."""
+    async def _run(tasks):
+        for t in tasks:
+            t['state'] = 'RUNNING'
+
+    session = _ready_session()
+    session._prepare_batch = lambda chunk: [_FakeTask(td) for td in chunk]
+    session._rh_session.submit_tasks = AsyncMock(side_effect=submit or _run)
+    return session
+
+
+def _td(uid, **kw):
+    return dict({'uid': uid, 'executable': '/bin/true'}, **kw)
+
+
+@pytest.mark.asyncio
+async def test_dedup_sequential_same_uid_submits_once():
+    session = _dedup_session()
+    first   = await session.submit_tasks([_td('t1')])
+    again   = await session.submit_tasks([_td('t1')])
+    assert session._rh_session.submit_tasks.await_count == 1
+    assert first == [{'uid': 't1', 'state': 'RUNNING'}]
+    assert again == [{'uid': 't1', 'state': 'RUNNING', 'duplicate': True}]
+
+
+@pytest.mark.asyncio
+async def test_dedup_concurrent_same_uid_submits_once():
+    async def _slow(tasks):
+        await asyncio.sleep(0.05)
+        for t in tasks:
+            t['state'] = 'RUNNING'
+
+    session = _dedup_session(_slow)
+    a, b = await asyncio.gather(session.submit_tasks([_td('t1')]),
+                                session.submit_tasks([_td('t1')]))
+    assert session._rh_session.submit_tasks.await_count == 1
+    assert a == [{'uid': 't1', 'state': 'RUNNING'}]
+    # the duplicate awaited the owner and reports the real outcome
+    assert b == [{'uid': 't1', 'state': 'RUNNING', 'duplicate': True}]
+
+
+@pytest.mark.asyncio
+async def test_dedup_uid_repeated_within_one_request():
+    session = _dedup_session()
+    acks    = await session.submit_tasks([_td('t1'), _td('t2'), _td('t1')])
+    sent    = session._rh_session.submit_tasks.await_args.args[0]
+    assert [t.uid for t in sent] == ['t1', 't2']
+    assert [a['uid'] for a in acks] == ['t1', 't2', 't1']
+    assert 'duplicate' not in acks[0] and acks[2]['duplicate'] is True
+
+
+@pytest.mark.asyncio
+async def test_dedup_reservation_released_after_presubmit_failure():
+    session = _dedup_session()
+    good    = session._prepare_batch
+
+    def _bad(chunk):
+        raise ValueError('bad task dict')
+
+    session._prepare_batch = _bad
+    with pytest.raises(HTTPException) as exc:
+        await session.submit_tasks([_td('t1')])
+    assert exc.value.status_code == 400
+    assert session._reserved == {} and 't1' not in session._spec
+    session._prepare_batch = good
+    assert await session.submit_tasks([_td('t1')]) == \
+        [{'uid': 't1', 'state': 'RUNNING'}]
+
+
+@pytest.mark.asyncio
+async def test_dedup_inflight_duplicate_reports_owner_refusal():
+    """A retry arriving while the original request is still preparing
+    waits for it, then reports the original's refusal -- no blind ack, no
+    hang."""
+    import time as _time
+    session = _dedup_session()
+
+    def _slow_bad(chunk):
+        _time.sleep(0.1)
+        raise ValueError('cannot resolve function')
+
+    session._prepare_batch = _slow_bad
+    owner = asyncio.ensure_future(session.submit_tasks([_td('t1')]))
+    await asyncio.sleep(0.02)                     # owner holds t1
+    assert 't1' in session._reserved
+    session._prepare_batch = lambda chunk: [_FakeTask(td) for td in chunk]
+    dup   = asyncio.ensure_future(session.submit_tasks([_td('t1'),
+                                                        _td('t2')]))
+    for fut in (owner, dup):
+        with pytest.raises(HTTPException) as exc:
+            await asyncio.wait_for(fut, 5)
+        assert exc.value.status_code == 400
+    assert 'cannot resolve function' in exc.value.detail
+    session._rh_session.submit_tasks.assert_not_awaited()
+    assert session._reserved == {}
+
+
+@pytest.mark.asyncio
+async def test_dedup_spec_mismatch_warns(caplog):
+    session = _dedup_session()
+    await session.submit_tasks([_td('t1')])
+    with caplog.at_level('WARNING', logger='radical.orbit'):
+        acks = await session.submit_tasks([_td('t1', arguments=['other'])])
+    assert acks[0]['duplicate'] is True
+    assert 'different spec' in caplog.text
+    assert session._rh_session.submit_tasks.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_dedup_terminal_duplicate_ack_carries_payload():
+    session = _dedup_session()
+    await session.submit_tasks([_td('t1')])
+    session._tasks['t1'].update(state='DONE', exit_code=0, stdout='out')
+    acks = await session.submit_tasks([_td('t1')])
+    assert acks[0]['duplicate'] is True
+    assert acks[0]['state']     == 'DONE'
+    assert acks[0]['stdout']    == 'out'
+    assert acks[0]['exit_code'] == 0
+    assert session._rh_session.submit_tasks.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_mid_chunk_fails_unregistered_keeps_registered():
+    """The handler is cancelled while the backend submit is open.  A task
+    the rhapsody session registered may have reached its backend: it stays
+    recorded (SUBMITTING) and watched, so a real completion still arrives.
+    One it never registered provably did not: FAILED and notified.  A
+    retry runs nothing twice."""
+    started = asyncio.Event()
+
+    async def _hang(tasks):
+        session._rh_session._tasks['t1'] = tasks[0]   # registered t1 only
+        started.set()
+        await asyncio.Event().wait()
+
+    session = _dedup_session(_hang)
+    session._rh_session._tasks  = {}
+    session._plugin             = MagicMock()
+    session._watch_batch        = AsyncMock()
+    session._queue_notification = MagicMock()
+    owner = asyncio.ensure_future(session.submit_tasks([_td('t1'),
+                                                        _td('t2')]))
+    await started.wait()
+    owner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await owner
+    await asyncio.sleep(0)
+
+    assert session._tasks['t2']['state'] == 'FAILED'
+    note = session._queue_notification.call_args.args[0]
+    assert note['uid'] == 't2' and note['state'] == 'FAILED'
+    assert 'submit interrupted' in note['exception']
+    assert 'state' not in session._tasks['t1']           # not failed
+    assert session._sanitize_task(session._tasks['t1'])['state'] == \
+        'SUBMITTING'
+    watched = session._watch_batch.call_args.args[0]
+    assert [t.uid for t in watched] == ['t1']
+    assert session._reserved == {}
+
+    acks = await session.submit_tasks([_td('t1'), _td('t2')])
+    assert session._rh_session.submit_tasks.await_count == 1
+    assert [(a['uid'], a['state'], a['duplicate']) for a in acks] == \
+        [('t1', 'SUBMITTING', True), ('t2', 'FAILED', True)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('tasks', ['nope', [1], [{'uid': 7}],
+                                   [{'uid': 't1'}, 'x']])
+async def test_submit_malformed_request_is_400_without_side_effects(tasks):
+    session = _dedup_session()
+    with pytest.raises(HTTPException) as exc:
+        await session.submit_tasks(tasks)
+    assert exc.value.status_code == 400
+    assert session._reserved == {} and len(session._spec) == 0
+    assert session._tasks == {}
+    session._rh_session.submit_tasks.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_spec_hashes_off_the_loop_and_bounded(monkeypatch):
+    import threading
+    from radical.orbit import plugin_rhapsody as prh
+    monkeypatch.setattr(prh, 'SPEC_MEMORY', 2)
+    threads = []
+    real    = prh._spec_hash
+
+    def _spy(td):
+        threads.append(threading.current_thread())
+        return real(td)
+
+    monkeypatch.setattr(prh, '_spec_hash', _spy)
+    session = _dedup_session()
+    await session.submit_tasks([_td('t1'), _td('t2'), _td('t3')])
+    assert threads and threading.main_thread() not in threads
+    assert list(session._spec) == ['t2', 't3']          # bounded, newest
 
 
 if __name__ == '__main__':

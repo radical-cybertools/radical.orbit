@@ -34,6 +34,7 @@ envelope is versioned, so a future field (e.g. reinstating a per-envelope
 in-place addition.
 """
 
+import logging
 import uuid
 
 from typing import Any, Dict, List, Literal, Optional, Union
@@ -41,6 +42,11 @@ from typing import Any, Dict, List, Literal, Optional, Union
 import msgpack
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from .errors import error_body
+
+
+log = logging.getLogger("radical.orbit.protocol")
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +59,12 @@ PROTOCOL_VERSION = 1
 # design inequality and the GIL-hold rationale.
 FRAME_CAP = 4 * 1024 * 1024
 
+# Room reserved for the ``request``/``response`` envelope around its
+# ``body`` (version, ids, src/dst, method, path, headers, bin header).  The
+# envelope measures ~260 B; the slack leaves ample room for long paths and
+# headers.  See ``max_body``.
+ENVELOPE_SLACK = 64 * 1024
+
 
 class ProtocolError(Exception):
     """Raised on any envelope pack/parse failure.
@@ -60,6 +72,30 @@ class ProtocolError(Exception):
     Covers: oversized frame, malformed msgpack, unknown ``kind``,
     missing/invalid fields, and protocol version mismatch.
     """
+
+
+class FrameTooLarge(ProtocolError):
+    """Raised by ``pack_message`` when the packed frame exceeds the cap."""
+
+
+class RequestNotSent(RuntimeError):
+    """A call failed before its request frame left this process.
+
+    Raised by the call transports (``EndpointRuntime.call``, the broker
+    caller) when the request provably never reached the wire: unknown
+    destination, in-flight cap, transport not up, unpackable request.  The
+    callee cannot have seen it, so a retry is safe.  A ``RuntimeError``, as
+    those failures were before.
+    """
+
+
+def max_body(cap: int = FRAME_CAP) -> int:
+    """Return the largest ``body`` a request/response frame under *cap* fits.
+
+    The frame cap minus the envelope slack (at most a quarter of a small,
+    test-tuned cap).
+    """
+    return cap - min(ENVELOPE_SLACK, cap // 4)
 
 
 # ---------------------------------------------------------------------------
@@ -266,10 +302,29 @@ def pack_message(msg: BaseModel, cap: int = FRAME_CAP) -> bytes:
         raise ProtocolError(f"failed to pack {msg.kind!r} message: {e}") from e
 
     if len(packed) > cap:
-        raise ProtocolError(
+        raise FrameTooLarge(
             f"frame size {len(packed)} bytes exceeds cap {cap} bytes")
 
     return packed
+
+
+def pack_or_error(resp: 'Response', cap: int = FRAME_CAP) -> bytes:
+    """Pack a ``response``; if it cannot be packed, pack a 500 in its place.
+
+    The replacement keeps ``src``/``dst``/``corr_id``, so the caller's
+    pending call resolves at once with an error instead of waiting out its
+    timeout for a frame that was never sent.
+    """
+    try:
+        return pack_message(resp, cap=cap)
+    except ProtocolError as e:
+        log.warning("response %s -> %s not sent: %s", resp.src, resp.dst, e)
+        err = Response(
+            src=resp.src, dst=resp.dst, status=500,
+            headers={'content-type': 'application/json'},
+            body=error_body(500, f"response not sent: {e}"),
+            corr_id=resp.corr_id)
+        return pack_message(err, cap=cap)
 
 
 def parse_message(data: bytes, cap: int = FRAME_CAP) -> Message:

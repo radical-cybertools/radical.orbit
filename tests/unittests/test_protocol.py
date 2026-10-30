@@ -316,3 +316,42 @@ class TestErrors:
             msg = Control(src='broker', op=op)
             parsed, _ = _roundtrip(msg)
             assert parsed.op == op
+
+
+class TestFrameBudget:
+    """Oversized frames: typed error, body limit, and the response fallback."""
+
+    def test_oversized_pack_raises_frame_too_large(self):
+        from radical.orbit.protocol import FrameTooLarge
+        req = make_request('a', 'b', 'POST', '/p', body=b'x' * 4096)
+        with pytest.raises(FrameTooLarge, match='exceeds cap 1024'):
+            pack_message(req, cap=1024)
+        assert issubclass(FrameTooLarge, ProtocolError)
+
+    def test_max_body_leaves_envelope_slack(self):
+        from radical.orbit.protocol import ENVELOPE_SLACK, max_body
+        assert max_body(FRAME_CAP) == FRAME_CAP - ENVELOPE_SLACK
+        assert max_body(64 * 1024) == 48 * 1024        # small cap: a quarter
+        # a request carrying max_body bytes fits the cap
+        req = make_request('a', 'b', 'POST', '/some/path/x',
+                           headers={'content-type': 'application/msgpack'},
+                           body=b'x' * max_body(64 * 1024))
+        pack_message(req, cap=64 * 1024)
+
+    def test_pack_or_error_passes_small_response(self):
+        from radical.orbit.protocol import pack_or_error
+        resp = make_response(make_request('a', 'b', 'GET', '/p'), 200,
+                             body=b'ok')
+        assert pack_or_error(resp, cap=4096) == pack_message(resp, cap=4096)
+
+    def test_pack_or_error_replaces_oversized_with_500(self):
+        import json
+        from radical.orbit.protocol import pack_or_error
+        req  = make_request('a', 'b', 'GET', '/p')
+        resp = make_response(req, 200, body=b'x' * 8192)
+        msg  = parse_message(pack_or_error(resp, cap=4096), cap=4096)
+        assert msg.kind    == 'response'
+        assert msg.status  == 500
+        assert msg.corr_id == req.corr_id
+        assert (msg.src, msg.dst) == ('b', 'a')
+        assert 'exceeds cap 4096' in json.loads(msg.body)['detail']

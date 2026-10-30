@@ -858,7 +858,8 @@ class TestEndpointMode:
 
             r = client.post(f'{plugin.namespace}/cancel/{sid}/t.1')
             assert r.status_code == 200
-            rh_mock.cancel_task.assert_called_once_with('t.1')
+            # the target session sees the session-namespaced uid
+            rh_mock.cancel_task.assert_called_once_with('t.1.A')
 
     def test_endpoint_mode_shape_400_still_fires(self, tmp_path):
         _, plugin = _make_plugin(tmp_path)
@@ -958,6 +959,189 @@ class TestEndpointMode:
         assert r.status_code == 200, r.text
         assert 't.1' not in plugin._endpoint_mode_tasks
         assert notified and notified[0][1]['state'] == TASK_DONE
+
+    def test_endpoint_mode_oversized_task_is_413(self, tmp_path):
+        from radical.orbit.runtime_client import PayloadTooLarge
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _register(client, plugin, body={'sid': 'A',
+                                              'lifetime': 'persistent'})
+        self._seed_topology(plugin, {'ep': ['rhapsody']})
+        rh_mock = MagicMock()
+        rh_mock.submit_tasks = MagicMock(
+            side_effect=PayloadTooLarge('HTTP 413 — too big', [0], ['t.1']))
+        with patch.object(plugin, '_get_rhapsody_client',
+                          new=AsyncMock(return_value=rh_mock)):
+            r = client.post(f'{plugin.namespace}/submit/{sid}', json={
+                'endpoint': 'ep', 'task_id': 't.1',
+                'cmd': ['/bin/true'], 'cwd': '/tmp'})
+        assert r.status_code == 413, r.text
+        assert 'too big' in r.json()['detail']
+        assert 't.1' not in plugin._endpoint_mode_tasks
+
+    def _endpoint_mode_submit(self, tmp_path, exc, result=None,
+                              notified=None):
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _register(client, plugin, body={'sid': 'A',
+                                              'lifetime': 'persistent'})
+        self._seed_topology(plugin, {'ep': ['rhapsody']})
+        if notified is not None:
+            plugin._dispatch_notify = lambda t, d: notified.append((t, d))
+        rh_mock = MagicMock()
+        if exc is None:
+            rh_mock.submit_tasks = MagicMock(return_value=result or [])
+        else:
+            rh_mock.submit_tasks = MagicMock(side_effect=exc)
+        with patch.object(plugin, '_get_rhapsody_client',
+                          new=AsyncMock(return_value=rh_mock)):
+            r = client.post(f'{plugin.namespace}/submit/{sid}', json={
+                'endpoint': 'ep', 'task_id': 't.1',
+                'cmd': ['/bin/true'], 'cwd': '/tmp'})
+        return plugin, r
+
+    def test_endpoint_mode_unconfirmed_submit_is_503_retry(self, tmp_path):
+        """Not confirmed after the client's retries: unmapped, and a 503
+        telling the caller a resubmit of the same task_id is safe."""
+        from radical.orbit.plugin_rhapsody import PartialSubmitError
+        plugin, r = self._endpoint_mode_submit(tmp_path, PartialSubmitError(
+            'HTTP 503 — busy', status_code=503, failed=['t.1']))
+        assert r.status_code == 503, r.text
+        assert r.headers['retry-after'] == '1'
+        assert 'safe' in r.json()['detail']
+        assert 't.1' not in plugin._endpoint_mode_tasks
+
+    def test_endpoint_mode_not_sent_is_503_retry(self, tmp_path):
+        from radical.orbit.plugin_rhapsody import PartialSubmitError
+        plugin, r = self._endpoint_mode_submit(tmp_path, PartialSubmitError(
+            'endpoint unknown', failed=['t.1'], not_sent=True))
+        assert r.status_code == 503, r.text
+        assert r.headers['retry-after'] == '1'
+        assert 't.1' not in plugin._endpoint_mode_tasks
+
+    def test_endpoint_mode_refused_submit_passes_status(self, tmp_path):
+        from radical.orbit.plugin_rhapsody import PartialSubmitError
+        plugin, r = self._endpoint_mode_submit(tmp_path, PartialSubmitError(
+            'HTTP 400 — cannot resolve function', status_code=400,
+            failed=['t.1'], refused=True))
+        assert r.status_code == 400, r.text
+        assert 't.1' not in plugin._endpoint_mode_tasks
+
+    @pytest.mark.parametrize('status', [404, 410])
+    def test_endpoint_mode_session_refusal_is_502_and_evicts(self, tmp_path,
+                                                             status):
+        """The target's rhapsody session is gone or not ready: 502, and the
+        cached child client is dropped, so the next submit registers a
+        fresh session."""
+        from radical.orbit.plugin_rhapsody import PartialSubmitError
+        _, plugin = _make_plugin(tmp_path)
+        stale = MagicMock()
+        plugin._child_clients[('ep', 'rhapsody', None)] = stale
+        client = TestClient(plugin._app)
+        sid = _register(client, plugin, body={'sid': 'A',
+                                              'lifetime': 'persistent'})
+        self._seed_topology(plugin, {'ep': ['rhapsody']})
+        rh_mock = MagicMock()
+        rh_mock.submit_tasks = MagicMock(side_effect=PartialSubmitError(
+            f'HTTP {status}', status_code=status, failed=['t.1'],
+            refused=True))
+        with patch.object(plugin, '_get_rhapsody_client',
+                          new=AsyncMock(return_value=rh_mock)):
+            r = client.post(f'{plugin.namespace}/submit/{sid}', json={
+                'endpoint': 'ep', 'task_id': 't.1',
+                'cmd': ['/bin/true'], 'cwd': '/tmp'})
+        assert r.status_code == 502, r.text
+        assert ('ep', 'rhapsody', None) not in plugin._child_clients
+        assert 't.1' not in plugin._endpoint_mode_tasks
+        # the evicted session is unregistered, best-effort, in background
+        deadline = time.time() + 5
+        while not stale.unregister_session.called and time.time() < deadline:
+            time.sleep(0.01)
+        stale.unregister_session.assert_called_once()
+
+    def test_endpoint_mode_initializing_409_is_503_no_eviction(self,
+                                                               tmp_path):
+        from radical.orbit.plugin_rhapsody import PartialSubmitError
+        _, plugin = _make_plugin(tmp_path)
+        cached = MagicMock()
+        plugin._child_clients[('ep', 'rhapsody', None)] = cached
+        client = TestClient(plugin._app)
+        sid = _register(client, plugin, body={'sid': 'A',
+                                              'lifetime': 'persistent'})
+        self._seed_topology(plugin, {'ep': ['rhapsody']})
+        rh_mock = MagicMock()
+        rh_mock.submit_tasks = MagicMock(side_effect=PartialSubmitError(
+            'HTTP 409 — initializing', status_code=409, failed=['t.1'],
+            refused=True))
+        with patch.object(plugin, '_get_rhapsody_client',
+                          new=AsyncMock(return_value=rh_mock)):
+            r = client.post(f'{plugin.namespace}/submit/{sid}', json={
+                'endpoint': 'ep', 'task_id': 't.1',
+                'cmd': ['/bin/true'], 'cwd': '/tmp'})
+        assert r.status_code == 503, r.text
+        assert r.headers['retry-after'] == '1'
+        assert plugin._child_clients[('ep', 'rhapsody', None)] is cached
+        cached.unregister_session.assert_not_called()
+
+    def test_endpoint_mode_uid_is_namespaced_and_reexecutes(self, tmp_path):
+        """The target sees f'{task_id}.{sid}': a task_id another session
+        reuses is no duplicate there.  After the task FAILED, a resubmit of
+        the same task_id goes out under the next attempt's uid and re-runs;
+        an in-flight resubmit keeps the uid (the target deduplicates)."""
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _register(client, plugin, body={'sid': 'A',
+                                              'lifetime': 'persistent'})
+        self._seed_topology(plugin, {'ep': ['rhapsody']})
+        rh_mock = MagicMock()
+        rh_mock.submit_tasks = MagicMock(return_value=[])
+        body = {'endpoint': 'ep', 'task_id': 't.1',
+                'cmd': ['/bin/true'], 'cwd': '/tmp'}
+        sent = lambda: rh_mock.submit_tasks.call_args.args[0][0]['uid']
+        with patch.object(plugin, '_get_rhapsody_client',
+                          new=AsyncMock(return_value=rh_mock)):
+            client.post(f'{plugin.namespace}/submit/{sid}', json=body)
+            assert sent() == 't.1.A'
+            client.post(f'{plugin.namespace}/submit/{sid}', json=body)
+            assert sent() == 't.1.A'                  # in flight: same uid
+            plugin._on_task_status({'uid': 't.1.A', 'state': 'FAILED'})
+            assert 't.1' not in plugin._endpoint_mode_tasks
+            client.post(f'{plugin.namespace}/submit/{sid}', json=body)
+            assert sent() == 't.1.A.1'                # re-executes
+
+    def test_endpoint_mode_ledger_keeps_uid_across_restart(self, tmp_path):
+        plugin_a = _make_plugin(tmp_path)[1]
+        plugin_a._em_map('t.1', 'ep', 't.1.A.2', 't.1.A')
+        plugin_a._persist_endpoint_mode()
+        # plus a pre-namespacing entry: endpoint name only
+        import json as _json
+        ledger = _json.loads(plugin_a._endpoint_mode_path.read_text())
+        ledger['t.old'] = 'ep2'
+        plugin_a._endpoint_mode_path.write_text(_json.dumps(ledger))
+
+        plugin_b = _make_plugin(tmp_path)[1]
+        assert plugin_b._endpoint_mode_tasks == {'t.1': 'ep', 't.old': 'ep2'}
+        assert plugin_b._em_uid('t.1')   == 't.1.A.2'
+        assert plugin_b._em_uid('t.old') == 't.old'
+        notified = []
+        plugin_b._dispatch_notify = lambda t, d: notified.append(d)
+        plugin_b._on_task_status({'uid': 't.1.A.2', 'state': 'DONE'})
+        assert notified[0]['task_id'] == 't.1'
+
+    def test_endpoint_mode_terminal_duplicate_ack_completes(self, tmp_path):
+        """Resubmitting a task_id the target already finished: the target
+        acks it as a terminal duplicate (no new event), and the dispatcher
+        applies that ack."""
+        notified = []
+        plugin, r = self._endpoint_mode_submit(
+            tmp_path, None, notified=notified,
+            result=[{'uid': 't.1.A', 'state': 'DONE', 'exit_code': 0,
+                     'duplicate': True}])
+        assert r.status_code == 200, r.text
+        assert r.json()['state'] == TASK_DONE      # consistent with the ack
+        assert 't.1' not in plugin._endpoint_mode_tasks
+        assert notified and notified[-1][1]['state'] == TASK_DONE
+        assert notified[-1][1]['task_id'] == 't.1'
 
     def test_terminal_batch_event_is_handled(self, tmp_path):
         '''Several completions in one frame arrive as task_status_batch.'''
@@ -1169,6 +1353,182 @@ class TestRhapsodyDialect:
             raise RuntimeError('boom after accept')
         _, task = self._submit_one(tmp_path, submit)
         assert task.state == TASK_DONE
+
+    def _submit_many(self, tmp_path, n, submit):
+        '''Post *n* co-claimed tasks through ``_do_rhapsody_submit``; each
+        pilot ``submit_tasks`` call runs ``submit(dicts)``.'''
+        _, plugin = _make_plugin(tmp_path)
+        plugin._materialise_pool('A', _make_pool_cfg())
+        ps = _pool(plugin, 'A', 'cpu')
+        pilot = PilotRecord(
+            pid='p.1', pool='cpu', owning_sid='A', size_key='s',
+            rhapsody_backend='concurrent', state=PILOT_ACTIVE,
+            child_endpoint_name='endpoint0_p.1', capacity=4)
+        ps.pilots['p.1'] = pilot
+        tasks = []
+        for i in range(1, n + 1):
+            td = _dialect_td(f't.{i}')
+            td.pop('pool')
+            tasks.append(TaskRecord(
+                task_id=f't.{i}', pool='cpu', owning_sid='A', cmd=[], cwd='',
+                task_dict=td, state=TASK_RUNNING))
+            ps.tasks[f't.{i}'] = tasks[-1]
+        rh_mock = MagicMock()
+        rh_mock.submit_tasks = MagicMock(side_effect=submit)
+        self._last_tasks = tasks
+
+        async def drive():
+            with patch.object(plugin, '_get_rhapsody_client',
+                              new=AsyncMock(return_value=rh_mock)):
+                await plugin._do_rhapsody_submit(ps, list(tasks), pilot)
+
+        asyncio.run(drive())
+        return plugin, tasks, rh_mock
+
+    def test_partial_submit_fails_unconfirmed_after_retries(self, tmp_path):
+        """The client retried in place with the tasks still claimed; once
+        it gives up, accepted tasks stay mapped and RUNNING, the failed and
+        unsent ones are FAILED with the reason (no re-queue)."""
+        from radical.orbit.plugin_rhapsody import PartialSubmitError
+        during = []
+
+        def submit(dicts):
+            during.append([t.state for t in self._last_tasks])
+            raise PartialSubmitError('HTTP 503 after retries',
+                                     accepted=['t.1.A'], failed=['t.2.A'],
+                                     unsent=['t.3.A'], status_code=503)
+        plugin, tasks, _ = self._submit_many(tmp_path, 3, submit)
+        assert during == [[TASK_RUNNING] * 3]      # claimed while retrying
+        assert tasks[0].state == TASK_RUNNING
+        assert tasks[0].rhapsody_uid == 't.1.A'
+        assert 't.1.A' in plugin._uid_to_task
+        for task in tasks[1:]:
+            assert task.state == TASK_FAILED
+            assert 'HTTP 503 after retries' in task.error
+            assert task.rhapsody_uid is None
+            assert task.rhapsody_uid not in plugin._uid_to_task
+
+    def test_pool_refusal_fails_at_once(self, tmp_path):
+        from radical.orbit.plugin_rhapsody import PartialSubmitError
+
+        def submit(dicts):
+            raise PartialSubmitError('HTTP 400 — bad', status_code=400,
+                                     failed=['t.1.A', 't.2.A'], refused=True)
+        plugin, tasks, rh = self._submit_many(tmp_path, 2, submit)
+        assert rh.submit_tasks.call_count == 1
+        assert [t.state for t in tasks] == [TASK_FAILED] * 2
+
+    def test_pool_terminal_duplicate_ack_completes_record(self, tmp_path):
+        """A pilot that already ran the uid acks it as a terminal duplicate
+        (no new event follows): the dispatcher applies the ack."""
+        def submit(dicts):
+            return [{'uid': 't.1.A', 'state': 'DONE', 'exit_code': 0,
+                     'duplicate': True},
+                    {'uid': 't.2.A', 'state': 'RUNNING'}]
+        plugin, tasks, _ = self._submit_many(tmp_path, 2, submit)
+        assert tasks[0].state == TASK_DONE
+        assert tasks[1].state == TASK_RUNNING
+
+    def test_retry_header_acks_existing_as_duplicate(self, tmp_path):
+        """A client's resend (retry header) never re-executes: an existing
+        uid is acked as a duplicate in any state.  A fresh resubmit of a
+        FAILED task still re-executes."""
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _register(client, plugin, body={
+            'pools': [_pool_dict()], 'sid': 'A', 'lifetime': 'persistent'})
+        ps = _pool(plugin, sid, 'cpu')
+        with patch.object(ps.policy, 'pick_dispatch', return_value=None):
+            client.post(f'{plugin.namespace}/submit_rh/{sid}',
+                        json={'tasks': [_dialect_td('t.1')]})
+            ps.tasks['t.1'].state = TASK_FAILED
+            r = client.post(f'{plugin.namespace}/submit_rh/{sid}',
+                            json={'tasks': [_dialect_td('t.1')]},
+                            headers={'X-Orbit-Submit-Retry': '1'})
+            assert r.json() == [{'uid': 't.1', 'state': TASK_FAILED,
+                                 'duplicate': True}]
+            assert ps.tasks['t.1'].attempt == 0
+            r = client.post(f'{plugin.namespace}/submit_rh/{sid}',
+                            json={'tasks': [_dialect_td('t.1')]})
+            assert r.json() == [{'uid': 't.1', 'state': TASK_QUEUED}]
+            assert ps.tasks['t.1'].attempt == 1
+
+    def test_reexecute_after_failure_uses_attempt_suffix(self, tmp_path):
+        """The pilot never re-runs a uid, so a re-execute (resubmit after
+        FAILED/CANCELED) goes out under a new, attempt-suffixed uid."""
+        from radical.orbit.plugin_task_dispatcher import _rhapsody_uid
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _register(client, plugin, body={
+            'pools': [_pool_dict()], 'sid': 'A', 'lifetime': 'persistent'})
+        ps = _pool(plugin, sid, 'cpu')
+        with patch.object(ps.policy, 'pick_dispatch', return_value=None):
+            client.post(f'{plugin.namespace}/submit_rh/{sid}',
+                        json={'tasks': [_dialect_td('t.1')]})
+            rec = ps.tasks['t.1']
+            assert rec.attempt == 0
+            assert _rhapsody_uid(rec) == 't.1.A'
+            rec.state = TASK_FAILED
+            client.post(f'{plugin.namespace}/submit_rh/{sid}',
+                        json={'tasks': [_dialect_td('t.1')]})
+            rec = ps.tasks['t.1']
+            assert rec.attempt == 1
+            assert _rhapsody_uid(rec) == 't.1.A.1'
+
+    def test_oversized_task_fails_alone_and_peers_submit(self, tmp_path):
+        from radical.orbit.runtime_client import PayloadTooLarge
+        calls = []
+
+        def submit(dicts):
+            calls.append([d['uid'] for d in dicts])
+            if len(calls) == 1:
+                raise PayloadTooLarge('HTTP 413 — too big', [1], ['t.2.A'])
+            return [{'uid': d['uid']} for d in dicts]
+        plugin, tasks, _ = self._submit_many(tmp_path, 3, submit)
+        assert calls == [['t.1.A', 't.2.A', 't.3.A'], ['t.1.A', 't.3.A']]
+        assert tasks[1].state == TASK_FAILED
+        assert 'too big' in (tasks[1].error or '')
+        assert 't.2.A' not in plugin._uid_to_task
+        for task in (tasks[0], tasks[2]):
+            assert task.state == TASK_RUNNING
+            assert f'{task.task_id}.A' in plugin._uid_to_task
+
+    def test_client_submit_partial_failure_and_413(self, tmp_path):
+        from radical.orbit.plugin_rhapsody import PartialSubmitError
+        from radical.orbit.plugin_task_dispatcher import TaskDispatcherClient
+        from radical.orbit.runtime_client import RuntimeResponse
+
+        class _HTTP:
+            max_body = 8 * 1024
+
+            def __init__(self):
+                self.posts = 0
+
+            def post(self, url, data=None, headers=None, **kw):
+                self.posts += 1
+                if self.posts == 2:
+                    return RuntimeResponse(400, {}, b'{"detail": "bad"}')
+                return RuntimeResponse(200, {}, b'[{"uid": "x"}]')
+
+        def _tds(n, pad):
+            return [{'uid': f't.{i}', 'pool': 'cpu', 'executable': '/bin/true',
+                     'arguments': ['x' * pad]} for i in range(n)]
+
+        http = _HTTP()
+        c    = TaskDispatcherClient(http, '/task_dispatcher')
+        c._sid = 'A'
+        with pytest.raises(PartialSubmitError) as exc:
+            c.submit_tasks(_tds(200, 100))
+        assert exc.value.status_code == 400 and exc.value.refused
+        assert exc.value.accepted[0] == 't.0'
+        assert 't.199' in exc.value.unsent
+
+        http = _HTTP()
+        c._http = http
+        with pytest.raises(RuntimeError) as exc:
+            c.submit_tasks(_tds(1, 9000))
+        assert exc.value.status_code == 413
+        assert http.posts == 0
 
     def test_terminal_notifications_batch_and_forward_results(self, tmp_path):
         _, plugin = _make_plugin(tmp_path)
