@@ -75,6 +75,14 @@ export function init(page, api) {
 }
 
 export function onNotification(data, page, api) {
+  // Bulk frames (terminal completions and RUNNING changes) carry a list of
+  // single task_status payloads.
+  if (data.topic === 'task_status_batch') {
+    for (const task of data.data?.tasks || []) {
+      onNotification({ topic: 'task_status', data: task }, page, api);
+    }
+    return;
+  }
   if (data.topic !== 'task_status') return;
 
   const uid   = data.data?.uid || '';
