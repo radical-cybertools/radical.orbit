@@ -826,8 +826,8 @@ def _bare_runtime(maxlen=1024):
     rt._name      = 'consumer'
     rt._callbacks = {}
     rt._cb_lock   = threading.Lock()
-    rt._session_routed = set()
-    rt._session_capable = set(rt._session_routed)
+    rt._broker_routes = False
+    rt._session_capable = set()
     rt._wire_count = Counter()
     rt._emit      = MagicMock()
     rt._cb        = CallbackDispatcher(maxlen=maxlen)
@@ -923,7 +923,7 @@ def _outbox_runtime():
     rt._transport_loop = asyncio.new_event_loop()
     rt._outbox         = asyncio.Queue()
     rt._sub_epoch      = 0
-    rt._session_routed  = set()
+    rt._broker_routes   = False
     rt._session_capable = set()
     rt._wire_count      = Counter()
     rt._topology           = {}
@@ -1204,6 +1204,23 @@ def test_session_callback_drops_session_less_from_capable_plugin():
         assert rt._cb._q.qsize() == 0
 
 
+def test_resync_resets_session_capability():
+    """A reconnect forgets both capabilities until the new topology: no
+    routing, and session-less events are not filtered on stale info."""
+    rt = _topo_runtime()
+    rt._on_topology(_topo_msg())
+    cb = lambda *a: None                              # noqa: E731
+    rt.register_callback(endpoint_id='ep', plugin_name='rh', callback=cb,
+                         session='sid-a')
+    rt._on_event(_ev(None))
+    assert rt._cb._q.qsize() == 0                     # capable: dropped
+    rt._resync_subscriptions()
+    assert not rt._broker_routes and rt._session_capable == set()
+    assert _emitted(rt)[-1] == ('subscribe', [_PLAIN])
+    rt._on_event(_ev(None))
+    assert rt._cb._q.qsize() == 1                     # unknown: passed
+
+
 def test_topology_hides_reserved_plugin_keys():
     """The broker's reserved capability key steers routing but never shows
     in the runtime's topology (listings, callbacks, served plugins)."""
@@ -1213,7 +1230,7 @@ def test_topology_hides_reserved_plugin_keys():
     rt._topology_callbacks = [got.append]
     rt._cb.submit = lambda fn, *a: fn(*a)
     rt._on_topology(_topo_msg())
-    assert rt._session_routed == {('ep', 'rh')}
+    assert rt._broker_routes and ('ep', 'rh') in rt._session_capable
     assert list(rt.topology()['broker']['plugins']) == ['sysinfo']
     assert protocol.BROKER_CAPS not in got[0]['broker']['plugins']
 
@@ -1252,7 +1269,7 @@ def test_stale_topology_does_not_rescope_after_resync():
     rt._resync_subscriptions()                        # fresh reconnect
     _emitted(rt)
     rt._on_topology(_topo_msg(), gen=old_gen)         # stale frame
-    assert _emitted(rt) == [] and rt._session_routed == set()
+    assert _emitted(rt) == [] and not rt._broker_routes
     rt._on_topology(_topo_msg(), gen=rt._sub_epoch)    # the new broker's
     assert _emitted(rt) == [('subscribe', [_SID_A]),
                             ('unsubscribe', [_PLAIN])]

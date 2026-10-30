@@ -283,15 +283,16 @@ class EndpointRuntime(PluginHostBase):
         # Session capability, from topology (guarded by ``_cb_lock``):
         # ``_session_capable`` holds the (endpoint, plugin) pairs whose plugin
         # advertises ``session_events`` (a session callback there never gets
-        # session-less events); ``_session_routed`` those of them where the
-        # broker advertises it too, so a session callback subscribes with a
-        # session pattern — emptied on a fresh (not resumed) registration
-        # until that broker's topology.  ``_wire_count`` counts registrations
-        # per wire pattern ``(endpoint, plugin, topic, session-or-None)``;
-        # topology frames carry the ``_sub_epoch`` of their connection, so
-        # one of an earlier connection cannot re-scope after a resync.
+        # session-less events); ``_broker_routes`` whether the broker
+        # advertises it too, so that a session callback on such a pair
+        # subscribes with a session pattern.  Both are reset by every resync
+        # until the new connection's topology.  ``_wire_count`` counts
+        # registrations per wire pattern ``(endpoint, plugin, topic,
+        # session-or-None)``; topology frames carry the ``_sub_epoch`` of
+        # their connection, so one of an earlier connection cannot re-scope
+        # after a resync.
         self._session_capable: set = set()
-        self._session_routed:  set = set()
+        self._broker_routes:  bool = False
         self._wire_count:  Counter = Counter()
 
         # rich topology snapshot (name -> {role, plugins, liveness})
@@ -997,7 +998,8 @@ class EndpointRuntime(PluginHostBase):
         with self._cb_lock:
             self._callbacks.setdefault(key, []).append(
                 (callback, with_meta, session))
-            wkey = self._wire_key(key, session, self._session_routed)
+            wkey = self._wire_key(key, session, self._session_capable,
+                                  self._broker_routes)
             self._wire_count[wkey] += 1
             if self._wire_count[wkey] == 1:
                 # under the lock: subscribe/unsubscribe go out in the order
@@ -1028,7 +1030,8 @@ class EndpointRuntime(PluginHostBase):
             if not cbs:
                 # no resync of a pattern nobody listens to any more
                 del self._callbacks[key]
-            wkey = self._wire_key(key, session, self._session_routed)
+            wkey = self._wire_key(key, session, self._session_capable,
+                                  self._broker_routes)
             self._wire_count[wkey] -= 1
             if self._wire_count[wkey] > 0:
                 return
@@ -1037,21 +1040,15 @@ class EndpointRuntime(PluginHostBase):
                 src=self._name, patterns=self._patterns([wkey])))
 
     @staticmethod
-    def _wire_key(key: tuple, session: Optional[str], routed: set) -> tuple:
+    def _wire_key(key: tuple, session: Optional[str], capable: set,
+                  routes: bool) -> tuple:
         """The broker pattern of a registration on *key* with *session*, as
         ``(endpoint, plugin, topic, session)``: the session only where the
-        broker routes it (*routed*)."""
+        broker routes sessions (*routes*) and the plugin is *capable*."""
         endpoint, plugin, topic = key
-        if session is not None and (endpoint, plugin) in routed:
+        if session is not None and routes and (endpoint, plugin) in capable:
             return (endpoint, plugin, topic, session)
         return (endpoint, plugin, topic, None)
-
-    def _count_wire_keys(self, routed: set) -> Counter:
-        """Registrations per wire pattern, counted afresh (under
-        ``_cb_lock``), in registration order."""
-        return Counter(self._wire_key(key, s, routed)
-                       for key, cbs in self._callbacks.items()
-                       for (_, _, s) in cbs)
 
     @staticmethod
     def _patterns(wkeys) -> List[protocol.SubscribePattern]:
@@ -1060,9 +1057,12 @@ class EndpointRuntime(PluginHostBase):
                 for (e, p, t, s) in wkeys]
 
     def _rescope_sessions(self, topo: Dict[str, Dict[str, Any]],
+                          broker_routes: bool,
                           gen: Optional[int] = None) -> None:
-        """Follow the ``session_events`` capability in topology *topo*
-        (received on connection *gen*; an earlier connection's is ignored).
+        """Follow the ``session_events`` capability: of the plugins in
+        topology *topo* (reserved keys already dropped) and of the broker
+        (*broker_routes*), received on connection *gen* (an earlier
+        connection's is ignored).
 
         Session registrations of an ``(endpoint, plugin)`` pair whose
         capability appeared (both the broker and that endpoint plugin
@@ -1075,18 +1075,14 @@ class EndpointRuntime(PluginHostBase):
         """
         capable = {(name, pname)
                    for name, info in topo.items()
-                   for pname, pinfo in ((info or {}).get('plugins')
-                                        or {}).items()
-                   if not pname.startswith('_')
-                   and (pinfo or {}).get('session_events')}
-        bcaps  = (((topo.get(protocol.BROKER_NAME) or {}).get('plugins')
-                   or {}).get(protocol.BROKER_CAPS) or {})
-        routed = capable if bcaps.get('session_events') else set()
+                   for pname, pinfo in (info.get('plugins') or {}).items()
+                   if (pinfo or {}).get('session_events')}
         with self._cb_lock:
             if gen is not None and gen != self._sub_epoch:
                 return                          # an earlier connection's
-            flipped = routed ^ self._session_routed
-            self._session_capable = capable
+            old_cap, old_routes = self._session_capable, self._broker_routes
+            flipped = (capable if broker_routes else set()) \
+                ^ (old_cap if old_routes else set())
             sub, unsub = [], []
             for key, cbs in self._callbacks.items():
                 if key[:2] not in flipped:
@@ -1094,8 +1090,8 @@ class EndpointRuntime(PluginHostBase):
                 for (_, _, s) in cbs:
                     if s is None:
                         continue
-                    new = self._wire_key(key, s, routed)
-                    old = self._wire_key(key, s, self._session_routed)
+                    new = self._wire_key(key, s, capable, broker_routes)
+                    old = self._wire_key(key, s, old_cap, old_routes)
                     self._wire_count[new] += 1
                     if self._wire_count[new] == 1:
                         sub.append(new)
@@ -1103,10 +1099,8 @@ class EndpointRuntime(PluginHostBase):
                     if self._wire_count[old] == 0:
                         del self._wire_count[old]
                         unsub.append(old)
-            self._session_routed = routed
-            # a pattern can be dropped and re-added within one pass
-            sub   = [w for w in sub if w in self._wire_count]
-            unsub = [w for w in unsub if w not in self._wire_count]
+            self._session_capable = capable
+            self._broker_routes   = broker_routes
             if sub:
                 self._emit(protocol.Subscribe(
                     src=self._name, patterns=self._patterns(sub)))
@@ -1143,8 +1137,13 @@ class EndpointRuntime(PluginHostBase):
         """
         with self._cb_lock:
             self._sub_epoch += 1
-            self._session_routed = set()
-            self._wire_count = self._count_wire_keys(self._session_routed)
+            # no capability until the new connection's topology: nothing is
+            # routed, and no session-less event is filtered on stale info
+            self._session_capable = set()
+            self._broker_routes   = False
+            self._wire_count = Counter(
+                (e, p, t, None) for (e, p, t), cbs in self._callbacks.items()
+                for _ in cbs)
             if not self._wire_count:
                 return
             patterns = self._patterns(self._wire_count)
@@ -1182,9 +1181,13 @@ class EndpointRuntime(PluginHostBase):
                      gen: Optional[int] = None) -> None:
         raw = {name: info.model_dump()
                for name, info in msg.participants.items()}
-        self._rescope_sessions(raw, gen)
-        # consumers see plugins only, never the reserved (``_``) keys
+        # consumers see plugins only, never the reserved keys
         new_topo = protocol.public_topology(raw)
+        bcaps = (raw.get(protocol.BROKER_NAME) or {}).get('plugins') or {}
+        self._rescope_sessions(
+            new_topo,
+            bool((bcaps.get(protocol.BROKER_CAPS) or {}).get('session_events')),
+            gen)
         prev = self._topology
         self._topology = new_topo
         # One-shot ``lost`` synthesis — a single diff feeding two consumers

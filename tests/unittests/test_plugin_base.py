@@ -61,6 +61,13 @@ def test_plugin_initialization():
     assert plugin._namespace == f"/{plugin.instance_name}"
 
 
+def test_plugin_reserved_instance_name_rejected():
+    '''A name starting with '_' is reserved in topology (not a plugin):
+    no plugin instance may take it.'''
+    with pytest.raises(ValueError, match='reserved'):
+        Plugin(FastAPI(), '_broker')
+
+
 def test_plugin_uid_property():
     '''
     Test that the uid property returns the correct UUID.

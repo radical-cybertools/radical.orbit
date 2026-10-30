@@ -1168,7 +1168,7 @@ class Broker:
         if self._plugin_host is not None:
             broker_plugins = dict(
                 self._plugin_host.get_topology_info().get('plugins', {}))
-        broker_plugins[protocol.BROKER_CAPS] = {'session_events': True}
+        broker_plugins[protocol.BROKER_CAPS] = protocol.broker_caps_entry()
         parts[BROKER_NAME] = protocol.ParticipantInfo(
             role='broker', plugins=broker_plugins, liveness='present')
         return parts
@@ -1280,9 +1280,15 @@ class Broker:
                               ) -> Dict[str, Dict[str, Any]]:
         """Normalise ``register.plugins`` (a list of per-plugin dicts) into the
         topology's name-keyed rich dict.  Each entry names itself via ``name``
-        or ``type``; anonymous entries fall back to positional keys."""
+        or ``type``; anonymous entries fall back to positional keys.  A
+        reserved name (``protocol.is_reserved``) is no plugin: it is dropped,
+        with a warning."""
         out: Dict[str, Dict[str, Any]] = {}
         for i, p in enumerate(plugins or []):
             key = p.get('name') or p.get('type') or 'plugin.%d' % i
+            if protocol.is_reserved(key):
+                log.warning("[Broker] dropped registered plugin %r: names "
+                            "starting with '_' are reserved", key)
+                continue
             out[key] = p
         return out

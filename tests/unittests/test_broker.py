@@ -759,7 +759,12 @@ async def test_broker_topology_advertises_session_events(make_broker):
                 {'name': 'rh', 'namespace': '/rh', 'session_events': True}])
             topo = [m for m in ws1.msgs() if m.kind == 'topology'][-1]
             bplugins = topo.participants['broker'].plugins
-            assert bplugins[protocol.BROKER_CAPS] == {'session_events': True}
+            caps = bplugins[protocol.BROKER_CAPS]
+            assert caps['session_events'] is True
+            # well-formed for older consumers, which list it as a plugin
+            assert caps['namespace'] == '/broker/_broker'
+            assert caps['enabled'] is False and caps['version']
+            assert 'ui_config' in caps and caps['ui_config'] is None
             assert topo.participants['e1'].plugins['rh']['session_events']
             snap = broker.topology_snapshot()
             assert protocol.BROKER_CAPS not in snap['broker']['plugins']
@@ -770,6 +775,64 @@ async def test_broker_topology_advertises_session_events(make_broker):
                     'session_events'] is False
         finally:
             await broker.shutdown()
+
+
+def test_session_patterns_indexed_per_stream(monkeypatch):
+    """A subscriber's session patterns are indexed by (endpoint, plugin,
+    session): an event checks the wildcard list plus its own stream's
+    patterns, not all N session patterns; matching is unchanged."""
+    from radical.orbit.broker_events import EventRouter
+
+    router = EventRouter({}, lambda *a: None, MagicMock(), 8, lambda: None)
+    router.add_endpoint('c')
+    n = 200
+    router.update_subscription('c', {'patterns': [
+        {'endpoint': 'ep', 'plugin': 'rh', 'session': 's%d' % i}
+        for i in range(n)] + [{'plugin': 'other'}]}, True)
+    rest, streams = router._index['c']
+    assert len(rest) == 1 and len(streams) == n
+
+    checked = []
+    real = EventRouter._matches
+
+    def _counting(patterns, *args):
+        checked.append(len(patterns))
+        return real(patterns, *args)
+    monkeypatch.setattr(EventRouter, '_matches', staticmethod(_counting))
+
+    def _delivered(src, plugin, session):
+        before = len(router._out['c'].buf)
+        router.ingest(src, {'kind': 'event', 'plugin': plugin, 'topic': 't',
+                            'session': session, 'data': {}})
+        return len(router._out['c'].buf) > before
+
+    assert not _delivered('ep', 'rh', 'unrelated')
+    assert sum(checked) <= 1                     # O(1), not O(n)
+    assert _delivered('ep', 'rh', 's7')
+    assert not _delivered('ep2', 'rh', 's7')     # stream includes endpoint
+    assert not _delivered('ep', 'rh', None)      # session-less: no match
+    assert _delivered('ep', 'other', None)       # wildcard list still works
+
+    router.update_subscription('c', {'patterns': [
+        {'endpoint': 'ep', 'plugin': 'rh', 'session': 's7'}]}, False)
+    assert not _delivered('ep', 'rh', 's7')
+    assert len(router._index['c'][1]) == n - 1
+
+
+@pytest.mark.asyncio
+async def test_registered_reserved_plugin_name_dropped(make_broker):
+    """A participant registering a plugin under a reserved name ('_...')
+    does not get it into topology (it could pose as broker capabilities)."""
+    broker = make_broker()
+    await broker.startup()
+    try:
+        await _register(broker, 'e1', FakeWS(), plugins=[
+            {'name': '_broker', 'session_events': True},
+            {'name': 'rh', 'namespace': '/rh'}])
+        parts = broker._participants_for_topology()
+        assert list(parts['e1'].plugins) == ['rh']
+    finally:
+        await broker.shutdown()
 
 
 @pytest.mark.asyncio

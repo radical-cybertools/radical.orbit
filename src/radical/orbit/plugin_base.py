@@ -11,6 +11,7 @@ from typing import Type, Optional, Dict, Callable, Any, Union
 from fastapi import FastAPI, HTTPException, Request
 from starlette.responses import JSONResponse
 
+from . import protocol
 from .plugin_session_base import PluginSession
 from .ui_schema import UIConfig, ui_config_to_dict
 from .utils import HOST_ROLES
@@ -246,6 +247,10 @@ class Plugin(object):
         if not instance_name:
             raise ValueError("instance_name is required "
                              "(no class plugin_name to default to)")
+        if protocol.is_reserved(instance_name):
+            raise ValueError(f"plugin instance name {instance_name!r} is "
+                             f"reserved: names starting with '_' are not "
+                             f"plugins in topology")
 
         self._app: FastAPI = app
         self._instance_name: str = instance_name

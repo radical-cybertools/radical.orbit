@@ -59,18 +59,35 @@ FRAME_CAP = 4 * 1024 * 1024
 # (its hosted plugins) and the ``src``/``dst`` of broker-originated frames.
 BROKER_NAME = 'broker'
 
-# Keys of a topology ``plugins`` dict that start with ``_`` are reserved: they
-# carry participant-level information, not plugins, and plugin listings skip
-# them (``public_plugins``).  The broker's entry carries ``BROKER_CAPS`` with
-# its own capabilities, e.g. ``{'session_events': True}`` (it routes session
-# subscription patterns).
+# Keys of a topology ``plugins`` dict that start with ``_`` are reserved
+# (``is_reserved``): they carry participant-level information, not plugins;
+# plugin listings skip them (``public_plugins``) and no plugin instance may
+# take such a name.  The broker's entry carries ``BROKER_CAPS`` with its own
+# capabilities, e.g. ``session_events`` (it routes session subscription
+# patterns), shaped as a disabled plugin so that older consumers, which list
+# it as one, find the usual fields.
 BROKER_CAPS = '_broker'
+
+
+def is_reserved(name: Any) -> bool:
+    """Whether *name* is a reserved (non-plugin) key of a ``plugins`` dict."""
+    return str(name).startswith('_')
+
+
+def broker_caps_entry() -> Dict[str, Any]:
+    """The broker's ``BROKER_CAPS`` entry in its topology ``plugins``."""
+    return {'name':           BROKER_CAPS,
+            'type':           BROKER_CAPS,
+            'namespace':      '/' + BROKER_NAME + '/' + BROKER_CAPS,
+            'version':        str(PROTOCOL_VERSION),
+            'enabled':        False,
+            'ui_config':      None,
+            'session_events': True}
 
 
 def public_plugins(plugins: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """The plugins of a topology ``plugins`` dict, reserved keys dropped."""
-    return {k: v for k, v in (plugins or {}).items()
-            if not str(k).startswith('_')}
+    return {k: v for k, v in (plugins or {}).items() if not is_reserved(k)}
 
 
 def public_topology(topo: Dict[str, Dict[str, Any]]

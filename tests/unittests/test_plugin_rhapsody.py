@@ -955,8 +955,8 @@ def test_notification_callbacks_fire_in_registration_order():
     rt = EndpointRuntime.__new__(EndpointRuntime)
     rt._callbacks = {}
     rt._cb_lock   = _threading.Lock()
-    rt._session_routed = set()
-    rt._session_capable = set(rt._session_routed)
+    rt._broker_routes = False
+    rt._session_capable = set()
     rt._wire_count = Counter()
     rt._name      = 'test-consumer'
     rt._emit      = MagicMock()
@@ -3090,8 +3090,8 @@ def test_fan_out_one_runtime_callback_per_topic():
     rt = EndpointRuntime.__new__(EndpointRuntime)
     rt._callbacks = {}
     rt._cb_lock   = _threading.Lock()
-    rt._session_routed = set()
-    rt._session_capable = set(rt._session_routed)
+    rt._broker_routes = False
+    rt._session_capable = set()
     rt._wire_count = Counter()
     rt._name      = 'test-consumer'
     rt._emit      = MagicMock()
@@ -3151,8 +3151,8 @@ def test_session_patterns_follow_reregister_and_close():
     rt = EndpointRuntime.__new__(EndpointRuntime)
     rt._callbacks = {}
     rt._cb_lock   = _threading.Lock()
-    rt._session_routed = {('ep', 'rhapsody')}
-    rt._session_capable = set(rt._session_routed)
+    rt._broker_routes = True
+    rt._session_capable = {('ep', 'rhapsody')}
     rt._wire_count = Counter()
     rt._name      = 'test-consumer'
     rt._emit      = MagicMock()
@@ -3985,8 +3985,8 @@ def _bare_runtime(maxlen=1024):
     rt._name      = 'consumer'
     rt._callbacks = {}
     rt._cb_lock   = threading.Lock()
-    rt._session_routed = set()
-    rt._session_capable = set(rt._session_routed)
+    rt._broker_routes = False
+    rt._session_capable = set()
     rt._wire_count = Counter()
     rt._emit      = MagicMock()
     rt._cb        = CallbackDispatcher(maxlen=maxlen)

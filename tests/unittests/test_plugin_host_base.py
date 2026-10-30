@@ -334,20 +334,20 @@ class _DummySession:
 
 
 class _DummyPlugin(Plugin):
-    plugin_name   = '_test_dummy'
+    plugin_name   = 'test_dummy_hb'
     session_class = None
 
-    def __init__(self, app, instance_name='_test_dummy', **kwargs):
+    def __init__(self, app, instance_name='test_dummy_hb', **kwargs):
         super().__init__(app, instance_name)
         self._extra = kwargs
 
 
-# Ensure _test_dummy is in the registry for each test, clean up after
+# Ensure test_dummy_hb is in the registry for each test, clean up after
 @pytest.fixture(autouse=True)
 def _cleanup_registry():
-    Plugin._registry['_test_dummy'] = _DummyPlugin
+    Plugin._registry['test_dummy_hb'] = _DummyPlugin
     yield
-    Plugin._registry.pop('_test_dummy', None)
+    Plugin._registry.pop('test_dummy_hb', None)
 
 
 # ---------------------------------------------------------------------------
@@ -357,9 +357,9 @@ def _cleanup_registry():
 def test_load_plugins_from_filter():
     app  = FastAPI()
     host = _TestHost(app)
-    host._load_plugins_from_filter(['_test_dummy'])
-    assert '_test_dummy' in host._plugins
-    assert isinstance(host._plugins['_test_dummy'], _DummyPlugin)
+    host._load_plugins_from_filter(['test_dummy_hb'])
+    assert 'test_dummy_hb' in host._plugins
+    assert isinstance(host._plugins['test_dummy_hb'], _DummyPlugin)
 
 
 def test_load_plugins_from_filter_skip_disabled():
@@ -374,8 +374,8 @@ def test_load_plugins_from_filter_skip_disabled():
 
     _DummyPlugin.is_enabled = _disabled
     try:
-        host._load_plugins_from_filter(['_test_dummy'])
-        assert '_test_dummy' not in host._plugins
+        host._load_plugins_from_filter(['test_dummy_hb'])
+        assert 'test_dummy_hb' not in host._plugins
     finally:
         _DummyPlugin.is_enabled = original
 
