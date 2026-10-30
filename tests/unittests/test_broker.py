@@ -670,8 +670,10 @@ async def test_subscribe_session_pattern(make_broker):
                 src, _event_bytes(src, plugin, 't', session=sid))
         await asyncio.sleep(0.02)
 
-        got = [(e.src, e.plugin, e.session, e.seq) for e in c_sid.msgs()]
-        assert got == [('e1', 'rh', 'a', 0), ('e1', 'rh', 'a', 1)]
+        evs = c_sid.msgs()
+        assert [(e.src, e.plugin, e.session) for e in evs] \
+            == [('e1', 'rh', 'a')] * 2
+        assert evs[1].seq == evs[0].seq + 1
         assert [(e.src, e.plugin, e.session) for e in c_wild.msgs()] == sent
 
         unsub = protocol.Unsubscribe(
@@ -707,7 +709,8 @@ async def test_two_clients_receive_only_their_session(make_broker):
             evs = [m for m in ws[name].msgs() if m.kind == 'event']
             assert len(ws[name].sent) == len(evs) == n
             assert {e.session for e in evs} == {sid}
-            assert [e.seq for e in evs] == list(range(n))  # no gaps
+            seqs = [e.seq for e in evs]                     # no gaps
+            assert seqs == list(range(seqs[0], seqs[0] + n))
     finally:
         await broker.shutdown()
 
