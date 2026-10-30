@@ -343,7 +343,7 @@ class RhapsodySession(PluginSession):
         self._flush_scheduled        = False
         self._notify_window          = NOTIFY_BATCH_WINDOW
         self._notify_batch_bytes     = NOTIFY_BATCH_BYTES
-        self._sid_bytes: int | None  = None
+        self._sid_bytes              = _payload_size({'sid': sid})
         self._return_value_limit     = RETURN_VALUE_LIMIT
         self._output_notify_limit    = OUTPUT_NOTIFY_LIMIT
 
@@ -706,12 +706,10 @@ class RhapsodySession(PluginSession):
     def _frame_budget(self) -> int:
         """Bytes available for task payloads per frame: ``notify`` adds the
         session id to each frame after the split."""
-        if self._sid_bytes is None:             # constant for the session
-            self._sid_bytes = _payload_size({'sid': self.sid})
         return self._notify_batch_bytes - self._sid_bytes
 
     def _split_frames(self, batch: list[dict]) -> list[list[dict]]:
-        """Split notifications into frames under ``_notify_batch_bytes``.
+        """Split notifications into frames under ``_frame_budget()``.
 
         A single payload larger than the budget still ships alone — it is
         bounded by ``_return_value_limit`` (half the frame) plus
@@ -1438,20 +1436,21 @@ class RhapsodyClient(PluginClient):
                    self._plugin_name is not None)
 
         # Ensure the SSE listener is connected BEFORE we send the POST,
-        # so we never miss a fast init notification.
-        ready = threading.Event()
-        error = [None]
+        # so we never miss a fast init notification.  session_status is
+        # broadcast to every client of the plugin, and our sid is only known
+        # once the POST returns: record outcomes by sid, pick ours after.
+        changed  = threading.Event()
+        outcomes = {}      # sid (None: older endpoint) -> (status, error)
 
         if has_sse:
             self._bc.wait_for_listener(timeout=30)
 
             def _on_session_status(endpoint, plugin, topic, data):
                 st = data.get('status')
-                if st == 'ready':
-                    ready.set()
-                elif st == 'failed':
-                    error[0] = data.get('error', 'unknown init error')
-                    ready.set()
+                if st in ('ready', 'failed'):
+                    outcomes[data.get('sid')] = (
+                        st, data.get('error', 'unknown init error'))
+                    changed.set()
 
             self.register_notification_callback(_on_session_status,
                                                 topic="session_status")
@@ -1485,13 +1484,21 @@ class RhapsodyClient(PluginClient):
 
         # Wait for async init to complete via SSE notification
         try:
-            ready.wait(timeout=init_timeout)
-            if error[0]:
-                raise RuntimeError(
-                    f"Session init failed on endpoint: {error[0]}")
-            if not ready.is_set():
+            deadline = time.time() + init_timeout
+            mine     = None
+            while mine is None:
+                mine = outcomes.get(self._sid) or outcomes.get(None)
+                remaining = deadline - time.time()
+                if mine is not None or remaining <= 0:
+                    break
+                changed.wait(timeout=remaining)
+                changed.clear()            # outcomes is re-checked next loop
+            if mine is None:
                 raise RuntimeError(
                     f"Session init timed out after {init_timeout}s")
+            if mine[0] == 'failed':
+                raise RuntimeError(
+                    f"Session init failed on endpoint: {mine[1]}")
         finally:
             self.unregister_notification_callback(_on_session_status,
                                                   topic="session_status")

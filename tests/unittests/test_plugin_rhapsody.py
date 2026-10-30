@@ -5,6 +5,7 @@ All RHAPSODY imports are mocked so the tests do not require the rhapsody
 package to be installed.
 '''
 
+import threading
 import json
 import asyncio
 
@@ -2720,6 +2721,65 @@ def test_two_sessions_with_colliding_uids_get_their_own_results():
 
     assert clients[0]._completed["task.000001"]["return_value"] == "from-a"
     assert clients[1]._completed["task.000001"]["return_value"] == "from-b"
+
+
+
+def _client_registering_as(sid, events_during_post):
+    """A RhapsodyClient whose register_session POST returns *sid* while the
+    given session_status events are delivered (some after a short delay)."""
+    client = _make_rhapsody_client()
+    client._bc, client._endpoint_id, client._plugin_name = MagicMock(), "ep", "rhapsody"
+    cbs = []
+    client.register_notification_callback = lambda cb, topic=None: cbs.append(cb)
+    client.unregister_notification_callback = lambda cb, topic=None: None
+    client._start_task_listener = lambda: None
+
+    resp = MagicMock()
+    resp.is_error, resp.status_code = False, 200
+    resp.json = MagicMock(return_value={"sid": sid, "status": "initializing"})
+
+    def post(url, json=None):
+        for delay, data in events_during_post:
+            fire = (lambda d=data: cbs[0]("ep", "rhapsody", "session_status", d))
+            if delay:
+                threading.Timer(delay, fire).start()
+            else:
+                fire()
+        return resp
+
+    client._http.post = post
+    return client
+
+
+def test_register_session_ignores_other_sessions_status():
+    """Another session's failed/ready event neither fails nor unblocks us."""
+    client = _client_registering_as("s-b", [
+        (0,   {"sid": "s-a", "status": "failed", "error": "not mine"}),
+        (0,   {"sid": "s-a", "status": "ready"}),
+        (0.2, {"sid": "s-b", "status": "ready"})])
+    client.register_session(init_timeout=5)
+    assert client.sid == "s-b"
+
+
+def test_register_session_own_failure_raises():
+    client = _client_registering_as("s-b", [
+        (0,   {"sid": "s-a", "status": "ready"}),
+        (0.1, {"sid": "s-b", "status": "failed", "error": "boom"})])
+    with pytest.raises(RuntimeError, match="boom"):
+        client.register_session(init_timeout=5)
+
+
+def test_register_session_other_ready_does_not_unblock():
+    client = _client_registering_as("s-b", [(0, {"sid": "s-a", "status": "ready"})])
+    with pytest.raises(RuntimeError, match="timed out"):
+        client.register_session(init_timeout=0.5)
+
+
+def test_register_session_sidless_status_accepted():
+    """An older endpoint sends session_status without sid: still accepted."""
+    client = _client_registering_as("s-b", [(0.1, {"status": "ready"})])
+    client.register_session(init_timeout=5)
+    assert client.sid == "s-b"
 
 
 if __name__ == '__main__':
