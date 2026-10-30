@@ -2995,6 +2995,7 @@ def _reconciling_client(rt, session, idle=60.0, gate=None):
     client._sid              = session.sid
     client._reconcile_idle   = idle
     client._reconcile_settle = 0.01
+    client._close_drain      = 0.05
     client._start_task_listener()
     return client, http
 
@@ -3301,6 +3302,7 @@ def _sse_client(http, rt=None):
     client = RhapsodyClient(http, '/rhapsody', broker_client=rt or MagicMock(),
                             endpoint_id='ep', plugin_name='rhapsody')
     client._sid = 'sid-rh'
+    client._close_drain = 0.05
     return client
 
 
@@ -3330,10 +3332,12 @@ def test_fan_out_does_not_repeat_terminal_states():
     pass unchanged."""
     client = _sse_client(MagicMock(), rt=_FakeRuntime())
     got = []
-    client.register_notification_callback(
-        lambda e, p, t, d: got.append((t, d)), topic='task_status')
-    client.register_notification_callback(
-        lambda e, p, t, d: got.append((t, d)), topic='task_status_batch')
+
+    def _cb(e, p, t, d):                       # registered for both topics
+        got.append((t, d))
+
+    client.register_notification_callback(_cb, topic='task_status')
+    client.register_notification_callback(_cb, topic='task_status_batch')
 
     run  = {'uid': 't.1', 'state': 'RUNNING', 'sid': 'sid-rh'}
     done = {'uid': 't.1', 'state': 'DONE',    'sid': 'sid-rh'}
@@ -3747,7 +3751,8 @@ def test_reconcile_aborts_when_the_session_changes():
         got = []
         client.register_notification_callback(
             lambda *a: got.append(a), topic='task_status_batch')
-        client._reconcile(['task.s1', 'task.s2'], threading.Event())
+        client._reconcile('sid-old', ['task.s1', 'task.s2'],
+                          threading.Event())
         assert urls == ['/rhapsody/task_states/sid-old']
         time.sleep(0.05)
         assert got == [] and not client._completed
@@ -3761,9 +3766,12 @@ def test_stale_running_after_terminal_is_not_passed_on():
     is dropped from the fan-out (alone, or from a batch)."""
     client = _sse_client(MagicMock(), rt=_FakeRuntime())
     got = []
+
+    def _cb(e, p, t, d):                       # registered for both topics
+        got.append(d)
+
     for topic in ('task_status', 'task_status_batch'):
-        client.register_notification_callback(
-            lambda e, p, t, d: got.append(d), topic=topic)
+        client.register_notification_callback(_cb, topic=topic)
     client._fan_out('ep', 'rhapsody', 'task_status',
                     {'uid': 't.1', 'state': 'DONE', 'sid': 'sid-rh'})
     client._fan_out('ep', 'rhapsody', 'task_status',
@@ -3882,13 +3890,13 @@ def test_uncertain_unknown_waits_for_grace():
         client._uncertain_grace = 60.0
         client._track_pending('sid-grace', [{'uid': 't.u'}], uncertain=True)
         client._submitted.add('t.u')
-        client._reconcile(['t.u'], threading.Event())
+        client._reconcile('sid-grace', ['t.u'], threading.Event())
         time.sleep(0.05)
         assert 't.u' not in client._completed
         assert client._outstanding() == ['t.u']
 
         client._uncertain_grace = 0.0
-        client._reconcile(['t.u'], threading.Event())
+        client._reconcile('sid-grace', ['t.u'], threading.Event())
         assert _until(lambda: 't.u' in client._completed)
         assert client._completed['t.u']['state'] == 'FAILED'
         assert client._outstanding() == [] and not client._uncertain
@@ -4159,7 +4167,7 @@ def test_reconcile_stops_for_good_on_404():
     rt._cb.start()
     client, http = _reconciling_client(rt, session)
     http.post = lambda url, json=None, **kw: _SessionHTTP._resp(
-        404, {'detail': 'no route'})
+        404, {'detail': 'No route: POST /rhapsody/task_states/sid-404'})
     try:
         _track(client, ['task.x'])
         thread = client._reconcile_thread
@@ -4171,11 +4179,11 @@ def test_reconcile_stops_for_good_on_404():
         rt._cb.stop()
 
 
-def test_task_states_entry_alone_and_too_large():
+def test_task_states_entry_alone_and_stripped():
     """A first entry that does not fit next to the uid lists is sent
     alone (earlier unknown uids move to remaining); one exceeding even the
-    frame is reported too_large, and the reconcile fetches it via
-    get_task."""
+    frame is stripped to its terminal state, so the reconcile still settles
+    it."""
     session = _done_session('sid-big', [])
     session._notify_batch_bytes = 6000         # frame cap 12000
     session._output_notify_limit = 100_000     # big output tails survive
@@ -4187,8 +4195,11 @@ def test_task_states_entry_alone_and_too_large():
     assert body['unknown'] == [] and body['remaining'] == ['t.u', 't.next']
 
     body = asyncio.run(session.task_states(['t.big', 't.next']))
-    assert body['tasks'] == [] and body['too_large'] == ['t.big']
-    assert body['remaining'] == ['t.next']
+    assert body['remaining'] == ['t.next'] and 'too_large' not in body
+    big, = body['tasks']
+    assert big['state'] == 'DONE' and big['exit_code'] == 0
+    assert 'too large' in big['error'] and 'stdout' not in big
+    assert len(json.dumps(body)) < 12000
 
     rt = _FakeRuntime()
     rt._cb.start()
@@ -4197,8 +4208,7 @@ def test_task_states_entry_alone_and_too_large():
         _track(client, ['t.big'])
         client._reconcile_wake.set()
         done = client.wait_tasks(['t.big'], timeout=5)
-        assert done[0]['state'] == 'DONE'
-        assert len(done[0]['stdout']) == 20000
+        assert done[0]['state'] == 'DONE' and 'too large' in done[0]['error']
     finally:
         client.close()
         rt._cb.stop()
@@ -4260,6 +4270,281 @@ def test_all_topics_registration_survives_close_and_reregister():
             == ['None', 'task_status', 'task_status_batch']
     finally:
         client.close()
+
+
+
+# ---------------------------------------------------------------------------
+# Code-review round 5
+# ---------------------------------------------------------------------------
+
+def _bare_runtime():
+    """An EndpointRuntime callback registry without transport."""
+    import threading as _threading
+    from radical.orbit.runtime import EndpointRuntime
+
+    rt = EndpointRuntime.__new__(EndpointRuntime)
+    rt._callbacks = {}
+    rt._cb_lock   = _threading.Lock()
+    rt._name      = 'test-consumer'
+    rt._emit      = MagicMock()
+    rt._cb        = MagicMock()
+    return rt
+
+
+def test_close_and_reregister_leave_one_registration():
+    """Bound methods unregister (equality), so close() and a new session
+    leave exactly one runtime registration per topic."""
+    rt     = _bare_runtime()
+    client = _sse_client(_ack_http(), rt=rt)
+    client.register_notification_callback(lambda *a: None)
+    client._start_task_listener()
+    client.close()
+    assert all(not cbs for cbs in rt._callbacks.values())
+    client._sid = 'sid-again'
+    client._start_task_listener()
+    try:
+        for topic in ('task_status', 'task_status_batch', None):
+            assert len(rt._callbacks[('ep', 'rhapsody', topic)]) == 1
+    finally:
+        client.close()
+
+
+def test_gone_reconcile_detaches_and_a_new_session_restarts_it():
+    """After the reconcile ended on a gone session, a later session starts
+    a new reconcile thread."""
+    session = _done_session('sid-gone', ['task.x'])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session)
+    orig = http.post
+    http.post = lambda url, json=None, **kw: _SessionHTTP._resp(
+        404, {'detail': 'unknown session id: sid-gone'})
+    try:
+        _track(client, ['task.x'])
+        thread = client._reconcile_thread
+        client._reconcile_wake.set()
+        thread.join(5)
+        assert not thread.is_alive()
+        assert client._reconcile_thread is None
+        assert rt._cb._hooks == []
+
+        http.post = orig
+        client._start_task_listener()
+        assert client._reconcile_thread is not None
+        assert client._reconcile_thread.is_alive()
+        assert rt._cb._hooks == [client._on_drop]
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
+def test_transient_404_and_502_keep_reconciling():
+    """A broker/gateway 404 (endpoint unknown in a reconnect gap) or a 502
+    is transient: the reconcile backs off and recovers once it clears."""
+    session = _done_session('sid-gap', ['task.g'])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session)
+    client._reconcile_retry = 0.02
+    orig, calls = http.post, []
+    errors = [(404, "endpoint 'ep' unknown"), (502, "endpoint 'ep' unknown")]
+
+    def _gap(url, json=None, **kw):
+        calls.append(url)
+        if errors:
+            status, detail = errors.pop(0)
+            return _SessionHTTP._resp(status, {'detail': detail})
+        return orig(url, json=json, **kw)
+
+    http.post = _gap
+    try:
+        _track(client, ['task.g'])
+        client._reconcile_wake.set()
+        assert client.wait_tasks(['task.g'], timeout=5)[0]['state'] == 'DONE'
+        assert len(calls) >= 3 and client._reconcile_thread.is_alive()
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
+def test_snapshot_takes_sid_and_uids_together():
+    """Session switches racing the snapshot never pair a sid with another
+    session's uids."""
+    client = _sse_client(_ack_http())
+    stop   = threading.Event()
+
+    def _switch():
+        n = 0
+        while not stop.is_set():
+            with client._cond:
+                client._sid = f'sid-{n}'
+                client._reset_tracking()
+                client._pending.update({f'sid-{n}:t{i}': 0.0
+                                        for i in range(20)})
+            n += 1
+            time.sleep(0)
+
+    switcher = threading.Thread(target=_switch)
+    switcher.start()
+    try:
+        for _ in range(500):
+            sid, uids = client._snapshot(None)
+            assert all(u.startswith(f'{sid}:') for u in uids)
+    finally:
+        stop.set()
+        switcher.join(5)
+
+
+def test_close_drains_the_closing_sessions_last_states():
+    """CANCELED states the session close produces arrive after the close
+    POST returned: close() keeps the fan-out (and the closing sid) until
+    they are in, then unregisters."""
+    session = _done_session('sid-closing', [])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session)
+    client._close_drain = 5.0
+    got  = []
+    client.register_notification_callback(
+        lambda e, p, t, d: got.append(d['state']), topic='task_status')
+    orig = http.post
+
+    def _post(url, json=None, **kw):
+        if 'unregister_session' in url:
+            threading.Timer(0.1, rt.deliver, ('task_status', {
+                'uid': 'task.c', 'state': 'CANCELED',
+                'sid': 'sid-closing'})).start()
+        return orig(url, json=json, **kw)
+
+    http.post = _post
+    _track(client, ['task.c'])
+    t0 = time.monotonic()
+    client.close()
+    assert 0.05 < time.monotonic() - t0 < 2.0
+    assert got == ['CANCELED']
+    assert rt.callbacks == []
+    rt._cb.stop()
+
+
+@pytest.mark.asyncio
+async def test_endpoint_close_flushes_the_cancellations():
+    """The endpoint sends the states its session close produced before the
+    session goes away, not after the coalescing window."""
+    session, futs = _watched_session('test.closeflush', window=10.0)
+    session._init_ready.set()
+    task = MagicMock()
+    task.uid, task.state = 'task.k', 'RUNNING'
+    task.to_dict = lambda: {'uid': 'task.k', 'state': task.state}
+    watcher = asyncio.ensure_future(session._watch_batch([task]))
+    session._watchers.add(watcher)
+    await _ticks(1)
+
+    async def _close():
+        task.state = 'CANCELED'
+        futs['task.k'].set_result(None)
+
+    session._rh_session.close = _close
+    await session.close()
+    frames = _sent_frames(session)
+    assert [(t['uid'], t['state']) for f in frames for t in f] \
+        == [('task.k', 'CANCELED')]
+
+
+def test_recovered_shapes_and_task_status_only_callbacks():
+    """A single recovered completion comes as task_status, several as one
+    batch; a task_status-only callback gets batch items one by one, a
+    callback of both topics the batch once."""
+    client = _sse_client(MagicMock(), rt=_FakeRuntime())
+    solo, both = [], []
+
+    def _both(e, p, t, d):
+        both.append((t, d.get('uid') or [x['uid'] for x in d['tasks']]))
+
+    client.register_notification_callback(
+        lambda e, p, t, d: solo.append((t, d['uid'], d.get('sid'))),
+        topic='task_status')
+    client.register_notification_callback(_both, topic='task_status')
+    client.register_notification_callback(_both, topic='task_status_batch')
+
+    client._redeliver('sid-rh', [{'uid': 't.1', 'state': 'DONE'}],
+                      threading.Event(), None)
+    client._redeliver('sid-rh', [{'uid': 't.2', 'state': 'DONE'},
+                                 {'uid': 't.3', 'state': 'FAILED'}],
+                      threading.Event(), None)
+    assert both == [('task_status', 't.1'),
+                    ('task_status_batch', ['t.2', 't.3'])]
+    assert solo == [('task_status', 't.1', 'sid-rh'),
+                    ('task_status', 't.2', 'sid-rh'),
+                    ('task_status', 't.3', 'sid-rh')]
+
+
+@pytest.mark.asyncio
+async def test_handed_off_running_after_completion_is_dropped():
+    """A RUNNING handed to the loop before the completion was marked is
+    dropped when the loop gets to it."""
+    session, _ = _watched_session('test.recheck')
+    session._notified_states = {}
+    session._notified_lock   = threading.Lock()
+    session._plugin._main_loop = asyncio.get_running_loop()
+
+    t = threading.Thread(target=session._on_task_state_change,
+                         args=({'uid': 't.1'}, 'RUNNING'))
+    t.start()
+    t.join()                                   # handed off, not yet run
+    session._mark_terminal('t.1', 'DONE')
+    await _ticks()
+    assert session._notify_buf == []
+    session._plugin._dispatch_notify.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_task_states_is_tracked_and_410_when_torn_down_midway():
+    """task_states counts as in flight (close waits for it) and answers
+    410 if the session started closing meanwhile — never 'unknown'."""
+    session = _done_session('sid-midway', ['task.m'])
+    gate    = threading.Event()
+    orig    = session._collect_states
+
+    def _slow(*a):
+        gate.wait(5)
+        return orig(*a)
+
+    session._collect_states = _slow
+    session._rh_session.close = AsyncMock()
+    call = asyncio.ensure_future(session.task_states(['task.m']))
+    await _ticks()
+    assert session._ops == 1
+    closing = asyncio.ensure_future(session.close())
+    await _ticks()
+    assert not closing.done()                  # waits for the call
+    gate.set()
+    with pytest.raises(HTTPException) as e:
+        await call
+    assert e.value.status_code == 410
+    await asyncio.wait_for(closing, 5)
+
+
+def test_last_all_topics_callback_drops_its_registration():
+    """Unregistering the last all-topics callback removes the runtime
+    registration; a new one registers it again."""
+    rt     = _FakeRuntime()
+    client = _sse_client(MagicMock(), rt=rt)
+
+    def cb1(*a):
+        pass
+
+    def cb2(*a):
+        pass
+
+    client.register_notification_callback(cb1)
+    client.register_notification_callback(cb2)
+    client.unregister_notification_callback(cb1)
+    assert any(t is None for t, _ in rt.callbacks)
+    client.unregister_notification_callback(cb2)
+    assert not any(t is None for t, _ in rt.callbacks)
+    assert not client._fanout_all and client._fanout_on
+    client.register_notification_callback(cb1)
+    assert [t for t, _ in rt.callbacks].count(None) == 1
 
 
 _TIMERS: list = []

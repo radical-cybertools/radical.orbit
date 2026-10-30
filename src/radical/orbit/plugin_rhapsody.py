@@ -66,6 +66,8 @@ RECONCILE_IDLE_MAX  = 300.0            # backoff cap
 RECONCILE_SETTLE    = 1.0              # after a drop, let the burst settle
 RECONCILE_TIMEOUT   = 10.0             # bound of one task_states call
 RECONCILE_JOIN      = 2.0              # close() waits this long for it
+CLOSE_NOTIFY_DRAIN  = 2.0              # close() waits this long for the
+                                       # last states of its tasks
 RECONCILE_RETRY     = 5.0              # next pass after a failed call,
                                        # doubling while calls keep failing
 # An uid whose submit POST failed may still reach the endpoint: unknown to
@@ -239,6 +241,22 @@ def _frame_budget_for(batch_bytes: int, sid_bytes: int) -> int:
     return max(batch_bytes - sid_bytes, batch_bytes // 2)
 
 
+# Error details of a 404 / 410 that come from the rhapsody plugin itself:
+# the session is unknown, expired or closing, or the endpoint has no such
+# route (an older endpoint).  Only those end a client's reconcile for good;
+# a broker or gateway answer (e.g. an endpoint unknown during a reconnect
+# gap, a 502 / 503) is transient.
+_GONE_MARKERS = ('unknown session id', 'session expired',
+                 'session is closing', 'No route:')
+
+
+def _session_gone(exc: Exception) -> bool:
+    """Whether *exc* (a ``PluginClient._raise`` error) says the session or
+    its route is gone for good (see ``_GONE_MARKERS``)."""
+    return getattr(exc, 'status_code', None) in (404, 410) \
+        and any(m in str(exc) for m in _GONE_MARKERS)
+
+
 def _uid_bytes(uids: list[str]) -> int:
     """Wire bytes of a uid list, as echoed in a ``task_states`` response."""
     return 64 + sum(len(u.encode('utf-8', 'replace')) + 4 for u in uids)
@@ -394,6 +412,7 @@ class RhapsodySession(PluginSession):
         self._leftovers: list[_DataEntry] = []
         self._torn_down = False                # teardown took the leftovers
         self._bg: set[asyncio.Future] = set()  # strong refs to shutdown tasks
+        self._watchers: set[asyncio.Future] = set()  # running _watch_batch
 
         # Close coordination: ``_closing`` turns new requests away (410),
         # tracked routes (``_tracked``) are drained before teardown, and
@@ -711,7 +730,9 @@ class RhapsodySession(PluginSession):
 
         # Start a single batch watcher instead of per-task watchers
         if self._plugin and all_tasks:
-            asyncio.ensure_future(self._watch_batch(all_tasks))
+            watcher = asyncio.ensure_future(self._watch_batch(all_tasks))
+            self._watchers.add(watcher)
+            watcher.add_done_callback(self._watchers.discard)
 
         if self._prof:
             self._prof.prof('rh_submit_done', uid=bid, msg=str(batch_n))
@@ -735,6 +756,9 @@ class RhapsodySession(PluginSession):
         if loop is not None:
             loop.call_soon_threadsafe(self._queue_notification, payload)
             return
+        if not _is_terminal(payload) and self._notified_terminal(
+                str(payload.get('uid'))):
+            return                    # handed off before its completion
 
         size = _payload_size(payload)
         with self._notify_lock:
@@ -904,6 +928,14 @@ class RhapsodySession(PluginSession):
                     self._queue_notification({
                         "uid": uid_str, "state": state_str,
                         "error": f"unexpected state: {state_str}"})
+
+    def _notified_terminal(self, uid: str) -> bool:
+        """Whether *uid* was notified terminal (``_mark_terminal``)."""
+        lock = getattr(self, '_notified_lock', None)
+        if lock is None:
+            return False
+        with lock:
+            return _is_terminal(self._notified_states.get(uid, ''))
 
     def _mark_terminal(self, uid: str, state: str) -> None:
         """Record that *uid* was notified terminal: later intermediate
@@ -1142,6 +1174,7 @@ class RhapsodySession(PluginSession):
                                 detail=f"task {uid} not found")
         return self._sanitize_task(task)
 
+    @_tracked
     async def task_states(self, uids: list[str],
                           terminal_only: bool = False) -> dict:
         """
@@ -1160,6 +1193,7 @@ class RhapsodySession(PluginSession):
         Raises:
             HTTPException 413: The request does not fit
                                (``_task_states_fits``).
+            HTTPException 410: The session was torn down meanwhile.
 
         Returns:
             dict: ``{"tasks": [...], "remaining": [...], "unknown": [...]}``.
@@ -1173,21 +1207,25 @@ class RhapsodySession(PluginSession):
                 detail=f"task_states takes at most {TASK_STATES_MAX_UIDS} "
                        f"uids and {budget // 2} bytes of uids per call")
 
-        # terminal payloads are CPU work (sanitize, encode): off the loop
-        return await asyncio.to_thread(self._collect_states, uids,
-                                       terminal_only,
-                                       budget - _uid_bytes(uids))
+        # terminal payloads are CPU work (sanitize, encode): off the loop;
+        # on the task map as it is now (a teardown replaces it)
+        result = await asyncio.to_thread(self._collect_states, self._tasks,
+                                         uids, terminal_only,
+                                         budget - _uid_bytes(uids))
+        if self._closing or self._rh_session is None:
+            raise HTTPException(status_code=410, detail="session is closing")
+        return result
 
-    def _collect_states(self, uids: list[str], terminal_only: bool,
-                        budget: int) -> dict:
-        """The body of ``task_states``: pack entries within *budget* (the
-        room the uid lists leave; remaining and unknown are disjoint
-        subsets of *uids*)."""
+    def _collect_states(self, known: dict, uids: list[str],
+                        terminal_only: bool, budget: int) -> dict:
+        """The body of ``task_states``: pack the entries of *uids* (looked
+        up in *known*) within *budget* (the room the uid lists leave;
+        remaining and unknown are disjoint subsets of *uids*)."""
         nbytes  = 0
         tasks   = []
         unknown = []
         for i, uid in enumerate(uids):
-            task = self._tasks.get(uid)
+            task = known.get(uid)
             if task is None:
                 unknown.append(uid)
                 continue
@@ -1209,13 +1247,18 @@ class RhapsodySession(PluginSession):
                      rest: list[str]) -> dict:
         """A first entry too large to share the frame with the uid lists:
         sent alone, all other uids (also those found unknown so far) left
-        for a follow-up call — or, if even that exceeds the frame cap,
-        reported ``too_large`` (the client fetches it with ``get_task``)."""
+        for a follow-up call.  If even that exceeds the frame cap, the
+        entry is stripped to its terminal state, exit code and an error
+        (``get_task`` still has the full record for an explicit caller)."""
         room = self._notify_batch_bytes * BUDGET_RATIO - TASK_STATES_ENVELOPE
-        if size + _uid_bytes(rest) <= room:
-            return {"tasks": [entry], "remaining": rest, "unknown": []}
-        return {"tasks": [], "remaining": rest, "unknown": [],
-                "too_large": [uid]}
+        if size + _uid_bytes(rest) > room:
+            entry = {"uid":       uid,
+                     "state":     entry.get("state"),
+                     "exit_code": entry.get("exit_code"),
+                     "error":     f"task {uid}: result / output too "
+                                  f"large for a notification ({size} "
+                                  f"bytes) — fetch it with get_task"}
+        return {"tasks": [entry], "remaining": rest, "unknown": []}
 
     def _task_state(self, task) -> dict:
         """A task's ``task_states`` entry: the terminal notification payload,
@@ -1465,6 +1508,14 @@ class RhapsodySession(PluginSession):
         await asyncio.shield(self._close_task)
         return {}
 
+    async def _flush_at_close(self) -> None:
+        """Send the states the close produced (CANCELED) before the session
+        goes away: let the watchers queue them (bounded), then flush."""
+        watchers = set(self._watchers)
+        if watchers:
+            await asyncio.wait(watchers, timeout=CLOSE_NOTIFY_DRAIN)
+        self._flush_notifications()
+
     async def _teardown(self) -> None:
         # let tracked routes in flight finish (bounded), so none of them
         # sees a half torn-down session
@@ -1499,6 +1550,7 @@ class RhapsodySession(PluginSession):
                 held = set(rh_session.backends)
                 await rh_session.close()
                 owned = held
+                await self._flush_at_close()
         finally:
             self._tasks = {}
             starting = [(n, e) for n, e in data.items()
@@ -1615,6 +1667,11 @@ class RhapsodyClient(PluginClient):
         self._fanout_on    = False
         self._fanout_all   = False
 
+        # close(): the sid being closed, whose last states are still taken
+        # (for up to ``_close_drain`` seconds) after unregister_session
+        self._closing_sid : str | None = None
+        self._close_drain = CLOSE_NOTIFY_DRAIN
+
         # Fan-out runs serialized: live and recovered deliveries never
         # interleave, even without a dispatcher thread to order them.
         self._deliver_lock  = threading.RLock()
@@ -1680,6 +1737,9 @@ class RhapsodyClient(PluginClient):
         with self._fanout_lock:
             self._fanout[topic] = [cb for cb in self._fanout[topic]
                                    if cb != callback]
+            last_all = topic is None and not self._fanout[None]
+        if last_all:
+            self._drop_fan_out(task_topics=False)
 
     def _ensure_fan_out(self) -> None:
         """Register the one runtime callback per task topic (once)."""
@@ -1742,7 +1802,9 @@ class RhapsodyClient(PluginClient):
         An item for a task this client recorded terminal already (a live
         event that crossed a recovered one, or a late RUNNING) is not passed
         on, so the callbacks see each completion once and a task's state
-        never goes backwards.  Deliveries are serialized.
+        never goes backwards.  A callback registered for ``task_status`` but
+        not for ``task_status_batch`` gets a batch item by item, as
+        ``task_status``.  Deliveries are serialized.
         """
         with self._delivering():
             seen = self._recorded(topic, data)
@@ -1751,9 +1813,18 @@ class RhapsodyClient(PluginClient):
             if data is None:
                 return
             with self._fanout_lock:
-                cbs = self._fanout[topic] + self._fanout[None]
+                cbs  = self._fanout[topic] + self._fanout[None]
+                solo = [cb for cb in self._fanout['task_status']
+                        if cb not in self._fanout['task_status_batch']] \
+                    if topic == 'task_status_batch' else []
             for cb in cbs:
                 self._call(cb, endpoint, plugin, topic, data)
+            # callbacks of task_status only: a batch item by item
+            for item in self._items(topic, data) if solo else []:
+                single = item if 'sid' not in data else \
+                    {**item, 'sid': data['sid']}
+                for cb in solo:
+                    self._call(cb, endpoint, plugin, 'task_status', single)
 
     @staticmethod
     def _call(cb, *args) -> None:
@@ -1769,11 +1840,17 @@ class RhapsodyClient(PluginClient):
             return [t for t in data.get('tasks', []) if isinstance(t, dict)]
         return [data]
 
+    def _mine(self, sid) -> bool:
+        """Whether *sid* is this client's session — or the one it is
+        closing, whose last states are still taken."""
+        return sid == self.sid or \
+            (sid is not None and sid == self._closing_sid)
+
     def _recorded(self, topic, data) -> set:
         """Uids of items in *data* whose task is recorded terminal already.
         Another session's notification is not ours to judge."""
         sid = data.get('sid')
-        if sid is not None and sid != self.sid:
+        if sid is not None and not self._mine(sid):
             return set()
         with self._cond:
             return {t.get('uid') for t in self._items(topic, data)
@@ -1812,7 +1889,7 @@ class RhapsodyClient(PluginClient):
                         "told apart")
 
         with self._cond:
-            if sid is not None and sid != self.sid:
+            if sid is not None and not self._mine(sid):
                 return
             changed = False
             for t in self._items(topic, data):
@@ -2027,7 +2104,7 @@ class RhapsodyClient(PluginClient):
     def _outstanding(self, older: float | None = None) -> list[str]:
         """Pending uids — only those pending for *older* seconds or more,
         if given."""
-        with self._cond:
+        with self._cond:                     # (reentrant: _snapshot)
             if older is None:
                 return list(self._pending)
             since = time.monotonic() - older
@@ -2060,33 +2137,49 @@ class RhapsodyClient(PluginClient):
             if stop.is_set():
                 return
             # a drop, or a retry after a failed call: every pending uid
-            every = woken or failed
-            uids  = self._outstanding(None if every else self._reconcile_idle)
-            if not uids:
+            every     = woken or failed
+            sid, uids = self._snapshot(None if every
+                                       else self._reconcile_idle)
+            if not sid or not uids:
                 pace.idle_reset()
                 failed = False
                 continue
-            found, failed, gone = self._reconcile(uids, stop)
+            found, failed, gone = self._reconcile(sid, uids, stop)
             if gone:
+                self._retire(stop)
                 return
             pace.passed(found, failed, woken)
 
-    def _reconcile(self, uids: list[str],
+    def _snapshot(self, older: float | None) -> tuple:
+        """The session id and its pending uids (see ``_outstanding``), taken
+        together: a session switch between the two would hand the old
+        session's uids to the new one."""
+        with self._cond:
+            return self._sid, self._outstanding(older)
+
+    def _retire(self, stop: threading.Event) -> None:
+        """The reconcile thread of *stop* ends for good (the session is
+        gone): detach it, so a later session starts a new one."""
+        if self._reconcile_stop is not stop:
+            return                            # superseded already
+        self._reconcile_thread = None
+        disp, self._dispatcher = self._dispatcher, None
+        if disp is not None:
+            disp.remove_drop_hook(self._on_drop)
+
+    def _reconcile(self, sid: str, uids: list[str],
                    stop: threading.Event) -> tuple[int, bool, bool]:
         """Fetch the states of *uids* and re-deliver the terminal ones (and
         those the endpoint does not know, as FAILED — for an uncertain
         submit only after its grace period).
 
-        The session id and the dispatcher are taken once: a pass whose
-        session changed (or a stopping client) ends without delivering
-        anything.  A failing call skips its chunk, not the pass; a 404 or
-        410 (no such route: older endpoint; or the session is gone) ends
-        reconciling for good.  Returns ``(recovered, failed, gone)``.
+        *sid* and *uids* are one snapshot (``_snapshot``), the dispatcher
+        is taken once: a pass whose session changed (or a stopping client)
+        ends without delivering anything.  A failing call skips its chunk,
+        not the pass; a 404 / 410 of the plugin itself (``_session_gone``)
+        ends reconciling for good.  Returns ``(recovered, failed, gone)``.
         """
-        sid  = self.sid
         disp = self._dispatcher
-        if not sid:
-            return 0, False, False
         log.info("[rhapsody] reconciling %d outstanding task(s) of %s",
                  len(uids), sid)
         found, failed = 0, False
@@ -2096,7 +2189,7 @@ class RhapsodyClient(PluginClient):
             try:
                 page = self._fetch_states(sid, chunk)
             except Exception as e:
-                if getattr(e, 'status_code', None) in (404, 410):
+                if _session_gone(e):
                     log.warning("[rhapsody] not reconciling session %s any "
                                 "more: %s", sid, e)
                     return found, failed, True
@@ -2125,33 +2218,10 @@ class RhapsodyClient(PluginClient):
         done.extend({'uid': u, 'state': 'FAILED',
                      'error': f'task unknown to session {sid}'}
                     for u in self._settled_unknown(page))
-        done.extend(self._fetch_alone(sid, page.get('too_large') or [],
-                                      stop))
         if done:
             self._redeliver(sid, done, stop, disp)
         rest = page.get('remaining') or []
         return len(done), (rest if len(rest) < len(chunk) else [])
-
-    def _fetch_alone(self, sid: str, uids: list[str],
-                     stop: threading.Event) -> list[dict]:
-        """Terminal states of tasks too large for a ``task_states`` frame,
-        one ``get_task`` each."""
-        done = []
-        for uid in uids:
-            if not self._reconciling(sid, stop):
-                break
-            try:
-                resp = self._http.get(
-                    self._url(ROUTE_TASK.format(sid=sid, uid=uid)),
-                    timeout=RECONCILE_TIMEOUT)
-                self._raise(resp, f"get_task {uid}")
-                task = resp.json()
-            except Exception as e:
-                log.warning("[rhapsody] cannot fetch %s: %r", uid, e)
-                continue
-            if _is_terminal(task):
-                done.append(task)
-        return done
 
     def _settled_unknown(self, page: dict) -> list[str]:
         """The unknown uids of *page* that are lost: all but those whose
@@ -2219,13 +2289,16 @@ class RhapsodyClient(PluginClient):
     def _redeliver(self, sid: str, tasks: list[dict],
                    stop: threading.Event, disp) -> None:
         """Deliver recovered completions through the fan-out, as one
-        ``task_status_batch`` stamped with our ``sid`` — on the dispatcher
+        ``task_status_batch`` (one ``task_status`` for a single completion)
+        stamped with our ``sid`` — on the dispatcher
         *disp* (taken at the start of the pass) like any notification,
         waiting for queue room.  Without a dispatcher it runs here,
         serialized with live delivery by the fan-out's lock.  Nothing is
         delivered once *stop* is set (``close()``)."""
         args = (self._endpoint_id, self._plugin_name, 'task_status_batch',
-                {'sid': sid, 'tasks': tasks})
+                {'sid': sid, 'tasks': tasks}) if len(tasks) > 1 else \
+            (self._endpoint_id, self._plugin_name, 'task_status',
+             {**tasks[0], 'sid': sid})
         if disp is None:
             with self._delivering():
                 self._fan_out_unless(stop, *args)
@@ -2244,24 +2317,62 @@ class RhapsodyClient(PluginClient):
             self._fan_out(*args)
 
     def close(self) -> None:
-        """Stop the reconcile thread, close the session, then drop this
-        client's runtime registrations (kept through the session close, so
-        the states it causes still arrive)."""
-        self._stop_reconcile()
-        super().close()
-        with self._cond:
-            self._reset_tracking()
-        self._unregister_fan_out()
+        """Stop the reconcile thread, close the session, then drain and
+        unregister the runtime callbacks.
 
-    def _unregister_fan_out(self) -> None:
-        """Undo ``_ensure_fan_out`` / ``_ensure_fan_out_all``."""
+        The states the session close produces (CANCELED) arrive as
+        notifications after the close returns: the callbacks stay
+        registered, and the closing session's events are still taken, until
+        every outstanding task is terminal or ``_close_drain`` seconds
+        passed (no wait when called from a notification callback).
+        """
+        inside = self._in_callback()
+        self._stop_reconcile()
+        self._closing_sid = self.sid
+        try:
+            super().close()
+        finally:
+            try:
+                if self._fanout_on and not inside:
+                    self._drain_close()
+            finally:
+                self._drop_fan_out()
+                with self._cond:
+                    self._closing_sid = None
+                    self._reset_tracking()
+
+    def _in_callback(self) -> bool:
+        """Whether this thread delivers notifications (dispatcher thread,
+        or holding the delivery lock): it must not wait for more."""
+        me   = threading.get_ident()
+        disp = self._dispatcher or getattr(self._bc, '_cb', None)
+        return self._deliver_owner == me or \
+            (isinstance(disp, CallbackDispatcher) and disp.ident == me)
+
+    def _drain_close(self) -> None:
+        """Wait until no task is outstanding, at most ``_close_drain``."""
+        deadline = time.monotonic() + self._close_drain
+        with self._cond:
+            while self._pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    log.info("[rhapsody] %d task(s) of %s without a final "
+                             "state at close", len(self._pending),
+                             self._closing_sid)
+                    return
+                self._cond.wait(remaining)
+
+    def _drop_fan_out(self, task_topics: bool = True) -> None:
+        """Undo ``_ensure_fan_out_all`` and (with *task_topics*)
+        ``_ensure_fan_out``."""
         with self._fanout_reg:
             regs = []
-            if self._fanout_on:
+            if self._fanout_on and task_topics:
                 regs += [(self._fan_out, t) for t in self._FANOUT_TOPICS]
+                self._fanout_on = False
             if self._fanout_all:
                 regs.append((self._fan_out_other, None))
-            self._fanout_on = self._fanout_all = False
+                self._fanout_all = False
             for fn, topic in regs:
                 try:
                     super().unregister_notification_callback(fn, topic=topic)
