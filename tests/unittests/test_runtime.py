@@ -785,6 +785,35 @@ def test_send_notification_sync_from_plain_thread(harness):
     assert data == {'via': 'thread'}
 
 
+def test_send_notification_sets_event_session():
+    """A session notification reaches the wire as an event with that
+    session; a plugin-level one stays session-less, called as before."""
+    from unittest.mock import MagicMock
+    from fastapi import FastAPI
+    from radical.orbit.runtime import EndpointRuntime
+
+    rt = EndpointRuntime.__new__(EndpointRuntime)
+    rt._name = 'epA'
+    rt._emit = MagicMock()
+    rt.send_notification('echo_rt', 'demo', {'k': 1}, session='sid.1')
+    rt.send_notification('echo_rt', 'demo', {'k': 2})
+    evs = [c.args[0] for c in rt._emit.call_args_list]
+    assert [(e.plugin, e.session, e.data) for e in evs] \
+        == [('echo_rt', 'sid.1', {'k': 1}), ('echo_rt', None, {'k': 2})]
+
+    # Plugin.send_notification: the session keyword only when set
+    app = FastAPI()
+    app.state.endpoint_service = MagicMock(spec=['send_notification'])
+    app.state.endpoint_service.send_notification.return_value = None
+    plugin = _EchoPlugin(app)
+    asyncio.run(plugin.send_notification('demo', {'k': 1}, session='s'))
+    asyncio.run(plugin.send_notification('demo', {'k': 2}))
+    calls = app.state.endpoint_service.send_notification.call_args_list
+    assert [(c.args, c.kwargs) for c in calls] == [
+        (('echo_rt', 'demo', {'k': 1}), {'session': 's'}),
+        (('echo_rt', 'demo', {'k': 2}), {})]
+
+
 # ---------------------------------------------------------------------------
 # item 4: with_meta delivers broker-stamped seq matching what replay retains
 # ---------------------------------------------------------------------------

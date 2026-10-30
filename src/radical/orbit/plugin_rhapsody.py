@@ -2524,7 +2524,7 @@ class PluginRhapsody(Plugin):
             self._dispatch_notify("session_status", {
                 "sid":    sid,
                 "status": "ready",
-            })
+            }, session=sid)
 
         except Exception as e:
             log.error("[%s] Session %s init failed: %s",
@@ -2533,7 +2533,7 @@ class PluginRhapsody(Plugin):
                 "sid":    sid,
                 "status": "failed",
                 "error":  str(e),
-            })
+            }, session=sid)
 
     # -- route handlers -----------------------------------------------------
 

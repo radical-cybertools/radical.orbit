@@ -2819,6 +2819,38 @@ def test_task_states_splits_large_uid_lists():
 # Session scoping of task notifications
 # ---------------------------------------------------------------------------
 
+def test_session_notify_sets_event_session():
+    """A session's notifications carry its sid as the event session."""
+    session = RhapsodySession("test.scope.ev")
+    session._plugin = MagicMock()
+    session.notify("task_status", {"uid": "task.000001", "state": "DONE"})
+    assert session._plugin._dispatch_notify.call_args.kwargs \
+        == {"session": "test.scope.ev"}
+
+
+@pytest.mark.asyncio
+async def test_init_session_status_carries_the_session():
+    """session_status is plugin-level but concerns one session: it passes
+    that session's sid as the event session, ready and failed alike."""
+    _, plugin, _ = _make_plugin()
+    plugin._dispatch_notify = MagicMock()
+
+    ok = MagicMock()
+    ok._init_ready.is_set.return_value = False
+    ok.initialize = AsyncMock()
+    await plugin._init_session("sid.ok", ok)
+
+    bad = MagicMock()
+    bad._init_ready.is_set.return_value = False
+    bad.initialize = AsyncMock(side_effect=RuntimeError("boom"))
+    await plugin._init_session("sid.bad", bad)
+
+    calls = plugin._dispatch_notify.call_args_list
+    assert [(c.args[0], c.args[1]["status"], c.kwargs) for c in calls] == [
+        ("session_status", "ready",  {"session": "sid.ok"}),
+        ("session_status", "failed", {"session": "sid.bad"})]
+
+
 def test_session_notify_stamps_sid_on_task_topics():
     """Task notifications carry the session id; the payload is a copy."""
     session = RhapsodySession("test.scope.1")
@@ -2893,7 +2925,7 @@ def test_two_sessions_with_colliding_uids_get_their_own_results():
         s._rh_session = MagicMock()
         s._plugin = MagicMock()
         s._plugin._dispatch_notify.side_effect = \
-            lambda topic, data: sent.append((topic, data))
+            lambda topic, data, session=None: sent.append((topic, data))
         sessions.append(s)
 
     for s, value in zip(sessions, ("from-a", "from-b")):

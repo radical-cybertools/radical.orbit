@@ -72,11 +72,13 @@ class PluginSession:
     def notify(self, topic: str, data: dict) -> None:
         """Send a notification to consumers via the parent plugin.
 
-        A no-op when the session has no plugin (e.g. built directly in a
-        test).  Safe from sync/async contexts and background threads.
+        The notification carries this session's sid as the event
+        ``session``.  A no-op when the session has no plugin (e.g. built
+        directly in a test).  Safe from sync/async contexts and background
+        threads.
         """
         if self._plugin is not None:
-            self._plugin._dispatch_notify(topic, data)
+            self._plugin._dispatch_notify(topic, data, session=self.sid)
 
     def start_status_poller(
         self, *,

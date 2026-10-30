@@ -81,12 +81,14 @@ class BrokerPluginHost(PluginHostBase):
     # ------------------------------------------------------------------
 
     async def send_notification(self, plugin_name: str, topic: str,
-                                data: Dict[str, Any]) -> None:
+                                data: Dict[str, Any],
+                                session: Optional[str] = None) -> None:
         try:
             await self._broadcast_fn('notification', {
                 'endpoint'  : self._name,
                 'plugin': plugin_name,
                 'topic' : topic,
+                'session': session,
                 'data'  : data,
             })
         except Exception as e:

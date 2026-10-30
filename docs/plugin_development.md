@@ -44,7 +44,8 @@ The plugin system provides three base classes:
 2.  **PluginSession** (`plugin_session_base.py`) — per-client session state.
     - Created when a caller invokes `register_session`
     - Holds domain-specific state (jobs, tasks, connections)
-    - Sends notifications via `self._plugin._dispatch_notify(topic, data)`
+    - Sends notifications via `self.notify(topic, data)`, which stamps the
+      session's sid as the event `session`
 3.  **PluginClient** (`client.py`) — application-side helper.
     - Speaks a small `httpx`-shaped transport surface, so it is
       transport-agnostic: the endpoint runtime rides it over the WebSocket by
@@ -76,11 +77,10 @@ class MySession(PluginSession):
         self._data[param] = result
 
         # Send a real-time notification to subscribed consumers
-        if self._plugin:
-            self._plugin._dispatch_notify("work_status", {
-                "param": param,
-                "status": "done"
-            })
+        self.notify("work_status", {
+            "param": param,
+            "status": "done"
+        })
 
         return {"result": result}
 
@@ -94,8 +94,8 @@ class MySession(PluginSession):
 
 - Call `super().__init__(sid)` to initialize base functionality
 - Use `self._check_active()` to validate the session is open
-- Emit notifications with `self._plugin._dispatch_notify(topic, data)`
-  (thread-safe; works from sync/async contexts and background threads)
+- Emit notifications with `self.notify(topic, data)` (thread-safe; works
+  from sync/async contexts and background threads; a no-op without a plugin)
 - Call `await super().close()` in your close method
 
 ### Step 2: Define Your Plugin Class
@@ -258,12 +258,17 @@ From a session:
 
 ``` python
 # In your PluginSession subclass method:
-if self._plugin:
-    self._plugin._dispatch_notify("job_status", {
-        "job_id": "abc123",
-        "state":  "RUNNING"
-    })
+self.notify("job_status", {
+    "job_id": "abc123",
+    "state":  "RUNNING"
+})
 ```
+
+A session's notification carries its sid as the event `session`: the broker
+numbers those events per `(endpoint, plugin, session)`, and a consumer that
+registered with `session=sid` gets only its own session's events. A
+plugin-level notification (`self._dispatch_notify(topic, data)` or
+`send_notification`) is session-less unless it passes `session=sid`.
 
 From a plugin (async context):
 
@@ -336,8 +341,9 @@ I/O, subprocess calls, network requests) must be offloaded to a thread pool with
 
 Callbacks from external libraries (PsiJ status callbacks, Rhapsody backend
 callbacks) run on background threads, not the loop. Emit notifications from
-them with `self._plugin._dispatch_notify(topic, data)` — it is thread-safe and
-schedules the send on the main loop automatically.
+them with the session's `notify(topic, data)` (or the plugin's
+`_dispatch_notify(topic, data, session=None)`) — both are thread-safe and
+schedule the send on the main loop automatically.
 
 ## Testing Your Plugin
 

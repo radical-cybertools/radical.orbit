@@ -546,6 +546,34 @@ async def test_event_session_seq_keyed_by_src_plugin_session(make_broker):
         await broker.shutdown()
 
 
+@pytest.mark.asyncio
+async def test_broker_hosted_session_notification_keeps_session(make_broker):
+    """A broker-hosted plugin's session notification keeps its session
+    through BrokerPluginHost and _host_broadcast into the event."""
+    from radical.orbit.broker_plugin_host import BrokerPluginHost
+
+    broker = make_broker()
+    await broker.startup()
+    try:
+        cons = FakeWS()
+        await _register(broker, 'c1', cons)
+        broker._events.update_subscription('c1', {'patterns': [{}]}, True)
+        cons.sent.clear()
+
+        host = BrokerPluginHost(plugin_names=[],
+                                broadcast_fn=broker._host_broadcast)
+        await host.send_notification('p', 't', {'k': 1}, session='s')
+        await host.send_notification('p', 't', {'k': 2})
+        await asyncio.sleep(0.02)
+
+        got = [(e.src, e.plugin, e.session, e.seq, e.data)
+               for e in cons.msgs()]
+        assert got == [('broker', 'p', 's',  0, {'k': 1}),
+                       ('broker', 'p', None, 0, {'k': 2})]
+    finally:
+        await broker.shutdown()
+
+
 def test_event_session_seq_table_bounded():
     """The per-session seq table is LRU-bounded; a pruned stream restarts."""
     from radical.orbit.broker_events import EventRouter

@@ -983,7 +983,7 @@ class Broker:
                 'src':     BROKER_NAME,
                 'plugin':  data.get('plugin'),
                 'topic':   data.get('topic'),
-                'session': None,
+                'session': data.get('session'),
                 'data':    data.get('data') or {},
             }
             self._loop.call_soon_threadsafe(

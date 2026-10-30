@@ -1071,7 +1071,8 @@ class EndpointRuntime(PluginHostBase):
     # ── notifications from served plugins ──────────────────────────────
 
     def send_notification(self, plugin_name: str, topic: str,
-                          data: Dict[str, Any]) -> None:
+                          data: Dict[str, Any],
+                          session: Optional[str] = None) -> None:
         """Turn a served plugin's notification into a broker ``event`` frame.
 
         A plain sync method (the body only packs + hands off to the transport
@@ -1079,10 +1080,11 @@ class EndpointRuntime(PluginHostBase):
         one obvious way, matching the rest of the consumer-facing API.
 
         ``seq`` is a placeholder (0) — the broker stamps the authoritative
-        ``seq``/``ts`` on ingest.
+        ``seq``/``ts`` on ingest, per ``(endpoint, plugin, session)`` when
+        *session* is set.
         """
         ev = protocol.Event(src=self._name, plugin=plugin_name, topic=topic,
-                            session=None, ts=0.0, seq=0, data=data)
+                            session=session, ts=0.0, seq=0, data=data)
         self._emit(ev)
 
     # ── topology snapshot access ───────────────────────────────────────
