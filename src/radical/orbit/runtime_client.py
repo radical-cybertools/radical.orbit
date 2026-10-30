@@ -65,10 +65,15 @@ def max_body_of(holder) -> int:
     val = getattr(holder, 'max_body', None)
     if isinstance(val, int) and val > 0:
         return val
+    return protocol.max_body(frame_cap_of(holder))
+
+
+def frame_cap_of(holder) -> int:
+    """Return the published ``frame_cap`` of *holder*, else the default."""
     cap = getattr(holder, 'frame_cap', None)
-    if not (isinstance(cap, int) and cap > 0):
-        cap = protocol.FRAME_CAP
-    return protocol.max_body(cap)
+    if isinstance(cap, int) and cap > 0:
+        return cap
+    return protocol.FRAME_CAP
 
 
 def pack_batches(items: List[Any], budget: int, limit: int,

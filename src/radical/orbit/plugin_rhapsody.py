@@ -8,6 +8,7 @@ and monitor compute / AI tasks on endpoint nodes.
 import asyncio
 import base64
 import functools
+import hashlib
 import importlib
 import importlib.util
 import json
@@ -25,7 +26,7 @@ from .plugin_session_base import PluginSession
 from .plugin_base import Plugin, DEFAULT_SID
 from .client import PluginClient
 from .protocol import FRAME_CAP, RequestNotSent
-from .runtime_client import PayloadTooLarge, max_body_of, pack_batches
+from .runtime_client import frame_cap_of, max_body_of, pack_batches
 
 log = logging.getLogger("radical.orbit")
 
@@ -110,6 +111,7 @@ except ImportError:
     rh = None
 
 import cloudpickle as _cp
+import msgpack
 from . import _prof as rprof
 
 
@@ -196,7 +198,7 @@ def _resolve_frame_cap(app) -> int:
     """Resolve the effective transport frame cap for this plugin host.
 
     ``protocol.FRAME_CAP`` is only the default: the serving runtime packs
-    with its own ``frame_cap`` tunable (``EndpointRuntime._frame_cap``), so a
+    with its own ``frame_cap`` tunable (``EndpointRuntime.frame_cap``), so a
     lower configured cap must shrink the plugin's budgets too — otherwise an
     "allowed" result or batch still overruns the real transport limit and the
     frame is dropped.  The runtime is reached through the established
@@ -210,10 +212,18 @@ def _resolve_frame_cap(app) -> int:
     endpoints can still reject a frame this budget allows.
     """
     svc = getattr(getattr(app, 'state', None), 'endpoint_service', None)
-    cap = getattr(svc, '_frame_cap', None)
-    if isinstance(cap, int) and cap > 0:
-        return cap
-    return FRAME_CAP
+    return frame_cap_of(svc)
+
+
+def _spec_hash(td: dict) -> str | None:
+    """A cheap hash of a task dict as received (its packed msgpack bytes).
+
+    Used only to warn when a duplicate uid comes with a different spec.
+    """
+    try:
+        return hashlib.sha1(msgpack.packb(td, use_bin_type=True)).hexdigest()
+    except Exception:
+        return None
 
 
 def _submit_budget(http) -> int:
@@ -230,96 +240,122 @@ def _submit_budget(http) -> int:
 
 
 class PartialSubmitError(RuntimeError):
-    """A batched submit failed part-way: each task's fate, by uid.
+    """A batched submit stopped part-way; each task's fate, by uid.
 
-    ``accepted``  the endpoint acknowledged these; they run.
-    ``uncertain`` the failing batch, when the endpoint may have taken some
-                  or all of it: a timeout or transport error after the
-                  request was sent, a 5xx (a failure once submission
-                  started), any other unexpected status, or an unreadable
-                  ack.
-    ``rejected``  the failing batch when it provably was not taken (a
-                  status in ``SUBMIT_REFUSED_STATUS``, answered before the
-                  endpoint submits any task of the request, or a
-                  :class:`~radical.orbit.protocol.RequestNotSent`), plus
-                  every batch never sent.
+    ``accepted`` the endpoint acknowledged these; they run.
+    ``failed``   the batch that could not be confirmed: refused (``refused``,
+                 a status in ``SUBMIT_REFUSED_STATUS``: nothing of it was
+                 taken), provably not sent (``not_sent``), or still failing
+                 after ``SUBMIT_RETRIES`` retries -- then the endpoint may
+                 have taken some of it, and resubmitting the same uids is
+                 safe (the endpoint session deduplicates by uid) and
+                 confirms.
+    ``unsent``   every later batch, never sent.
 
-    ``results`` holds the accepted tasks' submit results; ``status_code``
-    is the failed batch's HTTP error status, ``None`` when there was none
-    (transport failure, or an unreadable ack on a 2xx).
+    ``results`` holds the accepted tasks' acks; ``status_code`` is the
+    failing batch's last HTTP error status, ``None`` when it had none (a
+    transport failure, or an unreadable ack on a 2xx).
     """
 
     def __init__(self, msg: str = '', accepted=(), results=(),
-                 status_code: int | None = None, uncertain=(), rejected=()):
+                 status_code: int | None = None, failed=(), unsent=(),
+                 refused: bool = False, not_sent: bool = False):
         super().__init__(msg)
         self.accepted    = list(accepted)
         self.results     = list(results)
         self.status_code = status_code
-        self.uncertain   = list(uncertain)
-        self.rejected    = list(rejected)
+        self.failed      = list(failed)
+        self.unsent      = list(unsent)
+        self.refused     = refused
+        self.not_sent    = not_sent
 
     def __reduce__(self):
         return (type(self), (str(self), self.accepted, self.results,
-                             self.status_code, self.uncertain, self.rejected))
+                             self.status_code, self.failed, self.unsent,
+                             self.refused, self.not_sent))
 
 
 # Submit statuses that mean the endpoint took no task of the request.  The
 # session answers these only before the first chunk reaches the backend
 # (it validates the whole request first: 400; session gates: 404 unknown,
 # 409 initializing, 410 closing/expired); the transport answers 413 and
-# FastAPI 422 before the handler runs.  A failure once submission has
-# started answers 500 (see ``RhapsodySession.submit_tasks``).
+# FastAPI 422 before the handler runs.  A refused batch is final: no retry.
 SUBMIT_REFUSED_STATUS = (400, 404, 409, 410, 413, 422)
 
+# A batch that fails with a retryable outcome -- a timeout or transport
+# error, ``RequestNotSent``, a 5xx (incl. the runtime's admission 503 and
+# the broker relay's 502/503/504), an unreadable ack -- is resent with the
+# same uids: the endpoint session deduplicates by uid, so a resend never
+# runs a task twice (within one session).  ``SUBMIT_BACKOFF`` is the sleep
+# before each retry; no retry starts later than ``SUBMIT_RETRY_WINDOW``
+# seconds after the batch's first attempt.
+SUBMIT_RETRIES      = 3
+SUBMIT_BACKOFF      = (0.5, 1.0, 2.0)
+SUBMIT_RETRY_WINDOW = 300.0
 
-def _error_status(exc: BaseException, status: int | None) -> int | None:
-    """The HTTP error status of a failed submit batch, ``None`` if none.
 
-    A 2xx whose ack cannot be read is no error status: ``None``.
-    """
-    code = getattr(exc, 'status_code', None)
-    if code is None and isinstance(status, int) and status >= 400:
-        code = status
-    return code
-
-
-def _submit_batches(client, url: str, task_dicts: list[dict]) -> list[dict]:
+def _submit_batches(client, url: str, task_dicts: list[dict], *,
+                    retries: int | None = None, backoff=None,
+                    sleep=time.sleep) -> list[dict]:
     """Post *task_dicts* to *url* in frame-bounded msgpack batches.
 
     Every task is packed and checked before the first send, so a task that
     no frame carries fails with a 413 (:class:`PayloadTooLarge`) and nothing
-    is submitted.  Batches go out sequentially; any failure while sending
-    raises :class:`PartialSubmitError`, which sorts every uid into
-    accepted, uncertain or rejected.
+    is submitted.  Batches go out sequentially; a batch failing with a
+    retryable outcome is resent with the same uids (see
+    ``SUBMIT_RETRIES``).  A refusal, a non-retryable status, or exhausted
+    retries raise :class:`PartialSubmitError`.  *retries*, *backoff* and
+    *sleep* are injectable (tests).
     """
+    retries = SUBMIT_RETRIES if retries is None else retries
+    backoff = SUBMIT_BACKOFF if backoff is None else backoff
     http    = client._http
     batches = pack_batches(task_dicts, _submit_budget(http),
                            max_body_of(http))
     results:  list[dict] = []
     accepted: list[str]  = []
     for batch, body in batches:
-        uids   = [str(td['uid']) for td in batch]
-        status = None
-        try:
-            resp   = http.post(url, data=body,
-                               headers={"Content-Type": "application/msgpack"})
-            status = resp.status_code
-            client._raise(resp, f"submit {len(batch)} task(s)")
-            acks   = resp.json()
-        except Exception as e:
-            # only a validation refusal or a provably unsent request means
-            # nothing of this batch was taken; anything else may have been
-            refused   = isinstance(e, RequestNotSent) \
-                        or status in SUBMIT_REFUSED_STATUS
-            unsent    = [str(td['uid'])
-                         for td in task_dicts[len(accepted) + len(uids):]]
-            uncertain = [] if refused else uids
-            rejected  = (uids if refused else []) + unsent
+        uids    = [str(td['uid']) for td in batch]
+        attempt = 0
+        t0      = time.monotonic()
+        while True:
+            status = None
+            try:
+                resp   = http.post(url, data=body,
+                                   headers={"Content-Type":
+                                            "application/msgpack"})
+                status = resp.status_code
+                client._raise(resp, f"submit {len(batch)} task(s)")
+                acks   = resp.json()
+                if not isinstance(acks, list):
+                    raise ValueError(f"unreadable submit ack: {acks!r:.80}")
+                break
+            except Exception as e:
+                err = e
+            refused   = status in SUBMIT_REFUSED_STATUS
+            not_sent  = isinstance(err, RequestNotSent)
+            retryable = not refused and (status is None or status < 400
+                                         or status >= 500)
+            if retryable and attempt < retries \
+                    and time.monotonic() - t0 < SUBMIT_RETRY_WINDOW:
+                log.warning("submit of %d task(s) failed (%s), retry %d/%d",
+                            len(batch), err, attempt + 1, retries)
+                sleep(backoff[min(attempt, len(backoff) - 1)])
+                attempt += 1
+                continue
+            unsent = [str(td['uid'])
+                      for td in task_dicts[len(accepted) + len(uids):]]
+            if refused or not_sent:
+                fate = "were not taken"
+            else:
+                fate = ("may still have been taken by the endpoint; "
+                        "resubmitting the same uids is safe and confirms")
             raise PartialSubmitError(
-                f"{e} — of {len(task_dicts)} task(s): {len(accepted)} "
-                f"accepted, {len(uncertain)} uncertain, {len(rejected)} "
-                f"rejected", accepted, results,
-                _error_status(e, status), uncertain, rejected) from e
+                f"{err} — of {len(task_dicts)} task(s): {len(accepted)} "
+                f"accepted, {len(uids)} failed ({fate}), {len(unsent)} "
+                f"unsent", accepted, results,
+                status if status is not None and status >= 400 else None,
+                uids, unsent, refused, not_sent) from err
         accepted.extend(uids)
         results.extend(acks)
     return results
@@ -420,6 +456,14 @@ class RhapsodySession(PluginSession):
         self._rh_session         = None
         self._telemetry          = None
         self._tasks: dict[str, dict] = {}
+
+        # Idempotent submit by uid (see ``submit_tasks``): uids reserved by
+        # a request in progress, each mapped to its chunk's outcome future;
+        # uids recorded but still in the backend submit (SUBMITTING); and a
+        # spec hash per known uid, to warn when a duplicate's spec differs.
+        self._reserved:   dict[str, asyncio.Future] = {}
+        self._submitting: set[str]                  = set()
+        self._spec:       dict[str, str]            = {}
 
         # Data backends started via ``data_start``, keyed by name.  Once
         # started they are also registered with the rhapsody session, so
@@ -691,11 +735,25 @@ class RhapsodySession(PluginSession):
     @_tracked
     async def submit_tasks(self, task_dicts: list[dict]) -> list[dict]:
         """
-        Submit a list of tasks.
+        Submit a list of tasks, idempotently by uid.
 
         Each dict is converted to a ``ComputeTask`` or ``AITask`` via
         ``BaseTask.from_dict()``.  Function fields encoded as cloudpickle
         blobs or import-path strings are deserialized first.
+
+        **Idempotent by uid** (within this session): a uid this session
+        already knows -- submitted, in any state including terminal, or
+        reserved by a request still in progress -- is not submitted again.
+        Its ack is marked ``"duplicate": true`` and carries the current
+        info: ``{uid, state}``, or the full terminal-notification payload
+        for a terminal task.  A duplicate of an in-flight uid first awaits
+        that request's outcome for it (bounded by this request's own handler
+        timeout), so it is never acked blindly; if that request refused the
+        task, this one answers the refusal too.  The uid is the client's
+        identity for a task: a duplicate with a different spec is still a
+        duplicate (logged).  Re-running a task needs a new uid.  A uid
+        repeated within one request is submitted once and acked per
+        occurrence, in order.
 
         Large submissions are processed in chunks: the CPU-bound
         deserialization of every chunk is offloaded to a worker thread
@@ -707,69 +765,193 @@ class RhapsodySession(PluginSession):
         refusal raised before the first chunk reaches the backend -- an
         invalid task (400, whatever the preparation raised), and the session
         gates (404 unknown, 409 initializing, 410 closing/expired) -- means
-        no task of the request was taken.  Once submission has started, any
-        failure answers 500 naming how many tasks were submitted; those
-        tasks are recorded and watched, so they still report.
+        no task of the request was taken.  A chunk's tasks are recorded
+        (state ``SUBMITTING``) before its backend await; if that await fails
+        or is cancelled, the chunk's tasks the backend left in their initial
+        state are marked FAILED ("submit interrupted") and notified, later
+        chunks never start, and the request answers 500 naming how many
+        tasks went in.  Recorded tasks are watched, so they report.
 
         Returns:
-            list[dict]: Minimal ack dicts ``{uid, state}``.
+            list[dict]: One ack per task dict, in order.
         """
         batch_n = len(task_dicts)
         bid     = task_dicts[0].get('uid', '?') if task_dicts else '?'
         if self._prof:
             self._prof.prof('rh_submit', uid=bid, msg=str(batch_n))
 
-        _CHUNK    = 4096
-        results   = []
-        all_tasks = []   # collect for batch watcher
+        # -- classify and reserve: synchronous, before the first await, so
+        #    two concurrent requests with one uid submit it at most once
+        order: list[str]                 = []    # uid per task dict
+        waits: dict[str, asyncio.Future] = {}    # in-flight duplicates
+        own:   list[dict]                = []
+        seen:  set[str]                  = set()
+        for td in task_dicts:
+            if td.get('uid') is None:
+                td['uid'] = f"task.{uuid.uuid4().hex[:8]}"
+            uid  = str(td['uid'])
+            spec = _spec_hash(td)
+            order.append(uid)
+            if uid in seen:
+                continue                         # repeated in this request
+            seen.add(uid)
+            if uid in self._reserved or uid in self._tasks:
+                if spec != self._spec.get(uid):
+                    log.warning("[%s] duplicate uid %s with a different "
+                                "spec: kept the first", self._sid, uid)
+                if uid in self._reserved:
+                    waits[uid] = self._reserved[uid]
+                continue
+            own.append(td)
+            self._spec[uid] = spec
 
-        # validate the whole request before submitting any of it
+        _CHUNK = 4096
+        loop   = asyncio.get_running_loop()
+        chunks = [own[i:i + _CHUNK] for i in range(0, len(own), _CHUNK)]
+        futs   = [loop.create_future() for _ in chunks]
+        for chunk, fut in zip(chunks, futs):
+            for td in chunk:
+                self._reserved[str(td['uid'])] = fut
+
+        # -- await in-flight duplicates, prepare: nothing submitted yet
         prepared = []
         try:
-            for i in range(0, len(task_dicts), _CHUNK):
-                chunk = task_dicts[i:i + _CHUNK]
-                prepared.append(
-                    await asyncio.to_thread(self._prepare_batch, chunk))
-        except HTTPException:
+            for uid, fut in waits.items():
+                refusal = await asyncio.shield(fut)
+                if refusal is not None:
+                    raise HTTPException(
+                        status_code=refusal.status_code,
+                        detail=f"task {uid}: {refusal.detail}")
+            try:
+                for chunk in chunks:
+                    prepared.append(
+                        await asyncio.to_thread(self._prepare_batch, chunk))
+            except HTTPException:
+                raise
+            except Exception as e:
+                # nothing was submitted: an invalid task, not a server fault
+                raise HTTPException(status_code=400,
+                                    detail=f"invalid task: {e}") from e
+        except BaseException as e:
+            self._release(chunks, futs, 0, e)
             raise
-        except Exception as e:
-            # nothing was submitted: an invalid task, not a server fault
-            raise HTTPException(status_code=400,
-                                detail=f"invalid task: {e}") from e
 
+        # -- submit chunk by chunk
+        own_acks: dict[str, dict] = {}
+        watch:    list            = []
+        started                   = 0
         try:
-            for tasks in prepared:
+            for i, tasks in enumerate(prepared):
                 if self._rh_session is None:   # torn down after drain timeout
                     raise HTTPException(status_code=410,
                                         detail="session is closing")
-                await self._rh_session.submit_tasks(tasks)
+                started = i + 1
+                watch.extend(await self._submit_chunk(tasks, futs[i]))
                 for t in tasks:
-                    uid_str = str(t.uid)
-                    self._tasks[uid_str] = t
-                    results.append({"uid": uid_str,
-                                    "state": str(t.get("state"))})
-                all_tasks.extend(tasks)
-        except Exception as e:
-            if not all_tasks and isinstance(e, HTTPException) \
-                    and e.status_code == 410:
+                    own_acks[str(t.uid)] = {"uid": str(t.uid),
+                                            "state": str(t.get("state"))}
+        except BaseException as e:
+            self._release(chunks, futs, started, e)
+            if isinstance(e, asyncio.CancelledError):
+                raise
+            if not started and isinstance(e, HTTPException):
                 raise                           # nothing taken: a refusal
-            # Part of the request may be in the backend: 500, never a
-            # refusal status, so the client treats the batch as uncertain.
             log.exception("[%s] submit failed after %d of %d task(s)",
-                          self._sid, len(all_tasks), batch_n)
+                          self._sid, len(watch), batch_n)
             raise HTTPException(
                 status_code=500,
-                detail=f"submit failed after {len(all_tasks)} of {batch_n} "
+                detail=f"submit failed after {len(watch)} of {batch_n} "
                        f"task(s) were submitted: {e}") from e
         finally:
-            # Start a single batch watcher instead of per-task watchers --
-            # also for the chunks submitted before a failure.
-            if self._plugin and all_tasks:
-                asyncio.ensure_future(self._watch_batch(all_tasks))
+            # one batch watcher for every recorded task -- also after a
+            # failure or a cancellation
+            if self._plugin and watch:
+                asyncio.ensure_future(self._watch_batch(watch))
+
+        acks:  list[dict] = []
+        acked: set[str]   = set()
+        for uid in order:
+            ack = own_acks.get(uid) if uid not in acked else None
+            if ack is None:
+                ack = self._duplicate_ack(uid)
+            acked.add(uid)
+            acks.append(ack)
 
         if self._prof:
             self._prof.prof('rh_submit_done', uid=bid, msg=str(batch_n))
-        return results
+        return acks
+
+    async def _submit_chunk(self, tasks: list, fut: asyncio.Future) -> list:
+        """Record *tasks* (SUBMITTING) and hand them to the backend.
+
+        Returns the tasks to watch.  If the backend await fails or is
+        cancelled, the tasks it left in their initial state are marked
+        FAILED and notified, the others are returned for watching (via the
+        exception's ``watch`` attribute), and the exception propagates.
+        Either way the chunk's reservations resolve: its uids are now known.
+        """
+        uids = [str(t.uid) for t in tasks]
+        for uid, t in zip(uids, tasks):
+            self._tasks[uid] = t
+        self._submitting.update(uids)
+        try:
+            await self._rh_session.submit_tasks(tasks)
+        except BaseException as e:
+            taken = []
+            for t in tasks:
+                if t.get('state'):
+                    taken.append(t)              # the backend has it
+                    continue
+                t['state']     = 'FAILED'
+                t['exception'] = f"submit interrupted: {e!r}"
+                self._queue_notification(self._notification_payload(t))
+            if self._plugin and taken:
+                asyncio.ensure_future(self._watch_batch(taken))
+            raise
+        finally:
+            self._submitting.difference_update(uids)
+            for uid in uids:
+                self._reserved.pop(uid, None)
+            if not fut.done():
+                fut.set_result(None)
+        return tasks
+
+    def _release(self, chunks: list, futs: list, start: int,
+                 exc: BaseException) -> None:
+        """Release the reservations of chunks *start*.. (never submitted).
+
+        Their in-flight duplicates get *exc* as the refusal when it is one
+        (an ``HTTPException`` in ``SUBMIT_REFUSED_STATUS``), else a
+        retryable 503: the task was not taken, a resend will submit it.
+        """
+        if isinstance(exc, HTTPException) \
+                and exc.status_code in SUBMIT_REFUSED_STATUS:
+            refusal = exc
+        else:
+            refusal = HTTPException(
+                status_code=503,
+                detail=f"the request owning this uid failed before "
+                       f"submitting it: {exc!r}")
+        for chunk, fut in zip(chunks[start:], futs[start:]):
+            for td in chunk:
+                uid = str(td['uid'])
+                if self._reserved.get(uid) is fut:
+                    del self._reserved[uid]
+                    self._spec.pop(uid, None)
+            if not fut.done():
+                fut.set_result(refusal)
+
+    def _duplicate_ack(self, uid: str) -> dict:
+        """The ack for a uid this session already knows (``duplicate``)."""
+        t     = self._tasks.get(uid)
+        state = self._get_attr(t, 'state') if t is not None else None
+        if state and str(state).upper() in TERMINAL_STATES:
+            ack = self._notification_payload(t)
+        else:
+            ack = {"uid": uid, "state": str(state) if state
+                   else 'SUBMITTING'}
+        ack["duplicate"] = True
+        return ack
 
     def _queue_notification(self, payload: dict) -> None:
         """Add a task notification to the batch buffer and ensure a
@@ -976,6 +1158,8 @@ class RhapsodySession(PluginSession):
         state = self._get_attr(t, 'state')
         if state:
             d['state'] = str(state)
+        elif uid and str(uid) in self._submitting:
+            d['state'] = 'SUBMITTING'          # recorded, backend await open
 
         d.pop('future', None)
         if 'exception' in d and d['exception'] is not None:
@@ -1709,13 +1893,21 @@ class RhapsodyClient(PluginClient):
         Returns:
             list[dict]: Submitted task info (uid, state).
 
+        Submission is idempotent by uid within the endpoint's session: a
+        batch that fails with a retryable outcome is resent with the same
+        uids (``SUBMIT_RETRIES``), and an ack marked ``duplicate`` for a
+        terminal task carries its terminal payload, which is applied here
+        as a completion (waiters wake).
+
         Raises:
             PayloadTooLarge: a ``RuntimeError`` with ``status_code`` 413
                 naming the ``uids`` too large for any frame (nothing is
                 submitted then).
-            PartialSubmitError: a batch failed; its ``accepted`` uids run,
-                its ``uncertain`` ones may, its ``rejected`` ones do not
-                (and are no longer waitable).
+            PartialSubmitError: a batch could not be confirmed; its
+                ``accepted`` uids run.  Its ``failed`` and ``unsent`` uids
+                are no longer waitable -- unless the client can reconcile
+                (``_can_reconcile``), which keeps ``failed`` ones pending.
+                Resubmitting the same uids is safe.
         """
         self._require_session()
 
@@ -1730,11 +1922,10 @@ class RhapsodyClient(PluginClient):
 
         # Remember what we submitted so wait_tasks() can validate UIDs --
         # all of them before packing and sending, so a concurrent wait on a
-        # client-assigned uid is valid at once.  A rejected (never taken)
-        # uid is withdrawn on failure and its waiters woken, so they raise
-        # instead of hanging; an uncertain one stays waitable.  Only uids
-        # this call added are withdrawn: one an earlier submit registered
-        # stays.
+        # client-assigned uid is valid at once.  A uid that is not confirmed
+        # is withdrawn on failure and its waiters woken, so they raise
+        # instead of hanging.  Only uids this call added are withdrawn: one
+        # an earlier submit registered stays.
         with self._cond:
             added = {str(td['uid']) for td in task_dicts} - self._submitted
             self._submitted.update(added)
@@ -1746,13 +1937,41 @@ class RhapsodyClient(PluginClient):
 
         url = self._url(ROUTE_SUBMIT.format(sid=self.sid))
         try:
-            return _submit_batches(self, url, task_dicts)
-        except PayloadTooLarge:
+            results = _submit_batches(self, url, task_dicts)
+        except PartialSubmitError as e:
+            self._apply_duplicate_acks(e.results)
+            gone = list(e.unsent)
+            if e.refused or e.not_sent or not self._can_reconcile():
+                gone += e.failed
+            _withdraw(gone)
+            raise
+        except BaseException:
             _withdraw(added)                    # nothing was sent
             raise
-        except PartialSubmitError as e:
-            _withdraw(e.rejected)
-            raise
+        self._apply_duplicate_acks(results)
+        return results
+
+    def _can_reconcile(self) -> bool:
+        """Whether this client can resolve a failed submit's uids later.
+
+        ``False`` here: an unconfirmed uid is withdrawn.  A client with a
+        reconcile path (task state query) keeps it pending instead.
+        """
+        return False
+
+    def _apply_duplicate_acks(self, acks: list) -> None:
+        """Apply terminal duplicate acks as completions.
+
+        A resubmit of a uid that already finished gets its terminal payload
+        back instead of a new run, and no new event follows -- so the ack
+        itself completes the task here.
+        """
+        done = [a for a in acks or ()
+                if isinstance(a, dict) and a.get('duplicate')
+                and str(a.get('state', '')).upper() in TERMINAL_STATES]
+        if done:
+            self._on_task_done(None, None, 'task_status_batch',
+                               {'tasks': done})
 
     def wait_tasks(self, uids: list[str],
                    timeout: float | None = None) -> list[dict]:
@@ -1874,18 +2093,24 @@ class RhapsodyClient(PluginClient):
             with self._cond:
                 self._raise_withdrawn(uids)
             resp = self._http.post(url, json=payload)
-            # the endpoint omits uids it never received: a submit failing
-            # meanwhile may have withdrawn some -- raise, not a short list
+            # The endpoint omits uids it does not know (yet: a submit may
+            # still be in progress) and answers 404 when it knows none.  A
+            # short reply is "not done": keep waiting for the missing uids
+            # while they are still submitted, raise once one is withdrawn.
             with self._cond:
                 self._raise_withdrawn(uids)
-            self._raise(resp, f"wait {len(uids)} task(s)")
-            tasks = resp.json()
+            if resp.status_code == 404:
+                tasks = []
+            else:
+                self._raise(resp, f"wait {len(uids)} task(s)")
+                tasks = resp.json()
 
             for t in tasks:
                 self._decode_return_value(t)
 
-            # Check if all are terminal
-            all_done = all(
+            # Done once every requested uid is present and terminal
+            have     = {t.get('uid') for t in tasks}
+            all_done = have >= set(uids) and all(
                 str(t.get('state', '')).upper() in TERMINAL_STATES
                 for t in tasks)
             if all_done:

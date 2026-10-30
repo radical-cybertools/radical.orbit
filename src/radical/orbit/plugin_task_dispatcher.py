@@ -56,9 +56,8 @@ from .plugin_session_base               import PluginSession
 from .plugin_rhapsody                   import (
     RhapsodyClient, RhapsodySession, NOTIFY_BATCH_SIZE,
     _payload_size, _resolve_notify_window, _resolve_frame_cap, BUDGET_RATIO,
-    _submit_batches, PartialSubmitError, SUBMIT_REFUSED_STATUS,
+    _submit_batches, PartialSubmitError,
 )
-from .protocol                          import RequestNotSent
 from .runtime_client                    import PayloadTooLarge, max_body_of
 from .task_dispatcher_config            import (
     PoolConfig, PoolMember, PilotSize, PoolConfigError,
@@ -167,14 +166,24 @@ _MAX_INPUTS_BYTES = 8 * 1024 * 1024      # per submit
 # and no mkdir, and one zero-byte put is cheaper than a new route.
 _CWD_MARKER = '.orbit-cwd'
 
-# Endpoint-mode submit with an unknown outcome (the pilot may have taken
-# the task): the 504 carries this header, valued ``unknown``, so a caller
-# can tell it from a plain gateway/runtime timeout.  The task stays mapped
-# until it is settled -- by its terminal event, by a get/cancel the target
-# answers (404: never taken, the task is failed), or by a probe once it has
-# been unsettled for ``_UNCERTAIN_TTL`` seconds.
-SUBMIT_OUTCOME_HEADER = 'X-Orbit-Submit-Outcome'
-_UNCERTAIN_TTL        = 600.0
+
+def _rhapsody_uid(task: TaskRecord) -> str:
+    '''Return the uid a pool task is submitted to its pilot under.
+
+    Namespaced by the owning session (the pilot's rhapsody session is
+    shared across sessions, and client uid counters are only unique per
+    client), and -- from the second attempt on -- by the attempt: the
+    pilot deduplicates submits by uid and never re-runs one, so a
+    re-execute after FAILED/CANCELED needs a new uid.  Attempt 0 keeps the
+    suffix-less form.
+    '''
+    uid = f'{task.task_id}.{task.owning_sid}'
+    return f'{uid}.{task.attempt}' if task.attempt else uid
+
+
+def _next_attempt(existing: TaskRecord | None) -> int:
+    '''The attempt number of a (re-)submitted task record.'''
+    return existing.attempt + 1 if existing is not None else 0
 
 
 def child_endpoint_name(pool: str, member_id: str | None, pid: str) -> str:
@@ -1069,10 +1078,6 @@ class PluginTaskDispatcher(Plugin):
         self._endpoint_mode_path = self._state_root / 'endpoint_mode.json'
         self._endpoint_mode_tasks: dict[str, str] = dict(
             read_json(self._endpoint_mode_path, default={}) or {})
-        # task_id → when its submit outcome became unknown (in memory only;
-        # see ``_settle_uncertain``).
-        self._endpoint_mode_uncertain: dict[str, float] = {}
-        self._uncertain_probes: set = set()
 
         # rhapsody-task-uid → (owning_sid, pool_name, task_id) so the event tap
         # can find the right TaskRecord when a pilot reports completion.
@@ -1924,7 +1929,8 @@ class PluginTaskDispatcher(Plugin):
                 log.info('[%s] task %s already %s; attaching',
                          self.instance_name, task_id, existing.state)
                 return self._task_dict(existing)
-            # FAILED / CANCELED → re-execute: fall through and overwrite
+            # FAILED / CANCELED → re-execute: fall through and overwrite,
+            # under a new rhapsody uid (the pilot never re-runs a uid)
 
         spooled = self._write_spool(pool_state, task_id, decoded)
 
@@ -1944,6 +1950,7 @@ class PluginTaskDispatcher(Plugin):
             state        = TASK_QUEUED,
             submitted_at = now,
             arrival_ts   = now,
+            attempt      = _next_attempt(existing),
         )
         pool_state.tasks[task_id] = record
         pool_state.persist()
@@ -2016,8 +2023,6 @@ class PluginTaskDispatcher(Plugin):
             'cwd'       : cwd,
             'task_backend_specific_kwargs': {'cwd': cwd},
         }
-        self._sweep_uncertain()
-
         # map before submitting, as in pool mode: the task can finish before
         # the threaded submit call returns
         self._endpoint_mode_tasks[task_id] = target_endpoint
@@ -2027,39 +2032,12 @@ class PluginTaskDispatcher(Plugin):
         except Exception as e:
             log.exception('[%s] endpoint-mode submit to %s failed: %s',
                           self.instance_name, target_endpoint, e)
-            if isinstance(e, PartialSubmitError) and e.uncertain:
-                # The endpoint may run the task: keep it mapped so its
-                # events stay routable (bounded: see _settle_uncertain),
-                # and tell the caller the outcome is unknown -- a blind
-                # resubmit could run it twice.
-                self._endpoint_mode_uncertain[task_id] = time.time()
-                raise HTTPException(
-                    status_code=504,
-                    detail=f'rhapsody submit outcome unknown on '
-                           f'{target_endpoint}: task {task_id!r} may be '
-                           f'running; check its status before '
-                           f'resubmitting ({e})',
-                    headers={SUBMIT_OUTCOME_HEADER: 'unknown'}) from e
             if self._endpoint_mode_tasks.pop(task_id, None):
                 self._persist_endpoint_mode()
-            if isinstance(e.__cause__, RequestNotSent):
-                # never left the broker: transient, safe to retry
-                raise HTTPException(
-                    status_code=503,
-                    detail=f'rhapsody submit not sent to '
-                           f'{target_endpoint}: {e}',
-                    headers={'Retry-After': '1'}) from e
-            status = getattr(e, 'status_code', None)
-            if status in SUBMIT_REFUSED_STATUS:
-                # the endpoint (or the task's size) refused it
-                raise HTTPException(
-                    status_code=status,
-                    detail=f'rhapsody submit refused on '
-                           f'{target_endpoint}: {e}') from e
-            raise HTTPException(
-                status_code=502,
-                detail=f'rhapsody submit failed on '
-                       f'{target_endpoint}: {e}') from e
+            raise self._endpoint_submit_error(target_endpoint, task_id,
+                                              e) from e
+        # a resubmit of a task that already finished: its terminal payload
+        self._apply_duplicate_acks(result)
 
         return {
             'task_id' : task_id,
@@ -2151,6 +2129,7 @@ class PluginTaskDispatcher(Plugin):
                 # silent no-op riding the wire.  The record gets the
                 # validated block (with any derived 'cores'), not the raw one.
                 td.pop('requirements', None)
+                attempt = _next_attempt(existing)
                 pool_state.tasks[uid] = TaskRecord(
                     task_id      = uid,
                     pool         = pool_name,
@@ -2162,6 +2141,7 @@ class PluginTaskDispatcher(Plugin):
                     state        = TASK_QUEUED,
                     submitted_at = now,
                     arrival_ts   = now,
+                    attempt      = attempt,
                 )
                 acks.append({'uid': uid, 'state': TASK_QUEUED})
                 fresh = True
@@ -2189,12 +2169,10 @@ class PluginTaskDispatcher(Plugin):
             try:
                 info = await asyncio.to_thread(rh.get_task, task_id)
             except Exception as e:
-                self._settle_on_error(task_id, endpoint_name, e)
                 raise HTTPException(
                     status_code=502,
                     detail=f'rhapsody get_task failed on '
                            f'{endpoint_name}: {e}') from e
-            self._settle_uncertain(task_id, taken=True)
             return {'task_id': task_id, 'endpoint': endpoint_name,
                     'result': info}
 
@@ -2222,12 +2200,10 @@ class PluginTaskDispatcher(Plugin):
             try:
                 info = await asyncio.to_thread(rh.cancel_task, task_id)
             except Exception as e:
-                self._settle_on_error(task_id, endpoint_name, e)
                 raise HTTPException(
                     status_code=502,
                     detail=f'rhapsody cancel_task failed on '
                            f'{endpoint_name}: {e}') from e
-            self._settle_uncertain(task_id, taken=True)
             return {'task_id': task_id, 'endpoint': endpoint_name,
                     'result': info}
 
@@ -3285,7 +3261,7 @@ class PluginTaskDispatcher(Plugin):
                 # client-side uid counters (asyncflow's `task.NNNNNN`) are
                 # only unique per client process.
                 fwd = dict(task.task_dict)
-                fwd['uid'] = f'{task.task_id}.{task.owning_sid}'
+                fwd['uid'] = _rhapsody_uid(task)
                 # Per-key merge: the caller's own
                 # task_backend_specific_kwargs override the keys derived
                 # from `requirements` (the caller knows its backend), but
@@ -3303,7 +3279,7 @@ class PluginTaskDispatcher(Plugin):
                     }
             else:
                 fwd = {
-                    'uid'       : task.task_id,
+                    'uid'       : _rhapsody_uid(task),
                     'executable': task.cmd[0] if task.cmd else '',
                     'arguments' : task.cmd[1:] if len(task.cmd) > 1 else [],
                     'cwd'       : task.cwd,
@@ -3332,7 +3308,8 @@ class PluginTaskDispatcher(Plugin):
 
         try:
             try:
-                await asyncio.to_thread(rh.submit_tasks, [f for _, f in fwds])
+                acks = await asyncio.to_thread(rh.submit_tasks,
+                                               [f for _, f in fwds])
             except PayloadTooLarge as e:
                 # Nothing was sent.  Fail only the tasks no frame carries
                 # and submit their co-claimed peers.
@@ -3347,23 +3324,23 @@ class PluginTaskDispatcher(Plugin):
                         self._fail_unsent(pool_state, task, fwd,
                                           f'rhapsody submit error: {e}')
                 fwds = [(t, f) for t, f in fwds if f['uid'] not in too_big]
+                acks = []
                 if fwds:
-                    await asyncio.to_thread(rh.submit_tasks,
-                                            [f for _, f in fwds])
+                    acks = await asyncio.to_thread(rh.submit_tasks,
+                                                   [f for _, f in fwds])
             self._mark_dirty(pool_state)
+            self._apply_duplicate_acks(acks)
         except Exception as e:
-            # A partial submit: accepted batches run on the pilot, and an
-            # uncertain one (timeout, 5xx) may; those tasks keep their
-            # mapping.  Only the rejected / never-sent ones fail.
+            # The client already retried transient failures in place (same
+            # uids; the pilot deduplicates), with the tasks still claimed.
+            # What it accepted runs; everything else -- a refusal, or not
+            # confirmed after the retries -- fails here, with the reason.
             kept = set()
             if isinstance(e, PartialSubmitError):
-                kept = set(e.accepted) | set(e.uncertain)
-                if e.uncertain:
-                    log.warning('[%s] %d task(s) submitted with an uncertain '
-                                'outcome, kept pending: %s',
-                                self.instance_name, len(e.uncertain), e)
+                kept = set(e.accepted)
                 if kept:
                     self._mark_dirty(pool_state)
+                self._apply_duplicate_acks(e.results)
             failed = [(t, f) for t, f in fwds if f['uid'] not in kept]
             log.exception('[%s] rhapsody submit failed: %d of %d submitted '
                           'task(s) failed (%d claimed): %s',
@@ -3375,7 +3352,7 @@ class PluginTaskDispatcher(Plugin):
 
     def _fail_unsent(self, pool_state: PoolState, task: TaskRecord,
                      fwd: dict, reason: str) -> None:
-        '''Unmap a task its pilot never took, and fail it.'''
+        '''Unmap a task whose submit was not confirmed, and fail it.'''
         self._uid_to_task.pop(fwd['uid'], None)
         # a task the pilot already finished keeps that outcome
         if task.state not in TASK_TERMINAL_STATES:
@@ -3429,7 +3406,6 @@ class PluginTaskDispatcher(Plugin):
         # plugin='task_dispatcher' still see the event.
         if uid in self._endpoint_mode_tasks:
             endpoint_name = self._endpoint_mode_tasks.pop(uid)
-            self._endpoint_mode_uncertain.pop(uid, None)
             self._persist_endpoint_mode()
             self._dispatch_notify('task_status', {
                 'task_id'  : uid,
@@ -3646,68 +3622,56 @@ class PluginTaskDispatcher(Plugin):
 
     # -- helpers -------------------------------------------------------
 
-    def _settle_uncertain(self, task_id: str, taken: bool) -> None:
-        '''Resolve an endpoint-mode task whose submit outcome was unknown.
+    def _endpoint_submit_error(self, endpoint: str, task_id: str,
+                               exc: BaseException) -> HTTPException:
+        '''Map a failed endpoint-mode submit onto the caller's answer.
 
-        *taken*: the target knows the task, so it is an ordinary mapped
-        task from now on.  Otherwise it never reached the target: unmap it
-        and report it FAILED, so neither the mapping nor a waiter lingers.
+        - A refusal by the target: 400/413/422 pass through; 404/409/410
+          (the target's rhapsody session is gone, closing or not ready)
+          are a 502, and the cached child client is evicted, so the next
+          submit registers a fresh session.
+        - Not confirmed after the client's retries (or never sent): 503
+          with ``Retry-After``.  Resubmitting the same task_id is safe --
+          the target session deduplicates by uid (and the task_id is the
+          uid) -- within that session; after the child client is replaced
+          (eviction, broker restart) a resubmit may run it twice.
         '''
-        if self._endpoint_mode_uncertain.pop(task_id, None) is None or taken:
-            return
-        endpoint_name = self._endpoint_mode_tasks.pop(task_id, None)
-        self._persist_endpoint_mode()
-        log.warning('[%s] endpoint-mode task %s never reached %s: failed',
-                    self.instance_name, task_id, endpoint_name)
-        self._dispatch_notify('task_status', {
-            'task_id'  : task_id,
-            'endpoint' : endpoint_name,
-            'state'    : TASK_FAILED,
-            'exit_code': None,
-            'error'    : 'rhapsody submit outcome was unknown and the '
-                         'endpoint does not know the task',
-        })
+        status = getattr(exc, 'status_code', None)
+        refused = getattr(exc, 'refused', False) \
+            or isinstance(exc, PayloadTooLarge)
+        if refused and status in (400, 413, 422):
+            return HTTPException(
+                status_code=status,
+                detail=f'rhapsody submit refused on {endpoint}: {exc}')
+        if refused:
+            self._child_clients.pop((endpoint, 'rhapsody', None), None)
+            return HTTPException(
+                status_code=502,
+                detail=f'rhapsody session on {endpoint} refused the submit '
+                       f'({exc}); its client was reset, retry')
+        if isinstance(exc, PartialSubmitError):
+            return HTTPException(
+                status_code=503,
+                headers={'Retry-After': '1'},
+                detail=f'rhapsody submit to {endpoint} not confirmed: '
+                       f'{exc}.  Resubmitting task {task_id!r} is safe: '
+                       f'the endpoint session deduplicates by task_id '
+                       f'(not across a session change)')
+        return HTTPException(
+            status_code=502,
+            detail=f'rhapsody submit failed on {endpoint}: {exc}')
 
-    def _settle_on_error(self, task_id: str, endpoint_name: str,
-                         exc: BaseException) -> None:
-        '''A get/cancel the target answered 404 settles an unknown submit
-        outcome as "never taken" and answers 404 itself.'''
-        if task_id in self._endpoint_mode_uncertain \
-                and getattr(exc, 'status_code', None) == 404:
-            self._settle_uncertain(task_id, taken=False)
-            raise HTTPException(
-                status_code=404,
-                detail=f'task {task_id!r} never reached {endpoint_name} '
-                       f'(its submit outcome was unknown): marked FAILED'
-            ) from exc
+    def _apply_duplicate_acks(self, acks) -> None:
+        '''Apply terminal duplicate acks from a child submit.
 
-    def _sweep_uncertain(self) -> None:
-        '''Probe endpoint-mode tasks unsettled for ``_UNCERTAIN_TTL``.'''
-        now = time.time()
-        for task_id, since in list(self._endpoint_mode_uncertain.items()):
-            if now - since >= _UNCERTAIN_TTL:
-                self._endpoint_mode_uncertain[task_id] = now   # probe once
-                # keep a strong ref: the loop holds tasks weakly
-                fut = asyncio.ensure_future(self._probe_uncertain(task_id))
-                self._uncertain_probes.add(fut)
-                fut.add_done_callback(self._uncertain_probes.discard)
-
-    async def _probe_uncertain(self, task_id: str) -> None:
-        '''Ask the target about an unsettled task and settle it.'''
-        endpoint_name = self._endpoint_mode_tasks.get(task_id)
-        if endpoint_name is None:
-            self._endpoint_mode_uncertain.pop(task_id, None)
-            return
-        rh = await self._get_rhapsody_client(endpoint_name)
-        if rh is None:
-            return                              # retried after the next TTL
-        try:
-            await asyncio.to_thread(rh.get_task, task_id)
-        except Exception as e:
-            if getattr(e, 'status_code', None) == 404:
-                self._settle_uncertain(task_id, taken=False)
-            return                              # else: retried later
-        self._settle_uncertain(task_id, taken=True)
+        A resubmitted uid that already finished is acked with its terminal
+        payload instead of being re-run, and no new event follows: route the
+        ack through the event path, so the record (pool or endpoint mode)
+        completes.
+        '''
+        for ack in acks or ():
+            if isinstance(ack, dict) and ack.get('duplicate'):
+                self._on_task_status(ack)      # acts on terminal acks only
 
     def _persist_endpoint_mode(self) -> None:
         '''Rewrite the endpoint-mode ledger (task_id → endpoint) atomically.'''

@@ -469,9 +469,10 @@ def test_class_pool_routes_by_attribute(harness, tmp_path):
                       ).status_code == 200
     assert fed.wait(lambda: len(_FakeRhapsody.received) == 2)
 
+    # the pilot-side uid is namespaced by the owning session
     landed = {td['uid']: ep for ep, td in _FakeRhapsody.received}
-    assert landed['t.x'] == px.child_endpoint_name
-    assert landed['t.y'] == py.child_endpoint_name
+    assert landed[fed.ps.tasks['t.x'].rhapsody_uid] == px.child_endpoint_name
+    assert landed[fed.ps.tasks['t.y'].rhapsody_uid] == py.child_endpoint_name
     assert fed.ps.tasks['t.x'].member_id == 'm_x'
     assert fed.ps.tasks['t.y'].member_id == 'm_y'
 
@@ -585,7 +586,8 @@ def test_inputs_reach_a_non_shared_member(harness, tmp_path):
     assert _FakeStaging.puts == [
         (px.child_endpoint_name, str(remote / 't.1' / 'md.json'), 7)]
     # the put happened before the task was forwarded
-    assert _FakeRhapsody.received[0][1]['uid'] == 't.1'
+    assert _FakeRhapsody.received[0][1]['uid'] == task.rhapsody_uid
+    assert task.rhapsody_uid.startswith('t.1.')
     # nothing created on the broker host under the member's scratch
     assert not remote.exists()
 

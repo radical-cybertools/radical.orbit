@@ -184,6 +184,9 @@ class TaskRecord:
     # Times a pilot loss re-queued this task; capped by the pool policy's
     # ``max_requeues``.
     requeues     : int         = 0
+    # Re-executions after FAILED/CANCELED; part of the pilot-side rhapsody
+    # uid from 1 on (the pilot deduplicates by uid).
+    attempt      : int         = 0
     # Files the dispatcher actually holds for this task under
     # ``<state_dir>/inputs/<task_id>/`` (submitted as ``inputs_b64``).  NOT
     # ``inputs``, which keeps its client-declared meaning -- the names a
