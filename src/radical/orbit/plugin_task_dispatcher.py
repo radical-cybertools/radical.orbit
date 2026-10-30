@@ -56,8 +56,9 @@ from .plugin_session_base               import PluginSession
 from .plugin_rhapsody                   import (
     RhapsodyClient, RhapsodySession, NOTIFY_BATCH_SIZE,
     _payload_size, _resolve_notify_window, _resolve_frame_cap, BUDGET_RATIO,
-    _submit_batches, PartialSubmitError,
+    _submit_batches, PartialSubmitError, SUBMIT_REFUSED_STATUS,
 )
+from .protocol                          import RequestNotSent
 from .runtime_client                    import PayloadTooLarge, max_body_of
 from .task_dispatcher_config            import (
     PoolConfig, PoolMember, PilotSize, PoolConfigError,
@@ -165,6 +166,15 @@ _MAX_INPUTS_BYTES = 8 * 1024 * 1024      # per submit
 # purely to create its cwd there: the staging plugin offers put/get/list
 # and no mkdir, and one zero-byte put is cheaper than a new route.
 _CWD_MARKER = '.orbit-cwd'
+
+# Endpoint-mode submit with an unknown outcome (the pilot may have taken
+# the task): the 504 carries this header, valued ``unknown``, so a caller
+# can tell it from a plain gateway/runtime timeout.  The task stays mapped
+# until it is settled -- by its terminal event, by a get/cancel the target
+# answers (404: never taken, the task is failed), or by a probe once it has
+# been unsettled for ``_UNCERTAIN_TTL`` seconds.
+SUBMIT_OUTCOME_HEADER = 'X-Orbit-Submit-Outcome'
+_UNCERTAIN_TTL        = 600.0
 
 
 def child_endpoint_name(pool: str, member_id: str | None, pid: str) -> str:
@@ -1059,6 +1069,10 @@ class PluginTaskDispatcher(Plugin):
         self._endpoint_mode_path = self._state_root / 'endpoint_mode.json'
         self._endpoint_mode_tasks: dict[str, str] = dict(
             read_json(self._endpoint_mode_path, default={}) or {})
+        # task_id → when its submit outcome became unknown (in memory only;
+        # see ``_settle_uncertain``).
+        self._endpoint_mode_uncertain: dict[str, float] = {}
+        self._uncertain_probes: set = set()
 
         # rhapsody-task-uid → (owning_sid, pool_name, task_id) so the event tap
         # can find the right TaskRecord when a pilot reports completion.
@@ -2002,6 +2016,8 @@ class PluginTaskDispatcher(Plugin):
             'cwd'       : cwd,
             'task_backend_specific_kwargs': {'cwd': cwd},
         }
+        self._sweep_uncertain()
+
         # map before submitting, as in pool mode: the task can finish before
         # the threaded submit call returns
         self._endpoint_mode_tasks[task_id] = target_endpoint
@@ -2013,23 +2029,29 @@ class PluginTaskDispatcher(Plugin):
                           self.instance_name, target_endpoint, e)
             if isinstance(e, PartialSubmitError) and e.uncertain:
                 # The endpoint may run the task: keep it mapped so its
-                # events stay routable, and tell the caller the outcome is
-                # unknown -- a blind resubmit could run it twice.
+                # events stay routable (bounded: see _settle_uncertain),
+                # and tell the caller the outcome is unknown -- a blind
+                # resubmit could run it twice.
+                self._endpoint_mode_uncertain[task_id] = time.time()
                 raise HTTPException(
                     status_code=504,
                     detail=f'rhapsody submit outcome unknown on '
                            f'{target_endpoint}: task {task_id!r} may be '
                            f'running; check its status before '
-                           f'resubmitting ({e})') from e
+                           f'resubmitting ({e})',
+                    headers={SUBMIT_OUTCOME_HEADER: 'unknown'}) from e
             if self._endpoint_mode_tasks.pop(task_id, None):
                 self._persist_endpoint_mode()
-            if isinstance(e, PayloadTooLarge):
-                # the task itself is too large: the caller's error, not
-                # the pilot's
-                raise HTTPException(status_code=413, detail=str(e)) from e
+            if isinstance(e.__cause__, RequestNotSent):
+                # never left the broker: transient, safe to retry
+                raise HTTPException(
+                    status_code=503,
+                    detail=f'rhapsody submit not sent to '
+                           f'{target_endpoint}: {e}',
+                    headers={'Retry-After': '1'}) from e
             status = getattr(e, 'status_code', None)
-            if status in (400, 413, 422):
-                # the endpoint refused the task as invalid
+            if status in SUBMIT_REFUSED_STATUS:
+                # the endpoint (or the task's size) refused it
                 raise HTTPException(
                     status_code=status,
                     detail=f'rhapsody submit refused on '
@@ -2167,10 +2189,12 @@ class PluginTaskDispatcher(Plugin):
             try:
                 info = await asyncio.to_thread(rh.get_task, task_id)
             except Exception as e:
+                self._settle_on_error(task_id, endpoint_name, e)
                 raise HTTPException(
                     status_code=502,
                     detail=f'rhapsody get_task failed on '
                            f'{endpoint_name}: {e}') from e
+            self._settle_uncertain(task_id, taken=True)
             return {'task_id': task_id, 'endpoint': endpoint_name,
                     'result': info}
 
@@ -2198,10 +2222,12 @@ class PluginTaskDispatcher(Plugin):
             try:
                 info = await asyncio.to_thread(rh.cancel_task, task_id)
             except Exception as e:
+                self._settle_on_error(task_id, endpoint_name, e)
                 raise HTTPException(
                     status_code=502,
                     detail=f'rhapsody cancel_task failed on '
                            f'{endpoint_name}: {e}') from e
+            self._settle_uncertain(task_id, taken=True)
             return {'task_id': task_id, 'endpoint': endpoint_name,
                     'result': info}
 
@@ -3313,6 +3339,9 @@ class PluginTaskDispatcher(Plugin):
                 too_big = set(e.uids)
                 if not too_big:
                     raise
+                log.warning('[%s] %d of %d claimed task(s) too large for '
+                            'a frame, failed; submitting the rest: %s',
+                            self.instance_name, len(too_big), len(fwds), e)
                 for task, fwd in fwds:
                     if fwd['uid'] in too_big:
                         self._fail_unsent(pool_state, task, fwd,
@@ -3323,8 +3352,6 @@ class PluginTaskDispatcher(Plugin):
                                             [f for _, f in fwds])
             self._mark_dirty(pool_state)
         except Exception as e:
-            log.exception('[%s] rhapsody submit failed for %d task(s): %s',
-                          self.instance_name, len(fwds), e)
             # A partial submit: accepted batches run on the pilot, and an
             # uncertain one (timeout, 5xx) may; those tasks keep their
             # mapping.  Only the rejected / never-sent ones fail.
@@ -3337,9 +3364,12 @@ class PluginTaskDispatcher(Plugin):
                                 self.instance_name, len(e.uncertain), e)
                 if kept:
                     self._mark_dirty(pool_state)
-            for task, fwd in fwds:
-                if fwd['uid'] in kept:
-                    continue
+            failed = [(t, f) for t, f in fwds if f['uid'] not in kept]
+            log.exception('[%s] rhapsody submit failed: %d of %d submitted '
+                          'task(s) failed (%d claimed): %s',
+                          self.instance_name, len(failed), len(fwds),
+                          len(tasks), e)
+            for task, fwd in failed:
                 self._fail_unsent(pool_state, task, fwd,
                                   f'rhapsody submit error: {e}')
 
@@ -3399,6 +3429,7 @@ class PluginTaskDispatcher(Plugin):
         # plugin='task_dispatcher' still see the event.
         if uid in self._endpoint_mode_tasks:
             endpoint_name = self._endpoint_mode_tasks.pop(uid)
+            self._endpoint_mode_uncertain.pop(uid, None)
             self._persist_endpoint_mode()
             self._dispatch_notify('task_status', {
                 'task_id'  : uid,
@@ -3614,6 +3645,69 @@ class PluginTaskDispatcher(Plugin):
         return self._task_dict(task)
 
     # -- helpers -------------------------------------------------------
+
+    def _settle_uncertain(self, task_id: str, taken: bool) -> None:
+        '''Resolve an endpoint-mode task whose submit outcome was unknown.
+
+        *taken*: the target knows the task, so it is an ordinary mapped
+        task from now on.  Otherwise it never reached the target: unmap it
+        and report it FAILED, so neither the mapping nor a waiter lingers.
+        '''
+        if self._endpoint_mode_uncertain.pop(task_id, None) is None or taken:
+            return
+        endpoint_name = self._endpoint_mode_tasks.pop(task_id, None)
+        self._persist_endpoint_mode()
+        log.warning('[%s] endpoint-mode task %s never reached %s: failed',
+                    self.instance_name, task_id, endpoint_name)
+        self._dispatch_notify('task_status', {
+            'task_id'  : task_id,
+            'endpoint' : endpoint_name,
+            'state'    : TASK_FAILED,
+            'exit_code': None,
+            'error'    : 'rhapsody submit outcome was unknown and the '
+                         'endpoint does not know the task',
+        })
+
+    def _settle_on_error(self, task_id: str, endpoint_name: str,
+                         exc: BaseException) -> None:
+        '''A get/cancel the target answered 404 settles an unknown submit
+        outcome as "never taken" and answers 404 itself.'''
+        if task_id in self._endpoint_mode_uncertain \
+                and getattr(exc, 'status_code', None) == 404:
+            self._settle_uncertain(task_id, taken=False)
+            raise HTTPException(
+                status_code=404,
+                detail=f'task {task_id!r} never reached {endpoint_name} '
+                       f'(its submit outcome was unknown): marked FAILED'
+            ) from exc
+
+    def _sweep_uncertain(self) -> None:
+        '''Probe endpoint-mode tasks unsettled for ``_UNCERTAIN_TTL``.'''
+        now = time.time()
+        for task_id, since in list(self._endpoint_mode_uncertain.items()):
+            if now - since >= _UNCERTAIN_TTL:
+                self._endpoint_mode_uncertain[task_id] = now   # probe once
+                # keep a strong ref: the loop holds tasks weakly
+                fut = asyncio.ensure_future(self._probe_uncertain(task_id))
+                self._uncertain_probes.add(fut)
+                fut.add_done_callback(self._uncertain_probes.discard)
+
+    async def _probe_uncertain(self, task_id: str) -> None:
+        '''Ask the target about an unsettled task and settle it.'''
+        endpoint_name = self._endpoint_mode_tasks.get(task_id)
+        if endpoint_name is None:
+            self._endpoint_mode_uncertain.pop(task_id, None)
+            return
+        rh = await self._get_rhapsody_client(endpoint_name)
+        if rh is None:
+            return                              # retried after the next TTL
+        try:
+            await asyncio.to_thread(rh.get_task, task_id)
+        except Exception as e:
+            if getattr(e, 'status_code', None) == 404:
+                self._settle_uncertain(task_id, taken=False)
+            return                              # else: retried later
+        self._settle_uncertain(task_id, taken=True)
 
     def _persist_endpoint_mode(self) -> None:
         '''Rewrite the endpoint-mode ledger (task_id → endpoint) atomically.'''

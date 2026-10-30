@@ -398,6 +398,68 @@ async def test_submit_validates_whole_request_before_any_chunk():
     assert session._tasks == {}
 
 
+@pytest.mark.asyncio
+async def test_submit_prepare_exception_is_400_nothing_submitted():
+    """Any error preparing a task (unpicklable blob, bad dict) is a refusal:
+    400, not a 500 the client would have to treat as uncertain."""
+    _, plugin, client = _make_plugin()
+    sid = _register(client, plugin)
+    session = plugin._sessions[sid]
+    session._rh_session = MagicMock()
+    session._rh_session.submit_tasks = AsyncMock()
+
+    def _bad(chunk):
+        raise ModuleNotFoundError("No module named 'gone'")
+
+    session._prepare_batch = _bad
+    resp = client.post(f"{plugin.namespace}/submit/{sid}", json={
+        "tasks": [{"executable": "/bin/true", "uid": "task.x"}]})
+    assert resp.status_code == 400
+    assert "No module named 'gone'" in resp.json()['detail']
+    session._rh_session.submit_tasks.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_submit_failure_mid_submit_is_500_and_watches_submitted():
+    """A backend failure after a chunk was submitted is a 500 (uncertain
+    for the client, never a refusal status), and the submitted chunk is
+    recorded and watched, so its tasks still report."""
+    _, plugin, client = _make_plugin()
+    sid = _register(client, plugin)
+    session = plugin._sessions[sid]
+    session._rh_session = MagicMock()
+    session._rh_session.submit_tasks = AsyncMock(
+        side_effect=[None, ValueError('backend full')])
+    session._watch_batch = AsyncMock()
+
+    tasks = [{"executable": "/bin/true", "uid": f"task.{i:06d}"}
+             for i in range(4097)]
+    resp = client.post(f"{plugin.namespace}/submit/{sid}",
+                       json={"tasks": tasks})
+    assert resp.status_code == 500
+    assert 'after 4096 of 4097' in resp.json()['detail']
+    assert len(session._tasks) == 4096
+    session._watch_batch.assert_called_once()
+    assert len(session._watch_batch.call_args.args[0]) == 4096
+
+
+@pytest.mark.asyncio
+async def test_submit_closed_before_first_chunk_stays_410():
+    _, plugin, client = _make_plugin()
+    sid = _register(client, plugin)
+    session = plugin._sessions[sid]
+    session._rh_session = MagicMock()
+
+    def _prepare(chunk):                     # torn down while preparing
+        session._rh_session = None
+        return []
+
+    session._prepare_batch = _prepare
+    resp = client.post(f"{plugin.namespace}/submit/{sid}", json={
+        "tasks": [{"executable": "/bin/true", "uid": "task.x"}]})
+    assert resp.status_code == 410
+
+
 # ---------------------------------------------------------------------------
 # Wait tasks
 # ---------------------------------------------------------------------------
@@ -2890,14 +2952,19 @@ def test_submit_partial_ambiguous_batch_is_uncertain(kind):
 
 
 @pytest.mark.parametrize('status,fate', [(400, 'rejected'),
+                                         (404, 'rejected'),
+                                         (409, 'rejected'),
+                                         (410, 'rejected'),
                                          (413, 'rejected'),
                                          (422, 'rejected'),
-                                         (404, 'uncertain'),
-                                         (409, 'uncertain'),
-                                         (410, 'uncertain')])
-def test_submit_partial_only_validation_4xx_rejects(status, fate):
-    """400/413/422 are refused before the endpoint submits any task of the
-    request; other 4xx (e.g. 410 'session is closing') can come mid-submit."""
+                                         (418, 'uncertain'),
+                                         (500, 'uncertain')])
+def test_submit_partial_only_refusal_statuses_reject(status, fate):
+    """The endpoint answers SUBMIT_REFUSED_STATUS only before it submits any
+    task of the request; a failure once submission started is a 500, and an
+    unexpected status is not trusted to mean 'nothing taken'."""
+    from radical.orbit import plugin_rhapsody as prh
+    assert (status in prh.SUBMIT_REFUSED_STATUS) == (fate == 'rejected')
     tasks       = _tasks(200, pad=100)
     http        = _RecordingHTTP(max_body=8 * 1024, fail_at=1,
                                  fail_status=status)
@@ -2911,6 +2978,45 @@ def test_submit_partial_only_validation_4xx_rejects(status, fate):
     else:
         assert err.uncertain == second
         assert set(second) <= client._submitted
+
+
+def test_submit_withdraws_only_uids_this_call_added():
+    """A uid an earlier submit registered stays waitable when a later
+    submit that repeats it is rejected."""
+    tasks = _tasks(200, pad=100)
+    http  = _RecordingHTTP(max_body=8 * 1024, fail_at=1, fail_status=400)
+    client = _rh_client(http)
+    earlier = tasks[-1]['uid']
+    client._submitted.add(earlier)
+    from radical.orbit import plugin_rhapsody as prh
+    with pytest.raises(prh.PartialSubmitError) as exc:
+        client.submit_tasks(tasks)
+    assert earlier in exc.value.rejected
+    assert earlier in client._submitted
+    assert not set(exc.value.rejected) - {earlier} & client._submitted
+
+
+def test_submit_registers_uids_before_packing(monkeypatch):
+    """uids are waitable before packing starts; on a 413 the ones this call
+    added are withdrawn again, an earlier one stays."""
+    from radical.orbit import plugin_rhapsody as prh
+    from radical.orbit.runtime_client import PayloadTooLarge
+    http    = _RecordingHTTP(max_body=8 * 1024)
+    client  = _rh_client(http)
+    tasks   = _tasks(3) + _tasks(1, pad=9000, prefix='big')
+    client._submitted.add('t.00000')               # an earlier submit's
+    seen    = []
+    real    = prh.pack_batches
+
+    def _spy(*a, **kw):
+        seen.append(set(client._submitted))
+        return real(*a, **kw)
+
+    monkeypatch.setattr(prh, 'pack_batches', _spy)
+    with pytest.raises(PayloadTooLarge):
+        client.submit_tasks(tasks)
+    assert seen == [{td['uid'] for td in tasks}]
+    assert client._submitted == {'t.00000'}
 
 
 def test_submit_partial_request_not_sent_is_rejected():

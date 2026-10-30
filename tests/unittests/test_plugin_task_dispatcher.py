@@ -999,10 +999,80 @@ class TestEndpointMode:
         plugin, r = self._endpoint_mode_submit(tmp_path, PartialSubmitError(
             'timed out', uncertain=['t.1']))
         assert r.status_code == 504, r.text
+        assert r.headers['x-orbit-submit-outcome'] == 'unknown'
         assert 'outcome unknown' in r.json()['detail']
         assert 'before resubmitting' in r.json()['detail']
         # the task may run: its events must stay routable
         assert plugin._endpoint_mode_tasks.get('t.1') == 'ep'
+        assert 't.1' in plugin._endpoint_mode_uncertain
+
+    def _uncertain_plugin(self, tmp_path):
+        from radical.orbit.plugin_rhapsody import PartialSubmitError
+        plugin, _ = self._endpoint_mode_submit(tmp_path, PartialSubmitError(
+            'timed out', uncertain=['t.1']))
+        notified = []
+        plugin._dispatch_notify = lambda t, d: notified.append((t, d))
+        return plugin, notified
+
+    def test_endpoint_mode_uncertain_settled_by_get_task_404(self, tmp_path):
+        plugin, notified = self._uncertain_plugin(tmp_path)
+        gone = RuntimeError('HTTP 404 — unknown task')
+        gone.status_code = 404
+        rh_mock = MagicMock()
+        rh_mock.get_task = MagicMock(side_effect=gone)
+        client = TestClient(plugin._app)
+        with patch.object(plugin, '_get_rhapsody_client',
+                          new=AsyncMock(return_value=rh_mock)):
+            r = client.get(f'{plugin.namespace}/task/A/t.1')
+        assert r.status_code == 404, r.text
+        assert 'marked FAILED' in r.json()['detail']
+        assert 't.1' not in plugin._endpoint_mode_tasks
+        assert 't.1' not in plugin._endpoint_mode_uncertain
+        assert notified[0][1]['state'] == TASK_FAILED
+
+    def test_endpoint_mode_uncertain_settled_taken_by_get_task(self,
+                                                                tmp_path):
+        plugin, notified = self._uncertain_plugin(tmp_path)
+        rh_mock = MagicMock()
+        rh_mock.get_task = MagicMock(return_value={'uid': 't.1',
+                                                   'state': 'RUNNING'})
+        client = TestClient(plugin._app)
+        with patch.object(plugin, '_get_rhapsody_client',
+                          new=AsyncMock(return_value=rh_mock)):
+            r = client.get(f'{plugin.namespace}/task/A/t.1')
+        assert r.status_code == 200, r.text
+        assert plugin._endpoint_mode_tasks.get('t.1') == 'ep'
+        assert 't.1' not in plugin._endpoint_mode_uncertain
+        assert notified == []
+
+    def test_endpoint_mode_uncertain_expires_via_probe(self, tmp_path):
+        from radical.orbit import plugin_task_dispatcher as ptd
+        plugin, notified = self._uncertain_plugin(tmp_path)
+        plugin._endpoint_mode_uncertain['t.1'] -= ptd._UNCERTAIN_TTL + 1
+        gone = RuntimeError('HTTP 404 — unknown task')
+        gone.status_code = 404
+        rh_mock = MagicMock()
+        rh_mock.get_task = MagicMock(side_effect=gone)
+
+        async def drive():
+            with patch.object(plugin, '_get_rhapsody_client',
+                              new=AsyncMock(return_value=rh_mock)):
+                plugin._sweep_uncertain()
+                await asyncio.gather(*plugin._uncertain_probes)
+
+        asyncio.run(drive())
+        assert 't.1' not in plugin._endpoint_mode_tasks
+        assert notified[0][1]['state'] == TASK_FAILED
+
+    def test_endpoint_mode_request_not_sent_is_503_retry(self, tmp_path):
+        from radical.orbit.plugin_rhapsody import PartialSubmitError
+        from radical.orbit.protocol import RequestNotSent
+        err = PartialSubmitError('not sent', rejected=['t.1'])
+        err.__cause__ = RequestNotSent('endpoint unknown')
+        plugin, r = self._endpoint_mode_submit(tmp_path, err)
+        assert r.status_code == 503, r.text
+        assert r.headers['retry-after'] == '1'
+        assert 't.1' not in plugin._endpoint_mode_tasks
 
     def test_endpoint_mode_rejected_submit_unmaps(self, tmp_path):
         from radical.orbit.plugin_rhapsody import PartialSubmitError

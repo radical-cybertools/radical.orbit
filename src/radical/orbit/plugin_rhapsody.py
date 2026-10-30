@@ -25,7 +25,7 @@ from .plugin_session_base import PluginSession
 from .plugin_base import Plugin, DEFAULT_SID
 from .client import PluginClient
 from .protocol import FRAME_CAP, RequestNotSent
-from .runtime_client import max_body_of, pack_batches
+from .runtime_client import PayloadTooLarge, max_body_of, pack_batches
 
 log = logging.getLogger("radical.orbit")
 
@@ -235,12 +235,12 @@ class PartialSubmitError(RuntimeError):
     ``accepted``  the endpoint acknowledged these; they run.
     ``uncertain`` the failing batch, when the endpoint may have taken some
                   or all of it: a timeout or transport error after the
-                  request was sent, a 5xx, a 4xx other than a validation
-                  refusal (e.g. 404/409/410, possible mid-submit), or an
-                  unreadable ack.
+                  request was sent, a 5xx (a failure once submission
+                  started), any other unexpected status, or an unreadable
+                  ack.
     ``rejected``  the failing batch when it provably was not taken (a
-                  validation refusal -- 400/413/422, raised by the endpoint
-                  before it submits any task of the request -- or a
+                  status in ``SUBMIT_REFUSED_STATUS``, answered before the
+                  endpoint submits any task of the request, or a
                   :class:`~radical.orbit.protocol.RequestNotSent`), plus
                   every batch never sent.
 
@@ -263,9 +263,13 @@ class PartialSubmitError(RuntimeError):
                              self.status_code, self.uncertain, self.rejected))
 
 
-# Submit statuses that mean the endpoint took no task of the request: it
-# validates the whole request before submitting any of it.
-_REFUSED_STATUS = (400, 413, 422)
+# Submit statuses that mean the endpoint took no task of the request.  The
+# session answers these only before the first chunk reaches the backend
+# (it validates the whole request first: 400; session gates: 404 unknown,
+# 409 initializing, 410 closing/expired); the transport answers 413 and
+# FastAPI 422 before the handler runs.  A failure once submission has
+# started answers 500 (see ``RhapsodySession.submit_tasks``).
+SUBMIT_REFUSED_STATUS = (400, 404, 409, 410, 413, 422)
 
 
 def _error_status(exc: BaseException, status: int | None) -> int | None:
@@ -279,22 +283,18 @@ def _error_status(exc: BaseException, status: int | None) -> int | None:
     return code
 
 
-def _submit_batches(client, url: str, task_dicts: list[dict],
-                    on_packed=None) -> list[dict]:
+def _submit_batches(client, url: str, task_dicts: list[dict]) -> list[dict]:
     """Post *task_dicts* to *url* in frame-bounded msgpack batches.
 
     Every task is packed and checked before the first send, so a task that
     no frame carries fails with a 413 (:class:`PayloadTooLarge`) and nothing
-    is submitted.  *on_packed* runs after that check, before the first
-    send.  Batches go out sequentially; any failure while sending raises
-    :class:`PartialSubmitError`, which sorts every uid into accepted,
-    uncertain or rejected.
+    is submitted.  Batches go out sequentially; any failure while sending
+    raises :class:`PartialSubmitError`, which sorts every uid into
+    accepted, uncertain or rejected.
     """
     http    = client._http
     batches = pack_batches(task_dicts, _submit_budget(http),
                            max_body_of(http))
-    if on_packed is not None:
-        on_packed()
     results:  list[dict] = []
     accepted: list[str]  = []
     for batch, body in batches:
@@ -310,7 +310,7 @@ def _submit_batches(client, url: str, task_dicts: list[dict],
             # only a validation refusal or a provably unsent request means
             # nothing of this batch was taken; anything else may have been
             refused   = isinstance(e, RequestNotSent) \
-                        or status in _REFUSED_STATUS
+                        or status in SUBMIT_REFUSED_STATUS
             unsent    = [str(td['uid'])
                          for td in task_dicts[len(accepted) + len(uids):]]
             uncertain = [] if refused else uids
@@ -700,10 +700,16 @@ class RhapsodySession(PluginSession):
         Large submissions are processed in chunks: the CPU-bound
         deserialization of every chunk is offloaded to a worker thread
         first, and only once the whole request has been prepared are the
-        chunks handed to the backend.  So a validation error (HTTP 400,
-        e.g. an unresolvable function) means no task of the request was
-        submitted.  Both the ``to_thread`` offload and the ``await`` on the
-        backend keep the work loop responsive.
+        chunks handed to the backend.  Both the ``to_thread`` offload and
+        the ``await`` on the backend keep the work loop responsive.
+
+        Error contract (the client's ``SUBMIT_REFUSED_STATUS``): every
+        refusal raised before the first chunk reaches the backend -- an
+        invalid task (400, whatever the preparation raised), and the session
+        gates (404 unknown, 409 initializing, 410 closing/expired) -- means
+        no task of the request was taken.  Once submission has started, any
+        failure answers 500 naming how many tasks were submitted; those
+        tasks are recorded and watched, so they still report.
 
         Returns:
             list[dict]: Minimal ack dicts ``{uid, state}``.
@@ -719,26 +725,47 @@ class RhapsodySession(PluginSession):
 
         # validate the whole request before submitting any of it
         prepared = []
-        for i in range(0, len(task_dicts), _CHUNK):
-            chunk = task_dicts[i:i + _CHUNK]
-            prepared.append(
-                await asyncio.to_thread(self._prepare_batch, chunk))
+        try:
+            for i in range(0, len(task_dicts), _CHUNK):
+                chunk = task_dicts[i:i + _CHUNK]
+                prepared.append(
+                    await asyncio.to_thread(self._prepare_batch, chunk))
+        except HTTPException:
+            raise
+        except Exception as e:
+            # nothing was submitted: an invalid task, not a server fault
+            raise HTTPException(status_code=400,
+                                detail=f"invalid task: {e}") from e
 
-        for tasks in prepared:
-            if self._rh_session is None:     # torn down after a drain timeout
-                raise HTTPException(status_code=410,
-                                    detail="session is closing")
-            await self._rh_session.submit_tasks(tasks)
-            for t in tasks:
-                uid_str = str(t.uid)
-                self._tasks[uid_str] = t
-                results.append({"uid": uid_str,
-                                "state": str(t.get("state"))})
-            all_tasks.extend(tasks)
-
-        # Start a single batch watcher instead of per-task watchers
-        if self._plugin and all_tasks:
-            asyncio.ensure_future(self._watch_batch(all_tasks))
+        try:
+            for tasks in prepared:
+                if self._rh_session is None:   # torn down after drain timeout
+                    raise HTTPException(status_code=410,
+                                        detail="session is closing")
+                await self._rh_session.submit_tasks(tasks)
+                for t in tasks:
+                    uid_str = str(t.uid)
+                    self._tasks[uid_str] = t
+                    results.append({"uid": uid_str,
+                                    "state": str(t.get("state"))})
+                all_tasks.extend(tasks)
+        except Exception as e:
+            if not all_tasks and isinstance(e, HTTPException) \
+                    and e.status_code == 410:
+                raise                           # nothing taken: a refusal
+            # Part of the request may be in the backend: 500, never a
+            # refusal status, so the client treats the batch as uncertain.
+            log.exception("[%s] submit failed after %d of %d task(s)",
+                          self._sid, len(all_tasks), batch_n)
+            raise HTTPException(
+                status_code=500,
+                detail=f"submit failed after {len(all_tasks)} of {batch_n} "
+                       f"task(s) were submitted: {e}") from e
+        finally:
+            # Start a single batch watcher instead of per-task watchers --
+            # also for the chunks submitted before a failure.
+            if self._plugin and all_tasks:
+                asyncio.ensure_future(self._watch_batch(all_tasks))
 
         if self._prof:
             self._prof.prof('rh_submit_done', uid=bid, msg=str(batch_n))
@@ -1702,21 +1729,29 @@ class RhapsodyClient(PluginClient):
                 td['uid'] = f"task.{uuid.uuid4().hex[:8]}"
 
         # Remember what we submitted so wait_tasks() can validate UIDs --
-        # all of them before the first send, so a concurrent wait on a
+        # all of them before packing and sending, so a concurrent wait on a
         # client-assigned uid is valid at once.  A rejected (never taken)
         # uid is withdrawn on failure and its waiters woken, so they raise
-        # instead of hanging; an uncertain one stays waitable.
-        def _register():
+        # instead of hanging; an uncertain one stays waitable.  Only uids
+        # this call added are withdrawn: one an earlier submit registered
+        # stays.
+        with self._cond:
+            added = {str(td['uid']) for td in task_dicts} - self._submitted
+            self._submitted.update(added)
+
+        def _withdraw(uids):
             with self._cond:
-                self._submitted.update(str(td['uid']) for td in task_dicts)
+                self._submitted.difference_update(added.intersection(uids))
+                self._cond.notify_all()
 
         url = self._url(ROUTE_SUBMIT.format(sid=self.sid))
         try:
-            return _submit_batches(self, url, task_dicts, on_packed=_register)
+            return _submit_batches(self, url, task_dicts)
+        except PayloadTooLarge:
+            _withdraw(added)                    # nothing was sent
+            raise
         except PartialSubmitError as e:
-            with self._cond:
-                self._submitted.difference_update(e.rejected)
-                self._cond.notify_all()
+            _withdraw(e.rejected)
             raise
 
     def wait_tasks(self, uids: list[str],
