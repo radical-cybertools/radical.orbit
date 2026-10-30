@@ -1811,8 +1811,9 @@ def test_notify_window_invalid_falls_back(monkeypatch, orbit_caplog, raw):
     assert prh.ENV_NOTIFY_WINDOW in orbit_caplog.text
 
 
-def test_notify_window_zero_flushes_immediately(monkeypatch):
-    '''A window of 0 delivers each completion inline — no delayed flush.'''
+def test_notify_window_zero_flushes_without_delay(monkeypatch):
+    '''A window of 0 schedules one flush without delay (it runs on the next
+    loop iteration) instead of flushing every completion inline.'''
     from radical.orbit import plugin_rhapsody as prh
 
     monkeypatch.setenv(prh.ENV_NOTIFY_WINDOW, '0')
@@ -1823,13 +1824,129 @@ def test_notify_window_zero_flushes_immediately(monkeypatch):
     assert session._notify_window == 0
 
     plugin._dispatch_notify = MagicMock()
-    payload = {'uid': 'task.nw001', 'state': 'DONE'}
-    session._queue_notification(payload)
+    with patch.object(session, '_schedule_flush') as sched:
+        session._queue_notification({'uid': 'task.nw001', 'state': 'DONE'})
+        session._queue_notification({'uid': 'task.nw003', 'state': 'DONE'})
 
-    plugin._dispatch_notify.assert_called_once_with(
-        'task_status', {**payload, 'sid': sid})
-    assert session._notify_buf == []
-    assert not session._flush_scheduled
+    sched.assert_called_once_with(delay=0)
+    plugin._dispatch_notify.assert_not_called()
+    assert len(session._notify_buf) == 2
+    assert session._flush_scheduled
+
+
+def _watched_session(sid, window=0):
+    """A plugin-attached session whose task futures the test resolves."""
+    session = RhapsodySession(sid)
+    session._plugin         = MagicMock()
+    session._notify_window  = window
+    session._rh_session     = MagicMock()
+    futs: dict = {}
+    session._rh_session._state_manager.get_wait_future = \
+        lambda uid, t: futs.setdefault(
+            uid, asyncio.get_running_loop().create_future())
+    return session, futs
+
+
+def _sent_frames(session):
+    """The task lists of every notification frame the session sent."""
+    frames = []
+    for call in session._plugin._dispatch_notify.call_args_list:
+        topic, data = call.args
+        frames.append(data['tasks'] if topic == 'task_status_batch'
+                      else [data])
+    return frames
+
+
+async def _ticks(n=3):
+    for _ in range(n):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_window_zero_coalesces_completions_of_one_tick():
+    '''With window 0, completions drained in one watcher pass go out in one
+    batch frame; a lone completion still flushes without a timer.'''
+    session, futs = _watched_session('test.nw0.tick')
+    tasks   = [_done_task(f'task.c{i:03d}', i) for i in range(20)]
+    watcher = asyncio.ensure_future(session._watch_batch(tasks))
+    await _ticks(1)
+    for fut in futs.values():
+        fut.set_result(None)
+    await asyncio.wait_for(watcher, 5)
+    await _ticks()
+
+    frames = _sent_frames(session)
+    assert len(frames) == 1
+    assert sorted(t['uid'] for t in frames[0]) == [t.uid for t in tasks]
+
+    session, futs = _watched_session('test.nw0.lone')
+    watcher = asyncio.ensure_future(
+        session._watch_batch([_done_task('task.lone', 1)]))
+    await _ticks(1)
+    futs['task.lone'].set_result(None)
+    await asyncio.wait_for(watcher, 5)
+    await _ticks()                         # no sleep: no timer involved
+    session._plugin._dispatch_notify.assert_called_once()
+    assert session._plugin._dispatch_notify.call_args.args[0] \
+        == 'task_status'
+
+
+@pytest.mark.asyncio
+async def test_window_zero_completions_across_ticks_all_delivered():
+    '''Completions spread over loop iterations go out in several frames,
+    each exactly once.'''
+    session, futs = _watched_session('test.nw0.ticks')
+    tasks   = [_done_task(f'task.x{i:03d}', i) for i in range(10)]
+    watcher = asyncio.ensure_future(session._watch_batch(tasks))
+    await _ticks(1)
+    for i, fut in enumerate(futs.values()):
+        fut.set_result(None)
+        if i % 3 == 2:
+            await _ticks()
+    await asyncio.wait_for(watcher, 5)
+    await _ticks()
+
+    frames = _sent_frames(session)
+    assert len(frames) > 1
+    assert sorted(t['uid'] for f in frames for t in f) \
+        == sorted(t.uid for t in tasks)
+
+
+@pytest.mark.asyncio
+async def test_running_state_changes_are_batched():
+    '''RUNNING changes go through the batch buffer: a burst is one frame,
+    not one frame per task — also when reported from a backend thread.'''
+    session, _ = _watched_session('test.running')
+    session._notified_states = {}
+    session._notified_lock   = threading.Lock()
+
+    for i in range(50):
+        session._on_task_state_change({'uid': f'task.r{i}'}, 'RUNNING')
+    session._plugin._dispatch_notify.assert_not_called()
+    await _ticks()
+    frames = _sent_frames(session)
+    assert len(frames) == 1
+    assert len(frames[0]) == 50
+    assert {t['state'] for t in frames[0]} == {'RUNNING'}
+    # sid is stamped on the frame by notify()
+    assert session._plugin._dispatch_notify.call_args.args[1]['sid'] \
+        == 'test.running'
+
+    # from a backend thread: flushed on the plugin's loop
+    session._plugin._dispatch_notify.reset_mock()
+    session._plugin._main_loop = asyncio.get_running_loop()
+
+    def _burst():
+        for i in range(50, 100):
+            session._on_task_state_change({'uid': f'task.r{i}'}, 'RUNNING')
+
+    await asyncio.to_thread(_burst)
+    deadline = time.monotonic() + 5
+    while sum(map(len, _sent_frames(session))) < 50 \
+            and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert sorted(t['uid'] for f in _sent_frames(session) for t in f) \
+        == sorted(f'task.r{i}' for i in range(50, 100))
 
 
 def test_notify_window_defers_flush(monkeypatch):
@@ -2628,6 +2745,77 @@ def test_client_data_helpers():
 
 
 # ---------------------------------------------------------------------------
+# task_states route — frame-bounded state fetch for lost notifications
+# ---------------------------------------------------------------------------
+
+def _states_session(plugin, client, tasks):
+    sid = _register(client, plugin)
+    session = plugin._sessions[sid]
+    session._rh_session = MagicMock()
+    for t in tasks:
+        session._tasks[t.uid] = t
+    return sid, session
+
+
+def test_task_states_reports_unknown_uids():
+    """Unknown uids are listed, not a 404; known ones carry the payload of
+    their terminal notification."""
+    _, plugin, client = _make_plugin()
+    sid, _ = _states_session(plugin, client, [_done_task("task.k1", 7)])
+
+    resp = client.post(f"{plugin.namespace}/task_states/{sid}",
+                       json={"uids": ["task.k1", "task.nope"]})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["unknown"]   == ["task.nope"]
+    assert body["remaining"] == []
+    assert body["tasks"]     == [{"uid": "task.k1", "state": "DONE",
+                                  "return_value": 7}]
+
+    resp = client.post(f"{plugin.namespace}/task_states/{sid}",
+                       json={"uids": "task.k1"})
+    assert resp.status_code == 400
+
+
+def test_task_states_truncates_output():
+    """Large stdout is cut like in the terminal notification."""
+    _, plugin, client = _make_plugin()
+    sid, session = _states_session(
+        plugin, client, [_output_task("task.big", "x" * 100_000, "")])
+    session._output_notify_limit = 1024
+
+    resp = client.post(f"{plugin.namespace}/task_states/{sid}",
+                       json={"uids": ["task.big"]})
+    task = resp.json()["tasks"][0]
+    assert task["stdout_truncated"] is True
+    assert len(task["stdout"]) <= 1024
+
+
+def test_task_states_splits_large_uid_lists():
+    """Payloads are packed within the frame budget; the rest comes back as
+    ``remaining`` and a follow-up call picks it up."""
+    from radical.orbit.plugin_rhapsody import _payload_size
+
+    _, plugin, client = _make_plugin()
+    tasks = [_output_task(f"task.s{i:02d}", "y" * 300, "") for i in range(20)]
+    sid, session = _states_session(plugin, client, tasks)
+    session._notify_batch_bytes = 2048
+
+    todo, seen, calls = [t.uid for t in tasks], [], 0
+    while todo:
+        resp = client.post(f"{plugin.namespace}/task_states/{sid}",
+                           json={"uids": todo})
+        body = resp.json()
+        assert sum(_payload_size(t) for t in body["tasks"]) \
+            <= session._frame_budget()
+        seen.extend(t["uid"] for t in body["tasks"])
+        todo   = body["remaining"]
+        calls += 1
+    assert calls > 1
+    assert seen == [t.uid for t in tasks]
+
+
+# ---------------------------------------------------------------------------
 # Session scoping of task notifications
 # ---------------------------------------------------------------------------
 
@@ -2723,6 +2911,1640 @@ def test_two_sessions_with_colliding_uids_get_their_own_results():
     assert clients[0]._completed["task.000001"]["return_value"] == "from-a"
     assert clients[1]._completed["task.000001"]["return_value"] == "from-b"
 
+
+
+
+# ---------------------------------------------------------------------------
+# Client fan-out and reconcile of lost task notifications
+# ---------------------------------------------------------------------------
+
+class _FakeRuntime:
+    """Runtime stand-in: its callback registry feeds a real
+    CallbackDispatcher, the way ``EndpointRuntime._on_event`` does."""
+
+    def __init__(self, maxlen=1024):
+        from radical.orbit.runtime_support import CallbackDispatcher
+        self._cb       = CallbackDispatcher(maxlen=maxlen)
+        self.callbacks = []                     # (topic, callback)
+
+    def register_callback(self, endpoint_id=None, plugin_name=None,
+                          topic=None, callback=None):
+        self.callbacks.append((topic, callback))
+
+    def unregister_callback(self, endpoint_id=None, plugin_name=None,
+                            topic=None, callback=None):
+        self.callbacks = [(t, cb) for t, cb in self.callbacks
+                          if (t, cb) != (topic, callback)]
+
+    def deliver(self, topic, data):
+        for t, cb in list(self.callbacks):
+            if t is None or t == topic:
+                self._cb.submit(cb, 'ep', 'rhapsody', topic, data)
+
+
+class _SessionHTTP:
+    """httpx-shaped transport serving ``task_states`` from a session."""
+
+    def __init__(self, session, gate=None):
+        self.session = session
+        self.gate    = gate
+        self.threads = []                       # thread of each task_states
+
+    def post(self, url, json=None, **kwargs):
+        body = {}
+        if 'task_states' in url:
+            self.threads.append(threading.current_thread().name)
+            if self.gate is not None:
+                self.gate.wait(10)
+            try:
+                body = asyncio.run(self.session.task_states(
+                    json['uids'], json.get('terminal_only', False)))
+            except HTTPException as e:
+                return self._resp(e.status_code, {'detail': e.detail})
+        return self._resp(200, body)
+
+    def get(self, url, **kwargs):
+        uid = url.rsplit('/', 1)[-1]
+        try:
+            body = asyncio.run(self.session.get_task(uid))
+        except HTTPException as e:
+            return self._resp(e.status_code, {'detail': e.detail})
+        return self._resp(200, body)
+
+    @staticmethod
+    def _resp(status, body):
+        resp = MagicMock()
+        resp.is_error, resp.status_code = status >= 400, status
+        resp.json = MagicMock(return_value=body)
+        return resp
+
+
+def _done_session(sid, uids, tag=None):
+    session = RhapsodySession(sid)
+    session._rh_session = MagicMock()
+    session._init_ready.set()
+    for uid in uids:
+        session._tasks[uid] = _done_task(uid, f'{tag or sid}:{uid}')
+    return session
+
+
+def _reconciling_client(rt, session, idle=60.0, gate=None):
+    http   = _SessionHTTP(session, gate)
+    client = RhapsodyClient(http, '/rhapsody', broker_client=rt,
+                            endpoint_id='ep', plugin_name='rhapsody')
+    client._sid              = session.sid
+    client._reconcile_idle   = idle
+    client._reconcile_settle = 0.01
+    client._close_drain      = 0.05
+    client._start_task_listener()
+    return client, http
+
+
+def _track(client, uids):
+    """Record *uids* as submitted and acknowledged by the endpoint."""
+    with client._cond:
+        client._submitted.update(uids)
+        client._pending.update(dict.fromkeys(uids, time.monotonic()))
+
+
+def _backend_recorder(client):
+    """Register a backend-style callback (as rhapsody's
+    OrbitExecutionBackend does) and return what it receives."""
+    got = {'uids': [], 'sids': set()}
+
+    def _cb(endpoint, plugin, topic, data):
+        tasks = data.get('tasks', []) if topic == 'task_status_batch' \
+            else [data]
+        got['sids'].add(data.get('sid'))
+        got['uids'].extend(t['uid'] for t in tasks)
+
+    client.register_notification_callback(_cb, topic='task_status')
+    client.register_notification_callback(_cb, topic='task_status_batch')
+    return got
+
+
+def _until(cond, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while not cond() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return cond()
+
+
+def test_fan_out_one_runtime_callback_per_topic():
+    """The client holds the only runtime registration per task topic; the
+    backend callbacks it records run after ``_on_task_done``, in order, on
+    the same (decoded) data object."""
+    import base64
+    import threading as _threading
+
+    from radical.orbit import protocol
+    from radical.orbit.runtime import EndpointRuntime
+
+    rt = EndpointRuntime.__new__(EndpointRuntime)
+    rt._callbacks = {}
+    rt._cb_lock   = _threading.Lock()
+    rt._name      = 'test-consumer'
+    rt._emit      = MagicMock()
+    queued: list  = []
+    rt._cb        = MagicMock()
+    rt._cb.submit = lambda fn, *args: queued.append((fn, args))
+
+    client = RhapsodyClient(MagicMock(), '/rhapsody', broker_client=rt,
+                            endpoint_id='ep', plugin_name='rhapsody')
+    client._sid = 'sid-a'
+    client._start_task_listener()
+    try:
+        seen = []
+
+        def _backend_cb(endpoint, plugin, topic, data):
+            seen.append(('backend', topic, data['return_value']))
+
+        def _other_cb(endpoint, plugin, topic, data):
+            seen.append(('other', topic, data['return_value']))
+
+        for topic in ('task_status', 'task_status_batch'):
+            client.register_notification_callback(_backend_cb, topic=topic)
+        client.register_notification_callback(_other_cb, topic='task_status')
+
+        for topic in ('task_status', 'task_status_batch'):
+            assert len(rt._callbacks[('ep', 'rhapsody', topic)]) == 1
+
+        rt._on_event(protocol.Event(
+            src='ep', plugin='rhapsody', topic='task_status',
+            data={'uid': 't.1', 'state': 'DONE', 'sid': 'sid-a',
+                  'return_value': base64.b64encode(b'raw').decode(),
+                  '_return_value_encoding': 'base64'}))
+        assert len(queued) == 1                 # one queue entry per event
+        for fn, args in queued:
+            fn(*args)
+        assert seen == [('backend', 'task_status', b'raw'),
+                        ('other',   'task_status', b'raw')]
+        assert client._completed['t.1']['return_value'] == b'raw'
+
+        client.unregister_notification_callback(_other_cb,
+                                                topic='task_status')
+        assert client._fanout['task_status'] == [_backend_cb]
+    finally:
+        client._stop_reconcile()
+
+
+def test_reconcile_after_client_drop():
+    """Callback-queue overflow: the drop hook wakes the reconcile, and both
+    wait_tasks and the backend callbacks see every completion."""
+    uids    = [f'task.d{i:03d}' for i in range(50)]
+    session = _done_session('sid-drop', uids)
+    rt      = _FakeRuntime(maxlen=4)            # dispatcher not started yet
+    client, http = _reconciling_client(rt, session, idle=60.0)
+    try:
+        backend = _backend_recorder(client)
+        _track(client, uids)
+
+        for uid in uids:
+            payload = session._notification_payload(session._tasks[uid])
+            rt.deliver('task_status', {**payload, 'sid': session.sid})
+        assert rt._cb.dropped == 46
+
+        rt._cb.start()
+        done = client.wait_tasks(uids, timeout=10)
+        assert [t['state'] for t in done] == ['DONE'] * 50
+        assert [t['return_value'] for t in done] \
+            == [f'sid-drop:{u}' for u in uids]
+        assert _until(lambda: set(backend['uids']) == set(uids))
+        assert backend['sids'] == {'sid-drop'}
+        assert http.threads and set(http.threads) == {'orbit-rh-reconcile'}
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
+def test_reconcile_after_broker_drop():
+    """A broker-side drop is invisible to the client: the idle path
+    recovers it (no dispatcher drop involved)."""
+    from radical.orbit.queues import BoundedDropOldestQueue
+
+    uids    = [f'task.b{i:03d}' for i in range(50)]
+    session = _done_session('sid-broker', uids)
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, _ = _reconciling_client(rt, session, idle=0.05)
+    try:
+        backend = _backend_recorder(client)
+        _track(client, uids)
+
+        broker_q = BoundedDropOldestQueue(4)    # the broker's event_queue
+        for uid in uids:
+            payload = session._notification_payload(session._tasks[uid])
+            broker_q.push(('task_status', {**payload, 'sid': session.sid}))
+        assert broker_q.dropped == 46
+        while broker_q.buf:
+            rt.deliver(*broker_q.buf.popleft())
+
+        done = client.wait_tasks(uids, timeout=10)
+        assert [t['state'] for t in done] == ['DONE'] * 50
+        assert rt._cb.dropped == 0
+        assert _until(lambda: set(backend['uids']) == set(uids))
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
+def test_reconcile_two_clients_recover_their_own():
+    """Two sessions with colliding uids on one runtime: each client
+    recovers only its own uids, and its synthesized events carry its sid."""
+    uids = [f'task.t{i:03d}' for i in range(20)]
+    rt   = _FakeRuntime(maxlen=4)
+    sessions = [_done_session(sid, uids) for sid in ('sid-a', 'sid-b')]
+    clients, backends = [], []
+    try:
+        for session in sessions:
+            client, _ = _reconciling_client(rt, session)
+            _track(client, uids)
+            clients.append(client)
+            backends.append(_backend_recorder(client))
+
+        for session in sessions:                # the broadcast
+            for uid in uids:
+                payload = session._notification_payload(session._tasks[uid])
+                rt.deliver('task_status', {**payload, 'sid': session.sid})
+        rt._cb.start()
+
+        for client in clients:
+            done = client.wait_tasks(uids, timeout=10)
+            assert [t['return_value'] for t in done] \
+                == [f'{client.sid}:{u}' for u in uids]
+        for client, backend in zip(clients, backends):
+            # the backend saw its own sid (recovered), plus foreign real
+            # events that its own sid filter drops — never a sid-less one
+            assert _until(lambda b=backend: set(b['uids']) == set(uids))
+            assert client.sid in backend['sids'] and None not in \
+                backend['sids']
+    finally:
+        for client in clients:
+            client.close()
+        rt._cb.stop()
+
+
+def test_reconcile_unknown_uids_fail_and_inflight_skipped():
+    """A uid the endpoint does not know is completed as FAILED; a uid whose
+    submit is still in flight is not asked for."""
+    session = _done_session('sid-unk', ['task.known'])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session)
+    try:
+        _track(client, ['task.known', 'task.lost'])
+        client._submitted.add('task.busy')          # submit not acked yet
+        assert sorted(client._outstanding()) == ['task.known', 'task.lost']
+
+        client._reconcile_wake.set()
+        assert _until(lambda: 'task.lost' in client._completed)
+        assert client._completed['task.lost']['state'] == 'FAILED'
+        assert 'unknown' in client._completed['task.lost']['error']
+        assert client._completed['task.known']['state'] == 'DONE'
+        assert 'task.busy' not in client._completed
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
+def test_drop_hook_does_not_block_the_work_loop():
+    """The drop hook only wakes the reconcile thread: delivering into a
+    full queue returns at once even while a reconcile fetch is stuck."""
+    gate    = threading.Event()
+    session = _done_session('sid-hook', ['task.h1'])
+    rt      = _FakeRuntime(maxlen=1)
+    client, http = _reconciling_client(rt, session, gate=gate)
+    try:
+        _track(client, ['task.h1'])
+        rt.deliver('task_status', {'uid': 'task.x', 'state': 'RUNNING'})
+        t0 = time.monotonic()
+        for _ in range(20):                     # all dropped
+            rt.deliver('task_status', {'uid': 'task.x', 'state': 'RUNNING'})
+        assert _until(lambda: http.threads)     # reconcile is in its fetch
+        for _ in range(20):
+            rt.deliver('task_status', {'uid': 'task.x', 'state': 'RUNNING'})
+        assert time.monotonic() - t0 < 1.0
+        assert http.threads == ['orbit-rh-reconcile']
+    finally:
+        gate.set()
+        rt._cb.start()
+        client.close()
+        rt._cb.stop()
+
+
+def test_close_during_reconcile_stops_cleanly():
+    """close() waits for the reconcile in flight, then the thread is gone
+    and the drop hook is removed."""
+    gate    = threading.Event()
+    session = _done_session('sid-close', ['task.c1'])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session, gate=gate)
+    thread = client._reconcile_thread
+    _track(client, ['task.c1'])
+    client._reconcile_wake.set()
+    assert _until(lambda: http.threads)         # reconcile is in its fetch
+
+    closer = threading.Thread(target=client.close)
+    closer.start()
+    closer.join(0.2)
+    assert closer.is_alive()                    # waits for the reconcile
+    gate.set()
+    closer.join(10)
+    assert not closer.is_alive()
+    assert not thread.is_alive()
+    assert client._reconcile_thread is None
+    assert rt._cb._hooks == []
+    rt._cb.stop()
+
+
+
+# ---------------------------------------------------------------------------
+# Code-review round 1
+# ---------------------------------------------------------------------------
+
+def _ack_http(fail_at=None, gate=None, before_ack=None, status=None):
+    """Transport acking every submit POST; the *fail_at*-th one (0-based)
+    waits for *gate* and raises (with *status* as ``status_code`` if given:
+    an HTTP error, else a transport error).  *before_ack(uids)* runs before
+    an ack."""
+    calls = []
+
+    def post(url, data=None, json=None, headers=None):
+        n = len(calls)
+        calls.append(url)
+        if 'submit' not in url:
+            body = {"sid": "sid-new", "status": "ready"}
+        else:
+            if n == fail_at:
+                if gate is not None:
+                    gate.wait(10)
+                exc = RuntimeError("submit POST failed")
+                if status is not None:
+                    exc.status_code = status
+                raise exc
+            import msgpack
+            tasks = msgpack.unpackb(data)["tasks"]
+            if before_ack:
+                before_ack([t["uid"] for t in tasks])
+            body = [{"uid": t["uid"], "state": "SUBMITTED"} for t in tasks]
+        resp = MagicMock()
+        resp.is_error, resp.status_code = False, 200
+        resp.json = MagicMock(return_value=body)
+        return resp
+
+    http = MagicMock()
+    http.post = post
+    return http
+
+
+def _sse_client(http, rt=None):
+    client = RhapsodyClient(http, '/rhapsody', broker_client=rt or MagicMock(),
+                            endpoint_id='ep', plugin_name='rhapsody')
+    client._sid = 'sid-rh'
+    client._close_drain = 0.05
+    return client
+
+
+def test_session_switch_and_close_reset_tracking():
+    """A new session (or close) forgets the old session's tasks: they are
+    neither reconciled nor waited for."""
+    client = _sse_client(_ack_http())
+    _track(client, ['t.old1', 't.old2'])
+    client._on_task_done(None, None, 'task_status',
+                         {'uid': 't.old1', 'state': 'DONE'})
+
+    client._register_and_wait(None, 5, False, {}, threading.Event())
+    assert client.sid == 'sid-new'
+    assert client._outstanding() == []
+    assert not client._submitted and not client._completed
+    with pytest.raises(ValueError, match='unknown task UID'):
+        client.wait_tasks(['t.old2'])
+
+    _track(client, ['t.new'])
+    client.close()
+    assert client._outstanding() == [] and not client._submitted
+
+
+def test_fan_out_does_not_repeat_terminal_states():
+    """A terminal state already recorded (live and recovered events
+    crossing) is not passed on again; RUNNING and other sessions' events
+    pass unchanged."""
+    client = _sse_client(MagicMock(), rt=_FakeRuntime())
+    got = []
+
+    def _cb(e, p, t, d):                       # registered for both topics
+        got.append((t, d))
+
+    client.register_notification_callback(_cb, topic='task_status')
+    client.register_notification_callback(_cb, topic='task_status_batch')
+
+    run  = {'uid': 't.1', 'state': 'RUNNING', 'sid': 'sid-rh'}
+    done = {'uid': 't.1', 'state': 'DONE',    'sid': 'sid-rh'}
+    client._fan_out('ep', 'rhapsody', 'task_status', run)
+    client._fan_out('ep', 'rhapsody', 'task_status', done)
+    client._fan_out('ep', 'rhapsody', 'task_status', dict(done))   # dup
+    client._fan_out('ep', 'rhapsody', 'task_status_batch',          # recovered
+                    {'sid': 'sid-rh', 'tasks': [
+                        {'uid': 't.1', 'state': 'DONE'},
+                        {'uid': 't.2', 'state': 'DONE'}]})
+    client._fan_out('ep', 'rhapsody', 'task_status_batch',
+                    {'sid': 'sid-rh', 'tasks': [
+                        {'uid': 't.2', 'state': 'FAILED'}]})       # all dups
+    foreign = {'uid': 't.1', 'state': 'DONE', 'sid': 'sid-other'}
+    client._fan_out('ep', 'rhapsody', 'task_status', foreign)
+
+    assert [(t, d.get('uid') or [x['uid'] for x in d['tasks']])
+            for t, d in got] == [
+        ('task_status', 't.1'), ('task_status', 't.1'),
+        ('task_status_batch', ['t.2']), ('task_status', 't.1')]
+    assert got[1][1] is done and got[3][1] is foreign
+    assert 't.2' in client._completed      # recorded, passed on once
+
+
+def _failing_submit(status, pre=()):
+    """Submit 4 one-task batches whose second POST fails; a waiter on the
+    unsent t.2 blocks before the failure.  *pre* uids were submitted (and
+    acked) earlier and are part of the failing batch's call."""
+    from radical.orbit import plugin_rhapsody as prh
+
+    gate   = threading.Event()
+    client = _sse_client(_ack_http(fail_at=1, gate=gate, status=status))
+    _track(client, pre)
+    tasks  = [{'uid': f't.{i}', 'executable': '/bin/true'} for i in range(4)]
+    tasks += [{'uid': u, 'executable': '/bin/true'} for u in pre]
+    errors, waited = [], []
+
+    def _submit():
+        try:
+            client.submit_tasks(tasks)
+        except RuntimeError as e:
+            errors.append(e)
+
+    def _wait():
+        try:
+            client.wait_tasks(['t.0', 't.2'], timeout=10)
+        except RuntimeError as e:
+            waited.append(e)
+
+    with patch.object(prh, 'WS_PAYLOAD_LIMIT', 1):  # one task per batch
+        submitter = threading.Thread(target=_submit)
+        submitter.start()
+        assert _until(lambda: 't.0' in client._pending)
+        waiter = threading.Thread(target=_wait)
+        waiter.start()
+        time.sleep(0.05)                         # waiter blocks
+        gate.set()
+        submitter.join(10)
+        waiter.join(10)
+
+    assert errors and 'submit POST failed' in str(errors[0])
+    assert waited and 'withdrawn' in str(waited[0])
+    return client
+
+
+def test_failed_submit_keeps_uncertain_batch():
+    """Whatever the error (transport, 5xx, 4xx — the endpoint submits
+    chunk by chunk), the failing batch stays submitted and pending as
+    uncertain; batches never sent are withdrawn."""
+    for status in (None, 504, 400, 410):
+        client = _failing_submit(status)
+        assert client._submitted == {'t.0', 't.1'}
+        assert sorted(client._outstanding()) == ['t.0', 't.1']
+        assert list(client._uncertain) == ['t.1']
+
+
+def test_failed_submit_withdraws_only_new_uids():
+    """Only uids this call added are withdrawn: an earlier submit's uid in
+    an unsent batch stays."""
+    client = _failing_submit(400, pre=('t.early',))
+    assert client._submitted == {'t.0', 't.1', 't.early'}
+    assert sorted(client._outstanding()) == ['t.0', 't.1', 't.early']
+
+
+def test_outstanding_is_kept_incrementally():
+    """Acked uids become pending, a completion removes one, and a
+    completion that beats its ack never becomes pending."""
+    holder = {}
+
+    def _early(uids):
+        if 't.fast' in uids:
+            holder['c']._on_task_done(None, None, 'task_status',
+                                      {'uid': 't.fast', 'state': 'DONE'})
+
+    client = _sse_client(_ack_http(before_ack=_early))
+    holder['c'] = client
+    client.submit_tasks([{'uid': u, 'executable': '/bin/true'}
+                         for u in ('t.a', 't.b', 't.fast')])
+    assert sorted(client._outstanding()) == ['t.a', 't.b']
+
+    client._on_task_done(None, None, 'task_status_batch',
+                         {'sid': 'sid-rh', 'tasks': [
+                             {'uid': 't.a', 'state': 'RUNNING'},
+                             {'uid': 't.b', 'state': 'CANCELED'}]})
+    assert client._outstanding() == ['t.a']
+
+
+def test_task_states_rejects_oversized_requests():
+    """Too many uids, or uids too large for half the budget: 413."""
+    _, plugin, client = _make_plugin()
+    sid, session = _states_session(plugin, client, [])
+
+    from radical.orbit.plugin_rhapsody import TASK_STATES_MAX_UIDS
+    resp = client.post(f"{plugin.namespace}/task_states/{sid}",
+                       json={"uids": [f"t.{i}" for i in
+                                      range(TASK_STATES_MAX_UIDS + 1)]})
+    assert resp.status_code == 413
+
+    session._notify_batch_bytes = 1024
+    resp = client.post(f"{plugin.namespace}/task_states/{sid}",
+                       json={"uids": ["x" * 40 for _ in range(30)]})
+    assert resp.status_code == 413
+
+
+def test_task_states_response_fits_with_uid_lists():
+    """The whole response — tasks, remaining and unknown — stays within
+    the frame budget."""
+    _, plugin, client = _make_plugin()
+    tasks = [_output_task(f"task.f{i:02d}", "z" * 300, "") for i in range(20)]
+    sid, session = _states_session(plugin, client, tasks)
+    session._notify_batch_bytes = 4096
+
+    uids = [f"task.unknown{i:02d}" for i in range(10)] \
+        + [t.uid for t in tasks] + [f"task.gone{i:02d}" for i in range(10)]
+    body = client.post(f"{plugin.namespace}/task_states/{sid}",
+                       json={"uids": uids}).json()
+    assert body["remaining"] and len(body["unknown"]) == 10
+    assert len(json.dumps(body)) <= session._frame_budget()
+
+
+def test_task_states_non_terminal_bare_and_payloads_computed_once():
+    """Running tasks come back as {uid, state}; across pages each terminal
+    payload is built at most once more than needed (the page boundary)."""
+    _, plugin, client = _make_plugin()
+    running = MagicMock()
+    running.uid, running.state = "task.run", "RUNNING"
+    running.to_dict = lambda: {"uid": "task.run", "state": "RUNNING",
+                               "stdout": "partial"}
+    tasks = [_output_task(f"task.p{i:02d}", "y" * 300, "") for i in range(12)]
+    sid, session = _states_session(plugin, client, [running] + tasks)
+    session._notify_batch_bytes = 2048
+
+    with patch.object(session, '_notification_payload',
+                      wraps=session._notification_payload) as built:
+        todo, pages, first = ["task.run"] + [t.uid for t in tasks], 0, None
+        while todo:
+            body = client.post(f"{plugin.namespace}/task_states/{sid}",
+                               json={"uids": todo}).json()
+            first = first or body["tasks"][0]
+            todo   = body["remaining"]
+            pages += 1
+    assert first == {"uid": "task.run", "state": "RUNNING"}
+    assert pages > 1
+    assert built.call_count <= len(tasks) + pages - 1
+
+
+@pytest.mark.asyncio
+async def test_thread_notifications_are_serialized_on_the_loop():
+    """A RUNNING change from a backend thread is handed to the loop: it is
+    never flushed on that thread (even with a full buffer) and cannot
+    overtake a completion queued after it."""
+    session, _ = _watched_session('test.handoff')
+    session._notified_states = {}
+    session._notified_lock   = threading.Lock()
+    loop = asyncio.get_running_loop()
+    session._plugin._main_loop = loop
+    flushed_on = []
+    session._plugin._dispatch_notify.side_effect = \
+        lambda topic, data: flushed_on.append(threading.get_ident())
+
+    await asyncio.to_thread(session._on_task_state_change,
+                            {'uid': 't.1'}, 'RUNNING')
+    session._queue_notification({'uid': 't.1', 'state': 'DONE'})
+    await _ticks()
+    frames = _sent_frames(session)
+    assert [(t['uid'], t['state']) for f in frames for t in f] \
+        == [('t.1', 'RUNNING'), ('t.1', 'DONE')]
+
+    session._notify_batch_bytes = 1               # every item flushes now
+    await asyncio.to_thread(session._on_task_state_change,
+                            {'uid': 't.2'}, 'RUNNING')
+    await _ticks()
+    main = threading.get_ident()
+    assert len(flushed_on) >= 2 and set(flushed_on) == {main}
+
+
+class _NoDispatcherRuntime(_FakeRuntime):
+    """A runtime without a CallbackDispatcher: callbacks run on the
+    delivering thread."""
+
+    def __init__(self):
+        super().__init__()
+        del self._cb
+
+    def deliver(self, topic, data):
+        for t, cb in list(self.callbacks):
+            if t is None or t == topic:
+                cb('ep', 'rhapsody', topic, data)
+
+
+def test_fan_out_serialized_without_dispatcher():
+    """Without a dispatcher the reconcile delivers on its own thread, but
+    never concurrently with live delivery."""
+    uids    = [f'task.n{i:02d}' for i in range(10)]
+    session = _done_session('sid-nodisp', uids)
+    rt      = _NoDispatcherRuntime()
+    client, http = _reconciling_client(rt, session)
+    active, peak, got = [0], [0], []
+    lock = threading.Lock()
+
+    def _slow(endpoint, plugin, topic, data):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        time.sleep(0.005)
+        got.append(topic)
+        with lock:
+            active[0] -= 1
+
+    try:
+        assert client._dispatcher is None
+        for topic in ('task_status', 'task_status_batch'):
+            client.register_notification_callback(_slow, topic=topic)
+        _track(client, uids)
+
+        def _live():
+            for i in range(40):
+                rt.deliver('task_status', {'uid': f'task.live{i}',
+                                           'state': 'RUNNING',
+                                           'sid': 'sid-nodisp'})
+
+        live = threading.Thread(target=_live)
+        live.start()
+        client._reconcile_wake.set()
+        live.join(10)
+        assert client.wait_tasks(uids, timeout=10)
+        assert _until(lambda: 'task_status_batch' in got)
+        assert peak[0] == 1
+    finally:
+        client.close()
+
+
+
+# ---------------------------------------------------------------------------
+# Code-review round 2
+# ---------------------------------------------------------------------------
+
+def test_all_topics_callbacks_go_through_the_fan_out():
+    """A topic=None callback gets task events through the fan-out (once,
+    deduplicated, including recovered ones) and other topics as is."""
+    rt     = _FakeRuntime()
+    client = _sse_client(MagicMock(), rt=rt)
+    got    = []
+    client.register_notification_callback(
+        lambda e, p, t, d: got.append((t, d.get('uid') or d.get('status')
+                                       or [x['uid'] for x in d['tasks']])))
+    rt._cb.start()
+    try:
+        rt.deliver('task_status', {'uid': 't.1', 'state': 'DONE',
+                                   'sid': 'sid-rh'})
+        rt.deliver('session_status', {'sid': 'sid-rh', 'status': 'ready'})
+        assert _until(lambda: len(got) == 2)    # live ones first
+        client._redeliver('sid-rh', [{'uid': 't.1', 'state': 'DONE'},
+                                     {'uid': 't.2', 'state': 'DONE'}],
+                          threading.Event(), None)
+        assert _until(lambda: len(got) == 3)
+        time.sleep(0.05)
+        assert sorted(got, key=str) == sorted([
+            ('task_status', 't.1'), ('session_status', 'ready'),
+            ('task_status_batch', ['t.2'])], key=str)
+        # one runtime registration per task topic, one for the rest
+        assert sorted(str(t) for t, _ in rt.callbacks) \
+            == ['None', 'task_status', 'task_status_batch']
+    finally:
+        rt._cb.stop()
+
+
+def test_example_rhapsody_runs_against_the_client(capsys):
+    """examples/example_rhapsody.py (all-topics callback, submit, wait,
+    get_task, close) runs end to end against a fake runtime."""
+    import importlib.util
+    import pathlib
+
+    path = pathlib.Path(__file__).resolve().parents[2] \
+        / 'examples' / 'example_rhapsody.py'
+    spec = importlib.util.spec_from_file_location('example_rhapsody', path)
+    example = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(example)
+
+    rt      = _FakeRuntime()
+    session = RhapsodySession('sid-example')
+    session._rh_session = MagicMock()
+    session._init_ready.set()
+
+    class _ExampleHTTP:
+        def post(self, url, data=None, json=None, headers=None, **kw):
+            body = {}
+            if 'submit' in url:
+                import msgpack
+                tasks = msgpack.unpackb(data)['tasks']
+                for t in tasks:
+                    session._tasks[t['uid']] = _done_task(t['uid'], 'ok')
+                body = [{'uid': t['uid'], 'state': 'SUBMITTED'}
+                        for t in tasks]
+                for t in tasks:                    # completions follow
+                    rt.deliver('task_status', {
+                        **session._notification_payload(
+                            session._tasks[t['uid']]),
+                        'sid': session.sid})
+            return self._resp(body)
+
+        def get(self, url, **kw):
+            return self._resp({'uid': url.rsplit('/', 1)[-1],
+                               'state': 'DONE'})
+
+        @staticmethod
+        def _resp(body):
+            resp = MagicMock()
+            resp.is_error, resp.status_code = False, 200
+            resp.json = MagicMock(return_value=body)
+            return resp
+
+    class _ExampleRuntime:
+        name = 'consumer'
+
+        def __init__(self, *a, **kw):
+            pass
+
+        def start(self, wait=True):
+            rt._cb.start()
+
+        def topology(self):
+            return {'ep': {'plugins': {'rhapsody': {}}}}
+
+        def get_plugin(self, eid, plugin):
+            client = RhapsodyClient(_ExampleHTTP(), '/rhapsody',
+                                    broker_client=rt, endpoint_id=eid,
+                                    plugin_name=plugin)
+            client._sid = session.sid
+            client._start_task_listener()
+            return client
+
+        def stop(self):
+            rt._cb.stop()
+
+    with patch.object(example, 'EndpointRuntime', _ExampleRuntime):
+        example.main()
+    out = capsys.readouterr().out
+    assert 'All tasks finished' in out and 'Done.' in out
+    assert out.count('[Notification]') == 3        # each completion once
+
+
+def test_reconcile_chunks_by_bytes_and_splits_on_413():
+    """The reconcile sizes requests by uid bytes; an endpoint with a smaller
+    budget answers 413 and the request is split until it fits."""
+    from radical.orbit.plugin_rhapsody import _task_states_fits
+
+    uids    = [f'task.{"l" * 40}.{i:03d}' for i in range(60)]
+    session = _done_session('sid-bytes', uids)
+    session._notify_batch_bytes = 2048         # endpoint: small budget
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session)
+    try:
+        from radical.orbit.plugin_rhapsody import NOTIFY_BATCH_BYTES
+        assert all(_task_states_fits(c, NOTIFY_BATCH_BYTES // 2)
+                   for c in client._uid_chunks('sid-bytes', uids))
+        client._states_budget = 64 * 1024      # client: assumes more
+        assert len(client._uid_chunks('sid-bytes', uids)) == 1
+        _track(client, uids)
+        client._reconcile_wake.set()
+        assert len(client.wait_tasks(uids, timeout=10)) == 60
+        assert len(http.threads) > 2           # 413s, then split calls
+        # learned: the next pass sizes its requests to what was accepted
+        assert all(_task_states_fits(c, session._frame_budget())
+                   for c in client._uid_chunks('sid-bytes', uids))
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
+def test_reconcile_aborts_when_the_session_changes():
+    """The sid is taken once per pass; if the session changed while
+    fetching, nothing is delivered."""
+    session = _done_session('sid-old', ['task.s1', 'task.s2'])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session)
+    urls = []
+    orig = http.post
+
+    def _switching(url, json=None, **kwargs):
+        urls.append(url)
+        resp = orig(url, json=json, **kwargs)
+        client._sid = 'sid-new'                # switched meanwhile
+        return resp
+
+    http.post = _switching
+    try:
+        _track(client, ['task.s1', 'task.s2'])
+        got = []
+        client.register_notification_callback(
+            lambda *a: got.append(a), topic='task_status_batch')
+        client._reconcile('sid-old', ['task.s1', 'task.s2'],
+                          threading.Event())
+        assert urls == ['/rhapsody/task_states/sid-old']
+        time.sleep(0.05)
+        assert got == [] and not client._completed
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
+def test_stale_running_after_terminal_is_not_passed_on():
+    """State never goes backwards: a RUNNING for a task recorded terminal
+    is dropped from the fan-out (alone, or from a batch)."""
+    client = _sse_client(MagicMock(), rt=_FakeRuntime())
+    got = []
+
+    def _cb(e, p, t, d):                       # registered for both topics
+        got.append(d)
+
+    for topic in ('task_status', 'task_status_batch'):
+        client.register_notification_callback(_cb, topic=topic)
+    client._fan_out('ep', 'rhapsody', 'task_status',
+                    {'uid': 't.1', 'state': 'DONE', 'sid': 'sid-rh'})
+    client._fan_out('ep', 'rhapsody', 'task_status',
+                    {'uid': 't.1', 'state': 'RUNNING', 'sid': 'sid-rh'})
+    client._fan_out('ep', 'rhapsody', 'task_status_batch',
+                    {'sid': 'sid-rh', 'tasks': [
+                        {'uid': 't.1', 'state': 'RUNNING'},
+                        {'uid': 't.2', 'state': 'RUNNING'}]})
+    assert [d.get('state') or [x['uid'] for x in d['tasks']]
+            for d in got] == ['DONE', ['t.2']]
+
+
+def test_ensure_fan_out_rolls_back_a_partial_registration():
+    """If the second runtime registration fails, the first is undone, the
+    error is raised and a later attempt registers both."""
+    rt   = _FakeRuntime()
+    orig = rt.register_callback
+    fail = [True]
+
+    def _flaky(**kw):
+        if kw.get('topic') == 'task_status_batch' and fail[0]:
+            raise RuntimeError('register failed')
+        orig(**kw)
+
+    rt.register_callback = _flaky
+    client = _sse_client(MagicMock(), rt=rt)
+    with pytest.raises(RuntimeError, match='register failed'):
+        client._ensure_fan_out()
+    assert rt.callbacks == [] and not client._fanout_on
+
+    fail[0] = False
+    client._ensure_fan_out()
+    assert sorted(t for t, _ in rt.callbacks) \
+        == ['task_status', 'task_status_batch']
+    assert client._fanout_on
+
+
+def test_close_does_not_stall_on_a_stuck_reconcile():
+    """close() waits only briefly for a stuck task_states call (which is
+    bounded by a timeout), returns at once from inside a callback, and the
+    stuck reconcile delivers nothing afterwards."""
+    from radical.orbit import plugin_rhapsody as prh
+
+    gate    = threading.Event()
+    session = _done_session('sid-stuck', ['task.k1'])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session, gate=gate)
+    timeouts = []
+    orig = http.post
+
+    def _record(url, json=None, **kwargs):
+        timeouts.append(kwargs.get('timeout'))
+        return orig(url, json=json, **kwargs)
+
+    http.post = _record
+    got = []
+    client.register_notification_callback(
+        lambda *a: got.append(a), topic='task_status_batch')
+    _track(client, ['task.k1'])
+    client._reconcile_wake.set()
+    assert _until(lambda: http.threads)
+    assert timeouts == [prh.RECONCILE_TIMEOUT]
+
+    with patch.object(prh, 'RECONCILE_JOIN', 0.2):
+        t0 = time.monotonic()
+        client.close()
+        assert time.monotonic() - t0 < 1.0
+
+    # from inside a callback (holding the delivery lock): no wait at all
+    other, other_http = _reconciling_client(
+        rt, _done_session('sid-stuck2', ['task.k2']), gate=gate)
+    _track(other, ['task.k2'])
+    other._reconcile_wake.set()
+    assert _until(lambda: other_http.threads)
+    t0 = time.monotonic()
+    with other._delivering():
+        other.close()
+    assert time.monotonic() - t0 < 0.1
+
+    gate.set()
+    time.sleep(0.1)
+    assert got == []                            # stopped: nothing delivered
+    rt._cb.stop()
+
+
+def test_task_states_terminal_only():
+    """With terminal_only, running tasks are left out of `tasks` (and are
+    not reported unknown)."""
+    _, plugin, client = _make_plugin()
+    running = MagicMock()
+    running.uid, running.state = "task.r", "RUNNING"
+    running.to_dict = lambda: {"uid": "task.r", "state": "RUNNING"}
+    sid, _ = _states_session(plugin, client,
+                             [running, _done_task("task.d", 1)])
+    body = client.post(f"{plugin.namespace}/task_states/{sid}",
+                       json={"uids": ["task.r", "task.d", "task.x"],
+                             "terminal_only": True}).json()
+    assert [t["uid"] for t in body["tasks"]] == ["task.d"]
+    assert body["unknown"] == ["task.x"] and body["remaining"] == []
+
+
+
+# ---------------------------------------------------------------------------
+# Code-review round 3
+# ---------------------------------------------------------------------------
+
+def test_uncertain_unknown_waits_for_grace():
+    """An uncertain uid (its submit POST failed) unknown to the endpoint
+    stays pending within the grace period, and fails after it."""
+    session = _done_session('sid-grace', [])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, _ = _reconciling_client(rt, session)
+    try:
+        client._uncertain_grace = 60.0
+        client._track_pending('sid-grace', [{'uid': 't.u'}], uncertain=True)
+        client._submitted.add('t.u')
+        client._reconcile('sid-grace', ['t.u'], threading.Event())
+        time.sleep(0.05)
+        assert 't.u' not in client._completed
+        assert client._outstanding() == ['t.u']
+
+        client._uncertain_grace = 0.0
+        client._reconcile('sid-grace', ['t.u'], threading.Event())
+        assert _until(lambda: 't.u' in client._completed)
+        assert client._completed['t.u']['state'] == 'FAILED'
+        assert client._outstanding() == [] and not client._uncertain
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
+def test_acks_after_a_session_switch_are_dropped():
+    """A submit acked after the client switched sessions does not touch
+    the new session's tracking."""
+    holder = {}
+
+    def _switch(uids):
+        c = holder['c']
+        with c._cond:
+            c._sid = 'sid-new'
+            c._reset_tracking()
+        _track(c, ['t.new'])
+
+    client = _sse_client(_ack_http(before_ack=_switch))
+    holder['c'] = client
+    client.submit_tasks([{'uid': 't.old', 'executable': '/bin/true'}])
+    assert client._outstanding() == ['t.new']
+    assert client._submitted == {'t.new'}
+
+
+def test_restart_does_not_revive_a_lingering_reconcile():
+    """A reconcile thread that outlives close keeps its own stop event: it
+    exits even after a new thread started."""
+    from radical.orbit import plugin_rhapsody as prh
+
+    gate    = threading.Event()
+    session = _done_session('sid-gen', ['task.g1'])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session, gate=gate)
+    try:
+        _track(client, ['task.g1'])
+        old = client._reconcile_thread
+        client._reconcile_wake.set()
+        assert _until(lambda: http.threads)        # stuck in its fetch
+        with patch.object(prh, 'RECONCILE_JOIN', 0.05):
+            client._stop_reconcile()
+        assert old.is_alive()
+        client._start_reconcile()
+        new = client._reconcile_thread
+        assert new is not old
+        gate.set()
+        old.join(5)
+        assert not old.is_alive() and new.is_alive()
+    finally:
+        gate.set()
+        client.close()
+        rt._cb.stop()
+
+
+def test_failed_chunk_does_not_abort_the_pass_and_retries_soon():
+    """A failing task_states call skips its chunk only; the pass goes on,
+    and a short retry recovers the rest."""
+    uids    = [f'task.c{i:02d}' for i in range(6)]
+    session = _done_session('sid-chunk', uids)
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session)
+    client._states_budget = 2 * _uid_bytes_for(uids[:2])   # 3 chunks
+    client._reconcile_retry = 0.05
+    orig, calls = http.post, []
+
+    def _flaky(url, json=None, **kwargs):
+        calls.append(list(json['uids']))
+        if len(calls) == 1:
+            raise RuntimeError('transport hiccup')
+        return orig(url, json=json, **kwargs)
+
+    http.post = _flaky
+    try:
+        _track(client, uids)
+        client._reconcile_wake.set()
+        assert [t['state'] for t in client.wait_tasks(uids, timeout=5)] \
+            == ['DONE'] * 6
+        assert len(calls) >= 4                 # 3 chunks, then the retry
+        assert calls[1] != calls[0]            # pass went on after failure
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
+def _uid_bytes_for(uids):
+    from radical.orbit.plugin_rhapsody import _uid_bytes
+    return _uid_bytes(uids)
+
+
+def test_idle_reconcile_by_age_despite_other_completions():
+    """A task pending past the idle threshold is reconciled although other
+    tasks keep completing."""
+    session = _done_session('sid-age', ['task.lost'])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session, idle=0.1)
+    stop = threading.Event()
+
+    def _busy():
+        i = 0
+        while not stop.is_set():
+            rt.deliver('task_status', {'uid': f'task.busy{i}',
+                                       'state': 'DONE', 'sid': 'sid-age'})
+            i += 1
+            time.sleep(0.01)
+
+    busy = threading.Thread(target=_busy)
+    try:
+        _track(client, ['task.lost'])
+        busy.start()
+        assert client.wait_tasks(['task.lost'], timeout=5)[0]['state'] \
+            == 'DONE'
+    finally:
+        stop.set()
+        busy.join(5)
+        client.close()
+        rt._cb.stop()
+
+
+class _CountingSet(set):
+    def __init__(self, *a):
+        super().__init__(*a)
+        self.lookups = 0
+
+    def __contains__(self, item):
+        self.lookups += 1
+        return super().__contains__(item)
+
+
+def test_wait_tasks_rescans_for_withdrawn_only_on_change():
+    """Completions wake the waiter without a withdrawn rescan; a withdraw
+    makes it raise."""
+    client = _sse_client(_ack_http())
+    uids   = [f't.{i}' for i in range(20)]
+    _track(client, uids + ['t.w'])
+    client._submitted = _CountingSet(client._submitted)
+    errors = []
+
+    def _wait():
+        try:
+            client.wait_tasks(uids + ['t.w'], timeout=10)
+        except RuntimeError as e:
+            errors.append(e)
+
+    waiter = threading.Thread(target=_wait)
+    waiter.start()
+    time.sleep(0.05)
+    for uid in uids:                           # 20 wakes
+        client._on_task_done(None, None, 'task_status',
+                             {'uid': uid, 'state': 'DONE'})
+        time.sleep(0.002)
+    time.sleep(0.05)
+    assert client._submitted.lookups <= 2 * (len(uids) + 1)
+
+    client._submit_failed('sid-rh', [], [[{'uid': 't.w'}]], {'t.w'})
+    waiter.join(5)
+    assert errors and 'withdrawn' in str(errors[0])
+
+
+def test_close_unregisters_after_the_session_close():
+    """Registrations stay through the session close (its notifications
+    still arrive), then close() drops all of them."""
+    rt     = _NoDispatcherRuntime()
+    got    = []
+
+    class _HTTP:
+        def post(self, url, **kw):
+            if 'unregister_session' in url:   # the close cancels a task
+                rt.deliver('task_status', {'uid': 't.c', 'sid': 'sid-rh',
+                                           'state': 'CANCELED'})
+            resp = MagicMock()
+            resp.is_error, resp.status_code = False, 200
+            resp.json = MagicMock(return_value={})
+            return resp
+
+    client = _sse_client(_HTTP(), rt=rt)
+    client._start_task_listener()
+    client.register_notification_callback(
+        lambda e, p, t, d: got.append((t, d.get('state'))))
+    assert len(rt.callbacks) == 3
+    client.close()
+    assert got == [('task_status', 'CANCELED')]
+    assert rt.callbacks == []
+
+
+
+# ---------------------------------------------------------------------------
+# Code-review round 4
+# ---------------------------------------------------------------------------
+
+def test_state_never_goes_backwards_within_a_frame():
+    """A non-terminal item of a task with a terminal item in the same frame
+    is dropped, before or after it; the endpoint stops sending
+    intermediate changes once a task was notified terminal."""
+    client = _sse_client(MagicMock(), rt=_FakeRuntime())
+    got = []
+    client.register_notification_callback(
+        lambda e, p, t, d: got.extend((x['uid'], x['state'])
+                                      for x in d['tasks']),
+        topic='task_status_batch')
+    client._fan_out('ep', 'rhapsody', 'task_status_batch', {
+        'sid': 'sid-rh', 'tasks': [
+            {'uid': 't.1', 'state': 'DONE'}, {'uid': 't.1', 'state': 'RUNNING'},
+            {'uid': 't.2', 'state': 'RUNNING'}, {'uid': 't.2', 'state': 'FAILED'},
+            {'uid': 't.3', 'state': 'RUNNING'}]})
+    assert got == [('t.1', 'DONE'), ('t.2', 'FAILED'), ('t.3', 'RUNNING')]
+
+    session = RhapsodySession('test.backwards')
+    session._notified_states = {}
+    session._notified_lock   = threading.Lock()
+    queued = []
+    session._queue_notification = queued.append
+    session._mark_terminal('t.9', 'DONE')
+    session._on_task_state_change({'uid': 't.9'}, 'RUNNING')
+    session._on_task_state_change({'uid': 't.8'}, 'DONE')     # via callback
+    session._on_task_state_change({'uid': 't.8'}, 'RUNNING')
+    assert queued == []
+
+
+def test_uncertain_grace_defaults_to_the_call_timeout():
+    """The grace is the runtime's call timeout (the submit's bound)."""
+    from radical.orbit.plugin_rhapsody import RECONCILE_GRACE
+
+    rt = _FakeRuntime()
+    rt._call_timeout = 123.0
+    assert _sse_client(MagicMock(), rt=rt)._uncertain_grace == 123.0
+    assert _sse_client(MagicMock())._uncertain_grace == RECONCILE_GRACE \
+        == 600.0
+
+
+class _PaceClient:
+    _reconcile_idle, _reconcile_idle_max = 1.0, 100.0
+    _reconcile_retry, _reconcile_settle  = 0.5, 0.25
+
+
+def test_pace_backs_off_failing_and_fruitless_passes():
+    """Failing passes back the retry off (from the second on); drop passes
+    that recover nothing double the minimum gap; a recovery resets."""
+    from radical.orbit.plugin_rhapsody import _ReconcilePace
+
+    pace = _ReconcilePace(_PaceClient())
+    pace.passed(0, True, False)
+    assert pace.wait(True) == 0.5
+    pace.passed(0, True, False)
+    pace.passed(0, True, False)
+    assert pace.wait(True) == 2.0
+    pace.passed(0, False, False)
+    assert pace.wait(True) == 0.5 and pace.wait(False) == 2.0
+
+    pace.passed(0, False, True)
+    pace.passed(0, False, True)
+    assert pace.gap == 1.0
+    assert pace.drop_delay() == 0.25           # first: the settle time
+    assert 1.2 < pace.drop_delay() <= 1.25     # then: a gap after it
+    pace.passed(3, False, True)
+    assert pace.gap == 0.25 and pace.wait(False) == 1.0
+
+
+def test_reconcile_stops_for_good_on_404():
+    """An older endpoint (no task_states route) or a gone session: the
+    reconcile thread ends instead of retrying forever."""
+    session = _done_session('sid-404', ['task.x'])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session)
+    http.post = lambda url, json=None, **kw: _SessionHTTP._resp(
+        404, {'detail': 'No route: POST /rhapsody/task_states/sid-404'})
+    try:
+        _track(client, ['task.x'])
+        thread = client._reconcile_thread
+        client._reconcile_wake.set()
+        thread.join(5)
+        assert not thread.is_alive()
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
+def test_task_states_entry_alone_and_stripped():
+    """A first entry that does not fit next to the uid lists is sent
+    alone (earlier unknown uids move to remaining); one exceeding even the
+    frame is stripped to its terminal state, so the reconcile still settles
+    it."""
+    session = _done_session('sid-big', [])
+    session._notify_batch_bytes = 6000         # frame cap 12000
+    session._output_notify_limit = 100_000     # big output tails survive
+    session._tasks['t.mid'] = _output_task('t.mid', 'm' * 7000, '')
+    session._tasks['t.big'] = _output_task('t.big', 'b' * 20000, '')
+
+    body = asyncio.run(session.task_states(['t.u', 't.mid', 't.next']))
+    assert [t['uid'] for t in body['tasks']] == ['t.mid']
+    assert body['unknown'] == [] and body['remaining'] == ['t.u', 't.next']
+
+    body = asyncio.run(session.task_states(['t.big', 't.next']))
+    assert body['remaining'] == ['t.next'] and 'too_large' not in body
+    big, = body['tasks']
+    assert big['state'] == 'DONE' and big['exit_code'] == 0
+    assert 'too large' in big['error'] and 'stdout' not in big
+    assert len(json.dumps(body)) < 12000
+
+    rt = _FakeRuntime()
+    rt._cb.start()
+    client, _ = _reconciling_client(rt, session)
+    try:
+        _track(client, ['t.big'])
+        client._reconcile_wake.set()
+        done = client.wait_tasks(['t.big'], timeout=5)
+        assert done[0]['state'] == 'DONE' and 'too large' in done[0]['error']
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
+def test_nothing_is_delivered_after_close():
+    """A recovered event queued before close() is not delivered once the
+    dispatcher gets to it."""
+    session = _done_session('sid-late', ['task.l1'])
+    rt      = _FakeRuntime()                   # dispatcher not started
+    client, _ = _reconciling_client(rt, session)
+    got = []
+    client.register_notification_callback(
+        lambda *a: got.append(a), topic='task_status_batch')
+    _track(client, ['task.l1'])
+    client._reconcile_wake.set()
+    assert _until(lambda: rt._cb._q.qsize() > 0)
+    client.close()
+    rt._cb.start()
+    time.sleep(0.1)
+    assert got == [] and not client._completed
+    rt._cb.stop()
+
+
+@pytest.mark.asyncio
+async def test_notifications_from_another_loop_are_handed_off():
+    """A notification queued on a loop other than the plugin's is handed
+    to the plugin's loop too."""
+    session, _ = _watched_session('test.otherloop')
+    session._plugin._main_loop = asyncio.get_running_loop()
+    flushed_on = []
+    session._plugin._dispatch_notify.side_effect = \
+        lambda topic, data: flushed_on.append(threading.get_ident())
+
+    async def _elsewhere():
+        session._queue_notification({'uid': 't.o', 'state': 'DONE'})
+
+    await asyncio.to_thread(asyncio.run, _elsewhere())
+    for _ in range(50):
+        if flushed_on:
+            break
+        await asyncio.sleep(0.01)
+    assert flushed_on == [threading.get_ident()]
+
+
+def test_all_topics_registration_survives_close_and_reregister():
+    """After close() and a new session, the all-topics registration is
+    made again."""
+    rt     = _FakeRuntime()
+    client = _sse_client(_ack_http(), rt=rt)
+    client.register_notification_callback(lambda *a: None)
+    client._start_task_listener()
+    client.close()
+    assert rt.callbacks == []
+    client._sid = 'sid-again'
+    client._start_task_listener()
+    try:
+        assert sorted(str(t) for t, _ in rt.callbacks) \
+            == ['None', 'task_status', 'task_status_batch']
+    finally:
+        client.close()
+
+
+
+# ---------------------------------------------------------------------------
+# Code-review round 5
+# ---------------------------------------------------------------------------
+
+def _bare_runtime():
+    """An EndpointRuntime callback registry without transport."""
+    import threading as _threading
+    from radical.orbit.runtime import EndpointRuntime
+
+    rt = EndpointRuntime.__new__(EndpointRuntime)
+    rt._callbacks = {}
+    rt._cb_lock   = _threading.Lock()
+    rt._name      = 'test-consumer'
+    rt._emit      = MagicMock()
+    rt._cb        = MagicMock()
+    return rt
+
+
+def test_close_and_reregister_leave_one_registration():
+    """Bound methods unregister (equality), so close() and a new session
+    leave exactly one runtime registration per topic."""
+    rt     = _bare_runtime()
+    client = _sse_client(_ack_http(), rt=rt)
+    client.register_notification_callback(lambda *a: None)
+    client._start_task_listener()
+    client.close()
+    assert all(not cbs for cbs in rt._callbacks.values())
+    client._sid = 'sid-again'
+    client._start_task_listener()
+    try:
+        for topic in ('task_status', 'task_status_batch', None):
+            assert len(rt._callbacks[('ep', 'rhapsody', topic)]) == 1
+    finally:
+        client.close()
+
+
+def test_gone_reconcile_detaches_and_a_new_session_restarts_it():
+    """After the reconcile ended on a gone session, a later session starts
+    a new reconcile thread."""
+    session = _done_session('sid-gone', ['task.x'])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session)
+    orig = http.post
+    http.post = lambda url, json=None, **kw: _SessionHTTP._resp(
+        404, {'detail': 'unknown session id: sid-gone'})
+    try:
+        _track(client, ['task.x'])
+        thread = client._reconcile_thread
+        client._reconcile_wake.set()
+        thread.join(5)
+        assert not thread.is_alive()
+        assert client._reconcile_thread is None
+        assert rt._cb._hooks == []
+
+        http.post = orig
+        client._start_task_listener()
+        assert client._reconcile_thread is not None
+        assert client._reconcile_thread.is_alive()
+        assert rt._cb._hooks == [client._on_drop]
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
+def test_transient_404_and_502_keep_reconciling():
+    """A broker/gateway 404 (endpoint unknown in a reconnect gap) or a 502
+    is transient: the reconcile backs off and recovers once it clears."""
+    session = _done_session('sid-gap', ['task.g'])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session)
+    client._reconcile_retry = 0.02
+    orig, calls = http.post, []
+    errors = [(404, "endpoint 'ep' unknown"), (502, "endpoint 'ep' unknown")]
+
+    def _gap(url, json=None, **kw):
+        calls.append(url)
+        if errors:
+            status, detail = errors.pop(0)
+            return _SessionHTTP._resp(status, {'detail': detail})
+        return orig(url, json=json, **kw)
+
+    http.post = _gap
+    try:
+        _track(client, ['task.g'])
+        client._reconcile_wake.set()
+        assert client.wait_tasks(['task.g'], timeout=5)[0]['state'] == 'DONE'
+        assert len(calls) >= 3 and client._reconcile_thread.is_alive()
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
+def test_snapshot_takes_sid_and_uids_together():
+    """Session switches racing the snapshot never pair a sid with another
+    session's uids."""
+    client = _sse_client(_ack_http())
+    stop   = threading.Event()
+
+    def _switch():
+        n = 0
+        while not stop.is_set():
+            with client._cond:
+                client._sid = f'sid-{n}'
+                client._reset_tracking()
+                client._pending.update({f'sid-{n}:t{i}': 0.0
+                                        for i in range(20)})
+            n += 1
+            time.sleep(0)
+
+    switcher = threading.Thread(target=_switch)
+    switcher.start()
+    try:
+        for _ in range(500):
+            sid, uids = client._snapshot(None)
+            assert all(u.startswith(f'{sid}:') for u in uids)
+    finally:
+        stop.set()
+        switcher.join(5)
+
+
+def test_close_drains_the_closing_sessions_last_states():
+    """CANCELED states the session close produces arrive after the close
+    POST returned: close() keeps the fan-out (and the closing sid) until
+    they are in, then unregisters."""
+    session = _done_session('sid-closing', [])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session)
+    client._close_drain = 5.0
+    got  = []
+    client.register_notification_callback(
+        lambda e, p, t, d: got.append(d['state']), topic='task_status')
+    orig = http.post
+
+    def _post(url, json=None, **kw):
+        if 'unregister_session' in url:
+            threading.Timer(0.1, rt.deliver, ('task_status', {
+                'uid': 'task.c', 'state': 'CANCELED',
+                'sid': 'sid-closing'})).start()
+        return orig(url, json=json, **kw)
+
+    http.post = _post
+    _track(client, ['task.c'])
+    t0 = time.monotonic()
+    client.close()
+    assert 0.05 < time.monotonic() - t0 < 2.0
+    assert got == ['CANCELED']
+    assert rt.callbacks == []
+    rt._cb.stop()
+
+
+@pytest.mark.asyncio
+async def test_endpoint_close_flushes_the_cancellations():
+    """The endpoint sends the states its session close produced before the
+    session goes away, not after the coalescing window."""
+    session, futs = _watched_session('test.closeflush', window=10.0)
+    session._init_ready.set()
+    task = MagicMock()
+    task.uid, task.state = 'task.k', 'RUNNING'
+    task.to_dict = lambda: {'uid': 'task.k', 'state': task.state}
+    watcher = asyncio.ensure_future(session._watch_batch([task]))
+    session._watchers.add(watcher)
+    await _ticks(1)
+
+    async def _close():
+        task.state = 'CANCELED'
+        futs['task.k'].set_result(None)
+
+    session._rh_session.close = _close
+    await session.close()
+    frames = _sent_frames(session)
+    assert [(t['uid'], t['state']) for f in frames for t in f] \
+        == [('task.k', 'CANCELED')]
+
+
+def test_recovered_shapes_and_task_status_only_callbacks():
+    """A single recovered completion comes as task_status, several as one
+    batch; a task_status-only callback gets batch items one by one, a
+    callback of both topics the batch once."""
+    client = _sse_client(MagicMock(), rt=_FakeRuntime())
+    solo, both = [], []
+
+    def _both(e, p, t, d):
+        both.append((t, d.get('uid') or [x['uid'] for x in d['tasks']]))
+
+    client.register_notification_callback(
+        lambda e, p, t, d: solo.append((t, d['uid'], d.get('sid'))),
+        topic='task_status')
+    client.register_notification_callback(_both, topic='task_status')
+    client.register_notification_callback(_both, topic='task_status_batch')
+
+    client._redeliver('sid-rh', [{'uid': 't.1', 'state': 'DONE'}],
+                      threading.Event(), None)
+    client._redeliver('sid-rh', [{'uid': 't.2', 'state': 'DONE'},
+                                 {'uid': 't.3', 'state': 'FAILED'}],
+                      threading.Event(), None)
+    assert both == [('task_status', 't.1'),
+                    ('task_status_batch', ['t.2', 't.3'])]
+    assert solo == [('task_status', 't.1', 'sid-rh'),
+                    ('task_status', 't.2', 'sid-rh'),
+                    ('task_status', 't.3', 'sid-rh')]
+
+
+@pytest.mark.asyncio
+async def test_handed_off_running_after_completion_is_dropped():
+    """A RUNNING handed to the loop before the completion was marked is
+    dropped when the loop gets to it."""
+    session, _ = _watched_session('test.recheck')
+    session._notified_states = {}
+    session._notified_lock   = threading.Lock()
+    session._plugin._main_loop = asyncio.get_running_loop()
+
+    t = threading.Thread(target=session._on_task_state_change,
+                         args=({'uid': 't.1'}, 'RUNNING'))
+    t.start()
+    t.join()                                   # handed off, not yet run
+    session._mark_terminal('t.1', 'DONE')
+    await _ticks()
+    assert session._notify_buf == []
+    session._plugin._dispatch_notify.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_task_states_is_tracked_and_410_when_torn_down_midway():
+    """task_states counts as in flight (close waits for it) and answers
+    410 if the session started closing meanwhile — never 'unknown'."""
+    session = _done_session('sid-midway', ['task.m'])
+    gate    = threading.Event()
+    orig    = session._collect_states
+
+    def _slow(*a):
+        gate.wait(5)
+        return orig(*a)
+
+    session._collect_states = _slow
+    session._rh_session.close = AsyncMock()
+    call = asyncio.ensure_future(session.task_states(['task.m']))
+    await _ticks()
+    assert session._ops == 1
+    closing = asyncio.ensure_future(session.close())
+    await _ticks()
+    assert not closing.done()                  # waits for the call
+    gate.set()
+    with pytest.raises(HTTPException) as e:
+        await call
+    assert e.value.status_code == 410
+    await asyncio.wait_for(closing, 5)
+
+
+def test_last_all_topics_callback_drops_its_registration():
+    """Unregistering the last all-topics callback removes the runtime
+    registration; a new one registers it again."""
+    rt     = _FakeRuntime()
+    client = _sse_client(MagicMock(), rt=rt)
+
+    def cb1(*a):
+        pass
+
+    def cb2(*a):
+        pass
+
+    client.register_notification_callback(cb1)
+    client.register_notification_callback(cb2)
+    client.unregister_notification_callback(cb1)
+    assert any(t is None for t, _ in rt.callbacks)
+    client.unregister_notification_callback(cb2)
+    assert not any(t is None for t, _ in rt.callbacks)
+    assert not client._fanout_all and client._fanout_on
+    client.register_notification_callback(cb1)
+    assert [t for t, _ in rt.callbacks].count(None) == 1
 
 
 _TIMERS: list = []

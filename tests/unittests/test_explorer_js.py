@@ -490,3 +490,66 @@ def test_fed_a_stale_refresh_says_so_in_the_tooltip(render_resources):
     html = render_resources([_fed_resource([member], state="stale")])
     assert "(stale)" in html
     assert "fed-live-stale" in html
+
+
+# ── orbit_explorer.html: bulk notification unpacking (quickjs) ────────────
+
+_HTML = (pathlib.Path(__file__).resolve().parents[2]
+         / "src" / "radical" / "orbit" / "data" / "orbit_explorer.html")
+
+_NOTIFY_STUBS = """
+var calls = [], registry = [], pendingNotifications = {};
+var activeDynamicPages = {'ep__rhapsody': {}};
+var pluginPageModules = {'ep__rhapsody': {api: {}, module: {
+  notificationConfig: {topic: 'task_status', idField: 'uid'},
+  onNotification: function (d) { calls.push([d.topic, d.data]); }}}};
+function updateTaskState(ep, plugin, id, state) {
+  registry.push([id, state]);
+}
+"""
+
+
+@pytest.fixture(scope="module")
+def notify_ctx():
+    if quickjs is None:
+        pytest.skip("quickjs not installed")
+    html  = _HTML.read_text()
+    start = html.index("    function batchItems")
+    end   = html.index("\n    // ─", html.index("function handleNotification"))
+    return html[start:end]
+
+
+def _notify(src, frame):
+    ctx = quickjs.Context()
+    ctx.eval(_NOTIFY_STUBS + src)
+    ctx.eval("handleNotification(%s)" % json.dumps(frame))
+    return (_run(ctx, "calls"), _run(ctx, "registry"),
+            sorted(_run(ctx, "Object.keys(pendingNotifications)")))
+
+
+def test_explorer_unpacks_task_batches(notify_ctx):
+    """A `*_batch` frame of per-task items is replayed item by item under
+    the topic without `_batch`, reaching the registry and the replay."""
+    calls, registry, pending = _notify(notify_ctx, {
+        "endpoint": "ep", "plugin": "rhapsody", "topic": "task_status_batch",
+        "data": {"sid": "s1", "tasks": [{"uid": "t.1", "state": "RUNNING"},
+                                        {"uid": "t.2", "state": "DONE"}]}})
+    assert calls == [["task_status", {"sid": "s1", "uid": "t.1",
+                                      "state": "RUNNING"}],
+                     ["task_status", {"sid": "s1", "uid": "t.2",
+                                      "state": "DONE"}]]
+    assert registry == [["t.1", "RUNNING"], ["t.2", "DONE"]]
+    assert pending == ["ep/rhapsody/t.1", "ep/rhapsody/t.2"]
+
+
+def test_explorer_passes_other_frames_through(notify_ctx):
+    """Frames that are not per-task batches are handled unchanged: a list
+    under another topic, or items without the id field."""
+    for frame in (
+            {"endpoint": "ep", "plugin": "rhapsody", "topic": "pool_status",
+             "data": {"tasks": [{"uid": "t.1"}]}},
+            {"endpoint": "ep", "plugin": "rhapsody", "topic": "x_batch",
+             "data": {"tasks": [{"name": "n"}]}}):
+        calls, registry, _ = _notify(notify_ctx, frame)
+        assert calls == [[frame["topic"], frame["data"]]]
+        assert registry == []

@@ -153,6 +153,7 @@ Namespace: `rhapsody`
 | `GET` | `list_tasks/{sid}` | All tasks in session |
 | `GET` | `task/{sid}/{uid}` | Task details including stdout, stderr, exception |
 | `POST` | `cancel/{sid}/{uid}` | Cancel a task |
+| `POST` | `task_states/{sid}` | Current states of the given tasks: a terminal task as its terminal notification carries it (output tails, bounded return value), a non-terminal one as `{uid, state}`. Body: `{"uids": [...], "terminal_only": false}` (`terminal_only` leaves non-terminal tasks out of `tasks`), at most 4096 uids taking at most half the notification frame budget (else `413`). Returns `{"tasks": [...], "remaining": [...], "unknown": [...]}`: the response, uid lists included, is packed within the notification frame budget; `remaining` lists the uids for a follow-up call, `unknown` the uids the session does not know. A first entry too large to share the frame with the uid lists comes alone (every other uid in `remaining`); one larger than the frame cap is stripped to `{uid, state, exit_code, error}` (`task/{sid}/{uid}` has the full record). `410` if the session closed during the call |
 | `GET` | `statistics/{sid}` | Backend execution statistics |
 
 ## Queue Info Plugin

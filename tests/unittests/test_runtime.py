@@ -620,6 +620,49 @@ def test_callback_dispatcher_drop_oldest_counter():
     assert cb.dropped == 3                           # 5 submitted, 2 retained
 
 
+def test_callback_dispatcher_drop_hooks():
+    """Drop hooks see the dropped callable on the submitting thread; a
+    failing hook neither breaks submit nor the other hooks."""
+    from radical.orbit.runtime_support import CallbackDispatcher
+    cb = CallbackDispatcher(maxlen=1)               # not started
+
+    def mine():
+        pass
+
+    seen = []
+
+    def boom(fn):
+        raise RuntimeError('hook failed')
+
+    def hook(fn):
+        seen.append((fn, threading.get_ident()))
+
+    cb.add_drop_hook(boom)
+    cb.add_drop_hook(hook)
+    cb.submit(mine)
+    cb.submit(mine)                                 # dropped
+    assert seen == [(mine, threading.get_ident())]
+
+    cb.remove_drop_hook(hook)
+    cb.submit(mine)
+    assert len(seen) == 1 and cb.dropped == 2
+
+
+def test_callback_dispatcher_submit_blocking():
+    """submit_blocking waits for room and gives up after its timeout."""
+    from radical.orbit.runtime_support import CallbackDispatcher
+    cb  = CallbackDispatcher(maxlen=1)
+    ran = threading.Event()
+    cb.submit(lambda: None)
+    assert cb.submit_blocking(ran.set, timeout=0.05) is False
+    assert cb.dropped == 0                          # not counted as a drop
+
+    cb.start()                                      # drains: room again
+    assert cb.submit_blocking(ran.set, timeout=2.0) is True
+    assert ran.wait(2.0)
+    cb.stop()
+
+
 # ---------------------------------------------------------------------------
 # dispatch.py move: shared RequestShim/match_route across hosts
 # ---------------------------------------------------------------------------

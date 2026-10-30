@@ -954,8 +954,10 @@ class EndpointRuntime(PluginHostBase):
         with self._cb_lock:
             cbs = self._callbacks.get(key)
             if cbs:
+                # equality: a bound method is a new object on every
+                # attribute access, and unregisters as passed at registration
                 self._callbacks[key] = [(cb, m) for (cb, m) in cbs
-                                        if cb is not callback]
+                                        if cb != callback]
         self._emit(protocol.Unsubscribe(
             src=self._name,
             patterns=[protocol.SubscribePattern(

@@ -9,6 +9,8 @@ liveness.  Structural isolation on its own thread is the guarantee.
 The queue is bounded so a wedged callback cannot grow memory without bound; an
 overflowing submission is dropped with a logged warning (and counted in
 :attr:`CallbackDispatcher.dropped`) so the loss is visible rather than silent.
+A consumer that can recover lost events registers a drop hook
+(:meth:`CallbackDispatcher.add_drop_hook`) to learn about the loss.
 """
 
 import logging
@@ -29,11 +31,18 @@ class CallbackDispatcher:
     warning is logged, and :attr:`dropped` is bumped — so a wedged callback can
     never stall the caller or grow memory without bound, and the loss is
     observable.
+
+    Drop hooks (:meth:`add_drop_hook`) are called with the dropped ``fn``
+    on the submitting thread — the work loop — so a hook must not block:
+    it should only record the loss (e.g. set a ``threading.Event``) and
+    leave the recovery to a thread of its own.
     """
 
     def __init__(self, maxlen: int = 1024, name: str = 'orbit-callbacks'):
         self._q      : queue.Queue = queue.Queue(maxsize=maxlen)
         self.dropped = 0
+        self._hooks  : list = []
+        self._hlock  = threading.Lock()
         self._thread = threading.Thread(target=self._run, name=name,
                                         daemon=True)
 
@@ -49,6 +58,15 @@ class CallbackDispatcher:
     def start(self) -> None:
         self._thread.start()
 
+    def add_drop_hook(self, hook: Callable) -> None:
+        """Call ``hook(fn)`` whenever a submission of ``fn`` is dropped."""
+        with self._hlock:
+            self._hooks.append(hook)
+
+    def remove_drop_hook(self, hook: Callable) -> None:
+        with self._hlock:
+            self._hooks = [h for h in self._hooks if h != hook]
+
     def submit(self, fn: Callable, *args: Any) -> None:
         try:
             self._q.put_nowait((fn, args))
@@ -56,6 +74,26 @@ class CallbackDispatcher:
             self.dropped += 1
             log.warning("[Runtime] callback queue full; dropping callback %r",
                         getattr(fn, '__name__', fn))
+            with self._hlock:
+                hooks = list(self._hooks)
+            for hook in hooks:
+                try:
+                    hook(fn)
+                except Exception as e:
+                    log.error("[Runtime] drop hook failed: %r", e, exc_info=e)
+
+    def submit_blocking(self, fn: Callable, *args: Any,
+                        timeout: Optional[float] = None) -> bool:
+        """Like :meth:`submit`, but wait up to *timeout* seconds for room.
+
+        For producers off the work loop (a recovery thread), where waiting
+        is harmless.  Returns ``False`` when the queue stayed full.
+        """
+        try:
+            self._q.put((fn, args), timeout=timeout)
+        except queue.Full:
+            return False
+        return True
 
     def _run(self) -> None:
         while True:
