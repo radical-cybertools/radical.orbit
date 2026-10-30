@@ -497,6 +497,13 @@ class RhapsodySession(PluginSession):
             "state": state_str,
         })
 
+    def is_busy(self) -> bool:
+        """Probed at the idle deadline: busy while a task is not terminal
+        (a long task emits no events between RUNNING and its end)."""
+        return any(str(self._get_attr(t, 'state', '')).upper()
+                   not in TERMINAL_STATES
+                   for t in reversed(list(self._tasks.values())))
+
     def _check_initialized(self) -> None:
         """Check that the session is active and fully initialized.
 
@@ -1380,7 +1387,10 @@ class RhapsodyClient(PluginClient):
         del t['_return_value_encoding']
 
     def register_session(self, backends: list[str] | None = None,
-                         init_timeout: float = 120):
+                         init_timeout: float = 120,
+                         sid: str | None = None,
+                         ttl: float | None = None,
+                         lifetime: str | None = None):
         """
         Register a session, optionally specifying backend names.
 
@@ -1394,6 +1404,13 @@ class RhapsodyClient(PluginClient):
             backends: List of backend names (e.g. ``['dragon_v3']``).
                       Defaults to ``['dragon_v3']`` on the server side.
             init_timeout: Seconds to wait for session init (default 120).
+            sid:      Reconnect to (or create) this session id; any client
+                      holding a sid can reconnect to it.
+            ttl:      Idle timeout in seconds, fixed at creation (``0``:
+                      never expires); default: the plugin's (900 s).  Set it
+                      for sessions reconnected to after long idle phases.
+            lifetime: Legacy policy name (``'ephemeral'`` / ``'persistent'``);
+                      prefer *ttl*.
         """
         has_sse = (self._bc is not None and
                    self._endpoint_id is not None and
@@ -1418,7 +1435,7 @@ class RhapsodyClient(PluginClient):
             self.register_notification_callback(_on_session_status,
                                                 topic="session_status")
 
-        payload = {}
+        payload = self._session_payload(sid, lifetime, ttl) or {}
         if backends:
             payload['backends'] = backends
         resp = self._http.post(self._url('register_session'), json=payload)
@@ -1940,7 +1957,7 @@ class PluginRhapsody(Plugin):
                 detail="'backends' must be a list of backend names")
 
         owner              = self._request_owner(request)
-        sid, lifetime, ttl = self._normalize_session_policy(data)
+        sid, lifetime, ttl = await self._normalize_session_policy(data)
         backend_names      = self._backend_names(backends)
 
         self._ensure_cleanup_task()
@@ -1957,14 +1974,11 @@ class PluginRhapsody(Plugin):
             while sid in self._sessions:
                 sid = f"session.{uuid.uuid4().hex[:8]}"
 
-        # Reconnect to an existing session — do not rebuild it.  Owner check
-        # first (bug A5: a session created with an owner must not be hijacked
-        # by another participant).  Report the session's real status: its init
-        # may have long completed, and the reconnecting client would otherwise
-        # wait for a `session_status` notification emitted before it attached.
+        # Reconnect to an existing session (any client) — do not rebuild it.
+        # Report the session's real status: its init may have long completed,
+        # and the reconnecting client would otherwise wait for a
+        # `session_status` notification emitted before it attached.
         if sid in self._sessions:
-            self._check_owner(sid, owner)
-            self._check_policy_conflict(sid, lifetime, ttl)
             self._touch(sid)
             log.info("[%s] Reconnected session %s", self.instance_name, sid)
             return {"sid": sid,

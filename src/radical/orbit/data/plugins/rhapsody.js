@@ -245,8 +245,8 @@ async function openTaskDetail(api, uid) {
   try {
     task = await api.fetch(`task/${sid}/${uid}`);
   } catch (e) {
-    if (e.message && e.message.includes('404')) {
-      api.flash('Task details unavailable — the endpoint session may have been reset.', false);
+    if (e.message && (e.message.includes('404') || e.message.includes('410'))) {
+      api.flash('Task details unavailable — the endpoint session may have been reset or expired.', false);
     } else {
       api.flash('Error loading task details: ' + e.message, false);
     }

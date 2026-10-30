@@ -265,7 +265,9 @@ class TestSessionTeardown:
         assert sid not in plugin._pool_states
         assert ps.pilots['p.1'].state == PILOT_FAILED
 
-    def test_ephemeral_owner_lost_drains_and_cancels(self, tmp_path):
+    def test_ephemeral_pool_survives_owner_loss_until_idle(self, tmp_path):
+        '''A client may disconnect and reconnect later: owner loss does not
+        reclaim the session; its idle timeout does (pools torn down).'''
         _, plugin = _make_plugin(tmp_path)
 
         async def scenario():
@@ -277,22 +279,23 @@ class TestSessionTeardown:
             ps.pilots['p.1'] = PilotRecord(
                 pid='p.1', pool='cpu', owning_sid=sid, size_key='s',
                 rhapsody_backend='concurrent', state=PILOT_ACTIVE)
-            # owner declared lost → stamps the reclaim-drain deadline; the
-            # 5 s sweep reclaims once it passes.  Backdate + sweep now.
             await plugin.on_topology_change(
                 {'clientA': {'role': 'endpoint', 'plugins': {},
                              'liveness': 'lost'}})
-            plugin._records[sid].drain_deadline = time.time() - 1
             await plugin._cleanup_expired_sessions()
-            return sid, ps
+            survived = sid in plugin._pool_states
+            plugin._records[sid].last_access = \
+                time.time() - plugin.session_ttl - 1
+            await plugin._cleanup_expired_sessions()
+            return sid, ps, survived
 
-        sid, ps = asyncio.run(scenario())
-        assert sid not in plugin._pool_states
+        sid, ps, survived = asyncio.run(scenario())
+        assert survived                              # owner loss: kept
+        assert sid not in plugin._pool_states        # idle: torn down
         assert ps.pilots['p.1'].state == PILOT_FAILED
 
     def test_persistent_pool_survives_owner_loss(self, tmp_path):
         _, plugin = _make_plugin(tmp_path)
-        plugin.reclaim_drain = 0.05
 
         async def scenario():
             plugin._maybe_start()
@@ -310,7 +313,6 @@ class TestSessionTeardown:
 
     def test_pool_survives_suspect_owner_blip(self, tmp_path):
         _, plugin = _make_plugin(tmp_path)
-        plugin.reclaim_drain = 0.05
 
         async def scenario():
             plugin._maybe_start()
@@ -787,6 +789,16 @@ class TestPilotSubmitTransport:
         assert plugin._broker_caller is None
         assert asyncio.run(plugin._get_psij_client('someone')) is None
         assert asyncio.run(plugin._get_rhapsody_client('someone')) is None
+
+    def test_child_sessions_never_idle_expire(self, tmp_path):
+        """Child sessions are cached across arbitrarily long pool idle
+        phases, so they are registered with ttl=0."""
+        _, plugin = _make_plugin(tmp_path, broker_caller=MagicMock())
+        client = MagicMock()
+        with patch.object(plugin, '_make_child_client', return_value=client):
+            got = asyncio.run(plugin._get_psij_client('ep'))
+        assert got is client
+        assert client.register_session.call_args.kwargs['ttl'] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -3580,3 +3592,42 @@ def test_last_pilot_error_stops_at_the_newest_healthy_pilot():
     assert P._last_pilot_error([failed, active]) is None
     assert P._last_pilot_error([active, failed]) == 'quota exceeded'
     assert P._last_pilot_error([]) is None
+
+
+def test_dispatcher_session_is_busy_while_a_pool_task_runs():
+    from types import SimpleNamespace
+    from radical.orbit.plugin_task_dispatcher import TaskDispatcherSession
+
+    task  = SimpleNamespace(state='QUEUED')
+    pools = {'cpu': SimpleNamespace(tasks={'t.1': task}, pilots={})}
+
+    session = TaskDispatcherSession('s1')
+    assert session.is_busy() is False              # no plugin
+    session._plugin = SimpleNamespace(_pool_states={'s1': pools})
+    assert session.is_busy() is False              # queued, no pilot pending
+    task.state = 'RUNNING'
+    assert session.is_busy() is True
+    task.state = 'DONE'
+    assert session.is_busy() is False
+
+
+def test_dispatcher_queued_tasks_keep_the_session_while_a_pilot_waits():
+    """Queued tasks behind a pending pilot keep the session busy, but at
+    most QUEUE_WAIT_MAX without any task running."""
+    from types import SimpleNamespace
+    from radical.orbit import plugin_task_dispatcher as ptd
+
+    task  = SimpleNamespace(state='QUEUED')
+    pilot = SimpleNamespace(state='PENDING')
+    pools = {'cpu': SimpleNamespace(tasks={'t.1': task},
+                                    pilots={'p.1': pilot})}
+    session = ptd.TaskDispatcherSession('s1')
+    session._plugin = SimpleNamespace(_pool_states={'s1': pools})
+
+    assert session.is_busy() is True               # waits on the batch queue
+    session._stalled_since -= ptd.QUEUE_WAIT_MAX + 1
+    assert session.is_busy() is False              # stalled too long
+    task.state = 'RUNNING'
+    assert session.is_busy() is True               # progress resets the cap
+    task.state = 'QUEUED'
+    assert session.is_busy() is True

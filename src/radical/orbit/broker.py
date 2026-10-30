@@ -462,7 +462,7 @@ class Broker:
         """Ask the hosted plugins to stop their background work cleanly.
 
         Runs the host's plugin-shutdown path *on the host loop* (cancelling each
-        plugin's cleanup / reclaim-drain tasks and closing sessions) and waits a
+        plugin's cleanup task and closing sessions) and waits a
         bounded window, so a subsequent ``_stop_host_thread`` does not tear the
         loop down with plugin tasks still pending (the "Task was destroyed but
         it is pending" warnings)."""
@@ -1173,7 +1173,7 @@ class Broker:
         for name, ws in list(self.registry.items()):
             await self._send(ws, packed)
         # Deliver the rich topology to the hosted-plugin host (task_dispatcher
-        # consumes it for pilot-child liveness + owner-session reclaim-drain).
+        # consumes it for pilot-child liveness).
         self._deliver_topology_to_host()
         # Notify in-process topology listeners (the gateway's SSE fan-out).
         for cb in list(self._topology_listeners):

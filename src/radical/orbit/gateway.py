@@ -47,9 +47,8 @@ a stalled browser can never grow broker memory — the oldest frame is dropped a
 the loss is countable, never propagated back into the routing loop.
 
 **Sessions.**  Gateway-originated sessions carry **no participant identity** —
-they are capability-style within the token trust domain.  Only TTL/persistent
-sessions are meaningful for such callers; owner-checked reattach (403) does not
-apply.
+they are capability-style within the token trust domain, as all sessions are:
+any caller holding a sid can attach.  They idle-expire like any other session.
 
 The gateway serves the **exact** HTTP surface (paths, response shapes, SSE
 message envelopes) that the Explorer UI and other HTTP clients expect; it is the

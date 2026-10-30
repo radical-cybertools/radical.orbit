@@ -154,6 +154,13 @@ class PSIJSession(PluginSession):
         self._cleanup_stale_output()
         self._output_dir.mkdir(parents=True, exist_ok=True)
 
+    def is_busy(self) -> bool:
+        """Probed at the idle deadline: busy while a job is not terminal --
+        reaping the session would stop its status polling and remove the
+        running jobs' output dir.  A copy: psij threads mutate ``_jobs``."""
+        return any(self._job_states.get(j) not in TERMINAL_STATES
+                   for j in list(self._jobs))
+
     def _effective_state(self, job_id: str, raw_state: str) -> str:
         """Map a psij state to what the caller should see.
 
@@ -165,6 +172,9 @@ class PSIJSession(PluginSession):
         """
         if job_id in self._cancelled_jobs and raw_state in ('COMPLETED', 'FAILED'):
             return 'CANCELED'
+        known = self._job_states.get(job_id)
+        if known in TERMINAL_STATES and raw_state not in TERMINAL_STATES:
+            return known    # e.g. a failed submit: psij still says NEW
         return raw_state
 
     def _cleanup_stale_output(self) -> None:
@@ -199,6 +209,9 @@ class PSIJSession(PluginSession):
             return
         if status is None:
             status = job.status
+        if self._job_states.get(job_id) in TERMINAL_STATES:
+            return      # terminal is final (a requested cancel remaps a
+                        # racing end before it is recorded: _effective_state)
         state = self._effective_state(job_id, _normalize_state(status.state))
         if state == self._job_states.get(job_id):
             return
@@ -322,7 +335,19 @@ class PSIJSession(PluginSession):
 
             job.set_job_status_callback(_on_status)
 
-            ex.submit(job)
+            try:
+                ex.submit(job)
+            except Exception as e:
+                # never submitted: no further state will arrive from psij.
+                # Record and notify FAILED (stays visible, stops pinning) --
+                # unless psij's callback already reported a terminal state
+                if self._job_states.get(job.id) not in TERMINAL_STATES:
+                    self._job_states[job.id] = 'FAILED'
+                    self.notify("job_status", {
+                        "job_id": job.id, "state": 'FAILED',
+                        "exit_code": None, "stdout": "",
+                        "stderr": f"submit failed: {e}"})
+                raise
 
             # Start background polling for job status updates
             self._start_polling()
@@ -406,8 +431,10 @@ class PSIJSession(PluginSession):
             raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
 
         # Record intent *before* calling cancel() so any status update
-        # that races with qdel gets mapped through _effective_state.
-        self._cancelled_jobs.add(job_id)
+        # that races with qdel gets mapped through _effective_state -- but
+        # not for a job already finished: its final state stands
+        if self._job_states.get(job_id) not in TERMINAL_STATES:
+            self._cancelled_jobs.add(job_id)
         try:
             job.cancel()
             return {"job_id": job_id, "status": "canceled"}

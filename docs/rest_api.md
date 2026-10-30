@@ -90,8 +90,9 @@ Every plugin automatically registers these routes under its namespace
 | Method | Path | Description |
 |----|----|----|
 | `POST` | `register_session` | Create or reconnect to a session. Body (optional):
-`{sid, lifetime, ttl}`. Returns `{"sid": "<session_id>"}`. |
+`{sid, ttl}` (`ttl`: idle timeout in seconds, fixed at creation, `0` = never; legacy `lifetime` accepted). Returns `{"sid": "<session_id>"}`. |
 | `POST` | `unregister_session/{sid}` | Close and remove a session. Returns `{"ok": true}` |
+| `POST` | `touch/{sid}` | Count as an access of the session (keepalive), nothing else. Returns `{}` |
 | `GET` | `version` | Plugin version. Returns `{"version": "x.y.z"}` |
 | `GET` | `list_sessions` | Active session IDs. Returns `{"sessions": [...]}` |
 | `GET` | `health` | Health check. Returns status, uptime, active session count |
@@ -680,10 +681,9 @@ All plugin endpoints return standard HTTP status codes:
 - `200` — Success
 - `400` — Bad request (missing/invalid parameters)
 - `401` — Missing or invalid broker token (ingress auth)
-- `403` — Session owned by another participant (cross-owner reattach)
 - `404` — Session, resource, or endpoint not found
-- `409` — Conflict (e.g. incoherent/conflicting session lifetime policy)
-- `410` — Session expired (TTL exceeded)
+- `409` — Conflict (e.g. invalid session `ttl` / `lifetime`)
+- `410` — Session ended (idle expiry or `unregister_session`); the detail says why
 - `500` — Internal server error
 - `502` — Bad gateway (upstream participant returned an invalid response)
 - `503` — Broker/endpoint at concurrency cap (too many in-flight calls)
@@ -710,9 +710,9 @@ validation body is preserved as-is and is *not* rewrapped in this envelope.
 |--------|--------------------------------------------------------------------|
 | `400`  | Bad request — missing or invalid parameters                        |
 | `401`  | Missing or invalid broker token (ingress auth gate)                |
-| `403`  | Forbidden — permission denied / cross-owner session reattach       |
+| `403`  | Forbidden — permission denied                                      |
 | `404`  | Not found — session, resource, route, or endpoint                  |
-| `409`  | Conflict — e.g. target already exists, incoherent lifetime         |
+| `409`  | Conflict — e.g. target already exists, invalid session ttl         |
 | `500`  | Internal server error — unhandled handler exception                |
 | `502`  | Bad gateway — upstream participant returned an invalid response    |
 | `503`  | At concurrency cap — too many in-flight calls (with `Retry-After`) |

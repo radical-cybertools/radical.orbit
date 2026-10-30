@@ -66,18 +66,6 @@ except ImportError:
 
 log = logging.getLogger('radical.orbit')
 
-# 409 detail marker: an owner-less session cannot rotate its credential
-# (GlobusClient falls back to a new session on exactly this refusal).
-ROTATION_REFUSED = 'owner-less session cannot rotate its credential'
-
-# 403 detail marker of the base owner check (Plugin._check_owner): the sid
-# belongs to another participant.  A Globus-side 403 does not carry it.
-OWNER_REFUSED    = 'owned by another participant'
-
-# 409 detail marker: the session expired or was unregistered before the
-# rotation could land (the client falls back to a new session).
-SESSION_ENDED    = 'ended before its credential could be rotated'
-
 # Background poll interval for active transfer tasks (seconds).
 GLOBUS_POLL_INTERVAL = 10.0
 
@@ -93,6 +81,10 @@ GLOBUS_TERMINAL = {'SUCCEEDED', 'FAILED', 'CANCELED', 'CANCELLED'}
 # Statuses that end ``task_wait``: the task has left ACTIVE.  INACTIVE
 # (e.g. an expired credential) is not terminal but needs intervention.
 GLOBUS_WAIT_DONE = GLOBUS_TERMINAL | {'INACTIVE'}
+
+# A transfer whose status could not be fetched for this long (seconds; e.g.
+# an expired access token) no longer keeps its session busy.
+GLOBUS_STALE_STATUS = 1800
 
 # Local-collection config file (lowest-priority auto-detection source).
 GLOBUS_CONFIG_FILE = '~/.radical/orbit/globus.json'
@@ -353,7 +345,8 @@ class GlobusSession(PluginSession):
                 status_code=502,
                 detail='Globus submit_transfer: missing task_id in response')
 
-        self._tasks[task_id] = {'status': 'ACTIVE', 'label': label or ''}
+        self._tasks[task_id] = {'status': 'ACTIVE', 'label': label or '',
+                                'seen': time.time()}
         self._start_polling()
 
         log.info('[globus] session %s: submitted transfer %s (%s -> %s)',
@@ -444,7 +437,8 @@ class GlobusSession(PluginSession):
             self._tc.submit_delete, ddata, context='submit_delete'))
         task_id = res.get('task_id')
         if task_id:
-            self._tasks[task_id] = {'status': 'ACTIVE', 'label': label or ''}
+            self._tasks[task_id] = {'status': 'ACTIVE', 'label': label or '',
+                                    'seen': time.time()}
             self._start_polling()
         return {'task_id'      : task_id,
                 'submission_id': res.get('submission_id'),
@@ -532,6 +526,18 @@ class GlobusSession(PluginSession):
 
     # -- background polling -------------------------------------------------
 
+    def is_busy(self) -> bool:
+        """Probed at the idle deadline: busy while a transfer is not yet
+        reported terminal.  INACTIVE does not count: it waits on a human
+        (consent, expired credential) and must not pin the session and its
+        credential -- nor does a transfer whose status has not been fetched
+        for ``GLOBUS_STALE_STATUS`` (e.g. the poll fails on an expired
+        token)."""
+        cutoff = time.time() - GLOBUS_STALE_STATUS
+        return any(meta.get('notified') not in GLOBUS_WAIT_DONE
+                   and meta.get('seen', 0) > cutoff
+                   for meta in list(self._tasks.values()))
+
     def _start_polling(self) -> None:
         '''(Re)start the shared status poller for the session's active tasks.'''
         self.start_status_poller(
@@ -594,6 +600,7 @@ class GlobusSession(PluginSession):
         status = res.get('status')
         if not status:
             return
+        meta['seen'] = time.time()
         if meta.get('status') in GLOBUS_TERMINAL \
                 and status not in GLOBUS_TERMINAL:
             return
@@ -633,19 +640,21 @@ class GlobusClient(PluginClient):
                          refresh_token: Optional[str]    = None,
                          client_id: Optional[str]        = None,
                          local_collection: Optional[str] = None,
-                         new_session: bool               = False) -> None:
+                         new_session: bool               = False,
+                         ttl: Optional[float]            = None) -> None:
         '''Register a Globus session.
 
         Supply either ``access_token`` or ``refresh_token`` + ``client_id``.
         ``local_collection`` overrides the endpoint's configured default.
         Calling it again on a registered client rotates the credential of
-        the same session (its tracked tasks are kept); where the server
-        refuses rotation (owner-less session, or a sid now owned by another
-        participant, or one that ended meanwhile) a new session is
-        registered.  ``new_session=True`` always registers a new one — e.g.
-        to switch Globus identity, which rotation does not support.  The old
+        the same session (its tracked tasks are kept).  If that session has
+        ended (expired or unregistered), this raises (HTTP 410, with the
+        reason); ``new_session=True`` registers a new one -- also the way to
+        switch Globus identity, which rotation does not support.  The old
         session is not released (it may be shared); call
-        ``unregister_session()`` first to release it.
+        ``unregister_session()`` first to release it.  ``ttl`` is the idle
+        timeout in seconds of a new session (``0``: never expires; ignored
+        on rotation).
         '''
         payload: Dict[str, Any] = {}
         if self._sid and not new_session:
@@ -654,22 +663,9 @@ class GlobusClient(PluginClient):
         if refresh_token:    payload['refresh_token']    = refresh_token
         if client_id:        payload['client_id']        = client_id
         if local_collection: payload['local_collection'] = local_collection
+        payload.update(self._session_payload(None, None, ttl) or {})
 
         resp = self._http.post(self._url('register_session'), json=payload)
-        if 'sid' in payload and (
-                (resp.status_code == 403 and OWNER_REFUSED in resp.text) or
-                (resp.status_code == 409 and (ROTATION_REFUSED in resp.text or
-                                              SESSION_ENDED in resp.text))):
-            # owner-less session (e.g. via the gateway) cannot rotate, or
-            # the sid expired and now belongs to another participant:
-            # register a new one.  An owner-less old session is left to idle
-            # expiry — it is shared by design, others may still use it.
-            log.warning('[globus] session %s cannot rotate its credential; '
-                        'registering a new session — tasks tracked by %s '
-                        'are not carried over', self._sid, self._sid)
-            payload = {k: v for k, v in payload.items() if k != 'sid'}
-            resp    = self._http.post(self._url('register_session'),
-                                      json=payload)
         self._raise(resp)
         self._sid = resp.json()['sid']
 
@@ -887,9 +883,9 @@ class PluginGlobus(Plugin):
         ``_normalize_session_policy`` so a globus session gets the same
         lifetime/owner bookkeeping every other plugin's sessions get.
 
-        Re-registering an existing ``sid`` passes ``_check_rotation`` (owned
-        sessions only, by their owner, same policy) and then rotates the
-        credential in place: the session keeps its tracked tasks and
+        Re-registering an existing ``sid`` (any holder of it, as any may
+        attach) rotates the credential in place: the session keeps its
+        tracked tasks and
         poller, the old SDK clients are retired and released on a timer
         (see ``GlobusSession.adopt_credential``), and ``local_collection``
         changes only when the body gives one.  The reserved ``default`` sid
@@ -925,7 +921,7 @@ class PluginGlobus(Plugin):
 
         self._ensure_cleanup_task()
         owner              = self._request_owner(request)
-        sid, lifetime, ttl = self._normalize_session_policy(data)
+        sid, lifetime, ttl = await self._normalize_session_policy(data)
         rotating = False
         if sid is None:
             sid = f'session.{uuid.uuid4().hex[:8]}'
@@ -935,9 +931,6 @@ class PluginGlobus(Plugin):
             # a known sid (live, or expired but unswept) is a rotation: it
             # either lands on the live session or is refused, never revived
             rotating = True
-            if await self._live_session(sid) is not None:
-                # fail fast, before the credential is exercised
-                self._check_rotation(sid, owner, lifetime, ttl)
 
         kwargs = {'access_token'    : access_token,
                   'refresh_token'   : refresh_token,
@@ -968,11 +961,9 @@ class PluginGlobus(Plugin):
             raise
 
         # Re-check after the (possibly offloaded) build: the sid may have
-        # been created meanwhile by a concurrent register.
+        # been created (or ended) meanwhile.
         try:
             existing = await self._live_session(sid)
-            if existing is not None:
-                self._check_rotation(sid, owner, lifetime, ttl)
         except BaseException:         # incl. cancellation: nothing holds it
             session._close_clients()
             raise
@@ -989,39 +980,20 @@ class PluginGlobus(Plugin):
             # credential could land: do not silently recreate it
             session._close_clients()
             raise HTTPException(
-                status_code=409,
-                detail=f"session {sid} {SESSION_ENDED} — register a new "
-                       "session")
+                status_code=410,
+                detail=self._ended_detail(sid)
+                       or f"session {sid} has ended — register a new session")
         self._record_session(sid, session, lifetime, ttl, owner)
         log.info('[globus] Registered session %s', sid)
         return {'sid': sid}
 
     async def _live_session(self, sid: str) -> Optional[GlobusSession]:
-        '''Return the session under ``sid``, dropping it first if it has
+        '''Return the session under ``sid``, ending it first if it has
         expired but was not swept yet — a rotation must not revive it.'''
         record = self._records.get(sid)
-        if record is not None and self._is_expired(record, time.time()):
-            await self._drop_session(sid)
+        if record is not None:
+            await self._expire_if_due(sid, record, time.time())
         return self._sessions.get(sid)
-
-    def _check_rotation(self, sid: str, owner: Optional[str],
-                        lifetime: str, ttl: Optional[float]) -> None:
-        '''Gate a re-register of an existing ``sid`` (credential rotation).
-
-        Stricter than the base reattach: the base lets anyone reattach an
-        owner-less session, which is harmless for a reattach but would let
-        any caller swap the credential others act under.  An owner-less
-        session therefore cannot rotate (409, register a new session); an
-        owned one only by its owner (403), under the same policy (409).
-        '''
-        record = self._records.get(sid)
-        if record is None or record.owner is None:
-            raise HTTPException(
-                status_code=409,
-                detail=f"session {sid}: {ROTATION_REFUSED} — register a "
-                       "new session")
-        self._check_owner(sid, owner)
-        self._check_policy_conflict(sid, lifetime, ttl)
 
     async def _ensure_default_session(self):
         '''A globus session needs a caller credential: there is no shared

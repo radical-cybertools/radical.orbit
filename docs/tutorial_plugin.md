@@ -71,9 +71,11 @@ Things to note:
   which marks the session inactive. Real plugins cancel background pollers
   and close backend connections here.
 
-Session *lifetime* (when an abandoned session is reclaimed) is a policy the
-caller selects at registration time — you do not implement anything for it.
-See the *Lifetime policies* section in [Plugin Development](plugin_development.md).
+Session *lifetime* (the idle timeout after which an abandoned session ends)
+is set by the caller at registration time — you do not implement anything for
+it.  A session that runs long work without emitting notifications overrides
+`is_busy()`.  See the *Session lifetime* section in
+[Plugin Development](plugin_development.md).
 
 ## Step 2 — the plugin
 

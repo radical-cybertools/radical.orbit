@@ -37,10 +37,10 @@ class RequestShim:
     Encoding-agnostic: stores raw bytes, decodes lazily based on content_type.
 
     ``headers`` is a plain dict.  The serving runtime injects the trusted
-    ``x-orbit-src`` owner header here (see ``runtime._dispatch_served``); the
-    old-stack ``service.py`` and the broker gateway pass no such header, so
-    ``headers.get('x-orbit-src')`` is ``None`` there (owner-less,
-    capability-style within the token trust domain).
+    ``x-orbit-src`` owner header here (see ``runtime._dispatch_served``),
+    recorded on sessions for diagnostics only; the broker plugin host passes
+    only the ``x-orbit-client`` tag (it selects how an idle expiry is
+    logged), so ``headers.get('x-orbit-src')`` is ``None`` there.
     """
 
     def __init__(self, path_params : dict,

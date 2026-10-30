@@ -58,3 +58,25 @@ def test_plugin_client_close_with_session_calls_unregister():
     client.close()
     # unregister_session should have been called (POST to unregister)
     mock_http.post.assert_called_once()
+
+
+def test_plugin_client_touch_posts_the_touch_route():
+    mock_http = MagicMock()
+    mock_http.post.return_value = MagicMock(is_error=False)
+    client = PluginClient(mock_http, "/base",
+                          endpoint_id="e1", plugin_name="p1")
+    with pytest.raises(Exception):
+        client.touch()                      # no session yet
+    client._sid = "sid-abc"
+    client.touch()
+    assert mock_http.post.call_args[0][0].endswith("touch/sid-abc")
+
+
+def test_plugin_client_ttl_is_sent_in_the_legacy_form_too():
+    '''Endpoints of the previous release accept ttl only with
+    lifetime='ttl', and ttl=0 only as lifetime='persistent'.'''
+    assert PluginClient._session_payload(None, None, 60) == \
+        {'lifetime': 'ttl', 'ttl': 60}
+    assert PluginClient._session_payload(None, None, 0) == \
+        {'lifetime': 'persistent'}
+    assert PluginClient._session_payload('s', None, None) == {'sid': 's'}

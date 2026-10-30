@@ -307,7 +307,7 @@ class PluginReplay(Plugin):
     version       = '0.0.1'
 
     # Retention tunables — injectable per instance for tests (mirrors the
-    # session_ttl / reclaim_drain precedent).
+    # session_ttl precedent).
     session_max_age   = _SESSION_MAX_AGE
     session_max_bytes = _SESSION_MAX_BYTES
     global_max_bytes  = _GLOBAL_MAX_BYTES

@@ -2,6 +2,8 @@
 
 # pylint: disable=protected-access,unused-import
 
+import inspect
+
 import pytest
 
 from fastapi import FastAPI
@@ -308,6 +310,11 @@ def test_discover_entry_points_smoke():
 # PluginHostBase — concrete test subclass
 # ---------------------------------------------------------------------------
 
+def _bound(handler):
+    """The plugin a (possibly session-wrapped) route handler is bound to."""
+    return getattr(inspect.unwrap(handler), '__self__', None)
+
+
 class _TestHost(PluginHostBase):
     """Concrete subclass for testing the mixin."""
 
@@ -460,15 +467,14 @@ async def test_deregister_strips_direct_routes():
     p1 = await host.register_dynamic_plugin(_DummyPlugin, 'dummy.one')
     p1.add_route_get('probe', lambda req: {'ok': 1})
     routes_after_register = list(app.state.direct_routes)
-    assert any(entry[3].__self__ is p1 for entry in routes_after_register), \
+    assert any(_bound(entry[3]) is p1 for entry in routes_after_register), \
         "test setup: expected at least one route bound to the new plugin"
 
     await host.deregister_dynamic_plugin('dummy.one')
 
     # No surviving route should be bound to the deregistered instance.
-    assert not any(entry[3].__self__ is p1
-                   for entry in app.state.direct_routes
-                   if hasattr(entry[3], '__self__')), \
+    assert not any(_bound(entry[3]) is p1
+                   for entry in app.state.direct_routes), \
         "stale routes for deregistered plugin remained in direct_routes"
 
 
@@ -489,7 +495,7 @@ async def test_reregister_replaces_routes_cleanly():
     for entry in app.state.direct_routes:
         method, pattern, _, handler = entry
         if method == 'GET' and pattern.match('/dummy.one/probe'):
-            assert getattr(handler, '__self__', None) is not p1, \
+            assert _bound(handler) is not p1, \
                 "stale route from p1 still ahead of p2 in match order"
             # First match wins; p2's must be it.
             assert handler({}) == {'ok': 2}

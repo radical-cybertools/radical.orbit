@@ -2626,3 +2626,24 @@ def test_client_data_helpers():
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
+
+
+def test_rhapsody_is_busy_while_a_task_is_not_terminal():
+    session = RhapsodySession("test.busy")
+    assert session.is_busy() is False
+    session._tasks['t.1'] = {'uid': 't.1', 'state': 'DONE'}
+    assert session.is_busy() is False
+    session._tasks['t.2'] = {'uid': 't.2', 'state': 'RUNNING'}
+    assert session.is_busy() is True
+
+
+def test_rhapsody_client_register_session_passes_sid_and_ttl():
+    from radical.orbit.plugin_rhapsody import RhapsodyClient
+    http = MagicMock()
+    http.post.return_value = MagicMock(
+        is_error=False, json=lambda: {'sid': 's1', 'status': 'ready'})
+    client = RhapsodyClient(http, '/rhapsody')
+    client._start_task_listener = lambda: None
+    client.register_session(sid='s1', ttl=7200)
+    assert http.post.call_args.kwargs['json'] == {'sid': 's1', 'ttl': 7200,
+                                                  'lifetime': 'ttl'}
