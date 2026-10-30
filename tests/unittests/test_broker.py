@@ -1101,3 +1101,28 @@ async def test_broker_call_unsent_raises_request_not_sent(make_broker):
         assert issubclass(protocol.RequestNotSent, RuntimeError)
     finally:
         await broker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_broker_call_unpackable_request_is_request_not_sent(
+        make_broker, monkeypatch):
+    """A non-size pack failure is a ``RequestNotSent`` (as in the runtime's
+    ``_call``), with nothing sent and no in-flight entry."""
+    broker = make_broker()
+    await broker.startup()
+    try:
+        ws = FakeWS()
+        broker.registry['e2'] = ws
+
+        def _bad(msg, cap=protocol.FRAME_CAP):
+            raise protocol.ProtocolError("failed to pack 'request'")
+
+        monkeypatch.setattr(protocol, 'pack_message', _bad)
+        with pytest.raises(protocol.RequestNotSent, match='failed to pack'):
+            await broker.caller.call('e2', 'GET', '/p', timeout=5.0)
+        assert ws.sent == [] and broker._calls == {}
+        assert broker.caller.call_timeout == broker._call_timeout
+    finally:
+        monkeypatch.undo()
+        broker.registry.pop('e2', None)
+        await broker.shutdown()

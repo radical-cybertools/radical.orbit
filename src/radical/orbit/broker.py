@@ -181,6 +181,11 @@ class BrokerCaller:
         """The broker's frame cap, which bounds every call it sends."""
         return self._broker._frame_cap
 
+    @property
+    def call_timeout(self) -> float:
+        """The broker's call timeout (seconds), its relay reap deadline."""
+        return self._broker._call_timeout
+
     async def call(self, dst: str, method: str, path: str, *,
                    body:    bytes                    = b'',
                    headers: Optional[Dict[str, str]] = None,
@@ -904,6 +909,9 @@ class Broker:
                     'body':    error_body(413, f"request body of "
                                                f"{len(body or b'')} bytes too "
                                                f"large for {dst!r}: {e}")}
+        except protocol.ProtocolError as e:
+            raise protocol.RequestNotSent(
+                f"request to {dst!r} not sent: {e}") from e
 
         fut = self._loop.create_future()
         self._calls[corr_id] = _Call(BROKER_NAME, dst, fut,

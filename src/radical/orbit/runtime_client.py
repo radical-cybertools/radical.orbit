@@ -68,6 +68,19 @@ def max_body_of(holder) -> int:
     return protocol.max_body(frame_cap_of(holder))
 
 
+def call_timeout_of(holder) -> float | None:
+    """Return the published ``call_timeout`` (seconds) of *holder*, if any.
+
+    The runtime and broker-caller transports publish theirs; the submit
+    retry window is derived from it (``plugin_rhapsody._submit_batches``).
+    """
+    val = getattr(holder, 'call_timeout', None)
+    if isinstance(val, (int, float)) and not isinstance(val, bool) \
+            and val > 0:
+        return float(val)
+    return None
+
+
 def frame_cap_of(holder) -> int:
     """Return the published ``frame_cap`` of *holder*, else the default."""
     cap = getattr(holder, 'frame_cap', None)
@@ -212,6 +225,11 @@ class _RuntimeHTTP:
     def max_body(self) -> int:
         """Largest request body the runtime's frame cap carries."""
         return max_body_of(self._runtime)
+
+    @property
+    def call_timeout(self) -> float | None:
+        """The runtime's call timeout (seconds)."""
+        return call_timeout_of(self._runtime)
 
     def get(self, url: str, *, params=None, headers=None, **kw
             ) -> RuntimeResponse:

@@ -17,7 +17,8 @@ def _reset_batch_system_detection():
 
 @pytest.fixture(autouse=True)
 def _no_submit_backoff(monkeypatch):
-    """Submit retries resend at once in tests (no real backoff sleeps).
+    """Submit retries resend at once in tests (no real backoff sleeps), at
+    most 3 times (the default is bounded by the retry window only).
 
     Patched only when the module is loaded already: importing it here would
     pre-empt the rhapsody mocks some test modules install before import.
@@ -26,3 +27,4 @@ def _no_submit_backoff(monkeypatch):
     prh = sys.modules.get('radical.orbit.plugin_rhapsody')
     if prh is not None:
         monkeypatch.setattr(prh, 'SUBMIT_BACKOFF', (0.0,))
+        monkeypatch.setattr(prh, 'SUBMIT_MAX_RETRIES', 3)

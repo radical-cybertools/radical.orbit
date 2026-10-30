@@ -299,6 +299,12 @@ class EndpointRuntime(PluginHostBase):
         return self._frame_cap
 
     @property
+    def call_timeout(self) -> float:
+        """Default timeout (seconds) of a consumer call -- and of a served
+        request's handler."""
+        return self._call_timeout
+
+    @property
     def embedded_broker(self):
         """The in-process :class:`Broker` when ``embedded=True``, else None."""
         return self._embedded.broker if self._embedded else None

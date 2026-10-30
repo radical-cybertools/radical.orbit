@@ -858,7 +858,8 @@ class TestEndpointMode:
 
             r = client.post(f'{plugin.namespace}/cancel/{sid}/t.1')
             assert r.status_code == 200
-            rh_mock.cancel_task.assert_called_once_with('t.1')
+            # the target session sees the session-namespaced uid
+            rh_mock.cancel_task.assert_called_once_with('t.1.A')
 
     def test_endpoint_mode_shape_400_still_fires(self, tmp_path):
         _, plugin = _make_plugin(tmp_path)
@@ -1026,7 +1027,7 @@ class TestEndpointMode:
         assert r.status_code == 400, r.text
         assert 't.1' not in plugin._endpoint_mode_tasks
 
-    @pytest.mark.parametrize('status', [404, 409, 410])
+    @pytest.mark.parametrize('status', [404, 410])
     def test_endpoint_mode_session_refusal_is_502_and_evicts(self, tmp_path,
                                                              status):
         """The target's rhapsody session is gone or not ready: 502, and the
@@ -1034,7 +1035,7 @@ class TestEndpointMode:
         fresh session."""
         from radical.orbit.plugin_rhapsody import PartialSubmitError
         _, plugin = _make_plugin(tmp_path)
-        stale = object()
+        stale = MagicMock()
         plugin._child_clients[('ep', 'rhapsody', None)] = stale
         client = TestClient(plugin._app)
         sid = _register(client, plugin, body={'sid': 'A',
@@ -1052,6 +1053,80 @@ class TestEndpointMode:
         assert r.status_code == 502, r.text
         assert ('ep', 'rhapsody', None) not in plugin._child_clients
         assert 't.1' not in plugin._endpoint_mode_tasks
+        # the evicted session is unregistered, best-effort, in background
+        deadline = time.time() + 5
+        while not stale.unregister_session.called and time.time() < deadline:
+            time.sleep(0.01)
+        stale.unregister_session.assert_called_once()
+
+    def test_endpoint_mode_initializing_409_is_503_no_eviction(self,
+                                                               tmp_path):
+        from radical.orbit.plugin_rhapsody import PartialSubmitError
+        _, plugin = _make_plugin(tmp_path)
+        cached = MagicMock()
+        plugin._child_clients[('ep', 'rhapsody', None)] = cached
+        client = TestClient(plugin._app)
+        sid = _register(client, plugin, body={'sid': 'A',
+                                              'lifetime': 'persistent'})
+        self._seed_topology(plugin, {'ep': ['rhapsody']})
+        rh_mock = MagicMock()
+        rh_mock.submit_tasks = MagicMock(side_effect=PartialSubmitError(
+            'HTTP 409 — initializing', status_code=409, failed=['t.1'],
+            refused=True))
+        with patch.object(plugin, '_get_rhapsody_client',
+                          new=AsyncMock(return_value=rh_mock)):
+            r = client.post(f'{plugin.namespace}/submit/{sid}', json={
+                'endpoint': 'ep', 'task_id': 't.1',
+                'cmd': ['/bin/true'], 'cwd': '/tmp'})
+        assert r.status_code == 503, r.text
+        assert r.headers['retry-after'] == '1'
+        assert plugin._child_clients[('ep', 'rhapsody', None)] is cached
+        cached.unregister_session.assert_not_called()
+
+    def test_endpoint_mode_uid_is_namespaced_and_reexecutes(self, tmp_path):
+        """The target sees f'{task_id}.{sid}': a task_id another session
+        reuses is no duplicate there.  After the task FAILED, a resubmit of
+        the same task_id goes out under the next attempt's uid and re-runs;
+        an in-flight resubmit keeps the uid (the target deduplicates)."""
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _register(client, plugin, body={'sid': 'A',
+                                              'lifetime': 'persistent'})
+        self._seed_topology(plugin, {'ep': ['rhapsody']})
+        rh_mock = MagicMock()
+        rh_mock.submit_tasks = MagicMock(return_value=[])
+        body = {'endpoint': 'ep', 'task_id': 't.1',
+                'cmd': ['/bin/true'], 'cwd': '/tmp'}
+        sent = lambda: rh_mock.submit_tasks.call_args.args[0][0]['uid']
+        with patch.object(plugin, '_get_rhapsody_client',
+                          new=AsyncMock(return_value=rh_mock)):
+            client.post(f'{plugin.namespace}/submit/{sid}', json=body)
+            assert sent() == 't.1.A'
+            client.post(f'{plugin.namespace}/submit/{sid}', json=body)
+            assert sent() == 't.1.A'                  # in flight: same uid
+            plugin._on_task_status({'uid': 't.1.A', 'state': 'FAILED'})
+            assert 't.1' not in plugin._endpoint_mode_tasks
+            client.post(f'{plugin.namespace}/submit/{sid}', json=body)
+            assert sent() == 't.1.A.1'                # re-executes
+
+    def test_endpoint_mode_ledger_keeps_uid_across_restart(self, tmp_path):
+        plugin_a = _make_plugin(tmp_path)[1]
+        plugin_a._em_map('t.1', 'ep', 't.1.A.2', 't.1.A')
+        plugin_a._persist_endpoint_mode()
+        # plus a pre-namespacing entry: endpoint name only
+        import json as _json
+        ledger = _json.loads(plugin_a._endpoint_mode_path.read_text())
+        ledger['t.old'] = 'ep2'
+        plugin_a._endpoint_mode_path.write_text(_json.dumps(ledger))
+
+        plugin_b = _make_plugin(tmp_path)[1]
+        assert plugin_b._endpoint_mode_tasks == {'t.1': 'ep', 't.old': 'ep2'}
+        assert plugin_b._em_uid('t.1')   == 't.1.A.2'
+        assert plugin_b._em_uid('t.old') == 't.old'
+        notified = []
+        plugin_b._dispatch_notify = lambda t, d: notified.append(d)
+        plugin_b._on_task_status({'uid': 't.1.A.2', 'state': 'DONE'})
+        assert notified[0]['task_id'] == 't.1'
 
     def test_endpoint_mode_terminal_duplicate_ack_completes(self, tmp_path):
         """Resubmitting a task_id the target already finished: the target
@@ -1060,11 +1135,13 @@ class TestEndpointMode:
         notified = []
         plugin, r = self._endpoint_mode_submit(
             tmp_path, None, notified=notified,
-            result=[{'uid': 't.1', 'state': 'DONE', 'exit_code': 0,
+            result=[{'uid': 't.1.A', 'state': 'DONE', 'exit_code': 0,
                      'duplicate': True}])
         assert r.status_code == 200, r.text
+        assert r.json()['state'] == TASK_DONE      # consistent with the ack
         assert 't.1' not in plugin._endpoint_mode_tasks
         assert notified and notified[-1][1]['state'] == TASK_DONE
+        assert notified[-1][1]['task_id'] == 't.1'
 
     def test_terminal_batch_event_is_handled(self, tmp_path):
         '''Several completions in one frame arrive as task_status_batch.'''
@@ -1351,6 +1428,30 @@ class TestRhapsodyDialect:
         plugin, tasks, _ = self._submit_many(tmp_path, 2, submit)
         assert tasks[0].state == TASK_DONE
         assert tasks[1].state == TASK_RUNNING
+
+    def test_retry_header_acks_existing_as_duplicate(self, tmp_path):
+        """A client's resend (retry header) never re-executes: an existing
+        uid is acked as a duplicate in any state.  A fresh resubmit of a
+        FAILED task still re-executes."""
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _register(client, plugin, body={
+            'pools': [_pool_dict()], 'sid': 'A', 'lifetime': 'persistent'})
+        ps = _pool(plugin, sid, 'cpu')
+        with patch.object(ps.policy, 'pick_dispatch', return_value=None):
+            client.post(f'{plugin.namespace}/submit_rh/{sid}',
+                        json={'tasks': [_dialect_td('t.1')]})
+            ps.tasks['t.1'].state = TASK_FAILED
+            r = client.post(f'{plugin.namespace}/submit_rh/{sid}',
+                            json={'tasks': [_dialect_td('t.1')]},
+                            headers={'X-Orbit-Submit-Retry': '1'})
+            assert r.json() == [{'uid': 't.1', 'state': TASK_FAILED,
+                                 'duplicate': True}]
+            assert ps.tasks['t.1'].attempt == 0
+            r = client.post(f'{plugin.namespace}/submit_rh/{sid}',
+                            json={'tasks': [_dialect_td('t.1')]})
+            assert r.json() == [{'uid': 't.1', 'state': TASK_QUEUED}]
+            assert ps.tasks['t.1'].attempt == 1
 
     def test_reexecute_after_failure_uses_attempt_suffix(self, tmp_path):
         """The pilot never re-runs a uid, so a re-execute (resubmit after
