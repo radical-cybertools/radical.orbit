@@ -2724,9 +2724,18 @@ def test_two_sessions_with_colliding_uids_get_their_own_results():
 
 
 
+_TIMERS: list = []
+
+
+def _join_timers():
+    while _TIMERS:
+        _TIMERS.pop().join(timeout=5)
+
+
 def _client_registering_as(sid, events_during_post):
     """A RhapsodyClient whose register_session POST returns *sid* while the
-    given session_status events are delivered (some after a short delay)."""
+    given session_status events are delivered (some after a short delay;
+    tests call ``_join_timers`` at the end)."""
     client = _make_rhapsody_client()
     client._bc, client._endpoint_id, client._plugin_name = MagicMock(), "ep", "rhapsody"
     cbs = []
@@ -2742,7 +2751,9 @@ def _client_registering_as(sid, events_during_post):
         for delay, data in events_during_post:
             fire = (lambda d=data: cbs[0]("ep", "rhapsody", "session_status", d))
             if delay:
-                threading.Timer(delay, fire).start()
+                timer = threading.Timer(delay, fire)
+                _TIMERS.append(timer)
+                timer.start()
             else:
                 fire()
         return resp
@@ -2758,6 +2769,7 @@ def test_register_session_ignores_other_sessions_status():
         (0,   {"sid": "s-a", "status": "ready"}),
         (0.2, {"sid": "s-b", "status": "ready"})])
     client.register_session(init_timeout=5)
+    _join_timers()
     assert client.sid == "s-b"
 
 
@@ -2767,6 +2779,7 @@ def test_register_session_own_failure_raises():
         (0.1, {"sid": "s-b", "status": "failed", "error": "boom"})])
     with pytest.raises(RuntimeError, match="boom"):
         client.register_session(init_timeout=5)
+    _join_timers()
 
 
 def test_register_session_other_ready_does_not_unblock():
@@ -2779,7 +2792,24 @@ def test_register_session_sidless_status_accepted():
     """An older endpoint sends session_status without sid: still accepted."""
     client = _client_registering_as("s-b", [(0.1, {"status": "ready"})])
     client.register_session(init_timeout=5)
+    _join_timers()
     assert client.sid == "s-b"
+
+
+def test_register_session_failed_post_unregisters_callback():
+    """A failing POST must not leave the session_status callback behind."""
+    client = _client_registering_as("s-b", [])
+    removed = []
+    client.unregister_notification_callback = \
+        lambda cb, topic=None: removed.append(topic)
+
+    def boom(url, json=None):
+        raise RuntimeError("POST failed")
+
+    client._http.post = boom
+    with pytest.raises(RuntimeError, match="POST failed"):
+        client.register_session(init_timeout=5)
+    assert removed == ["session_status"]
 
 
 if __name__ == '__main__':

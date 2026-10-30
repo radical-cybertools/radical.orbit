@@ -706,7 +706,10 @@ class RhapsodySession(PluginSession):
     def _frame_budget(self) -> int:
         """Bytes available for task payloads per frame: ``notify`` adds the
         session id to each frame after the split."""
-        return self._notify_batch_bytes - self._sid_bytes
+        # never below half the budget: a tiny cap plus a long sid must not
+        # disable coalescing
+        return max(self._notify_batch_bytes - self._sid_bytes,
+                   self._notify_batch_bytes // 2)
 
     def _split_frames(self, batch: list[dict]) -> list[list[dict]]:
         """Split notifications into frames under ``_frame_budget()``.
@@ -1454,7 +1457,19 @@ class RhapsodyClient(PluginClient):
 
             self.register_notification_callback(_on_session_status,
                                                 topic="session_status")
+        try:
+            self._register_and_wait(backends, init_timeout, has_sse,
+                                    outcomes, changed)
+        finally:
+            # also when the POST fails: never leave the callback behind
+            if has_sse:
+                self.unregister_notification_callback(_on_session_status,
+                                                      topic="session_status")
+        self._start_task_listener()
 
+    def _register_and_wait(self, backends, init_timeout, has_sse,
+                           outcomes, changed):
+        """POST register_session, then wait until our session is ready."""
         payload = {}
         if backends:
             payload['backends'] = backends
@@ -1472,10 +1487,6 @@ class RhapsodyClient(PluginClient):
             self._completed.clear()
 
         if status == 'ready':
-            if has_sse:
-                self.unregister_notification_callback(
-                    _on_session_status, topic="session_status")
-            self._start_task_listener()
             return  # fast path: init was synchronous
 
         if not has_sse:
@@ -1483,27 +1494,21 @@ class RhapsodyClient(PluginClient):
             return
 
         # Wait for async init to complete via SSE notification
-        try:
-            deadline = time.time() + init_timeout
-            mine     = None
-            while mine is None:
-                mine = outcomes.get(self._sid) or outcomes.get(None)
-                remaining = deadline - time.time()
-                if mine is not None or remaining <= 0:
-                    break
-                changed.wait(timeout=remaining)
-                changed.clear()            # outcomes is re-checked next loop
-            if mine is None:
-                raise RuntimeError(
-                    f"Session init timed out after {init_timeout}s")
-            if mine[0] == 'failed':
-                raise RuntimeError(
-                    f"Session init failed on endpoint: {mine[1]}")
-        finally:
-            self.unregister_notification_callback(_on_session_status,
-                                                  topic="session_status")
-
-        self._start_task_listener()
+        deadline = time.monotonic() + init_timeout
+        mine     = None
+        while mine is None:
+            mine = outcomes.get(self._sid) or outcomes.get(None)
+            remaining = deadline - time.monotonic()
+            if mine is not None or remaining <= 0:
+                break
+            changed.wait(timeout=remaining)
+            changed.clear()            # outcomes is re-checked next loop
+        if mine is None:
+            raise RuntimeError(
+                f"Session init timed out after {init_timeout}s")
+        if mine[0] == 'failed':
+            raise RuntimeError(
+                f"Session init failed on endpoint: {mine[1]}")
 
     def _start_task_listener(self):
         """Register persistent SSE callback that accumulates completions."""
