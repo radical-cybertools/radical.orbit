@@ -952,12 +952,14 @@ class EndpointRuntime(PluginHostBase):
                             callback: Callable = None) -> None:
         key = (endpoint_id, plugin_name, topic)
         with self._cb_lock:
-            cbs = self._callbacks.get(key)
+            # equality: a bound method is a new object on every attribute
+            # access, and unregisters as passed at registration
+            cbs = [(cb, m) for (cb, m) in self._callbacks.get(key, [])
+                   if cb != callback]
             if cbs:
-                # equality: a bound method is a new object on every
-                # attribute access, and unregisters as passed at registration
-                self._callbacks[key] = [(cb, m) for (cb, m) in cbs
-                                        if cb != callback]
+                self._callbacks[key] = cbs
+                return                  # others still listen: keep it
+            self._callbacks.pop(key, None)
         self._emit(protocol.Unsubscribe(
             src=self._name,
             patterns=[protocol.SubscribePattern(

@@ -3703,7 +3703,10 @@ def test_example_rhapsody_runs_against_the_client(capsys):
 def test_reconcile_chunks_by_bytes_and_splits_on_413():
     """The reconcile sizes requests by uid bytes; an endpoint with a smaller
     budget answers 413 and the request is split until it fits."""
-    from radical.orbit.plugin_rhapsody import _task_states_fits
+    from radical.orbit.plugin_rhapsody import _task_states_fits, _uid_bytes
+
+    def _fits(chunk, budget):
+        return _task_states_fits(len(chunk), _uid_bytes(chunk), budget)
 
     uids    = [f'task.{"l" * 40}.{i:03d}' for i in range(60)]
     session = _done_session('sid-bytes', uids)
@@ -3713,7 +3716,7 @@ def test_reconcile_chunks_by_bytes_and_splits_on_413():
     client, http = _reconciling_client(rt, session)
     try:
         from radical.orbit.plugin_rhapsody import NOTIFY_BATCH_BYTES
-        assert all(_task_states_fits(c, NOTIFY_BATCH_BYTES // 2)
+        assert all(_fits(c, NOTIFY_BATCH_BYTES // 2)
                    for c in client._uid_chunks('sid-bytes', uids))
         client._states_budget = 64 * 1024      # client: assumes more
         assert len(client._uid_chunks('sid-bytes', uids)) == 1
@@ -3722,7 +3725,7 @@ def test_reconcile_chunks_by_bytes_and_splits_on_413():
         assert len(client.wait_tasks(uids, timeout=10)) == 60
         assert len(http.threads) > 2           # 413s, then split calls
         # learned: the next pass sizes its requests to what was accepted
-        assert all(_task_states_fits(c, session._frame_budget())
+        assert all(_fits(c, session._frame_budget())
                    for c in client._uid_chunks('sid-bytes', uids))
     finally:
         client.close()
@@ -4545,6 +4548,219 @@ def test_last_all_topics_callback_drops_its_registration():
     assert not client._fanout_all and client._fanout_on
     client.register_notification_callback(cb1)
     assert [t for t, _ in rt.callbacks].count(None) == 1
+
+
+
+# ---------------------------------------------------------------------------
+# Code-review round 6
+# ---------------------------------------------------------------------------
+
+def test_task_states_budgets_the_json_it_sends():
+    """Non-ASCII output is escaped by json.dumps (6 bytes per character):
+    the response is measured as sent, alone and stripped entries too."""
+    session = _done_session('sid-json', [])
+    session._notify_batch_bytes = 6000         # frame cap 12000
+    session._output_notify_limit = 100_000
+    uids = [f't.j{i}' for i in range(6)]
+    for uid in uids:
+        session._tasks[uid] = _output_task(uid, '\u00e4' * 300, '')
+    budget = session._frame_budget()
+    todo = list(uids)
+    while todo:
+        body = asyncio.run(session.task_states(todo))
+        assert len(json.dumps(body)) <= budget
+        todo = body['remaining']
+
+    session._tasks['t.huge'] = _output_task('t.huge', '\u00e4' * 3000, '')
+    body = asyncio.run(session.task_states(['t.huge']))
+    assert 'too large' in body['tasks'][0]['error']
+    assert len(json.dumps(body)) < 12000
+
+
+def test_runtime_unsubscribes_only_when_the_last_callback_goes():
+    """Unregistering one of two callbacks of a pattern keeps the broker
+    subscription; the last one sends the unsubscribe."""
+    from radical.orbit import protocol
+
+    rt = _bare_runtime()
+
+    def a(*x):
+        pass
+
+    def b(*x):
+        pass
+
+    for cb in (a, b):
+        rt.register_callback('ep', 'rhapsody', 'task_status', cb)
+    rt._emit.reset_mock()
+    rt.unregister_callback('ep', 'rhapsody', 'task_status', a)
+    assert rt._emit.call_count == 0
+    rt.unregister_callback('ep', 'rhapsody', 'task_status', b)
+    assert rt._emit.call_count == 1
+    assert isinstance(rt._emit.call_args.args[0], protocol.Unsubscribe)
+    assert ('ep', 'rhapsody', 'task_status') not in rt._callbacks
+
+
+def test_gone_session_fails_its_pending_tasks():
+    """When the session is gone for good, its pending tasks complete as
+    FAILED and their waiters wake."""
+    session = _done_session('sid-gone2', [])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session)
+    http.post = lambda url, json=None, **kw: _SessionHTTP._resp(
+        410, {'detail': 'session expired: sid-gone2'})
+    try:
+        _track(client, ['task.a', 'task.b'])
+        client._reconcile_wake.set()
+        done = client.wait_tasks(['task.a', 'task.b'], timeout=5)
+        assert [t['state'] for t in done] == ['FAILED', 'FAILED']
+        assert 'gone' in done[0]['error']
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
+def test_drop_pass_waits_for_submits_in_flight():
+    """A drop-woken pass waits until in-flight submits are acked, so their
+    uids are covered."""
+    session = _done_session('sid-flight', ['task.f'])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session)
+    asked = []
+    orig  = http.post
+
+    def _record(url, json=None, **kw):
+        asked.extend(json['uids'])
+        return orig(url, json=json, **kw)
+
+    http.post = _record
+    try:
+        with client._cond:
+            client._submitted.add('task.f')
+            client._inflight = 1                # its POST is in flight
+        client._reconcile_wake.set()
+        time.sleep(0.1)
+        assert asked == []                      # waits for the ack
+        client._track_pending('sid-flight', [{'uid': 'task.f'}])
+        with client._cond:
+            client._inflight = 0
+            client._cond.notify_all()
+        assert client.wait_tasks(['task.f'], timeout=5)[0]['state'] == 'DONE'
+        assert asked == ['task.f']
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
+def test_no_tracking_without_a_subscription():
+    """A client without a runtime (no events, no reconcile) keeps no
+    pending / uncertain state."""
+    client = _make_rhapsody_client([{'uid': 't.1', 'state': 'SUBMITTED'}])
+    client.submit_tasks([{'uid': 't.1', 'executable': '/bin/true'}])
+    assert client._pending == {} and client._uncertain == {}
+    assert client._submitted == {'t.1'}
+
+
+def test_all_topics_register_unregister_race():
+    """Concurrent registration and unregistration of all-topics callbacks
+    leave the runtime registration matching the local callbacks."""
+    rt     = _bare_runtime()
+    client = _sse_client(MagicMock(), rt=rt)
+    cbs    = [(lambda *a: None) for _ in range(8)]
+
+    def _churn(cb):
+        for _ in range(200):
+            client.register_notification_callback(cb)
+            client.unregister_notification_callback(cb)
+
+    threads = [threading.Thread(target=_churn, args=(cb,)) for cb in cbs]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    client.register_notification_callback(cbs[0])
+    assert len(rt._callbacks[('ep', 'rhapsody', None)]) == 1
+    client.unregister_notification_callback(cbs[0])
+    assert ('ep', 'rhapsody', None) not in rt._callbacks
+
+
+@pytest.mark.filterwarnings(
+    "ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_reconcile_pass_errors_are_contained():
+    """A raising pass is logged and counted, the thread goes on; a thread
+    that dies anyway is detached."""
+    session = _done_session('sid-crash', ['task.c'])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, _ = _reconciling_client(rt, session)
+    client._reconcile_retry = 0.02
+    calls = []
+    orig  = client._reconcile
+
+    def _flaky(*a):
+        calls.append(1)
+        if len(calls) == 1:
+            raise ValueError('bug')
+        return orig(*a)
+
+    client._reconcile = _flaky
+    try:
+        _track(client, ['task.c'])
+        client._reconcile_wake.set()
+        assert client.wait_tasks(['task.c'], timeout=5)[0]['state'] == 'DONE'
+        assert client._reconcile_errors == 1
+        assert client._reconcile_thread.is_alive()
+
+        thread = client._reconcile_thread
+        client._snapshot = MagicMock(side_effect=RuntimeError('worse'))
+        _track(client, ['task.d'])
+        client._reconcile_wake.set()
+        thread.join(5)
+        assert not thread.is_alive() and client._reconcile_thread is None
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
+def test_unregister_session_winds_down_like_close():
+    """unregister_session() stops the reconcile, drops the registrations
+    and wakes waiters, as close() does."""
+    session = _done_session('sid-unreg', [])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, _ = _reconciling_client(rt, session)
+    thread = client._reconcile_thread
+    _track(client, ['task.w'])
+    errors = []
+
+    def _wait():
+        try:
+            client.wait_tasks(['task.w'], timeout=10)
+        except RuntimeError as e:
+            errors.append(e)
+
+    waiter = threading.Thread(target=_wait)
+    waiter.start()
+    time.sleep(0.05)
+    client.unregister_session()
+    waiter.join(5)
+    assert errors and 'withdrawn' in str(errors[0])
+    assert not thread.is_alive() and client._reconcile_thread is None
+    assert rt.callbacks == [] and client.sid is None
+    rt._cb.stop()
+
+
+def test_task_states_terminal_only_must_be_a_boolean():
+    _, plugin, client = _make_plugin()
+    sid, _ = _states_session(plugin, client, [_done_task("task.d", 1)])
+    url = f"{plugin.namespace}/task_states/{sid}"
+    for flag, status in ((True, 200), ('true', 200), ('False', 200),
+                         ('yes', 400), (1, 400), (None, 400)):
+        resp = client.post(url, json={"uids": ["task.d"],
+                                      "terminal_only": flag})
+        assert resp.status_code == status, flag
 
 
 _TIMERS: list = []
