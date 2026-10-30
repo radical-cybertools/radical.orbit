@@ -2913,6 +2913,327 @@ def test_two_sessions_with_colliding_uids_get_their_own_results():
 
 
 
+
+# ---------------------------------------------------------------------------
+# Client fan-out and reconcile of lost task notifications
+# ---------------------------------------------------------------------------
+
+class _FakeRuntime:
+    """Runtime stand-in: its callback registry feeds a real
+    CallbackDispatcher, the way ``EndpointRuntime._on_event`` does."""
+
+    def __init__(self, maxlen=1024):
+        from radical.orbit.runtime_support import CallbackDispatcher
+        self._cb       = CallbackDispatcher(maxlen=maxlen)
+        self.callbacks = []                     # (topic, callback)
+
+    def register_callback(self, endpoint_id=None, plugin_name=None,
+                          topic=None, callback=None):
+        self.callbacks.append((topic, callback))
+
+    def unregister_callback(self, endpoint_id=None, plugin_name=None,
+                            topic=None, callback=None):
+        self.callbacks = [(t, cb) for t, cb in self.callbacks
+                          if (t, cb) != (topic, callback)]
+
+    def deliver(self, topic, data):
+        for t, cb in list(self.callbacks):
+            if t is None or t == topic:
+                self._cb.submit(cb, 'ep', 'rhapsody', topic, data)
+
+
+class _SessionHTTP:
+    """httpx-shaped transport serving ``task_states`` from a session."""
+
+    def __init__(self, session, gate=None):
+        self.session = session
+        self.gate    = gate
+        self.threads = []                       # thread of each task_states
+
+    def post(self, url, json=None, **kwargs):
+        body = {}
+        if 'task_states' in url:
+            self.threads.append(threading.current_thread().name)
+            if self.gate is not None:
+                self.gate.wait(10)
+            body = asyncio.run(self.session.task_states(json['uids']))
+        resp = MagicMock()
+        resp.is_error, resp.status_code = False, 200
+        resp.json = MagicMock(return_value=body)
+        return resp
+
+
+def _done_session(sid, uids, tag=None):
+    session = RhapsodySession(sid)
+    session._rh_session = MagicMock()
+    session._init_ready.set()
+    for uid in uids:
+        session._tasks[uid] = _done_task(uid, f'{tag or sid}:{uid}')
+    return session
+
+
+def _reconciling_client(rt, session, idle=60.0, gate=None):
+    http   = _SessionHTTP(session, gate)
+    client = RhapsodyClient(http, '/rhapsody', broker_client=rt,
+                            endpoint_id='ep', plugin_name='rhapsody')
+    client._sid              = session.sid
+    client._reconcile_idle   = idle
+    client._reconcile_settle = 0.01
+    client._start_task_listener()
+    return client, http
+
+
+def _backend_recorder(client):
+    """Register a backend-style callback (as rhapsody's
+    OrbitExecutionBackend does) and return what it receives."""
+    got = {'uids': [], 'sids': set()}
+
+    def _cb(endpoint, plugin, topic, data):
+        tasks = data.get('tasks', []) if topic == 'task_status_batch' \
+            else [data]
+        got['sids'].add(data.get('sid'))
+        got['uids'].extend(t['uid'] for t in tasks)
+
+    client.register_notification_callback(_cb, topic='task_status')
+    client.register_notification_callback(_cb, topic='task_status_batch')
+    return got
+
+
+def _until(cond, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while not cond() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return cond()
+
+
+def test_fan_out_one_runtime_callback_per_topic():
+    """The client holds the only runtime registration per task topic; the
+    backend callbacks it records run after ``_on_task_done``, in order, on
+    the same (decoded) data object."""
+    import base64
+    import threading as _threading
+
+    from radical.orbit import protocol
+    from radical.orbit.runtime import EndpointRuntime
+
+    rt = EndpointRuntime.__new__(EndpointRuntime)
+    rt._callbacks = {}
+    rt._cb_lock   = _threading.Lock()
+    rt._name      = 'test-consumer'
+    rt._emit      = MagicMock()
+    queued: list  = []
+    rt._cb        = MagicMock()
+    rt._cb.submit = lambda fn, *args: queued.append((fn, args))
+
+    client = RhapsodyClient(MagicMock(), '/rhapsody', broker_client=rt,
+                            endpoint_id='ep', plugin_name='rhapsody')
+    client._sid = 'sid-a'
+    client._start_task_listener()
+    try:
+        seen = []
+
+        def _backend_cb(endpoint, plugin, topic, data):
+            seen.append(('backend', topic, data['return_value']))
+
+        def _other_cb(endpoint, plugin, topic, data):
+            seen.append(('other', topic, data['return_value']))
+
+        for topic in ('task_status', 'task_status_batch'):
+            client.register_notification_callback(_backend_cb, topic=topic)
+        client.register_notification_callback(_other_cb, topic='task_status')
+
+        for topic in ('task_status', 'task_status_batch'):
+            assert len(rt._callbacks[('ep', 'rhapsody', topic)]) == 1
+
+        rt._on_event(protocol.Event(
+            src='ep', plugin='rhapsody', topic='task_status',
+            data={'uid': 't.1', 'state': 'DONE', 'sid': 'sid-a',
+                  'return_value': base64.b64encode(b'raw').decode(),
+                  '_return_value_encoding': 'base64'}))
+        assert len(queued) == 1                 # one queue entry per event
+        for fn, args in queued:
+            fn(*args)
+        assert seen == [('backend', 'task_status', b'raw'),
+                        ('other',   'task_status', b'raw')]
+        assert client._completed['t.1']['return_value'] == b'raw'
+
+        client.unregister_notification_callback(_other_cb,
+                                                topic='task_status')
+        assert client._fanout['task_status'] == [_backend_cb]
+    finally:
+        client._stop_reconcile()
+
+
+def test_reconcile_after_client_drop():
+    """Callback-queue overflow: the drop hook wakes the reconcile, and both
+    wait_tasks and the backend callbacks see every completion."""
+    uids    = [f'task.d{i:03d}' for i in range(50)]
+    session = _done_session('sid-drop', uids)
+    rt      = _FakeRuntime(maxlen=4)            # dispatcher not started yet
+    client, http = _reconciling_client(rt, session, idle=60.0)
+    try:
+        backend = _backend_recorder(client)
+        client._submitted.update(uids)
+
+        for uid in uids:
+            payload = session._notification_payload(session._tasks[uid])
+            rt.deliver('task_status', {**payload, 'sid': session.sid})
+        assert rt._cb.dropped == 46
+
+        rt._cb.start()
+        done = client.wait_tasks(uids, timeout=10)
+        assert [t['state'] for t in done] == ['DONE'] * 50
+        assert [t['return_value'] for t in done] \
+            == [f'sid-drop:{u}' for u in uids]
+        assert _until(lambda: set(backend['uids']) == set(uids))
+        assert backend['sids'] == {'sid-drop'}
+        assert http.threads and set(http.threads) == {'orbit-rh-reconcile'}
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
+def test_reconcile_after_broker_drop():
+    """A broker-side drop is invisible to the client: the idle path
+    recovers it (no dispatcher drop involved)."""
+    from radical.orbit.queues import BoundedDropOldestQueue
+
+    uids    = [f'task.b{i:03d}' for i in range(50)]
+    session = _done_session('sid-broker', uids)
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, _ = _reconciling_client(rt, session, idle=0.05)
+    try:
+        backend = _backend_recorder(client)
+        client._submitted.update(uids)
+
+        broker_q = BoundedDropOldestQueue(4)    # the broker's event_queue
+        for uid in uids:
+            payload = session._notification_payload(session._tasks[uid])
+            broker_q.push(('task_status', {**payload, 'sid': session.sid}))
+        assert broker_q.dropped == 46
+        while broker_q.buf:
+            rt.deliver(*broker_q.buf.popleft())
+
+        done = client.wait_tasks(uids, timeout=10)
+        assert [t['state'] for t in done] == ['DONE'] * 50
+        assert rt._cb.dropped == 0
+        assert _until(lambda: set(backend['uids']) == set(uids))
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
+def test_reconcile_two_clients_recover_their_own():
+    """Two sessions with colliding uids on one runtime: each client
+    recovers only its own uids, and its synthesized events carry its sid."""
+    uids = [f'task.t{i:03d}' for i in range(20)]
+    rt   = _FakeRuntime(maxlen=4)
+    sessions = [_done_session(sid, uids) for sid in ('sid-a', 'sid-b')]
+    clients, backends = [], []
+    try:
+        for session in sessions:
+            client, _ = _reconciling_client(rt, session)
+            client._submitted.update(uids)
+            clients.append(client)
+            backends.append(_backend_recorder(client))
+
+        for session in sessions:                # the broadcast
+            for uid in uids:
+                payload = session._notification_payload(session._tasks[uid])
+                rt.deliver('task_status', {**payload, 'sid': session.sid})
+        rt._cb.start()
+
+        for client in clients:
+            done = client.wait_tasks(uids, timeout=10)
+            assert [t['return_value'] for t in done] \
+                == [f'{client.sid}:{u}' for u in uids]
+        for client, backend in zip(clients, backends):
+            # the backend saw its own sid (recovered), plus foreign real
+            # events that its own sid filter drops — never a sid-less one
+            assert _until(lambda b=backend: set(b['uids']) == set(uids))
+            assert client.sid in backend['sids'] and None not in \
+                backend['sids']
+    finally:
+        for client in clients:
+            client.close()
+        rt._cb.stop()
+
+
+def test_reconcile_unknown_uids_fail_and_inflight_skipped():
+    """A uid the endpoint does not know is completed as FAILED; a uid whose
+    submit is still in flight is not asked for."""
+    session = _done_session('sid-unk', ['task.known'])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session)
+    try:
+        client._submitted.update(['task.known', 'task.lost', 'task.busy'])
+        client._submitting.add('task.busy')
+        assert sorted(client._outstanding()) == ['task.known', 'task.lost']
+
+        client._reconcile_wake.set()
+        assert _until(lambda: 'task.lost' in client._completed)
+        assert client._completed['task.lost']['state'] == 'FAILED'
+        assert 'unknown' in client._completed['task.lost']['error']
+        assert client._completed['task.known']['state'] == 'DONE'
+        assert 'task.busy' not in client._completed
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
+def test_drop_hook_does_not_block_the_work_loop():
+    """The drop hook only wakes the reconcile thread: delivering into a
+    full queue returns at once even while a reconcile fetch is stuck."""
+    gate    = threading.Event()
+    session = _done_session('sid-hook', ['task.h1'])
+    rt      = _FakeRuntime(maxlen=1)
+    client, http = _reconciling_client(rt, session, gate=gate)
+    try:
+        client._submitted.add('task.h1')
+        rt.deliver('task_status', {'uid': 'task.x', 'state': 'RUNNING'})
+        t0 = time.monotonic()
+        for _ in range(20):                     # all dropped
+            rt.deliver('task_status', {'uid': 'task.x', 'state': 'RUNNING'})
+        assert _until(lambda: http.threads)     # reconcile is in its fetch
+        for _ in range(20):
+            rt.deliver('task_status', {'uid': 'task.x', 'state': 'RUNNING'})
+        assert time.monotonic() - t0 < 1.0
+        assert http.threads == ['orbit-rh-reconcile']
+    finally:
+        gate.set()
+        rt._cb.start()
+        client.close()
+        rt._cb.stop()
+
+
+def test_close_during_reconcile_stops_cleanly():
+    """close() waits for the reconcile in flight, then the thread is gone
+    and the drop hook is removed."""
+    gate    = threading.Event()
+    session = _done_session('sid-close', ['task.c1'])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session, gate=gate)
+    thread = client._reconcile_thread
+    client._submitted.add('task.c1')
+    client._reconcile_wake.set()
+    assert _until(lambda: http.threads)         # reconcile is in its fetch
+
+    closer = threading.Thread(target=client.close)
+    closer.start()
+    closer.join(0.2)
+    assert closer.is_alive()                    # waits for the reconcile
+    gate.set()
+    closer.join(10)
+    assert not closer.is_alive()
+    assert not thread.is_alive()
+    assert client._reconcile_thread is None
+    assert rt._cb._hooks == []
+    rt._cb.stop()
+
+
 _TIMERS: list = []
 
 
