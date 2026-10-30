@@ -349,8 +349,8 @@ class FederationClient(PluginClient):
     '''Application-side client for the federation plugin.
 
     Every call uses the reserved ``default`` session: federation state is
-    global to the plugin instance, and a client-minted session would be
-    swept after an idle hour.
+    global to the plugin instance, and a client-minted session would
+    idle-expire (it owns nothing, so other sessions keep the default timeout).
     '''
 
     # Every federation route is addressed with the reserved persistent
@@ -423,7 +423,6 @@ class PluginFederation(Plugin):
     session_class = FederationSession
     client_class  = FederationClient
     version       = '0.0.1'
-    session_ttl   = 0       # broker-hosted federation state: until closed
     ui_module     = os.path.join(os.path.dirname(__file__),
                                  'data', 'plugins', 'federation.js')
 

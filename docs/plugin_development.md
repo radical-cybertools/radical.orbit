@@ -215,7 +215,7 @@ session's idle timeout and, for reconnect, a client-supplied session id:
 A session expires once it was idle for longer than its timeout.  The
 timeout is fixed at creation: `ttl` seconds, `0` for never; omitted, the
 plugin's `session_ttl` class attribute applies (900 s by default; the task
-dispatcher and xgfabric use 86400 s, federation uses 0).  Set `ttl` for sessions that are reconnected to after long
+dispatcher and xgfabric use 86400 s).  Set `ttl` for sessions that are reconnected to after long
 idle phases.  The legacy `lifetime` field stays accepted: `persistent` means
 `ttl=0`, `ephemeral` the plugin default; an explicit `ttl` wins.
 

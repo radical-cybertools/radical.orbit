@@ -752,7 +752,9 @@ class TaskDispatcherSession(PluginSession):
         a pilot of its pool is pending or starting (e.g. a long batch-queue
         wait).  Queued tasks stop counting after ``QUEUE_WAIT_MAX`` without
         any running task: an abandoned pool whose pilots keep failing (each
-        replacement pending again) must not keep submitting forever.
+        replacement pending again) must not keep submitting forever.  The
+        stall is first seen at a deadline probe, so such a pool ends one
+        idle timeout plus ``QUEUE_WAIT_MAX`` after its last access.
         '''
         if self._plugin is None:
             return False
