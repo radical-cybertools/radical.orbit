@@ -814,6 +814,73 @@ def test_send_notification_sets_event_session():
         (('echo_rt', 'demo', {'k': 2}), {})]
 
 
+def _bare_runtime(maxlen=1024):
+    """A runtime with a callback registry and a real (unstarted) dispatcher
+    queue, but no transport: what _on_event / register_callback touch."""
+    from unittest.mock import MagicMock
+    from radical.orbit.runtime import EndpointRuntime
+    from radical.orbit.runtime_support import CallbackDispatcher
+
+    rt = EndpointRuntime.__new__(EndpointRuntime)
+    rt._name      = 'consumer'
+    rt._callbacks = {}
+    rt._cb_lock   = threading.Lock()
+    rt._emit      = MagicMock()
+    rt._cb        = CallbackDispatcher(maxlen=maxlen)
+    return rt
+
+
+def _ev(session, topic='t', src='ep', plugin='rh', seq=0):
+    from radical.orbit import protocol
+    return protocol.Event(src=src, plugin=plugin, topic=topic,
+                          session=session, seq=seq, ts=0.0, data={})
+
+
+def test_session_callback_local_routing():
+    """A session callback never gets another session's event — it is dropped
+    before the callback queue — but still gets session-less events (older
+    endpoints).  The broker pattern carries no session (wire unchanged)."""
+    rt = _bare_runtime()
+    cb = lambda *a: None                              # noqa: E731
+    rt.register_callback(endpoint_id='ep', plugin_name='rh', topic='t',
+                         callback=cb, session='sid-a')
+    sub = rt._emit.call_args.args[0]
+    assert [p.model_dump() for p in sub.patterns] \
+        == [{'endpoint': 'ep', 'plugin': 'rh', 'topic': 't'}]
+
+    for _ in range(5):
+        rt._on_event(_ev('sid-b'))                    # foreign: not queued
+    assert rt._cb._q.qsize() == 0 and rt._cb.dropped == 0
+    rt._on_event(_ev('sid-a'))
+    rt._on_event(_ev(None))                           # older endpoint
+    assert rt._cb._q.qsize() == 2
+
+    # a session-less registration of the same pattern still gets them all
+    other = lambda *a: None                           # noqa: E731
+    rt.register_callback(endpoint_id='ep', plugin_name='rh', topic='t',
+                         callback=other)
+    rt._on_event(_ev('sid-b'))
+    assert [rt._cb._q.get_nowait()[0] for _ in range(3)] == [cb, cb, other]
+
+
+def test_session_callback_unregister():
+    """Unregister removes the registration of that session only; the last
+    one removes the pattern from the resync set."""
+    rt = _bare_runtime()
+    cb = lambda *a: None                              # noqa: E731
+    for sid in ('sid-a', 'sid-b'):
+        rt.register_callback(endpoint_id='ep', plugin_name='rh',
+                             callback=cb, session=sid)
+    rt.unregister_callback(endpoint_id='ep', plugin_name='rh',
+                           callback=cb, session='sid-a')
+    assert rt._callbacks[('ep', 'rh', None)] == [(cb, False, 'sid-b')]
+    rt.unregister_callback(endpoint_id='ep', plugin_name='rh', callback=cb)
+    assert rt._callbacks[('ep', 'rh', None)] == [(cb, False, 'sid-b')]
+    rt.unregister_callback(endpoint_id='ep', plugin_name='rh',
+                           callback=cb, session='sid-b')
+    assert rt._callbacks == {}
+
+
 # ---------------------------------------------------------------------------
 # item 4: with_meta delivers broker-stamped seq matching what replay retains
 # ---------------------------------------------------------------------------
