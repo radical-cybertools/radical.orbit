@@ -343,6 +343,7 @@ class RhapsodySession(PluginSession):
         self._flush_scheduled        = False
         self._notify_window          = NOTIFY_BATCH_WINDOW
         self._notify_batch_bytes     = NOTIFY_BATCH_BYTES
+        self._sid_bytes              = _payload_size({'sid': sid})
         self._return_value_limit     = RETURN_VALUE_LIMIT
         self._output_notify_limit    = OUTPUT_NOTIFY_LIMIT
 
@@ -353,6 +354,19 @@ class RhapsodySession(PluginSession):
         # Profiler — injected by PluginRhapsody._create_session (shared with
         # the endpoint runtime); ``None`` for sessions built directly in tests.
         self._prof: rprof.Profiler | None = None
+
+    # task notifications carry the session id: they are broadcast to every
+    # consumer of the plugin, and task uids are only unique per client
+    _SCOPED_TOPICS = ('task_status', 'task_status_batch')
+
+    def notify(self, topic: str, data: dict) -> None:
+        """Send a notification; task notifications get this session's ``sid``.
+
+        The payload is copied, so buffered task dicts are not modified.
+        """
+        if topic in self._SCOPED_TOPICS:
+            data = {**data, 'sid': self.sid}
+        super().notify(topic, data)
 
     async def initialize(self) -> None:
         """Asynchronously initialize the session and its backends."""
@@ -638,7 +652,7 @@ class RhapsodySession(PluginSession):
             window   = self._notify_window
             now      = window <= 0 \
                        or len(self._notify_buf) >= NOTIFY_BATCH_SIZE \
-                       or self._notify_bytes >= self._notify_batch_bytes
+                       or self._notify_bytes >= self._frame_budget()
             schedule = not now and not self._flush_scheduled
             if schedule:
                 self._flush_scheduled = True
@@ -689,8 +703,16 @@ class RhapsodySession(PluginSession):
             else:
                 self.notify("task_status_batch", {"tasks": frame})
 
+    def _frame_budget(self) -> int:
+        """Bytes available for task payloads per frame: ``notify`` adds the
+        session id to each frame after the split."""
+        # never below half the budget: a tiny cap plus a long sid must not
+        # disable coalescing
+        return max(self._notify_batch_bytes - self._sid_bytes,
+                   self._notify_batch_bytes // 2)
+
     def _split_frames(self, batch: list[dict]) -> list[list[dict]]:
-        """Split notifications into frames under ``_notify_batch_bytes``.
+        """Split notifications into frames under ``_frame_budget()``.
 
         A single payload larger than the budget still ships alone — it is
         bounded by ``_return_value_limit`` (half the frame) plus
@@ -700,10 +722,11 @@ class RhapsodySession(PluginSession):
         frames: list[list[dict]] = []
         frame:  list[dict]       = []
         nbytes                   = 0
+        budget = self._frame_budget()
 
         for payload in batch:
             size = _payload_size(payload)
-            if frame and nbytes + size > self._notify_batch_bytes:
+            if frame and nbytes + size > budget:
                 frames.append(frame)
                 frame  = []
                 nbytes = 0
@@ -1320,19 +1343,33 @@ class RhapsodyClient(PluginClient):
         # UIDs submitted via this client — lets wait_tasks() reject UIDs that
         # were never submitted instead of blocking on them forever.
         self._submitted: set[str] = set()
+        self._warned_no_sid = False
 
     def _on_task_done(self, endpoint, plugin, topic, data):
         """Persistent SSE callback: accumulate terminal task states.
 
         Handles both single ``task_status`` and bulk
-        ``task_status_batch`` notifications.
+        ``task_status_batch`` notifications.  Notifications of other
+        sessions (a different ``sid``) are ignored: they are broadcast to
+        every consumer of the plugin and their uids can collide with ours.
+        A notification without ``sid`` (older endpoint) is accepted.
         """
+        sid = data.get('sid')
+        if sid is None and not self._warned_no_sid:
+            self._warned_no_sid = True
+            log.warning("[rhapsody] task notifications without a session id "
+                        "(older endpoint, or the pool task dispatcher): results "
+                        "of other sessions with the same task uids cannot be "
+                        "told apart")
+
         if topic == 'task_status_batch':
             tasks = data.get('tasks', [])
         else:
             tasks = [data]
 
         with self._cond:
+            if sid is not None and sid != self.sid:
+                return
             changed = False
             for t in tasks:
                 self._decode_return_value(t)
@@ -1340,7 +1377,10 @@ class RhapsodyClient(PluginClient):
                 uid   = t.get('uid')
                 state = str(t.get('state', '')).upper()
                 if uid and state in TERMINAL_STATES:
-                    self._completed[uid] = t
+                    # stored without the envelope's sid: a completion looks
+                    # the same whether it came alone or in a batch frame
+                    self._completed[uid] = t if 'sid' not in t else \
+                        {k: v for k, v in t.items() if k != 'sid'}
                     changed = True
 
             if changed:
@@ -1400,63 +1440,82 @@ class RhapsodyClient(PluginClient):
                    self._plugin_name is not None)
 
         # Ensure the SSE listener is connected BEFORE we send the POST,
-        # so we never miss a fast init notification.
-        ready = threading.Event()
-        error = [None]
+        # so we never miss a fast init notification.  session_status is
+        # broadcast to every client of the plugin, and our sid is only known
+        # once the POST returns: record outcomes by sid, pick ours after.
+        changed  = threading.Event()
+        outcomes = {}      # sid (None: older endpoint) -> (status, error)
 
         if has_sse:
             self._bc.wait_for_listener(timeout=30)
 
             def _on_session_status(endpoint, plugin, topic, data):
                 st = data.get('status')
-                if st == 'ready':
-                    ready.set()
-                elif st == 'failed':
-                    error[0] = data.get('error', 'unknown init error')
-                    ready.set()
+                if st in ('ready', 'failed'):
+                    outcomes[data.get('sid')] = (
+                        st, data.get('error', 'unknown init error'))
+                    changed.set()
 
             self.register_notification_callback(_on_session_status,
                                                 topic="session_status")
+        try:
+            self._register_and_wait(backends, init_timeout, has_sse,
+                                    outcomes, changed)
+        finally:
+            # also when the POST fails: never leave the callback behind
+            if has_sse:
+                self.unregister_notification_callback(_on_session_status,
+                                                      topic="session_status")
+        self._start_task_listener()
 
+    def _register_and_wait(self, backends, init_timeout, has_sse,
+                           outcomes, changed):
+        """POST register_session, then wait until our session is ready."""
         payload = {}
         if backends:
             payload['backends'] = backends
         resp = self._http.post(self._url('register_session'), json=payload)
         self._raise(resp)
 
-        data      = resp.json()
-        self._sid = data['sid']
-        status    = data.get('status')
+        data   = resp.json()
+        status = data.get('status')
 
-        # Reset the session-wide task completion accumulator
+        # Switch to the new session and reset the session-wide completion
+        # accumulator in one step, so a late notification of the old session
+        # cannot pass the sid check and land after the reset.
         with self._cond:
+            self._sid = data['sid']
             self._completed.clear()
 
         if status == 'ready':
-            if has_sse:
-                self.unregister_notification_callback(
-                    _on_session_status, topic="session_status")
-            self._start_task_listener()
             return  # fast path: init was synchronous
+        if status == 'failed':
+            # reconnect to a session whose init already failed: its
+            # session_status event went out before we listened
+            raise RuntimeError(
+                f"Session init failed on endpoint: "
+                f"{data.get('error', 'unknown init error')}")
 
         if not has_sse:
             self._poll_session_ready(init_timeout)
             return
 
         # Wait for async init to complete via SSE notification
-        try:
-            ready.wait(timeout=init_timeout)
-            if error[0]:
-                raise RuntimeError(
-                    f"Session init failed on endpoint: {error[0]}")
-            if not ready.is_set():
-                raise RuntimeError(
-                    f"Session init timed out after {init_timeout}s")
-        finally:
-            self.unregister_notification_callback(_on_session_status,
-                                                  topic="session_status")
-
-        self._start_task_listener()
+        deadline = time.monotonic() + init_timeout
+        mine     = None
+        while mine is None:
+            mine = outcomes.get(self._sid) or outcomes.get(None)
+            remaining = deadline - time.monotonic()
+            if mine is not None or remaining <= 0:
+                break
+            changed.wait(timeout=remaining)
+            changed.clear()            # outcomes is re-checked next loop
+        if mine is None:
+            raise RuntimeError(
+                f"Session init timed out after {init_timeout}s")
+        if mine[0] == 'failed':
+            raise RuntimeError(
+                f"Session init failed on endpoint: {mine[1]}")
 
     def _start_task_listener(self):
         """Register persistent SSE callback that accumulates completions."""

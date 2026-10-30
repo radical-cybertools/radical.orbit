@@ -5,6 +5,8 @@ All RHAPSODY imports are mocked so the tests do not require the rhapsody
 package to be installed.
 '''
 
+import threading
+import time
 import json
 import asyncio
 
@@ -1824,7 +1826,8 @@ def test_notify_window_zero_flushes_immediately(monkeypatch):
     payload = {'uid': 'task.nw001', 'state': 'DONE'}
     session._queue_notification(payload)
 
-    plugin._dispatch_notify.assert_called_once_with('task_status', payload)
+    plugin._dispatch_notify.assert_called_once_with(
+        'task_status', {**payload, 'sid': sid})
     assert session._notify_buf == []
     assert not session._flush_scheduled
 
@@ -2624,5 +2627,211 @@ def test_client_data_helpers():
     rc._http.post.assert_called_with('/rhapsody/data_shutdown/sid.1/r')
 
 
+# ---------------------------------------------------------------------------
+# Session scoping of task notifications
+# ---------------------------------------------------------------------------
+
+def test_session_notify_stamps_sid_on_task_topics():
+    """Task notifications carry the session id; the payload is a copy."""
+    session = RhapsodySession("test.scope.1")
+    session._plugin = MagicMock()
+
+    single = {"uid": "task.000001", "state": "DONE"}
+    batch  = {"tasks": [{"uid": "task.000002", "state": "DONE"}]}
+    session.notify("task_status", single)
+    session.notify("task_status_batch", batch)
+    session.notify("session_status", {"state": "ready"})
+
+    calls = session._plugin._dispatch_notify.call_args_list
+    assert calls[0].args == ("task_status",
+                             {"uid": "task.000001", "state": "DONE",
+                              "sid": "test.scope.1"})
+    assert calls[1].args[1]["sid"] == "test.scope.1"
+    assert calls[1].args[1]["tasks"] == batch["tasks"]
+    assert "sid" not in calls[2].args[1]          # other topics unchanged
+    assert "sid" not in single and "sid" not in batch   # not mutated
+
+
+def test_client_ignores_other_session_task_notifications():
+    """Foreign-sid completions are dropped; own and sid-less are kept."""
+    client = _make_rhapsody_client()                # sid-rh
+
+    client._on_task_done(None, None, "task_status",
+                         {"uid": "task.000001", "state": "DONE",
+                          "return_value": "theirs", "sid": "sid-other"})
+    client._on_task_done(None, None, "task_status_batch",
+                         {"sid": "sid-other", "tasks": [
+                             {"uid": "task.000002", "state": "DONE"}]})
+    assert "task.000001" not in client._completed
+    assert "task.000002" not in client._completed
+
+    client._on_task_done(None, None, "task_status",
+                         {"uid": "task.000001", "state": "DONE",
+                          "return_value": "ours", "sid": "sid-rh"})
+    client._on_task_done(None, None, "task_status",          # older endpoint
+                         {"uid": "task.000003", "state": "DONE"})
+    assert client._completed["task.000001"]["return_value"] == "ours"
+    assert "task.000003" in client._completed
+    assert "sid" not in client._completed["task.000001"]   # same shape as batch
+
+
+def test_split_frames_reserves_room_for_sid():
+    """Frames stay within the budget after notify() adds the session id."""
+    from radical.orbit.plugin_rhapsody import _payload_size
+
+    session = RhapsodySession("test.scope.budget")
+    one = {"uid": "task.000001", "state": "DONE", "stdout": "x" * 60}
+    session._notify_batch_bytes = 2 * _payload_size(one)   # two fit without sid
+    frames = session._split_frames([dict(one), dict(one)])
+    assert len(frames) == 2                     # but not once sid is counted
+
+
+def test_client_wait_tasks_rejects_uid_only_seen_from_other_session():
+    """A uid completed by another session is not known to this client."""
+    client = _make_rhapsody_client()
+    client._on_task_done(None, None, "task_status",
+                         {"uid": "task.000009", "state": "DONE",
+                          "sid": "sid-other"})
+    with pytest.raises(ValueError, match="unknown task UID"):
+        client.wait_tasks(["task.000009"])
+
+
+def test_two_sessions_with_colliding_uids_get_their_own_results():
+    """Broadcast notifications of two sessions reach both clients; each
+    client keeps only its own session's result for the shared uid."""
+    sessions, sent = [], []
+    for sid in ("sid-a", "sid-b"):
+        s = RhapsodySession(sid)
+        s._rh_session = MagicMock()
+        s._plugin = MagicMock()
+        s._plugin._dispatch_notify.side_effect = \
+            lambda topic, data: sent.append((topic, data))
+        sessions.append(s)
+
+    for s, value in zip(sessions, ("from-a", "from-b")):
+        s.notify("task_status",
+                 s._notification_payload(_done_task("task.000001", value)))
+
+    clients = []
+    for sid in ("sid-a", "sid-b"):
+        c = _make_rhapsody_client()
+        c._sid = sid
+        for topic, data in sent:                  # the broadcast
+            c._on_task_done(None, None, topic, data)
+        clients.append(c)
+
+    assert clients[0]._completed["task.000001"]["return_value"] == "from-a"
+    assert clients[1]._completed["task.000001"]["return_value"] == "from-b"
+
+
+
+_TIMERS: list = []
+
+
+def _join_timers():
+    while _TIMERS:
+        _TIMERS.pop().join(timeout=5)
+
+
+@pytest.fixture
+def join_timers():
+    """Join the register_session test timers even when the test fails."""
+    yield
+    _join_timers()
+
+
+def _client_registering_as(sid, events_during_post):
+    """A RhapsodyClient whose register_session POST returns *sid* while the
+    given session_status events are delivered (some after a short delay;
+    tests call ``_join_timers`` at the end)."""
+    client = _make_rhapsody_client()
+    client._bc, client._endpoint_id, client._plugin_name = MagicMock(), "ep", "rhapsody"
+    cbs = []
+    client.register_notification_callback = lambda cb, topic=None: cbs.append(cb)
+    client.unregister_notification_callback = lambda cb, topic=None: None
+    client._start_task_listener = lambda: None
+
+    resp = MagicMock()
+    resp.is_error, resp.status_code = False, 200
+    resp.json = MagicMock(return_value={"sid": sid, "status": "initializing"})
+
+    def post(url, json=None):
+        for delay, data in events_during_post:
+            fire = (lambda d=data: cbs[0]("ep", "rhapsody", "session_status", d))
+            if delay:
+                timer = threading.Timer(delay, fire)
+                _TIMERS.append(timer)
+                timer.start()
+            else:
+                fire()
+        return resp
+
+    client._http.post = post
+    return client
+
+
+def test_register_session_ignores_other_sessions_status(join_timers):
+    """Another session's failed/ready event neither fails nor unblocks us."""
+    client = _client_registering_as("s-b", [
+        (0,   {"sid": "s-a", "status": "failed", "error": "not mine"}),
+        (0,   {"sid": "s-a", "status": "ready"}),
+        (0.2, {"sid": "s-b", "status": "ready"})])
+    client.register_session(init_timeout=5)
+    assert client.sid == "s-b"
+
+
+def test_register_session_own_failure_raises(join_timers):
+    client = _client_registering_as("s-b", [
+        (0,   {"sid": "s-a", "status": "ready"}),
+        (0.1, {"sid": "s-b", "status": "failed", "error": "boom"})])
+    with pytest.raises(RuntimeError, match="boom"):
+        client.register_session(init_timeout=5)
+
+
+def test_register_session_other_ready_does_not_unblock():
+    client = _client_registering_as("s-b", [(0, {"sid": "s-a", "status": "ready"})])
+    with pytest.raises(RuntimeError, match="timed out"):
+        client.register_session(init_timeout=0.5)
+
+
+def test_register_session_sidless_status_accepted(join_timers):
+    """An older endpoint sends session_status without sid: still accepted."""
+    client = _client_registering_as("s-b", [(0.1, {"status": "ready"})])
+    client.register_session(init_timeout=5)
+    assert client.sid == "s-b"
+
+
+def test_register_session_failed_post_unregisters_callback():
+    """A failing POST must not leave the session_status callback behind."""
+    client = _client_registering_as("s-b", [])
+    removed = []
+    client.unregister_notification_callback = \
+        lambda cb, topic=None: removed.append(topic)
+
+    def boom(url, json=None):
+        raise RuntimeError("POST failed")
+
+    client._http.post = boom
+    with pytest.raises(RuntimeError, match="POST failed"):
+        client.register_session(init_timeout=5)
+    assert removed == ["session_status"]
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
+
+
+
+def test_register_session_reconnect_to_failed_session_raises_at_once():
+    """POST says 'failed' (reconnect to a failed session): raise the real
+    error right away instead of waiting for an event that went out earlier."""
+    client = _client_registering_as("s-b", [])
+    resp = MagicMock()
+    resp.is_error, resp.status_code = False, 200
+    resp.json = MagicMock(return_value={"sid": "s-b", "status": "failed",
+                                        "error": "dragon init boom"})
+    client._http.post = lambda url, json=None: resp
+    t0 = time.monotonic()
+    with pytest.raises(RuntimeError, match="dragon init boom"):
+        client.register_session(init_timeout=30)
+    assert time.monotonic() - t0 < 5
