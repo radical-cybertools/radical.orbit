@@ -1448,12 +1448,23 @@ class RhapsodyClient(PluginClient):
         self._submitted: set[str] = set()
         self._warned_no_sid = False
 
-        # Task notifications reach this client through ONE runtime callback
-        # per topic (``_fan_out``), which feeds ``_on_task_done`` and then
+        # Notifications reach this client through ONE runtime callback
+        # (``_on_plugin_event``: all topics of the plugin, scoped to this
+        # client's session once known), which tracks the session's seq and
+        # hands task topics to ``_fan_out``: ``_on_task_done`` first, then
         # the callbacks registered on this client for those topics.
         self._fanout: dict[str, list] = {t: [] for t in self._FANOUT_TOPICS}
         self._fanout_lock = threading.Lock()
+        self._route_lock  = threading.Lock()
         self._fanout_on   = False
+        self._fanout_sid  : str | None = None
+
+        # Seq gap detection: last broker seq seen per (endpoint, plugin,
+        # sid); a gap is a lost event of this session and wakes the
+        # reconcile.  Read and updated under ``_deliver_lock``; replaced
+        # (not mutated) on a session switch or close.
+        self._seq_last: dict[tuple, int] = {}
+        self._seq_gaps  = 0
 
         # Fan-out runs serialized: live and recovered deliveries never
         # interleave, even without a dispatcher thread to order them.
@@ -1503,14 +1514,88 @@ class RhapsodyClient(PluginClient):
                                    if cb != callback]
 
     def _ensure_fan_out(self) -> None:
-        """Register the one runtime callback per task topic (once)."""
-        with self._fanout_lock:
-            if self._fanout_on:
+        """Register this client's one runtime callback, scoped to the
+        current session — or move it when the session changed.
+
+        It covers every topic of the plugin (``topic=None``), because the
+        broker numbers a session's events across all its topics: a per-topic
+        view would see gaps that are not losses.  The runtime drops other
+        sessions' events before its callback queue; session-less ones (an
+        older endpoint) still arrive and are filtered by ``sid`` in
+        ``_on_task_done``.  The broker subscription is unchanged.
+        """
+        if not (self._bc and self._endpoint_id and self._plugin_name):
+            raise RuntimeError("Missing endpoint tracking info; cannot "
+                               "register notifications.")
+        with self._route_lock:
+            sid = self.sid
+            if self._fanout_on and self._fanout_sid == sid:
                 return
-            self._fanout_on = True
-        for topic in self._FANOUT_TOPICS:
-            super().register_notification_callback(self._fan_out,
-                                                   topic=topic)
+            # register the new scope before dropping the old one, so no
+            # event finds no callback in between
+            self._bc.register_callback(
+                endpoint_id=self._endpoint_id, plugin_name=self._plugin_name,
+                topic=None, callback=self._on_plugin_event, with_meta=True,
+                session=sid)
+            if self._fanout_on:
+                self._bc.unregister_callback(
+                    endpoint_id=self._endpoint_id,
+                    plugin_name=self._plugin_name, topic=None,
+                    callback=self._on_plugin_event, session=self._fanout_sid)
+            self._fanout_on  = True
+            self._fanout_sid = sid
+            self._seq_last   = {}
+
+    def _drop_fan_out(self) -> None:
+        """Unregister this client's runtime callback (``close``)."""
+        with self._route_lock:
+            if not self._fanout_on:
+                return
+            self._fanout_on = False
+            self._bc.unregister_callback(
+                endpoint_id=self._endpoint_id, plugin_name=self._plugin_name,
+                topic=None, callback=self._on_plugin_event,
+                session=self._fanout_sid)
+
+    def _on_plugin_event(self, endpoint, plugin, topic, data, meta):
+        """Runtime callback (with meta) for every topic of the plugin:
+        track the session's seq, then fan task topics out (serialized with
+        recovered deliveries, like the fan-out itself)."""
+        with self._deliver_lock:
+            self._track_seq(endpoint, plugin, meta)
+            if topic in self._FANOUT_TOPICS:
+                self._fan_out(endpoint, plugin, topic, data)
+
+    def _track_seq(self, endpoint, plugin, meta) -> None:
+        """Detect lost events of this session from broker seq gaps.
+
+        The tracker starts at the first seq it sees (a session can be
+        joined mid-stream); a seq that moves backwards (broker restart, or
+        a pruned counter) restarts it.  A gap wakes the reconcile at once.
+        Drops before the broker numbers an event (endpoint side) leave no
+        gap: the reconcile's idle timer still covers those.
+        """
+        session = meta.get('session') if meta else None
+        seq     = meta.get('seq')     if meta else None
+        if session is None or seq is None or session != self.sid:
+            return
+        key  = (endpoint, plugin, session)
+        last = self._seq_last.get(key)
+        if last is None or seq < last:
+            if last is not None:
+                log.info("[rhapsody] seq of session %s went back from %d "
+                         "to %d: tracking restarts", session, last, seq)
+            self._seq_last[key] = seq
+            return
+        if seq <= last:
+            return                                  # duplicate
+        self._seq_last[key] = seq
+        if seq > last + 1:
+            self._seq_gaps += seq - last - 1
+            log.info("[rhapsody] %d event(s) of session %s lost (seq %d "
+                     "after %d): reconciling", seq - last - 1, session, seq,
+                     last)
+            self._reconcile_wake.set()
 
     def _fan_out(self, endpoint, plugin, topic, data):
         """Runtime callback for task topics: this client first, then the
@@ -1787,7 +1872,7 @@ class RhapsodyClient(PluginClient):
     def _on_drop(self, fn) -> None:
         """Dispatcher drop hook.  Runs on the runtime's work loop: it must
         not block, so it only wakes the reconcile thread."""
-        if fn == self._fan_out:
+        if fn == self._on_plugin_event:
             self._reconcile_wake.set()
 
     def _outstanding(self) -> list[str]:
@@ -1801,6 +1886,7 @@ class RhapsodyClient(PluginClient):
         self._completed.clear()
         self._submitted.clear()
         self._pending.clear()
+        self._seq_last = {}                   # the seq tracker restarts too
         self._cond.notify_all()
 
     def _reconcile_loop(self) -> None:
@@ -1874,8 +1960,10 @@ class RhapsodyClient(PluginClient):
                 return                         # runtime stopped
 
     def close(self) -> None:
-        """Stop the reconcile thread, then close the session."""
+        """Stop the reconcile thread, unregister the runtime callback,
+        then close the session."""
         self._stop_reconcile()
+        self._drop_fan_out()
         super().close()
         with self._cond:
             self._reset_tracking()

@@ -2952,26 +2952,35 @@ def test_two_sessions_with_colliding_uids_get_their_own_results():
 
 class _FakeRuntime:
     """Runtime stand-in: its callback registry feeds a real
-    CallbackDispatcher, the way ``EndpointRuntime._on_event`` does."""
+    CallbackDispatcher, the way ``EndpointRuntime._on_event`` does
+    (including the session filter and the ``with_meta`` form)."""
 
     def __init__(self, maxlen=1024):
         from radical.orbit.runtime_support import CallbackDispatcher
         self._cb       = CallbackDispatcher(maxlen=maxlen)
-        self.callbacks = []                     # (topic, callback)
+        self.callbacks = []             # (topic, callback, with_meta, session)
 
     def register_callback(self, endpoint_id=None, plugin_name=None,
-                          topic=None, callback=None):
-        self.callbacks.append((topic, callback))
+                          topic=None, callback=None, with_meta=False,
+                          session=None):
+        self.callbacks.append((topic, callback, with_meta, session))
 
     def unregister_callback(self, endpoint_id=None, plugin_name=None,
-                            topic=None, callback=None):
-        self.callbacks = [(t, cb) for t, cb in self.callbacks
-                          if (t, cb) != (topic, callback)]
+                            topic=None, callback=None, session=None):
+        self.callbacks = [c for c in self.callbacks
+                          if (c[0], c[1], c[3]) != (topic, callback, session)]
 
-    def deliver(self, topic, data):
-        for t, cb in list(self.callbacks):
-            if t is None or t == topic:
-                self._cb.submit(cb, 'ep', 'rhapsody', topic, data)
+    def deliver(self, topic, data, session=None, seq=0):
+        """An event as the broker sends it; ``session=None`` is an older
+        endpoint's session-less event."""
+        meta = {'seq': seq, 'ts': 0.0, 'session': session}
+        for t, cb, with_meta, s in list(self.callbacks):
+            if t not in (None, topic):
+                continue
+            if s is not None and session is not None and s != session:
+                continue
+            args = ('ep', 'rhapsody', topic, data)
+            self._cb.submit(cb, *args, *((meta,) if with_meta else ()))
 
 
 class _SessionHTTP:
@@ -3081,8 +3090,10 @@ def test_fan_out_one_runtime_callback_per_topic():
             client.register_notification_callback(_backend_cb, topic=topic)
         client.register_notification_callback(_other_cb, topic='task_status')
 
-        for topic in ('task_status', 'task_status_batch'):
-            assert len(rt._callbacks[('ep', 'rhapsody', topic)]) == 1
+        # one registration: all topics, scoped to the session
+        assert list(rt._callbacks) == [('ep', 'rhapsody', None)]
+        assert [(m, s) for _, m, s in rt._callbacks[('ep', 'rhapsody', None)]] \
+            == [(True, 'sid-a')]
 
         rt._on_event(protocol.Event(
             src='ep', plugin='rhapsody', topic='task_status',
@@ -3505,7 +3516,7 @@ async def test_thread_notifications_are_serialized_on_the_loop():
     session._plugin._main_loop = loop
     flushed_on = []
     session._plugin._dispatch_notify.side_effect = \
-        lambda topic, data: flushed_on.append(threading.get_ident())
+        lambda topic, data, session=None: flushed_on.append(threading.get_ident())
 
     await asyncio.to_thread(session._on_task_state_change,
                             {'uid': 't.1'}, 'RUNNING')
@@ -3577,6 +3588,181 @@ def test_fan_out_serialized_without_dispatcher():
         assert peak[0] == 1
     finally:
         client.close()
+
+
+# ---------------------------------------------------------------------------
+# Session-scoped routing and seq gap detection
+# ---------------------------------------------------------------------------
+
+def _bare_runtime(maxlen=1024):
+    """A real EndpointRuntime registry and _on_event, with a real (not yet
+    started) callback dispatcher and no transport."""
+    from radical.orbit.runtime import EndpointRuntime
+    from radical.orbit.runtime_support import CallbackDispatcher
+
+    rt = EndpointRuntime.__new__(EndpointRuntime)
+    rt._name      = 'consumer'
+    rt._callbacks = {}
+    rt._cb_lock   = threading.Lock()
+    rt._emit      = MagicMock()
+    rt._cb        = CallbackDispatcher(maxlen=maxlen)
+    return rt
+
+
+def _event(sid, payload, seq, topic='task_status'):
+    from radical.orbit import protocol
+    return protocol.Event(src='ep', plugin='rhapsody', topic=topic,
+                          session=sid, seq=seq, ts=0.0,
+                          data={**payload, 'sid': sid})
+
+
+def test_two_clients_bursts_no_foreign_queue_entries():
+    """Two clients, each on its own runtime with a callback queue of 4, get
+    both sessions' bursts (the broadcast): the foreign events never take
+    queue room, so neither drops and each gets exactly its own results."""
+    uids     = [f'task.q{i}' for i in range(4)]
+    sessions = [_done_session(sid, uids) for sid in ('sid-a', 'sid-b')]
+    pairs    = []
+    try:
+        for session in sessions:
+            rt = _bare_runtime(maxlen=4)
+            client, _ = _reconciling_client(rt, session)
+            _track(client, uids)
+            pairs.append((rt, client))
+
+        for i, uid in enumerate(uids):            # interleaved bursts
+            for session in sessions:
+                ev = _event(session.sid, session._notification_payload(
+                    session._tasks[uid]), seq=i)
+                for rt, _ in pairs:
+                    rt._on_event(ev)
+
+        for rt, client in pairs:
+            assert rt._cb.dropped == 0
+            assert rt._cb._q.qsize() == len(uids)   # own events only
+            rt._cb.start()
+        for rt, client in pairs:
+            done = client.wait_tasks(uids, timeout=10)
+            assert [t['return_value'] for t in done] \
+                == [f'{client.sid}:{u}' for u in uids]
+            assert client._seq_gaps == 0
+    finally:
+        for rt, client in pairs:
+            client.close()
+            rt._cb.stop()
+
+
+def _tracking_client():
+    """A client whose fan-out is not registered: _on_plugin_event is
+    called directly, and the reconcile wake is observed, not run."""
+    client = _make_rhapsody_client()
+    client._sid = 'sid-t'
+    return client
+
+
+def _feed(client, seq, topic='task_status', session='sid-t'):
+    client._reconcile_wake.clear()
+    client._on_plugin_event('ep', 'rhapsody', topic,
+                            {'uid': 'x', 'state': 'RUNNING'},
+                            {'seq': seq, 'ts': 0.0, 'session': session})
+    return client._reconcile_wake.is_set()
+
+
+def test_seq_tracker_starts_at_first_seen_and_gap_wakes_reconcile():
+    client = _tracking_client()
+    assert _feed(client, 7) is False             # mid-stream join: no gap
+    assert _feed(client, 8) is False
+    assert _feed(client, 11) is True             # 9, 10 lost
+    assert client._seq_gaps == 2
+    assert _feed(client, 11) is False            # duplicate
+    assert _feed(client, 12) is False
+
+
+def test_seq_tracker_backwards_resets():
+    client = _tracking_client()
+    for seq in (40, 41):
+        _feed(client, seq)
+    assert _feed(client, 0) is False             # broker restart: reset
+    assert _feed(client, 1) is False
+    assert _feed(client, 3) is True
+    assert client._seq_gaps == 1
+
+
+def test_seq_tracker_reset_with_session_tracking():
+    """A session switch or close forgets the tracked seqs with the tasks."""
+    client = _tracking_client()
+    _feed(client, 5)
+    assert client._seq_last
+    with client._cond:
+        client._reset_tracking()
+    assert client._seq_last == {}
+    assert _feed(client, 9) is False             # starts afresh
+
+
+def test_seq_tracker_spans_topics_and_ignores_others():
+    """One seq runs across all topics of a session: no false gaps.  Other
+    sessions and session-less events are not tracked."""
+    client = _tracking_client()
+    topics = ['session_status', 'task_status', 'task_status_batch',
+              'task_status', 'some_other_topic', 'task_status_batch']
+    for seq, topic in enumerate(topics):
+        assert _feed(client, seq, topic=topic) is False
+    assert _feed(client, 50, session='sid-other') is False
+    assert _feed(client, 99, session=None) is False
+    assert _feed(client, len(topics)) is False
+    assert client._seq_gaps == 0
+    assert list(client._seq_last) == [('ep', 'rhapsody', 'sid-t')]
+
+
+def test_seq_gap_triggers_reconcile():
+    """A broker drop seen as a seq gap recovers the lost completion at
+    once — long before the idle timer would."""
+    uids    = ['task.g0', 'task.g1', 'task.g2']
+    session = _done_session('sid-gap', uids)
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session, idle=60.0)
+    try:
+        _track(client, uids)
+        for seq, uid in enumerate(uids):
+            if uid == 'task.g1':
+                continue                         # lost in the broker
+            payload = session._notification_payload(session._tasks[uid])
+            rt.deliver('task_status', {**payload, 'sid': session.sid},
+                       session=session.sid, seq=seq)
+        done = client.wait_tasks(uids, timeout=10)
+        assert [t['state'] for t in done] == ['DONE'] * 3
+        assert client._seq_gaps == 1
+        assert http.threads == ['orbit-rh-reconcile']
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
+def test_reregister_and_close_leave_no_stale_callbacks():
+    """A session switch moves the one runtime callback to the new sid;
+    close() removes it — no local callbacks or patterns pile up."""
+    rt     = _bare_runtime()
+    client = RhapsodyClient(MagicMock(), '/rhapsody', broker_client=rt,
+                            endpoint_id='ep', plugin_name='rhapsody')
+    client._sid = 'sid-a'
+    client._start_task_listener()
+    client._start_task_listener()                # idempotent
+    key = ('ep', 'rhapsody', None)
+    assert [s for _, _, s in rt._callbacks[key]] == ['sid-a']
+
+    client._sid = 'sid-b'                        # what register_session does
+    client._start_task_listener()
+    assert [s for _, _, s in rt._callbacks[key]] == ['sid-b']
+
+    client._sid = None                           # close: nothing to POST
+    client.close()
+    assert rt._callbacks == {}
+    assert client._reconcile_thread is None
+
+    # every Subscribe the runtime sent was matched by an Unsubscribe
+    kinds = [type(c.args[0]).__name__ for c in rt._emit.call_args_list]
+    assert kinds.count('Subscribe') == kinds.count('Unsubscribe') == 2
 
 
 _TIMERS: list = []
