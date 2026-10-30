@@ -12,8 +12,9 @@ There is **no ``ping``/``pong`` kind** in the envelope: liveness is
 WS-protocol-level only (transport keepalive on both sides), never app-level.
 
 ``seq`` (``event`` only) is broker-assigned and frozen with the envelope:
-monotone per session for session-scoped events, monotone per the global
-session-less stream otherwise. Consumers detect drops as ``seq`` gaps.
+monotone per ``(src, plugin, session)`` for session-scoped events, monotone
+per the global session-less stream otherwise. Consumers detect drops as
+``seq`` gaps.
 
 ``corr_id`` is only meaningful on ``request``/``response``; it is prefixed
 with the requester's ``src`` (see ``mint_corr_id``) purely for log
@@ -162,9 +163,9 @@ class Response(_Envelope):
 class Event(_Envelope):
     """A plugin-originated notification.
 
-    ``seq`` is broker-assigned: monotone per session for session-scoped
-    events (``session`` set), monotone per the global session-less stream
-    otherwise (``session`` is ``None``).
+    ``seq`` is broker-assigned: monotone per ``(src, plugin, session)`` for
+    session-scoped events (``session`` set), monotone per the global
+    session-less stream otherwise (``session`` is ``None``).
     """
 
     kind:    Literal['event'] = 'event'

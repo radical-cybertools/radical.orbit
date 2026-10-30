@@ -55,7 +55,7 @@ def test_math_session_notifies():
     sent    = []
 
     class _FakePlugin:
-        def _dispatch_notify(self, topic, data):
+        def _dispatch_notify(self, topic, data, session=None):
             sent.append((topic, data))
 
     session._plugin = _FakePlugin()

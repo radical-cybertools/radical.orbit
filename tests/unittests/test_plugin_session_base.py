@@ -14,10 +14,12 @@ class _RecordingPlugin:
     """Captures notify() calls the way the real Plugin._dispatch_notify would."""
 
     def __init__(self):
-        self.events = []
+        self.events   = []
+        self.sessions = []
 
-    def _dispatch_notify(self, topic, data):
+    def _dispatch_notify(self, topic, data, session=None):
         self.events.append((topic, data))
+        self.sessions.append(session)
 
 
 # ---------------------------------------------------------------------------
@@ -30,7 +32,8 @@ def test_notify_forwards_to_plugin():
     sess._plugin = plug
 
     sess.notify("topic", {"k": "v"})
-    assert plug.events == [("topic", {"k": "v"})]
+    assert plug.events   == [("topic", {"k": "v"})]
+    assert plug.sessions == ["s1"]             # the event's session
 
 
 def test_notify_without_plugin_is_noop():

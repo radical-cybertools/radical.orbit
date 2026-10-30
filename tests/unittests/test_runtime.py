@@ -785,6 +785,240 @@ def test_send_notification_sync_from_plain_thread(harness):
     assert data == {'via': 'thread'}
 
 
+def test_send_notification_sets_event_session():
+    """A session notification reaches the wire as an event with that
+    session; a plugin-level one stays session-less, called as before."""
+    from unittest.mock import MagicMock
+    from fastapi import FastAPI
+    from radical.orbit.runtime import EndpointRuntime
+
+    rt = EndpointRuntime.__new__(EndpointRuntime)
+    rt._name = 'epA'
+    rt._emit = MagicMock()
+    rt.send_notification('echo_rt', 'demo', {'k': 1}, session='sid.1')
+    rt.send_notification('echo_rt', 'demo', {'k': 2})
+    evs = [c.args[0] for c in rt._emit.call_args_list]
+    assert [(e.plugin, e.session, e.data) for e in evs] \
+        == [('echo_rt', 'sid.1', {'k': 1}), ('echo_rt', None, {'k': 2})]
+
+    # Plugin.send_notification: the session keyword only when set
+    app = FastAPI()
+    app.state.endpoint_service = MagicMock(spec=['send_notification'])
+    app.state.endpoint_service.send_notification.return_value = None
+    plugin = _EchoPlugin(app)
+    asyncio.run(plugin.send_notification('demo', {'k': 1}, session='s'))
+    asyncio.run(plugin.send_notification('demo', {'k': 2}))
+    calls = app.state.endpoint_service.send_notification.call_args_list
+    assert [(c.args, c.kwargs) for c in calls] == [
+        (('echo_rt', 'demo', {'k': 1}), {'session': 's'}),
+        (('echo_rt', 'demo', {'k': 2}), {})]
+
+
+def _bare_runtime(maxlen=1024):
+    """A runtime with a callback registry and a real (unstarted) dispatcher
+    queue, but no transport: what _on_event / register_callback touch."""
+    from unittest.mock import MagicMock
+    from radical.orbit.runtime import EndpointRuntime
+    from radical.orbit.runtime_support import CallbackDispatcher
+
+    rt = EndpointRuntime.__new__(EndpointRuntime)
+    rt._name      = 'consumer'
+    rt._callbacks = {}
+    rt._cb_lock   = threading.Lock()
+    rt._emit      = MagicMock()
+    rt._cb        = CallbackDispatcher(maxlen=maxlen)
+    return rt
+
+
+def _ev(session, topic='t', src='ep', plugin='rh', seq=0):
+    from radical.orbit import protocol
+    return protocol.Event(src=src, plugin=plugin, topic=topic,
+                          session=session, seq=seq, ts=0.0, data={})
+
+
+def test_session_callback_local_routing():
+    """A session callback never gets another session's event — it is dropped
+    before the callback queue — but still gets session-less events (older
+    endpoints).  The broker pattern carries no session (wire unchanged)."""
+    rt = _bare_runtime()
+    cb = lambda *a: None                              # noqa: E731
+    rt.register_callback(endpoint_id='ep', plugin_name='rh', topic='t',
+                         callback=cb, session='sid-a')
+    sub = rt._emit.call_args.args[0]
+    assert [p.model_dump() for p in sub.patterns] \
+        == [{'endpoint': 'ep', 'plugin': 'rh', 'topic': 't'}]
+
+    for _ in range(5):
+        rt._on_event(_ev('sid-b'))                    # foreign: not queued
+    assert rt._cb._q.qsize() == 0 and rt._cb.dropped == 0
+    rt._on_event(_ev('sid-a'))
+    rt._on_event(_ev(None))                           # older endpoint
+    assert rt._cb._q.qsize() == 2
+
+    # a session-less registration of the same pattern still gets them all
+    other = lambda *a: None                           # noqa: E731
+    rt.register_callback(endpoint_id='ep', plugin_name='rh', topic='t',
+                         callback=other)
+    rt._on_event(_ev('sid-b'))
+    assert [rt._cb._q.get_nowait()[0] for _ in range(3)] == [cb, cb, other]
+
+
+def test_session_callback_unregister():
+    """Unregister removes the registration of that session only; the last
+    one removes the pattern from the resync set."""
+    rt = _bare_runtime()
+    cb = lambda *a: None                              # noqa: E731
+    for sid in ('sid-a', 'sid-b'):
+        rt.register_callback(endpoint_id='ep', plugin_name='rh',
+                             callback=cb, session=sid)
+    rt.unregister_callback(endpoint_id='ep', plugin_name='rh',
+                           callback=cb, session='sid-a')
+    assert rt._callbacks[('ep', 'rh', None)] == [(cb, False, 'sid-b')]
+    rt.unregister_callback(endpoint_id='ep', plugin_name='rh', callback=cb)
+    assert rt._callbacks[('ep', 'rh', None)] == [(cb, False, 'sid-b')]
+    rt.unregister_callback(endpoint_id='ep', plugin_name='rh',
+                           callback=cb, session='sid-b')
+    assert rt._callbacks == {}
+
+
+def test_subscription_refcounted_per_pattern():
+    """Subscribe on the first registration of a pattern, unsubscribe on its
+    last; a callback registered twice counts twice."""
+    rt = _bare_runtime()
+    cb = lambda *a: None                              # noqa: E731
+
+    def _kinds():
+        return [type(c.args[0]).__name__ for c in rt._emit.call_args_list]
+
+    rt.register_callback(endpoint_id='ep', callback=cb)
+    rt.register_callback(endpoint_id='ep', callback=cb)
+    assert _kinds() == ['Subscribe']
+    rt.unregister_callback(endpoint_id='ep', callback=cb)
+    assert _kinds() == ['Subscribe']                  # one registration left
+    assert len(rt._callbacks[('ep', None, None)]) == 1
+    rt.unregister_callback(endpoint_id='ep', callback=cb)
+    assert _kinds() == ['Subscribe', 'Unsubscribe']
+    rt.unregister_callback(endpoint_id='ep', callback=cb)   # unknown: no-op
+    assert _kinds() == ['Subscribe', 'Unsubscribe']
+
+
+def _outbox_runtime():
+    """A bare runtime whose _emit really packs into an outbox on a loop of
+    its own (no socket)."""
+    from radical.orbit.runtime import EndpointRuntime
+    from radical.orbit import protocol
+    from radical.orbit.runtime_support import CallbackDispatcher
+
+    rt = EndpointRuntime.__new__(EndpointRuntime)
+    rt._name           = 'consumer'
+    rt._callbacks      = {}
+    rt._cb_lock        = threading.Lock()
+    rt._cb             = CallbackDispatcher()
+    rt._frame_cap      = protocol.FRAME_CAP
+    rt._transport_loop = asyncio.new_event_loop()
+    rt._outbox         = asyncio.Queue()
+    rt._sub_epoch      = 0
+    return rt
+
+
+def _drain_outbox(rt):
+    """Run the loop's pending puts, then return the messages the sender
+    would send (it drops subscriptions queued before a resync)."""
+    from radical.orbit import protocol
+    from radical.orbit.runtime import _SUB_KINDS
+    rt._transport_loop.run_until_complete(asyncio.sleep(0))
+    out = []
+    while not rt._outbox.empty():
+        kind, epoch, data = rt._outbox.get_nowait()
+        if kind in _SUB_KINDS and epoch != rt._sub_epoch:
+            continue
+        out.append(protocol.parse_message(data))
+    return out
+
+
+def _apply(router, msgs):
+    for m in msgs:
+        router.update_subscription(
+            'consumer', {'patterns': [p.model_dump() for p in m.patterns]},
+            m.kind == 'subscribe')
+
+
+def test_resync_after_reconnect_holds_each_pattern_once():
+    """Subscribe/unsubscribe frames queued before a (re)connect's resync
+    are dropped (even one whose put is still pending), and the resync
+    sends one subscribe per key: a fresh
+    registration with a queued subscribe ends with exactly one copy, and a
+    subscribe lost before a resume (the broker clears on resume) is
+    restored."""
+    from unittest.mock import MagicMock
+    from radical.orbit.broker_events import EventRouter
+
+    rt = _outbox_runtime()
+    try:
+        router = EventRouter({}, lambda *a: None, MagicMock(), 8,
+                             lambda: None)
+        cb = lambda *a: None                          # noqa: E731
+
+        # connected: key A subscribed and applied at the broker
+        rt.register_callback(endpoint_id='epA', callback=cb)
+        router.clear_subscriptions('consumer')
+        _apply(router, _drain_outbox(rt))
+
+        # disconnected: key B registered, its subscribe queued (or lost)
+        rt.register_callback(endpoint_id='epB', callback=cb)
+        rt._transport_loop.run_until_complete(asyncio.sleep(0))
+
+        # resume: the broker clears, the runtime resyncs
+        router.clear_subscriptions('consumer')
+        rt._resync_subscriptions()
+        _apply(router, _drain_outbox(rt))
+        pats = sorted(p.endpoint for p in router._subscriptions['consumer'])
+        assert pats == ['epA', 'epB']
+
+        # fresh registration with a subscribe still queued: one copy each
+        rt.register_callback(endpoint_id='epC', callback=cb)
+        router.clear_subscriptions('consumer')
+        rt._resync_subscriptions()
+        _apply(router, _drain_outbox(rt))
+        pats = sorted(p.endpoint for p in router._subscriptions['consumer'])
+        assert pats == ['epA', 'epB', 'epC']
+
+        # the last unsubscribe of a key really removes it
+        rt.unregister_callback(endpoint_id='epC', callback=cb)
+        _apply(router, _drain_outbox(rt))
+        pats = sorted(p.endpoint for p in router._subscriptions['consumer'])
+        assert pats == ['epA', 'epB']
+    finally:
+        rt._transport_loop.close()
+
+
+def test_resync_drops_only_stale_subscriptions():
+    from radical.orbit import protocol
+
+    rt = _outbox_runtime()
+    try:
+        rt.register_callback(endpoint_id='epA', callback=lambda *a: None)
+        rt._emit(protocol.Event(src='consumer', plugin='p', topic='t'))
+        rt._resync_subscriptions()
+        assert [m.kind for m in _drain_outbox(rt)] == ['event', 'subscribe']
+    finally:
+        rt._transport_loop.close()
+
+
+def test_unregister_callback_bound_method():
+    """A bound method is a new object on each access: it unregisters by
+    equality."""
+    rt = _bare_runtime()
+
+    class _C:
+        def on(self, *a):
+            pass
+    c = _C()
+    rt.register_callback(endpoint_id='ep', callback=c.on, session='s')
+    rt.unregister_callback(endpoint_id='ep', callback=c.on, session='s')
+    assert rt._callbacks == {}
+
+
 # ---------------------------------------------------------------------------
 # item 4: with_meta delivers broker-stamped seq matching what replay retains
 # ---------------------------------------------------------------------------

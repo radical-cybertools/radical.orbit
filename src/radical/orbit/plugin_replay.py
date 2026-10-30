@@ -2,8 +2,9 @@
 Event-replay plugin — the optional retaining subscriber for radical.orbit.
 
 The broker core is deliberately **stateless** about events: it stamps every
-``event`` frame with an authoritative ``seq``/``ts`` (monotone per session for
-session-scoped events, monotone per the global session-less stream otherwise),
+``event`` frame with an authoritative ``seq``/``ts`` (monotone per ``(src,
+plugin, session)`` for session-scoped events, monotone per the global
+session-less stream otherwise),
 fans it out to live subscribers, and forgets it.  ``PluginReplay`` is the single
 component that *retains* the stream so a consumer that connected late — or
 dropped and reconnected — can pull what it missed.
@@ -24,12 +25,18 @@ replay-after-reconnect for ephemeral events.
 Retention
 ---------
 * **Session-scoped events** (``event['session']`` set): one bounded buffer per
-  session, capped by BOTH an age (``session_max_age``, default 600 s) and a
-  byte size (``session_max_bytes``, default 4 MB, measured as the msgpack size
-  of the event dict).  Per-session isolation means one chatty session cannot
-  evict another's history.
+  ``(src, plugin, session)`` — the key of the broker's per-session ``seq`` —
+  capped by BOTH an age (``session_max_age``, default 600 s) and a byte size
+  (``session_max_bytes``, default 4 MB, measured as the msgpack size of the
+  event dict).  Per-session isolation means one chatty session cannot evict
+  another's history.
 * **Session-less events** (``event['session']`` is ``None``): one global ring
-  capped by total bytes (``global_max_bytes``, default 16 MB).
+  capped by total bytes (``global_max_bytes``, default 16 MB).  Session events
+  never land there: plugin session notifications (rhapsody, psij, ...) carry
+  their session.  A session-less fetch therefore returns them separately,
+  grouped per ``(src, plugin, session)`` stream under ``sessions`` (each
+  stream has its own ``seq`` and position), or a consumer fetches one
+  session directly.
 
 Every eviction — age or size — increments the buffer's ``dropped`` counter, so
 a gap is *observable*: the ``stats`` route exposes retained count, byte size,
@@ -54,7 +61,7 @@ from typing      import Any, Callable, Dict, List, Optional
 
 import msgpack
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 
 from .client               import PluginClient
 from .plugin_base          import Plugin
@@ -144,8 +151,9 @@ class _RingBuffer:
         }
 
     def select(self, after_exclusive: int, patterns: List[dict],
-               max_events: int, max_bytes: int) -> List[Dict[str, Any]]:
-        '''Return matching events with ``seq > after_exclusive``, oldest-first.
+               max_events: int, max_bytes: int) -> tuple:
+        '''Return ``(events, nbytes)``: the matching events with ``seq >
+        after_exclusive``, oldest-first, and their retained size.
 
         Bounded by *max_events* / *max_bytes*, but always returns at least the
         first matching event so a single oversized event can never stall the
@@ -162,7 +170,31 @@ class _RingBuffer:
                 break
             out.append(event)
             nbytes += size
-        return out
+        return out, nbytes
+
+
+def _gap(buf: _RingBuffer, lower: int, from_zero: bool = True) -> bool:
+    '''True when events after *lower* were evicted from *buf*.
+
+    ``lowest_seq`` bounds it while the buffer is non-empty; ``last_dropped_seq``
+    still reports it once everything matching (or the whole buffer) has been
+    evicted.  A session stream does not start at 0 (it starts at the broker's
+    seq high-water mark): for it (``from_zero=False``) a read from the start
+    (``lower < 0``) relies on ``last_dropped_seq`` only.
+    '''
+    lowest = buf.lowest_seq
+    bound  = lower >= 0 or from_zero
+    return (bound and lowest is not None and lowest > lower + 1) or \
+        (buf.last_dropped_seq is not None and buf.last_dropped_seq > lower)
+
+
+def _stream_matches(patterns: List[dict], src: Any, plugin: Any) -> bool:
+    '''True if a stream of *src*'s *plugin* can hold events matching any of
+    *patterns* (their ``topic`` is left to the per-event match).'''
+    if not patterns:
+        return True
+    return any(p.get('endpoint') in (None, src) and
+               p.get('plugin') in (None, plugin) for p in patterns)
 
 
 # ---------------------------------------------------------------------------
@@ -208,15 +240,22 @@ class ReplayClient(PluginClient):
     1. Register the live callback **first**
        (``runtime.register_callback(endpoint=..., plugin=..., topic=...)``), so
        no live event is missed while replay drains.
-    2. Drain ``replay_iter(patterns=..., session=...)``, feeding each replayed
-       event through the same handler as the live callback.
-    3. **Dedup by ``seq``.**  Replayed events carry ``event['seq']``; keep a set
-       of seen ``seq`` (per stream) and skip any already seen.  Live delivery
-       now exposes the same broker-stamped ``seq`` too: register the live
-       callback with ``runtime.register_callback(..., with_meta=True)`` and read
-       ``meta['seq']`` (the identical authoritative value this plugin retains),
-       so the dedup keys on the broker ``seq`` on both streams — no application
-       key needed.
+    2. Drain ``replay_iter(patterns=..., session=..., endpoint=...,
+       plugin=...)``, feeding each replayed event through the same handler as
+       the live callback.  Session events are retained per ``(endpoint,
+       plugin, session)``; the global ring (``session=None``) holds only
+       session-less events, and a session-less fetch also returns the
+       matching session streams, grouped (``replay_iter`` drains them all).
+    3. **Dedup by ``(src, plugin, session, seq)``.**  The broker numbers each
+       session's stream on its own (and the session-less stream globally), so
+       ``seq`` alone is not unique: key the seen-set on the full tuple and skip
+       any already seen.  Replayed events carry ``src``, ``plugin``,
+       ``session`` and ``seq``; live delivery exposes the same broker-stamped
+       values too: register the live callback with
+       ``runtime.register_callback(..., with_meta=True)`` and key on
+       ``(endpoint, plugin, meta['session'], meta['seq'])`` (the identical
+       authoritative values this plugin retains) — no application key
+       needed.
 
     Because live delivery starts *before* replay finishes, the two streams
     overlap around the join point; the ``seq`` dedup discards the duplicates, so
@@ -237,21 +276,33 @@ class ReplayClient(PluginClient):
 
     def fetch(self, after_seq: int, patterns: Optional[list] = None,
               session: Optional[str] = None,
-              max_events: Optional[int] = None) -> dict:
+              max_events: Optional[int] = None,
+              endpoint: Optional[str] = None,
+              plugin: Optional[str] = None,
+              session_after_seq: Optional[list] = None) -> dict:
         '''Pull one batch of retained events with ``seq > after_seq``.
 
         Stateless: the server keeps no cursor — pass ``after_seq=-1`` to read
         the whole retained buffer, or the last ``next_seq`` to resume.  A fetch
         that repeats the same *after_seq* simply re-reads the batch (at-least-
-        once).  *session* selects the per-session buffer (``None`` = the global
-        ring); *patterns* filters with subscribe-pattern None-wildcard
-        semantics.
+        once).  *session* selects a per-session buffer (``None`` = the global
+        ring), together with the *endpoint* and *plugin* that emitted it; they
+        may be omitted while only one endpoint/plugin retains that session id
+        (an ambiguous fetch fails; *patterns* naming them disambiguate).
+        *patterns* filters with subscribe-pattern None-wildcard semantics.
 
-        Returns ``{events, next_seq, gap}``.
+        Returns ``{events, next_seq, gap}``.  Without *session* it also
+        returns ``sessions``: the matching session streams, grouped (each
+        ``{endpoint, plugin, session, events, next_seq, gap}``), positioned
+        by *session_after_seq* (``[[endpoint, plugin, session, after_seq],
+        ...]``).
         '''
         body: dict = {'after_seq': after_seq}
         if patterns   is not None: body['patterns']   = patterns
         if session    is not None: body['session']    = session
+        if endpoint   is not None: body['endpoint']   = endpoint
+        if plugin     is not None: body['plugin']     = plugin
+        if session_after_seq:      body['session_after_seq'] = session_after_seq
         if max_events is not None: body['max_events'] = max_events
         resp = self._http.post(self._url('fetch'), json=body)
         self._raise(resp, 'fetch')
@@ -266,26 +317,44 @@ class ReplayClient(PluginClient):
     def replay_iter(self, patterns: Optional[list] = None,
                     session: Optional[str] = None,
                     after_seq: int = -1,
-                    max_events: Optional[int] = None):
+                    max_events: Optional[int] = None,
+                    endpoint: Optional[str] = None,
+                    plugin: Optional[str] = None):
         '''Generator that drains replay: fetch, yield events, advance, repeat.
 
         Fetches a batch with ``seq > after_seq``, yields its events, advances
         its own position to the batch's ``next_seq``, and stops when a batch
         comes back empty.  This is the drain step of the splice recipe (see the
         class docstring): register the live callback first, then drive this
-        generator, deduping by ``seq``.  Defaults to ``after_seq=-1`` (whole
-        retained buffer).
+        generator, deduping by ``(src, plugin, session, seq)``.  Defaults
+        to ``after_seq=-1`` (whole retained buffer).  Without *session* it
+        drains the global ring and the matching session streams, each from
+        its own position (the session streams from their start).
         '''
-        pos = after_seq
+        pos  = after_seq
+        spos: dict = {}
         while True:
-            resp   = self.fetch(pos, patterns=patterns, session=session,
-                                max_events=max_events)
+            resp = self.fetch(pos, patterns=patterns, session=session,
+                              max_events=max_events, endpoint=endpoint,
+                              plugin=plugin,
+                              session_after_seq=[[*k, v]
+                                                 for k, v in spos.items()])
+            more   = False
             events = resp.get('events') or []
-            if not events:
-                break
             for event in events:
                 yield event
-            pos = resp['next_seq']
+            if events:
+                pos  = resp['next_seq']
+                more = True
+            for st in resp.get('sessions') or []:
+                for event in st.get('events') or []:
+                    yield event
+                if st.get('events'):
+                    spos[(st['endpoint'], st['plugin'], st['session'])] = \
+                        st['next_seq']
+                    more = True
+            if not more:
+                break
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +411,8 @@ class PluginReplay(Plugin):
 
         # Global ring (session-less broadcasts) + per-session buffers.
         self._global = _RingBuffer(self.global_max_bytes)
-        self._session_buffers: Dict[str, _RingBuffer] = {}
+        # Session buffers are keyed ``(src, plugin, session)``.
+        self._session_buffers: Dict[tuple, _RingBuffer] = {}
 
         # Subscribe to the raw event tap NOW so retention starts at load time
         # (a late consumer must find events already buffered).  Absent (None)
@@ -384,10 +454,11 @@ class PluginReplay(Plugin):
 
         session = event.get('session')
         if session:
-            buf = self._session_buffers.get(session)
+            key = (event.get('src'), event.get('plugin'), session)
+            buf = self._session_buffers.get(key)
             if buf is None:
                 buf = _RingBuffer(self.session_max_bytes, self.session_max_age)
-                self._session_buffers[session] = buf
+                self._session_buffers[key] = buf
         else:
             buf = self._global
         buf.append(int(seq), float(ts), size, event, now)
@@ -396,13 +467,13 @@ class PluginReplay(Plugin):
 
     def _evict_aged(self, now: float) -> None:
         self._global.evict_aged(now)
-        for sid, buf in list(self._session_buffers.items()):
+        for key, buf in list(self._session_buffers.items()):
             buf.evict_aged(now)
             # Drop a per-session buffer once it fully ages out, so a long-lived
             # broker does not accumulate empty buffers for every session it ever
             # saw.  A later event for the same session recreates it on demand.
             if not buf.events:
-                del self._session_buffers[sid]
+                del self._session_buffers[key]
 
     def _maybe_start_sweeper(self) -> None:
         if self._sweeper is not None:
@@ -447,12 +518,24 @@ class PluginReplay(Plugin):
     async def _route_fetch(self, request: Request) -> dict:
         '''Pull a batch with ``seq > after_seq`` (stateless — no cursor).
 
-        Body: ``{after_seq?, patterns?, session?, max_events?, max_bytes?}``.
+        Body: ``{after_seq?, patterns?, session?, endpoint?, plugin?,
+        session_after_seq?, max_events?, max_bytes?}``.  A *session* buffer is
+        found by ``(endpoint, plugin, session)``; see :meth:`_session_buffer`.
         *after_seq* defaults to ``-1`` (whole retained buffer); the consumer
         passes its own position and advances it by the returned ``next_seq``.
         Returns ``{events, next_seq, gap}`` where ``gap`` is true when the
         buffer's lowest retained ``seq`` has risen above ``after_seq`` (events
         were evicted — re-sync, don't trust continuity).
+
+        A fetch without *session* returns the global ring under ``events``
+        and, under ``sessions``, the session streams whose endpoint and plugin
+        match *patterns* (all with no patterns): a list of ``{endpoint,
+        plugin, session, events, next_seq, gap}``, one per stream with
+        anything to report.  Each stream has its own seq, so it is grouped,
+        not merged; its position comes from *session_after_seq* —
+        ``[[endpoint, plugin, session, after_seq], ...]``, ``-1`` for a
+        stream not listed.  The streams share the fetch's event and byte
+        budget with the global ring.
         '''
         body = await request.json()
 
@@ -464,28 +547,95 @@ class PluginReplay(Plugin):
         max_bytes  = int(body.get('max_bytes')  or self.default_max_bytes)
 
         now = self._now()
-        buf = (self._global if session is None
-               else self._session_buffers.get(session))
+        if session is None:
+            res = self._select(self._global, lower, patterns, max_events,
+                               max_bytes, now, from_zero=True)
+            res['sessions'] = self._select_sessions(
+                body.get('session_after_seq') or [], patterns,
+                max_events - len(res['events']),
+                max_bytes - res.pop('_bytes'), now)
+            return res
+        buf = self._session_buffer(session, body.get('endpoint'),
+                                   body.get('plugin'), patterns)
         if buf is None:
             return {'events': [], 'next_seq': lower, 'gap': False}
-        buf.evict_aged(now)
+        res = self._select(buf, lower, patterns, max_events, max_bytes, now,
+                           from_zero=False)
+        res.pop('_bytes')
+        return res
 
-        events   = buf.select(lower, patterns, max_events, max_bytes)
-        lowest   = buf.lowest_seq
-        # Gap when events after ``lower`` were evicted.  ``lowest_seq`` bounds it
-        # while the buffer is non-empty; ``last_dropped_seq`` still reports it
-        # once everything matching (or the whole buffer) has been evicted.
-        gap      = (lowest is not None and lowest > lower + 1) or \
-                   (buf.last_dropped_seq is not None
-                    and buf.last_dropped_seq > lower)
+    @staticmethod
+    def _select(buf: _RingBuffer, lower: int, patterns: List[dict],
+                max_events: int, max_bytes: int, now: float,
+                from_zero: bool) -> dict:
+        '''One buffer's ``{events, next_seq, gap}`` (plus ``_bytes`` used).'''
+        buf.evict_aged(now)
+        events, nbytes = buf.select(lower, patterns, max_events, max_bytes)
         next_seq = events[-1]['seq'] if events else lower
-        return {'events': events, 'next_seq': next_seq, 'gap': gap}
+        return {'events': events, 'next_seq': next_seq,
+                'gap': _gap(buf, lower, from_zero), '_bytes': nbytes}
+
+    def _select_sessions(self, positions: list, patterns: List[dict],
+                         max_events: int, max_bytes: int,
+                         now: float) -> List[dict]:
+        '''The session streams of a session-less fetch (see the route).'''
+        after = {}
+        for pos in positions:
+            try:
+                ep, plg, sid, seq = pos
+                after[(ep, plg, sid)] = int(seq)
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="session_after_seq takes [endpoint, plugin, "
+                           "session, after_seq] entries")
+        out = []
+        for key, buf in list(self._session_buffers.items()):
+            if max_events <= 0 or max_bytes <= 0:
+                break
+            if not _stream_matches(patterns, key[0], key[1]):
+                continue
+            res = self._select(buf, after.get(key, -1), patterns, max_events,
+                               max_bytes, now, from_zero=False)
+            max_events -= len(res['events'])
+            max_bytes  -= res.pop('_bytes')
+            if res['events'] or res['gap']:
+                out.append({'endpoint': key[0], 'plugin': key[1],
+                            'session': key[2], **res})
+        return out
+
+    def _session_buffer(self, session: str, endpoint: Optional[str],
+                        plugin: Optional[str],
+                        patterns: Optional[List[dict]] = None
+                        ) -> Optional[_RingBuffer]:
+        '''The buffer of *session* emitted by *endpoint*'s *plugin*.
+
+        Either may be ``None`` (older consumers pass the sid alone, maybe
+        with *patterns* naming the endpoint and plugin): the one buffer that
+        matches them all is used, and a sid still retained for several
+        endpoints/plugins (``'default'`` is everywhere) is rejected as
+        ambiguous rather than mixing them.
+        '''
+        if endpoint is not None and plugin is not None:
+            return self._session_buffers.get((endpoint, plugin, session))
+        found = [buf for (src, plg, sid), buf in self._session_buffers.items()
+                 if sid == session
+                 and endpoint in (None, src) and plugin in (None, plg)
+                 and _stream_matches(patterns or [], src, plg)]
+        if len(found) > 1:
+            raise HTTPException(
+                status_code=400,
+                detail=f"session {session!r} is retained for several "
+                       f"endpoints/plugins: pass 'endpoint' and 'plugin' "
+                       f"(or patterns naming them)")
+        return found[0] if found else None
 
     async def _route_stats(self, request: Request) -> dict:
-        '''Return retention stats: the global ring + each per-session buffer.'''
+        '''Return retention stats: the global ring + each per-session buffer
+        (keyed ``'<src>/<plugin>/<session>'``).'''
         self._evict_aged(self._now())
-        sessions = {sid: buf.stats()
-                    for sid, buf in self._session_buffers.items()}
+        sessions = {'/'.join(str(k) for k in key): buf.stats()
+                    for key, buf in self._session_buffers.items()}
         return {
             'global'  : self._global.stats(),
             'sessions': sessions,

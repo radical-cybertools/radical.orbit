@@ -15,6 +15,8 @@ import asyncio
 import threading
 import time
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from starlette.websockets import WebSocketDisconnect
@@ -512,6 +514,104 @@ async def test_event_seq_stamping_session_and_global(make_broker):
 
 
 @pytest.mark.asyncio
+async def test_event_session_seq_keyed_by_src_plugin_session(make_broker):
+    """The session seq is numbered per (src, plugin, session): two plugins'
+    'default' sessions and one sid on two endpoints are independent."""
+    broker = make_broker()
+    await broker.startup()
+    try:
+        cons = FakeWS()
+        await _register(broker, 'c1', cons)
+        broker._events.update_subscription('c1', {'patterns': [{}]}, True)
+        cons.sent.clear()
+
+        for src, plugin, sid in [('e1', 'psij', 'default'),
+                                 ('e1', 'rh',   'default'),
+                                 ('e1', 'psij', 'default'),
+                                 ('e1', 'rh',   'sid-x'),
+                                 ('e2', 'rh',   'sid-x'),
+                                 ('e1', 'rh',   'sid-x')]:
+            await broker._route_frame(
+                src, _event_bytes(src, plugin, 't', session=sid))
+        await asyncio.sleep(0.02)
+
+        # each stream counts on its own, consecutively; a new stream starts
+        # at the broker-wide high-water mark (not at 0)
+        got = [(e.src, e.plugin, e.session, e.seq) for e in cons.msgs()]
+        assert got == [('e1', 'psij', 'default', 0),
+                       ('e1', 'rh',   'default', 1),
+                       ('e1', 'psij', 'default', 1),
+                       ('e1', 'rh',   'sid-x',   2),
+                       ('e2', 'rh',   'sid-x',   3),
+                       ('e1', 'rh',   'sid-x',   3)]
+    finally:
+        await broker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_broker_hosted_session_notification_keeps_session(make_broker):
+    """A broker-hosted plugin's session notification keeps its session
+    through BrokerPluginHost and _host_broadcast into the event."""
+    from radical.orbit.broker_plugin_host import BrokerPluginHost
+
+    broker = make_broker()
+    await broker.startup()
+    try:
+        cons = FakeWS()
+        await _register(broker, 'c1', cons)
+        broker._events.update_subscription('c1', {'patterns': [{}]}, True)
+        cons.sent.clear()
+
+        host = BrokerPluginHost(plugin_names=[],
+                                broadcast_fn=broker._host_broadcast)
+        await host.send_notification('p', 't', {'k': 1}, session='s')
+        await host.send_notification('p', 't', {'k': 2})
+        await asyncio.sleep(0.02)
+
+        got = [(e.src, e.plugin, e.session, e.seq, e.data)
+               for e in cons.msgs()]
+        assert got == [('broker', 'p', 's',  0, {'k': 1}),
+                       ('broker', 'p', None, 0, {'k': 2})]
+    finally:
+        await broker.shutdown()
+
+
+def test_event_session_seq_table_bounded():
+    """The per-session seq table is LRU-bounded; a pruned stream resumes
+    above every seq it issued before (never backwards)."""
+    from radical.orbit.broker_events import EventRouter
+
+    router = EventRouter({}, lambda *a: None, MagicMock(), 8,
+                         lambda: None)
+    router._session_seq_max = 3
+
+    def _seq(sid):
+        raw = {'kind': 'event', 'plugin': 'p', 'topic': 't',
+               'session': sid, 'data': {}}
+        router.ingest('e1', raw)
+        return raw['seq']
+
+    issued = {}
+
+    def _seq_of(sid):
+        seq = _seq(sid)
+        assert seq > max(issued.get(sid, [-1]))   # never backwards
+        issued.setdefault(sid, []).append(seq)
+        return seq
+
+    assert [_seq_of('a'), _seq_of('a'), _seq_of('b'), _seq_of('c')] \
+        == [0, 1, 2, 3]
+    _seq_of('d')                              # evicts 'a' (least recent)
+    assert len(router._session_seq) == 3
+    assert ('e1', 'p', 'a') not in router._session_seq
+    for _ in range(3):
+        _seq_of('b')                          # 'b' runs ahead
+    assert _seq_of('a') > 1                   # 'a' resumes above its past
+    for sid in 'abcd':
+        _seq_of(sid)
+
+
+@pytest.mark.asyncio
 async def test_subscribe_filtering_exact_wildcard_unsubscribe(make_broker):
     broker = make_broker()
     await broker.startup()
@@ -633,6 +733,26 @@ async def test_suspect_then_lost_cascade(make_broker):
         broker._fire_lost('e1', ws1)
         await asyncio.sleep(0)
         assert 'e1' not in broker.registry
+    finally:
+        await broker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_resume_clears_subscriptions(make_broker):
+    """A resumed registration starts with no patterns: the participant
+    resyncs its full interest set right after."""
+    broker = make_broker()
+    await broker.startup()
+    try:
+        ws1 = FakeWS()
+        await _register(broker, 'e1', ws1)
+        key = protocol.parse_message(ws1.sent[0]).resume_key
+        broker._events.update_subscription('e1', {'patterns': [{}]}, True)
+        await broker._on_socket_drop('e1', ws1, clean=False)
+
+        ok, _ = await _register(broker, 'e1', FakeWS(), resume_key=key)
+        assert ok is True
+        assert broker._events._subscriptions['e1'] == []
     finally:
         await broker.shutdown()
 
