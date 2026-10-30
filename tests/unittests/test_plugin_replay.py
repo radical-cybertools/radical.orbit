@@ -218,6 +218,11 @@ def test_event_matches_wildcards():
     assert _event_matches([{'topic': 'other'}], ev) is False
     # OR across patterns
     assert _event_matches([{'endpoint': 'epB'}, {'plugin': 'psij'}], ev)
+    # a session pattern matches that session's events only
+    sev = _ev(0, session='s', src='epA', plugin='psij')
+    assert _event_matches([{'plugin': 'psij', 'session': 's'}], sev)
+    assert _event_matches([{'session': 'x'}], sev) is False
+    assert _event_matches([{'session': 's'}], ev) is False      # session-less
 
 
 def test_fetch_pattern_filter():
