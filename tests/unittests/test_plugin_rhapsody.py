@@ -2956,9 +2956,17 @@ class _SessionHTTP:
             self.threads.append(threading.current_thread().name)
             if self.gate is not None:
                 self.gate.wait(10)
-            body = asyncio.run(self.session.task_states(json['uids']))
+            try:
+                body = asyncio.run(self.session.task_states(
+                    json['uids'], json.get('terminal_only', False)))
+            except HTTPException as e:
+                return self._resp(e.status_code, {'detail': e.detail})
+        return self._resp(200, body)
+
+    @staticmethod
+    def _resp(status, body):
         resp = MagicMock()
-        resp.is_error, resp.status_code = False, 200
+        resp.is_error, resp.status_code = status >= 400, status
         resp.json = MagicMock(return_value=body)
         return resp
 
@@ -3246,9 +3254,11 @@ def test_close_during_reconcile_stops_cleanly():
 # Code-review round 1
 # ---------------------------------------------------------------------------
 
-def _ack_http(fail_at=None, gate=None, before_ack=None):
+def _ack_http(fail_at=None, gate=None, before_ack=None, status=None):
     """Transport acking every submit POST; the *fail_at*-th one (0-based)
-    waits for *gate* and raises.  *before_ack(uids)* runs before an ack."""
+    waits for *gate* and raises (with *status* as ``status_code`` if given:
+    an HTTP error, else a transport error).  *before_ack(uids)* runs before
+    an ack."""
     calls = []
 
     def post(url, data=None, json=None, headers=None):
@@ -3260,7 +3270,10 @@ def _ack_http(fail_at=None, gate=None, before_ack=None):
             if n == fail_at:
                 if gate is not None:
                     gate.wait(10)
-                raise RuntimeError("submit POST failed")
+                exc = RuntimeError("submit POST failed")
+                if status is not None:
+                    exc.status_code = status
+                raise exc
             import msgpack
             tasks = msgpack.unpackb(data)["tasks"]
             if before_ack:
@@ -3337,15 +3350,18 @@ def test_fan_out_does_not_repeat_terminal_states():
     assert 't.2' in client._completed      # recorded, passed on once
 
 
-def test_failed_submit_withdraws_unacked_batches():
-    """Batches not acked when submit raises are withdrawn and a waiter on
-    them raises; acked batches stay pending."""
+def _failing_submit(status, pre=()):
+    """Submit 4 one-task batches whose second POST fails; a waiter on the
+    unsent t.2 blocks before the failure.  *pre* uids were submitted (and
+    acked) earlier and are part of the failing batch's call."""
     from radical.orbit import plugin_rhapsody as prh
 
     gate   = threading.Event()
-    client = _sse_client(_ack_http(fail_at=1, gate=gate))
+    client = _sse_client(_ack_http(fail_at=1, gate=gate, status=status))
+    _track(client, pre)
     tasks  = [{'uid': f't.{i}', 'executable': '/bin/true'} for i in range(4)]
-    errors = []
+    tasks += [{'uid': u, 'executable': '/bin/true'} for u in pre]
+    errors, waited = [], []
 
     def _submit():
         try:
@@ -3353,19 +3369,16 @@ def test_failed_submit_withdraws_unacked_batches():
         except RuntimeError as e:
             errors.append(e)
 
+    def _wait():
+        try:
+            client.wait_tasks(['t.0', 't.2'], timeout=10)
+        except RuntimeError as e:
+            waited.append(e)
+
     with patch.object(prh, 'WS_PAYLOAD_LIMIT', 1):  # one task per batch
         submitter = threading.Thread(target=_submit)
         submitter.start()
         assert _until(lambda: 't.0' in client._pending)
-
-        waited = []
-
-        def _wait():
-            try:
-                client.wait_tasks(['t.0', 't.2'], timeout=10)
-            except RuntimeError as e:
-                waited.append(e)
-
         waiter = threading.Thread(target=_wait)
         waiter.start()
         time.sleep(0.05)                         # waiter blocks
@@ -3375,8 +3388,25 @@ def test_failed_submit_withdraws_unacked_batches():
 
     assert errors and 'submit POST failed' in str(errors[0])
     assert waited and 'withdrawn' in str(waited[0])
-    assert client._submitted == {'t.0'}
-    assert client._outstanding() == ['t.0']
+    return client
+
+
+def test_failed_submit_keeps_uncertain_batch():
+    """A transport error (or 5xx) leaves the failing batch uncertain: it
+    stays submitted and pending, for the reconcile to resolve.  Batches
+    never sent are withdrawn."""
+    for status in (None, 504):
+        client = _failing_submit(status)
+        assert client._submitted == {'t.0', 't.1'}
+        assert sorted(client._outstanding()) == ['t.0', 't.1']
+
+
+def test_failed_submit_withdraws_rejected_batch_only_new_uids():
+    """A 4xx withdraws the rejected batch too — but only uids this call
+    added: an earlier submit's uid stays."""
+    client = _failing_submit(400, pre=('t.early',))
+    assert client._submitted == {'t.0', 't.early'}
+    assert sorted(client._outstanding()) == ['t.0', 't.early']
 
 
 def test_outstanding_is_kept_incrementally():
@@ -3545,6 +3575,281 @@ def test_fan_out_serialized_without_dispatcher():
         assert peak[0] == 1
     finally:
         client.close()
+
+
+
+# ---------------------------------------------------------------------------
+# Code-review round 2
+# ---------------------------------------------------------------------------
+
+def test_all_topics_callbacks_go_through_the_fan_out():
+    """A topic=None callback gets task events through the fan-out (once,
+    deduplicated, including recovered ones) and other topics as is."""
+    rt     = _FakeRuntime()
+    client = _sse_client(MagicMock(), rt=rt)
+    got    = []
+    client.register_notification_callback(
+        lambda e, p, t, d: got.append((t, d.get('uid') or d.get('status')
+                                       or [x['uid'] for x in d['tasks']])))
+    rt._cb.start()
+    try:
+        rt.deliver('task_status', {'uid': 't.1', 'state': 'DONE',
+                                   'sid': 'sid-rh'})
+        rt.deliver('session_status', {'sid': 'sid-rh', 'status': 'ready'})
+        assert _until(lambda: len(got) == 2)    # live ones first
+        client._redeliver('sid-rh', [{'uid': 't.1', 'state': 'DONE'},
+                                     {'uid': 't.2', 'state': 'DONE'}])
+        assert _until(lambda: len(got) == 3)
+        time.sleep(0.05)
+        assert sorted(got, key=str) == sorted([
+            ('task_status', 't.1'), ('session_status', 'ready'),
+            ('task_status_batch', ['t.2'])], key=str)
+        # one runtime registration per task topic, one for the rest
+        assert sorted(str(t) for t, _ in rt.callbacks) \
+            == ['None', 'task_status', 'task_status_batch']
+    finally:
+        rt._cb.stop()
+
+
+def test_example_rhapsody_runs_against_the_client(capsys):
+    """examples/example_rhapsody.py (all-topics callback, submit, wait,
+    get_task, close) runs end to end against a fake runtime."""
+    import importlib.util
+    import pathlib
+
+    path = pathlib.Path(__file__).resolve().parents[2] \
+        / 'examples' / 'example_rhapsody.py'
+    spec = importlib.util.spec_from_file_location('example_rhapsody', path)
+    example = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(example)
+
+    rt      = _FakeRuntime()
+    session = RhapsodySession('sid-example')
+    session._rh_session = MagicMock()
+    session._init_ready.set()
+
+    class _ExampleHTTP:
+        def post(self, url, data=None, json=None, headers=None, **kw):
+            body = {}
+            if 'submit' in url:
+                import msgpack
+                tasks = msgpack.unpackb(data)['tasks']
+                for t in tasks:
+                    session._tasks[t['uid']] = _done_task(t['uid'], 'ok')
+                body = [{'uid': t['uid'], 'state': 'SUBMITTED'}
+                        for t in tasks]
+                for t in tasks:                    # completions follow
+                    rt.deliver('task_status', {
+                        **session._notification_payload(
+                            session._tasks[t['uid']]),
+                        'sid': session.sid})
+            return self._resp(body)
+
+        def get(self, url, **kw):
+            return self._resp({'uid': url.rsplit('/', 1)[-1],
+                               'state': 'DONE'})
+
+        @staticmethod
+        def _resp(body):
+            resp = MagicMock()
+            resp.is_error, resp.status_code = False, 200
+            resp.json = MagicMock(return_value=body)
+            return resp
+
+    class _ExampleRuntime:
+        name = 'consumer'
+
+        def __init__(self, *a, **kw):
+            pass
+
+        def start(self, wait=True):
+            rt._cb.start()
+
+        def topology(self):
+            return {'ep': {'plugins': {'rhapsody': {}}}}
+
+        def get_plugin(self, eid, plugin):
+            client = RhapsodyClient(_ExampleHTTP(), '/rhapsody',
+                                    broker_client=rt, endpoint_id=eid,
+                                    plugin_name=plugin)
+            client._sid = session.sid
+            client._start_task_listener()
+            return client
+
+        def stop(self):
+            rt._cb.stop()
+
+    with patch.object(example, 'EndpointRuntime', _ExampleRuntime):
+        example.main()
+    out = capsys.readouterr().out
+    assert 'All tasks finished' in out and 'Done.' in out
+    assert out.count('[Notification]') == 3        # each completion once
+
+
+def test_reconcile_chunks_by_bytes_and_splits_on_413():
+    """The reconcile sizes requests by uid bytes; an endpoint with a smaller
+    budget answers 413 and the request is split until it fits."""
+    from radical.orbit.plugin_rhapsody import _task_states_fits
+
+    uids    = [f'task.{"l" * 40}.{i:03d}' for i in range(60)]
+    session = _done_session('sid-bytes', uids)
+    session._notify_batch_bytes = 2048         # endpoint: small budget
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session)
+    try:
+        assert all(_task_states_fits(c, client._states_budget)
+                   for c in client._uid_chunks('sid-bytes', uids))
+        client._states_budget = 64 * 1024      # client: assumes more
+        assert len(client._uid_chunks('sid-bytes', uids)) == 1
+        _track(client, uids)
+        client._reconcile_wake.set()
+        assert len(client.wait_tasks(uids, timeout=10)) == 60
+        assert len(http.threads) > 2           # 413s, then split calls
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
+def test_reconcile_aborts_when_the_session_changes():
+    """The sid is taken once per pass; if the session changed while
+    fetching, nothing is delivered."""
+    session = _done_session('sid-old', ['task.s1', 'task.s2'])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session)
+    urls = []
+    orig = http.post
+
+    def _switching(url, json=None, **kwargs):
+        urls.append(url)
+        resp = orig(url, json=json, **kwargs)
+        client._sid = 'sid-new'                # switched meanwhile
+        return resp
+
+    http.post = _switching
+    try:
+        _track(client, ['task.s1', 'task.s2'])
+        got = []
+        client.register_notification_callback(
+            lambda *a: got.append(a), topic='task_status_batch')
+        client._reconcile()
+        assert urls == ['/rhapsody/task_states/sid-old']
+        time.sleep(0.05)
+        assert got == [] and not client._completed
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
+def test_stale_running_after_terminal_is_not_passed_on():
+    """State never goes backwards: a RUNNING for a task recorded terminal
+    is dropped from the fan-out (alone, or from a batch)."""
+    client = _sse_client(MagicMock(), rt=_FakeRuntime())
+    got = []
+    for topic in ('task_status', 'task_status_batch'):
+        client.register_notification_callback(
+            lambda e, p, t, d: got.append(d), topic=topic)
+    client._fan_out('ep', 'rhapsody', 'task_status',
+                    {'uid': 't.1', 'state': 'DONE', 'sid': 'sid-rh'})
+    client._fan_out('ep', 'rhapsody', 'task_status',
+                    {'uid': 't.1', 'state': 'RUNNING', 'sid': 'sid-rh'})
+    client._fan_out('ep', 'rhapsody', 'task_status_batch',
+                    {'sid': 'sid-rh', 'tasks': [
+                        {'uid': 't.1', 'state': 'RUNNING'},
+                        {'uid': 't.2', 'state': 'RUNNING'}]})
+    assert [d.get('state') or [x['uid'] for x in d['tasks']]
+            for d in got] == ['DONE', ['t.2']]
+
+
+def test_ensure_fan_out_rolls_back_a_partial_registration():
+    """If the second runtime registration fails, the first is undone, the
+    error is raised and a later attempt registers both."""
+    rt   = _FakeRuntime()
+    orig = rt.register_callback
+    fail = [True]
+
+    def _flaky(**kw):
+        if kw.get('topic') == 'task_status_batch' and fail[0]:
+            raise RuntimeError('register failed')
+        orig(**kw)
+
+    rt.register_callback = _flaky
+    client = _sse_client(MagicMock(), rt=rt)
+    with pytest.raises(RuntimeError, match='register failed'):
+        client._ensure_fan_out()
+    assert rt.callbacks == [] and not client._fanout_on
+
+    fail[0] = False
+    client._ensure_fan_out()
+    assert sorted(t for t, _ in rt.callbacks) \
+        == ['task_status', 'task_status_batch']
+    assert client._fanout_on
+
+
+def test_close_does_not_stall_on_a_stuck_reconcile():
+    """close() waits only briefly for a stuck task_states call (which is
+    bounded by a timeout), returns at once from inside a callback, and the
+    stuck reconcile delivers nothing afterwards."""
+    from radical.orbit import plugin_rhapsody as prh
+
+    gate    = threading.Event()
+    session = _done_session('sid-stuck', ['task.k1'])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session, gate=gate)
+    timeouts = []
+    orig = http.post
+
+    def _record(url, json=None, **kwargs):
+        timeouts.append(kwargs.get('timeout'))
+        return orig(url, json=json, **kwargs)
+
+    http.post = _record
+    got = []
+    client.register_notification_callback(
+        lambda *a: got.append(a), topic='task_status_batch')
+    _track(client, ['task.k1'])
+    client._reconcile_wake.set()
+    assert _until(lambda: http.threads)
+    assert timeouts == [prh.RECONCILE_TIMEOUT]
+
+    with patch.object(prh, 'RECONCILE_JOIN', 0.2):
+        t0 = time.monotonic()
+        client.close()
+        assert time.monotonic() - t0 < 1.0
+
+    # from inside a callback (holding the delivery lock): no wait at all
+    other, other_http = _reconciling_client(
+        rt, _done_session('sid-stuck2', ['task.k2']), gate=gate)
+    _track(other, ['task.k2'])
+    other._reconcile_wake.set()
+    assert _until(lambda: other_http.threads)
+    t0 = time.monotonic()
+    with other._delivering():
+        other.close()
+    assert time.monotonic() - t0 < 0.1
+
+    gate.set()
+    time.sleep(0.1)
+    assert got == []                            # stopped: nothing delivered
+    rt._cb.stop()
+
+
+def test_task_states_terminal_only():
+    """With terminal_only, running tasks are left out of `tasks` (and are
+    not reported unknown)."""
+    _, plugin, client = _make_plugin()
+    running = MagicMock()
+    running.uid, running.state = "task.r", "RUNNING"
+    running.to_dict = lambda: {"uid": "task.r", "state": "RUNNING"}
+    sid, _ = _states_session(plugin, client,
+                             [running, _done_task("task.d", 1)])
+    body = client.post(f"{plugin.namespace}/task_states/{sid}",
+                       json={"uids": ["task.r", "task.d", "task.x"],
+                             "terminal_only": True}).json()
+    assert [t["uid"] for t in body["tasks"]] == ["task.d"]
+    assert body["unknown"] == ["task.x"] and body["remaining"] == []
 
 
 _TIMERS: list = []

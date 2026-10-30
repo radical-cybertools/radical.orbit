@@ -108,14 +108,16 @@ class _RuntimeHTTP:
         self._runtime = runtime
         self._dst     = dst
 
-    def get(self, url: str, *, params=None, headers=None, **kw
-            ) -> RuntimeResponse:
-        return self._do('GET', url, params=params, headers=headers)
+    def get(self, url: str, *, params=None, headers=None, timeout=None,
+            **kw) -> RuntimeResponse:
+        return self._do('GET', url, params=params, headers=headers,
+                        timeout=timeout)
 
     def post(self, url: str, *, json=None, content=None, data=None,
-             params=None, headers=None, **kw) -> RuntimeResponse:
+             params=None, headers=None, timeout=None, **kw
+             ) -> RuntimeResponse:
         return self._do('POST', url, json=json, content=content, data=data,
-                        params=params, headers=headers)
+                        params=params, headers=headers, timeout=timeout)
 
     def request(self, method: str, url: str, *, json=None, content=None,
                 data=None, params=None, headers=None, **kw) -> RuntimeResponse:
@@ -123,9 +125,9 @@ class _RuntimeHTTP:
                         params=params, headers=headers)
 
     def _do(self, method, url, json=None, content=None, data=None,
-            params=None, headers=None) -> RuntimeResponse:
+            params=None, headers=None, timeout=None) -> RuntimeResponse:
         path, body, hdrs = _pack_request(
             method, url, json=json, content=content, data=data,
             params=params, headers=headers)
         return self._runtime.call(self._dst, method, path,
-                                  body=body, headers=hdrs)
+                                  body=body, headers=hdrs, timeout=timeout)

@@ -2629,6 +2629,16 @@
     // ─────────────────────────────────────────────────────────────
     //  SSE Notification handler
     // ─────────────────────────────────────────────────────────────
+    // The per-task items of a bulk notification frame, or null: only a
+    // `*_batch` topic whose `tasks` are all objects carrying `idField`.
+    function batchItems(data, idField) {
+      const tasks = data && data.data && data.data.tasks;
+      if (typeof data?.topic !== 'string' || !data.topic.endsWith('_batch')
+          || !Array.isArray(tasks) || !tasks.length) return null;
+      const ok = tasks.every(t => t && typeof t === 'object' && t[idField]);
+      return ok ? tasks : null;
+    }
+
     function handleNotification(data) {
       const plugin = data.plugin;
       const d = data.data || {};
@@ -2640,15 +2650,15 @@
       if (pageModule && pageModule.module.onNotification) {
         const idField       = pageModule.module.notificationConfig?.idField || 'uid';
         const configTopic   = pageModule.module.notificationConfig?.topic;
-        // A bulk frame (e.g. rhapsody's task_status_batch) carries a list of
-        // single payloads under `tasks`: handle each as its single topic, so
-        // the task registry and the pending-notification replay see them.
-        if (Array.isArray(d.tasks) && !d[idField]) {
-          const topic = configTopic || String(data.topic || '').replace(/_batch$/, '');
-          for (const item of d.tasks) {
-            if (item && typeof item === 'object') {
-              handleNotification({ ...data, topic, data: { sid: d.sid, ...item } });
-            }
+        // A bulk frame (topic `<topic>_batch`, e.g. rhapsody's
+        // task_status_batch) carries per-task payloads under `tasks`: replay
+        // each under `<topic>`, so the task registry and the pending
+        // replay see them.  Anything else passes through unchanged.
+        const items = batchItems(data, idField);
+        if (items) {
+          const topic = data.topic.slice(0, -'_batch'.length);
+          for (const item of items) {
+            handleNotification({ ...data, topic, data: { sid: d.sid, ...item } });
           }
           return;
         }
