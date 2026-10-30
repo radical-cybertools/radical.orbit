@@ -294,6 +294,11 @@ class EndpointRuntime(PluginHostBase):
         return self._broker_url
 
     @property
+    def frame_cap(self) -> int:
+        """This runtime's frame cap, which bounds every frame it sends."""
+        return self._frame_cap
+
+    @property
     def embedded_broker(self):
         """The in-process :class:`Broker` when ``embedded=True``, else None."""
         return self._embedded.broker if self._embedded else None

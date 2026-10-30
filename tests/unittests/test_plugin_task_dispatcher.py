@@ -959,6 +959,25 @@ class TestEndpointMode:
         assert 't.1' not in plugin._endpoint_mode_tasks
         assert notified and notified[0][1]['state'] == TASK_DONE
 
+    def test_endpoint_mode_oversized_task_is_413(self, tmp_path):
+        from radical.orbit.runtime_client import PayloadTooLarge
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _register(client, plugin, body={'sid': 'A',
+                                              'lifetime': 'persistent'})
+        self._seed_topology(plugin, {'ep': ['rhapsody']})
+        rh_mock = MagicMock()
+        rh_mock.submit_tasks = MagicMock(
+            side_effect=PayloadTooLarge('HTTP 413 — too big', [0], ['t.1']))
+        with patch.object(plugin, '_get_rhapsody_client',
+                          new=AsyncMock(return_value=rh_mock)):
+            r = client.post(f'{plugin.namespace}/submit/{sid}', json={
+                'endpoint': 'ep', 'task_id': 't.1',
+                'cmd': ['/bin/true'], 'cwd': '/tmp'})
+        assert r.status_code == 413, r.text
+        assert 'too big' in r.json()['detail']
+        assert 't.1' not in plugin._endpoint_mode_tasks
+
     def test_terminal_batch_event_is_handled(self, tmp_path):
         '''Several completions in one frame arrive as task_status_batch.'''
         _, plugin = _make_plugin(tmp_path)
@@ -1170,16 +1189,72 @@ class TestRhapsodyDialect:
         _, task = self._submit_one(tmp_path, submit)
         assert task.state == TASK_DONE
 
-    def test_partial_submit_keeps_accepted_tasks_mapped(self, tmp_path):
+    def _submit_many(self, tmp_path, n, submit):
+        '''Post *n* co-claimed tasks through ``_do_rhapsody_submit``; each
+        pilot ``submit_tasks`` call runs ``submit(dicts)``.'''
+        _, plugin = _make_plugin(tmp_path)
+        plugin._materialise_pool('A', _make_pool_cfg())
+        ps = _pool(plugin, 'A', 'cpu')
+        pilot = PilotRecord(
+            pid='p.1', pool='cpu', owning_sid='A', size_key='s',
+            rhapsody_backend='concurrent', state=PILOT_ACTIVE,
+            child_endpoint_name='endpoint0_p.1', capacity=4)
+        ps.pilots['p.1'] = pilot
+        tasks = []
+        for i in range(1, n + 1):
+            td = _dialect_td(f't.{i}')
+            td.pop('pool')
+            tasks.append(TaskRecord(
+                task_id=f't.{i}', pool='cpu', owning_sid='A', cmd=[], cwd='',
+                task_dict=td, state=TASK_RUNNING))
+            ps.tasks[f't.{i}'] = tasks[-1]
+        rh_mock = MagicMock()
+        rh_mock.submit_tasks = MagicMock(side_effect=submit)
+
+        async def drive():
+            with patch.object(plugin, '_get_rhapsody_client',
+                              new=AsyncMock(return_value=rh_mock)):
+                await plugin._do_rhapsody_submit(ps, list(tasks), pilot)
+
+        asyncio.run(drive())
+        return plugin, tasks, rh_mock
+
+    def test_partial_submit_keeps_accepted_and_uncertain_mapped(self,
+                                                                tmp_path):
         from radical.orbit.plugin_rhapsody import PartialSubmitError
 
-        def submit(plugin, loop):
-            raise PartialSubmitError('HTTP 503 after 1 task', ['t.1.A'], [])
-        plugin, task = self._submit_one(tmp_path, submit)
-        # accepted by the pilot: it runs there, so it stays RUNNING + mapped
-        assert task.state        == TASK_RUNNING
-        assert task.rhapsody_uid == 't.1.A'
-        assert plugin._uid_to_task['t.1.A'] == ('A', 'cpu', 't.1')
+        def submit(dicts):
+            raise PartialSubmitError('HTTP 504', accepted=['t.1.A'],
+                                     uncertain=['t.2.A'],
+                                     rejected=['t.3.A'])
+        plugin, tasks, _ = self._submit_many(tmp_path, 3, submit)
+        # accepted runs on the pilot, uncertain may: both stay mapped
+        for task in tasks[:2]:
+            assert task.state        == TASK_RUNNING
+            assert task.rhapsody_uid == f'{task.task_id}.A'
+            assert f'{task.task_id}.A' in plugin._uid_to_task
+        # rejected never reached the pilot: it fails, unmapped
+        assert tasks[2].state        == TASK_FAILED
+        assert tasks[2].rhapsody_uid is None
+        assert 't.3.A' not in plugin._uid_to_task
+
+    def test_oversized_task_fails_alone_and_peers_submit(self, tmp_path):
+        from radical.orbit.runtime_client import PayloadTooLarge
+        calls = []
+
+        def submit(dicts):
+            calls.append([d['uid'] for d in dicts])
+            if len(calls) == 1:
+                raise PayloadTooLarge('HTTP 413 — too big', [1], ['t.2.A'])
+            return [{'uid': d['uid']} for d in dicts]
+        plugin, tasks, _ = self._submit_many(tmp_path, 3, submit)
+        assert calls == [['t.1.A', 't.2.A', 't.3.A'], ['t.1.A', 't.3.A']]
+        assert tasks[1].state == TASK_FAILED
+        assert 'too big' in (tasks[1].error or '')
+        assert 't.2.A' not in plugin._uid_to_task
+        for task in (tasks[0], tasks[2]):
+            assert task.state == TASK_RUNNING
+            assert f'{task.task_id}.A' in plugin._uid_to_task
 
     def test_client_submit_partial_failure_and_413(self, tmp_path):
         from radical.orbit.plugin_rhapsody import PartialSubmitError

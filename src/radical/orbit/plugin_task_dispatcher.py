@@ -56,8 +56,9 @@ from .plugin_session_base               import PluginSession
 from .plugin_rhapsody                   import (
     RhapsodyClient, RhapsodySession, NOTIFY_BATCH_SIZE,
     _payload_size, _resolve_notify_window, _resolve_frame_cap, BUDGET_RATIO,
-    _submit_batches,
+    _submit_batches, PartialSubmitError,
 )
+from .runtime_client                    import PayloadTooLarge, max_body_of
 from .task_dispatcher_config            import (
     PoolConfig, PoolMember, PilotSize, PoolConfigError,
     PILOT_ENDPOINT, default_pool_config, parse_pools, parse_member,
@@ -150,9 +151,10 @@ _NO_MPI_BACKENDS = NO_MPI_BACKENDS
 # a number an operator can remember.
 #
 # The per-submit total only bites past the default cap: the gateway reads
-# at most ``protocol.FRAME_CAP`` of HTTP body, and a WS submit is bounded by
-# the broker's ``BrokerTuning.frame_cap`` (default ``FRAME_CAP``), so with
-# stock settings no path can deliver 8 MiB of decoded inputs.  It is the
+# at most ``protocol.max_body(frame_cap)`` of HTTP body (the broker's frame
+# cap minus the envelope slack), and a WS submit is bounded by the broker's
+# ``BrokerTuning.frame_cap`` (default ``FRAME_CAP``), so with stock
+# settings no path can deliver 8 MiB of decoded inputs.  It is the
 # backstop for a broker tuned to a ``frame_cap`` above ~10.7 MiB (8 MiB
 # decoded, base64-inflated), whose one submit could otherwise spool as much
 # as that cap allows.
@@ -517,9 +519,7 @@ class _CallerSyncHTTP:
     @property
     def max_body(self) -> int:
         '''Largest request body the broker's frame cap carries.'''
-        from . import protocol
-        return protocol.max_body(
-            getattr(self._caller, 'frame_cap', protocol.FRAME_CAP))
+        return max_body_of(self._caller)
 
     def request(self, method: str, url: str, *, json=None, content=None,
                 data=None, params=None, headers=None, **_kw):
@@ -2013,6 +2013,10 @@ class PluginTaskDispatcher(Plugin):
                           self.instance_name, target_endpoint, e)
             if self._endpoint_mode_tasks.pop(task_id, None):
                 self._persist_endpoint_mode()
+            if isinstance(e, PayloadTooLarge):
+                # the task itself is too large: the caller's error, not
+                # the pilot's
+                raise HTTPException(status_code=413, detail=str(e)) from e
             raise HTTPException(
                 status_code=502,
                 detail=f'rhapsody submit failed on '
@@ -3284,25 +3288,52 @@ class PluginTaskDispatcher(Plugin):
                                              task.task_id)
 
         try:
-            await asyncio.to_thread(rh.submit_tasks, [f for _, f in fwds])
+            try:
+                await asyncio.to_thread(rh.submit_tasks, [f for _, f in fwds])
+            except PayloadTooLarge as e:
+                # Nothing was sent.  Fail only the tasks no frame carries
+                # and submit their co-claimed peers.
+                too_big = set(e.uids)
+                if not too_big:
+                    raise
+                for task, fwd in fwds:
+                    if fwd['uid'] in too_big:
+                        self._fail_unsent(pool_state, task, fwd,
+                                          f'rhapsody submit error: {e}')
+                fwds = [(t, f) for t, f in fwds if f['uid'] not in too_big]
+                if fwds:
+                    await asyncio.to_thread(rh.submit_tasks,
+                                            [f for _, f in fwds])
             self._mark_dirty(pool_state)
         except Exception as e:
             log.exception('[%s] rhapsody submit failed for %d task(s): %s',
-                          self.instance_name, len(tasks), e)
-            # a partial submit: the accepted batches run on the pilot, so
-            # those tasks keep their mapping (``PartialSubmitError.accepted``)
-            accepted = set(getattr(e, 'accepted', None) or ())
-            if accepted:
-                self._mark_dirty(pool_state)
+                          self.instance_name, len(fwds), e)
+            # A partial submit: accepted batches run on the pilot, and an
+            # uncertain one (timeout, 5xx) may; those tasks keep their
+            # mapping.  Only the rejected / never-sent ones fail.
+            kept = set()
+            if isinstance(e, PartialSubmitError):
+                kept = set(e.accepted) | set(e.uncertain)
+                if e.uncertain:
+                    log.warning('[%s] %d task(s) submitted with an uncertain '
+                                'outcome, kept pending: %s',
+                                self.instance_name, len(e.uncertain), e)
+                if kept:
+                    self._mark_dirty(pool_state)
             for task, fwd in fwds:
-                if fwd['uid'] in accepted:
+                if fwd['uid'] in kept:
                     continue
-                self._uid_to_task.pop(fwd['uid'], None)
-                # a task the pilot already finished keeps that outcome
-                if task.state not in TASK_TERMINAL_STATES:
-                    task.rhapsody_uid = None
-                    self._mark_task_failed(pool_state, task,
-                                           f'rhapsody submit error: {e}')
+                self._fail_unsent(pool_state, task, fwd,
+                                  f'rhapsody submit error: {e}')
+
+    def _fail_unsent(self, pool_state: PoolState, task: TaskRecord,
+                     fwd: dict, reason: str) -> None:
+        '''Unmap a task its pilot never took, and fail it.'''
+        self._uid_to_task.pop(fwd['uid'], None)
+        # a task the pilot already finished keeps that outcome
+        if task.state not in TASK_TERMINAL_STATES:
+            task.rhapsody_uid = None
+            self._mark_task_failed(pool_state, task, reason)
 
     def _on_event(self, event: dict) -> None:
         '''Broker raw-tap callback: a child rhapsody reported a transition.

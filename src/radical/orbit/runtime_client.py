@@ -24,7 +24,7 @@ base ``PluginClient.register_notification_callback`` forwards notification
 
 import json as _json
 
-from typing       import Any, Dict, List, Tuple
+from typing       import Any, Dict, Iterator, List, Tuple
 from urllib.parse import urlencode
 
 import httpx
@@ -35,9 +35,34 @@ from .client import PluginClient  # noqa: F401  (re-export convenience)
 
 
 class PayloadTooLarge(RuntimeError):
-    """A request item that no frame can carry (HTTP 413, before any send)."""
+    """Request items that no frame can carry (HTTP 413, before any send).
+
+    ``indices`` are the offending items' positions, ``uids`` their ``uid``
+    (for dict items carrying one), so a caller can drop just those.
+    """
 
     status_code = 413
+
+    def __init__(self, msg: str = '', indices=(), uids=()):
+        super().__init__(msg)
+        self.indices = list(indices)
+        self.uids    = list(uids)
+
+    def __reduce__(self):
+        return (type(self), (str(self), self.indices, self.uids))
+
+
+def max_body_of(holder) -> int:
+    """Return the request-body limit of a frame-cap *holder*.
+
+    The holder (an :class:`~radical.orbit.runtime.EndpointRuntime` or the
+    broker's ``BrokerCaller``) publishes its cap as ``frame_cap``; anything
+    else gets the protocol default.
+    """
+    cap = getattr(holder, 'frame_cap', None)
+    if not (isinstance(cap, int) and cap > 0):
+        cap = protocol.FRAME_CAP
+    return protocol.max_body(cap)
 
 
 def transport_max_body(http) -> int:
@@ -54,41 +79,48 @@ def transport_max_body(http) -> int:
 
 
 def pack_batches(items: List[Any], budget: int, limit: int,
-                 key: str = 'tasks') -> List[Tuple[List[Any], bytes]]:
+                 key: str = 'tasks') -> Iterator[Tuple[List[Any], bytes]]:
     """Split *items* into msgpack bodies ``{key: [...]}`` bounded in bytes.
 
     Each item is packed once; a body is assembled from those bytes (map
     header + *key* + array header + parts), so the size is exact and the
     bytes equal ``msgpack.packb({key: batch})``.  A body holds items up to
     *budget* bytes; an item larger than that travels alone.  Every item is
-    checked before anything is returned, so the caller sends nothing when
-    one item cannot fit *limit* (the transport's hard body limit):
-    :class:`PayloadTooLarge` is raised instead.
+    checked here, before the first body exists, so the caller sends nothing
+    when an item cannot fit *limit* (the transport's hard body limit):
+    :class:`PayloadTooLarge` names all such items instead.
 
-    Returns ``[(batch_items, body_bytes), ...]``.
+    Returns an iterator of ``(batch_items, body_bytes)``; the bodies are
+    built lazily, one at a time, so a submission is not held twice.
     """
     head  = msgpack.packb({key: []}, use_bin_type=True)[:-1]   # minus [] hdr
     parts = [msgpack.packb(it, use_bin_type=True) for it in items]
     over  = 5 + len(head)                                      # + array hdr
 
-    for idx, part in enumerate(parts):
-        if over + len(part) > limit:
-            raise PayloadTooLarge(
-                f"HTTP 413 — item {idx} packs to {len(part)} bytes, over "
-                f"the {limit} byte request body limit")
+    bad = [idx for idx, part in enumerate(parts) if over + len(part) > limit]
+    if bad:
+        uids = [str(items[i]['uid']) for i in bad
+                if isinstance(items[i], dict) and 'uid' in items[i]]
+        raise PayloadTooLarge(
+            f"HTTP 413 — {len(bad)} item(s) (first: item {bad[0]}, "
+            f"{len(parts[bad[0]])} bytes) over the {limit} byte request "
+            f"body limit", bad, uids)
 
-    out:   List[Tuple[List[Any], bytes]] = []
+    return _iter_batches(items, parts, head, over, budget)
+
+
+def _iter_batches(items, parts, head, over, budget
+                  ) -> Iterator[Tuple[List[Any], bytes]]:
     start = 0
     size  = over
     for idx, part in enumerate(parts):
         if idx > start and size + len(part) > budget:
-            out.append(_assemble(items, parts, head, start, idx))
+            yield _assemble(items, parts, head, start, idx)
             start = idx
             size  = over
         size += len(part)
     if start < len(parts):
-        out.append(_assemble(items, parts, head, start, len(parts)))
-    return out
+        yield _assemble(items, parts, head, start, len(parts))
 
 
 def _assemble(items, parts, head, start, end) -> Tuple[List[Any], bytes]:
@@ -178,8 +210,7 @@ class _RuntimeHTTP:
     @property
     def max_body(self) -> int:
         """Largest request body the runtime's frame cap carries."""
-        return protocol.max_body(
-            getattr(self._runtime, '_frame_cap', protocol.FRAME_CAP))
+        return max_body_of(self._runtime)
 
     def get(self, url: str, *, params=None, headers=None, **kw
             ) -> RuntimeResponse:

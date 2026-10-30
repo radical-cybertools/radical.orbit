@@ -894,8 +894,11 @@ def test_runtime_http_reports_max_body():
     from unittest.mock import MagicMock
     from radical.orbit import protocol
     from radical.orbit.runtime_client import _RuntimeHTTP
-    http = _RuntimeHTTP(MagicMock(_frame_cap=1024 * 1024), 'ep')
+    from radical.orbit.runtime_client import max_body_of
+    http = _RuntimeHTTP(MagicMock(frame_cap=1024 * 1024), 'ep')
     assert http.max_body == protocol.max_body(1024 * 1024)
+    # no published cap: the protocol default
+    assert max_body_of(object()) == protocol.max_body(protocol.FRAME_CAP)
 
 
 def test_call_oversized_request_is_413_fast(harness):
@@ -904,6 +907,7 @@ def test_call_oversized_request_is_413_fast(harness):
     a = make_runtime(srv.url, name='epA', plugins=['echo_rt'])
     assert a.wait_registered(timeout=5.0)
     b = make_runtime(srv.url, name='epB', frame_cap=64 * 1024)
+    assert b.frame_cap == 64 * 1024
 
     t0   = time.time()
     resp = b.call('epA', 'POST', '/echo_rt/echo/x', body=b'x' * 128 * 1024)

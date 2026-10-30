@@ -75,10 +75,9 @@ from starlette.responses        import StreamingResponse
 from starlette.exceptions       import HTTPException as StarletteHTTPException
 
 from . import utils
-from . import protocol
 from .errors        import error_dict
 from .queues        import BoundedDropOldestQueue
-from .runtime_client import unpack_response_dict
+from .runtime_client import max_body_of, unpack_response_dict
 
 
 log = logging.getLogger("radical.orbit.gateway")
@@ -584,8 +583,8 @@ class Gateway:
 
         # Cap at what one frame of the broker's cap carries around the body,
         # so an over-limit body is a 413 here, not a pack failure (500) later.
-        cap     = getattr(self._broker, '_frame_cap', protocol.FRAME_CAP)
-        body    = await self._read_body_capped(request, protocol.max_body(cap))
+        body    = await self._read_body_capped(
+            request, max_body_of(self._broker.caller))
         headers = self._strip_headers(request)
 
         # dst == the broker's own hosted-plugin participant: route into the

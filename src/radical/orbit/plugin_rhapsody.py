@@ -50,7 +50,6 @@ ROUTE_DATA_SHUTDOWN  = 'data_shutdown/{sid}/{name}'
 DATA_NAME_RE = re.compile(r'[A-Za-z0-9_.-]+')
 
 TERMINAL_STATES     = {'DONE', 'FAILED', 'CANCELED', 'COMPLETED'}
-WS_PAYLOAD_LIMIT    = 8 * 1024 * 1024  # upper clamp on a submit batch body
 NOTIFY_BATCH_SIZE   = 1024             # max tasks per bulk notification
 NOTIFY_BATCH_WINDOW = 0.25             # seconds to accumulate before flush
 CLOSE_DRAIN_TIMEOUT = 30.0             # close waits this long for ops in flight
@@ -61,6 +60,12 @@ CLOSE_DRAIN_TIMEOUT = 30.0             # close waits this long for ops in flight
 # the protocol-default fallback, and the default for a session built without
 # a plugin (direct construction, tests).
 BUDGET_RATIO        = 2
+
+# Upper clamp on one submit batch body: the budget a peer at the default
+# frame cap accepts.  Peer caps are not advertised (see
+# ``_resolve_frame_cap``), so raising a local or broker cap above the
+# default does not raise the submit budget; lower this to shrink batches.
+WS_PAYLOAD_LIMIT    = FRAME_CAP // BUDGET_RATIO
 
 # Cumulative payload budget for one notification frame.  ``NOTIFY_BATCH_SIZE``
 # alone cannot bound a batch: a single completion may carry an encoded
@@ -217,60 +222,80 @@ def _submit_budget(http) -> int:
     Half the transport's body limit (``BUDGET_RATIO``).  The envelope needs
     only ~260 B; the halving is margin for peer-cap skew: the broker's cap,
     and a destination endpoint's, are not advertised, and a relayed frame
-    over a peer's cap closes that peer's socket.  ``WS_PAYLOAD_LIMIT`` stays
-    an upper clamp (read at call time, so an override still applies).
+    over a peer's cap closes that peer's socket.  ``WS_PAYLOAD_LIMIT``
+    clamps it to what a default-cap peer accepts (read at call time, so an
+    override still applies).
     """
     return min(transport_max_body(http) // BUDGET_RATIO, WS_PAYLOAD_LIMIT)
 
 
 class PartialSubmitError(RuntimeError):
-    """A batched submit failed after earlier batches were accepted.
+    """A batched submit failed part-way: each task's fate, by uid.
 
-    ``accepted`` lists the uids the endpoint accepted (those tasks run);
-    ``results`` holds their submit results.  ``status_code`` is the failed
-    batch's HTTP status, when it had one.
+    ``accepted``  the endpoint acknowledged these; they run.
+    ``uncertain`` the failing batch, when the endpoint may have taken it
+                  (timeout, transport error, 5xx, unreadable ack).
+    ``rejected``  the failing batch on a 4xx, plus every batch never sent.
+
+    ``results`` holds the accepted tasks' submit results; ``status_code``
+    is the failed batch's HTTP status, when it had one.
     """
 
-    def __init__(self, msg: str, accepted: list, results: list,
-                 status_code: int | None = None):
+    def __init__(self, msg: str = '', accepted=(), results=(),
+                 status_code: int | None = None, uncertain=(), rejected=()):
         super().__init__(msg)
-        self.accepted    = accepted
-        self.results     = results
+        self.accepted    = list(accepted)
+        self.results     = list(results)
         self.status_code = status_code
+        self.uncertain   = list(uncertain)
+        self.rejected    = list(rejected)
+
+    def __reduce__(self):
+        return (type(self), (str(self), self.accepted, self.results,
+                             self.status_code, self.uncertain, self.rejected))
 
 
 def _submit_batches(client, url: str, task_dicts: list[dict],
-                    on_accept=None) -> list[dict]:
+                    on_packed=None) -> list[dict]:
     """Post *task_dicts* to *url* in frame-bounded msgpack batches.
 
     Every task is packed and checked before the first send, so a task that
-    no frame carries fails with a 413 and nothing is submitted.  Batches go
-    out sequentially; *on_accept* is called with each accepted batch's
-    uids.  A failure after an accepted batch raises
-    :class:`PartialSubmitError` naming the accepted uids.
+    no frame carries fails with a 413 (:class:`PayloadTooLarge`) and nothing
+    is submitted.  *on_packed* runs after that check, before the first
+    send.  Batches go out sequentially; any failure while sending raises
+    :class:`PartialSubmitError`, which sorts every uid into accepted,
+    uncertain or rejected.
     """
     http    = client._http
     batches = pack_batches(task_dicts, _submit_budget(http),
                            transport_max_body(http))
+    if on_packed is not None:
+        on_packed()
     results:  list[dict] = []
     accepted: list[str]  = []
     for batch, body in batches:
+        uids   = [str(td['uid']) for td in batch]
+        status = None
         try:
-            resp = http.post(url, data=body,
-                             headers={"Content-Type": "application/msgpack"})
+            resp   = http.post(url, data=body,
+                               headers={"Content-Type": "application/msgpack"})
+            status = resp.status_code
             client._raise(resp, f"submit {len(batch)} task(s)")
+            acks   = resp.json()
         except Exception as e:
-            if not accepted:
-                raise
+            # a 4xx refused the batch; anything else may have delivered it
+            refused   = isinstance(status, int) and 400 <= status < 500
+            unsent    = [str(td['uid'])
+                         for td in task_dicts[len(accepted) + len(uids):]]
+            uncertain = [] if refused else uids
+            rejected  = (uids if refused else []) + unsent
             raise PartialSubmitError(
-                f"{e} — after {len(accepted)} of {len(task_dicts)} task(s) "
-                f"were accepted", accepted, results,
-                getattr(e, 'status_code', None)) from e
-        uids = [str(td['uid']) for td in batch]
-        if on_accept is not None:
-            on_accept(uids)
+                f"{e} — of {len(task_dicts)} task(s): {len(accepted)} "
+                f"accepted, {len(uncertain)} uncertain, {len(rejected)} "
+                f"rejected", accepted, results,
+                getattr(e, 'status_code', status), uncertain, rejected) from e
         accepted.extend(uids)
-        results.extend(resp.json())
+        results.extend(acks)
     return results
 
 
@@ -1624,10 +1649,12 @@ class RhapsodyClient(PluginClient):
             list[dict]: Submitted task info (uid, state).
 
         Raises:
-            RuntimeError: with ``status_code`` 413 if a single task is too
-                large for any frame (nothing is submitted then);
-                :class:`PartialSubmitError` if a batch fails after earlier
-                ones were accepted (its ``accepted`` uids are running).
+            PayloadTooLarge: a ``RuntimeError`` with ``status_code`` 413
+                naming the ``uids`` too large for any frame (nothing is
+                submitted then).
+            PartialSubmitError: a batch failed; its ``accepted`` uids run,
+                its ``uncertain`` ones may, its ``rejected`` ones do not
+                (and are no longer waitable).
         """
         self._require_session()
 
@@ -1640,14 +1667,23 @@ class RhapsodyClient(PluginClient):
             if 'uid' not in td:
                 td['uid'] = f"task.{uuid.uuid4().hex[:8]}"
 
-        # Remember what was accepted, per batch, so wait_tasks() can
-        # validate UIDs -- an unsent task must not look waitable.
-        def _accept(uids):
+        # Remember what we submitted so wait_tasks() can validate UIDs --
+        # all of them before the first send, so a concurrent wait on a
+        # client-assigned uid is valid at once.  A rejected (never taken)
+        # uid is withdrawn on failure and its waiters woken, so they raise
+        # instead of hanging; an uncertain one stays waitable.
+        def _register():
             with self._cond:
-                self._submitted.update(uids)
+                self._submitted.update(str(td['uid']) for td in task_dicts)
 
         url = self._url(ROUTE_SUBMIT.format(sid=self.sid))
-        return _submit_batches(self, url, task_dicts, on_accept=_accept)
+        try:
+            return _submit_batches(self, url, task_dicts, on_packed=_register)
+        except PartialSubmitError as e:
+            with self._cond:
+                self._submitted.difference_update(e.rejected)
+                self._cond.notify_all()
+            raise
 
     def wait_tasks(self, uids: list[str],
                    timeout: float | None = None) -> list[dict]:
@@ -1725,6 +1761,14 @@ class RhapsodyClient(PluginClient):
         deadline = (time.time() + timeout) if timeout is not None else None
         with self._cond:
             while not all(uid in self._completed for uid in uids):
+                # a failed submit withdrew these: they will never complete
+                dropped = [u for u in uids
+                           if u not in self._submitted
+                           and u not in self._completed]
+                if dropped:
+                    raise ValueError(
+                        "wait_tasks: task UID(s) rejected by a failed "
+                        f"submit: {dropped}")
                 remaining = None
                 if deadline is not None:
                     remaining = deadline - time.time()

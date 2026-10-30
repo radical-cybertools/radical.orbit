@@ -2630,23 +2630,35 @@ def test_client_data_helpers():
 
 
 class _RecordingHTTP:
-    """Fake transport: records each submit body; *fail_at* (0-based post
-    index) answers with *fail_status*.  ``max_body`` is set only when given,
-    so the default exercises the protocol-default fallback."""
+    """Fake transport: records each submit body.  At post *fail_at*
+    (0-based) it fails: with *fail_status* as the response status, or by
+    raising *fail_exc*, or (``fail_status='badjson'``) with a 200 whose body
+    is not JSON.  *on_post(idx)* runs at the start of every post.
+    ``max_body`` is set only when given, so the default exercises the
+    protocol-default fallback."""
 
-    def __init__(self, max_body=None, fail_at=None, fail_status=503):
+    def __init__(self, max_body=None, fail_at=None, fail_status=503,
+                 fail_exc=None, on_post=None):
         if max_body is not None:
             self.max_body = max_body
         self.bodies      = []
         self.fail_at     = fail_at
         self.fail_status = fail_status
+        self.fail_exc    = fail_exc
+        self.on_post     = on_post
 
     def post(self, url, data=None, headers=None, **kw):
         import msgpack
         from radical.orbit.runtime_client import RuntimeResponse
         idx = len(self.bodies)
         self.bodies.append(data)
+        if self.on_post is not None:
+            self.on_post(idx)
         if idx == self.fail_at:
+            if self.fail_exc is not None:
+                raise self.fail_exc
+            if self.fail_status == 'badjson':
+                return RuntimeResponse(200, {}, b'not json')
             return RuntimeResponse(self.fail_status, {},
                                    b'{"detail": "nope"}')
         tasks = msgpack.unpackb(data, raw=False)['tasks']
@@ -2674,7 +2686,7 @@ def test_pack_batches_bodies_are_exact_and_bounded():
     import msgpack
     from radical.orbit.runtime_client import pack_batches
     items   = _tasks(300, pad=40)
-    batches = pack_batches(items, 4096, 8192)
+    batches = list(pack_batches(items, 4096, 8192))
     assert len(batches) > 1
     assert [td for b, _ in batches for td in b] == items      # order kept
     for batch, body in batches:
@@ -2683,20 +2695,58 @@ def test_pack_batches_bodies_are_exact_and_bounded():
         assert len(body) <= 4096
 
 
+def test_pack_batches_builds_bodies_lazily():
+    """The size check is eager, the bodies are not: they are assembled one
+    at a time as the caller sends, so a submission is not held twice."""
+    import inspect
+    from unittest.mock import patch as _patch
+    from radical.orbit import runtime_client as rc
+    items = _tasks(300, pad=40)
+    with _patch.object(rc, '_assemble', wraps=rc._assemble) as asm:
+        batches = rc.pack_batches(items, 4096, 8192)
+        assert inspect.isgenerator(batches)
+        assert asm.call_count == 0
+        next(batches)
+        assert asm.call_count == 1
+        rest = list(batches)
+        assert asm.call_count == 1 + len(rest)
+
+
 def test_pack_batches_item_over_budget_travels_alone():
     from radical.orbit.runtime_client import pack_batches
     items   = _tasks(2) + _tasks(1, pad=6000, prefix='big') + _tasks(2)
-    batches = pack_batches(items, 4096, 8192)
+    batches = list(pack_batches(items, 4096, 8192))
     assert [len(b) for b, _ in batches] == [2, 1, 2]
 
 
 def test_pack_batches_item_over_limit_is_413_before_any_batch():
     from radical.orbit.runtime_client import PayloadTooLarge, pack_batches
-    items = _tasks(2) + _tasks(1, pad=9000, prefix='big')
+    items = (_tasks(2) + _tasks(1, pad=9000, prefix='big')
+             + _tasks(1) + _tasks(1, pad=9000, prefix='huge'))
     with pytest.raises(PayloadTooLarge) as exc:
-        pack_batches(items, 4096, 8192)
+        pack_batches(items, 4096, 8192)            # raises at the call
     assert exc.value.status_code == 413
+    assert exc.value.indices     == [2, 4]
+    assert exc.value.uids        == ['big.00000', 'huge.00000']
     assert 'item 2' in str(exc.value)
+
+
+def test_submit_errors_survive_pickle():
+    import copy
+    import pickle
+    from radical.orbit import plugin_rhapsody as prh
+    from radical.orbit.runtime_client import PayloadTooLarge
+    err = prh.PartialSubmitError('boom', ['a'], [{'uid': 'a'}], 503,
+                                 ['b'], ['c'])
+    for clone in (pickle.loads(pickle.dumps(err)), copy.copy(err)):
+        assert str(clone) == 'boom'
+        assert (clone.accepted, clone.results, clone.status_code,
+                clone.uncertain, clone.rejected) == \
+               (['a'], [{'uid': 'a'}], 503, ['b'], ['c'])
+    big   = PayloadTooLarge('too big', [3], ['t.3'])
+    clone = pickle.loads(pickle.dumps(big))
+    assert (str(clone), clone.indices, clone.uids, clone.status_code) == \
+           ('too big', [3], ['t.3'], 413)
 
 
 def test_submit_8192_tasks_at_default_cap_splits_under_frame_cap():
@@ -2726,6 +2776,16 @@ def test_submit_budget_is_half_the_transport_body_limit():
     assert all(len(b) <= 8 * 1024 for b in http.bodies)
 
 
+def test_submit_budget_default_clamp_is_default_peer_safe():
+    """A raised local cap does not raise the batch budget past what a
+    default-cap peer accepts (peer caps are not advertised)."""
+    from radical.orbit import plugin_rhapsody as prh
+    from radical.orbit import protocol
+    assert prh.WS_PAYLOAD_LIMIT == protocol.FRAME_CAP // prh.BUDGET_RATIO
+    big = _RecordingHTTP(max_body=protocol.max_body(4 * protocol.FRAME_CAP))
+    assert prh._submit_budget(big) == prh.WS_PAYLOAD_LIMIT
+
+
 def test_submit_ws_payload_limit_still_clamps(monkeypatch):
     from radical.orbit import plugin_rhapsody as prh
     monkeypatch.setattr(prh, 'WS_PAYLOAD_LIMIT', 2048)
@@ -2735,43 +2795,126 @@ def test_submit_ws_payload_limit_still_clamps(monkeypatch):
 
 
 def test_submit_oversized_task_413_sends_nothing():
+    from radical.orbit.runtime_client import PayloadTooLarge
     http   = _RecordingHTTP(max_body=8 * 1024)
     client = _rh_client(http)
-    with pytest.raises(RuntimeError) as exc:
+    with pytest.raises(PayloadTooLarge) as exc:
         client.submit_tasks(_tasks(3) + _tasks(1, pad=9000, prefix='big'))
     assert exc.value.status_code == 413
+    assert exc.value.uids        == ['big.00000']
     assert http.bodies       == []
     assert client._submitted == set()
 
 
-def test_submit_partial_failure_reports_accepted_uids():
-    from radical.orbit import plugin_rhapsody as prh
-    http   = _RecordingHTTP(max_body=8 * 1024, fail_at=1)
+def test_submit_registers_all_uids_before_first_post():
+    """A concurrent ``wait_tasks`` on a client-assigned uid is valid as soon
+    as the submit starts sending, not only once its batch is acked."""
+    tasks = _tasks(200, pad=100)
+    seen  = []
+    http  = _RecordingHTTP(max_body=8 * 1024)
     client = _rh_client(http)
-    tasks  = _tasks(200, pad=100)
+    http.on_post = lambda idx: seen.append(set(client._submitted))
+    client.submit_tasks(tasks)
+    assert len(seen) > 1
+    assert seen[0] == {td['uid'] for td in tasks}
+
+
+def _partial(http, tasks):
+    from radical.orbit import plugin_rhapsody as prh
+    client = _rh_client(http)
     with pytest.raises(prh.PartialSubmitError) as exc:
         client.submit_tasks(tasks)
-    err = exc.value
-    assert err.status_code == 503
+    return client, exc.value
+
+
+def test_submit_partial_4xx_rejects_failing_and_unsent_batches():
+    tasks       = _tasks(200, pad=100)
+    http        = _RecordingHTTP(max_body=8 * 1024, fail_at=1,
+                                 fail_status=400)
+    client, err = _partial(http, tasks)
+    assert err.status_code == 400
     assert len(http.bodies) == 2                    # stopped at the failure
-    sent = _sent_tasks(http.bodies[0])
-    assert err.accepted == [td['uid'] for td in sent]
-    assert [r['uid'] for r in err.results] == err.accepted
-    # only accepted uids are waitable; an unsent one is rejected, not hung on
-    assert client._submitted == set(err.accepted)
+    first  = [td['uid'] for td in _sent_tasks(http.bodies[0])]
+    second = [td['uid'] for td in _sent_tasks(http.bodies[1])]
+    assert err.accepted  == first
+    assert [r['uid'] for r in err.results] == first
+    assert err.uncertain == []
+    assert err.rejected  == [td['uid'] for td in tasks[len(first):]]
+    assert err.rejected[:len(second)] == second
+    # rejected uids are withdrawn: a wait on them fails fast, not hangs
+    assert client._submitted == set(first)
     with pytest.raises(ValueError, match='unknown task UID'):
         client.wait_tasks([tasks[-1]['uid']], timeout=0.1)
 
 
-def test_submit_first_batch_failure_raises_plain_error():
+@pytest.mark.parametrize('kind', ['5xx', 'timeout', 'badjson'])
+def test_submit_partial_ambiguous_batch_is_uncertain(kind):
+    tasks = _tasks(200, pad=100)
+    kw    = {'5xx':     dict(fail_status=503),
+             'timeout': dict(fail_exc=TimeoutError('no answer')),
+             'badjson': dict(fail_status='badjson')}[kind]
+    http        = _RecordingHTTP(max_body=8 * 1024, fail_at=1, **kw)
+    client, err = _partial(http, tasks)
+    first  = [td['uid'] for td in _sent_tasks(http.bodies[0])]
+    second = [td['uid'] for td in _sent_tasks(http.bodies[1])]
+    assert err.accepted  == first
+    assert err.uncertain == second
+    assert err.rejected  == [td['uid']
+                             for td in tasks[len(first) + len(second):]]
+    if kind == '5xx':
+        assert err.status_code == 503
+    # the endpoint may run the uncertain ones: they stay waitable
+    assert client._submitted == set(first) | set(second)
+
+
+def test_submit_first_batch_failure_rejects_everything():
     from radical.orbit import plugin_rhapsody as prh
-    http   = _RecordingHTTP(max_body=8 * 1024, fail_at=0, fail_status=413)
-    client = _rh_client(http)
-    with pytest.raises(RuntimeError) as exc:
-        client.submit_tasks(_tasks(200, pad=100))
-    assert not isinstance(exc.value, prh.PartialSubmitError)
-    assert exc.value.status_code == 413
+    tasks       = _tasks(200, pad=100)
+    http        = _RecordingHTTP(max_body=8 * 1024, fail_at=0,
+                                 fail_status=413)
+    client, err = _partial(http, tasks)
+    assert isinstance(err, RuntimeError)
+    assert isinstance(err, prh.PartialSubmitError)
+    assert err.status_code == 413
+    assert err.accepted == [] and err.uncertain == []
+    assert err.rejected == [td['uid'] for td in tasks]
     assert client._submitted == set()
+
+
+def test_submit_failure_wakes_concurrent_waiter_on_rejected_uid():
+    """A waiter blocked (SSE path) on a uid that the failed submit rejects
+    is woken and raises, instead of hanging until its timeout."""
+    import threading
+    import time as _time
+    tasks  = _tasks(200, pad=100)
+    last   = tasks[-1]['uid']
+    out    = {}
+    http   = _RecordingHTTP(max_body=8 * 1024, fail_at=1, fail_status=400)
+    client = _rh_client(http)
+    client._bc, client._endpoint_id, client._plugin_name = \
+        MagicMock(), 'ep', 'rhapsody'
+
+    def _wait():
+        try:
+            client.wait_tasks([last], timeout=30)
+        except ValueError as e:
+            out['err'] = e
+
+    waiter = threading.Thread(target=_wait, daemon=True)
+
+    def _on_post(idx):
+        if idx == 0:                       # uid registered: wait is valid
+            waiter.start()
+            _time.sleep(0.2)               # let it block on the condition
+
+    http.on_post = _on_post
+    t0 = _time.time()
+    with pytest.raises(RuntimeError):
+        client.submit_tasks(tasks)
+    waiter.join(5)
+    assert not waiter.is_alive()
+    assert _time.time() - t0 < 5
+    assert 'rejected' in str(out['err'])
 
 
 if __name__ == '__main__':
