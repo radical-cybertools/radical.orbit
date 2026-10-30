@@ -2995,7 +2995,7 @@ def _track(client, uids):
     """Record *uids* as submitted and acknowledged by the endpoint."""
     with client._cond:
         client._submitted.update(uids)
-        client._pending.update(uids)
+        client._pending.update(dict.fromkeys(uids, time.monotonic()))
 
 
 def _backend_recorder(client):
@@ -3392,21 +3392,22 @@ def _failing_submit(status, pre=()):
 
 
 def test_failed_submit_keeps_uncertain_batch():
-    """A transport error (or 5xx) leaves the failing batch uncertain: it
-    stays submitted and pending, for the reconcile to resolve.  Batches
-    never sent are withdrawn."""
-    for status in (None, 504):
+    """Whatever the error (transport, 5xx, 4xx — the endpoint submits
+    chunk by chunk), the failing batch stays submitted and pending as
+    uncertain; batches never sent are withdrawn."""
+    for status in (None, 504, 400, 410):
         client = _failing_submit(status)
         assert client._submitted == {'t.0', 't.1'}
         assert sorted(client._outstanding()) == ['t.0', 't.1']
+        assert list(client._uncertain) == ['t.1']
 
 
-def test_failed_submit_withdraws_rejected_batch_only_new_uids():
-    """A 4xx withdraws the rejected batch too — but only uids this call
-    added: an earlier submit's uid stays."""
+def test_failed_submit_withdraws_only_new_uids():
+    """Only uids this call added are withdrawn: an earlier submit's uid in
+    an unsent batch stays."""
     client = _failing_submit(400, pre=('t.early',))
-    assert client._submitted == {'t.0', 't.early'}
-    assert sorted(client._outstanding()) == ['t.0', 't.early']
+    assert client._submitted == {'t.0', 't.1', 't.early'}
+    assert sorted(client._outstanding()) == ['t.0', 't.1', 't.early']
 
 
 def test_outstanding_is_kept_incrementally():
@@ -3598,7 +3599,8 @@ def test_all_topics_callbacks_go_through_the_fan_out():
         rt.deliver('session_status', {'sid': 'sid-rh', 'status': 'ready'})
         assert _until(lambda: len(got) == 2)    # live ones first
         client._redeliver('sid-rh', [{'uid': 't.1', 'state': 'DONE'},
-                                     {'uid': 't.2', 'state': 'DONE'}])
+                                     {'uid': 't.2', 'state': 'DONE'}],
+                          threading.Event())
         assert _until(lambda: len(got) == 3)
         time.sleep(0.05)
         assert sorted(got, key=str) == sorted([
@@ -3698,14 +3700,18 @@ def test_reconcile_chunks_by_bytes_and_splits_on_413():
     rt._cb.start()
     client, http = _reconciling_client(rt, session)
     try:
-        assert all(_task_states_fits(c, client._states_budget)
-                   for c in client._uid_chunks('sid-bytes', uids))
-        client._states_budget = 64 * 1024      # client: assumes more
-        assert len(client._uid_chunks('sid-bytes', uids)) == 1
+        from radical.orbit.plugin_rhapsody import NOTIFY_BATCH_BYTES
+        assert all(_task_states_fits(c, NOTIFY_BATCH_BYTES // 2)
+                   for c in client._uid_chunks(uids))
+        client._states_limit = 32 * 1024       # client: assumes more
+        assert len(client._uid_chunks(uids)) == 1
         _track(client, uids)
         client._reconcile_wake.set()
         assert len(client.wait_tasks(uids, timeout=10)) == 60
         assert len(http.threads) > 2           # 413s, then split calls
+        # learned: the next pass sizes its requests to what was accepted
+        assert all(_task_states_fits(c, session._frame_budget())
+                   for c in client._uid_chunks(uids))
     finally:
         client.close()
         rt._cb.stop()
@@ -3733,7 +3739,7 @@ def test_reconcile_aborts_when_the_session_changes():
         got = []
         client.register_notification_callback(
             lambda *a: got.append(a), topic='task_status_batch')
-        client._reconcile()
+        client._reconcile(['task.s1', 'task.s2'], threading.Event())
         assert urls == ['/rhapsody/task_states/sid-old']
         time.sleep(0.05)
         assert got == [] and not client._completed
@@ -3850,6 +3856,218 @@ def test_task_states_terminal_only():
                              "terminal_only": True}).json()
     assert [t["uid"] for t in body["tasks"]] == ["task.d"]
     assert body["unknown"] == ["task.x"] and body["remaining"] == []
+
+
+
+# ---------------------------------------------------------------------------
+# Code-review round 3
+# ---------------------------------------------------------------------------
+
+def test_uncertain_unknown_waits_for_grace():
+    """An uncertain uid (its submit POST failed) unknown to the endpoint
+    stays pending within the grace period, and fails after it."""
+    session = _done_session('sid-grace', [])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, _ = _reconciling_client(rt, session)
+    try:
+        client._uncertain_grace = 60.0
+        client._track_pending('sid-grace', [{'uid': 't.u'}], uncertain=True)
+        client._submitted.add('t.u')
+        client._reconcile(['t.u'], threading.Event())
+        time.sleep(0.05)
+        assert 't.u' not in client._completed
+        assert client._outstanding() == ['t.u']
+
+        client._uncertain_grace = 0.0
+        client._reconcile(['t.u'], threading.Event())
+        assert _until(lambda: 't.u' in client._completed)
+        assert client._completed['t.u']['state'] == 'FAILED'
+        assert client._outstanding() == [] and not client._uncertain
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
+def test_acks_after_a_session_switch_are_dropped():
+    """A submit acked after the client switched sessions does not touch
+    the new session's tracking."""
+    holder = {}
+
+    def _switch(uids):
+        c = holder['c']
+        with c._cond:
+            c._sid = 'sid-new'
+            c._reset_tracking()
+        _track(c, ['t.new'])
+
+    client = _sse_client(_ack_http(before_ack=_switch))
+    holder['c'] = client
+    client.submit_tasks([{'uid': 't.old', 'executable': '/bin/true'}])
+    assert client._outstanding() == ['t.new']
+    assert client._submitted == {'t.new'}
+
+
+def test_restart_does_not_revive_a_lingering_reconcile():
+    """A reconcile thread that outlives close keeps its own stop event: it
+    exits even after a new thread started."""
+    from radical.orbit import plugin_rhapsody as prh
+
+    gate    = threading.Event()
+    session = _done_session('sid-gen', ['task.g1'])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session, gate=gate)
+    try:
+        _track(client, ['task.g1'])
+        old = client._reconcile_thread
+        client._reconcile_wake.set()
+        assert _until(lambda: http.threads)        # stuck in its fetch
+        with patch.object(prh, 'RECONCILE_JOIN', 0.05):
+            client._stop_reconcile()
+        assert old.is_alive()
+        client._start_reconcile()
+        new = client._reconcile_thread
+        assert new is not old
+        gate.set()
+        old.join(5)
+        assert not old.is_alive() and new.is_alive()
+    finally:
+        gate.set()
+        client.close()
+        rt._cb.stop()
+
+
+def test_failed_chunk_does_not_abort_the_pass_and_retries_soon():
+    """A failing task_states call skips its chunk only; the pass goes on,
+    and a short retry recovers the rest."""
+    uids    = [f'task.c{i:02d}' for i in range(6)]
+    session = _done_session('sid-chunk', uids)
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session)
+    client._states_limit = _uid_bytes_for(uids[:2])    # 3 chunks
+    client._reconcile_retry = 0.05
+    orig, calls = http.post, []
+
+    def _flaky(url, json=None, **kwargs):
+        calls.append(list(json['uids']))
+        if len(calls) == 1:
+            raise RuntimeError('transport hiccup')
+        return orig(url, json=json, **kwargs)
+
+    http.post = _flaky
+    try:
+        _track(client, uids)
+        client._reconcile_wake.set()
+        assert [t['state'] for t in client.wait_tasks(uids, timeout=5)] \
+            == ['DONE'] * 6
+        assert len(calls) >= 4                 # 3 chunks, then the retry
+        assert calls[1] != calls[0]            # pass went on after failure
+    finally:
+        client.close()
+        rt._cb.stop()
+
+
+def _uid_bytes_for(uids):
+    from radical.orbit.plugin_rhapsody import _uid_bytes
+    return _uid_bytes(uids)
+
+
+def test_idle_reconcile_by_age_despite_other_completions():
+    """A task pending past the idle threshold is reconciled although other
+    tasks keep completing."""
+    session = _done_session('sid-age', ['task.lost'])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, http = _reconciling_client(rt, session, idle=0.1)
+    stop = threading.Event()
+
+    def _busy():
+        i = 0
+        while not stop.is_set():
+            rt.deliver('task_status', {'uid': f'task.busy{i}',
+                                       'state': 'DONE', 'sid': 'sid-age'})
+            i += 1
+            time.sleep(0.01)
+
+    busy = threading.Thread(target=_busy)
+    try:
+        _track(client, ['task.lost'])
+        busy.start()
+        assert client.wait_tasks(['task.lost'], timeout=5)[0]['state'] \
+            == 'DONE'
+    finally:
+        stop.set()
+        busy.join(5)
+        client.close()
+        rt._cb.stop()
+
+
+class _CountingSet(set):
+    def __init__(self, *a):
+        super().__init__(*a)
+        self.lookups = 0
+
+    def __contains__(self, item):
+        self.lookups += 1
+        return super().__contains__(item)
+
+
+def test_wait_tasks_rescans_for_withdrawn_only_on_change():
+    """Completions wake the waiter without a withdrawn rescan; a withdraw
+    makes it raise."""
+    client = _sse_client(_ack_http())
+    uids   = [f't.{i}' for i in range(20)]
+    _track(client, uids + ['t.w'])
+    client._submitted = _CountingSet(client._submitted)
+    errors = []
+
+    def _wait():
+        try:
+            client.wait_tasks(uids + ['t.w'], timeout=10)
+        except RuntimeError as e:
+            errors.append(e)
+
+    waiter = threading.Thread(target=_wait)
+    waiter.start()
+    time.sleep(0.05)
+    for uid in uids:                           # 20 wakes
+        client._on_task_done(None, None, 'task_status',
+                             {'uid': uid, 'state': 'DONE'})
+        time.sleep(0.002)
+    time.sleep(0.05)
+    assert client._submitted.lookups <= 2 * (len(uids) + 1)
+
+    client._submit_failed('sid-rh', [], [[{'uid': 't.w'}]], {'t.w'})
+    waiter.join(5)
+    assert errors and 'withdrawn' in str(errors[0])
+
+
+def test_close_unregisters_after_the_session_close():
+    """Registrations stay through the session close (its notifications
+    still arrive), then close() drops all of them."""
+    rt     = _NoDispatcherRuntime()
+    got    = []
+
+    class _HTTP:
+        def post(self, url, **kw):
+            if 'unregister_session' in url:   # the close cancels a task
+                rt.deliver('task_status', {'uid': 't.c', 'sid': 'sid-rh',
+                                           'state': 'CANCELED'})
+            resp = MagicMock()
+            resp.is_error, resp.status_code = False, 200
+            resp.json = MagicMock(return_value={})
+            return resp
+
+    client = _sse_client(_HTTP(), rt=rt)
+    client._start_task_listener()
+    client.register_notification_callback(
+        lambda e, p, t, d: got.append((t, d.get('state'))))
+    assert len(rt.callbacks) == 3
+    client.close()
+    assert got == [('task_status', 'CANCELED')]
+    assert rt.callbacks == []
 
 
 _TIMERS: list = []
