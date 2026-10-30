@@ -76,7 +76,8 @@ export function init(page, api) {
 
 export function onNotification(data, page, api) {
   // Bulk frames (terminal completions and RUNNING changes) carry a list of
-  // single task_status payloads.
+  // single task_status payloads.  The Explorer host unpacks them before they
+  // get here; this keeps the module correct for a host that does not.
   if (data.topic === 'task_status_batch') {
     for (const task of data.data?.tasks || []) {
       onNotification({ topic: 'task_status', data: task }, page, api);
