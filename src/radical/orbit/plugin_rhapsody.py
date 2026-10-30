@@ -1561,10 +1561,13 @@ class RhapsodyClient(PluginClient):
         event costs one callback-queue entry.  All topics also because the
         broker numbers a session's events across all its topics: a
         per-topic view would see gaps that are not losses.  The runtime
-        drops other sessions' events before its callback queue; session-less
-        ones (an older endpoint) still arrive and are filtered by ``sid`` in
-        ``_on_task_done``.  The broker subscription is unchanged.  A failed
-        registration leaves the previous one in place.
+        drops other sessions' events before its callback queue, and where
+        the broker and this endpoint plugin advertise ``session_events`` the
+        broker subscription itself is scoped to the session, so they never
+        reach this process.  Session-less events arrive only from an older
+        endpoint (no ``session_events``) and are filtered by ``sid`` in
+        ``_on_task_done``.  A failed registration leaves the previous one in
+        place.
         """
         if not (self._bc and self._endpoint_id and self._plugin_name):
             raise RuntimeError("Missing endpoint tracking info; cannot "
@@ -2556,6 +2559,7 @@ class PluginRhapsody(Plugin):
     session_class = RhapsodySession
     client_class = RhapsodyClient
     version = '0.0.1'
+    session_events = True       # all its events are session events
 
     ui_config = {
         "icon": "🎼",

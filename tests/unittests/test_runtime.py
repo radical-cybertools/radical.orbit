@@ -13,6 +13,7 @@ import asyncio
 import subprocess
 import threading
 import time
+from collections import Counter
 
 import pytest
 
@@ -826,6 +827,8 @@ def _bare_runtime(maxlen=1024):
     rt._callbacks = {}
     rt._cb_lock   = threading.Lock()
     rt._session_routed = set()
+    rt._session_capable = set(rt._session_routed)
+    rt._wire_count = Counter()
     rt._emit      = MagicMock()
     rt._cb        = CallbackDispatcher(maxlen=maxlen)
     return rt
@@ -839,8 +842,9 @@ def _ev(session, topic='t', src='ep', plugin='rh', seq=0):
 
 def test_session_callback_local_routing():
     """A session callback never gets another session's event — it is dropped
-    before the callback queue — but still gets session-less events (older
-    endpoints).  The broker pattern carries no session (wire unchanged)."""
+    before the callback queue — but still gets session-less events from a
+    plugin without ``session_events`` (older endpoints).  The broker pattern
+    carries no session (wire unchanged)."""
     rt = _bare_runtime()
     cb = lambda *a: None                              # noqa: E731
     rt.register_callback(endpoint_id='ep', plugin_name='rh', topic='t',
@@ -918,17 +922,20 @@ def test_unregister_callback_bound_method():
 
 
 def _topo_msg(broker_caps=True, ep_caps=True):
-    """A topology frame: endpoint 'ep' serving 'rh', the broker hosting
-    'sysinfo', each with or without the ``session_events`` flag."""
+    """A topology frame: endpoint 'ep' serving 'rh' (with or without the
+    ``session_events`` flag), the broker hosting 'sysinfo' (without) and
+    advertising its own flag under the reserved key (or not)."""
     from radical.orbit import protocol
 
     def _plugins(name, caps):
         return {name: {'namespace': '/' + name,
                        **({'session_events': True} if caps else {})}}
+    bplugins = _plugins('sysinfo', False)
+    if broker_caps:
+        bplugins[protocol.BROKER_CAPS] = {'session_events': True}
     return protocol.Topology(src='broker', participants={
         'broker': protocol.ParticipantInfo(
-            role='broker', plugins=_plugins('sysinfo', broker_caps),
-            liveness='present'),
+            role='broker', plugins=bplugins, liveness='present'),
         'ep': protocol.ParticipantInfo(
             role='endpoint', plugins=_plugins('rh', ep_caps),
             liveness='present')})
@@ -940,6 +947,7 @@ def _topo_runtime():
     rt._topology_callbacks = []
     rt._plugins            = {}
     rt._topology_ready     = threading.Event()
+    rt._conn_gen           = 0
     return rt
 
 
@@ -1034,6 +1042,79 @@ def test_session_subscription_follows_topology_and_resync():
                            session='sid-a')
     assert _emitted(rt) == [('unsubscribe', [_PLAIN])]
     assert rt._callbacks == {}
+
+
+def test_session_callback_drops_session_less_from_capable_plugin():
+    """From a plugin advertising ``session_events`` a session callback gets
+    no session-less events, routed at the broker or not; a session-less
+    callback still does."""
+    for broker_caps in (True, False):
+        rt = _topo_runtime()
+        rt._on_topology(_topo_msg(broker_caps=broker_caps))
+        cb, other = (lambda *a: None), (lambda *a: None)  # noqa: E731
+        rt.register_callback(endpoint_id='ep', plugin_name='rh', callback=cb,
+                             session='sid-a')
+        rt.register_callback(endpoint_id='ep', plugin_name='rh',
+                             callback=other)
+        rt._on_event(_ev(None))
+        rt._on_event(_ev('sid-a'))
+        assert [rt._cb._q.get_nowait()[0] for _ in range(3)] \
+            == [other, cb, other]
+        assert rt._cb._q.qsize() == 0
+
+
+def test_topology_hides_reserved_plugin_keys():
+    """The broker's reserved capability key steers routing but never shows
+    in the runtime's topology (listings, callbacks, served plugins)."""
+    from radical.orbit import protocol
+    rt  = _topo_runtime()
+    got = []
+    rt._topology_callbacks = [got.append]
+    rt._cb.submit = lambda fn, *a: fn(*a)
+    rt._on_topology(_topo_msg())
+    assert rt._session_routed == {('ep', 'rh')}
+    assert list(rt.topology()['broker']['plugins']) == ['sysinfo']
+    assert protocol.BROKER_CAPS not in got[0]['broker']['plugins']
+
+
+def test_rescope_moves_only_flipped_pairs():
+    """A capability change of one (endpoint, plugin) moves only its
+    registrations; the wire count stays per pattern."""
+    from radical.orbit import protocol
+    rt = _topo_runtime()
+    rt._on_topology(_topo_msg())
+    cb = lambda *a: None                              # noqa: E731
+    for ep in ('ep', 'ep2'):
+        rt.register_callback(endpoint_id=ep, plugin_name='rh', callback=cb,
+                             session='sid-a')
+    _emitted(rt)
+    msg = _topo_msg()
+    msg.participants['ep2'] = protocol.ParticipantInfo(
+        role='endpoint', liveness='present',
+        plugins={'rh': {'namespace': '/rh', 'session_events': True}})
+    rt._on_topology(msg)                              # ep2 upgraded
+    assert _emitted(rt) == [
+        ('subscribe',   [dict(_SID_A, endpoint='ep2')]),
+        ('unsubscribe', [dict(_PLAIN, endpoint='ep2')])]
+    assert sorted(rt._wire_count.values()) == [1, 1]
+
+
+def test_stale_topology_does_not_rescope_after_resync():
+    """A topology frame of the previous connection, processed after the
+    reconnect's resync, does not turn session routing back on."""
+    rt = _topo_runtime()
+    rt._on_topology(_topo_msg(), gen=rt._conn_gen)
+    cb = lambda *a: None                              # noqa: E731
+    rt.register_callback(endpoint_id='ep', plugin_name='rh', callback=cb,
+                         session='sid-a')
+    old_gen = rt._conn_gen
+    rt._resync_subscriptions()                        # fresh reconnect
+    _emitted(rt)
+    rt._on_topology(_topo_msg(), gen=old_gen)         # stale frame
+    assert _emitted(rt) == [] and rt._session_routed == set()
+    rt._on_topology(_topo_msg(), gen=rt._conn_gen)    # the new broker's
+    assert _emitted(rt) == [('subscribe', [_SID_A]),
+                            ('unsubscribe', [_PLAIN])]
 
 
 # ---------------------------------------------------------------------------

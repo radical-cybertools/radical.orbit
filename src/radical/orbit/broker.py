@@ -74,7 +74,7 @@ from .errors             import error_body, error_dict
 
 log = logging.getLogger("radical.orbit.broker")
 
-BROKER_NAME = 'broker'
+BROKER_NAME = protocol.BROKER_NAME
 
 
 # ---------------------------------------------------------------------------
@@ -392,10 +392,12 @@ class Broker:
         """The current rich topology dict (gateway seam).
 
         ``{name: {role, plugins:{pname:{...}}, liveness}}`` including the
-        broker's own hosted-plugin participant.
+        broker's own hosted-plugin participant; reserved (``_``) plugin keys
+        are wire-only and left out.
         """
-        return {name: info.model_dump()
-                for name, info in self._participants_for_topology().items()}
+        return protocol.public_topology(
+            {name: info.model_dump()
+             for name, info in self._participants_for_topology().items()})
 
     async def get_ui_modules(self) -> Dict[str, str]:
         """Gateway seam: ``{plugin_name: js_content}`` for broker-hosted
@@ -1154,11 +1156,15 @@ class Broker:
                 role=info.get('role', 'endpoint'),
                 plugins=info.get('plugins', {}),
                 liveness=self._liveness.get(name, 'present'))
-        # The broker is itself a participant (its hosted-plugin host).
+        # The broker is itself a participant (its hosted-plugin host).  Its
+        # entry also carries the broker's own capabilities, under a reserved
+        # key (present with or without hosted plugins): it routes session
+        # subscription patterns.
         broker_plugins: Dict[str, Dict[str, Any]] = {}
         if self._plugin_host is not None:
-            broker_plugins = \
-                self._plugin_host.get_topology_info().get('plugins', {})
+            broker_plugins = dict(
+                self._plugin_host.get_topology_info().get('plugins', {}))
+        broker_plugins[protocol.BROKER_CAPS] = {'session_events': True}
         parts[BROKER_NAME] = protocol.ParticipantInfo(
             role='broker', plugins=broker_plugins, liveness='present')
         return parts

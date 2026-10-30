@@ -169,6 +169,11 @@ class Plugin(object):
     reclaim_drain: float = 300  # 'lost' owner -> ephemeral-session reclaim grace
     ui_config: Union[Dict, UIConfig, None] = None  # UI configuration for portal
     ui_module: Optional[str] = None  # Absolute path to JS plugin module, or None
+    # Every event about one session carries that session (it is sent via
+    # ``PluginSession.notify`` or with ``session=``): advertised in topology
+    # as ``session_events``, it lets a consumer subscribe to one session at
+    # the broker.  False for plugins that send session events session-less.
+    session_events: bool = False
     # Host roles (``utils.HOST_ROLES``) whose ``default`` plugin set
     # includes this plugin.  An own declaration wins; otherwise a class
     # inherits its parent's roles only under the same identity (the

@@ -55,6 +55,32 @@ PROTOCOL_VERSION = 1
 # design inequality and the GIL-hold rationale.
 FRAME_CAP = 4 * 1024 * 1024
 
+# The name the broker reserves for itself: its participant entry in topology
+# (its hosted plugins) and the ``src``/``dst`` of broker-originated frames.
+BROKER_NAME = 'broker'
+
+# Keys of a topology ``plugins`` dict that start with ``_`` are reserved: they
+# carry participant-level information, not plugins, and plugin listings skip
+# them (``public_plugins``).  The broker's entry carries ``BROKER_CAPS`` with
+# its own capabilities, e.g. ``{'session_events': True}`` (it routes session
+# subscription patterns).
+BROKER_CAPS = '_broker'
+
+
+def public_plugins(plugins: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The plugins of a topology ``plugins`` dict, reserved keys dropped."""
+    return {k: v for k, v in (plugins or {}).items()
+            if not str(k).startswith('_')}
+
+
+def public_topology(topo: Dict[str, Dict[str, Any]]
+                    ) -> Dict[str, Dict[str, Any]]:
+    """A ``{name: {role, plugins, liveness}}`` topology dict with every
+    participant's reserved plugin keys dropped (copies, not views)."""
+    return {name: dict(info or {},
+                       plugins=public_plugins((info or {}).get('plugins')))
+            for name, info in topo.items()}
+
 
 class ProtocolError(Exception):
     """Raised on any envelope pack/parse failure.

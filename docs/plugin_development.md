@@ -266,12 +266,17 @@ self.notify("job_status", {
 
 A session's notification carries its sid as the event `session`: the broker
 numbers those events per `(endpoint, plugin, session)`, and a consumer that
-registered with `session=sid` gets only its own session's events — filtered
-by the broker itself where both the broker and the plugin's endpoint advertise
-`session_events` in topology (every plugin a current runtime or broker hosts
-does), locally otherwise. A
+registered with `session=sid` gets only its own session's events. A
 plugin-level notification (`self._dispatch_notify(topic, data)` or
 `send_notification`) is session-less unless it passes `session=sid`.
+
+If every event your plugin sends about a session carries that session (all
+go through `PluginSession.notify` or pass `session=`), set the class
+attribute `session_events = True`. It is advertised in topology, and where
+the broker advertises it too, a consumer's session callback is filtered by
+the broker itself rather than locally. Leave it `False` (the default) if
+any session's events go out session-less: a session-scoped consumer would
+miss them.
 
 From a plugin (async context):
 

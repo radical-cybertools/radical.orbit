@@ -145,9 +145,9 @@ class BrokerPluginHost(PluginHostBase):
     # ------------------------------------------------------------------
 
     def get_topology_info(self) -> dict:
-        # ``session_events``: this broker stamps hosted-plugin session events
-        # with their session and routes session subscription patterns -- the
-        # capability a client checks before it sends one (see
+        # ``session_events``: the plugin's session events all carry their
+        # session (``Plugin.session_events``) -- with the broker's own flag,
+        # what a client checks before it subscribes to one session (see
         # ``EndpointRuntime.register_callback``).
         return {
             'endpoint': {'type': 'radical.orbit.broker'},
@@ -157,7 +157,7 @@ class BrokerPluginHost(PluginHostBase):
                     'namespace': f'/{self._name}{plugin.namespace}',
                     'version'  : plugin.version,
                     'enabled'  : True,
-                    'session_events': True,
+                    'session_events': bool(plugin.session_events),
                     'ui_config': ui_config_to_dict(
                         getattr(plugin, 'ui_config', None)),
                 }

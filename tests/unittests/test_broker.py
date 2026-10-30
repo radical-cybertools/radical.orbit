@@ -746,19 +746,30 @@ async def test_malformed_subscribe_pattern_rejects_pattern_not_socket(
 
 @pytest.mark.asyncio
 async def test_broker_topology_advertises_session_events(make_broker):
-    """The broker's hosted plugins advertise ``session_events`` in its
-    topology entry; an endpoint's entry carries what it registered."""
-    broker = make_broker(plugins='sysinfo')
-    await broker.startup()
-    try:
-        ws1 = FakeWS()
-        await _register(broker, 'e1', ws1, plugins=[
-            {'name': 'rh', 'namespace': '/rh', 'session_events': True}])
-        parts = broker._participants_for_topology()
-        assert parts['broker'].plugins['sysinfo']['session_events'] is True
-        assert parts['e1'].plugins['rh']['session_events'] is True
-    finally:
-        await broker.shutdown()
+    """The broker advertises its own ``session_events`` under the reserved
+    key of its topology entry — with no hosted plugins too — and keeps the
+    key out of the snapshot (the gateway and host source); plugins carry
+    their own flag."""
+    for spec in ('', 'sysinfo'):
+        broker = make_broker(plugins=spec)
+        await broker.startup()
+        try:
+            ws1 = FakeWS()
+            await _register(broker, 'e1', ws1, plugins=[
+                {'name': 'rh', 'namespace': '/rh', 'session_events': True}])
+            topo = [m for m in ws1.msgs() if m.kind == 'topology'][-1]
+            bplugins = topo.participants['broker'].plugins
+            assert bplugins[protocol.BROKER_CAPS] == {'session_events': True}
+            assert topo.participants['e1'].plugins['rh']['session_events']
+            snap = broker.topology_snapshot()
+            assert protocol.BROKER_CAPS not in snap['broker']['plugins']
+            assert sorted(snap['broker']['plugins']) \
+                == ([] if not spec else ['sysinfo'])
+            if spec:
+                assert snap['broker']['plugins']['sysinfo'][
+                    'session_events'] is False
+        finally:
+            await broker.shutdown()
 
 
 @pytest.mark.asyncio
