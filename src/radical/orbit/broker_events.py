@@ -134,8 +134,22 @@ class EventRouter:
     # ── subscriptions ─────────────────────────────────────────────────
 
     def update_subscription(self, name: str, raw: dict, add: bool) -> None:
-        patterns = [protocol.SubscribePattern(**p)
-                    for p in raw.get('patterns', [])]
+        """Add (or remove) *name*'s interest patterns.
+
+        A malformed pattern is logged and skipped: it rejects that one
+        pattern, never the subscriber's socket.
+        """
+        patterns = []
+        try:
+            for p in raw.get('patterns') or []:
+                try:
+                    patterns.append(protocol.SubscribePattern(**p))
+                except (TypeError, ValueError) as e:
+                    log.warning("[Broker] %s: rejected %s pattern %r: %s",
+                                name, raw.get('kind'), p, e)
+        except TypeError as e:
+            log.warning("[Broker] %s: rejected %s patterns %r: %s",
+                        name, raw.get('kind'), raw.get('patterns'), e)
         cur = self._subscriptions.setdefault(name, [])
         if add:
             cur.extend(patterns)
@@ -147,13 +161,15 @@ class EventRouter:
     @staticmethod
     def _matches(patterns: List[protocol.SubscribePattern],
                  endpoint: str, plugin: Optional[str],
-                 topic: Optional[str]) -> bool:
+                 topic: Optional[str], session: Optional[str] = None) -> bool:
         for p in patterns:
             if p.endpoint is not None and p.endpoint != endpoint:
                 continue
             if p.plugin   is not None and p.plugin   != plugin:
                 continue
             if p.topic    is not None and p.topic    != topic:
+                continue
+            if p.session  is not None and p.session  != session:
                 continue
             return True
         return False
@@ -217,7 +233,7 @@ class EventRouter:
         plugin = raw.get('plugin')
         topic  = raw.get('topic')
         for sub_name, patterns in self._subscriptions.items():
-            if self._matches(patterns, src_name, plugin, topic):
+            if self._matches(patterns, src_name, plugin, topic, session):
                 oq = self._out.get(sub_name)
                 if oq is not None:
                     oq.push(packed)

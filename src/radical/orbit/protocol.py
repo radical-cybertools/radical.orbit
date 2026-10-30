@@ -41,7 +41,8 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 import msgpack
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (BaseModel, ConfigDict, Field, ValidationError,
+                      model_serializer)
 
 
 # ---------------------------------------------------------------------------
@@ -99,12 +100,29 @@ class SubscribePattern(BaseModel):
 
     A ``None`` field is a wildcard -- mirrors the client callback-registry
     tuples (``endpoint_id``/``plugin_name``/``topic`` all optional).
+
+    ``session`` narrows the pattern to the events of one session (the
+    event's ``session``; session-less events do not match).  Like the
+    broker's seq key ``(src, plugin, session)``, it is meant together with
+    ``endpoint`` and ``plugin``: a sid alone names no stream.  It is only
+    on the wire when set, so a session-less pattern packs exactly as in v1
+    -- an older broker rejects the unknown field, so a client sends it only
+    when the broker and the endpoint plugin advertise ``session_events`` in
+    topology.
     """
     model_config = ConfigDict(extra='forbid')
 
     endpoint: Optional[str] = None
     plugin:   Optional[str] = None
     topic:    Optional[str] = None
+    session:  Optional[str] = None
+
+    @model_serializer(mode='wrap')
+    def _dump(self, handler):
+        data = handler(self)
+        if data.get('session') is None:
+            data.pop('session', None)
+        return data
 
 
 class ParticipantInfo(BaseModel):
