@@ -186,6 +186,10 @@ class XGFabricSession(PluginSession):
     XGFabric session - manages workflow configuration and execution.
     """
 
+    def is_busy(self) -> bool:
+        """Probed at the idle deadline: busy while the workflow runs."""
+        return self._state.status == 'running'
+
     def __init__(self, sid: str, workdir: Optional[str] = None, endpoint_name: Optional[str] = None,
                  broker_url: Optional[str] = None, runtime: Any = None):
         super().__init__(sid)
@@ -1279,7 +1283,11 @@ class PluginXGFabric(Plugin):
     session_class = XGFabricSession
     client_class = XGFabricClient
     version = '0.1.0'
-    session_ttl = 0     # broker-hosted workflow state: kept until closed
+    # Idle timeout of a session (s): the Explorer's keepalive holds an open
+    # tab's session, so the countdown starts when the tab closes; a running
+    # workflow keeps it (is_busy).  Clients that reconnect after longer idle
+    # phases register with their own ttl (0: never expires).
+    session_ttl = 86400
 
     ui_config = {
         "icon":            "🌊",

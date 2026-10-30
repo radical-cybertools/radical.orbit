@@ -724,6 +724,12 @@ class PoolState:
 # Session — thin identity handle
 # ---------------------------------------------------------------------------
 
+# How long queued tasks waiting on a pending pilot keep their session busy
+# without any task running (s): bounds an abandoned pool that keeps
+# resubmitting failing pilots.
+QUEUE_WAIT_MAX = 7 * 86400
+
+
 class TaskDispatcherSession(PluginSession):
     '''Session handle — owns this session's pools by lifetime.
 
@@ -734,17 +740,39 @@ class TaskDispatcherSession(PluginSession):
     — so a pool's pilots follow the session lifetime policy.
     '''
 
+    # Since when the session has had queued work but no running task
+    # (``None``: something runs, or nothing is queued).
+    _stalled_since: float | None = None
+
     def is_busy(self) -> bool:
-        '''Probed at the idle deadline: busy while one of this session's
-        pool tasks runs (the dispatcher notifies at plugin level, so task
-        events do not reset the idle clock themselves).  Queued tasks do
-        not count: an abandoned pool whose tasks never get placed would
-        otherwise keep submitting pilots forever.'''
+        '''Probed at the idle deadline (the dispatcher notifies at plugin
+        level, so task events do not reset the idle clock themselves).
+
+        Busy while one of this session's pool tasks runs, or is queued while
+        a pilot of its pool is pending or starting (e.g. a long batch-queue
+        wait).  Queued tasks stop counting after ``QUEUE_WAIT_MAX`` without
+        any running task: an abandoned pool whose pilots keep failing (each
+        replacement pending again) must not keep submitting forever.
+        '''
         if self._plugin is None:
             return False
         pools = self._plugin._pool_states.get(self._sid) or {}
-        return any(t.state == TASK_RUNNING
-                   for ps in pools.values() for t in ps.tasks.values())
+        if any(t.state == TASK_RUNNING
+               for ps in pools.values() for t in ps.tasks.values()):
+            self._stalled_since = None
+            return True
+        waiting = any(
+            any(t.state == TASK_QUEUED for t in ps.tasks.values())
+            and any(p.state in (PILOT_PENDING, PILOT_STARTING)
+                    for p in ps.pilots.values())
+            for ps in pools.values())
+        if not waiting:
+            self._stalled_since = None
+            return False
+        now = time.time()
+        if self._stalled_since is None:
+            self._stalled_since = now
+        return now - self._stalled_since < QUEUE_WAIT_MAX
 
     async def close(self) -> dict:
         '''Tear down this session's pools, then run the base close.'''

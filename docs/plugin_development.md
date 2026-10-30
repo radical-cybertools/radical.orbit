@@ -215,8 +215,7 @@ session's idle timeout and, for reconnect, a client-supplied session id:
 A session expires once it was idle for longer than its timeout.  The
 timeout is fixed at creation: `ttl` seconds, `0` for never; omitted, the
 plugin's `session_ttl` class attribute applies (900 s by default; the task
-dispatcher uses 86400 s, broker-hosted state plugins such as xgfabric and
-federation use 0).  Set `ttl` for sessions that are reconnected to after long
+dispatcher and xgfabric use 86400 s, federation uses 0).  Set `ttl` for sessions that are reconnected to after long
 idle phases.  The legacy `lifetime` field stays accepted: `persistent` means
 `ttl=0`, `ephemeral` the plugin default; an explicit `ttl` wins.
 
@@ -226,8 +225,11 @@ Activity restarts the idle clock:
 - every notification the session emits (`PluginSession.notify`);
 - `touch/{sid}` (`PluginClient.touch()`), which does nothing else;
 - at the deadline only, `PluginSession.is_busy()` -- override it in sessions
-  that run long work without emitting events (rhapsody, psij, globus and the
-  task dispatcher do).  A probe that raises counts as busy.
+  that run long work without emitting events.  rhapsody and psij: a task or
+  job not finished; globus: a transfer not finished (and its status fetched
+  within 30 min); xgfabric: a running workflow; task dispatcher: a running
+  task, or a queued one while a pilot of its pool is pending (at most 7 days
+  without any task running).  A probe that raises counts as busy.
 
 The owner identity (the trusted `x-orbit-src` header the serving runtime
 injects) is recorded for diagnostics only; it governs neither attachment nor

@@ -3599,13 +3599,35 @@ def test_dispatcher_session_is_busy_while_a_pool_task_runs():
     from radical.orbit.plugin_task_dispatcher import TaskDispatcherSession
 
     task  = SimpleNamespace(state='QUEUED')
-    pools = {'cpu': SimpleNamespace(tasks={'t.1': task})}
+    pools = {'cpu': SimpleNamespace(tasks={'t.1': task}, pilots={})}
 
     session = TaskDispatcherSession('s1')
     assert session.is_busy() is False              # no plugin
     session._plugin = SimpleNamespace(_pool_states={'s1': pools})
-    assert session.is_busy() is False              # queued: not pinning
+    assert session.is_busy() is False              # queued, no pilot pending
     task.state = 'RUNNING'
     assert session.is_busy() is True
     task.state = 'DONE'
     assert session.is_busy() is False
+
+
+def test_dispatcher_queued_tasks_keep_the_session_while_a_pilot_waits():
+    """Queued tasks behind a pending pilot keep the session busy, but at
+    most QUEUE_WAIT_MAX without any task running."""
+    from types import SimpleNamespace
+    from radical.orbit import plugin_task_dispatcher as ptd
+
+    task  = SimpleNamespace(state='QUEUED')
+    pilot = SimpleNamespace(state='PENDING')
+    pools = {'cpu': SimpleNamespace(tasks={'t.1': task},
+                                    pilots={'p.1': pilot})}
+    session = ptd.TaskDispatcherSession('s1')
+    session._plugin = SimpleNamespace(_pool_states={'s1': pools})
+
+    assert session.is_busy() is True               # waits on the batch queue
+    session._stalled_since -= ptd.QUEUE_WAIT_MAX + 1
+    assert session.is_busy() is False              # stalled too long
+    task.state = 'RUNNING'
+    assert session.is_busy() is True               # progress resets the cap
+    task.state = 'QUEUED'
+    assert session.is_busy() is True
