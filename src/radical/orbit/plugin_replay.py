@@ -151,8 +151,9 @@ class _RingBuffer:
         }
 
     def select(self, after_exclusive: int, patterns: List[dict],
-               max_events: int, max_bytes: int) -> List[Dict[str, Any]]:
-        '''Return matching events with ``seq > after_exclusive``, oldest-first.
+               max_events: int, max_bytes: int) -> tuple:
+        '''Return ``(events, nbytes)``: the matching events with ``seq >
+        after_exclusive``, oldest-first, and their retained size.
 
         Bounded by *max_events* / *max_bytes*, but always returns at least the
         first matching event so a single oversized event can never stall the
@@ -169,7 +170,7 @@ class _RingBuffer:
                 break
             out.append(event)
             nbytes += size
-        return out
+        return out, nbytes
 
 
 def _gap(buf: _RingBuffer, lower: int, from_zero: bool = True) -> bool:
@@ -569,11 +570,8 @@ class PluginReplay(Plugin):
                 from_zero: bool) -> dict:
         '''One buffer's ``{events, next_seq, gap}`` (plus ``_bytes`` used).'''
         buf.evict_aged(now)
-        events   = buf.select(lower, patterns, max_events, max_bytes)
+        events, nbytes = buf.select(lower, patterns, max_events, max_bytes)
         next_seq = events[-1]['seq'] if events else lower
-        picked   = {id(e) for e in events}
-        nbytes   = sum(size for _, _, size, ev in buf.events
-                       if id(ev) in picked)
         return {'events': events, 'next_seq': next_seq,
                 'gap': _gap(buf, lower, from_zero), '_bytes': nbytes}
 

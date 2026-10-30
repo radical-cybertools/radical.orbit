@@ -6,6 +6,7 @@ package to be installed.
 '''
 
 import threading
+import uuid
 import time
 import json
 import asyncio
@@ -2973,7 +2974,8 @@ class _FakeRuntime:
     def deliver(self, topic, data, session=None, seq=0):
         """An event as the broker sends it; ``session=None`` is an older
         endpoint's session-less event."""
-        meta = {'seq': seq, 'ts': 0.0, 'session': session}
+        meta = {'seq': seq, 'ts': 0.0, 'session': session,
+                'id': uuid.uuid4().hex}         # one id per event
         for t, cb, with_meta, s in list(self.callbacks):
             if t not in (None, topic):
                 continue
@@ -3028,6 +3030,7 @@ def _reconciling_client(rt, session, idle=60.0, gate=None):
     client._sid              = session.sid
     client._reconcile_idle   = idle
     client._reconcile_settle = 0.01
+    client._close_drain      = 0.05          # tests leave tasks behind
     client._start_task_listener()
     return client, http
 
@@ -3572,10 +3575,15 @@ class _NoDispatcherRuntime(_FakeRuntime):
         super().__init__()
         del self._cb
 
-    def deliver(self, topic, data):
-        for t, cb in list(self.callbacks):
-            if t is None or t == topic:
-                cb('ep', 'rhapsody', topic, data)
+    def deliver(self, topic, data, session=None, seq=0):
+        meta = {'seq': seq, 'ts': 0.0, 'session': session,
+                'id': uuid.uuid4().hex}
+        for t, cb, with_meta, s in list(self.callbacks):
+            if t not in (None, topic):
+                continue
+            if s is not None and session is not None and s != session:
+                continue
+            cb('ep', 'rhapsody', topic, data, *((meta,) if with_meta else ()))
 
 
 def test_fan_out_serialized_without_dispatcher():
@@ -3615,6 +3623,7 @@ def test_fan_out_serialized_without_dispatcher():
         live.join(10)
         assert client.wait_tasks(uids, timeout=10)
         assert _until(lambda: 'task_status_batch' in got)
+        assert got.count('task_status') == 40   # live delivery ran
         assert peak[0] == 1
     finally:
         client.close()
@@ -3866,6 +3875,7 @@ def test_close_does_not_stall_on_a_stuck_reconcile():
     assert _until(lambda: http.threads)
     assert timeouts == [prh.RECONCILE_TIMEOUT]
 
+    client._close_drain = 0.1                  # task.k1 never completes
     with patch.object(prh, 'RECONCILE_JOIN', 0.2):
         t0 = time.monotonic()
         client.close()
@@ -3920,6 +3930,7 @@ def _bare_runtime(maxlen=1024):
     rt._cb_lock   = threading.Lock()
     rt._emit      = MagicMock()
     rt._cb        = CallbackDispatcher(maxlen=maxlen)
+    rt._sub_epoch = 0
     return rt
 
 
@@ -3959,7 +3970,7 @@ def test_two_clients_bursts_no_foreign_queue_entries():
             done = client.wait_tasks(uids, timeout=10)
             assert [t['return_value'] for t in done] \
                 == [f'{client.sid}:{u}' for u in uids]
-            assert client._seq_gaps == 0
+            assert not client._reconcile_wake.is_set()
     finally:
         for rt, client in pairs:
             client.close()
@@ -3974,11 +3985,12 @@ def _tracking_client():
     return client
 
 
-def _feed(client, seq, topic='task_status', session='sid-t'):
+def _feed(client, seq, topic='task_status', session='sid-t', eid=None):
     client._reconcile_wake.clear()
     client._on_plugin_event('ep', 'rhapsody', topic,
                             {'uid': 'x', 'state': 'RUNNING'},
-                            {'seq': seq, 'ts': 0.0, 'session': session})
+                            {'seq': seq, 'ts': 0.0, 'session': session,
+                             'id': eid or uuid.uuid4().hex})
     return client._reconcile_wake.is_set()
 
 
@@ -3987,39 +3999,50 @@ def test_seq_tracker_starts_at_first_seen_and_gap_wakes_reconcile():
     assert _feed(client, 7) is False             # mid-stream join: no gap
     assert _feed(client, 8) is False
     assert _feed(client, 11) is True             # 9, 10 lost
-    assert client._seq_gaps == 2
-    assert _feed(client, 11) is False            # duplicate
     assert _feed(client, 12) is False
 
 
-def test_seq_tracker_backwards_restart_needs_confirmation():
-    """A backwards seq restarts the tracker only once the next event
-    continues from it (broker restart); a single stale event is ignored."""
-    client = _tracking_client()
-    for seq in (40, 41):
-        _feed(client, seq)
-    assert _feed(client, 39) is False            # stale: baseline kept
-    assert client._seq_last == 41
-    assert _feed(client, 42) is False            # no gap after the stale one
-    assert _feed(client, 0) is False             # broker restart ...
-    assert client._seq_last == 42
-    assert _feed(client, 1) is False             # ... confirmed
-    assert client._seq_last == 1
-    assert _feed(client, 3) is True
-    assert client._seq_gaps == 1
-
-
-def test_seq_tracker_duplicate_not_fanned_out():
-    """The same event twice (both registrations of a scope move match it)
-    reaches the fan-out once."""
+def test_seq_tracker_backwards_is_a_restart():
+    """Duplicates are told by id, so any seq at or below the last one is a
+    broker restart: the baseline moves to it at once, an equal seq is
+    delivered, and a loss right after the restart is a gap."""
     client = _tracking_client()
     got = []
     client._fanout['task_status'].append(lambda *a: got.append(a[3]['uid']))
-    meta = {'seq': 3, 'ts': 0.0, 'session': 'sid-t'}
-    for _ in range(2):
-        client._on_plugin_event('ep', 'rhapsody', 'task_status',
-                                {'uid': 'x', 'state': 'RUNNING',
-                                 'sid': 'sid-t'}, meta)
+    for seq in (40, 41):
+        _feed(client, seq)
+    assert _feed(client, 41) is False            # restart at an equal seq
+    assert got == ['x', 'x', 'x']                # ... a new event: delivered
+    assert _feed(client, 0) is False             # restart lower
+    assert client._seq_last == 0
+    assert _feed(client, 2) is True              # seq 1 lost after it
+
+
+def test_duplicate_across_scope_move_deduped_by_id():
+    """During a scope move one event matches both registrations (here the
+    unscoped one and the new sid's): it reaches the fan-out once."""
+    from radical.orbit import protocol
+
+    rt     = _bare_runtime()
+    client = RhapsodyClient(MagicMock(), '/rhapsody', broker_client=rt,
+                            endpoint_id='ep', plugin_name='rhapsody')
+    got = []
+    client.register_notification_callback(
+        lambda *a: got.append(a[3]['uid']), topic='task_status')
+    client._sid = 'sid-m'
+    # the new scope is registered before the old one goes: simulate an
+    # event arriving in between
+    rt.register_callback(endpoint_id='ep', plugin_name='rhapsody',
+                         callback=client._on_plugin_event, with_meta=True,
+                         session='sid-m')
+    rt._on_event(protocol.Event(src='ep', plugin='rhapsody',
+                                topic='task_status', session='sid-m', seq=5,
+                                ts=0.0, data={'uid': 'x', 'state': 'RUNNING',
+                                              'sid': 'sid-m'}))
+    assert rt._cb._q.qsize() == 2               # both registrations matched
+    while rt._cb._q.qsize():
+        fn, args = rt._cb._q.get_nowait()
+        fn(*args)
     assert got == ['x']
 
 
@@ -4044,7 +4067,6 @@ def test_seq_tracker_spans_topics_and_ignores_others():
     assert _feed(client, 50, session='sid-other') is False
     assert _feed(client, 99, session=None) is False
     assert _feed(client, len(topics)) is False
-    assert client._seq_gaps == 0
     assert client._seq_last == len(topics)
 
 
@@ -4066,7 +4088,6 @@ def test_seq_gap_triggers_reconcile():
                        session=session.sid, seq=seq)
         done = client.wait_tasks(uids, timeout=10)
         assert [t['state'] for t in done] == ['DONE'] * 3
-        assert client._seq_gaps == 1
         assert http.threads == ['orbit-rh-reconcile']
     finally:
         client.close()
@@ -4121,6 +4142,53 @@ def test_close_keeps_callback_through_session_close():
     assert rt._callbacks == {}
 
 
+def test_close_drains_the_closing_sessions_last_states():
+    """After unregister_session the callback stays registered and takes the
+    closing session's events until no task is outstanding; then it goes."""
+    session = _done_session('sid-drain', [])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, _ = _reconciling_client(rt, session)
+    client._close_drain = 10.0
+    got = []
+    client.register_notification_callback(
+        lambda *a: got.append(a[3].get('state')), topic='task_status')
+    _track(client, ['task.c1'])
+    try:
+        closer = threading.Thread(target=client.close)
+        t0 = time.monotonic()
+        closer.start()
+        assert _until(lambda: client.sid is None)  # unregister_session done
+        assert closer.is_alive()                     # ... and draining
+        rt.deliver('task_status', {'uid': 'task.c1', 'state': 'CANCELED',
+                                   'sid': 'sid-drain'},
+                   session='sid-drain', seq=1)
+        closer.join(5)
+        assert not closer.is_alive()
+        assert time.monotonic() - t0 < 5.0
+        assert got == ['CANCELED']
+        assert rt.callbacks == []
+    finally:
+        rt._cb.stop()
+
+
+def test_close_drain_is_bounded():
+    """Without the last states close() returns after the drain bound."""
+    session = _done_session('sid-drain2', [])
+    rt      = _FakeRuntime()
+    rt._cb.start()
+    client, _ = _reconciling_client(rt, session)
+    client._close_drain = 0.3
+    _track(client, ['task.never'])
+    try:
+        t0 = time.monotonic()
+        client.close()
+        assert 0.25 <= time.monotonic() - t0 < 2.0
+        assert rt.callbacks == []
+    finally:
+        rt._cb.stop()
+
+
 def test_reregister_and_close_leave_no_stale_callbacks():
     """A session switch moves the one runtime callback to the new sid;
     close() removes it — no local callbacks or patterns pile up."""
@@ -4149,8 +4217,8 @@ def test_reregister_and_close_leave_no_stale_callbacks():
 
 def test_two_clients_share_the_subscription_across_resync():
     """Two clients on one runtime share the (endpoint, plugin) pattern:
-    closing one keeps the broker subscription — also after a fresh or a
-    resumed resync — and closing the last removes it."""
+    closing one keeps the broker subscription — also after a resync — and
+    closing the last removes it."""
     from radical.orbit.broker_events import EventRouter
 
     rt     = _bare_runtime()
@@ -4180,16 +4248,11 @@ def test_two_clients_share_the_subscription_across_resync():
     _apply()
     assert len(router._subscriptions['consumer']) == 1
 
-    rt._resumed = True                          # resumed: patterns kept
-    rt._resync_subscriptions()
-    _apply()
-    assert len(router._subscriptions['consumer']) == 1
-
-    router._subscriptions['consumer'] = []      # fresh: broker forgot
-    rt._resumed = False
-    rt._resync_subscriptions()
-    _apply()
-    assert len(router._subscriptions['consumer']) == 1
+    for _ in range(2):                          # resumed or fresh: the
+        router.clear_subscriptions('consumer')  # broker starts from none
+        rt._resync_subscriptions()
+        _apply()
+        assert len(router._subscriptions['consumer']) == 1
 
     clients[0]._sid = None                      # nothing to POST on close
     clients[0].close()

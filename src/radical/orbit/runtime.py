@@ -72,6 +72,8 @@ from .runtime_support   import CallbackDispatcher
 from .ui_schema         import ui_config_to_dict
 
 
+_SUB_KINDS = ('subscribe', 'unsubscribe')
+
 log = logging.getLogger("radical.orbit.runtime")
 
 # ── Runtime tunables (defaults) ────────────────────────────────────────────
@@ -193,7 +195,7 @@ class EndpointRuntime(PluginHostBase):
         self._name: str = name or ('consumer.%s' % uuid.uuid4().hex[:8])
         self._role_override = role
         self._resume_key: Optional[str] = resume_key
-        self._resumed    = False      # last registration resumed (see resync)
+        self._sub_epoch  = 0          # bumped by each subscription resync
 
         # ── Tunnel ─────────────────────────────────────────────────────
         self._tunnel     = tunnel
@@ -685,10 +687,6 @@ class EndpointRuntime(PluginHostBase):
             else:
                 self._set_fatal(f"register rejected: {ack.reason}")
             return False
-        # the broker hands the same key back on a resume (it then keeps this
-        # participant's subscriptions), a new one on a fresh registration
-        self._resumed    = bool(self._resume_key) \
-            and ack.resume_key == self._resume_key
         self._resume_key = ack.resume_key
         log.info("[Runtime] registered as %r (role=%s, plugins=%s)",
                  self._name, self._role(), list(self._plugins))
@@ -729,7 +727,10 @@ class EndpointRuntime(PluginHostBase):
         """Drain the outbound queue onto the socket (transport loop)."""
         try:
             while True:
-                await ws.send(await self._outbox.get())
+                kind, epoch, data = await self._outbox.get()
+                if kind in _SUB_KINDS and epoch != self._sub_epoch:
+                    continue            # queued before a resync: stale
+                await ws.send(data)
         except asyncio.CancelledError:
             return
         except Exception as e:
@@ -746,7 +747,10 @@ class EndpointRuntime(PluginHostBase):
         if loop is None or self._outbox is None:
             log.warning("[Runtime] dropping %s: transport not up yet", msg.kind)
             return
-        loop.call_soon_threadsafe(self._outbox.put_nowait, data)
+        # subscribe/unsubscribe are emitted under ``_cb_lock`` and carry the
+        # resync epoch: the sender drops those queued before a resync
+        loop.call_soon_threadsafe(self._outbox.put_nowait,
+                                  (msg.kind, self._sub_epoch, data))
 
     # ── inbound dispatch (work loop) ───────────────────────────────────
 
@@ -952,10 +956,11 @@ class EndpointRuntime(PluginHostBase):
         By default the callback is invoked as
         ``callback(endpoint, plugin, topic, data)``.  With *with_meta* it is
         invoked as ``callback(endpoint, plugin, topic, data, meta)`` where
-        ``meta = {'seq': int, 'ts': float, 'session': str | None}`` carries the
-        broker-stamped envelope metadata (additive; the wire is unchanged).  The
-        broker ``seq`` is the same authoritative value the replay plugin
-        retains, so live delivery can dedup on it.
+        ``meta = {'seq': int, 'ts': float, 'session': str | None, 'id': str}``
+        carries the broker-stamped envelope metadata (additive; the wire is
+        unchanged).  The broker ``seq`` is the same authoritative value the
+        replay plugin retains, so live delivery can dedup on it; ``id`` is the
+        event's envelope id, the same for every callback the event reaches.
         """
         if callback is None:
             raise ValueError("callback is required")
@@ -1014,14 +1019,18 @@ class EndpointRuntime(PluginHostBase):
     def _resync_subscriptions(self) -> None:
         """Re-send the full interest set after a (re)connect (state re-sync).
 
-        One pattern per key.  A fresh registration holds no patterns: they
-        are subscribed.  A resumed one kept its patterns at the broker: they
-        are subscribed and then unsubscribed once, which leaves one copy and
-        never drops to none in between.  Either way the broker holds each
-        pattern once (the reference count of :meth:`register_callback`), so
-        the final ``unsubscribe`` of a key really removes it.
+        One ``subscribe`` per key.  The broker starts every registration —
+        fresh or resumed — with no patterns, and the ``subscribe`` /
+        ``unsubscribe`` frames queued before this resync are dropped by the
+        sender (they carry an older ``_sub_epoch``), so the broker holds each
+        pattern once (the reference count of
+        :meth:`register_callback`) and the final ``unsubscribe`` of a key
+        really removes it.  Events the broker routes between a resume and
+        this resync are not delivered: a consumer that can recover them sees
+        the loss as a ``seq`` gap (rhapsody's reconcile).
         """
         with self._cb_lock:
+            self._sub_epoch += 1
             keys = list(self._callbacks.keys())
             if not keys:
                 return
@@ -1029,9 +1038,6 @@ class EndpointRuntime(PluginHostBase):
                                                   topic=t)
                         for (e, p, t) in keys]
             self._emit(protocol.Subscribe(src=self._name, patterns=patterns))
-            if getattr(self, '_resumed', False):
-                self._emit(protocol.Unsubscribe(src=self._name,
-                                                patterns=patterns))
 
     def _on_event(self, ev: protocol.Event) -> None:
         endpoint, plugin, topic = ev.src, ev.plugin, ev.topic
@@ -1052,7 +1058,8 @@ class EndpointRuntime(PluginHostBase):
         for cb, with_meta in matched:
             if with_meta:
                 if meta is None:
-                    meta = {'seq': ev.seq, 'ts': ev.ts, 'session': ev.session}
+                    meta = {'seq': ev.seq, 'ts': ev.ts,
+                            'session': ev.session, 'id': ev.id}
                 self._cb.submit(cb, endpoint, plugin, topic, data, meta)
             else:
                 self._cb.submit(cb, endpoint, plugin, topic, data)

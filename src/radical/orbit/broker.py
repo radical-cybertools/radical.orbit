@@ -768,6 +768,9 @@ class Broker:
                 self._participants[name]['role'] = msg.role
                 self._participants[name]['plugins'] = \
                     self._plugins_list_to_dict(msg.plugins)
+                # the participant resyncs its full interest set after a
+                # resume: start it from none, so each pattern is held once
+                self._events.clear_subscriptions(name)
                 self._events.restart_sender(name)
                 await self._send(ws, self._ack(True, self._resume_keys[name]))
                 # Close the old socket; its teardown no-ops via the guard.
@@ -983,6 +986,7 @@ class Broker:
                 'src':     BROKER_NAME,
                 'plugin':  data.get('plugin'),
                 'topic':   data.get('topic'),
+                'id':      protocol.mint_id(),
                 'session': data.get('session'),
                 'data':    data.get('data') or {},
             }
