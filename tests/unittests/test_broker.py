@@ -1034,3 +1034,53 @@ def test_broker_startup_banner_empty_forms_no_crash():
     text = Broker._startup_banner([], str(utils.CERT_FILE), 'file', True)
     assert 'On Client' not in text
     assert 'listening' not in text
+
+
+# ---------------------------------------------------------------------------
+# frame budget: oversized broker-originated requests and hosted responses
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_broker_call_oversized_request_is_413_not_raised(make_broker):
+    """``_broker_call`` answers an over-cap request with a 413 dict at once:
+    nothing is sent and no in-flight entry is left to time out."""
+    import json as _json
+    broker = make_broker(frame_cap=4096)
+    await broker.startup()
+    try:
+        ws = FakeWS()
+        broker.registry['e2'] = ws
+        assert broker.caller.frame_cap == 4096
+        resp = await broker.caller.call('e2', 'POST', '/p', body=b'x' * 8192,
+                                        timeout=5.0)
+        assert resp['status'] == 413
+        assert 'exceeds cap 4096' in _json.loads(resp['body'])['detail']
+        assert ws.sent       == []
+        assert broker._calls == {}
+    finally:
+        broker.registry.pop('e2', None)
+        await broker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_to_host_oversized_response_is_500(make_broker,
+                                                          monkeypatch):
+    """A hosted plugin's over-cap response reaches the caller as a 500 for
+    the same ``corr_id`` instead of being lost in the routing loop."""
+    broker = make_broker(frame_cap=4096)
+
+    async def _big(method, path, headers=None, body=b''):
+        return {'status': 200, 'headers': {}, 'body': b'x' * 8192}
+
+    monkeypatch.setattr(broker, 'call_host', _big)
+    ws = FakeWS()
+    broker.registry['e1'] = ws
+    try:
+        await broker._dispatch_to_host(
+            'e1', {'method': 'GET', 'path': '/broker/x', 'corr_id': 'c9'})
+    finally:
+        broker.registry.pop('e1', None)
+    msg = protocol.parse_message(ws.sent[0], cap=4096)
+    assert msg.status  == 500
+    assert msg.corr_id == 'c9'
+    assert msg.dst     == 'e1'

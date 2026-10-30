@@ -1170,6 +1170,54 @@ class TestRhapsodyDialect:
         _, task = self._submit_one(tmp_path, submit)
         assert task.state == TASK_DONE
 
+    def test_partial_submit_keeps_accepted_tasks_mapped(self, tmp_path):
+        from radical.orbit.plugin_rhapsody import PartialSubmitError
+
+        def submit(plugin, loop):
+            raise PartialSubmitError('HTTP 503 after 1 task', ['t.1.A'], [])
+        plugin, task = self._submit_one(tmp_path, submit)
+        # accepted by the pilot: it runs there, so it stays RUNNING + mapped
+        assert task.state        == TASK_RUNNING
+        assert task.rhapsody_uid == 't.1.A'
+        assert plugin._uid_to_task['t.1.A'] == ('A', 'cpu', 't.1')
+
+    def test_client_submit_partial_failure_and_413(self, tmp_path):
+        from radical.orbit.plugin_rhapsody import PartialSubmitError
+        from radical.orbit.plugin_task_dispatcher import TaskDispatcherClient
+        from radical.orbit.runtime_client import RuntimeResponse
+
+        class _HTTP:
+            max_body = 8 * 1024
+
+            def __init__(self):
+                self.posts = 0
+
+            def post(self, url, data=None, headers=None, **kw):
+                self.posts += 1
+                if self.posts == 2:
+                    return RuntimeResponse(503, {}, b'{"detail": "busy"}')
+                return RuntimeResponse(200, {}, b'[{"uid": "x"}]')
+
+        def _tds(n, pad):
+            return [{'uid': f't.{i}', 'pool': 'cpu', 'executable': '/bin/true',
+                     'arguments': ['x' * pad]} for i in range(n)]
+
+        http = _HTTP()
+        c    = TaskDispatcherClient(http, '/task_dispatcher')
+        c._sid = 'A'
+        with pytest.raises(PartialSubmitError) as exc:
+            c.submit_tasks(_tds(200, 100))
+        assert exc.value.status_code == 503
+        assert exc.value.accepted[0] == 't.0'
+        assert 't.199' not in exc.value.accepted
+
+        http = _HTTP()
+        c._http = http
+        with pytest.raises(RuntimeError) as exc:
+            c.submit_tasks(_tds(1, 9000))
+        assert exc.value.status_code == 413
+        assert http.posts == 0
+
     def test_terminal_notifications_batch_and_forward_results(self, tmp_path):
         _, plugin = _make_plugin(tmp_path)
         plugin._materialise_pool('A', _make_pool_cfg())

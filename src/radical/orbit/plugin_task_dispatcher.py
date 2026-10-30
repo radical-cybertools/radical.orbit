@@ -44,8 +44,6 @@ import threading
 import time
 import uuid
 
-import msgpack
-
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
@@ -56,8 +54,9 @@ from .client                            import PluginClient
 from .plugin_base                       import Plugin
 from .plugin_session_base               import PluginSession
 from .plugin_rhapsody                   import (
-    RhapsodyClient, RhapsodySession, WS_PAYLOAD_LIMIT, NOTIFY_BATCH_SIZE,
+    RhapsodyClient, RhapsodySession, NOTIFY_BATCH_SIZE,
     _payload_size, _resolve_notify_window, _resolve_frame_cap, BUDGET_RATIO,
+    _submit_batches,
 )
 from .task_dispatcher_config            import (
     PoolConfig, PoolMember, PilotSize, PoolConfigError,
@@ -515,6 +514,13 @@ class _CallerSyncHTTP:
         self._dst     = dst
         self._timeout = timeout
 
+    @property
+    def max_body(self) -> int:
+        '''Largest request body the broker's frame cap carries.'''
+        from . import protocol
+        return protocol.max_body(
+            getattr(self._caller, 'frame_cap', protocol.FRAME_CAP))
+
     def request(self, method: str, url: str, *, json=None, content=None,
                 data=None, params=None, headers=None, **_kw):
         from .runtime_client import (
@@ -926,30 +932,9 @@ class TaskDispatcherClient(PluginClient):
 
         url = self._url(ROUTE_SUBMIT_RH.format(sid=self.sid))
 
-        # frame-size-bounded batches, same split as the rhapsody client
-        batches: list[list[dict]] = []
-        batch: list[dict]         = []
-        batch_bytes               = 0
-        for td in task_dicts:
-            td_size = len(str(td)) + 2
-            if batch and batch_bytes + td_size > WS_PAYLOAD_LIMIT:
-                batches.append(batch)
-                batch       = []
-                batch_bytes = 0
-            batch.append(td)
-            batch_bytes += td_size
-        if batch:
-            batches.append(batch)
-
-        results: list[dict] = []
-        for b in batches:
-            resp = self._http.post(
-                url,
-                data=msgpack.packb({'tasks': b}, use_bin_type=True),
-                headers={'Content-Type': 'application/msgpack'})
-            self._raise(resp, f'submit {len(b)} task(s)')
-            results.extend(resp.json())
-        return results
+        # frame-bounded batches, same split (and partial-failure report)
+        # as the rhapsody client
+        return _submit_batches(self, url, task_dicts)
 
     def get_task(self, task_id: str) -> dict:
         '''Fetch the current :class:`TaskRecord` for *task_id*.'''
@@ -3304,7 +3289,14 @@ class PluginTaskDispatcher(Plugin):
         except Exception as e:
             log.exception('[%s] rhapsody submit failed for %d task(s): %s',
                           self.instance_name, len(tasks), e)
+            # a partial submit: the accepted batches run on the pilot, so
+            # those tasks keep their mapping (``PartialSubmitError.accepted``)
+            accepted = set(getattr(e, 'accepted', None) or ())
+            if accepted:
+                self._mark_dirty(pool_state)
             for task, fwd in fwds:
+                if fwd['uid'] in accepted:
+                    continue
                 self._uid_to_task.pop(fwd['uid'], None)
                 # a task the pilot already finished keeps that outcome
                 if task.state not in TASK_TERMINAL_STATES:

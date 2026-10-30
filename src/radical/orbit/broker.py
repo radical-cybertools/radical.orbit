@@ -176,6 +176,11 @@ class BrokerCaller:
     def __init__(self, broker: 'Broker'):
         self._broker = broker
 
+    @property
+    def frame_cap(self) -> int:
+        """The broker's frame cap, which bounds every call it sends."""
+        return self._broker._frame_cap
+
     async def call(self, dst: str, method: str, path: str, *,
                    body:    bytes                    = b'',
                    headers: Optional[Dict[str, str]] = None,
@@ -184,7 +189,8 @@ class BrokerCaller:
 
         Raises ``RuntimeError`` immediately when broker-originated in-flight
         calls are at the cap, or on an unroutable ``dst``; raises
-        ``asyncio.TimeoutError`` if *timeout* elapses first.
+        ``asyncio.TimeoutError`` if *timeout* elapses first.  A request too
+        large for the frame cap is answered with a 413 dict, nothing sent.
         """
         return await self._broker._broker_call(
             dst, method, path, body=body, headers=headers, timeout=timeout)
@@ -887,11 +893,22 @@ class Broker:
         if target is None:
             raise RuntimeError(f"endpoint {dst!r} unknown")
 
+        # An oversized request is answered with a 413 like every other
+        # transport (runtime ``_call``, gateway ingress), not raised raw.
+        try:
+            data = protocol.pack_message(req, cap=self._frame_cap)
+        except protocol.FrameTooLarge as e:
+            return {'status':  413,
+                    'headers': {'content-type': 'application/json'},
+                    'body':    error_body(413, f"request body of "
+                                               f"{len(body or b'')} bytes too "
+                                               f"large for {dst!r}: {e}")}
+
         fut = self._loop.create_future()
         self._calls[corr_id] = _Call(BROKER_NAME, dst, fut,
                                      self._loop.time() + self._call_timeout)
         try:
-            await self._send(target, protocol.pack_message(req, cap=self._frame_cap))
+            await self._send(target, data)
             return await asyncio.wait_for(fut, timeout=timeout)
         except Exception:
             self._calls.pop(corr_id, None)
@@ -925,7 +942,9 @@ class Broker:
             body=resp['body'], corr_id=raw.get('corr_id'))
         target = self.registry.get(src_name)
         if target is not None:
-            await self._send(target, protocol.pack_message(out, cap=self._frame_cap))
+            # oversized: a 500 for the same corr_id, never a silent drop
+            await self._send(target, protocol.pack_or_error(
+                out, cap=self._frame_cap))
 
     async def call_host(self, method: str, path: str, *,
                         headers: Optional[Dict[str, str]] = None,

@@ -12,6 +12,9 @@ WebSocket **unchanged**:
 * :class:`_RuntimeHTTP` — a minimal ``httpx.Client``-shaped adapter bound to
   ``(runtime, dst)`` installed as the helper's ``self._http``.  Its verbs are
   sync (user-thread callers); each rides ``EndpointRuntime.call``.
+* :func:`transport_max_body` / :func:`pack_batches` — the request-body
+  budget of a transport, and the byte-bounded split of a list into msgpack
+  bodies that fit it.
 
 ``EndpointRuntime.get_plugin`` constructs a helper directly with a
 :class:`_RuntimeHTTP` transport and ``broker_client=`` the runtime itself, so the
@@ -21,12 +24,76 @@ base ``PluginClient.register_notification_callback`` forwards notification
 
 import json as _json
 
-from typing       import Any, Dict, Tuple
+from typing       import Any, Dict, List, Tuple
 from urllib.parse import urlencode
 
 import httpx
+import msgpack
 
+from . import protocol
 from .client import PluginClient  # noqa: F401  (re-export convenience)
+
+
+class PayloadTooLarge(RuntimeError):
+    """A request item that no frame can carry (HTTP 413, before any send)."""
+
+    status_code = 413
+
+
+def transport_max_body(http) -> int:
+    """Return the request-body budget of the plugin-client transport *http*.
+
+    The runtime and broker-caller transports report the budget of their own
+    frame cap as ``max_body``; a plain httpx client (gateway HTTP) gets the
+    protocol default, which the gateway enforces on its ingress.
+    """
+    val = getattr(http, 'max_body', None)
+    if isinstance(val, int) and val > 0:
+        return val
+    return protocol.max_body(protocol.FRAME_CAP)
+
+
+def pack_batches(items: List[Any], budget: int, limit: int,
+                 key: str = 'tasks') -> List[Tuple[List[Any], bytes]]:
+    """Split *items* into msgpack bodies ``{key: [...]}`` bounded in bytes.
+
+    Each item is packed once; a body is assembled from those bytes (map
+    header + *key* + array header + parts), so the size is exact and the
+    bytes equal ``msgpack.packb({key: batch})``.  A body holds items up to
+    *budget* bytes; an item larger than that travels alone.  Every item is
+    checked before anything is returned, so the caller sends nothing when
+    one item cannot fit *limit* (the transport's hard body limit):
+    :class:`PayloadTooLarge` is raised instead.
+
+    Returns ``[(batch_items, body_bytes), ...]``.
+    """
+    head  = msgpack.packb({key: []}, use_bin_type=True)[:-1]   # minus [] hdr
+    parts = [msgpack.packb(it, use_bin_type=True) for it in items]
+    over  = 5 + len(head)                                      # + array hdr
+
+    for idx, part in enumerate(parts):
+        if over + len(part) > limit:
+            raise PayloadTooLarge(
+                f"HTTP 413 — item {idx} packs to {len(part)} bytes, over "
+                f"the {limit} byte request body limit")
+
+    out:   List[Tuple[List[Any], bytes]] = []
+    start = 0
+    size  = over
+    for idx, part in enumerate(parts):
+        if idx > start and size + len(part) > budget:
+            out.append(_assemble(items, parts, head, start, idx))
+            start = idx
+            size  = over
+        size += len(part)
+    if start < len(parts):
+        out.append(_assemble(items, parts, head, start, len(parts)))
+    return out
+
+
+def _assemble(items, parts, head, start, end) -> Tuple[List[Any], bytes]:
+    hdr = msgpack.Packer(use_bin_type=True).pack_array_header(end - start)
+    return items[start:end], head + hdr + b''.join(parts[start:end])
 
 
 def _pack_request(method: str, url: str, *, json=None, content=None, data=None,
@@ -107,6 +174,12 @@ class _RuntimeHTTP:
     def __init__(self, runtime, dst: str):
         self._runtime = runtime
         self._dst     = dst
+
+    @property
+    def max_body(self) -> int:
+        """Largest request body the runtime's frame cap carries."""
+        return protocol.max_body(
+            getattr(self._runtime, '_frame_cap', protocol.FRAME_CAP))
 
     def get(self, url: str, *, params=None, headers=None, **kw
             ) -> RuntimeResponse:

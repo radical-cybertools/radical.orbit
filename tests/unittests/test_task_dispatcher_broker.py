@@ -791,3 +791,97 @@ def test_a_departing_adopted_endpoint_ends_done(harness, tmp_path):
     assert rec.state == 'DONE'
     assert rec.error is None
     assert task.requeues == 1
+
+
+# ---------------------------------------------------------------------------
+# Frame budget: rhapsody submits split under the cap on both transports
+# (endpoint runtime, and the broker caller the hosted dispatcher uses), an
+# oversized task is a fast 413, and the gateway caps HTTP bodies to fit.
+# ---------------------------------------------------------------------------
+
+_SMALL_CAP = 256 * 1024
+
+
+def _frame_harness(harness):
+    make_broker, make_runtime = harness
+    srv = make_broker(frame_cap=_SMALL_CAP)
+    make_runtime(srv.url, name='ep', serve=[_FakeRhapsody],
+                 frame_cap=_SMALL_CAP)
+    cli = make_runtime(srv.url, name='cli', frame_cap=_SMALL_CAP)
+    return srv, cli
+
+
+def _frame_transports(srv, cli):
+    from radical.orbit.plugin_task_dispatcher import _CallerSyncHTTP
+    from radical.orbit.runtime_client import _RuntimeHTTP
+    return {'runtime': _RuntimeHTTP(cli, 'ep'),
+            'caller':  _CallerSyncHTTP(srv.broker.caller, 'ep', timeout=10.0)}
+
+
+def _frame_client(http):
+    from radical.orbit.plugin_rhapsody import RhapsodyClient
+    client = RhapsodyClient(http, '/rhapsody')
+    client._sid = 'sid.frame'                  # the fake route takes any sid
+    return client
+
+
+def test_rhapsody_submit_splits_under_cap_on_both_transports(harness):
+    from radical.orbit import protocol
+    srv, cli = _frame_harness(harness)
+    budget   = protocol.max_body(_SMALL_CAP) // 2
+
+    for name, http in _frame_transports(srv, cli).items():
+        assert http.max_body == protocol.max_body(_SMALL_CAP), name
+        sizes = []
+        post  = http.post
+
+        def _post(url, *, _post=post, **kw):
+            sizes.append(len(kw['data']))
+            return _post(url, **kw)
+
+        http.post = _post
+        _FakeRhapsody.received = []
+        tasks = [{'uid': f'{name}.{i}', 'executable': '/bin/echo',
+                  'arguments': ['x' * 1500]} for i in range(400)]
+        result = _frame_client(http).submit_tasks(tasks)
+
+        assert len(result) == 400, name
+        assert len(_FakeRhapsody.received) == 400, name
+        assert len(sizes) >= 2, name
+        assert max(sizes) <= budget, name
+
+
+def test_rhapsody_oversized_task_is_fast_413_on_both_transports(harness):
+    srv, cli = _frame_harness(harness)
+
+    for name, http in _frame_transports(srv, cli).items():
+        _FakeRhapsody.received = []
+        task = {'uid': f'{name}.big', 'executable': '/bin/echo',
+                'arguments': ['x' * _SMALL_CAP]}
+        t0 = time.time()
+        with pytest.raises(RuntimeError) as exc:
+            _frame_client(http).submit_tasks([task])
+        assert time.time() - t0 < 1.0, name
+        assert exc.value.status_code == 413, name
+        assert _FakeRhapsody.received == [], name
+
+        # the transport itself answers an over-cap body with a 413 at once
+        t0   = time.time()
+        resp = http.post('/rhapsody/submit/sid.frame',
+                         data=b'x' * _SMALL_CAP,
+                         headers={'Content-Type': 'application/msgpack'})
+        assert time.time() - t0 < 1.0, name
+        assert resp.status_code == 413, name
+
+
+def test_gateway_body_between_slack_and_cap_is_413(harness):
+    """A body that fits the frame cap but not the envelope around it is a
+    413 at the gateway, not a 500 from a later pack failure."""
+    from radical.orbit import protocol
+    srv, _ = _frame_harness(harness)
+    size   = (protocol.max_body(_SMALL_CAP) + _SMALL_CAP) // 2
+    with httpx.Client(timeout=10.0) as c:
+        r = c.post('%s/ep/rhapsody/submit/sid.frame' % srv.url,
+                   content=b'x' * size,
+                   headers={'Content-Type': 'application/msgpack'})
+    assert r.status_code == 413, r.text

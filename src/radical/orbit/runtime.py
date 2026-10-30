@@ -730,15 +730,28 @@ class EndpointRuntime(PluginHostBase):
             log.debug("[Runtime] sender stopped: %s", e)
 
     def _emit(self, msg) -> None:
-        """Pack an envelope and hand it to the transport loop (thread-safe)."""
+        """Pack an envelope and hand it to the transport loop (thread-safe).
+
+        Lenient: a frame that cannot be packed is logged and dropped.  Calls
+        and served responses pack first themselves (see ``_call`` and
+        ``_serve_request``), so their failures are reported, not dropped.
+        """
         try:
-            data = protocol.pack_message(msg, cap=self._frame_cap)
+            data = self._pack(msg)
         except protocol.ProtocolError as e:
             log.error("[Runtime] failed to pack %s: %s", msg.kind, e)
             return
+        self._enqueue(data, msg.kind)
+
+    def _pack(self, msg) -> bytes:
+        """Pack an envelope against this runtime's frame cap (may raise)."""
+        return protocol.pack_message(msg, cap=self._frame_cap)
+
+    def _enqueue(self, data: bytes, kind: str) -> None:
+        """Hand a packed frame to the transport loop (thread-safe)."""
         loop = self._transport_loop
         if loop is None or self._outbox is None:
-            log.warning("[Runtime] dropping %s: transport not up yet", msg.kind)
+            log.warning("[Runtime] dropping %s: transport not up yet", kind)
             return
         loop.call_soon_threadsafe(self._outbox.put_nowait, data)
 
@@ -779,8 +792,11 @@ class EndpointRuntime(PluginHostBase):
         try:
             status, headers, body = await asyncio.wait_for(
                 self._dispatch_served(req), timeout=self._call_timeout)
-            self._emit(protocol.make_response(
-                req, status, headers=headers, body=body))
+            # An unpackable (oversized) response becomes a 500 for the same
+            # corr_id rather than a silent drop the caller would wait out.
+            self._enqueue(protocol.pack_or_error(
+                protocol.make_response(req, status, headers=headers, body=body),
+                cap=self._frame_cap), 'response')
         except asyncio.TimeoutError:
             # A stuck handler must not pin its admission slot forever (the
             # finally below releases it); fast-fail with a 504.
@@ -852,9 +868,18 @@ class EndpointRuntime(PluginHostBase):
     async def _call(self, dst, method, path, body, headers, timeout):
         req = protocol.make_request(self._name, dst, method, path,
                                     headers=headers, body=body)
+        try:
+            data = self._pack(req)
+        except protocol.FrameTooLarge as e:
+            # Fail fast, before a future is parked: an oversized request
+            # would be dropped and the caller would wait out the timeout.
+            return RuntimeResponse(
+                413, {'content-type': 'application/json'},
+                error_body(413, f"request body of {len(body or b'')} bytes "
+                                f"too large for {dst!r}: {e}"))
         fut = self._work_loop.create_future()
         self._pending[req.corr_id] = fut
-        self._emit(req)
+        self._enqueue(data, req.kind)
         try:
             resp = await asyncio.wait_for(fut, timeout=timeout)
         except Exception:

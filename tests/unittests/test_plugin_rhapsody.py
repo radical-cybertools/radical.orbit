@@ -2624,5 +2624,155 @@ def test_client_data_helpers():
     rc._http.post.assert_called_with('/rhapsody/data_shutdown/sid.1/r')
 
 
+# ---------------------------------------------------------------------------
+# Submit batching: frame budget, fail-fast, partial submission
+# ---------------------------------------------------------------------------
+
+
+class _RecordingHTTP:
+    """Fake transport: records each submit body; *fail_at* (0-based post
+    index) answers with *fail_status*.  ``max_body`` is set only when given,
+    so the default exercises the protocol-default fallback."""
+
+    def __init__(self, max_body=None, fail_at=None, fail_status=503):
+        if max_body is not None:
+            self.max_body = max_body
+        self.bodies      = []
+        self.fail_at     = fail_at
+        self.fail_status = fail_status
+
+    def post(self, url, data=None, headers=None, **kw):
+        import msgpack
+        from radical.orbit.runtime_client import RuntimeResponse
+        idx = len(self.bodies)
+        self.bodies.append(data)
+        if idx == self.fail_at:
+            return RuntimeResponse(self.fail_status, {},
+                                   b'{"detail": "nope"}')
+        tasks = msgpack.unpackb(data, raw=False)['tasks']
+        acks  = [{'uid': td['uid'], 'state': 'SUBMITTED'} for td in tasks]
+        return RuntimeResponse(200, {}, json.dumps(acks).encode())
+
+
+def _rh_client(http):
+    client = RhapsodyClient(http, '/rhapsody')
+    client._sid = 'sid-rh'
+    return client
+
+
+def _sent_tasks(body):
+    import msgpack
+    return msgpack.unpackb(body, raw=False)['tasks']
+
+
+def _tasks(n, pad=0, prefix='t'):
+    return [{'uid': f'{prefix}.{i:05d}', 'executable': '/bin/echo',
+             'arguments': ['x' * pad]} for i in range(n)]
+
+
+def test_pack_batches_bodies_are_exact_and_bounded():
+    import msgpack
+    from radical.orbit.runtime_client import pack_batches
+    items   = _tasks(300, pad=40)
+    batches = pack_batches(items, 4096, 8192)
+    assert len(batches) > 1
+    assert [td for b, _ in batches for td in b] == items      # order kept
+    for batch, body in batches:
+        # same bytes the old per-batch ``packb`` produced: no wire change
+        assert body == msgpack.packb({'tasks': batch}, use_bin_type=True)
+        assert len(body) <= 4096
+
+
+def test_pack_batches_item_over_budget_travels_alone():
+    from radical.orbit.runtime_client import pack_batches
+    items   = _tasks(2) + _tasks(1, pad=6000, prefix='big') + _tasks(2)
+    batches = pack_batches(items, 4096, 8192)
+    assert [len(b) for b, _ in batches] == [2, 1, 2]
+
+
+def test_pack_batches_item_over_limit_is_413_before_any_batch():
+    from radical.orbit.runtime_client import PayloadTooLarge, pack_batches
+    items = _tasks(2) + _tasks(1, pad=9000, prefix='big')
+    with pytest.raises(PayloadTooLarge) as exc:
+        pack_batches(items, 4096, 8192)
+    assert exc.value.status_code == 413
+    assert 'item 2' in str(exc.value)
+
+
+def test_submit_8192_tasks_at_default_cap_splits_under_frame_cap():
+    """Regression (overnight F2): 8192 tasks overran the 4 MiB frame in one
+    8 MiB batch, the frame was dropped and the client hung."""
+    from radical.orbit import protocol
+    http   = _RecordingHTTP()                       # protocol-default budget
+    client = _rh_client(http)
+    tasks  = _tasks(8192, pad=600)
+    result = client.submit_tasks(tasks)
+
+    assert len(result) == 8192
+    assert len(http.bodies) >= 2
+    for body in http.bodies:
+        req = protocol.make_request(
+            'client', 'ep', 'POST', '/rhapsody/submit/sid-rh', body=body,
+            headers={'Content-Type': 'application/msgpack'})
+        assert len(protocol.pack_message(req)) <= protocol.FRAME_CAP
+    assert client._submitted == {td['uid'] for td in tasks}
+
+
+def test_submit_budget_is_half_the_transport_body_limit():
+    http   = _RecordingHTTP(max_body=16 * 1024)
+    client = _rh_client(http)
+    client.submit_tasks(_tasks(200, pad=100))
+    assert len(http.bodies) > 1
+    assert all(len(b) <= 8 * 1024 for b in http.bodies)
+
+
+def test_submit_ws_payload_limit_still_clamps(monkeypatch):
+    from radical.orbit import plugin_rhapsody as prh
+    monkeypatch.setattr(prh, 'WS_PAYLOAD_LIMIT', 2048)
+    http = _RecordingHTTP(max_body=1024 * 1024)
+    _rh_client(http).submit_tasks(_tasks(200, pad=100))
+    assert all(len(b) <= 2048 for b in http.bodies)
+
+
+def test_submit_oversized_task_413_sends_nothing():
+    http   = _RecordingHTTP(max_body=8 * 1024)
+    client = _rh_client(http)
+    with pytest.raises(RuntimeError) as exc:
+        client.submit_tasks(_tasks(3) + _tasks(1, pad=9000, prefix='big'))
+    assert exc.value.status_code == 413
+    assert http.bodies       == []
+    assert client._submitted == set()
+
+
+def test_submit_partial_failure_reports_accepted_uids():
+    from radical.orbit import plugin_rhapsody as prh
+    http   = _RecordingHTTP(max_body=8 * 1024, fail_at=1)
+    client = _rh_client(http)
+    tasks  = _tasks(200, pad=100)
+    with pytest.raises(prh.PartialSubmitError) as exc:
+        client.submit_tasks(tasks)
+    err = exc.value
+    assert err.status_code == 503
+    assert len(http.bodies) == 2                    # stopped at the failure
+    sent = _sent_tasks(http.bodies[0])
+    assert err.accepted == [td['uid'] for td in sent]
+    assert [r['uid'] for r in err.results] == err.accepted
+    # only accepted uids are waitable; an unsent one is rejected, not hung on
+    assert client._submitted == set(err.accepted)
+    with pytest.raises(ValueError, match='unknown task UID'):
+        client.wait_tasks([tasks[-1]['uid']], timeout=0.1)
+
+
+def test_submit_first_batch_failure_raises_plain_error():
+    from radical.orbit import plugin_rhapsody as prh
+    http   = _RecordingHTTP(max_body=8 * 1024, fail_at=0, fail_status=413)
+    client = _rh_client(http)
+    with pytest.raises(RuntimeError) as exc:
+        client.submit_tasks(_tasks(200, pad=100))
+    assert not isinstance(exc.value, prh.PartialSubmitError)
+    assert exc.value.status_code == 413
+    assert client._submitted == set()
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
