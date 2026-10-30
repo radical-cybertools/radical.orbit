@@ -16,6 +16,10 @@ Guarantees:
   ``(src, plugin, session)`` for session-scoped events, monotone per the global
   stream otherwise.  Session ids are not unique across endpoints and plugins
   (every plugin has a ``'default'`` session), so the bare sid is not a key.
+  A session stream does not start at 0: a new (or pruned) stream starts at
+  the broker-wide high-water mark of session seqs, so a stream's seq never
+  goes backwards while the broker runs; consumers start at the first seq they
+  see.
 * The raw tap sees *every* event (stateless, unfiltered) and runs on the
   plugin-host loop — never the routing loop.
 """
@@ -37,7 +41,8 @@ from .queues import BoundedDropOldestQueue
 log = logging.getLogger("radical.orbit.broker")
 
 # Bound on the per-session seq table (one counter per ``(src, plugin,
-# session)``), least recently used pruned first.
+# session)``), least recently used pruned first.  A pruned stream restarts at
+# the broker-wide session-seq high-water mark, never below its own past.
 SESSION_SEQ_MAX = 65536
 
 
@@ -65,13 +70,15 @@ class EventRouter:
         self._out:           Dict[str, BoundedDropOldestQueue] = {}
         self._senders:       Dict[str, asyncio.Task] = {}
         # One monotone seq counter per ``(src, plugin, session)``.  Counters
-        # outlive their session (sessions are re-registrable, and a stale
-        # counter keeps a re-registered session from re-using seq numbers a
-        # consumer already saw), but the table is bounded: the least recently
-        # used counter goes first.  A pruned stream restarts at 0, which a
-        # consumer sees as a backwards seq, i.e. a reset.
+        # outlive their session (sessions are re-registrable), but the table
+        # is bounded: the least recently used counter goes first.  A stream
+        # without a counter — new, or pruned — starts at ``_session_seq_base``,
+        # the broker-wide high-water mark of every session seq issued so far,
+        # so a pruned stream resumes *above* anything it issued before and a
+        # key's seq never goes backwards (only a broker restart resets it).
         self._session_seq:   'OrderedDict[tuple, int]' = OrderedDict()
         self._session_seq_max: int                   = SESSION_SEQ_MAX
+        self._session_seq_base: int                  = 0
         self._global_seq:    int                     = 0
         self._taps:          list                    = []
 
@@ -190,9 +197,11 @@ class EventRouter:
         if session:
             key   = (src_name, raw.get('plugin'), session)
             table = self._session_seq
-            seq   = table.get(key, 0)
+            seq   = table.get(key, self._session_seq_base)
             table[key] = seq + 1
             table.move_to_end(key)
+            if seq + 1 > self._session_seq_base:
+                self._session_seq_base = seq + 1
             if len(table) > self._session_seq_max:
                 table.popitem(last=False)
             raw['seq'] = seq

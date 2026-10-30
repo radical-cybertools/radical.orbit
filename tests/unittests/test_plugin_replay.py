@@ -390,6 +390,54 @@ def test_session_buffers_keyed_by_src_plugin_session():
                                    'ep1/rh/sid-x', 'ep2/rh/sid-x'}
 
 
+def test_sessionless_fetch_returns_matching_session_streams_grouped():
+    """A fetch without session still finds the session events of the
+    endpoints/plugins its patterns name: grouped per stream, each with its
+    own position; replay_iter drains them all."""
+    p = _make_plugin()
+    p._on_event(_ev(0))                                   # global ring
+    p._on_event(_ev(500, session='s1', src='ep1'))        # starts high
+    p._on_event(_ev(501, session='s1', src='ep1'))
+    p._on_event(_ev(502, session='s2', src='ep2'))
+    p._on_event(_ev(503, session='s3', src='ep1', plugin='psij'))
+
+    r = _run(p._route_fetch(_shim({'patterns': [{'endpoint': 'ep1',
+                                                 'plugin': 'rh'}]})))
+    assert r['events'] == []                     # global event is from 'ep'
+    assert [(st['endpoint'], st['plugin'], st['session'], st['next_seq'],
+             st['gap'], [e['seq'] for e in st['events']])
+            for st in r['sessions']] == [('ep1', 'rh', 's1', 501, False,
+                                          [500, 501])]
+
+    # positioned per stream: nothing new for s1 at 501
+    r = _run(p._route_fetch(_shim({
+        'patterns': [{'endpoint': 'ep1', 'plugin': 'rh'}],
+        'session_after_seq': [['ep1', 'rh', 's1', 501]]})))
+    assert r['sessions'] == []
+
+    got = [(e['src'], e.get('session'), e['seq'])
+           for e in _client(p).replay_iter(max_events=1)]
+    assert sorted(got, key=str) == sorted(
+        [('ep', None, 0), ('ep1', 's1', 500), ('ep1', 's1', 501),
+         ('ep2', 's2', 502), ('ep1', 's3', 503)], key=str)
+
+
+def test_bare_default_sid_disambiguated_by_patterns():
+    """'default' is everywhere: the bare sid is ambiguous (400) unless the
+    patterns name the stream."""
+    from fastapi import HTTPException
+    p = _make_plugin()
+    p._on_event(_ev(0, session='default', plugin='psij'))
+    p._on_event(_ev(1, session='default', plugin='rh'))
+    with pytest.raises(HTTPException) as exc:
+        _run(p._route_fetch(_shim({'session': 'default'})))
+    assert exc.value.status_code == 400
+    r = _run(p._route_fetch(_shim({'session': 'default',
+                                   'patterns': [{'plugin': 'rh'}]})))
+    assert [e['plugin'] for e in r['events']] == ['rh']
+    assert r['gap'] is False                     # stream starts at 1
+
+
 def test_dedup_recipe_on_src_plugin_session_seq():
     """The splice recipe keys its seen-set on (src, plugin, session, seq):
     equal seqs of different streams are all kept, re-reads are dropped."""

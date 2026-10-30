@@ -322,8 +322,11 @@ session's events on their own — per ``(endpoint, plugin, session)`` — and th
 session-less events globally, so ``seq`` alone is not unique: dedup on
 ``(endpoint, plugin, meta['session'], meta['seq'])``.  The replay plugin keeps
 session events per ``(endpoint, plugin, session)`` too
-(``replay_iter(session=..., endpoint=..., plugin=...)``); its global ring holds
-only session-less events.
+(``replay_iter(session=..., endpoint=..., plugin=...)``).  Its global ring holds
+only session-less events; a fetch without ``session`` also returns the session
+streams matching its patterns, grouped per stream (each has its own ``seq``),
+and ``replay_iter(patterns=...)`` drains them all.  A session stream's ``seq``
+need not start at 0.
 
 ```python
 seen = set()

@@ -193,6 +193,7 @@ class EndpointRuntime(PluginHostBase):
         self._name: str = name or ('consumer.%s' % uuid.uuid4().hex[:8])
         self._role_override = role
         self._resume_key: Optional[str] = resume_key
+        self._resumed    = False      # last registration resumed (see resync)
 
         # ── Tunnel ─────────────────────────────────────────────────────
         self._tunnel     = tunnel
@@ -684,6 +685,10 @@ class EndpointRuntime(PluginHostBase):
             else:
                 self._set_fatal(f"register rejected: {ack.reason}")
             return False
+        # the broker hands the same key back on a resume (it then keeps this
+        # participant's subscriptions), a new one on a fresh registration
+        self._resumed    = bool(self._resume_key) \
+            and ack.resume_key == self._resume_key
         self._resume_key = ack.resume_key
         log.info("[Runtime] registered as %r (role=%s, plugins=%s)",
                  self._name, self._role(), list(self._plugins))
@@ -937,6 +942,13 @@ class EndpointRuntime(PluginHostBase):
         dropped before they reach the callback queue.  Unregister with the
         same *session*.
 
+        The broker subscription is reference-counted per ``(endpoint, plugin,
+        topic)``: the ``subscribe`` goes out when the first registration of
+        that pattern is made, the ``unsubscribe`` when its last one is gone —
+        each registration counts, a callback registered twice included — so
+        one consumer unregistering never cuts the subscription of another
+        that shares the pattern.
+
         By default the callback is invoked as
         ``callback(endpoint, plugin, topic, data)``.  With *with_meta* it is
         invoked as ``callback(endpoint, plugin, topic, data, meta)`` where
@@ -949,12 +961,17 @@ class EndpointRuntime(PluginHostBase):
             raise ValueError("callback is required")
         key = (endpoint_id, plugin_name, topic)
         with self._cb_lock:
+            first = key not in self._callbacks
             self._callbacks.setdefault(key, []).append(
                 (callback, with_meta, session))
-        self._emit(protocol.Subscribe(
-            src=self._name,
-            patterns=[protocol.SubscribePattern(
-                endpoint=endpoint_id, plugin=plugin_name, topic=topic)]))
+            if first:
+                # under the lock: subscribe/unsubscribe go out in the order
+                # the registry changed
+                self._emit(protocol.Subscribe(
+                    src=self._name,
+                    patterns=[protocol.SubscribePattern(
+                        endpoint=endpoint_id, plugin=plugin_name,
+                        topic=topic)]))
 
     def unregister_callback(self, endpoint_id: Optional[str] = None,
                             plugin_name: Optional[str] = None,
@@ -964,23 +981,26 @@ class EndpointRuntime(PluginHostBase):
         """Unregister *callback* registered for this pattern and *session*.
 
         Callbacks match by equality, so a bound method (a new object on
-        every attribute access) unregisters as passed at registration.
+        every attribute access) unregisters as passed at registration.  One
+        call removes one registration (the latest); the broker
+        ``unsubscribe`` goes out only when the pattern's last one is gone.
         """
         key = (endpoint_id, plugin_name, topic)
         with self._cb_lock:
             cbs = self._callbacks.get(key)
+            hit = [i for i, (cb, _, s) in enumerate(cbs or [])
+                   if cb == callback and s == session]
+            if not hit:
+                return
+            del cbs[hit[-1]]
             if cbs:
-                cbs = [(cb, m, s) for (cb, m, s) in cbs
-                       if cb != callback or s != session]
-                if cbs:
-                    self._callbacks[key] = cbs
-                else:
-                    # no resync of a pattern nobody listens to any more
-                    del self._callbacks[key]
-        self._emit(protocol.Unsubscribe(
-            src=self._name,
-            patterns=[protocol.SubscribePattern(
-                endpoint=endpoint_id, plugin=plugin_name, topic=topic)]))
+                return
+            # no resync of a pattern nobody listens to any more
+            del self._callbacks[key]
+            self._emit(protocol.Unsubscribe(
+                src=self._name,
+                patterns=[protocol.SubscribePattern(
+                    endpoint=endpoint_id, plugin=plugin_name, topic=topic)]))
 
     def register_topology_callback(self, callback: Callable) -> None:
         with self._cb_lock:
@@ -992,15 +1012,26 @@ class EndpointRuntime(PluginHostBase):
                 self._topology_callbacks.remove(callback)
 
     def _resync_subscriptions(self) -> None:
-        """Re-send the full interest set after a (re)connect (state re-sync)."""
+        """Re-send the full interest set after a (re)connect (state re-sync).
+
+        One pattern per key.  A fresh registration holds no patterns: they
+        are subscribed.  A resumed one kept its patterns at the broker: they
+        are subscribed and then unsubscribed once, which leaves one copy and
+        never drops to none in between.  Either way the broker holds each
+        pattern once (the reference count of :meth:`register_callback`), so
+        the final ``unsubscribe`` of a key really removes it.
+        """
         with self._cb_lock:
             keys = list(self._callbacks.keys())
-        if not keys:
-            return
-        self._emit(protocol.Subscribe(
-            src=self._name,
-            patterns=[protocol.SubscribePattern(endpoint=e, plugin=p, topic=t)
-                      for (e, p, t) in keys]))
+            if not keys:
+                return
+            patterns = [protocol.SubscribePattern(endpoint=e, plugin=p,
+                                                  topic=t)
+                        for (e, p, t) in keys]
+            self._emit(protocol.Subscribe(src=self._name, patterns=patterns))
+            if getattr(self, '_resumed', False):
+                self._emit(protocol.Unsubscribe(src=self._name,
+                                                patterns=patterns))
 
     def _on_event(self, ev: protocol.Event) -> None:
         endpoint, plugin, topic = ev.src, ev.plugin, ev.topic

@@ -535,13 +535,15 @@ async def test_event_session_seq_keyed_by_src_plugin_session(make_broker):
                 src, _event_bytes(src, plugin, 't', session=sid))
         await asyncio.sleep(0.02)
 
+        # each stream counts on its own, consecutively; a new stream starts
+        # at the broker-wide high-water mark (not at 0)
         got = [(e.src, e.plugin, e.session, e.seq) for e in cons.msgs()]
         assert got == [('e1', 'psij', 'default', 0),
-                       ('e1', 'rh',   'default', 0),
+                       ('e1', 'rh',   'default', 1),
                        ('e1', 'psij', 'default', 1),
-                       ('e1', 'rh',   'sid-x',   0),
-                       ('e2', 'rh',   'sid-x',   0),
-                       ('e1', 'rh',   'sid-x',   1)]
+                       ('e1', 'rh',   'sid-x',   2),
+                       ('e2', 'rh',   'sid-x',   3),
+                       ('e1', 'rh',   'sid-x',   3)]
     finally:
         await broker.shutdown()
 
@@ -575,7 +577,8 @@ async def test_broker_hosted_session_notification_keeps_session(make_broker):
 
 
 def test_event_session_seq_table_bounded():
-    """The per-session seq table is LRU-bounded; a pruned stream restarts."""
+    """The per-session seq table is LRU-bounded; a pruned stream resumes
+    above every seq it issued before (never backwards)."""
     from radical.orbit.broker_events import EventRouter
 
     router = EventRouter({}, lambda *a: None, MagicMock(), 8,
@@ -588,11 +591,24 @@ def test_event_session_seq_table_bounded():
         router.ingest('e1', raw)
         return raw['seq']
 
-    assert [_seq('a'), _seq('b'), _seq('a'), _seq('c')] == [0, 0, 1, 0]
-    assert _seq('d') == 0                     # evicts 'b' (least recent)
+    issued = {}
+
+    def _seq_of(sid):
+        seq = _seq(sid)
+        assert seq > max(issued.get(sid, [-1]))   # never backwards
+        issued.setdefault(sid, []).append(seq)
+        return seq
+
+    assert [_seq_of('a'), _seq_of('a'), _seq_of('b'), _seq_of('c')] \
+        == [0, 1, 2, 3]
+    _seq_of('d')                              # evicts 'a' (least recent)
     assert len(router._session_seq) == 3
-    assert _seq('a') == 2                     # 'a' was kept (recently used)
-    assert _seq('b') == 0                     # 'b' restarts
+    assert ('e1', 'p', 'a') not in router._session_seq
+    for _ in range(3):
+        _seq_of('b')                          # 'b' runs ahead
+    assert _seq_of('a') > 1                   # 'a' resumes above its past
+    for sid in 'abcd':
+        _seq_of(sid)
 
 
 @pytest.mark.asyncio

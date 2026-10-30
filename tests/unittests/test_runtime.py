@@ -881,6 +881,27 @@ def test_session_callback_unregister():
     assert rt._callbacks == {}
 
 
+def test_subscription_refcounted_per_pattern():
+    """Subscribe on the first registration of a pattern, unsubscribe on its
+    last; a callback registered twice counts twice."""
+    rt = _bare_runtime()
+    cb = lambda *a: None                              # noqa: E731
+
+    def _kinds():
+        return [type(c.args[0]).__name__ for c in rt._emit.call_args_list]
+
+    rt.register_callback(endpoint_id='ep', callback=cb)
+    rt.register_callback(endpoint_id='ep', callback=cb)
+    assert _kinds() == ['Subscribe']
+    rt.unregister_callback(endpoint_id='ep', callback=cb)
+    assert _kinds() == ['Subscribe']                  # one registration left
+    assert len(rt._callbacks[('ep', None, None)]) == 1
+    rt.unregister_callback(endpoint_id='ep', callback=cb)
+    assert _kinds() == ['Subscribe', 'Unsubscribe']
+    rt.unregister_callback(endpoint_id='ep', callback=cb)   # unknown: no-op
+    assert _kinds() == ['Subscribe', 'Unsubscribe']
+
+
 def test_unregister_callback_bound_method():
     """A bound method is a new object on each access: it unregisters by
     equality."""
