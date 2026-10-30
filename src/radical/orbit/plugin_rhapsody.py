@@ -1357,9 +1357,10 @@ class RhapsodyClient(PluginClient):
         sid = data.get('sid')
         if sid is None and not self._warned_no_sid:
             self._warned_no_sid = True
-            log.warning("[rhapsody] endpoint sends task notifications without "
-                        "a session id: results of other sessions with the "
-                        "same task uids cannot be told apart")
+            log.warning("[rhapsody] task notifications without a session id "
+                        "(older endpoint, or the pool task dispatcher): results "
+                        "of other sessions with the same task uids cannot be "
+                        "told apart")
 
         if topic == 'task_status_batch':
             tasks = data.get('tasks', [])
@@ -1488,6 +1489,12 @@ class RhapsodyClient(PluginClient):
 
         if status == 'ready':
             return  # fast path: init was synchronous
+        if status == 'failed':
+            # reconnect to a session whose init already failed: its
+            # session_status event went out before we listened
+            raise RuntimeError(
+                f"Session init failed on endpoint: "
+                f"{data.get('error', 'unknown init error')}")
 
         if not has_sse:
             self._poll_session_ready(init_timeout)

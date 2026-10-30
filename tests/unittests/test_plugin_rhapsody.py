@@ -6,6 +6,7 @@ package to be installed.
 '''
 
 import threading
+import time
 import json
 import asyncio
 
@@ -2732,6 +2733,13 @@ def _join_timers():
         _TIMERS.pop().join(timeout=5)
 
 
+@pytest.fixture
+def join_timers():
+    """Join the register_session test timers even when the test fails."""
+    yield
+    _join_timers()
+
+
 def _client_registering_as(sid, events_during_post):
     """A RhapsodyClient whose register_session POST returns *sid* while the
     given session_status events are delivered (some after a short delay;
@@ -2762,24 +2770,22 @@ def _client_registering_as(sid, events_during_post):
     return client
 
 
-def test_register_session_ignores_other_sessions_status():
+def test_register_session_ignores_other_sessions_status(join_timers):
     """Another session's failed/ready event neither fails nor unblocks us."""
     client = _client_registering_as("s-b", [
         (0,   {"sid": "s-a", "status": "failed", "error": "not mine"}),
         (0,   {"sid": "s-a", "status": "ready"}),
         (0.2, {"sid": "s-b", "status": "ready"})])
     client.register_session(init_timeout=5)
-    _join_timers()
     assert client.sid == "s-b"
 
 
-def test_register_session_own_failure_raises():
+def test_register_session_own_failure_raises(join_timers):
     client = _client_registering_as("s-b", [
         (0,   {"sid": "s-a", "status": "ready"}),
         (0.1, {"sid": "s-b", "status": "failed", "error": "boom"})])
     with pytest.raises(RuntimeError, match="boom"):
         client.register_session(init_timeout=5)
-    _join_timers()
 
 
 def test_register_session_other_ready_does_not_unblock():
@@ -2788,11 +2794,10 @@ def test_register_session_other_ready_does_not_unblock():
         client.register_session(init_timeout=0.5)
 
 
-def test_register_session_sidless_status_accepted():
+def test_register_session_sidless_status_accepted(join_timers):
     """An older endpoint sends session_status without sid: still accepted."""
     client = _client_registering_as("s-b", [(0.1, {"status": "ready"})])
     client.register_session(init_timeout=5)
-    _join_timers()
     assert client.sid == "s-b"
 
 
@@ -2814,3 +2819,19 @@ def test_register_session_failed_post_unregisters_callback():
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
+
+
+
+def test_register_session_reconnect_to_failed_session_raises_at_once():
+    """POST says 'failed' (reconnect to a failed session): raise the real
+    error right away instead of waiting for an event that went out earlier."""
+    client = _client_registering_as("s-b", [])
+    resp = MagicMock()
+    resp.is_error, resp.status_code = False, 200
+    resp.json = MagicMock(return_value={"sid": "s-b", "status": "failed",
+                                        "error": "dragon init boom"})
+    client._http.post = lambda url, json=None: resp
+    t0 = time.monotonic()
+    with pytest.raises(RuntimeError, match="dragon init boom"):
+        client.register_session(init_timeout=30)
+    assert time.monotonic() - t0 < 5
