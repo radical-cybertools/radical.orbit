@@ -881,6 +881,20 @@ def test_session_callback_unregister():
     assert rt._callbacks == {}
 
 
+def test_unregister_callback_bound_method():
+    """A bound method is a new object on each access: it unregisters by
+    equality."""
+    rt = _bare_runtime()
+
+    class _C:
+        def on(self, *a):
+            pass
+    c = _C()
+    rt.register_callback(endpoint_id='ep', callback=c.on, session='s')
+    rt.unregister_callback(endpoint_id='ep', callback=c.on, session='s')
+    assert rt._callbacks == {}
+
+
 # ---------------------------------------------------------------------------
 # item 4: with_meta delivers broker-stamped seq matching what replay retains
 # ---------------------------------------------------------------------------

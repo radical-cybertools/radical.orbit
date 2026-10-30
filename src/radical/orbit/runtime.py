@@ -961,13 +961,17 @@ class EndpointRuntime(PluginHostBase):
                             topic: Optional[str] = None,
                             callback: Callable = None,
                             session: Optional[str] = None) -> None:
-        """Unregister *callback* registered for this pattern and *session*."""
+        """Unregister *callback* registered for this pattern and *session*.
+
+        Callbacks match by equality, so a bound method (a new object on
+        every attribute access) unregisters as passed at registration.
+        """
         key = (endpoint_id, plugin_name, topic)
         with self._cb_lock:
             cbs = self._callbacks.get(key)
             if cbs:
                 cbs = [(cb, m, s) for (cb, m, s) in cbs
-                       if cb is not callback or s != session]
+                       if cb != callback or s != session]
                 if cbs:
                     self._callbacks[key] = cbs
                 else:
