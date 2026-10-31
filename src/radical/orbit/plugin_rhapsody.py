@@ -1474,9 +1474,14 @@ class RhapsodyClient(PluginClient):
             if self._fanout_on:
                 if self._fanout_sid != sid:
                     for topic in self._FANOUT_TOPICS:
-                        self._bc.rescope_callback(
+                        moved = self._bc.rescope_callback(
                             **self._fanout_key(topic),
                             session=self._fanout_sid, new_session=sid)
+                        if not moved:
+                            # nothing to move (dropped meanwhile): register
+                            # it fresh under the new sid
+                            self._bc.register_callback(
+                                **self._fanout_key(topic), session=sid)
                     self._fanout_sid = sid
                 return
             done = []
@@ -1667,10 +1672,12 @@ class RhapsodyClient(PluginClient):
         with self._cond:
             self._sid = data['sid']
             self._completed.clear()
-        if has_sse and self._fanout_on:
-            # move the scope to the new sid now: the new session's events
-            # are not dropped as foreign while it initializes
-            self._ensure_fan_out()
+            if has_sse and self._fanout_on:
+                # move the scope to the new sid in the same step: no event
+                # of the new session is dropped as foreign meanwhile.  Lock
+                # order _cond -> _fanout_lock -> the runtime's _cb_lock;
+                # nothing takes them the other way round.
+                self._ensure_fan_out()
 
         if status == 'ready':
             return  # fast path: init was synchronous

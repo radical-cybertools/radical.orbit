@@ -3161,6 +3161,41 @@ def test_fan_out_scope_moves_on_session_switch_and_goes_on_close():
     assert rt._callbacks == {}
 
 
+def test_session_switch_moves_scope_under_the_condition():
+    """register_session sets the new sid and moves the fan-out scope in one
+    critical section (no event of the new sid dropped in between)."""
+    rt   = _bare_runtime()
+    resp = MagicMock()
+    resp.is_error, resp.status_code = False, 200
+    resp.json = MagicMock(return_value={'sid': 'sid-b', 'status': 'ready'})
+    http = MagicMock()
+    http.post.return_value = resp
+    client = _fanout_client(rt, http)
+    client._start_task_listener()
+    orig, calls = rt.rescope_callback, []
+
+    def _spy(**kw):
+        calls.append((client._sid, client._cond._is_owned()))
+        return orig(**kw)
+
+    rt.rescope_callback = _spy
+    client._register_and_wait(None, 5, True, {}, threading.Event())
+    assert calls == [('sid-b', True), ('sid-b', True)]
+
+
+def test_scope_move_registers_fresh_when_nothing_to_move():
+    """If the runtime has nothing to move (the registration went away), the
+    fan-out is registered fresh under the new sid."""
+    rt     = _bare_runtime()
+    client = _fanout_client(rt)
+    client._start_task_listener()
+    rt._callbacks.clear()                       # gone behind the client
+    client._sid = 'sid-b'
+    client._ensure_fan_out()
+    assert _scopes(rt) == {'task_status': ['sid-b'],
+                           'task_status_batch': ['sid-b']}
+
+
 def test_two_clients_one_runtime_no_foreign_queue_entries():
     """Two clients of different sessions on one runtime with a callback
     queue of 4 get bursts of both sessions: each event takes one queue

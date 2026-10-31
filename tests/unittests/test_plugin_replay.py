@@ -379,15 +379,39 @@ def test_session_buffers_keyed_by_src_plugin_session():
     r = _run(p._route_fetch(_shim({'session': 'sid-x', 'endpoint': 'ep2'})))
     assert [e['src'] for e in r['events']] == ['ep2']
 
-    # the sid alone is ambiguous here: rejected rather than mixed
-    from fastapi import HTTPException
-    with pytest.raises(HTTPException) as exc:
-        _run(p._route_fetch(_shim({'session': 'sid-x'})))
-    assert exc.value.status_code == 400
+    # the sid alone matches two streams: merged in ts order (as one buffer
+    # per sid gave before); next_seq is the highest returned
+    p._on_event(_ev(5, session='sid-x', src='ep1', ts=time.time() + 1))
+    r = _run(p._route_fetch(_shim({'session': 'sid-x'})))
+    assert [(e['src'], e['seq']) for e in r['events']] \
+        == [('ep1', 0), ('ep2', 0), ('ep1', 5)]
+    assert r['next_seq'] == 5 and r['gap'] is False
 
     st = _run(p._route_stats(_shim({})))
     assert set(st['sessions']) == {'ep/psij/default', 'ep/rh/default',
                                    'ep1/rh/sid-x', 'ep2/rh/sid-x'}
+
+
+def test_read_from_start_reports_eviction_before_lowest():
+    """Read from its start, a session stream reports a gap when events
+    before its lowest retained seq were evicted — also after its buffer
+    aged out and the stream came back."""
+    clock = {'t': 1000.0}
+    two = len(__import__('msgpack').packb(_ev(500, session='s', ts=1000.0),
+                                          use_bin_type=True)) * 2 + 1
+    p = _make_plugin(session_max_age=100.0, session_max_bytes=two)
+    p._now = lambda: clock['t']
+    for i in (500, 501, 502):                   # 500 evicted by size
+        p._on_event(_ev(i, session='s', ts=1000.0))
+    r = _run(p._route_fetch(_shim({'session': 's'})))
+    assert [e['seq'] for e in r['events']] == [501, 502] and r['gap'] is True
+
+    clock['t'] = 1200.0                         # everything ages out
+    p._evict_aged(clock['t'])
+    assert ('ep', 'rh', 's') not in p._session_buffers
+    p._on_event(_ev(510, session='s', ts=1200.0))   # the stream comes back
+    r = _run(p._route_fetch(_shim({'session': 's'})))
+    assert [e['seq'] for e in r['events']] == [510] and r['gap'] is True
 
 
 def test_session_stream_starting_high_reads_without_false_gap():

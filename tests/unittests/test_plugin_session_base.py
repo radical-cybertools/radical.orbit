@@ -155,3 +155,77 @@ async def test_close_stops_poller():
     await asyncio.sleep(0)
     assert task.cancelled() or task.done()
     assert sess.is_active is False
+
+
+# ---------------------------------------------------------------------------
+# older overrides / shims without ``session``
+# ---------------------------------------------------------------------------
+
+def test_notify_falls_back_for_an_old_dispatch_override(caplog):
+    """A plugin whose _dispatch_notify predates ``session`` still gets the
+    notification (two-argument call, one warning)."""
+    class _OldPlugin:
+        def __init__(self):
+            self.events = []
+
+        def _dispatch_notify(self, topic, data):
+            self.events.append((topic, data))
+
+    sess = PluginSession("s1")
+    sess._plugin = _OldPlugin()
+    sess.notify("t", {"k": 1})
+    sess.notify("t", {"k": 2})
+    assert sess._plugin.events == [("t", {"k": 1}), ("t", {"k": 2})]
+    assert sum("takes no 'session'" in r.message
+               for r in caplog.records) == 1
+
+
+def test_session_less_sends_keep_the_old_call_form():
+    """A plugin-level (session-less) send calls an old send_notification
+    override and an old host shim with their two/three arguments; a session
+    send falls back to that form too."""
+    import asyncio
+    from fastapi import FastAPI
+    from radical.orbit.plugin_base import Plugin
+
+    class _Shim:
+        def __init__(self):
+            self.calls = []
+
+        def send_notification(self, plugin, topic, data):   # old form
+            self.calls.append((plugin, topic, data))
+
+    class _Old(Plugin):
+        plugin_name = 'old_notify_test'
+
+        def __init__(self, app):
+            super().__init__(app, 'old_notify_test')
+
+    app = FastAPI()
+    app.state.endpoint_service = _Shim()
+    plugin = _Old(app)
+    asyncio.run(plugin.send_notification('t', {'k': 1}))
+    asyncio.run(plugin.send_notification('t', {'k': 2}, session='s1'))
+    assert app.state.endpoint_service.calls == [
+        ('old_notify_test', 't', {'k': 1}),
+        ('old_notify_test', 't', {'k': 2})]
+
+    sent = []
+
+    class _OldSend(Plugin):
+        plugin_name = 'old_send_test'
+
+        def __init__(self, app):
+            super().__init__(app, 'old_send_test')
+
+        async def send_notification(self, topic, data):     # old override
+            sent.append((topic, data))
+
+    async def _go():
+        p = _OldSend(FastAPI())
+        p._dispatch_notify('t', {'k': 3})
+        p._dispatch_notify('t', {'k': 4}, session='s1')
+        await asyncio.sleep(0.01)
+
+    asyncio.run(_go())
+    assert sent == [('t', {'k': 3}), ('t', {'k': 4})]

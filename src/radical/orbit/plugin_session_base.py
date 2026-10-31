@@ -6,6 +6,7 @@ and notification callbacks.
 """
 
 import asyncio
+import inspect
 import logging
 
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Mapping, \
@@ -20,6 +21,50 @@ __author__    = 'Radical Development Team'
 __email__     = 'radical@radical-project.org'
 __copyright__ = 'Copyright 2024, RADICAL@Rutgers'
 __license__   = 'MIT'
+
+
+# Whether a callable takes ``session=`` (cached per function), and the ones
+# already warned about: plugin overrides and host shims written before
+# notifications carried a session keep working.
+_TAKES_SESSION: Dict[Any, bool] = {}
+_WARNED: set = set()
+
+
+def _takes_session(fn: Callable) -> bool:
+    key = getattr(fn, '__func__', fn)
+    try:
+        return _TAKES_SESSION[key]
+    except (KeyError, TypeError):
+        pass
+    try:
+        params = inspect.signature(fn).parameters.values()
+        ok = any(p.name == 'session' or p.kind is p.VAR_KEYWORD
+                 for p in params)
+    except (TypeError, ValueError):
+        ok = True                       # no signature: assume the new form
+    try:
+        _TAKES_SESSION[key] = ok
+    except TypeError:
+        pass
+    return ok
+
+
+def call_with_session(fn: Callable, *args: Any,
+                      session: Optional[str] = None) -> Any:
+    """Call ``fn(*args, session=session)``.  Without *session* (``None``)
+    the call keeps its old form ``fn(*args)``; so does a session call to a
+    *fn* that does not take ``session`` (an older override or shim), with a
+    one-time warning — its event then goes out session-less."""
+    if session is None:
+        return fn(*args)
+    if _takes_session(fn):
+        return fn(*args, session=session)
+    name = getattr(fn, '__qualname__', repr(fn))
+    if name not in _WARNED:
+        _WARNED.add(name)
+        log.warning("%s takes no 'session': its notifications go out "
+                    "session-less", name)
+    return fn(*args)
 
 
 class PluginSession:
@@ -78,7 +123,8 @@ class PluginSession:
         threads.
         """
         if self._plugin is not None:
-            self._plugin._dispatch_notify(topic, data, session=self.sid)
+            call_with_session(self._plugin._dispatch_notify, topic, data,
+                              session=self.sid)
 
     def start_status_poller(
         self, *,
