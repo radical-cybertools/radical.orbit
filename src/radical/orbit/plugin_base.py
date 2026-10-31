@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException, Request
 from starlette.responses import JSONResponse
 
 from . import protocol
-from .plugin_session_base import PluginSession
+from .plugin_session_base import PluginSession, call_with_session
 from .ui_schema import UIConfig, ui_config_to_dict
 from .utils import HOST_ROLES
 
@@ -430,7 +430,8 @@ class Plugin(object):
         """
         async def _send():
             try:
-                await self.send_notification(topic, data, session=session)
+                await call_with_session(self.send_notification, topic, data,
+                                        session=session)
             except Exception as e:
                 log.error("[%s] Notification send failed for %s: %s",
                           self.instance_name, topic, e)
@@ -734,16 +735,16 @@ class Plugin(object):
         Depends on `app.state.endpoint_service` having been injected by EndpointService.
         *session* becomes the event's ``session`` (``None``: session-less).
         """
-        # session-less sends keep the three-argument call, so a host shim
-        # without the ``session`` keyword keeps working for them
-        kwargs = {} if session is None else {'session': session}
         endpoint_svc = getattr(self._app.state, "endpoint_service", None)
         if endpoint_svc is not None and hasattr(endpoint_svc, "send_notification"):
             # The endpoint runtime's send_notification is sync (it only hands the
             # event off to its transport loop); the broker plugin host's is
             # async.  Await only when the call returned an awaitable.
-            result = endpoint_svc.send_notification(
-                self.instance_name, topic, data, **kwargs)
+            # session-less sends keep the three-argument call, and so does
+            # a host shim without the ``session`` keyword
+            result = call_with_session(endpoint_svc.send_notification,
+                                       self.instance_name, topic, data,
+                                       session=session)
             if inspect.isawaitable(result):
                 await result
         else:

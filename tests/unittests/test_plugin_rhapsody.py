@@ -957,6 +957,8 @@ def test_notification_callbacks_fire_in_registration_order():
     rt._session_capable = set()
     rt._broker_routes   = False
     rt._wire_count     = Counter()
+    rt._held           = Counter()
+    rt._subs_live      = True
     rt._name      = 'test-consumer'
     rt._emit      = MagicMock()
 
@@ -3049,6 +3051,8 @@ def _bare_runtime():
     rt._session_capable = set()
     rt._broker_routes   = False
     rt._wire_count     = Counter()
+    rt._held           = Counter()
+    rt._subs_live      = True
     rt._name      = 'test-consumer'
     rt._emit      = MagicMock()
     queued: list  = []
@@ -3168,29 +3172,131 @@ def test_fan_out_scope_moves_on_session_switch_and_goes_on_close():
     assert rt._callbacks == {}
 
 
-def test_fan_out_session_patterns_follow_switch_and_close():
-    """With broker session routing on, the fan-out subscribes its sid at
-    the broker; a session switch subscribes the new sid and withdraws the
-    old, close withdraws the last — one pattern per topic each."""
+def _routed_runtime():
+    """A bare runtime that learned the session capability from topology
+    as a real one does: the endpoint entry is what a runtime serving the
+    real PluginRhapsody registers, the broker entry carries its caps."""
+    from radical.orbit import protocol
+    from radical.orbit.runtime import EndpointRuntime
+
+    served = EndpointRuntime.__new__(EndpointRuntime)
+    served._plugins = {'rhapsody': PluginRhapsody(FastAPI())}
+    plugins = {d['name']: d for d in served._plugin_dicts()}
+    assert plugins['rhapsody']['session_events'] is True
+
     rt = _bare_runtime()
-    rt._session_capable = {('ep', 'rhapsody')}
-    rt._broker_routes   = True
+    rt._topology, rt._topology_callbacks, rt._plugins = {}, [], {}
+    rt._topology_ready = threading.Event()
+    rt._conn_gen       = 0
+    rt._on_topology(protocol.Topology(src='broker', participants={
+        'broker': protocol.ParticipantInfo(
+            role='broker', liveness='present',
+            plugins={protocol.BROKER_CAPS: protocol.broker_caps_entry()}),
+        'ep': protocol.ParticipantInfo(role='endpoint', liveness='present',
+                                       plugins=plugins)}))
+    assert rt._broker_routes and ('ep', 'rhapsody') in rt._session_capable
+    return rt
+
+
+def _sub_frames(rt):
+    return [(m.kind, [(p.topic, p.session) for p in m.patterns])
+            for m in (c.args[0] for c in rt._emit.call_args_list)
+            if m.kind in ('subscribe', 'unsubscribe')]
+
+
+def test_session_events_advertised_by_session_plugins():
+    """The plugins whose events are all session-stamped say so (the
+    capability is per class: a lost flag silently stops broker routing)."""
+    from radical.orbit.plugin_math     import PluginMath
+    from radical.orbit.plugin_psij     import PluginPSIJ
+    from radical.orbit.plugin_xgfabric import PluginXGFabric
+    for cls in (PluginRhapsody, PluginPSIJ, PluginMath, PluginXGFabric):
+        assert cls.session_events is True, cls
+
+
+def test_fan_out_session_patterns_follow_switch_and_close():
+    """With broker session routing on (learned from topology), the fan-out
+    subscribes its sid at the broker; a session switch subscribes the new
+    sid before it withdraws the old, close withdraws the last."""
+    rt     = _routed_runtime()
     client = _fanout_client(rt)
     client._start_task_listener()
     client._sid = 'sid-b'
     client._ensure_fan_out()
     client.close()
 
-    sent = [(m.kind, [(p.topic, p.session) for p in m.patterns])
-            for m in (c.args[0] for c in rt._emit.call_args_list)
-            if m.kind in ('subscribe', 'unsubscribe')]
     topics = ('task_status', 'task_status_batch')
-    assert sent == (
+    assert _sub_frames(rt) == (
         [('subscribe', [(t, 'sid-a')]) for t in topics]
         + [x for t in topics for x in (('subscribe',   [(t, 'sid-b')]),
                                        ('unsubscribe', [(t, 'sid-a')]))]
         + [('unsubscribe', [(t, 'sid-b')]) for t in topics])
     assert rt._callbacks == {} and not rt._wire_count
+
+
+def test_session_switch_holds_plain_pattern_across_the_post():
+    """With broker routing on, register_session holds the plain pattern
+    from before the POST until the new session pattern is in place, so the
+    broker never filters out the new session's events in between."""
+    rt   = _routed_runtime()
+    resp = MagicMock()
+    resp.is_error, resp.status_code = False, 200
+    resp.json = MagicMock(return_value={'sid': 'sid-b', 'status': 'ready'})
+    http = MagicMock()
+    at_post = []
+
+    def _post(*a, **kw):
+        at_post.extend(_sub_frames(rt))
+        return resp
+    http.post.side_effect = _post
+    client = _fanout_client(rt, http)
+    client._start_task_listener()
+    rt._emit.reset_mock()
+
+    client._register_and_wait(None, 5, True, {}, threading.Event())
+    topics = ('task_status', 'task_status_batch')
+    assert at_post == [('subscribe', [(t, None)]) for t in topics]
+    assert _sub_frames(rt) == (
+        [('subscribe', [(t, None)]) for t in topics]
+        + [x for t in topics for x in (('subscribe',   [(t, 'sid-b')]),
+                                       ('unsubscribe', [(t, 'sid-a')]))]
+        + [('unsubscribe', [(t, None)]) for t in topics])
+    assert not rt._held and sorted(rt._wire_count.values()) == [1, 1]
+
+
+def test_session_switch_moves_scope_under_the_condition():
+    """register_session sets the new sid and moves the fan-out scope in one
+    critical section (no event of the new sid dropped in between)."""
+    rt   = _bare_runtime()
+    resp = MagicMock()
+    resp.is_error, resp.status_code = False, 200
+    resp.json = MagicMock(return_value={'sid': 'sid-b', 'status': 'ready'})
+    http = MagicMock()
+    http.post.return_value = resp
+    client = _fanout_client(rt, http)
+    client._start_task_listener()
+    orig, calls = rt.rescope_callback, []
+
+    def _spy(**kw):
+        calls.append((client._sid, client._cond._is_owned()))
+        return orig(**kw)
+
+    rt.rescope_callback = _spy
+    client._register_and_wait(None, 5, True, {}, threading.Event())
+    assert calls == [('sid-b', True), ('sid-b', True)]
+
+
+def test_scope_move_registers_fresh_when_nothing_to_move():
+    """If the runtime has nothing to move (the registration went away), the
+    fan-out is registered fresh under the new sid."""
+    rt     = _bare_runtime()
+    client = _fanout_client(rt)
+    client._start_task_listener()
+    rt._callbacks.clear()                       # gone behind the client
+    client._sid = 'sid-b'
+    client._ensure_fan_out()
+    assert _scopes(rt) == {'task_status': ['sid-b'],
+                           'task_status_batch': ['sid-b']}
 
 
 def test_two_clients_one_runtime_no_foreign_queue_entries():

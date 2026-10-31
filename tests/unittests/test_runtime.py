@@ -786,6 +786,8 @@ def _bare_runtime(maxlen=1024):
     rt._session_capable = set()
     rt._broker_routes   = False
     rt._wire_count     = Counter()
+    rt._held           = Counter()
+    rt._subs_live      = True
     rt._emit      = MagicMock()
     rt._cb        = CallbackDispatcher(maxlen=maxlen)
     return rt
@@ -1054,6 +1056,34 @@ def test_rescope_moves_only_flipped_pairs():
         ('subscribe',   [dict(_SID_A, endpoint='ep2')]),
         ('unsubscribe', [dict(_PLAIN, endpoint='ep2')])]
     assert sorted(rt._wire_count.values()) == [1, 1]
+
+
+def test_no_subscription_frames_while_disconnected():
+    """While the transport is down, registry changes queue no subscribe /
+    unsubscribe (no stale session pattern for the next broker); the
+    reconnect's resync sends exactly the v1 set, the topology re-scopes."""
+    rt = _topo_runtime()
+    rt._on_topology(_topo_msg(), gen=rt._conn_gen)
+    a, b = (lambda *x: None), (lambda *x: None)       # noqa: E731
+    rt.register_callback(endpoint_id='ep', plugin_name='rh', callback=a,
+                         session='sid-a')
+    _emitted(rt)
+    rt._subs_down()                                   # connection lost
+    rt.register_callback(endpoint_id='ep', plugin_name='rh', callback=b,
+                         session='sid-b')
+    rt.rescope_callback(endpoint_id='ep', plugin_name='rh', callback=a,
+                        session='sid-a', new_session='sid-c')
+    rt.hold_subscription('ep', 'rh')
+    rt.release_subscription('ep', 'rh')
+    assert _emitted(rt) == []
+
+    rt._resync_subscriptions()                        # reconnected
+    assert _emitted(rt) == [('subscribe', [_PLAIN])]
+    rt._on_topology(_topo_msg(), gen=rt._conn_gen)
+    assert _emitted(rt) == [
+        ('subscribe', [dict(_PLAIN, session='sid-c'),
+                       dict(_PLAIN, session='sid-b')]),
+        ('unsubscribe', [_PLAIN])]
 
 
 def test_stale_topology_does_not_rescope_after_resync():

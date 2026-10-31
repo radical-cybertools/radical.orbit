@@ -1477,9 +1477,14 @@ class RhapsodyClient(PluginClient):
             if self._fanout_on:
                 if self._fanout_sid != sid:
                     for topic in self._FANOUT_TOPICS:
-                        self._bc.rescope_callback(
+                        moved = self._bc.rescope_callback(
                             **self._fanout_key(topic),
                             session=self._fanout_sid, new_session=sid)
+                        if not moved:
+                            # nothing to move (dropped meanwhile): register
+                            # it fresh under the new sid
+                            self._bc.register_callback(
+                                **self._fanout_key(topic), session=sid)
                     self._fanout_sid = sid
                 return
             done = []
@@ -1658,22 +1663,42 @@ class RhapsodyClient(PluginClient):
         payload = {}
         if backends:
             payload['backends'] = backends
-        resp = self._http.post(self._url('register_session'), json=payload)
-        self._raise(resp)
+        # Across the switch, hold the plain broker pattern of the fan-out:
+        # with the broker filtering by session, events of the new session
+        # (an existing one may already send) would otherwise be dropped at
+        # the broker until the scope moves.  Released once it has moved.
+        hold = has_sse and self._fanout_on
+        if hold:
+            for topic in self._FANOUT_TOPICS:
+                self._bc.hold_subscription(self._endpoint_id,
+                                           self._plugin_name, topic)
+        try:
+            resp = self._http.post(self._url('register_session'),
+                                   json=payload)
+            self._raise(resp)
 
-        data   = resp.json()
-        status = data.get('status')
+            data   = resp.json()
+            status = data.get('status')
 
-        # Switch to the new session and reset the session-wide completion
-        # accumulator in one step, so a late notification of the old session
-        # cannot pass the sid check and land after the reset.
-        with self._cond:
-            self._sid = data['sid']
-            self._completed.clear()
-        if has_sse and self._fanout_on:
-            # move the scope to the new sid now: the new session's events
-            # are not dropped as foreign while it initializes
-            self._ensure_fan_out()
+            # Switch to the new session and reset the session-wide
+            # completion accumulator in one step, so a late notification of
+            # the old session cannot pass the sid check and land after the
+            # reset.
+            with self._cond:
+                self._sid = data['sid']
+                self._completed.clear()
+                if has_sse and self._fanout_on:
+                    # move the scope to the new sid in the same step: no
+                    # event of the new session is dropped as foreign
+                    # meanwhile.  Lock order _cond -> _fanout_lock -> the
+                    # runtime's _cb_lock; nothing takes them the other way
+                    # round.
+                    self._ensure_fan_out()
+        finally:
+            if hold:
+                for topic in self._FANOUT_TOPICS:
+                    self._bc.release_subscription(self._endpoint_id,
+                                                  self._plugin_name, topic)
 
         if status == 'ready':
             return  # fast path: init was synchronous
@@ -2084,6 +2109,7 @@ class PluginRhapsody(Plugin):
     session_class = RhapsodySession
     client_class = RhapsodyClient
     version = '0.0.1'
+    session_events = True       # all its events are session events
 
     ui_config = {
         "icon": "🎼",

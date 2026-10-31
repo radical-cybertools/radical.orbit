@@ -294,6 +294,13 @@ class EndpointRuntime(PluginHostBase):
         self._broker_routes:  bool = False
         self._wire_count:  Counter = Counter()
         self._conn_gen:        int = 0
+        # Plain patterns held without a callback (``hold_subscription``),
+        # counted in ``_wire_count`` and kept across a resync.  While the
+        # transport is down (``_subs_live`` False) no subscribe/unsubscribe
+        # is queued: only the counts change, and the resync on reconnect
+        # sends the whole set.
+        self._held:        Counter = Counter()
+        self._subs_live:      bool = False
 
         # rich topology snapshot (name -> {role, plugins, liveness})
         self._topology: Dict[str, Dict[str, Any]] = {}
@@ -625,6 +632,7 @@ class EndpointRuntime(PluginHostBase):
                 await asyncio.sleep(min(backoff, self._backoff_max))
             finally:
                 self._ws = None
+                self._subs_down()
 
     def _ws_url(self) -> str:
         url = self._broker_url
@@ -1066,6 +1074,8 @@ class EndpointRuntime(PluginHostBase):
             if self._wire_count[w] <= 0:
                 del self._wire_count[w]
                 unsub.append(w)
+        if not self._subs_live:
+            return                      # disconnected: the resync sends all
         if sub:
             self._emit(protocol.Subscribe(src=self._name,
                                           patterns=self._patterns(sub)))
@@ -1134,19 +1144,57 @@ class EndpointRuntime(PluginHostBase):
         session pattern.  The capability is forgotten until the new
         connection's topology re-scopes the session registrations
         (:meth:`_rescope_sessions`); a topology frame of an earlier
-        connection cannot (``_conn_gen``).
+        connection cannot (``_conn_gen``).  From here on, registry changes
+        emit frames again (``_subs_live``).
         """
         with self._cb_lock:
             self._conn_gen        += 1
             self._session_capable  = set()
             self._broker_routes    = False
+            self._subs_live        = True
             self._wire_count = Counter(
                 (e, p, t, None) for (e, p, t), cbs in self._callbacks.items()
                 for _ in cbs)
+            self._wire_count.update(self._held)
             if self._wire_count:
                 self._emit(protocol.Subscribe(
                     src=self._name,
                     patterns=self._patterns(self._wire_count)))
+
+    def _subs_down(self) -> None:
+        """The transport is down: stop queuing subscription frames."""
+        with self._cb_lock:
+            self._subs_live = False
+
+    def hold_subscription(self, endpoint_id: Optional[str] = None,
+                          plugin_name: Optional[str] = None,
+                          topic: Optional[str] = None) -> None:
+        """Hold the plain ``(endpoint, plugin, topic)`` broker pattern
+        without a callback, until :meth:`release_subscription`.
+
+        A client about to switch sessions holds it across the switch, so
+        that events of the new session the broker routes before the
+        session pattern moves are not filtered out at the broker.  Counted
+        with the registrations (no frame if the pattern is subscribed
+        already)."""
+        key = (endpoint_id, plugin_name, topic, None)
+        with self._cb_lock:
+            self._held[key] += 1
+            self._move_wire([], [key])
+
+    def release_subscription(self, endpoint_id: Optional[str] = None,
+                             plugin_name: Optional[str] = None,
+                             topic: Optional[str] = None) -> None:
+        """Release one :meth:`hold_subscription` of this pattern."""
+        key = (endpoint_id, plugin_name, topic, None)
+        with self._cb_lock:
+            if self._held[key] <= 0:
+                del self._held[key]
+                return
+            self._held[key] -= 1
+            if not self._held[key]:
+                del self._held[key]
+            self._move_wire([key], [])
 
     def _on_event(self, ev: protocol.Event) -> None:
         endpoint, plugin, topic = ev.src, ev.plugin, ev.topic

@@ -54,12 +54,12 @@ import asyncio
 import logging
 import time
 
-from collections import deque
+from collections import OrderedDict, deque
 from typing      import Any, Callable, Dict, List, Optional
 
 import msgpack
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 
 from .client               import PluginClient
 from .plugin_base          import Plugin
@@ -78,6 +78,7 @@ _GLOBAL_MAX_BYTES  = 16 * 1024 * 1024   # global session-less ring bound (bytes)
 _FETCH_MAX_EVENTS  = 256                # default per-fetch event cap
 _FETCH_MAX_BYTES   = 1024 * 1024        # default per-fetch byte cap
 _SWEEP_INTERVAL    = 30.0              # background age-eviction sweep cadence (s)
+_STREAMS_MAX       = 65536             # session streams remembered (LRU)
 
 
 # ---------------------------------------------------------------------------
@@ -257,10 +258,12 @@ class ReplayClient(PluginClient):
         the whole retained buffer, or the last ``next_seq`` to resume.  A fetch
         that repeats the same *after_seq* simply re-reads the batch (at-least-
         once).  *session* selects a per-session buffer (``None`` = the global
-        ring), together with the *endpoint* and *plugin* that emitted it; they
-        may be omitted while only one endpoint/plugin retains that session id
-        (an ambiguous fetch fails).  *patterns* filters with subscribe-pattern
-        None-wildcard semantics.
+        ring), together with the *endpoint* and *plugin* that emitted it,
+        which make it exact.  Without them a sid retained for several
+        endpoints/plugins (``'default'`` is everywhere) reads their streams
+        merged in ``ts`` order, with ``next_seq`` the highest seq returned —
+        only an approximate position, as each stream numbers its own seq.
+        *patterns* filters with subscribe-pattern None-wildcard semantics.
 
         Returns ``{events, next_seq, gap}``.
         '''
@@ -364,6 +367,10 @@ class PluginReplay(Plugin):
         self._global = _RingBuffer(self.global_max_bytes)
         # Session buffers are keyed ``(src, plugin, session)``.
         self._session_buffers: Dict[tuple, _RingBuffer] = {}
+        # Per session stream, outliving its buffer (bounded, LRU): the first
+        # seq ever seen and the last seq evicted, so a read from the start
+        # still sees a gap after the buffer aged out and came back.
+        self._streams: 'OrderedDict[tuple, list]' = OrderedDict()
 
         # Subscribe to the raw event tap NOW so retention starts at load time
         # (a late consumer must find events already buffered).  Absent (None)
@@ -406,9 +413,16 @@ class PluginReplay(Plugin):
         session = event.get('session')
         if session:
             key = (event.get('src'), event.get('plugin'), session)
+            rec = self._streams.get(key)
+            if rec is None:
+                rec = self._streams[key] = [int(seq), None]
+                if len(self._streams) > _STREAMS_MAX:
+                    self._streams.popitem(last=False)
+            self._streams.move_to_end(key)
             buf = self._session_buffers.get(key)
             if buf is None:
                 buf = _RingBuffer(self.session_max_bytes, self.session_max_age)
+                buf.last_dropped_seq = rec[1]
                 self._session_buffers[key] = buf
         else:
             buf = self._global
@@ -425,6 +439,9 @@ class PluginReplay(Plugin):
             # saw.  A later event for the same session recreates it on demand.
             if not buf.events:
                 del self._session_buffers[key]
+                rec = self._streams.get(key)
+                if rec is not None:
+                    rec[1] = buf.last_dropped_seq
 
     def _maybe_start_sweeper(self) -> None:
         if self._sweeper is not None:
@@ -488,47 +505,78 @@ class PluginReplay(Plugin):
         max_bytes  = int(body.get('max_bytes')  or self.default_max_bytes)
 
         now = self._now()
-        buf = (self._global if session is None
-               else self._session_buffer(session, body.get('endpoint'),
-                                         body.get('plugin')))
-        if buf is None:
+        if session is None:
+            return self._read(self._global, lower, patterns, max_events,
+                              max_bytes, now, first=0)
+        found = self._session_buffers_of(session, body.get('endpoint'),
+                                         body.get('plugin'))
+        if not found:
             return {'events': [], 'next_seq': lower, 'gap': False}
-        buf.evict_aged(now)
+        if len(found) == 1:
+            key, buf = found[0]
+            return self._read(buf, lower, patterns, max_events, max_bytes,
+                              now, first=self._first_seq(key, buf))
 
-        events   = buf.select(lower, patterns, max_events, max_bytes)
-        lowest   = buf.lowest_seq
-        # Gap when events after ``lower`` were evicted.  ``lowest_seq`` bounds it
-        # while the buffer is non-empty; ``last_dropped_seq`` still reports it
-        # once everything matching (or the whole buffer) has been evicted.  A
-        # session stream does not start at 0 (it starts at the broker's seq
-        # high-water mark): read from its start (``lower < 0``), only
-        # ``last_dropped_seq`` tells.
-        bound    = session is None or lower >= 0
-        gap      = (bound and lowest is not None and lowest > lower + 1) or \
-                   (buf.last_dropped_seq is not None
-                    and buf.last_dropped_seq > lower)
+        # A bare sid retained for several endpoints/plugins ('default' is
+        # everywhere): their events merged in ts order, as one buffer per sid
+        # gave before.  Each stream numbers its own seq, so ``next_seq`` (the
+        # highest returned) only approximates a position here: pass
+        # ``endpoint`` and ``plugin`` for an exact stream.
+        events, gap = [], False
+        for key, buf in found:
+            res = self._read(buf, lower, patterns, max_events, max_bytes,
+                             now, first=self._first_seq(key, buf))
+            events.extend(res['events'])
+            gap = gap or res['gap']
+        events.sort(key=lambda e: e.get('ts') or 0.0)
+        events = events[:max_events]
+        next_seq = max((e['seq'] for e in events), default=lower)
+        return {'events': events, 'next_seq': next_seq, 'gap': gap}
+
+    def _first_seq(self, key: tuple, buf: _RingBuffer) -> int:
+        '''The first seq ever seen of a session stream (its lowest retained
+        if no record is left).'''
+        rec = self._streams.get(key)
+        if rec is not None:
+            return rec[0]
+        return buf.lowest_seq if buf.lowest_seq is not None else 0
+
+    @staticmethod
+    def _read(buf: _RingBuffer, lower: int, patterns: List[dict],
+              max_events: int, max_bytes: int, now: float,
+              first: int) -> dict:
+        '''One buffer's ``{events, next_seq, gap}`` past *lower*.
+
+        Gap when events after ``lower`` were evicted.  ``lowest_seq`` bounds
+        it while the buffer is non-empty — against *lower*, or, read from
+        the start (``lower < 0``), against *first*, the first seq the stream
+        ever had here (a session stream starts at the broker's seq
+        high-water mark, the global ring at 0); ``last_dropped_seq`` still
+        reports it once everything matching (or the whole buffer) has been
+        evicted.
+        '''
+        buf.evict_aged(now)
+        events = buf.select(lower, patterns, max_events, max_bytes)
+        lowest = buf.lowest_seq
+        start  = lower + 1 if lower >= 0 else first
+        gap    = (lowest is not None and lowest > start) or \
+                 (buf.last_dropped_seq is not None
+                  and buf.last_dropped_seq > lower)
         next_seq = events[-1]['seq'] if events else lower
         return {'events': events, 'next_seq': next_seq, 'gap': gap}
 
-    def _session_buffer(self, session: str, endpoint: Optional[str],
-                        plugin: Optional[str]) -> Optional[_RingBuffer]:
-        '''The buffer of *session* emitted by *endpoint*'s *plugin*.
-
-        Either may be ``None`` (older consumers pass the sid alone): the one
-        buffer that matches is used, and a sid retained for several
-        endpoints/plugins is rejected as ambiguous rather than mixing them.
-        '''
+    def _session_buffers_of(self, session: str, endpoint: Optional[str],
+                            plugin: Optional[str]) -> List[tuple]:
+        '''The ``(key, buffer)`` pairs of *session* emitted by *endpoint*'s
+        *plugin* — either may be ``None`` (older consumers pass the sid
+        alone), matching any.'''
         if endpoint is not None and plugin is not None:
-            return self._session_buffers.get((endpoint, plugin, session))
-        found = [buf for (src, plg, sid), buf in self._session_buffers.items()
-                 if sid == session
-                 and endpoint in (None, src) and plugin in (None, plg)]
-        if len(found) > 1:
-            raise HTTPException(
-                status_code=400,
-                detail=f"session {session!r} is retained for several "
-                       f"endpoints/plugins: pass 'endpoint' and 'plugin'")
-        return found[0] if found else None
+            key = (endpoint, plugin, session)
+            buf = self._session_buffers.get(key)
+            return [(key, buf)] if buf is not None else []
+        return [(key, buf) for key, buf in self._session_buffers.items()
+                if key[2] == session
+                and endpoint in (None, key[0]) and plugin in (None, key[1])]
 
     async def _route_stats(self, request: Request) -> dict:
         '''Return retention stats: the global ring + each per-session buffer
