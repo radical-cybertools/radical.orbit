@@ -951,8 +951,11 @@ class EndpointRuntime(PluginHostBase):
             raise ValueError("callback is required")
         key = (endpoint_id, plugin_name, topic)
         with self._cb_lock:
+            first = key not in self._callbacks
             self._callbacks.setdefault(key, []).append(
                 (callback, with_meta, session))
+        if not first:
+            return                      # subscribed already (one per key)
         self._emit(protocol.Subscribe(
             src=self._name,
             patterns=[protocol.SubscribePattern(

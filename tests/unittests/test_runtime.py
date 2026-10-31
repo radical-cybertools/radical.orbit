@@ -835,7 +835,7 @@ def test_session_callback_unregister():
                            callback=cb, session=None)
     assert rt._callbacks[('ep', 'rh', None)] == [(cb, False, 'sid-b')]
     kinds = [type(c.args[0]).__name__ for c in rt._emit.call_args_list]
-    assert 'Unsubscribe' not in kinds
+    assert kinds == ['Subscribe']             # one per key, kept
     rt.register_callback(endpoint_id='ep', plugin_name='rh', callback=cb,
                          session='sid-c')
     rt.unregister_callback(endpoint_id='ep', plugin_name='rh', callback=cb)
