@@ -2776,17 +2776,16 @@ def test_submit_partial_failure_reports_accepted_and_unconfirmed():
     assert client._submitted == {td['uid'] for td in tasks}
 
 
-def test_submit_first_batch_failure_is_partial_with_none_accepted():
+def test_submit_first_batch_failure_raises_its_own_error():
+    """Nothing accepted: the original error, unchanged (as before)."""
     from radical.orbit import plugin_rhapsody as prh
     http   = _RecordingHTTP(max_body=8 * 1024, fail_at=0, fail_status=413)
     client = _rh_client(http)
-    tasks  = _tasks(200, pad=100)
-    with pytest.raises(prh.PartialSubmitError) as exc:
-        client.submit_tasks(tasks)
-    assert isinstance(exc.value, RuntimeError)
+    with pytest.raises(RuntimeError) as exc:
+        client.submit_tasks(_tasks(200, pad=100))
+    assert not isinstance(exc.value, prh.PartialSubmitError)
     assert exc.value.status_code == 413
-    assert exc.value.accepted    == []
-    assert exc.value.unconfirmed == [td['uid'] for td in tasks]
+    assert len(http.bodies) == 1
 
 
 def test_submit_errors_survive_pickle():

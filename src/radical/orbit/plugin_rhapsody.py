@@ -226,7 +226,7 @@ def _submit_budget(http) -> int:
 
 
 class PartialSubmitError(RuntimeError):
-    """A batched submit failed at some batch.
+    """A batched submit failed after earlier batches were accepted.
 
     ``accepted`` lists the uids of the batches the endpoint acknowledged
     (those tasks run); ``unconfirmed`` the rest -- the failing batch, whose
@@ -253,8 +253,9 @@ def _submit_batches(client, url: str, task_dicts: list[dict]) -> list[dict]:
 
     Every task is packed and checked before the first send, so a task that
     no frame carries fails with a 413 (:class:`PayloadTooLarge`) and nothing
-    is submitted.  Batches go out sequentially; a failing batch raises
-    :class:`PartialSubmitError`.
+    is submitted.  Batches go out sequentially; a failing batch after an
+    accepted one raises :class:`PartialSubmitError`, a failing first batch
+    its own error unchanged.
     """
     http    = client._http
     batches = pack_batches(task_dicts, _submit_budget(http),
@@ -268,6 +269,8 @@ def _submit_batches(client, url: str, task_dicts: list[dict]) -> list[dict]:
             client._raise(resp, f"submit {len(batch)} task(s)")
             acks = resp.json()
         except Exception as e:
+            if not accepted:
+                raise                    # as before: nothing confirmed
             unconfirmed = [str(td['uid'])
                            for td in task_dicts[len(accepted):]]
             raise PartialSubmitError(
@@ -1632,8 +1635,10 @@ class RhapsodyClient(PluginClient):
             PayloadTooLarge: a ``RuntimeError`` with ``status_code`` 413
                 if a task is too large for any frame (nothing is submitted
                 then).
-            PartialSubmitError: a batch failed; its ``accepted`` uids run,
-                the outcome of its ``unconfirmed`` ones is unknown.
+            PartialSubmitError: a batch failed after earlier ones were
+                accepted; its ``accepted`` uids run, the outcome of its
+                ``unconfirmed`` ones is unknown.  A failing first batch
+                raises its own error, as before.
         """
         self._require_session()
 

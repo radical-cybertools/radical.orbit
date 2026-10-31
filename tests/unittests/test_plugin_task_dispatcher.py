@@ -1184,18 +1184,61 @@ class TestRhapsodyDialect:
     def test_caller_transport_wait_is_bounded(self):
         """The caller transport never waits unboundedly on its future (an
         unbounded wait pins the thread and hangs a 3.10 interpreter exit):
-        the caller's call timeout plus a grace, then a TimeoutError."""
+        the caller's call timeout plus its reap interval plus a grace, then
+        a TimeoutError."""
         import concurrent.futures as cf
         from radical.orbit import plugin_task_dispatcher as ptd
-        caller = MagicMock(call_timeout=0.05)
+        caller = MagicMock(call_timeout=0.05, reap_interval=0.05)
         fut    = cf.Future()                      # never answered
         caller.call_threadsafe.return_value = fut
         with patch.object(ptd, '_CALLER_WAIT_GRACE', 0.05):
             t0 = time.time()
-            with pytest.raises(TimeoutError):
+            with pytest.raises(TimeoutError, match='within 0 s'):
                 ptd._CallerSyncHTTP(caller, 'ep').post('/x', data=b'')
-        assert time.time() - t0 < 2
+        assert 0.15 <= time.time() - t0 < 2       # timeout + reap + grace
         assert fut.cancelled()
+
+    def test_oversized_task_fails_alone_and_peers_submit(self, tmp_path):
+        from radical.orbit.runtime_client import PayloadTooLarge
+        _, plugin = _make_plugin(tmp_path)
+        plugin._materialise_pool('A', _make_pool_cfg())
+        ps = _pool(plugin, 'A', 'cpu')
+        pilot = PilotRecord(
+            pid='p.1', pool='cpu', owning_sid='A', size_key='s',
+            rhapsody_backend='concurrent', state=PILOT_ACTIVE,
+            child_endpoint_name='endpoint0_p.1', capacity=4)
+        ps.pilots['p.1'] = pilot
+        tasks = []
+        for i in (1, 2, 3):
+            td = _dialect_td(f't.{i}')
+            td.pop('pool')
+            tasks.append(TaskRecord(
+                task_id=f't.{i}', pool='cpu', owning_sid='A', cmd=[], cwd='',
+                task_dict=td, state=TASK_RUNNING))
+            ps.tasks[f't.{i}'] = tasks[-1]
+        calls = []
+
+        def submit(dicts):
+            calls.append([d['uid'] for d in dicts])
+            if len(calls) == 1:
+                raise PayloadTooLarge('HTTP 413 — too big', ['t.2.A'])
+            return []
+        rh_mock = MagicMock()
+        rh_mock.submit_tasks = MagicMock(side_effect=submit)
+
+        async def drive():
+            with patch.object(plugin, '_get_rhapsody_client',
+                              new=AsyncMock(return_value=rh_mock)):
+                await plugin._do_rhapsody_submit(ps, list(tasks), pilot)
+
+        asyncio.run(drive())
+        assert calls == [['t.1.A', 't.2.A', 't.3.A'], ['t.1.A', 't.3.A']]
+        assert tasks[1].state == TASK_FAILED
+        assert 'too big' in (tasks[1].error or '')
+        assert 't.2.A' not in plugin._uid_to_task
+        for task in (tasks[0], tasks[2]):
+            assert task.state == TASK_RUNNING
+            assert task.rhapsody_uid in plugin._uid_to_task
 
     def test_endpoint_mode_oversized_is_413(self, tmp_path):
         from radical.orbit.plugin_rhapsody import PartialSubmitError

@@ -59,7 +59,7 @@ from .plugin_rhapsody                   import (
     _payload_size, _resolve_notify_window, _resolve_frame_cap, BUDGET_RATIO,
     _submit_batches,
 )
-from .runtime_client                    import max_body_of
+from .runtime_client                    import PayloadTooLarge, max_body_of
 from .task_dispatcher_config            import (
     PoolConfig, PoolMember, PilotSize, PoolConfigError,
     PILOT_ENDPOINT, default_pool_config, parse_pools, parse_member,
@@ -500,9 +500,19 @@ def backend_kwargs(req: dict, backend: str) -> dict:
 # ---------------------------------------------------------------------------
 
 # _CallerSyncHTTP waits for an answer at most the caller's call timeout
-# (or this default) plus a grace.
+# plus its reap interval (the reaper answers an expired call on its next
+# sweep) plus a grace; the defaults apply when the caller publishes none.
 _CALLER_WAIT_DEFAULT = 600.0
+_CALLER_REAP_DEFAULT = 5.0
 _CALLER_WAIT_GRACE   = 5.0
+
+
+def _num(val, default: float) -> float:
+    '''*val* if it is a positive number, else *default*.'''
+    if isinstance(val, (int, float)) and not isinstance(val, bool) \
+            and val > 0:
+        return float(val)
+    return default
 
 
 class _CallerSyncHTTP:
@@ -538,19 +548,20 @@ class _CallerSyncHTTP:
             self._dst, method, path, body=body, headers=hdrs,
             timeout=self._timeout)
         # Bounded wait: the broker answers (or reaps) every call by its
-        # call timeout, so wait that long plus a grace -- an unbounded
+        # call timeout plus one reap sweep, so wait that long plus a grace
+        # -- an unbounded
         # ``result()`` can pin this worker thread, and on Python 3.10 the
         # interpreter then never exits.
-        limit = self._timeout or getattr(self._caller, 'call_timeout', None)
-        if not isinstance(limit, (int, float)) or limit <= 0:
-            limit = _CALLER_WAIT_DEFAULT
+        limit = self._timeout or _num(getattr(self._caller, 'call_timeout',
+                                              None), _CALLER_WAIT_DEFAULT)
+        limit += _num(getattr(self._caller, 'reap_interval', None),
+                      _CALLER_REAP_DEFAULT) + _CALLER_WAIT_GRACE
         try:
-            resp = fut.result(limit + _CALLER_WAIT_GRACE)
+            resp = fut.result(limit)
         except concurrent.futures.TimeoutError as e:
             fut.cancel()
             raise TimeoutError(
-                f'no answer from {self._dst!r} within '
-                f'{limit + _CALLER_WAIT_GRACE:.0f} s') from e
+                f'no answer from {self._dst!r} within {limit:.0f} s') from e
         status, rhdrs, rbody = unpack_response_dict(resp)
         return RuntimeResponse(status, rhdrs, rbody)
 
@@ -3306,7 +3317,24 @@ class PluginTaskDispatcher(Plugin):
                                              task.task_id)
 
         try:
-            await asyncio.to_thread(rh.submit_tasks, [f for _, f in fwds])
+            try:
+                await asyncio.to_thread(rh.submit_tasks, [f for _, f in fwds])
+            except PayloadTooLarge as e:
+                # Nothing was sent: fail only the tasks no frame carries
+                # and submit their co-claimed peers.
+                big = set(e.uids)
+                if not big:
+                    raise
+                for task, fwd in fwds:
+                    if fwd['uid'] in big:
+                        self._uid_to_task.pop(fwd['uid'], None)
+                        task.rhapsody_uid = None
+                        self._mark_task_failed(pool_state, task,
+                                               f'rhapsody submit error: {e}')
+                fwds = [(t, f) for t, f in fwds if f['uid'] not in big]
+                if fwds:
+                    await asyncio.to_thread(rh.submit_tasks,
+                                            [f for _, f in fwds])
             self._mark_dirty(pool_state)
         except Exception as e:
             log.exception('[%s] rhapsody submit failed for %d task(s): %s',

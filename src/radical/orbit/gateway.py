@@ -75,6 +75,7 @@ from starlette.responses        import StreamingResponse
 from starlette.exceptions       import HTTPException as StarletteHTTPException
 
 from . import utils
+from . import protocol
 from .errors        import error_dict
 from .queues        import BoundedDropOldestQueue
 from .runtime_client import max_body_of, unpack_response_dict
@@ -581,10 +582,13 @@ class Gateway:
         if request.url.query:
             forward_path += '?' + str(request.url.query)
 
-        # Cap at what one frame of the broker's cap carries around the body,
-        # so an over-limit body is a 413 here, not a pack failure (500) later.
-        body    = await self._read_body_capped(
-            request, max_body_of(self._broker.caller))
+        # A body relayed over the WS is capped at what one frame of the
+        # broker's cap carries around it, so an over-limit body is a 413
+        # here, not a pack failure (500) later; a broker-hosted plugin
+        # (no frame) keeps the protocol frame cap as its read cap.
+        cap     = protocol.FRAME_CAP if endpoint_name == BROKER_NAME \
+                  else max_body_of(self._broker.caller)
+        body    = await self._read_body_capped(request, cap)
         headers = self._strip_headers(request)
 
         # dst == the broker's own hosted-plugin participant: route into the

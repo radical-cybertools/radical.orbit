@@ -186,6 +186,11 @@ class BrokerCaller:
         """The broker's call timeout (seconds): it reaps a call by then."""
         return self._broker._call_timeout
 
+    @property
+    def reap_interval(self) -> float:
+        """How often (seconds) the broker's reaper sweeps expired calls."""
+        return self._broker._reap_interval
+
     async def call(self, dst: str, method: str, path: str, *,
                    body:    bytes                    = b'',
                    headers: Optional[Dict[str, str]] = None,
@@ -919,7 +924,8 @@ class Broker:
         try:
             await self._send(target, data)
             return await asyncio.wait_for(fut, timeout=timeout)
-        except Exception:
+        except BaseException:
+            # also on cancellation: free the in-flight slot
             self._calls.pop(corr_id, None)
             raise
 

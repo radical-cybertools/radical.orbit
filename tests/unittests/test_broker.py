@@ -1115,3 +1115,27 @@ async def test_broker_call_unsent_raises_request_not_sent(make_broker,
         monkeypatch.undo()
         broker.registry.pop('e2', None)
         await broker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_broker_call_frees_its_slot(make_broker):
+    """A broker-originated call cancelled while it waits (CancelledError is
+    a BaseException) still frees its in-flight slot."""
+    broker = make_broker()
+    await broker.startup()
+    try:
+        broker.registry['e2'] = FakeWS()
+        task = asyncio.ensure_future(broker.caller.call('e2', 'GET', '/p'))
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if broker._calls:
+                break
+        assert len(broker._calls) == 1
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert broker._calls == {}
+        assert broker.caller.reap_interval == broker._reap_interval
+    finally:
+        broker.registry.pop('e2', None)
+        await broker.shutdown()

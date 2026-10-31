@@ -885,3 +885,13 @@ def test_gateway_body_between_slack_and_cap_is_413(harness):
                    content=b'x' * size,
                    headers={'Content-Type': 'application/msgpack'})
     assert r.status_code == 413, r.text
+
+
+def test_gateway_broker_hosted_body_keeps_frame_cap(harness):
+    """A broker-hosted plugin is not reached over the WS: its body read
+    cap stays FRAME_CAP, not the (tuned, smaller) relay max_body."""
+    srv, _ = _frame_harness(harness)
+    with httpx.Client(timeout=10.0) as c:
+        r = c.post('%s/broker/task_dispatcher/pools' % srv.url,
+                   content=b'x' * _SMALL_CAP)
+    assert r.status_code != 413, r.text
