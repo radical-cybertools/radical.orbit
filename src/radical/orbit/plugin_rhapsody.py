@@ -327,10 +327,13 @@ class RhapsodySession(PluginSession):
         self._ops_idle.set()
         self._close_task: asyncio.Future | None = None
 
-        # Last state notified per task: a task's notifications never go
-        # back from a terminal state (``_advance``)
+        # Last state notified per task: a task's state notifications never
+        # go back from a terminal state (``_advance``); terminal entries are
+        # pruned once flushed.  ``_loop`` is the loop the session runs on
+        # (the runtime's work loop), recorded when it submits / watches.
         self._notified_states: dict[str, str] = {}
         self._notified_lock = threading.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
 
         # Async init tracking
         self._init_ready = threading.Event()
@@ -508,7 +511,7 @@ class RhapsodySession(PluginSession):
         self._queue_notification({
             "uid":   uid_str,
             "state": state_str,
-        })
+        }, transition=True)
 
     def _check_initialized(self) -> None:
         """Check that the session is active and fully initialized.
@@ -619,6 +622,10 @@ class RhapsodySession(PluginSession):
             if self._rh_session is None:     # torn down after a drain timeout
                 raise HTTPException(status_code=410,
                                     detail="session is closing")
+            self._loop = asyncio.get_running_loop()
+            with self._notified_lock:        # a resubmitted uid starts over
+                for t in tasks:
+                    self._notified_states.pop(str(t.uid), None)
             await self._rh_session.submit_tasks(tasks)
             for t in tasks:
                 uid_str = str(t.uid)
@@ -635,24 +642,32 @@ class RhapsodySession(PluginSession):
             self._prof.prof('rh_submit_done', uid=bid, msg=str(batch_n))
         return results
 
-    def _queue_notification(self, payload: dict) -> None:
+    def _queue_notification(self, payload: dict,
+                            transition: bool = False) -> None:
         """Add a task notification to the batch buffer and ensure a
         flush is scheduled.
 
-        Called from watcher coroutines and backend threads.  A call from
-        anywhere but the plugin's loop is handed to that loop, so buffering
-        and flushing are serialized there.  A buffer full by count or by
-        bytes flushes immediately; otherwise a single flush is scheduled
-        (and only one is ever pending at a time).  A zero coalescing window
-        (latency-sensitive endpoint) schedules that flush without delay: it
-        runs on the next loop iteration, so the completions a watcher drains
-        in one pass still share one frame.
+        Called from watcher coroutines (completions) and backend threads
+        (*transition*: an intermediate state change).  A call from anywhere
+        but the session's loop is handed to that loop, so buffering and
+        flushing are serialized there.  Off any loop with no session loop
+        known, a transition is dropped and a completion only buffered: it
+        goes out with the next flush on the loop — never from a thread.  A
+        buffer full by count or by bytes flushes immediately; otherwise a
+        single flush is scheduled (and only one is ever pending at a time).
+        A zero coalescing window (latency-sensitive endpoint) schedules that
+        flush without delay: it runs on the next loop iteration, so the
+        completions a watcher drains in one pass still share one frame.
         """
         loop = self._handoff_loop()
         if loop is not None:
-            loop.call_soon_threadsafe(self._queue_notification, payload)
+            loop.call_soon_threadsafe(self._queue_notification, payload,
+                                      transition)
             return
-        if not self._advance(payload):
+        on_loop = self._on_a_loop() is not None
+        if transition and not on_loop:
+            return                         # no session loop to send it on
+        if not self._advance(payload, transition):
             return
 
         size = _payload_size(payload)
@@ -660,9 +675,10 @@ class RhapsodySession(PluginSession):
             self._notify_buf.append(payload)
             self._notify_bytes += size
             window   = self._notify_window
-            now      = len(self._notify_buf) >= NOTIFY_BATCH_SIZE \
-                       or self._notify_bytes >= self._frame_budget()
-            schedule = not now and not self._flush_scheduled
+            now      = on_loop and (
+                len(self._notify_buf) >= NOTIFY_BATCH_SIZE
+                or self._notify_bytes >= self._frame_budget())
+            schedule = on_loop and not now and not self._flush_scheduled
             if schedule:
                 self._flush_scheduled = True
 
@@ -671,56 +687,59 @@ class RhapsodySession(PluginSession):
         elif schedule:
             self._schedule_flush(delay=window)
 
-    def _advance(self, payload: dict) -> bool:
-        """Record the state *payload* notifies; ``False`` if it must not be
-        sent: the same non-terminal state again, or any non-terminal state
-        after a terminal one (a task's notifications never go back).  The
-        one place that rule is enforced: every notification passes here,
-        on the plugin's loop."""
+    def _advance(self, payload: dict, transition: bool) -> bool:
+        """Record the state *payload* notifies.  A *transition* (an
+        intermediate state change) must not be sent — ``False`` — if it
+        repeats the last state, or the task is terminal already (notified,
+        or by its own state): a task's state never goes backwards.  A
+        completion (or any payload carrying an ``error``) always passes.
+        The one place that rule is enforced, on the session's loop."""
         uid   = str(payload.get('uid'))
         state = str(payload.get('state', ''))
+        task  = self._tasks.get(uid)
         with self._notified_lock:
             prev = self._notified_states.get(uid)
-            if prev is not None and state.upper() not in TERMINAL_STATES \
-                    and (prev == state or prev.upper() in TERMINAL_STATES):
+            if transition and 'error' not in payload and (
+                    prev == state
+                    or (prev or '').upper() in TERMINAL_STATES
+                    or str(self._get_attr(task, 'state', '')).upper()
+                    in TERMINAL_STATES):
                 return False
             self._notified_states[uid] = state
         return True
 
     def _handoff_loop(self) -> "asyncio.AbstractEventLoop | None":
-        """The plugin's loop when called anywhere but on it (a backend
-        thread, another loop), else ``None`` (on it, or it is not usable:
-        then the caller proceeds where it is)."""
-        loop = getattr(self._plugin, '_main_loop', None) \
-            if self._plugin else None
-        if not isinstance(loop, asyncio.AbstractEventLoop) \
-                or loop.is_closed() or not loop.is_running():
+        """The session's loop (``_loop``) when called anywhere but on it (a
+        backend thread, another loop), else ``None`` (on it, or it is not
+        known / usable: then the caller proceeds where it is)."""
+        loop = self._loop
+        if loop is None or loop.is_closed() or not loop.is_running():
             return None
+        return None if self._on_a_loop() is loop else loop
+
+    @staticmethod
+    def _on_a_loop() -> "asyncio.AbstractEventLoop | None":
         try:
-            running = asyncio.get_running_loop()
+            return asyncio.get_running_loop()
         except RuntimeError:
-            running = None
-        return None if running is loop else loop
+            return None
 
     def _schedule_flush(self, delay: float = 0) -> None:
-        """Schedule a notification flush on the event loop."""
-        if not self._plugin:
-            return
-
+        """Schedule a notification flush on the current (session) loop.  A
+        cancelled flush task clears the pending flag, so the next
+        notification schedules a new one."""
         async def _do_flush():
             if delay > 0:
                 await asyncio.sleep(delay)
             self._flush_notifications()
 
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # no usable loop (off-loop calls are handed to the plugin's
-            # loop first): flush here rather than leave the buffer behind
-            # a flush that never runs
-            self._flush_notifications()
-            return
-        loop.create_task(_do_flush())
+        def _cancelled(task):
+            if task.cancelled():
+                with self._notify_lock:
+                    self._flush_scheduled = False
+
+        asyncio.get_running_loop().create_task(_do_flush()) \
+            .add_done_callback(_cancelled)
 
     def _flush_notifications(self) -> None:
         """Flush the notification buffer as one or more bulk messages.
@@ -743,6 +762,15 @@ class RhapsodySession(PluginSession):
                 self.notify("task_status", frame[0])
             else:
                 self.notify("task_status_batch", {"tasks": frame})
+
+        # a task notified terminal needs no entry any more: a late change
+        # is still caught by its own (terminal) state in ``_advance``
+        with self._notified_lock:
+            for p in batch:
+                uid = str(p.get('uid'))
+                if str(p.get('state', '')).upper() in TERMINAL_STATES \
+                        and self._notified_states.get(uid) == p.get('state'):
+                    del self._notified_states[uid]
 
     def _frame_budget(self) -> int:
         """Bytes available for task payloads per frame: ``notify`` adds the
@@ -797,6 +825,8 @@ class RhapsodySession(PluginSession):
         batches them opportunistically so fast-completing tasks are grouped
         into single SSE messages while slow tasks don't block others.
         """
+        self._loop = asyncio.get_running_loop()
+
         # Build uid map and per-task futures
         fut_to_uid: dict[asyncio.Future, str] = {}
         uid_to_task: dict[str, object]         = {}
