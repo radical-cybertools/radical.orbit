@@ -21,7 +21,7 @@ Guarantees:
   goes backwards while the broker runs; consumers start at the first seq they
   see.  A pruned stream's jump to that mark looks like a gap to its
   consumers: a known, rare false positive (pruning needs more than
-  ``SESSION_SEQ_MAX`` streams) that costs one reconcile.
+  ``SESSION_SEQ_MAX`` streams).
 * The raw tap sees *every* event (stateless, unfiltered) and runs on the
   plugin-host loop — never the routing loop.
 """
@@ -79,15 +79,12 @@ class EventRouter:
         self._out:           Dict[str, BoundedDropOldestQueue] = {}
         self._senders:       Dict[str, asyncio.Task] = {}
         # One monotone seq counter per ``(src, plugin, session)``.  Counters
-        # outlive their session (sessions are re-registrable), but the table
-        # is bounded: the least recently used counter goes first.  A stream
-        # without a counter — new, or pruned — starts at ``_session_seq_base``,
-        # the broker-wide high-water mark of every session seq issued so far,
-        # so a pruned stream resumes *above* anything it issued before and a
-        # key's seq never goes backwards (only a broker restart resets it).
-        # The jump to the high-water mark looks like a gap to a consumer of
-        # a pruned stream; pruning needs more than SESSION_SEQ_MAX live keys,
-        # and a false gap only costs one reconcile.
+        # outlive their session (sessions are re-registrable, and a stale
+        # counter keeps a re-registered session from re-using seq numbers a
+        # consumer already saw), but the table is bounded: the least recently
+        # used counter goes first.  A new or pruned stream starts at
+        # ``_session_seq_base``, the high-water mark of every session seq
+        # issued so far, so a key's seq never goes backwards.
         self._session_seq:   'OrderedDict[tuple, int]' = OrderedDict()
         self._session_seq_max: int                   = SESSION_SEQ_MAX
         self._session_seq_base: int                  = 0
@@ -146,11 +143,6 @@ class EventRouter:
         return oq.dropped if oq else 0
 
     # ── subscriptions ─────────────────────────────────────────────────
-
-    def clear_subscriptions(self, name: str) -> None:
-        """Forget *name*'s patterns (a resumed registration resyncs them)."""
-        self._subscriptions[name] = []
-        self._reindex(name)
 
     def update_subscription(self, name: str, raw: dict, add: bool) -> None:
         """Add (or remove) *name*'s interest patterns.
