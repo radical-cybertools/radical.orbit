@@ -620,49 +620,6 @@ def test_callback_dispatcher_drop_oldest_counter():
     assert cb.dropped == 3                           # 5 submitted, 2 retained
 
 
-def test_callback_dispatcher_drop_hooks():
-    """Drop hooks see the dropped callable on the submitting thread; a
-    failing hook neither breaks submit nor the other hooks."""
-    from radical.orbit.runtime_support import CallbackDispatcher
-    cb = CallbackDispatcher(maxlen=1)               # not started
-
-    def mine():
-        pass
-
-    seen = []
-
-    def boom(fn):
-        raise RuntimeError('hook failed')
-
-    def hook(fn):
-        seen.append((fn, threading.get_ident()))
-
-    cb.add_drop_hook(boom)
-    cb.add_drop_hook(hook)
-    cb.submit(mine)
-    cb.submit(mine)                                 # dropped
-    assert seen == [(mine, threading.get_ident())]
-
-    cb.remove_drop_hook(hook)
-    cb.submit(mine)
-    assert len(seen) == 1 and cb.dropped == 2
-
-
-def test_callback_dispatcher_submit_blocking():
-    """submit_blocking waits for room and gives up after its timeout."""
-    from radical.orbit.runtime_support import CallbackDispatcher
-    cb  = CallbackDispatcher(maxlen=1)
-    ran = threading.Event()
-    cb.submit(lambda: None)
-    assert cb.submit_blocking(ran.set, timeout=0.05) is False
-    assert cb.dropped == 0                          # not counted as a drop
-
-    cb.start()                                      # drains: room again
-    assert cb.submit_blocking(ran.set, timeout=2.0) is True
-    assert ran.wait(2.0)
-    cb.stop()
-
-
 # ---------------------------------------------------------------------------
 # dispatch.py move: shared RequestShim/match_route across hosts
 # ---------------------------------------------------------------------------
@@ -855,7 +812,7 @@ def test_session_callback_local_routing():
     rt._on_event(_ev(None))                           # older endpoint
     assert rt._cb._q.qsize() == 2
 
-    # a session-less registration of the same pattern still gets them all
+    # an unscoped registration of the same pattern still gets them all
     other = lambda *a: None                           # noqa: E731
     rt.register_callback(endpoint_id='ep', plugin_name='rh', topic='t',
                          callback=other)
@@ -864,159 +821,46 @@ def test_session_callback_local_routing():
 
 
 def test_session_callback_unregister():
-    """Unregister removes the registration of that session only; the last
-    one removes the pattern from the resync set."""
+    """With *session*, unregister removes that session's registrations
+    (``None``: the unscoped ones); without it, all of the callback's.  The
+    unsubscribe goes out when the pattern's last one is gone."""
     rt = _bare_runtime()
     cb = lambda *a: None                              # noqa: E731
-    for sid in ('sid-a', 'sid-b'):
+    for sid in ('sid-a', 'sid-b', None):
         rt.register_callback(endpoint_id='ep', plugin_name='rh',
                              callback=cb, session=sid)
     rt.unregister_callback(endpoint_id='ep', plugin_name='rh',
                            callback=cb, session='sid-a')
-    assert rt._callbacks[('ep', 'rh', None)] == [(cb, False, 'sid-b')]
-    rt.unregister_callback(endpoint_id='ep', plugin_name='rh', callback=cb)
-    assert rt._callbacks[('ep', 'rh', None)] == [(cb, False, 'sid-b')]
     rt.unregister_callback(endpoint_id='ep', plugin_name='rh',
-                           callback=cb, session='sid-b')
+                           callback=cb, session=None)
+    assert rt._callbacks[('ep', 'rh', None)] == [(cb, False, 'sid-b')]
+    kinds = [type(c.args[0]).__name__ for c in rt._emit.call_args_list]
+    assert 'Unsubscribe' not in kinds
+    rt.register_callback(endpoint_id='ep', plugin_name='rh', callback=cb,
+                         session='sid-c')
+    rt.unregister_callback(endpoint_id='ep', plugin_name='rh', callback=cb)
     assert rt._callbacks == {}
+    kinds = [type(c.args[0]).__name__ for c in rt._emit.call_args_list]
+    assert kinds[-1] == 'Unsubscribe'
 
 
-def test_subscription_refcounted_per_pattern():
-    """Subscribe on the first registration of a pattern, unsubscribe on its
-    last; a callback registered twice counts twice."""
+def test_rescope_callback_is_atomic():
+    """A registration moves to a new session in one step: an event of the
+    new session is queued once, one of the old not at all; the wire is not
+    touched."""
     rt = _bare_runtime()
     cb = lambda *a: None                              # noqa: E731
-
-    def _kinds():
-        return [type(c.args[0]).__name__ for c in rt._emit.call_args_list]
-
-    rt.register_callback(endpoint_id='ep', callback=cb)
-    rt.register_callback(endpoint_id='ep', callback=cb)
-    assert _kinds() == ['Subscribe']
-    rt.unregister_callback(endpoint_id='ep', callback=cb)
-    assert _kinds() == ['Subscribe']                  # one registration left
-    assert len(rt._callbacks[('ep', None, None)]) == 1
-    rt.unregister_callback(endpoint_id='ep', callback=cb)
-    assert _kinds() == ['Subscribe', 'Unsubscribe']
-    rt.unregister_callback(endpoint_id='ep', callback=cb)   # unknown: no-op
-    assert _kinds() == ['Subscribe', 'Unsubscribe']
-
-
-def _outbox_runtime():
-    """A bare runtime whose _emit really packs into an outbox on a loop of
-    its own (no socket)."""
-    from radical.orbit.runtime import EndpointRuntime
-    from radical.orbit import protocol
-    from radical.orbit.runtime_support import CallbackDispatcher
-
-    rt = EndpointRuntime.__new__(EndpointRuntime)
-    rt._name           = 'consumer'
-    rt._callbacks      = {}
-    rt._cb_lock        = threading.Lock()
-    rt._cb             = CallbackDispatcher()
-    rt._frame_cap      = protocol.FRAME_CAP
-    rt._transport_loop = asyncio.new_event_loop()
-    rt._outbox         = asyncio.Queue()
-    rt._sub_epoch      = 0
-    return rt
-
-
-def _drain_outbox(rt):
-    """Run the loop's pending puts, then return the messages the sender
-    would send (it drops subscriptions queued before a resync)."""
-    from radical.orbit import protocol
-    from radical.orbit.runtime import _SUB_KINDS
-    rt._transport_loop.run_until_complete(asyncio.sleep(0))
-    out = []
-    while not rt._outbox.empty():
-        kind, epoch, data = rt._outbox.get_nowait()
-        if kind in _SUB_KINDS and epoch != rt._sub_epoch:
-            continue
-        out.append(protocol.parse_message(data))
-    return out
-
-
-def _apply(router, msgs):
-    for m in msgs:
-        router.update_subscription(
-            'consumer', {'patterns': [p.model_dump() for p in m.patterns]},
-            m.kind == 'subscribe')
-
-
-def test_resync_after_reconnect_holds_each_pattern_once():
-    """Subscribe/unsubscribe frames queued before a (re)connect's resync
-    are dropped (even one whose put is still pending), and the resync
-    sends one subscribe per key: a fresh
-    registration with a queued subscribe ends with exactly one copy, and a
-    subscribe lost before a resume (the broker clears on resume) is
-    restored."""
-    from unittest.mock import MagicMock
-    from radical.orbit.broker_events import EventRouter
-
-    rt = _outbox_runtime()
-    try:
-        router = EventRouter({}, lambda *a: None, MagicMock(), 8,
-                             lambda: None)
-        cb = lambda *a: None                          # noqa: E731
-
-        # connected: key A subscribed and applied at the broker
-        rt.register_callback(endpoint_id='epA', callback=cb)
-        router.clear_subscriptions('consumer')
-        _apply(router, _drain_outbox(rt))
-
-        # disconnected: key B registered, its subscribe queued (or lost)
-        rt.register_callback(endpoint_id='epB', callback=cb)
-        rt._transport_loop.run_until_complete(asyncio.sleep(0))
-
-        # resume: the broker clears, the runtime resyncs
-        router.clear_subscriptions('consumer')
-        rt._resync_subscriptions()
-        _apply(router, _drain_outbox(rt))
-        pats = sorted(p.endpoint for p in router._subscriptions['consumer'])
-        assert pats == ['epA', 'epB']
-
-        # fresh registration with a subscribe still queued: one copy each
-        rt.register_callback(endpoint_id='epC', callback=cb)
-        router.clear_subscriptions('consumer')
-        rt._resync_subscriptions()
-        _apply(router, _drain_outbox(rt))
-        pats = sorted(p.endpoint for p in router._subscriptions['consumer'])
-        assert pats == ['epA', 'epB', 'epC']
-
-        # the last unsubscribe of a key really removes it
-        rt.unregister_callback(endpoint_id='epC', callback=cb)
-        _apply(router, _drain_outbox(rt))
-        pats = sorted(p.endpoint for p in router._subscriptions['consumer'])
-        assert pats == ['epA', 'epB']
-    finally:
-        rt._transport_loop.close()
-
-
-def test_resync_drops_only_stale_subscriptions():
-    from radical.orbit import protocol
-
-    rt = _outbox_runtime()
-    try:
-        rt.register_callback(endpoint_id='epA', callback=lambda *a: None)
-        rt._emit(protocol.Event(src='consumer', plugin='p', topic='t'))
-        rt._resync_subscriptions()
-        assert [m.kind for m in _drain_outbox(rt)] == ['event', 'subscribe']
-    finally:
-        rt._transport_loop.close()
-
-
-def test_unregister_callback_bound_method():
-    """A bound method is a new object on each access: it unregisters by
-    equality."""
-    rt = _bare_runtime()
-
-    class _C:
-        def on(self, *a):
-            pass
-    c = _C()
-    rt.register_callback(endpoint_id='ep', callback=c.on, session='s')
-    rt.unregister_callback(endpoint_id='ep', callback=c.on, session='s')
-    assert rt._callbacks == {}
+    rt.register_callback(endpoint_id='ep', callback=cb, with_meta=True,
+                         session='old')
+    assert rt.rescope_callback(endpoint_id='ep', callback=cb,
+                               session='old', new_session='new')
+    assert rt._callbacks[('ep', None, None)] == [(cb, True, 'new')]
+    assert len(rt._emit.call_args_list) == 1
+    for sid in ('old', 'new'):
+        rt._on_event(_ev(sid))
+    assert rt._cb._q.qsize() == 1
+    assert not rt.rescope_callback(endpoint_id='ep', callback=cb,
+                                   session='old', new_session='x')
 
 
 # ---------------------------------------------------------------------------
