@@ -81,11 +81,10 @@ class FrameTooLarge(ProtocolError):
 class RequestNotSent(RuntimeError):
     """A call failed before its request frame left this process.
 
-    Raised by the call transports (``EndpointRuntime.call``, the broker
-    caller) when the request provably never reached the wire: unknown
-    destination, in-flight cap, transport not up, unpackable request.  The
-    callee cannot have seen it, so a retry is safe.  A ``RuntimeError``, as
-    those failures were before.
+    Raised by ``EndpointRuntime.call`` and the broker caller when the
+    request provably never reached the wire (unknown destination, in-flight
+    cap, transport not up, unpackable request): the callee cannot have
+    seen it.  A ``RuntimeError``, as those failures were before.
     """
 
 

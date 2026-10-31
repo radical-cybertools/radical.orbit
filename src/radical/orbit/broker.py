@@ -183,7 +183,7 @@ class BrokerCaller:
 
     @property
     def call_timeout(self) -> float:
-        """The broker's call timeout (seconds), its relay reap deadline."""
+        """The broker's call timeout (seconds): it reaps a call by then."""
         return self._broker._call_timeout
 
     async def call(self, dst: str, method: str, path: str, *,
@@ -193,8 +193,8 @@ class BrokerCaller:
         """Send a ``request`` to *dst* and await its ``response`` (as a dict).
 
         Raises ``protocol.RequestNotSent`` (a ``RuntimeError``) immediately
-        when broker-originated in-flight calls are at the cap, or on an
-        unroutable ``dst``; raises
+        when broker-originated in-flight calls are at the cap, on an
+        unroutable ``dst``, or on an unpackable request; raises
         ``asyncio.TimeoutError`` if *timeout* elapses first.  A request too
         large for the frame cap is answered with a 413 dict, nothing sent.
         """

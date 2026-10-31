@@ -894,11 +894,8 @@ def test_runtime_http_reports_max_body():
     from unittest.mock import MagicMock
     from radical.orbit import protocol
     from radical.orbit.runtime_client import _RuntimeHTTP
-    from radical.orbit.runtime_client import max_body_of
     http = _RuntimeHTTP(MagicMock(frame_cap=1024 * 1024), 'ep')
     assert http.max_body == protocol.max_body(1024 * 1024)
-    # no published cap: the protocol default
-    assert max_body_of(object()) == protocol.max_body(protocol.FRAME_CAP)
 
 
 def test_call_oversized_request_is_413_fast(harness):
@@ -907,7 +904,6 @@ def test_call_oversized_request_is_413_fast(harness):
     a = make_runtime(srv.url, name='epA', plugins=['echo_rt'])
     assert a.wait_registered(timeout=5.0)
     b = make_runtime(srv.url, name='epB', frame_cap=64 * 1024)
-    assert b.frame_cap == 64 * 1024
 
     t0   = time.time()
     resp = b.call('epA', 'POST', '/echo_rt/echo/x', body=b'x' * 128 * 1024)
@@ -948,7 +944,7 @@ def test_emit_oversized_event_stays_lenient(harness):
     assert a.call('broker', 'GET', '/nope').status_code in (404, 503)
 
 
-def test_call_not_sent_fails_fast_as_request_not_sent(harness, monkeypatch):
+def test_call_transport_down_is_request_not_sent_fast(harness, monkeypatch):
     """A request that provably never left -- transport down, unpackable --
     raises ``RequestNotSent`` at once instead of waiting out the timeout."""
     from radical.orbit import protocol

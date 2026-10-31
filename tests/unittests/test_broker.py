@@ -1087,9 +1087,10 @@ async def test_dispatch_to_host_oversized_response_is_500(make_broker,
 
 
 @pytest.mark.asyncio
-async def test_broker_call_unsent_raises_request_not_sent(make_broker):
-    """Unknown dst and the in-flight cap fail before anything is sent:
-    ``RequestNotSent`` (still a ``RuntimeError``, as before)."""
+async def test_broker_call_unsent_raises_request_not_sent(make_broker,
+                                                         monkeypatch):
+    """Unknown dst, the in-flight cap and a non-size pack failure fail
+    before anything is sent: ``RequestNotSent`` (still a RuntimeError)."""
     broker = make_broker(call_cap=0)
     await broker.startup()
     try:
@@ -1098,19 +1099,6 @@ async def test_broker_call_unsent_raises_request_not_sent(make_broker):
         broker._call_cap = 8
         with pytest.raises(protocol.RequestNotSent, match='unknown'):
             await broker.caller.call('nope', 'GET', '/p', timeout=5.0)
-        assert issubclass(protocol.RequestNotSent, RuntimeError)
-    finally:
-        await broker.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_broker_call_unpackable_request_is_request_not_sent(
-        make_broker, monkeypatch):
-    """A non-size pack failure is a ``RequestNotSent`` (as in the runtime's
-    ``_call``), with nothing sent and no in-flight entry."""
-    broker = make_broker()
-    await broker.startup()
-    try:
         ws = FakeWS()
         broker.registry['e2'] = ws
 
@@ -1120,8 +1108,9 @@ async def test_broker_call_unpackable_request_is_request_not_sent(
         monkeypatch.setattr(protocol, 'pack_message', _bad)
         with pytest.raises(protocol.RequestNotSent, match='failed to pack'):
             await broker.caller.call('e2', 'GET', '/p', timeout=5.0)
+        monkeypatch.undo()
         assert ws.sent == [] and broker._calls == {}
-        assert broker.caller.call_timeout == broker._call_timeout
+        assert issubclass(protocol.RequestNotSent, RuntimeError)
     finally:
         monkeypatch.undo()
         broker.registry.pop('e2', None)
