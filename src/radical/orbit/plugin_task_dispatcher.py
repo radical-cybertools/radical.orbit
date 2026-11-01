@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import concurrent.futures
 import logging
 import math
 import os
@@ -44,6 +43,8 @@ import shutil
 import threading
 import time
 import uuid
+
+import msgpack
 
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -55,11 +56,9 @@ from .client                            import PluginClient
 from .plugin_base                       import Plugin
 from .plugin_session_base               import PluginSession
 from .plugin_rhapsody                   import (
-    RhapsodyClient, RhapsodySession, NOTIFY_BATCH_SIZE,
+    RhapsodyClient, RhapsodySession, WS_PAYLOAD_LIMIT, NOTIFY_BATCH_SIZE,
     _payload_size, _resolve_notify_window, _resolve_frame_cap, BUDGET_RATIO,
-    _submit_batches,
 )
-from .runtime_client                    import PayloadTooLarge, max_body_of
 from .task_dispatcher_config            import (
     PoolConfig, PoolMember, PilotSize, PoolConfigError,
     PILOT_ENDPOINT, default_pool_config, parse_pools, parse_member,
@@ -499,22 +498,6 @@ def backend_kwargs(req: dict, backend: str) -> dict:
 # Transport: sync child-plugin clients over the broker caller
 # ---------------------------------------------------------------------------
 
-# _CallerSyncHTTP waits for an answer at most the caller's call timeout
-# plus its reap interval (the reaper answers an expired call on its next
-# sweep) plus a grace; the defaults apply when the caller publishes none.
-_CALLER_WAIT_DEFAULT = 600.0
-_CALLER_REAP_DEFAULT = 5.0
-_CALLER_WAIT_GRACE   = 5.0
-
-
-def _num(val, default: float) -> float:
-    '''*val* if it is a positive number, else *default*.'''
-    if isinstance(val, (int, float)) and not isinstance(val, bool) \
-            and val > 0:
-        return float(val)
-    return default
-
-
 class _CallerSyncHTTP:
     '''Blocking transport over the broker's in-process caller.
 
@@ -532,11 +515,6 @@ class _CallerSyncHTTP:
         self._dst     = dst
         self._timeout = timeout
 
-    @property
-    def max_body(self) -> int:
-        '''Largest request body the broker's frame cap carries.'''
-        return max_body_of(self._caller)
-
     def request(self, method: str, url: str, *, json=None, content=None,
                 data=None, params=None, headers=None, **_kw):
         from .runtime_client import (
@@ -547,21 +525,7 @@ class _CallerSyncHTTP:
         fut  = self._caller.call_threadsafe(
             self._dst, method, path, body=body, headers=hdrs,
             timeout=self._timeout)
-        # Bounded wait: the broker answers (or reaps) every call by its
-        # call timeout plus one reap sweep, so wait that long plus a grace
-        # -- an unbounded
-        # ``result()`` can pin this worker thread, and on Python 3.10 the
-        # interpreter then never exits.
-        limit = self._timeout or _num(getattr(self._caller, 'call_timeout',
-                                              None), _CALLER_WAIT_DEFAULT)
-        limit += _num(getattr(self._caller, 'reap_interval', None),
-                      _CALLER_REAP_DEFAULT) + _CALLER_WAIT_GRACE
-        try:
-            resp = fut.result(limit)
-        except concurrent.futures.TimeoutError as e:
-            fut.cancel()
-            raise TimeoutError(
-                f'no answer from {self._dst!r} within {limit:.0f} s') from e
+        resp = fut.result(self._timeout)
         status, rhdrs, rbody = unpack_response_dict(resp)
         return RuntimeResponse(status, rhdrs, rbody)
 
@@ -962,9 +926,30 @@ class TaskDispatcherClient(PluginClient):
 
         url = self._url(ROUTE_SUBMIT_RH.format(sid=self.sid))
 
-        # frame-bounded batches, same split (and partial-failure report)
-        # as the rhapsody client
-        return _submit_batches(self, url, task_dicts)
+        # frame-size-bounded batches, same split as the rhapsody client
+        batches: list[list[dict]] = []
+        batch: list[dict]         = []
+        batch_bytes               = 0
+        for td in task_dicts:
+            td_size = len(msgpack.packb(td, use_bin_type=True))
+            if batch and batch_bytes + td_size > WS_PAYLOAD_LIMIT:
+                batches.append(batch)
+                batch       = []
+                batch_bytes = 0
+            batch.append(td)
+            batch_bytes += td_size
+        if batch:
+            batches.append(batch)
+
+        results: list[dict] = []
+        for b in batches:
+            resp = self._http.post(
+                url,
+                data=msgpack.packb({'tasks': b}, use_bin_type=True),
+                headers={'Content-Type': 'application/msgpack'})
+            self._raise(resp, f'submit {len(b)} task(s)')
+            results.extend(resp.json())
+        return results
 
     def get_task(self, task_id: str) -> dict:
         '''Fetch the current :class:`TaskRecord` for *task_id*.'''
@@ -2043,9 +2028,6 @@ class PluginTaskDispatcher(Plugin):
                           self.instance_name, target_endpoint, e)
             if self._endpoint_mode_tasks.pop(task_id, None):
                 self._persist_endpoint_mode()
-            if getattr(e, 'status_code', None) == 413:
-                # the task itself is too large: the caller's error
-                raise HTTPException(status_code=413, detail=str(e)) from e
             raise HTTPException(
                 status_code=502,
                 detail=f'rhapsody submit failed on '
@@ -3317,37 +3299,12 @@ class PluginTaskDispatcher(Plugin):
                                              task.task_id)
 
         try:
-            try:
-                await asyncio.to_thread(rh.submit_tasks, [f for _, f in fwds])
-            except PayloadTooLarge as e:
-                # Nothing was sent: fail only the tasks no frame carries
-                # and submit their co-claimed peers.
-                big = set(e.uids)
-                if not big:
-                    raise
-                for task, fwd in fwds:
-                    if fwd['uid'] in big:
-                        self._uid_to_task.pop(fwd['uid'], None)
-                        task.rhapsody_uid = None
-                        self._mark_task_failed(pool_state, task,
-                                               f'rhapsody submit error: {e}')
-                fwds = [(t, f) for t, f in fwds if f['uid'] not in big]
-                if fwds:
-                    await asyncio.to_thread(rh.submit_tasks,
-                                            [f for _, f in fwds])
+            await asyncio.to_thread(rh.submit_tasks, [f for _, f in fwds])
             self._mark_dirty(pool_state)
         except Exception as e:
             log.exception('[%s] rhapsody submit failed for %d task(s): %s',
                           self.instance_name, len(tasks), e)
-            # a partial submit: the accepted batches run on the pilot, so
-            # those tasks keep their mapping (``PartialSubmitError``); the
-            # unconfirmed ones fail with the reason
-            accepted = set(getattr(e, 'accepted', None) or ())
-            if accepted:
-                self._mark_dirty(pool_state)
             for task, fwd in fwds:
-                if fwd['uid'] in accepted:
-                    continue
                 self._uid_to_task.pop(fwd['uid'], None)
                 # a task the pilot already finished keeps that outcome
                 if task.state not in TASK_TERMINAL_STATES:

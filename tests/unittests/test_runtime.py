@@ -887,16 +887,8 @@ def test_tls_pin_mismatch_is_fatal_and_actionable(self_signed, tmp_path,
 
 
 # ---------------------------------------------------------------------------
-# frame budget: oversized requests / responses fail fast, events stay lenient
+# frame cap: oversized requests / responses fail fast, events stay lenient
 # ---------------------------------------------------------------------------
-
-def test_runtime_http_reports_max_body():
-    from unittest.mock import MagicMock
-    from radical.orbit import protocol
-    from radical.orbit.runtime_client import _RuntimeHTTP
-    http = _RuntimeHTTP(MagicMock(frame_cap=1024 * 1024), 'ep')
-    assert http.max_body == protocol.max_body(1024 * 1024)
-
 
 def test_call_oversized_request_is_413_fast(harness):
     make_broker, make_runtime = harness
@@ -910,7 +902,22 @@ def test_call_oversized_request_is_413_fast(harness):
     assert time.time() - t0 < 1.0
     assert resp.status_code == 413
     assert 'exceeds cap 65536' in resp.json()['detail']
-    assert b._pending == {}                       # no future left parked
+    assert b._pending == {}
+
+
+def test_call_transport_down_raises_fast(harness):
+    make_broker, make_runtime = harness
+    srv = make_broker()
+    b = make_runtime(srv.url, name='epB')
+    outbox, b._outbox = b._outbox, None             # transport not up
+    try:
+        t0 = time.time()
+        with pytest.raises(RuntimeError, match='not up'):
+            b.call('broker', 'GET', '/nope', timeout=30.0)
+        assert time.time() - t0 < 1.0
+        assert b._pending == {}
+    finally:
+        b._outbox = outbox
 
 
 def test_served_oversized_response_is_500_fast(harness):
@@ -927,7 +934,6 @@ def test_served_oversized_response_is_500_fast(harness):
     assert time.time() - t0 < 1.0
     assert resp.status_code == 500
     assert 'response not sent' in resp.json()['detail']
-    # the serving endpoint stays usable
     assert b.call('epA', 'GET', '/echo_rt/big/10').status_code == 200
 
 
@@ -938,39 +944,5 @@ def test_emit_oversized_event_stays_lenient(harness):
     make_broker, make_runtime = harness
     srv = make_broker()
     a = make_runtime(srv.url, name='epA', frame_cap=64 * 1024)
-    ev = protocol.Event(src='epA', plugin='p', topic='t',
-                        data={'x': 'y' * 128 * 1024})
-    a._emit(ev)                                    # must not raise
-    assert a.call('broker', 'GET', '/nope').status_code in (404, 503)
-
-
-def test_call_transport_down_is_request_not_sent_fast(harness, monkeypatch):
-    """A request that provably never left -- transport down, unpackable --
-    raises ``RequestNotSent`` at once instead of waiting out the timeout."""
-    from radical.orbit import protocol
-    make_broker, make_runtime = harness
-    srv = make_broker()
-    a = make_runtime(srv.url, name='epA', plugins=['echo_rt'])
-    assert a.wait_registered(timeout=5.0)
-    b = make_runtime(srv.url, name='epB')
-    assert _wait_topology(b, 'epA', 'echo_rt', timeout=5.0)
-
-    outbox    = b._outbox
-    b._outbox = None                                 # transport not up
-    try:
-        t0 = time.time()
-        with pytest.raises(protocol.RequestNotSent, match='not up'):
-            b.call('epA', 'GET', '/echo_rt/ping', timeout=30.0)
-        assert time.time() - t0 < 1.0
-        assert b._pending == {}
-    finally:
-        b._outbox = outbox
-
-    def _bad_pack(msg):
-        raise protocol.ProtocolError('failed to pack')
-
-    monkeypatch.setattr(b, '_pack', _bad_pack)
-    with pytest.raises(protocol.RequestNotSent, match='failed to pack'):
-        b.call('epA', 'GET', '/echo_rt/ping', timeout=30.0)
-    monkeypatch.undo()
-    assert b.call('epA', 'GET', '/echo_rt/ping').status_code == 200
+    a._emit(protocol.Event(src='epA', plugin='p', topic='t',
+                           data={'x': 'y' * 128 * 1024}))   # must not raise

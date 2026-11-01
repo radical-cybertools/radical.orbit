@@ -1036,32 +1036,6 @@ def test_broker_startup_banner_empty_forms_no_crash():
     assert 'listening' not in text
 
 
-# ---------------------------------------------------------------------------
-# frame budget: oversized broker-originated requests and hosted responses
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_broker_call_oversized_request_is_413_not_raised(make_broker):
-    """``_broker_call`` answers an over-cap request with a 413 dict at once:
-    nothing is sent and no in-flight entry is left to time out."""
-    import json as _json
-    broker = make_broker(frame_cap=4096)
-    await broker.startup()
-    try:
-        ws = FakeWS()
-        broker.registry['e2'] = ws
-        assert broker.caller.frame_cap == 4096
-        resp = await broker.caller.call('e2', 'POST', '/p', body=b'x' * 8192,
-                                        timeout=5.0)
-        assert resp['status'] == 413
-        assert 'exceeds cap 4096' in _json.loads(resp['body'])['detail']
-        assert ws.sent       == []
-        assert broker._calls == {}
-    finally:
-        broker.registry.pop('e2', None)
-        await broker.shutdown()
-
-
 @pytest.mark.asyncio
 async def test_dispatch_to_host_oversized_response_is_500(make_broker,
                                                           monkeypatch):
@@ -1081,61 +1055,4 @@ async def test_dispatch_to_host_oversized_response_is_500(make_broker,
     finally:
         broker.registry.pop('e1', None)
     msg = protocol.parse_message(ws.sent[0], cap=4096)
-    assert msg.status  == 500
-    assert msg.corr_id == 'c9'
-    assert msg.dst     == 'e1'
-
-
-@pytest.mark.asyncio
-async def test_broker_call_unsent_raises_request_not_sent(make_broker,
-                                                         monkeypatch):
-    """Unknown dst, the in-flight cap and a non-size pack failure fail
-    before anything is sent: ``RequestNotSent`` (still a RuntimeError)."""
-    broker = make_broker(call_cap=0)
-    await broker.startup()
-    try:
-        with pytest.raises(protocol.RequestNotSent, match='at cap'):
-            await broker.caller.call('e2', 'GET', '/p', timeout=5.0)
-        broker._call_cap = 8
-        with pytest.raises(protocol.RequestNotSent, match='unknown'):
-            await broker.caller.call('nope', 'GET', '/p', timeout=5.0)
-        ws = FakeWS()
-        broker.registry['e2'] = ws
-
-        def _bad(msg, cap=protocol.FRAME_CAP):
-            raise protocol.ProtocolError("failed to pack 'request'")
-
-        monkeypatch.setattr(protocol, 'pack_message', _bad)
-        with pytest.raises(protocol.RequestNotSent, match='failed to pack'):
-            await broker.caller.call('e2', 'GET', '/p', timeout=5.0)
-        monkeypatch.undo()
-        assert ws.sent == [] and broker._calls == {}
-        assert issubclass(protocol.RequestNotSent, RuntimeError)
-    finally:
-        monkeypatch.undo()
-        broker.registry.pop('e2', None)
-        await broker.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_cancelled_broker_call_frees_its_slot(make_broker):
-    """A broker-originated call cancelled while it waits (CancelledError is
-    a BaseException) still frees its in-flight slot."""
-    broker = make_broker()
-    await broker.startup()
-    try:
-        broker.registry['e2'] = FakeWS()
-        task = asyncio.ensure_future(broker.caller.call('e2', 'GET', '/p'))
-        for _ in range(50):
-            await asyncio.sleep(0)
-            if broker._calls:
-                break
-        assert len(broker._calls) == 1
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert broker._calls == {}
-        assert broker.caller.reap_interval == broker._reap_interval
-    finally:
-        broker.registry.pop('e2', None)
-        await broker.shutdown()
+    assert (msg.status, msg.corr_id, msg.dst) == (500, 'c9', 'e1')

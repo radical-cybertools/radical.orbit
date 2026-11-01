@@ -25,7 +25,6 @@ from .plugin_session_base import PluginSession
 from .plugin_base import Plugin, DEFAULT_SID
 from .client import PluginClient
 from .protocol import FRAME_CAP
-from .runtime_client import frame_cap_of, max_body_of, pack_batches
 
 log = logging.getLogger("radical.orbit")
 
@@ -61,10 +60,9 @@ CLOSE_DRAIN_TIMEOUT = 30.0             # close waits this long for ops in flight
 # a plugin (direct construction, tests).
 BUDGET_RATIO        = 2
 
-# Upper clamp on one submit batch body: the budget a peer at the default
-# frame cap accepts.  Peer caps are not advertised (see
-# ``_resolve_frame_cap``), so raising a cap above the default does not raise
-# the submit budget; lower this to shrink batches.
+# Byte budget for one submit batch (the client splits large submissions):
+# half the protocol frame cap, the same margin the budgets below keep for
+# the envelope and for a peer tuned to a smaller cap.
 WS_PAYLOAD_LIMIT    = FRAME_CAP // BUDGET_RATIO
 
 # Cumulative payload budget for one notification frame.  ``NOTIFY_BATCH_SIZE``
@@ -110,6 +108,7 @@ except ImportError:
     rh = None
 
 import cloudpickle as _cp
+import msgpack
 from . import _prof as rprof
 
 
@@ -196,7 +195,7 @@ def _resolve_frame_cap(app) -> int:
     """Resolve the effective transport frame cap for this plugin host.
 
     ``protocol.FRAME_CAP`` is only the default: the serving runtime packs
-    with its own ``frame_cap`` tunable (``EndpointRuntime.frame_cap``), so a
+    with its own ``frame_cap`` tunable (``EndpointRuntime._frame_cap``), so a
     lower configured cap must shrink the plugin's budgets too — otherwise an
     "allowed" result or batch still overruns the real transport limit and the
     frame is dropped.  The runtime is reached through the established
@@ -210,76 +209,10 @@ def _resolve_frame_cap(app) -> int:
     endpoints can still reject a frame this budget allows.
     """
     svc = getattr(getattr(app, 'state', None), 'endpoint_service', None)
-    return frame_cap_of(svc)
-
-
-def _submit_budget(http) -> int:
-    """Byte budget for one submit batch body over the transport *http*.
-
-    Half the transport's body limit (``BUDGET_RATIO``).  The envelope needs
-    only ~260 B; the halving is margin for peer-cap skew: the broker's cap,
-    and a destination endpoint's, are not advertised, and a relayed frame
-    over a peer's cap closes that peer's socket.  ``WS_PAYLOAD_LIMIT`` stays
-    an upper clamp (read at call time, so an override still applies).
-    """
-    return min(max_body_of(http) // BUDGET_RATIO, WS_PAYLOAD_LIMIT)
-
-
-class PartialSubmitError(RuntimeError):
-    """A batched submit failed after earlier batches were accepted.
-
-    ``accepted`` lists the uids of the batches the endpoint acknowledged
-    (those tasks run); ``unconfirmed`` the rest -- the failing batch, whose
-    outcome is unknown (the endpoint may have taken some of it), and every
-    later batch, never sent.  ``results`` holds the accepted tasks' acks;
-    ``status_code`` is the failing batch's HTTP status, when it had one.
-    """
-
-    def __init__(self, msg: str = '', accepted=(), unconfirmed=(),
-                 results=(), status_code: int | None = None):
-        super().__init__(msg)
-        self.accepted    = list(accepted)
-        self.unconfirmed = list(unconfirmed)
-        self.results     = list(results)
-        self.status_code = status_code
-
-    def __reduce__(self):
-        return (type(self), (str(self), self.accepted, self.unconfirmed,
-                             self.results, self.status_code))
-
-
-def _submit_batches(client, url: str, task_dicts: list[dict]) -> list[dict]:
-    """Post *task_dicts* to *url* in frame-bounded msgpack batches.
-
-    Every task is packed and checked before the first send, so a task that
-    no frame carries fails with a 413 (:class:`PayloadTooLarge`) and nothing
-    is submitted.  Batches go out sequentially; a failing batch after an
-    accepted one raises :class:`PartialSubmitError`, a failing first batch
-    its own error unchanged.
-    """
-    http    = client._http
-    batches = pack_batches(task_dicts, _submit_budget(http),
-                           max_body_of(http))
-    results:  list[dict] = []
-    accepted: list[str]  = []
-    for batch, body in batches:
-        try:
-            resp = http.post(url, data=body,
-                             headers={"Content-Type": "application/msgpack"})
-            client._raise(resp, f"submit {len(batch)} task(s)")
-            acks = resp.json()
-        except Exception as e:
-            if not accepted:
-                raise                    # as before: nothing confirmed
-            unconfirmed = [str(td['uid'])
-                           for td in task_dicts[len(accepted):]]
-            raise PartialSubmitError(
-                f"{e} — {len(accepted)} of {len(task_dicts)} task(s) "
-                f"accepted, {len(unconfirmed)} unconfirmed", accepted,
-                unconfirmed, results, getattr(e, 'status_code', None)) from e
-        accepted.extend(str(td['uid']) for td in batch)
-        results.extend(acks)
-    return results
+    cap = getattr(svc, '_frame_cap', None)
+    if isinstance(cap, int) and cap > 0:
+        return cap
+    return FRAME_CAP
 
 
 def _resolve_notify_window() -> float:
@@ -1677,9 +1610,9 @@ class RhapsodyClient(PluginClient):
         """
         Submit tasks to the endpoint.
 
-        Large submissions are split so each request body stays within the
-        transport's frame budget (half its body limit, clamped by
-        :data:`WS_PAYLOAD_LIMIT`); the batches are submitted sequentially.
+        Large submissions are split so each payload stays within the
+        WebSocket frame limit (:data:`WS_PAYLOAD_LIMIT`); the batches are
+        submitted sequentially.
 
         UIDs are assigned client-side (if absent) so the caller can
         start waiting for SSE notifications immediately.
@@ -1689,15 +1622,6 @@ class RhapsodyClient(PluginClient):
 
         Returns:
             list[dict]: Submitted task info (uid, state).
-
-        Raises:
-            PayloadTooLarge: a ``RuntimeError`` with ``status_code`` 413
-                if a task is too large for any frame (nothing is submitted
-                then).
-            PartialSubmitError: a batch failed after earlier ones were
-                accepted; its ``accepted`` uids run, the outcome of its
-                ``unconfirmed`` ones is unknown.  A failing first batch
-                raises its own error, as before.
         """
         self._require_session()
 
@@ -1714,8 +1638,33 @@ class RhapsodyClient(PluginClient):
         with self._cond:
             self._submitted.update(str(td['uid']) for td in task_dicts)
 
+        # --- split into frame-size-bounded batches ---
         url = self._url(ROUTE_SUBMIT.format(sid=self.sid))
-        return _submit_batches(self, url, task_dicts)
+        batches: list[list[dict]] = []
+        batch: list[dict]         = []
+        batch_bytes                = 0
+
+        for td in task_dicts:
+            td_size = len(msgpack.packb(td, use_bin_type=True))
+            if batch and batch_bytes + td_size > WS_PAYLOAD_LIMIT:
+                batches.append(batch)
+                batch       = []
+                batch_bytes = 0
+            batch.append(td)
+            batch_bytes += td_size
+        if batch:
+            batches.append(batch)
+
+        # --- submit batches sequentially ---
+        results: list[dict] = []
+        for b in batches:
+            resp = self._http.post(
+                url,
+                data=msgpack.packb({"tasks": b}, use_bin_type=True),
+                headers={"Content-Type": "application/msgpack"})
+            self._raise(resp, f"submit {len(b)} task(s)")
+            results.extend(resp.json())
+        return results
 
     def wait_tasks(self, uids: list[str],
                    timeout: float | None = None) -> list[dict]:

@@ -1919,7 +1919,7 @@ def test_frame_budgets_follow_host_runtime_cap():
     from radical.orbit import plugin_rhapsody as prh
 
     app = FastAPI()
-    app.state.endpoint_service = MagicMock(frame_cap=64 * 1024)
+    app.state.endpoint_service = MagicMock(_frame_cap=64 * 1024)
     plugin = PluginRhapsody(app)
 
     assert plugin._frame_cap          == 64 * 1024
@@ -2628,182 +2628,6 @@ def test_client_data_helpers():
 
 
 # ---------------------------------------------------------------------------
-# Submit batching: frame budget, fail-fast, partial submission
-# ---------------------------------------------------------------------------
-
-
-class _RecordingHTTP:
-    """Fake transport: records each submit body; *fail_at* (0-based post
-    index) answers with *fail_status*.  ``max_body`` is set only when given,
-    so the default exercises the protocol-default fallback."""
-
-    def __init__(self, max_body=None, fail_at=None, fail_status=503):
-        if max_body is not None:
-            self.max_body = max_body
-        self.bodies      = []
-        self.fail_at     = fail_at
-        self.fail_status = fail_status
-
-    def post(self, url, data=None, headers=None, **kw):
-        import msgpack
-        from radical.orbit.runtime_client import RuntimeResponse
-        idx = len(self.bodies)
-        self.bodies.append(data)
-        if idx == self.fail_at:
-            return RuntimeResponse(self.fail_status, {},
-                                   b'{"detail": "nope"}')
-        tasks = msgpack.unpackb(data, raw=False)['tasks']
-        acks  = [{'uid': td['uid'], 'state': 'SUBMITTED'} for td in tasks]
-        return RuntimeResponse(200, {}, json.dumps(acks).encode())
-
-
-def _rh_client(http):
-    client = RhapsodyClient(http, '/rhapsody')
-    client._sid = 'sid-rh'
-    return client
-
-
-def _sent_tasks(body):
-    import msgpack
-    return msgpack.unpackb(body, raw=False)['tasks']
-
-
-def _tasks(n, pad=0, prefix='t'):
-    return [{'uid': f'{prefix}.{i:05d}', 'executable': '/bin/echo',
-             'arguments': ['x' * pad]} for i in range(n)]
-
-
-def test_pack_batches_bodies_are_exact_and_bounded():
-    import msgpack
-    from radical.orbit.runtime_client import pack_batches
-    items   = _tasks(300, pad=40)
-    batches = list(pack_batches(items, 4096, 8192))
-    assert len(batches) > 1
-    assert [td for b, _ in batches for td in b] == items      # order kept
-    for batch, body in batches:
-        # same bytes the old per-batch ``packb`` produced: no wire change
-        assert body == msgpack.packb({'tasks': batch}, use_bin_type=True)
-        assert len(body) <= 4096
-
-
-def test_pack_batches_item_over_budget_travels_alone():
-    from radical.orbit.runtime_client import pack_batches
-    items   = _tasks(2) + _tasks(1, pad=6000, prefix='big') + _tasks(2)
-    batches = list(pack_batches(items, 4096, 8192))
-    assert [len(b) for b, _ in batches] == [2, 1, 2]
-
-
-def test_pack_batches_item_over_limit_is_413_before_any_batch():
-    from radical.orbit.runtime_client import PayloadTooLarge, pack_batches
-    items = _tasks(2) + _tasks(1, pad=9000, prefix='big')
-    with pytest.raises(PayloadTooLarge) as exc:
-        pack_batches(items, 4096, 8192)            # raises at the call
-    assert exc.value.status_code == 413
-    assert exc.value.uids == ['big.00000']
-    assert 'item 2' in str(exc.value)
-
-
-def test_pack_batches_builds_bodies_lazily():
-    import inspect
-    from unittest.mock import patch as _patch
-    from radical.orbit import runtime_client as rc
-    items = _tasks(300, pad=40)
-    with _patch.object(rc, '_assemble', wraps=rc._assemble) as asm:
-        batches = rc.pack_batches(items, 4096, 8192)
-        assert inspect.isgenerator(batches)
-        assert asm.call_count == 0
-        next(batches)
-        assert asm.call_count == 1
-
-
-def test_submit_8192_tasks_at_default_cap_splits_under_frame_cap():
-    """Regression (overnight F2): 8192 tasks overran the 4 MiB frame in one
-    8 MiB batch, the frame was dropped and the client hung."""
-    from radical.orbit import protocol
-    http   = _RecordingHTTP()                       # protocol-default budget
-    client = _rh_client(http)
-    tasks  = _tasks(8192, pad=600)
-    result = client.submit_tasks(tasks)
-
-    assert len(result) == 8192
-    assert len(http.bodies) >= 2
-    for body in http.bodies:
-        req = protocol.make_request(
-            'client', 'ep', 'POST', '/rhapsody/submit/sid-rh', body=body,
-            headers={'Content-Type': 'application/msgpack'})
-        assert len(protocol.pack_message(req)) <= protocol.FRAME_CAP
-    assert client._submitted == {td['uid'] for td in tasks}
-
-
-def test_submit_budget_is_half_the_transport_body_limit():
-    http   = _RecordingHTTP(max_body=16 * 1024)
-    client = _rh_client(http)
-    client.submit_tasks(_tasks(200, pad=100))
-    assert len(http.bodies) > 1
-    assert all(len(b) <= 8 * 1024 for b in http.bodies)
-
-
-def test_submit_ws_payload_limit_still_clamps(monkeypatch):
-    from radical.orbit import plugin_rhapsody as prh
-    monkeypatch.setattr(prh, 'WS_PAYLOAD_LIMIT', 2048)
-    http = _RecordingHTTP(max_body=1024 * 1024)
-    _rh_client(http).submit_tasks(_tasks(200, pad=100))
-    assert all(len(b) <= 2048 for b in http.bodies)
-
-
-def test_submit_oversized_task_413_sends_nothing():
-    from radical.orbit.runtime_client import PayloadTooLarge
-    http   = _RecordingHTTP(max_body=8 * 1024)
-    client = _rh_client(http)
-    with pytest.raises(PayloadTooLarge) as exc:
-        client.submit_tasks(_tasks(3) + _tasks(1, pad=9000, prefix='big'))
-    assert exc.value.status_code == 413
-    assert http.bodies == []
-
-
-def test_submit_partial_failure_reports_accepted_and_unconfirmed():
-    from radical.orbit import plugin_rhapsody as prh
-    http   = _RecordingHTTP(max_body=8 * 1024, fail_at=1)
-    client = _rh_client(http)
-    tasks  = _tasks(200, pad=100)
-    with pytest.raises(prh.PartialSubmitError) as exc:
-        client.submit_tasks(tasks)
-    err = exc.value
-    assert err.status_code == 503
-    assert len(http.bodies) == 2                    # stopped at the failure
-    first = [td['uid'] for td in _sent_tasks(http.bodies[0])]
-    assert err.accepted    == first
-    assert err.unconfirmed == [td['uid'] for td in tasks[len(first):]]
-    assert [r['uid'] for r in err.results] == first
-    # as before: every uid was registered up front, nothing is withdrawn
-    assert client._submitted == {td['uid'] for td in tasks}
-
-
-def test_submit_first_batch_failure_raises_its_own_error():
-    """Nothing accepted: the original error, unchanged (as before)."""
-    from radical.orbit import plugin_rhapsody as prh
-    http   = _RecordingHTTP(max_body=8 * 1024, fail_at=0, fail_status=413)
-    client = _rh_client(http)
-    with pytest.raises(RuntimeError) as exc:
-        client.submit_tasks(_tasks(200, pad=100))
-    assert not isinstance(exc.value, prh.PartialSubmitError)
-    assert exc.value.status_code == 413
-    assert len(http.bodies) == 1
-
-
-def test_submit_errors_survive_pickle():
-    import copy
-    import pickle
-    from radical.orbit import plugin_rhapsody as prh
-    from radical.orbit.runtime_client import PayloadTooLarge
-    err = prh.PartialSubmitError('boom', ['a'], ['b', 'c'], [{'uid': 'a'}],
-                                 503)
-    for clone in (pickle.loads(pickle.dumps(err)), copy.copy(err)):
-        assert str(clone) == 'boom'
-        assert (clone.accepted, clone.unconfirmed, clone.results,
-                clone.status_code) == (['a'], ['b', 'c'], [{'uid': 'a'}], 503)
-    big   = pickle.loads(pickle.dumps(PayloadTooLarge('too big', ['t.3'])))
-    assert (str(big), big.uids, big.status_code) == ('too big', ['t.3'], 413)
 # Session scoping of task notifications
 # ---------------------------------------------------------------------------
 
@@ -2991,6 +2815,36 @@ def test_register_session_failed_post_unregisters_callback():
     with pytest.raises(RuntimeError, match="POST failed"):
         client.register_session(init_timeout=5)
     assert removed == ["session_status"]
+
+
+
+def test_submit_8192_tasks_split_into_frames_under_the_cap():
+    """Regression (overnight F2): 8192 tasks overran the 4 MiB frame in one
+    8 MiB batch, the frame was dropped and the client hung.  Each batch is
+    now sized by its packed bytes (str() undercounts non-ASCII text)."""
+    import msgpack
+    from radical.orbit import protocol
+    bodies = []
+
+    def _post(url, data=None, headers=None, **kw):
+        bodies.append(data)
+        n = len(msgpack.unpackb(data, raw=False)['tasks'])
+        return MagicMock(is_error=False, status_code=200,
+                         json=MagicMock(return_value=[{}] * n))
+
+    http   = MagicMock()
+    http.post = _post
+    client = RhapsodyClient(http, '/rhapsody')
+    client._sid = 'sid-rh'
+    tasks  = [{'uid': f't.{i:05d}', 'executable': '/bin/echo',
+               'arguments': ['ü' * 300]} for i in range(8192)]
+    assert len(client.submit_tasks(tasks)) == 8192
+    assert len(bodies) >= 2
+    for body in bodies:
+        req = protocol.make_request(
+            'client', 'ep', 'POST', '/rhapsody/submit/sid-rh', body=body,
+            headers={'Content-Type': 'application/msgpack'})
+        assert len(protocol.pack_message(req)) <= protocol.FRAME_CAP
 
 
 if __name__ == '__main__':
