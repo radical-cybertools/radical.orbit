@@ -905,19 +905,45 @@ def test_call_oversized_request_is_413_fast(harness):
     assert b._pending == {}
 
 
-def test_call_transport_down_raises_fast(harness):
+def test_call_transport_down_raises_connection_error_fast(harness):
+    """A frame that cannot be queued -- no transport, or its loop closed --
+    fails at once as a ConnectionError (retryable like a lost connection),
+    and leaves no pending call behind."""
+    import asyncio as _asyncio
     make_broker, make_runtime = harness
     srv = make_broker()
     b = make_runtime(srv.url, name='epB')
-    outbox, b._outbox = b._outbox, None             # transport not up
+    outbox, loop = b._outbox, b._transport_loop
+    closed = _asyncio.new_event_loop()
+    closed.close()
     try:
-        t0 = time.time()
-        with pytest.raises(RuntimeError, match='not up'):
-            b.call('broker', 'GET', '/nope', timeout=30.0)
-        assert time.time() - t0 < 1.0
-        assert b._pending == {}
+        for attr, val in (('_outbox', None), ('_transport_loop', closed)):
+            setattr(b, attr, val)
+            t0 = time.time()
+            with pytest.raises(ConnectionError, match='not up'):
+                b.call('broker', 'GET', '/nope', timeout=30.0)
+            assert time.time() - t0 < 1.0
+            assert b._pending == {}
+            b._outbox, b._transport_loop = outbox, loop
     finally:
-        b._outbox = outbox
+        b._outbox, b._transport_loop = outbox, loop
+    assert b.call('broker', 'GET', '/nope').status_code in (404, 503)
+
+
+def test_gateway_body_too_large_for_the_frame_is_413(harness):
+    """A body the gateway reads (up to FRAME_CAP) but that no frame can
+    carry with its envelope is a 413 with detail, not a bare 500."""
+    import httpx
+    from radical.orbit import protocol
+    make_broker, make_runtime = harness
+    srv = make_broker()
+    a = make_runtime(srv.url, name='epA', plugins=['echo_rt'])
+    assert a.wait_registered(timeout=5.0)
+    with httpx.Client(timeout=30.0) as c:
+        r = c.post('%s/epA/echo_rt/echo/x' % srv.url,
+                   content=b'x' * (protocol.FRAME_CAP - 64))
+    assert r.status_code == 413, r.text
+    assert 'too large' in r.json()['detail']
 
 
 def test_served_oversized_response_is_500_fast(harness):

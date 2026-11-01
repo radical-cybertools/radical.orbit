@@ -171,7 +171,7 @@ Broker ↔ endpoint messages share **one symmetric, versioned envelope** (define
 - `topology` – rich participant/plugin/liveness snapshot.
 - `control` – `shutdown` / `error` / `terminate` / `disconnect`.
 
-Liveness is **transport-level only** (WS protocol ping/pong; no app-level heartbeat in the envelope). A protocol-level frame-size cap bounds each frame; oversized payloads are the sender's problem (rhapsody batches size-aware), and fail fast: `EndpointRuntime.call` packs a request before waiting for its answer — an over-cap request returns a 413 at once, and one that cannot be queued (transport not up) or packed raises at once — and an over-cap response is replaced by a 500 for the same `corr_id` (`protocol.pack_or_error`, in the serving runtime and `Broker._dispatch_to_host`). Other frames (events, subscriptions) are still logged and dropped.
+Liveness is **transport-level only** (WS protocol ping/pong; no app-level heartbeat in the envelope). A protocol-level frame-size cap bounds each frame; oversized payloads are the sender's problem (rhapsody batches size-aware), and fail fast: `EndpointRuntime.call` packs a request before waiting for its answer — an over-cap request returns a 413 at once (so does `Broker._broker_call`, e.g. for a gateway body that fits the read cap but not a frame), one that cannot be queued (transport not up) raises a `ConnectionError` at once, and one that cannot be packed raises at once — and an over-cap response is replaced by a 500 for the same `corr_id` (`protocol.pack_or_error`, in the serving runtime and `Broker._dispatch_to_host`). Other frames (events, subscriptions) are still logged and dropped.
 
 ### Notifications
 

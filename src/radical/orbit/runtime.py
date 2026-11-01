@@ -741,10 +741,13 @@ class EndpointRuntime(PluginHostBase):
     def _enqueue(self, data: bytes, kind: str) -> bool:
         """Hand a packed frame to the transport loop; False if not up."""
         loop = self._transport_loop
-        if loop is None or self._outbox is None:
+        try:
+            if loop is None or self._outbox is None or loop.is_closed():
+                raise RuntimeError('transport loop not running')
+            loop.call_soon_threadsafe(self._outbox.put_nowait, data)
+        except RuntimeError:                # absent, or closed meanwhile
             log.warning("[Runtime] dropping %s: transport not up yet", kind)
             return False
-        loop.call_soon_threadsafe(self._outbox.put_nowait, data)
         return True
 
     # ── inbound dispatch (work loop) ───────────────────────────────────
@@ -869,15 +872,15 @@ class EndpointRuntime(PluginHostBase):
                                    error_body(413, str(e)))
         fut = self._work_loop.create_future()
         self._pending[req.corr_id] = fut
-        if not self._enqueue(data, req.kind):
-            self._pending.pop(req.corr_id, None)
-            raise RuntimeError(f"request to {dst!r} not sent: "
-                               f"transport not up")
         try:
+            if not self._enqueue(data, req.kind):
+                # a ConnectionError, so retry sets written for a lost
+                # connection (TimeoutError / ConnectionError) apply
+                raise ConnectionError(f"request to {dst!r} not sent: "
+                                      f"transport not up")
             resp = await asyncio.wait_for(fut, timeout=timeout)
-        except Exception:
+        finally:
             self._pending.pop(req.corr_id, None)
-            raise
         return RuntimeResponse(resp.status, dict(resp.headers), bytes(resp.body))
 
     def call(self, dst: str, method: str, path: str, *,

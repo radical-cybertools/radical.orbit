@@ -887,11 +887,19 @@ class Broker:
         if target is None:
             raise RuntimeError(f"endpoint {dst!r} unknown")
 
+        try:
+            data = protocol.pack_message(req, cap=self._frame_cap)
+        except protocol.FrameTooLarge as e:
+            # the gateway's answer to an oversized body, not a bare 500
+            return {'status':  413,
+                    'headers': {'content-type': 'application/json'},
+                    'body':    error_body(413, f"request body too large: {e}")}
+
         fut = self._loop.create_future()
         self._calls[corr_id] = _Call(BROKER_NAME, dst, fut,
                                      self._loop.time() + self._call_timeout)
         try:
-            await self._send(target, protocol.pack_message(req, cap=self._frame_cap))
+            await self._send(target, data)
             return await asyncio.wait_for(fut, timeout=timeout)
         except Exception:
             self._calls.pop(corr_id, None)
