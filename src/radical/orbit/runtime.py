@@ -940,10 +940,7 @@ class EndpointRuntime(PluginHostBase):
             raise ValueError("callback is required")
         key = (endpoint_id, plugin_name, topic)
         with self._cb_lock:
-            first = key not in self._callbacks
             self._callbacks.setdefault(key, []).append((callback, with_meta))
-        if not first:
-            return                      # subscribed already (one per key)
         self._emit(protocol.Subscribe(
             src=self._name,
             patterns=[protocol.SubscribePattern(
@@ -955,14 +952,10 @@ class EndpointRuntime(PluginHostBase):
                             callback: Callable = None) -> None:
         key = (endpoint_id, plugin_name, topic)
         with self._cb_lock:
-            # equality: a bound method is a new object on every attribute
-            # access, and unregisters as passed at registration
-            cbs = [(cb, m) for (cb, m) in self._callbacks.get(key, [])
-                   if cb != callback]
+            cbs = self._callbacks.get(key)
             if cbs:
-                self._callbacks[key] = cbs
-                return                  # others still listen: keep it
-            self._callbacks.pop(key, None)
+                self._callbacks[key] = [(cb, m) for (cb, m) in cbs
+                                        if cb is not callback]
         self._emit(protocol.Unsubscribe(
             src=self._name,
             patterns=[protocol.SubscribePattern(
