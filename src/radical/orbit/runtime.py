@@ -951,11 +951,8 @@ class EndpointRuntime(PluginHostBase):
             raise ValueError("callback is required")
         key = (endpoint_id, plugin_name, topic)
         with self._cb_lock:
-            first = key not in self._callbacks
             self._callbacks.setdefault(key, []).append(
                 (callback, with_meta, session))
-        if not first:
-            return                      # subscribed already (one per key)
         self._emit(protocol.Subscribe(
             src=self._name,
             patterns=[protocol.SubscribePattern(
@@ -968,18 +965,16 @@ class EndpointRuntime(PluginHostBase):
                             session: Any = _ANY) -> None:
         """Unregister *callback* for this pattern — all its registrations,
         or only those of *session* when it is given (``None``: the unscoped
-        ones)."""
+        ones).  Callbacks match by equality, so a bound method (a new object
+        on every attribute access) unregisters as passed at registration."""
         key = (endpoint_id, plugin_name, topic)
         with self._cb_lock:
-            # equality: a bound method is a new object on every attribute
-            # access, and unregisters as passed at registration
-            cbs = [(cb, m, s) for (cb, m, s) in self._callbacks.get(key, [])
-                   if cb != callback
-                   or (session is not _ANY and s != session)]
+            cbs = self._callbacks.get(key)
             if cbs:
-                self._callbacks[key] = cbs
-                return                  # others still listen: keep it
-            self._callbacks.pop(key, None)
+                self._callbacks[key] = [
+                    (cb, m, s) for (cb, m, s) in cbs
+                    if cb != callback
+                    or (session is not _ANY and s != session)]
         self._emit(protocol.Unsubscribe(
             src=self._name,
             patterns=[protocol.SubscribePattern(

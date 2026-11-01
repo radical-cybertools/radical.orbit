@@ -89,7 +89,7 @@ OUTPUT_NOTIFY_LIMIT = FRAME_CAP // OUTPUT_RATIO
 # Endpoint-level override for the coalescing window above (seconds).  The
 # default trades ~250 ms of completion latency for fewer WS frames; a
 # latency-sensitive endpoint (co-located service, sequential task round
-# trips) sets `0` to flush on the next loop iteration.
+# trips) sets `0`: the flush runs on the next loop iteration.
 ENV_NOTIFY_WINDOW   = 'RADICAL_ORBIT_RHAPSODY_NOTIFY_WINDOW'
 
 # Endpoint-level telemetry switch: rhapsody session telemetry (when its
@@ -327,14 +327,6 @@ class RhapsodySession(PluginSession):
         self._ops_idle.set()
         self._close_task: asyncio.Future | None = None
 
-        # Last state notified per task: a task's state notifications never
-        # go back from a terminal state (``_advance``); terminal entries are
-        # pruned once flushed.  ``_loop`` is the loop the session runs on
-        # (the runtime's work loop), recorded when it submits / watches.
-        self._notified_states: dict[str, str] = {}
-        self._notified_lock = threading.Lock()
-        self._loop: asyncio.AbstractEventLoop | None = None
-
         # Async init tracking
         self._init_ready = threading.Event()
         self._init_error: str | None = None
@@ -441,6 +433,8 @@ class RhapsodySession(PluginSession):
                 raise RuntimeError("session closed during initialization")
 
             # Register state-change callbacks for intermediate notifications
+            self._notified_states: dict[str, str] = {}
+            self._notified_lock = threading.Lock()
             for b in backends:
                 if hasattr(b, 'register_callback'):
                     orig = getattr(b, '_callback_func', None)
@@ -495,23 +489,27 @@ class RhapsodySession(PluginSession):
     def _on_task_state_change(self, task, state):
         """Fire notification on intermediate state changes (e.g. RUNNING).
 
-        Called from backend threads.  The notification goes through the
-        batch buffer like a completion, so a burst of state changes is
-        coalesced instead of sent per task.
+        Called from backend threads — uses lock for _notified_states access.
         """
         uid = self._get_attr(task, 'uid')
         uid_str = str(uid) if uid else '?'
         state_str = str(state)
+
+        with self._notified_lock:
+            # Skip if we already notified this state
+            if self._notified_states.get(uid_str) == state_str:
+                return
+            self._notified_states[uid_str] = state_str
 
         # Only fire for non-terminal states; terminal states are handled by
         # _watch_batch (which carries the full completion payload).
         if state_str.upper() in TERMINAL_STATES:
             return
 
-        self._queue_notification({
+        self.notify("task_status", {
             "uid":   uid_str,
             "state": state_str,
-        }, transition=True)
+        })
 
     def _check_initialized(self) -> None:
         """Check that the session is active and fully initialized.
@@ -622,10 +620,6 @@ class RhapsodySession(PluginSession):
             if self._rh_session is None:     # torn down after a drain timeout
                 raise HTTPException(status_code=410,
                                     detail="session is closing")
-            self._loop = asyncio.get_running_loop()
-            with self._notified_lock:        # a resubmitted uid starts over
-                for t in tasks:
-                    self._notified_states.pop(str(t.uid), None)
             await self._rh_session.submit_tasks(tasks)
             for t in tasks:
                 uid_str = str(t.uid)
@@ -642,43 +636,24 @@ class RhapsodySession(PluginSession):
             self._prof.prof('rh_submit_done', uid=bid, msg=str(batch_n))
         return results
 
-    def _queue_notification(self, payload: dict,
-                            transition: bool = False) -> None:
+    def _queue_notification(self, payload: dict) -> None:
         """Add a task notification to the batch buffer and ensure a
         flush is scheduled.
 
-        Called from watcher coroutines (completions) and backend threads
-        (*transition*: an intermediate state change).  A call from anywhere
-        but the session's loop is handed to that loop, so buffering and
-        flushing are serialized there.  Off any loop with no session loop
-        known, a transition is dropped and a completion only buffered: it
-        goes out with the next flush on the loop — never from a thread.  A
-        buffer full by count or by bytes flushes immediately; otherwise a
-        single flush is scheduled (and only one is ever pending at a time).
-        A zero coalescing window (latency-sensitive endpoint) schedules that
-        flush without delay: it runs on the next loop iteration, so the
-        completions a watcher drains in one pass still share one frame.
+        Thread-safe — called from watcher coroutines.  A buffer full by count
+        or by bytes flushes immediately; otherwise a single delayed flush is
+        scheduled (and only one is ever pending at a time).  A zero window
+        (latency-sensitive endpoint) schedules it without delay, so the
+        completions of one loop pass share a frame.
         """
-        loop = self._handoff_loop()
-        if loop is not None:
-            loop.call_soon_threadsafe(self._queue_notification, payload,
-                                      transition)
-            return
-        on_loop = self._on_a_loop() is not None
-        if transition and not on_loop:
-            return                         # no session loop to send it on
-        if not self._advance(payload, transition):
-            return
-
         size = _payload_size(payload)
         with self._notify_lock:
             self._notify_buf.append(payload)
             self._notify_bytes += size
             window   = self._notify_window
-            now      = on_loop and (
-                len(self._notify_buf) >= NOTIFY_BATCH_SIZE
-                or self._notify_bytes >= self._frame_budget())
-            schedule = on_loop and not now and not self._flush_scheduled
+            now      = len(self._notify_buf) >= NOTIFY_BATCH_SIZE \
+                       or self._notify_bytes >= self._frame_budget()
+            schedule = not now and not self._flush_scheduled
             if schedule:
                 self._flush_scheduled = True
 
@@ -687,59 +662,31 @@ class RhapsodySession(PluginSession):
         elif schedule:
             self._schedule_flush(delay=window)
 
-    def _advance(self, payload: dict, transition: bool) -> bool:
-        """Record the state *payload* notifies.  A *transition* (an
-        intermediate state change) must not be sent — ``False`` — if it
-        repeats the last state, or the task is terminal already (notified,
-        or by its own state): a task's state never goes backwards.  A
-        completion (or any payload carrying an ``error``) always passes.
-        The one place that rule is enforced, on the session's loop."""
-        uid   = str(payload.get('uid'))
-        state = str(payload.get('state', ''))
-        task  = self._tasks.get(uid)
-        with self._notified_lock:
-            prev = self._notified_states.get(uid)
-            if transition and 'error' not in payload and (
-                    prev == state
-                    or (prev or '').upper() in TERMINAL_STATES
-                    or str(self._get_attr(task, 'state', '')).upper()
-                    in TERMINAL_STATES):
-                return False
-            self._notified_states[uid] = state
-        return True
-
-    def _handoff_loop(self) -> "asyncio.AbstractEventLoop | None":
-        """The session's loop (``_loop``) when called anywhere but on it (a
-        backend thread, another loop), else ``None`` (on it, or it is not
-        known / usable: then the caller proceeds where it is)."""
-        loop = self._loop
-        if loop is None or loop.is_closed() or not loop.is_running():
-            return None
-        return None if self._on_a_loop() is loop else loop
-
-    @staticmethod
-    def _on_a_loop() -> "asyncio.AbstractEventLoop | None":
-        try:
-            return asyncio.get_running_loop()
-        except RuntimeError:
-            return None
-
     def _schedule_flush(self, delay: float = 0) -> None:
-        """Schedule a notification flush on the current (session) loop.  A
-        cancelled flush task clears the pending flag, so the next
-        notification schedules a new one."""
+        """Schedule a notification flush on the event loop."""
+        if not self._plugin:
+            with self._notify_lock:          # nothing to schedule on
+                self._flush_scheduled = False
+            return
+
         async def _do_flush():
             if delay > 0:
                 await asyncio.sleep(delay)
             self._flush_notifications()
 
-        def _cancelled(task):
-            if task.cancelled():
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_do_flush())
+        except RuntimeError:
+            if delay <= 0:                   # off a loop: flush here
+                self._flush_notifications()
+            elif hasattr(self._plugin, '_main_loop') and \
+                    self._plugin._main_loop:
+                asyncio.run_coroutine_threadsafe(
+                    _do_flush(), self._plugin._main_loop)
+            else:
                 with self._notify_lock:
                     self._flush_scheduled = False
-
-        asyncio.get_running_loop().create_task(_do_flush()) \
-            .add_done_callback(_cancelled)
 
     def _flush_notifications(self) -> None:
         """Flush the notification buffer as one or more bulk messages.
@@ -762,15 +709,6 @@ class RhapsodySession(PluginSession):
                 self.notify("task_status", frame[0])
             else:
                 self.notify("task_status_batch", {"tasks": frame})
-
-        # a task notified terminal needs no entry any more: a late change
-        # is still caught by its own (terminal) state in ``_advance``
-        with self._notified_lock:
-            for p in batch:
-                uid = str(p.get('uid'))
-                if str(p.get('state', '')).upper() in TERMINAL_STATES \
-                        and self._notified_states.get(uid) == p.get('state'):
-                    del self._notified_states[uid]
 
     def _frame_budget(self) -> int:
         """Bytes available for task payloads per frame: ``notify`` adds the
@@ -825,8 +763,6 @@ class RhapsodySession(PluginSession):
         batches them opportunistically so fast-completing tasks are grouped
         into single SSE messages while slow tasks don't block others.
         """
-        self._loop = asyncio.get_running_loop()
-
         # Build uid map and per-task futures
         fut_to_uid: dict[asyncio.Future, str] = {}
         uid_to_task: dict[str, object]         = {}
@@ -1416,120 +1352,55 @@ class RhapsodyClient(PluginClient):
         self._submitted: set[str] = set()
         self._warned_no_sid = False
 
-        # Task notifications reach this client through ONE runtime callback
-        # per task topic (``_fan_out``), which feeds ``_on_task_done`` and
-        # then the callbacks registered on this client for that topic: one
-        # callback-queue entry per event, however many consumers.  Once the
-        # sid is known they are scoped to it (``_fanout_sid``): the runtime
-        # drops other sessions' events before its callback queue.
-        self._fanout: dict[str, list] = {t: [] for t in self._FANOUT_TOPICS}
-        self._fanout_lock = threading.Lock()
-        self._fanout_on   = False
-        self._fanout_sid  : str | None = None
+        # This client's own runtime callbacks (``_on_task_done``, the
+        # session_status waiter), ``[topic, callback, sid]`` each, scoped to
+        # the sid: the runtime drops other sessions' events before its
+        # callback queue.  Guarded by ``_cond``; a session switch moves them
+        # with the sid.  Callbacks registered through
+        # ``register_notification_callback`` stay unscoped.
+        self._own: list[list] = []
 
-    # task topics served by the client-owned fan-out
-    _FANOUT_TOPICS = ('task_status', 'task_status_batch')
+    # -- this client's own, session-scoped runtime callbacks -----------------
 
-    def register_notification_callback(self, callback, topic=None) -> None:
-        """Register a notification callback (see ``PluginClient``).
-
-        Task topics (``task_status``, ``task_status_batch``) are served by
-        this client's fan-out: the callback runs on the dispatcher thread
-        right after this client recorded the completion, with the same
-        ``(endpoint, plugin, topic, data)`` arguments and the same ``data``
-        object.  Other topics register with the runtime directly.
-        """
-        if topic not in self._FANOUT_TOPICS:
-            super().register_notification_callback(callback, topic=topic)
-            return
-        self._ensure_fan_out()
-        with self._fanout_lock:
-            self._fanout[topic].append(callback)
-
-    def unregister_notification_callback(self, callback, topic=None) -> None:
-        """Unregister a callback registered with the same *topic*."""
-        if topic not in self._FANOUT_TOPICS:
-            super().unregister_notification_callback(callback, topic=topic)
-            return
-        with self._fanout_lock:
-            self._fanout[topic] = [cb for cb in self._fanout[topic]
-                                   if cb != callback]
-
-    def _ensure_fan_out(self) -> None:
-        """Register the runtime callback for each task topic (once; all or
-        none of them), scoped to this client's session — or move them to
-        the current sid when the session changed.
-
-        The scope is local to the runtime (``register_callback(session=)``):
-        other sessions' events are dropped before its callback queue,
-        session-less ones (an older endpoint) still arrive and are filtered
-        by ``sid`` in ``_on_task_done``.  A move is atomic per topic
-        (``rescope_callback``): no event sees both scopes, or neither.
-        """
-        if not (self._bc and self._endpoint_id and self._plugin_name):
-            raise RuntimeError("Missing endpoint tracking info; cannot "
-                               "register notifications.")
-        with self._fanout_lock:
-            sid = self.sid
-            if self._fanout_on:
-                if self._fanout_sid != sid:
-                    for topic in self._FANOUT_TOPICS:
-                        moved = self._bc.rescope_callback(
-                            **self._fanout_key(topic),
-                            session=self._fanout_sid, new_session=sid)
-                        if not moved:
-                            # nothing to move (dropped meanwhile): register
-                            # it fresh under the new sid
-                            self._bc.register_callback(
-                                **self._fanout_key(topic), session=sid)
-                    self._fanout_sid = sid
-                return
-            done = []
-            try:
-                for topic in self._FANOUT_TOPICS:
-                    self._bc.register_callback(**self._fanout_key(topic),
-                                               session=sid)
-                    done.append(topic)
-            except BaseException:
-                for topic in done:
-                    self._bc.unregister_callback(**self._fanout_key(topic),
-                                                 session=sid)
-                raise
-            self._fanout_on  = True
-            self._fanout_sid = sid
-
-    def _fanout_key(self, topic) -> dict:
+    def _own_key(self, topic, fn) -> dict:
         return {'endpoint_id': self._endpoint_id,
                 'plugin_name': self._plugin_name,
-                'topic': topic, 'callback': self._fan_out}
+                'topic': topic, 'callback': fn}
 
-    def _drop_fan_out(self) -> None:
-        """Unregister the runtime callbacks of ``_ensure_fan_out``."""
-        with self._fanout_lock:
-            if not self._fanout_on:
-                return
-            self._fanout_on = False
-            for topic in self._FANOUT_TOPICS:
-                try:
-                    self._bc.unregister_callback(**self._fanout_key(topic),
-                                                 session=self._fanout_sid)
-                except Exception as e:
-                    log.warning("[rhapsody] cannot unregister %s: %r",
-                                topic, e)
+    def _register_own(self, fn, topic, sid) -> None:
+        """Register *fn* for *topic* with the runtime, scoped to *sid*
+        (``None``: unscoped until the sid is known)."""
+        with self._cond:
+            self._bc.register_callback(**self._own_key(topic, fn),
+                                       session=sid)
+            self._own.append([topic, fn, sid])
 
-    def _fan_out(self, endpoint, plugin, topic, data):
-        """Runtime callback for task topics: this client first, then the
-        callbacks registered on it for *topic*, in registration order and
-        with the same ``data`` object (they rely on the decode done here).
-        A failing callback does not keep the others from running."""
-        with self._fanout_lock:
-            cbs = [self._on_task_done] + self._fanout[topic]
-        for cb in cbs:
+    def _unregister_own(self, fn=None) -> None:
+        """Unregister this client's callback *fn* (all of them: ``None``)."""
+        with self._cond:
+            drop = [r for r in self._own if fn is None or r[1] == fn]
+            self._own = [r for r in self._own if r not in drop]
+        for topic, cb, sid in drop:
             try:
-                cb(endpoint, plugin, topic, data)
+                self._bc.unregister_callback(**self._own_key(topic, cb),
+                                             session=sid)
             except Exception as e:
-                log.error("[rhapsody] notification callback failed: %r", e,
-                          exc_info=e)
+                log.warning("[rhapsody] cannot unregister %s: %r", topic, e)
+
+    def _rescope_own(self, sid) -> None:
+        """Move this client's callbacks to *sid*, each in one runtime step
+        (re-registered if the runtime had nothing to move).  Caller holds
+        ``_cond``, so the move and the sid switch are one step for this
+        client.  Lock order: ``_cond`` -> the runtime's ``_cb_lock``."""
+        for rec in self._own:
+            topic, fn, old = rec
+            if old == sid:
+                continue
+            if not self._bc.rescope_callback(**self._own_key(topic, fn),
+                                             session=old, new_session=sid):
+                self._bc.register_callback(**self._own_key(topic, fn),
+                                           session=sid)
+            rec[2] = sid
 
     def _on_task_done(self, endpoint, plugin, topic, data):
         """Persistent SSE callback: accumulate terminal task states.
@@ -1642,16 +1513,15 @@ class RhapsodyClient(PluginClient):
                         st, data.get('error', 'unknown init error'))
                     changed.set()
 
-            self.register_notification_callback(_on_session_status,
-                                                topic="session_status")
+            # unscoped until the POST returns our sid, then moved to it
+            self._register_own(_on_session_status, "session_status", None)
         try:
             self._register_and_wait(backends, init_timeout, has_sse,
                                     outcomes, changed)
         finally:
             # also when the POST fails: never leave the callback behind
             if has_sse:
-                self.unregister_notification_callback(_on_session_status,
-                                                      topic="session_status")
+                self._unregister_own(_on_session_status)
         self._start_task_listener()
 
     def _register_and_wait(self, backends, init_timeout, has_sse,
@@ -1669,15 +1539,13 @@ class RhapsodyClient(PluginClient):
         # Switch to the new session and reset the session-wide completion
         # accumulator in one step, so a late notification of the old session
         # cannot pass the sid check and land after the reset.
+        # The client's own callbacks move to the new sid in the same step,
+        # so no event of the new session is dropped as foreign meanwhile.
         with self._cond:
             self._sid = data['sid']
             self._completed.clear()
-            if has_sse and self._fanout_on:
-                # move the scope to the new sid in the same step: no event
-                # of the new session is dropped as foreign meanwhile.  Lock
-                # order _cond -> _fanout_lock -> the runtime's _cb_lock;
-                # nothing takes them the other way round.
-                self._ensure_fan_out()
+            if has_sse:
+                self._rescope_own(self._sid)
 
         if status == 'ready':
             return  # fast path: init was synchronous
@@ -1714,16 +1582,22 @@ class RhapsodyClient(PluginClient):
         has_sse = (self._bc is not None and
                    self._endpoint_id is not None and
                    self._plugin_name is not None)
-        if has_sse:
-            self._ensure_fan_out()
+        if not has_sse:
+            return
+        with self._cond:
+            have = {r[0] for r in self._own if r[1] == self._on_task_done}
+            for topic in ("task_status", "task_status_batch"):
+                if topic not in have:           # once per client
+                    self._register_own(self._on_task_done, topic, self._sid)
 
     def close(self) -> None:
-        """Close the session, then unregister this client's runtime
-        callbacks (kept through the session close)."""
+        """Close the session, then unregister this client's own runtime
+        callbacks."""
         try:
             super().close()
         finally:
-            self._drop_fan_out()
+            if self._bc is not None:
+                self._unregister_own()
 
     def _poll_session_ready(self, timeout: float = 120) -> None:
         """Fallback: poll until the session is ready (no SSE available)."""

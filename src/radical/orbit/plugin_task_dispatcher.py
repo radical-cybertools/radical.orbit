@@ -3400,8 +3400,9 @@ class PluginTaskDispatcher(Plugin):
     # seconds of latency buys one WS frame per batch instead of one per
     # task, and one `state.json` fsync per dirty pool per flush instead of
     # one per completion -- the dominant latency cost of pool mode.  A
-    # zero window (latency-sensitive broker) flushes inline, which is also
-    # the exec-mode behavior of old.
+    # zero window (latency-sensitive broker) flushes on the next loop
+    # iteration, so the completions of one loop pass share a frame; its
+    # ledger persists stay inline.
 
     def _notify_task(self, pool_state: PoolState, task: TaskRecord,
                      child_data: dict | None = None) -> None:
@@ -3426,13 +3427,13 @@ class PluginTaskDispatcher(Plugin):
         self._queue_rh_notification(payload)
 
     def _queue_rh_notification(self, payload: dict) -> None:
-        '''Buffer one dialect notification; flush by window, count or bytes.'''
+        '''Buffer one dialect notification; flush by window (a zero window:
+        on the next loop iteration), count or bytes.'''
         size = _payload_size(payload)
         with self._rh_notify_lock:
             self._rh_notify_buf.append(payload)
             self._rh_notify_bytes += size
-            now      = self._notify_window <= 0 \
-                       or len(self._rh_notify_buf) >= NOTIFY_BATCH_SIZE \
+            now      = len(self._rh_notify_buf) >= NOTIFY_BATCH_SIZE \
                        or self._rh_notify_bytes >= self._notify_batch_bytes
             schedule = not now and not self._rh_flush_scheduled
             if schedule:
