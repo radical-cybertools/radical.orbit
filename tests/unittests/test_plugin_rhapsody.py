@@ -3075,3 +3075,111 @@ def test_two_clients_one_runtime_no_foreign_queue_entries():
     for c in clients:
         assert {u: t['return_value'] for u, t in c._completed.items()} \
             == {'task.0': c.sid, 'task.1': c.sid}
+
+
+def test_close_keeps_the_subscription_others_rely_on():
+    """Two clients and an unscoped backend callback share the task-topic
+    patterns of one runtime.  After a fresh resync (the broker holds one
+    copy per pattern), closing one client sends no unsubscribe for them:
+    the other client and the backend still receive events."""
+    from radical.orbit import protocol
+    from radical.orbit.broker_events import EventRouter
+
+    rt      = _bare_runtime()
+    router  = EventRouter({}, lambda *a: None, MagicMock(), 8, lambda: None)
+    clients = []
+    for sid in ('sid-a', 'sid-b'):
+        c = _scoped_client(rt, sid)
+        c._start_task_listener()
+        clients.append(c)
+    backend = []
+    clients[1].register_notification_callback(
+        lambda *a: backend.append(a[3]['uid']), topic='task_status')
+
+    rt._emit.reset_mock()
+    router._subscriptions['consumer'] = []      # fresh registration
+    rt._resync_subscriptions()
+
+    def _apply():
+        for c in rt._emit.call_args_list:
+            msg = c.args[0]
+            router.update_subscription(
+                'consumer', {'patterns': [p.model_dump()
+                                          for p in msg.patterns]},
+                type(msg).__name__ == 'Subscribe')
+        rt._emit.reset_mock()
+
+    _apply()
+    clients[0]._sid = None                      # nothing to POST on close
+    clients[0].close()
+    _apply()
+    assert router._matches(router._subscriptions['consumer'],
+                           'ep', 'rhapsody', 'task_status')
+    rt._on_event(protocol.Event(src='ep', plugin='rhapsody',
+                                topic='task_status', session='sid-b',
+                                seq=0, ts=0.0,
+                                data={'uid': 't.1', 'state': 'DONE',
+                                      'sid': 'sid-b'}))
+    while rt._cb._q.qsize():
+        fn, args = rt._cb._q.get_nowait()
+        fn(*args)
+    assert 't.1' in clients[1]._completed and backend == ['t.1']
+
+
+def test_client_works_with_a_base_contract_broker_client():
+    """A broker client with only the base contract (no session=, no
+    rescope_callback) gets the unscoped registrations of before."""
+    class _Base:
+        def __init__(self):
+            self.regs = []
+
+        def wait_for_listener(self, timeout=None):
+            return True
+
+        def register_callback(self, endpoint_id=None, plugin_name=None,
+                              topic=None, callback=None):
+            self.regs.append((topic, callback))
+
+        def unregister_callback(self, endpoint_id=None, plugin_name=None,
+                                topic=None, callback=None):
+            self.regs = [r for r in self.regs if r != (topic, callback)]
+
+    bc   = _Base()
+    resp = MagicMock()
+    resp.is_error, resp.status_code = False, 200
+    resp.json = MagicMock(return_value={'sid': 'sid-b', 'status': 'ready'})
+    http = MagicMock()
+    http.post.return_value = resp
+    client = _scoped_client(bc, 'sid-a', http)
+    client._start_task_listener()
+    client.register_session()
+    assert client.sid == 'sid-b'
+    assert sorted(t for t, _ in bc.regs) == ['task_status',
+                                             'task_status_batch']
+    client._sid = None
+    client.close()
+    assert bc.regs == []
+
+
+def test_rescope_own_is_all_or_nothing():
+    """If moving one of the client's callbacks fails, the ones moved are
+    moved back before the error propagates."""
+    rt     = _bare_runtime()
+    client = _scoped_client(rt, 'sid-a')
+    client._start_task_listener()
+    orig, n = rt.rescope_callback, [0]
+
+    def _flaky(**kw):
+        n[0] += 1
+        if n[0] == 2 and kw['new_session'] == 'sid-b':
+            raise RuntimeError('rescope failed')
+        return orig(**kw)
+
+    rt.rescope_callback = _flaky
+    with pytest.raises(RuntimeError, match='rescope failed'):
+        with client._cond:
+            client._rescope_own('sid-b')
+    assert _scopes(rt, client._on_task_done) == {
+        'task_status': ['sid-a'], 'task_status_batch': ['sid-a'],
+        'session_status': []}
+    assert [r[2] for r in client._own] == ['sid-a', 'sid-a']

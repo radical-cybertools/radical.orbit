@@ -21,7 +21,7 @@ import uuid
 
 from fastapi import FastAPI, HTTPException, Request
 
-from .plugin_session_base import PluginSession
+from .plugin_session_base import PluginSession, _takes_session
 from .plugin_base import Plugin, DEFAULT_SID
 from .client import PluginClient
 from .protocol import FRAME_CAP
@@ -1359,8 +1359,26 @@ class RhapsodyClient(PluginClient):
         # with the sid.  Callbacks registered through
         # ``register_notification_callback`` stay unscoped.
         self._own: list[list] = []
+        self._scoping: bool | None = None       # see _can_scope
 
     # -- this client's own, session-scoped runtime callbacks -----------------
+
+    def _can_scope(self) -> bool:
+        """Whether the broker client scopes callbacks to a session
+        (``register_callback(session=)``, ``rescope_callback``) — checked
+        once.  One offering only the base contract gets the unscoped
+        registrations of before; the sid filter in ``_on_task_done`` and
+        the waiter still holds."""
+        if self._scoping is None:
+            bc = self._bc
+            self._scoping = bool(
+                callable(getattr(bc, 'rescope_callback', None))
+                and _takes_session(bc.register_callback)
+                and _takes_session(bc.unregister_callback))
+        return self._scoping
+
+    def _scope_kw(self, sid) -> dict:
+        return {'session': sid} if self._can_scope() else {}
 
     def _own_key(self, topic, fn) -> dict:
         return {'endpoint_id': self._endpoint_id,
@@ -1371,8 +1389,9 @@ class RhapsodyClient(PluginClient):
         """Register *fn* for *topic* with the runtime, scoped to *sid*
         (``None``: unscoped until the sid is known)."""
         with self._cond:
+            sid = sid if self._can_scope() else None
             self._bc.register_callback(**self._own_key(topic, fn),
-                                       session=sid)
+                                       **self._scope_kw(sid))
             self._own.append([topic, fn, sid])
 
     def _unregister_own(self, fn=None) -> None:
@@ -1383,7 +1402,7 @@ class RhapsodyClient(PluginClient):
         for topic, cb, sid in drop:
             try:
                 self._bc.unregister_callback(**self._own_key(topic, cb),
-                                             session=sid)
+                                             **self._scope_kw(sid))
             except Exception as e:
                 log.warning("[rhapsody] cannot unregister %s: %r", topic, e)
 
@@ -1391,15 +1410,41 @@ class RhapsodyClient(PluginClient):
         """Move this client's callbacks to *sid*, each in one runtime step
         (re-registered if the runtime had nothing to move).  Caller holds
         ``_cond``, so the move and the sid switch are one step for this
-        client.  Lock order: ``_cond`` -> the runtime's ``_cb_lock``."""
-        for rec in self._own:
-            topic, fn, old = rec
-            if old == sid:
-                continue
-            if not self._bc.rescope_callback(**self._own_key(topic, fn),
-                                             session=old, new_session=sid):
-                self._bc.register_callback(**self._own_key(topic, fn),
-                                           session=sid)
+        client.  Lock order: ``_cond`` -> the runtime's ``_cb_lock``.
+
+        All or nothing: if a move fails, the ones done are moved back (a
+        fresh registration is dropped again) before the error propagates,
+        so no callback is left scoped to the wrong sid.  Without scoping
+        support in the broker client there is nothing to move.
+        """
+        if not self._can_scope():
+            return
+        done = []                               # (rec, moved)
+        try:
+            for rec in self._own:
+                topic, fn, old = rec
+                if old == sid:
+                    continue
+                key   = self._own_key(topic, fn)
+                moved = self._bc.rescope_callback(**key, session=old,
+                                                  new_session=sid)
+                if not moved:
+                    self._bc.register_callback(**key, session=sid)
+                done.append((rec, moved))
+        except BaseException:
+            for rec, moved in reversed(done):
+                key = self._own_key(rec[0], rec[1])
+                try:
+                    if moved:
+                        self._bc.rescope_callback(**key, session=sid,
+                                                  new_session=rec[2])
+                    else:
+                        self._bc.unregister_callback(**key, session=sid)
+                except Exception as e:
+                    log.warning("[rhapsody] cannot restore the scope of "
+                                "%s: %r", rec[0], e)
+            raise
+        for rec, _ in done:
             rec[2] = sid
 
     def _on_task_done(self, endpoint, plugin, topic, data):

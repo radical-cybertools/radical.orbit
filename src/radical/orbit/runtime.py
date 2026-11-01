@@ -966,15 +966,25 @@ class EndpointRuntime(PluginHostBase):
         """Unregister *callback* for this pattern — all its registrations,
         or only those of *session* when it is given (``None``: the unscoped
         ones).  Callbacks match by equality, so a bound method (a new object
-        on every attribute access) unregisters as passed at registration."""
+        on every attribute access) unregisters as passed at registration.
+
+        The broker ``unsubscribe`` goes out only when the call removed a
+        registration and none is left on the pattern: one consumer's
+        unregister must not cut the subscription another one (or another
+        session's callback) on this runtime still relies on.
+        """
         key = (endpoint_id, plugin_name, topic)
         with self._cb_lock:
-            cbs = self._callbacks.get(key)
-            if cbs:
-                self._callbacks[key] = [
-                    (cb, m, s) for (cb, m, s) in cbs
+            cbs  = self._callbacks.get(key) or []
+            keep = [(cb, m, s) for (cb, m, s) in cbs
                     if cb != callback
                     or (session is not _ANY and s != session)]
+            if len(keep) == len(cbs):
+                return                          # removed nothing
+            if keep:
+                self._callbacks[key] = keep
+                return                          # others still listen
+            del self._callbacks[key]
         self._emit(protocol.Unsubscribe(
             src=self._name,
             patterns=[protocol.SubscribePattern(
