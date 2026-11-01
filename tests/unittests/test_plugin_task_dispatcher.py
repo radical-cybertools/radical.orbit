@@ -1215,6 +1215,41 @@ class TestRhapsodyDialect:
         assert payloads[1]['stderr'] == 'tail'
         assert payloads[1]['stderr_truncated'] is True
 
+    def test_window_zero_coalesces_one_loop_pass(self, tmp_path):
+        '''With a zero notify window, completions handled in one loop pass
+        go out as one frame on the next iteration -- not one per task.'''
+        _, plugin = _make_plugin(tmp_path)
+        plugin._notify_window = 0
+        plugin._materialise_pool('A', _make_pool_cfg())
+        ps = _pool(plugin, 'A', 'cpu')
+        uids = [f't.{i}' for i in range(10)]
+        for uid in uids:
+            ps.tasks[uid] = TaskRecord(
+                task_id=uid, pool='cpu', owning_sid='A', cmd=[], cwd='',
+                task_dict={'function': 'cloudpickle::AAAA'},
+                state=TASK_RUNNING, rhapsody_uid=f'{uid}.A')
+            plugin._uid_to_task[f'{uid}.A'] = ('A', 'cpu', uid)
+
+        notified = []
+        plugin._dispatch_notify = lambda t, d: notified.append((t, d))
+
+        async def drive():
+            with patch.object(ps, 'persist'):
+                for uid in uids:
+                    plugin._handle_task_terminal(f'{uid}.A', TASK_DONE, {
+                        'uid': f'{uid}.A', 'state': 'DONE', 'exit_code': 0})
+                inline = len(notified)
+                for _ in range(3):
+                    await asyncio.sleep(0)
+                return inline
+
+        assert asyncio.run(drive()) == 0          # not flushed inline
+        assert len(notified) == 1
+        topic, frame = notified[0]
+        assert topic == 'task_status_batch'
+        assert [p['uid'] for p in frame['tasks']] == uids
+        assert not plugin._rh_flush_scheduled
+
     def test_client_requires_pool_key(self, tmp_path):
         from radical.orbit.plugin_task_dispatcher import TaskDispatcherClient
         c = TaskDispatcherClient.__new__(TaskDispatcherClient)
