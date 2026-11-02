@@ -93,7 +93,7 @@ OUTPUT_NOTIFY_LIMIT = FRAME_CAP // OUTPUT_RATIO
 # Endpoint-level override for the coalescing window above (seconds).  The
 # default trades ~250 ms of completion latency for fewer WS frames; a
 # latency-sensitive endpoint (co-located service, sequential task round
-# trips) sets `0` to flush every completion immediately.
+# trips) sets `0`: the flush runs on the next loop iteration.
 ENV_NOTIFY_WINDOW   = 'RADICAL_ORBIT_RHAPSODY_NOTIFY_WINDOW'
 
 # Endpoint-level telemetry switch: rhapsody session telemetry (when its
@@ -220,7 +220,7 @@ def _resolve_notify_window() -> float:
 
     Honours ``$RADICAL_ORBIT_RHAPSODY_NOTIFY_WINDOW`` so the endpoint
     operator can pick the latency / frame-count trade-off at service launch
-    (``0`` flushes every completion immediately).  Read once per plugin, not
+    (``0`` flushes on the next loop iteration).  Read once per plugin, not
     per flush.  A non-numeric, negative or non-finite value warns and falls
     back to ``NOTIFY_BATCH_WINDOW`` — ``nan`` would otherwise pass every
     comparison and silently act as a zero window.
@@ -645,17 +645,17 @@ class RhapsodySession(PluginSession):
         flush is scheduled.
 
         Thread-safe — called from watcher coroutines.  A buffer full by count
-        or by bytes — or a zero coalescing window (latency-sensitive
-        endpoint) — flushes immediately; otherwise a single delayed flush is
-        scheduled (and only one is ever pending at a time).
+        or by bytes flushes immediately; otherwise a single delayed flush is
+        scheduled (and only one is ever pending at a time).  A zero window
+        (latency-sensitive endpoint) schedules it without delay, so the
+        completions of one loop pass share a frame.
         """
         size = _payload_size(payload)
         with self._notify_lock:
             self._notify_buf.append(payload)
             self._notify_bytes += size
             window   = self._notify_window
-            now      = window <= 0 \
-                       or len(self._notify_buf) >= NOTIFY_BATCH_SIZE \
+            now      = len(self._notify_buf) >= NOTIFY_BATCH_SIZE \
                        or self._notify_bytes >= self._frame_budget()
             schedule = not now and not self._flush_scheduled
             if schedule:
@@ -669,6 +669,8 @@ class RhapsodySession(PluginSession):
     def _schedule_flush(self, delay: float = 0) -> None:
         """Schedule a notification flush on the event loop."""
         if not self._plugin:
+            with self._notify_lock:          # nothing to schedule on
+                self._flush_scheduled = False
             return
 
         async def _do_flush():
@@ -680,10 +682,15 @@ class RhapsodySession(PluginSession):
             loop = asyncio.get_running_loop()
             loop.create_task(_do_flush())
         except RuntimeError:
-            if hasattr(self._plugin, '_main_loop') and \
+            if delay <= 0:                   # off a loop: flush here
+                self._flush_notifications()
+            elif hasattr(self._plugin, '_main_loop') and \
                     self._plugin._main_loop:
                 asyncio.run_coroutine_threadsafe(
                     _do_flush(), self._plugin._main_loop)
+            else:
+                with self._notify_lock:
+                    self._flush_scheduled = False
 
     def _flush_notifications(self) -> None:
         """Flush the notification buffer as one or more bulk messages.
