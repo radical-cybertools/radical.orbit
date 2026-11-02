@@ -735,11 +735,19 @@ class EndpointRuntime(PluginHostBase):
         except protocol.ProtocolError as e:
             log.error("[Runtime] failed to pack %s: %s", msg.kind, e)
             return
+        self._enqueue(data, msg.kind)
+
+    def _enqueue(self, data: bytes, kind: str) -> bool:
+        """Hand a packed frame to the transport loop; False if not up."""
         loop = self._transport_loop
-        if loop is None or self._outbox is None:
-            log.warning("[Runtime] dropping %s: transport not up yet", msg.kind)
-            return
-        loop.call_soon_threadsafe(self._outbox.put_nowait, data)
+        try:
+            if loop is None or self._outbox is None or loop.is_closed():
+                raise RuntimeError('transport loop not running')
+            loop.call_soon_threadsafe(self._outbox.put_nowait, data)
+        except RuntimeError:                # absent, or closed meanwhile
+            log.warning("[Runtime] dropping %s: transport not up yet", kind)
+            return False
+        return True
 
     # ── inbound dispatch (work loop) ───────────────────────────────────
 
@@ -778,8 +786,11 @@ class EndpointRuntime(PluginHostBase):
         try:
             status, headers, body = await asyncio.wait_for(
                 self._dispatch_served(req), timeout=self._call_timeout)
-            self._emit(protocol.make_response(
-                req, status, headers=headers, body=body))
+            # an oversized response becomes a 500 for the same corr_id
+            self._enqueue(protocol.pack_or_error(
+                protocol.make_response(req, status, headers=headers,
+                                       body=body),
+                cap=self._frame_cap), 'response')
         except asyncio.TimeoutError:
             # A stuck handler must not pin its admission slot forever (the
             # finally below releases it); fast-fail with a 504.
@@ -851,14 +862,24 @@ class EndpointRuntime(PluginHostBase):
     async def _call(self, dst, method, path, body, headers, timeout):
         req = protocol.make_request(self._name, dst, method, path,
                                     headers=headers, body=body)
+        # Pack before parking the future: a request that cannot be sent
+        # fails now instead of waiting out the call timeout.
+        try:
+            data = protocol.pack_message(req, cap=self._frame_cap)
+        except protocol.FrameTooLarge as e:
+            return RuntimeResponse(413, {'content-type': 'application/json'},
+                                   error_body(413, str(e)))
         fut = self._work_loop.create_future()
         self._pending[req.corr_id] = fut
-        self._emit(req)
         try:
+            if not self._enqueue(data, req.kind):
+                # a ConnectionError, so retry sets written for a lost
+                # connection (TimeoutError / ConnectionError) apply
+                raise ConnectionError(f"request to {dst!r} not sent: "
+                                      f"transport not up")
             resp = await asyncio.wait_for(fut, timeout=timeout)
-        except Exception:
+        finally:
             self._pending.pop(req.corr_id, None)
-            raise
         return RuntimeResponse(resp.status, dict(resp.headers), bytes(resp.body))
 
     def call(self, dst: str, method: str, path: str, *,

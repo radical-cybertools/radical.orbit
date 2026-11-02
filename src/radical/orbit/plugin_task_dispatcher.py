@@ -968,7 +968,7 @@ class TaskDispatcherClient(PluginClient):
         batch: list[dict]         = []
         batch_bytes               = 0
         for td in task_dicts:
-            td_size = len(str(td)) + 2
+            td_size = len(msgpack.packb(td, use_bin_type=True))
             if batch and batch_bytes + td_size > WS_PAYLOAD_LIMIT:
                 batches.append(batch)
                 batch       = []
