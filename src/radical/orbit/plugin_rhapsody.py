@@ -49,7 +49,6 @@ ROUTE_DATA_SHUTDOWN  = 'data_shutdown/{sid}/{name}'
 DATA_NAME_RE = re.compile(r'[A-Za-z0-9_.-]+')
 
 TERMINAL_STATES     = {'DONE', 'FAILED', 'CANCELED', 'COMPLETED'}
-WS_PAYLOAD_LIMIT    = 8 * 1024 * 1024  # target max per batch (conservative)
 NOTIFY_BATCH_SIZE   = 1024             # max tasks per bulk notification
 NOTIFY_BATCH_WINDOW = 0.25             # seconds to accumulate before flush
 CLOSE_DRAIN_TIMEOUT = 30.0             # close waits this long for ops in flight
@@ -60,6 +59,11 @@ CLOSE_DRAIN_TIMEOUT = 30.0             # close waits this long for ops in flight
 # the protocol-default fallback, and the default for a session built without
 # a plugin (direct construction, tests).
 BUDGET_RATIO        = 2
+
+# Byte budget for one submit batch (the client splits large submissions):
+# half the protocol frame cap, the same margin the budgets below keep for
+# the envelope and for a peer tuned to a smaller cap.
+WS_PAYLOAD_LIMIT    = FRAME_CAP // BUDGET_RATIO
 
 # Cumulative payload budget for one notification frame.  ``NOTIFY_BATCH_SIZE``
 # alone cannot bound a batch: a single completion may carry an encoded
@@ -1648,7 +1652,7 @@ class RhapsodyClient(PluginClient):
         batch_bytes                = 0
 
         for td in task_dicts:
-            td_size = len(str(td)) + 2
+            td_size = len(msgpack.packb(td, use_bin_type=True))
             if batch and batch_bytes + td_size > WS_PAYLOAD_LIMIT:
                 batches.append(batch)
                 batch       = []

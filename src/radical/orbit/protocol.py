@@ -62,6 +62,10 @@ class ProtocolError(Exception):
     """
 
 
+class FrameTooLarge(ProtocolError):
+    """Raised by ``pack_message`` when the packed frame exceeds the cap."""
+
+
 # ---------------------------------------------------------------------------
 # id / corr_id helpers
 # ---------------------------------------------------------------------------
@@ -266,10 +270,26 @@ def pack_message(msg: BaseModel, cap: int = FRAME_CAP) -> bytes:
         raise ProtocolError(f"failed to pack {msg.kind!r} message: {e}") from e
 
     if len(packed) > cap:
-        raise ProtocolError(
+        raise FrameTooLarge(
             f"frame size {len(packed)} bytes exceeds cap {cap} bytes")
 
     return packed
+
+
+def pack_or_error(resp: 'Response', cap: int = FRAME_CAP) -> bytes:
+    """Pack a ``response``; if it cannot be packed, pack a 500 in its place.
+
+    The 500 keeps ``src``/``dst``/``corr_id``, so the caller's pending call
+    resolves at once instead of waiting out its timeout.
+    """
+    try:
+        return pack_message(resp, cap=cap)
+    except ProtocolError as e:
+        from .errors import error_body
+        return pack_message(Response(
+            src=resp.src, dst=resp.dst, status=500, corr_id=resp.corr_id,
+            headers={'content-type': 'application/json'},
+            body=error_body(500, f"response not sent: {e}")), cap=cap)
 
 
 def parse_message(data: bytes, cap: int = FRAME_CAP) -> Message:
