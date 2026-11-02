@@ -1004,11 +1004,16 @@ class EndpointRuntime(PluginHostBase):
                             session: Any = _ANY) -> None:
         """Unregister *callback* for this pattern — all its registrations,
         or only those of *session* when it is given (``None``: the unscoped
-        ones)."""
+        ones).  Callbacks match by equality, so a bound method (a new object
+        on every attribute access) unregisters as passed at registration.
+
+        The broker ``unsubscribe`` goes out only when the call removed a
+        registration and none is left on its wire pattern: one consumer's
+        unregister must not cut the subscription another one (or another
+        session's callback) on this runtime still relies on.
+        """
         key = (endpoint_id, plugin_name, topic)
         with self._cb_lock:
-            # equality: a bound method is a new object on every attribute
-            # access, and unregisters as passed at registration
             keep, gone = [], []
             for (cb, m, s) in self._callbacks.get(key, []):
                 if cb == callback and (session is _ANY or s == session):

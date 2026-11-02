@@ -828,8 +828,9 @@ def test_session_callback_local_routing():
 
 def test_session_callback_unregister():
     """With *session*, unregister removes that session's registrations
-    (``None``: the unscoped ones); without it, all of the callback's.  The
-    unsubscribe goes out when the pattern's last one is gone."""
+    (``None``: the unscoped ones); without it, all of the callback's (by
+    equality, so a bound method unregisters).  The unsubscribe goes out
+    only when the call removed one and none is left on the pattern."""
     rt = _bare_runtime()
     cb = lambda *a: None                              # noqa: E731
     for sid in ('sid-a', 'sid-b', None):
@@ -840,14 +841,25 @@ def test_session_callback_unregister():
     rt.unregister_callback(endpoint_id='ep', plugin_name='rh',
                            callback=cb, session=None)
     assert rt._callbacks[('ep', 'rh', None)] == [(cb, False, 'sid-b')]
-    kinds = [type(c.args[0]).__name__ for c in rt._emit.call_args_list]
-    assert kinds == ['Subscribe']             # one per key, kept
     rt.register_callback(endpoint_id='ep', plugin_name='rh', callback=cb,
                          session='sid-c')
-    rt.unregister_callback(endpoint_id='ep', plugin_name='rh', callback=cb)
-    assert rt._callbacks == {}
     kinds = [type(c.args[0]).__name__ for c in rt._emit.call_args_list]
-    assert kinds[-1] == 'Unsubscribe'
+    assert kinds.count('Unsubscribe') == 0     # others still listen
+    rt.unregister_callback(endpoint_id='ep', plugin_name='rh', callback=cb,
+                           session='nope')     # removes nothing
+    rt.unregister_callback(endpoint_id='ep', plugin_name='rh', callback=cb)
+    assert ('ep', 'rh', None) not in rt._callbacks
+    kinds = [type(c.args[0]).__name__ for c in rt._emit.call_args_list]
+    # counted per wire pattern: one subscribe (first), one unsubscribe (last)
+    assert (kinds.count('Subscribe'), kinds.count('Unsubscribe')) == (1, 1)
+
+    class _C:
+        def on(self, *a):
+            pass
+    c = _C()
+    rt.register_callback(endpoint_id='ep', callback=c.on, session='s')
+    rt.unregister_callback(endpoint_id='ep', callback=c.on, session='s')
+    assert ('ep', None, None) not in rt._callbacks
 
 
 def test_rescope_callback_is_atomic():

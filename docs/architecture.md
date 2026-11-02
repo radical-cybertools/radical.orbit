@@ -39,7 +39,9 @@ payload:
 - `subscribe` / `unsubscribe` — live-event interest patterns
   (`endpoint`, `plugin`, `topic`, optional `session`); a runtime sends a
   `session` pattern only where the broker and the endpoint plugin advertise
-  `session_events` in topology.
+  `session_events` in topology, and only for session-scoped registrations
+  (unscoped ones keep the plain pattern and still receive every session's
+  events).
 - `topology` — a rich participant/plugin/liveness snapshot.
 - `control` — `shutdown` / `error` / `terminate` / `disconnect`.
 
