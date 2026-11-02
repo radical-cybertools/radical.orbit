@@ -2817,6 +2817,36 @@ def test_register_session_failed_post_unregisters_callback():
     assert removed == ["session_status"]
 
 
+
+def test_submit_8192_tasks_split_into_frames_under_the_cap():
+    """Regression (overnight F2): 8192 tasks overran the 4 MiB frame in one
+    8 MiB batch, the frame was dropped and the client hung.  Each batch is
+    now sized by its packed bytes (str() undercounts non-ASCII text)."""
+    import msgpack
+    from radical.orbit import protocol
+    bodies = []
+
+    def _post(url, data=None, headers=None, **kw):
+        bodies.append(data)
+        n = len(msgpack.unpackb(data, raw=False)['tasks'])
+        return MagicMock(is_error=False, status_code=200,
+                         json=MagicMock(return_value=[{}] * n))
+
+    http   = MagicMock()
+    http.post = _post
+    client = RhapsodyClient(http, '/rhapsody')
+    client._sid = 'sid-rh'
+    tasks  = [{'uid': f't.{i:05d}', 'executable': '/bin/echo',
+               'arguments': ['ü' * 300]} for i in range(8192)]
+    assert len(client.submit_tasks(tasks)) == 8192
+    assert len(bodies) >= 2
+    for body in bodies:
+        req = protocol.make_request(
+            'client', 'ep', 'POST', '/rhapsody/submit/sid-rh', body=body,
+            headers={'Content-Type': 'application/msgpack'})
+        assert len(protocol.pack_message(req)) <= protocol.FRAME_CAP
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
 
