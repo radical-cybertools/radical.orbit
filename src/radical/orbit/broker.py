@@ -462,7 +462,7 @@ class Broker:
         """Ask the hosted plugins to stop their background work cleanly.
 
         Runs the host's plugin-shutdown path *on the host loop* (cancelling each
-        plugin's cleanup / reclaim-drain tasks and closing sessions) and waits a
+        plugin's cleanup task and closing sessions) and waits a
         bounded window, so a subsequent ``_stop_host_thread`` does not tear the
         loop down with plugin tasks still pending (the "Task was destroyed but
         it is pending" warnings)."""
@@ -887,11 +887,19 @@ class Broker:
         if target is None:
             raise RuntimeError(f"endpoint {dst!r} unknown")
 
+        try:
+            data = protocol.pack_message(req, cap=self._frame_cap)
+        except protocol.FrameTooLarge as e:
+            # the gateway's answer to an oversized body, not a bare 500
+            return {'status':  413,
+                    'headers': {'content-type': 'application/json'},
+                    'body':    error_body(413, f"request body too large: {e}")}
+
         fut = self._loop.create_future()
         self._calls[corr_id] = _Call(BROKER_NAME, dst, fut,
                                      self._loop.time() + self._call_timeout)
         try:
-            await self._send(target, protocol.pack_message(req, cap=self._frame_cap))
+            await self._send(target, data)
             return await asyncio.wait_for(fut, timeout=timeout)
         except Exception:
             self._calls.pop(corr_id, None)
@@ -925,7 +933,8 @@ class Broker:
             body=resp['body'], corr_id=raw.get('corr_id'))
         target = self.registry.get(src_name)
         if target is not None:
-            await self._send(target, protocol.pack_message(out, cap=self._frame_cap))
+            await self._send(target, protocol.pack_or_error(
+                out, cap=self._frame_cap))
 
     async def call_host(self, method: str, path: str, *,
                         headers: Optional[Dict[str, str]] = None,
@@ -1173,7 +1182,7 @@ class Broker:
         for name, ws in list(self.registry.items()):
             await self._send(ws, packed)
         # Deliver the rich topology to the hosted-plugin host (task_dispatcher
-        # consumes it for pilot-child liveness + owner-session reclaim-drain).
+        # consumes it for pilot-child liveness).
         self._deliver_topology_to_host()
         # Notify in-process topology listeners (the gateway's SSE fan-out).
         for cb in list(self._topology_listeners):

@@ -49,7 +49,6 @@ ROUTE_DATA_SHUTDOWN  = 'data_shutdown/{sid}/{name}'
 DATA_NAME_RE = re.compile(r'[A-Za-z0-9_.-]+')
 
 TERMINAL_STATES     = {'DONE', 'FAILED', 'CANCELED', 'COMPLETED'}
-WS_PAYLOAD_LIMIT    = 8 * 1024 * 1024  # target max per batch (conservative)
 NOTIFY_BATCH_SIZE   = 1024             # max tasks per bulk notification
 NOTIFY_BATCH_WINDOW = 0.25             # seconds to accumulate before flush
 CLOSE_DRAIN_TIMEOUT = 30.0             # close waits this long for ops in flight
@@ -60,6 +59,11 @@ CLOSE_DRAIN_TIMEOUT = 30.0             # close waits this long for ops in flight
 # the protocol-default fallback, and the default for a session built without
 # a plugin (direct construction, tests).
 BUDGET_RATIO        = 2
+
+# Byte budget for one submit batch (the client splits large submissions):
+# half the protocol frame cap, the same margin the budgets below keep for
+# the envelope and for a peer tuned to a smaller cap.
+WS_PAYLOAD_LIMIT    = FRAME_CAP // BUDGET_RATIO
 
 # Cumulative payload budget for one notification frame.  ``NOTIFY_BATCH_SIZE``
 # alone cannot bound a batch: a single completion may carry an encoded
@@ -510,6 +514,13 @@ class RhapsodySession(PluginSession):
             "uid":   uid_str,
             "state": state_str,
         })
+
+    def is_busy(self) -> bool:
+        """Probed at the idle deadline: busy while a task is not terminal
+        (a long task emits no events between RUNNING and its end)."""
+        return any(str(self._get_attr(t, 'state', '')).upper()
+                   not in TERMINAL_STATES
+                   for t in reversed(list(self._tasks.values())))
 
     def _check_initialized(self) -> None:
         """Check that the session is active and fully initialized.
@@ -1522,7 +1533,10 @@ class RhapsodyClient(PluginClient):
         del t['_return_value_encoding']
 
     def register_session(self, backends: list[str] | None = None,
-                         init_timeout: float = 120):
+                         init_timeout: float = 120,
+                         sid: str | None = None,
+                         ttl: float | None = None,
+                         lifetime: str | None = None):
         """
         Register a session, optionally specifying backend names.
 
@@ -1536,6 +1550,13 @@ class RhapsodyClient(PluginClient):
             backends: List of backend names (e.g. ``['dragon_v3']``).
                       Defaults to ``['dragon_v3']`` on the server side.
             init_timeout: Seconds to wait for session init (default 120).
+            sid:      Reconnect to (or create) this session id; any client
+                      holding a sid can reconnect to it.
+            ttl:      Idle timeout in seconds, fixed at creation (``0``:
+                      never expires); default: the plugin's (900 s).  Set it
+                      for sessions reconnected to after long idle phases.
+            lifetime: Legacy policy name (``'ephemeral'`` / ``'persistent'``);
+                      prefer *ttl*.
         """
         has_sse = (self._bc is not None and
                    self._endpoint_id is not None and
@@ -1562,7 +1583,8 @@ class RhapsodyClient(PluginClient):
             self._register_own(_on_session_status, "session_status", None)
         try:
             self._register_and_wait(backends, init_timeout, has_sse,
-                                    outcomes, changed)
+                                    outcomes, changed,
+                                    self._session_payload(sid, lifetime, ttl))
         finally:
             # also when the POST fails: never leave the callback behind
             if has_sse:
@@ -1570,9 +1592,9 @@ class RhapsodyClient(PluginClient):
         self._start_task_listener()
 
     def _register_and_wait(self, backends, init_timeout, has_sse,
-                           outcomes, changed):
+                           outcomes, changed, payload=None):
         """POST register_session, then wait until our session is ready."""
-        payload = {}
+        payload = dict(payload or {})
         if backends:
             payload['backends'] = backends
         resp = self._http.post(self._url('register_session'), json=payload)
@@ -1581,19 +1603,40 @@ class RhapsodyClient(PluginClient):
         data   = resp.json()
         status = data.get('status')
 
-        # Switch to the new session and reset the session-wide completion
-        # accumulator in one step, so a late notification of the old session
-        # cannot pass the sid check and land after the reset.
-        # The client's own callbacks move to the new sid in the same step,
-        # so no event of the new session is dropped as foreign meanwhile.
+        # Switch to the new session and reset the session-wide accumulators
+        # in one step, so a late notification of the old session cannot pass
+        # the sid check and land after the reset.  A reconnect to the same
+        # sid keeps them: completions already received stay valid.  The
+        # client's own callbacks move to the new sid in the same step, so no
+        # event of the new session is dropped as foreign meanwhile (on a
+        # same-sid reconnect only the waiter, still unscoped, moves).
         with self._cond:
+            if data['sid'] != self._sid:
+                self._completed.clear()
+                self._submitted.clear()      # waits on old uids raise
+                self._cond.notify_all()
             self._sid = data['sid']
-            self._completed.clear()
             if has_sse:
                 self._rescope_own(self._sid)
 
         if status == 'ready':
             return  # fast path: init was synchronous
+        try:
+            self._wait_ready(data, init_timeout, has_sse, outcomes, changed)
+        except Exception:
+            # a session this call created must not linger (ttl=0 sessions
+            # never expire); a reconnected one is not ours to drop
+            if 'sid' not in payload:
+                try:
+                    self.unregister_session()
+                except Exception as e:
+                    log.warning("[rhapsody] cannot unregister session %s "
+                                "after its failed init: %s", self._sid, e)
+            raise
+
+    def _wait_ready(self, data, init_timeout, has_sse, outcomes, changed):
+        """Wait until the session the POST returned (*data*) is ready."""
+        status = data.get('status')
         if status == 'failed':
             # reconnect to a session whose init already failed: its
             # session_status event went out before we listened
@@ -1654,6 +1697,10 @@ class RhapsodyClient(PluginClient):
                 status = resp.status_code
             except Exception:
                 status = None                # transient: retry
+            if status == 500 and self._init_failed(resp):
+                raise RuntimeError(
+                    f"Session init failed on endpoint: "
+                    f"{resp.json().get('detail')}")
             if status == 410:
                 # closing or expired.  Other statuses end the poll as
                 # before (404 included: it is not conclusive this early);
@@ -1665,6 +1712,15 @@ class RhapsodyClient(PluginClient):
             time.sleep(1.0)
         raise RuntimeError(
             f"Session init timed out after {timeout}s (poll)")
+
+    @staticmethod
+    def _init_failed(resp) -> bool:
+        """Whether a 500 is ``_check_initialized``'s failed-init answer."""
+        try:
+            detail = str(resp.json().get('detail') or '')
+        except Exception:
+            return False
+        return detail.startswith('session init failed')
 
     @staticmethod
     def _serialize_task(td: dict) -> None:
@@ -1757,7 +1813,7 @@ class RhapsodyClient(PluginClient):
         batch_bytes                = 0
 
         for td in task_dicts:
-            td_size = len(str(td)) + 2
+            td_size = len(msgpack.packb(td, use_bin_type=True))
             if batch and batch_bytes + td_size > WS_PAYLOAD_LIMIT:
                 batches.append(batch)
                 batch       = []
@@ -1827,6 +1883,7 @@ class RhapsodyClient(PluginClient):
         uids = norm
 
         with self._cond:
+            sid     = self._sid
             unknown = [u for u in uids
                        if u not in self._submitted
                        and u not in self._completed]
@@ -1854,6 +1911,10 @@ class RhapsodyClient(PluginClient):
         deadline = (time.time() + timeout) if timeout is not None else None
         with self._cond:
             while not all(uid in self._completed for uid in uids):
+                if self._sid != sid:
+                    raise RuntimeError(
+                        f"wait_tasks: session changed from {sid} to "
+                        f"{self._sid}; its tasks are not tracked any more")
                 remaining = None
                 if deadline is not None:
                     remaining = deadline - time.time()
@@ -2115,7 +2176,7 @@ class PluginRhapsody(Plugin):
                 detail="'backends' must be a list of backend names")
 
         owner              = self._request_owner(request)
-        sid, lifetime, ttl = self._normalize_session_policy(data)
+        sid, lifetime, ttl = await self._normalize_session_policy(data)
         backend_names      = self._backend_names(backends)
 
         self._ensure_cleanup_task()
@@ -2132,14 +2193,11 @@ class PluginRhapsody(Plugin):
             while sid in self._sessions:
                 sid = f"session.{uuid.uuid4().hex[:8]}"
 
-        # Reconnect to an existing session — do not rebuild it.  Owner check
-        # first (bug A5: a session created with an owner must not be hijacked
-        # by another participant).  Report the session's real status: its init
-        # may have long completed, and the reconnecting client would otherwise
-        # wait for a `session_status` notification emitted before it attached.
+        # Reconnect to an existing session (any client) — do not rebuild it.
+        # Report the session's real status: its init may have long completed,
+        # and the reconnecting client would otherwise wait for a
+        # `session_status` notification emitted before it attached.
         if sid in self._sessions:
-            self._check_owner(sid, owner)
-            self._check_policy_conflict(sid, lifetime, ttl)
             self._touch(sid)
             log.info("[%s] Reconnected session %s", self.instance_name, sid)
             return {"sid": sid,

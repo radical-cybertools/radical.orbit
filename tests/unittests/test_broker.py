@@ -1134,3 +1134,47 @@ def test_broker_startup_banner_empty_forms_no_crash():
     text = Broker._startup_banner([], str(utils.CERT_FILE), 'file', True)
     assert 'On Client' not in text
     assert 'listening' not in text
+
+
+@pytest.mark.asyncio
+async def test_dispatch_to_host_oversized_response_is_500(make_broker,
+                                                          monkeypatch):
+    """A hosted plugin's over-cap response reaches the caller as a 500 for
+    the same ``corr_id`` instead of being lost in the routing loop."""
+    broker = make_broker(frame_cap=4096)
+
+    async def _big(method, path, headers=None, body=b''):
+        return {'status': 200, 'headers': {}, 'body': b'x' * 8192}
+
+    monkeypatch.setattr(broker, 'call_host', _big)
+    ws = FakeWS()
+    broker.registry['e1'] = ws
+    try:
+        await broker._dispatch_to_host(
+            'e1', {'method': 'GET', 'path': '/broker/x', 'corr_id': 'c9'})
+    finally:
+        broker.registry.pop('e1', None)
+    msg = protocol.parse_message(ws.sent[0], cap=4096)
+    assert (msg.status, msg.corr_id, msg.dst) == (500, 'c9', 'e1')
+
+
+@pytest.mark.asyncio
+async def test_broker_call_oversized_request_is_413(make_broker):
+    """``_broker_call`` answers an over-cap request with the gateway's 413
+    shape at once: nothing is sent, no in-flight entry is left."""
+    import json as _json
+    broker = make_broker(frame_cap=4096)
+    await broker.startup()
+    try:
+        ws = FakeWS()
+        broker.registry['e2'] = ws
+        resp = await broker.caller.call('e2', 'POST', '/p', body=b'x' * 8192,
+                                        timeout=5.0)
+        assert resp['status'] == 413
+        body = _json.loads(resp['body'])
+        assert body['status_code'] == 413
+        assert 'too large' in body['detail']
+        assert ws.sent == [] and broker._calls == {}
+    finally:
+        broker.registry.pop('e2', None)
+        await broker.shutdown()

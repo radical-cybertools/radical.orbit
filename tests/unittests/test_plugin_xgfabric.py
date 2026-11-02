@@ -496,3 +496,15 @@ async def test_on_topology_change_classifies_only_endpoints():
 
     # Only role='endpoint' participants are retained for classification.
     assert set(plugin._connected_endpoints) == {'epA', 'epB'}
+
+
+def test_xgfabric_sessions_idle_expire_but_not_while_running():
+    '''A day-long idle timeout (the Explorer keepalive holds open tabs); a
+    running workflow keeps its session.'''
+    assert PluginXGFabric.session_ttl == 86400
+    session = XGFabricSession('s1')
+    assert session.is_busy() is False
+    session._state.status = 'running'
+    assert session.is_busy() is True
+    session._state.status = 'completed'
+    assert session.is_busy() is False
