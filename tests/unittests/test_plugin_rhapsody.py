@@ -2817,6 +2817,98 @@ def test_register_session_failed_post_unregisters_callback():
     assert removed == ["session_status"]
 
 
+def _ready_resp(sid, status="ready"):
+    resp = MagicMock()
+    resp.is_error, resp.status_code = False, 200
+    resp.json = MagicMock(return_value={"sid": sid, "status": status})
+    return resp
+
+
+def test_reconnect_to_same_sid_keeps_completions():
+    """Reconnecting to the session the client already holds keeps the
+    completions received so far: a wait on them returns at once."""
+    client = _client_registering_as("s-b", [])
+    client._sid = "s-b"
+    client._submitted.add("t.1")
+    client._on_task_done(None, None, "task_status",
+                         {"uid": "t.1", "state": "DONE", "sid": "s-b"})
+    client._http.post = lambda url, json=None: _ready_resp("s-b")
+    client.register_session(sid="s-b")
+    assert client.wait_tasks(["t.1"], timeout=1)[0]["state"] == "DONE"
+
+
+def test_switch_to_another_sid_fails_waits_on_old_tasks():
+    """A switch to another session drops the old session's tasks: a
+    blocked wait on them raises, and a new wait rejects them."""
+    client = _client_registering_as("s-a", [])
+    client._sid = "s-a"
+    client._submitted.add("t.1")
+    errors = []
+
+    def _wait():
+        try:
+            client.wait_tasks(["t.1"], timeout=10)
+        except RuntimeError as e:
+            errors.append(e)
+
+    waiter = threading.Thread(target=_wait)
+    waiter.start()
+    time.sleep(0.05)
+    client._http.post = lambda url, json=None: _ready_resp("s-new")
+    client.register_session()
+    waiter.join(5)
+    assert errors and "session changed" in str(errors[0])
+    with pytest.raises(ValueError, match="unknown task UID"):
+        client.wait_tasks(["t.1"])
+
+
+def test_failed_init_unregisters_only_a_created_session(join_timers):
+    """A session this call created is unregistered when its init fails or
+    times out; one the caller reconnected to by sid is left alone."""
+    for sid, events, expect_unreg in (
+            (None,  [(0.05, {"sid": "s-b", "status": "failed",
+                              "error": "boom"})], True),
+            (None,  [], True),                           # timeout
+            ("s-b", [(0.05, {"sid": "s-b", "status": "failed",
+                              "error": "boom"})], False)):
+        client = _client_registering_as("s-b", events)
+        posts  = []
+        orig   = client._http.post
+
+        def _post(url, json=None, _orig=orig, _posts=posts):
+            _posts.append(url)
+            return _orig(url, json=json)
+
+        client._http.post = _post
+        with pytest.raises(RuntimeError, match="boom|timed out"):
+            client.register_session(sid=sid, init_timeout=0.5)
+        unregs = [u for u in posts if "unregister_session/s-b" in u]
+        assert bool(unregs) == expect_unreg, (sid, events)
+        _join_timers()
+
+
+def test_client_poll_raises_on_failed_init():
+    """The no-SSE poll raises on the failed-init 500 instead of taking it
+    for ready; other statuses keep their meaning."""
+    def _resp(status, detail=None):
+        r = MagicMock(status_code=status)
+        r.json = MagicMock(return_value={"detail": detail})
+        return r
+
+    http = MagicMock()
+    http.get.side_effect = [_resp(409, "session is still initializing"),
+                            _resp(500, "session init failed: no dragon")]
+    rc = RhapsodyClient(http, '/rhapsody')
+    rc._sid = 'sid.1'
+    with patch('time.sleep'):
+        with pytest.raises(RuntimeError, match="no dragon"):
+            rc._poll_session_ready(timeout=5)
+    assert http.get.call_count == 2
+
+    http.get.side_effect = [_resp(500, "something else")]
+    rc._poll_session_ready(timeout=5)          # unchanged: not init failure
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
 

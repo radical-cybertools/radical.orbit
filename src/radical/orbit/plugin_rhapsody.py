@@ -1498,15 +1498,35 @@ class RhapsodyClient(PluginClient):
         data   = resp.json()
         status = data.get('status')
 
-        # Switch to the new session and reset the session-wide completion
-        # accumulator in one step, so a late notification of the old session
-        # cannot pass the sid check and land after the reset.
+        # Switch to the new session and reset the session-wide accumulators
+        # in one step, so a late notification of the old session cannot pass
+        # the sid check and land after the reset.  A reconnect to the same
+        # sid keeps them: completions already received stay valid.
         with self._cond:
+            if data['sid'] != self._sid:
+                self._completed.clear()
+                self._submitted.clear()      # waits on old uids raise
+                self._cond.notify_all()
             self._sid = data['sid']
-            self._completed.clear()
 
         if status == 'ready':
             return  # fast path: init was synchronous
+        try:
+            self._wait_ready(data, init_timeout, has_sse, outcomes, changed)
+        except Exception:
+            # a session this call created must not linger (ttl=0 sessions
+            # never expire); a reconnected one is not ours to drop
+            if 'sid' not in payload:
+                try:
+                    self.unregister_session()
+                except Exception as e:
+                    log.warning("[rhapsody] cannot unregister session %s "
+                                "after its failed init: %s", self._sid, e)
+            raise
+
+    def _wait_ready(self, data, init_timeout, has_sse, outcomes, changed):
+        """Wait until the session the POST returned (*data*) is ready."""
+        status = data.get('status')
         if status == 'failed':
             # reconnect to a session whose init already failed: its
             # session_status event went out before we listened
@@ -1556,6 +1576,10 @@ class RhapsodyClient(PluginClient):
                 status = resp.status_code
             except Exception:
                 status = None                # transient: retry
+            if status == 500 and self._init_failed(resp):
+                raise RuntimeError(
+                    f"Session init failed on endpoint: "
+                    f"{resp.json().get('detail')}")
             if status == 410:
                 # closing or expired.  Other statuses end the poll as
                 # before (404 included: it is not conclusive this early);
@@ -1567,6 +1591,15 @@ class RhapsodyClient(PluginClient):
             time.sleep(1.0)
         raise RuntimeError(
             f"Session init timed out after {timeout}s (poll)")
+
+    @staticmethod
+    def _init_failed(resp) -> bool:
+        """Whether a 500 is ``_check_initialized``'s failed-init answer."""
+        try:
+            detail = str(resp.json().get('detail') or '')
+        except Exception:
+            return False
+        return detail.startswith('session init failed')
 
     @staticmethod
     def _serialize_task(td: dict) -> None:
@@ -1729,6 +1762,7 @@ class RhapsodyClient(PluginClient):
         uids = norm
 
         with self._cond:
+            sid     = self._sid
             unknown = [u for u in uids
                        if u not in self._submitted
                        and u not in self._completed]
@@ -1756,6 +1790,10 @@ class RhapsodyClient(PluginClient):
         deadline = (time.time() + timeout) if timeout is not None else None
         with self._cond:
             while not all(uid in self._completed for uid in uids):
+                if self._sid != sid:
+                    raise RuntimeError(
+                        f"wait_tasks: session changed from {sid} to "
+                        f"{self._sid}; its tasks are not tracked any more")
                 remaining = None
                 if deadline is not None:
                     remaining = deadline - time.time()
