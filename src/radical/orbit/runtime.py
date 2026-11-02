@@ -71,6 +71,8 @@ from .runtime_support   import CallbackDispatcher
 from .ui_schema         import ui_config_to_dict
 
 
+_ANY = object()               # unregister_callback: any session
+
 log = logging.getLogger("radical.orbit.runtime")
 
 # ── Runtime tunables (defaults) ────────────────────────────────────────────
@@ -270,9 +272,10 @@ class EndpointRuntime(PluginHostBase):
         # consumer pending table (touched on the work loop)
         self._pending: Dict[str, asyncio.Future] = {}
 
-        # callback registry (guarded — mutated by user threads, read on work)
+        # callback registry (guarded — mutated by user threads, read on work):
+        # (endpoint, plugin, topic) -> [(callback, with_meta, session)]
         self._cb_lock = threading.Lock()
-        self._callbacks: Dict[Any, List[Callable]] = {}
+        self._callbacks: Dict[Any, List[tuple]] = {}
         self._topology_callbacks: List[Callable] = []
 
         # rich topology snapshot (name -> {role, plugins, liveness})
@@ -942,11 +945,19 @@ class EndpointRuntime(PluginHostBase):
                           plugin_name: Optional[str] = None,
                           topic: Optional[str] = None,
                           callback: Callable = None,
-                          with_meta: bool = False) -> None:
+                          with_meta: bool = False,
+                          session: Optional[str] = None) -> None:
         """Register an event callback and auto-``subscribe`` for its pattern.
 
         Tuple semantics: ``None`` is a wildcard; filtering happens at the
         boundary.
+
+        With *session* the callback gets only that session's events plus the
+        session-less ones (an older endpoint sends every event without a
+        session).  The filter is local: the broker subscription stays the
+        ``(endpoint, plugin, topic)`` pattern (wire unchanged), and other
+        sessions' events are dropped before they reach the callback queue.
+        :meth:`rescope_callback` moves a registration to another session.
 
         By default the callback is invoked as
         ``callback(endpoint, plugin, topic, data)``.  With *with_meta* it is
@@ -960,7 +971,8 @@ class EndpointRuntime(PluginHostBase):
             raise ValueError("callback is required")
         key = (endpoint_id, plugin_name, topic)
         with self._cb_lock:
-            self._callbacks.setdefault(key, []).append((callback, with_meta))
+            self._callbacks.setdefault(key, []).append(
+                (callback, with_meta, session))
         self._emit(protocol.Subscribe(
             src=self._name,
             patterns=[protocol.SubscribePattern(
@@ -969,17 +981,54 @@ class EndpointRuntime(PluginHostBase):
     def unregister_callback(self, endpoint_id: Optional[str] = None,
                             plugin_name: Optional[str] = None,
                             topic: Optional[str] = None,
-                            callback: Callable = None) -> None:
+                            callback: Callable = None,
+                            session: Any = _ANY) -> None:
+        """Unregister *callback* for this pattern — all its registrations,
+        or only those of *session* when it is given (``None``: the unscoped
+        ones).  Callbacks match by equality, so a bound method (a new object
+        on every attribute access) unregisters as passed at registration.
+
+        The broker ``unsubscribe`` goes out only when the call removed a
+        registration and none is left on the pattern: one consumer's
+        unregister must not cut the subscription another one (or another
+        session's callback) on this runtime still relies on.
+        """
         key = (endpoint_id, plugin_name, topic)
         with self._cb_lock:
-            cbs = self._callbacks.get(key)
-            if cbs:
-                self._callbacks[key] = [(cb, m) for (cb, m) in cbs
-                                        if cb is not callback]
+            cbs  = self._callbacks.get(key) or []
+            keep = [(cb, m, s) for (cb, m, s) in cbs
+                    if cb != callback
+                    or (session is not _ANY and s != session)]
+            if len(keep) == len(cbs):
+                return                          # removed nothing
+            if keep:
+                self._callbacks[key] = keep
+                return                          # others still listen
+            del self._callbacks[key]
         self._emit(protocol.Unsubscribe(
             src=self._name,
             patterns=[protocol.SubscribePattern(
                 endpoint=endpoint_id, plugin=plugin_name, topic=topic)]))
+
+    def rescope_callback(self, endpoint_id: Optional[str] = None,
+                         plugin_name: Optional[str] = None,
+                         topic: Optional[str] = None,
+                         callback: Callable = None,
+                         session: Optional[str] = None,
+                         new_session: Optional[str] = None) -> bool:
+        """Move the registrations of *callback* for this pattern from
+        *session* to *new_session* in one step under the registry lock: no
+        event sees both scopes, or neither.  The broker subscription is not
+        touched.  Returns ``False`` when there was nothing to move."""
+        key = (endpoint_id, plugin_name, topic)
+        with self._cb_lock:
+            cbs = self._callbacks.get(key) or []
+            hit = False
+            for i, (cb, m, s) in enumerate(cbs):
+                if cb == callback and s == session:
+                    cbs[i] = (cb, m, new_session)
+                    hit = True
+            return hit
 
     def register_topology_callback(self, callback: Callable) -> None:
         with self._cb_lock:
@@ -1003,6 +1052,7 @@ class EndpointRuntime(PluginHostBase):
 
     def _on_event(self, ev: protocol.Event) -> None:
         endpoint, plugin, topic = ev.src, ev.plugin, ev.topic
+        session = ev.session
         data = ev.data
         with self._cb_lock:
             matched: List[tuple] = []
@@ -1010,7 +1060,11 @@ class EndpointRuntime(PluginHostBase):
                 if (e is None or e == endpoint) and \
                    (p is None or p == plugin) and \
                    (t is None or t == topic):
-                    matched.extend(cbs)
+                    # a session callback skips other sessions' events here,
+                    # before they take room in the callback queue
+                    matched.extend((cb, m) for (cb, m, s) in cbs
+                                   if s is None or session is None
+                                   or s == session)
         meta = None
         for cb, with_meta in matched:
             if with_meta:
@@ -1091,7 +1145,8 @@ class EndpointRuntime(PluginHostBase):
     # ── notifications from served plugins ──────────────────────────────
 
     def send_notification(self, plugin_name: str, topic: str,
-                          data: Dict[str, Any]) -> None:
+                          data: Dict[str, Any],
+                          session: Optional[str] = None) -> None:
         """Turn a served plugin's notification into a broker ``event`` frame.
 
         A plain sync method (the body only packs + hands off to the transport
@@ -1099,10 +1154,11 @@ class EndpointRuntime(PluginHostBase):
         one obvious way, matching the rest of the consumer-facing API.
 
         ``seq`` is a placeholder (0) — the broker stamps the authoritative
-        ``seq``/``ts`` on ingest.
+        ``seq``/``ts`` on ingest, per ``(endpoint, plugin, session)`` when
+        *session* is set.
         """
         ev = protocol.Event(src=self._name, plugin=plugin_name, topic=topic,
-                            session=None, ts=0.0, seq=0, data=data)
+                            session=session, ts=0.0, seq=0, data=data)
         self._emit(ev)
 
     # ── topology snapshot access ───────────────────────────────────────

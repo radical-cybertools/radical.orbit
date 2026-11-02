@@ -21,7 +21,7 @@ import uuid
 
 from fastapi import FastAPI, HTTPException, Request
 
-from .plugin_session_base import PluginSession
+from .plugin_session_base import PluginSession, _takes_session
 from .plugin_base import Plugin, DEFAULT_SID
 from .client import PluginClient
 from .protocol import FRAME_CAP
@@ -1363,6 +1363,101 @@ class RhapsodyClient(PluginClient):
         self._submitted: set[str] = set()
         self._warned_no_sid = False
 
+        # This client's own runtime callbacks (``_on_task_done``, the
+        # session_status waiter), ``[topic, callback, sid]`` each, scoped to
+        # the sid: the runtime drops other sessions' events before its
+        # callback queue.  Guarded by ``_cond``; a session switch moves them
+        # with the sid.  Callbacks registered through
+        # ``register_notification_callback`` stay unscoped.
+        self._own: list[list] = []
+        self._scoping: bool | None = None       # see _can_scope
+
+    # -- this client's own, session-scoped runtime callbacks -----------------
+
+    def _can_scope(self) -> bool:
+        """Whether the broker client scopes callbacks to a session
+        (``register_callback(session=)``, ``rescope_callback``) — checked
+        once.  One offering only the base contract gets the unscoped
+        registrations of before; the sid filter in ``_on_task_done`` and
+        the waiter still holds."""
+        if self._scoping is None:
+            bc = self._bc
+            self._scoping = bool(
+                callable(getattr(bc, 'rescope_callback', None))
+                and _takes_session(bc.register_callback)
+                and _takes_session(bc.unregister_callback))
+        return self._scoping
+
+    def _scope_kw(self, sid) -> dict:
+        return {'session': sid} if self._can_scope() else {}
+
+    def _own_key(self, topic, fn) -> dict:
+        return {'endpoint_id': self._endpoint_id,
+                'plugin_name': self._plugin_name,
+                'topic': topic, 'callback': fn}
+
+    def _register_own(self, fn, topic, sid) -> None:
+        """Register *fn* for *topic* with the runtime, scoped to *sid*
+        (``None``: unscoped until the sid is known)."""
+        with self._cond:
+            sid = sid if self._can_scope() else None
+            self._bc.register_callback(**self._own_key(topic, fn),
+                                       **self._scope_kw(sid))
+            self._own.append([topic, fn, sid])
+
+    def _unregister_own(self, fn=None) -> None:
+        """Unregister this client's callback *fn* (all of them: ``None``)."""
+        with self._cond:
+            drop = [r for r in self._own if fn is None or r[1] == fn]
+            self._own = [r for r in self._own if r not in drop]
+        for topic, cb, sid in drop:
+            try:
+                self._bc.unregister_callback(**self._own_key(topic, cb),
+                                             **self._scope_kw(sid))
+            except Exception as e:
+                log.warning("[rhapsody] cannot unregister %s: %r", topic, e)
+
+    def _rescope_own(self, sid) -> None:
+        """Move this client's callbacks to *sid*, each in one runtime step
+        (re-registered if the runtime had nothing to move).  Caller holds
+        ``_cond``, so the move and the sid switch are one step for this
+        client.  Lock order: ``_cond`` -> the runtime's ``_cb_lock``.
+
+        All or nothing: if a move fails, the ones done are moved back (a
+        fresh registration is dropped again) before the error propagates,
+        so no callback is left scoped to the wrong sid.  Without scoping
+        support in the broker client there is nothing to move.
+        """
+        if not self._can_scope():
+            return
+        done = []                               # (rec, moved)
+        try:
+            for rec in self._own:
+                topic, fn, old = rec
+                if old == sid:
+                    continue
+                key   = self._own_key(topic, fn)
+                moved = self._bc.rescope_callback(**key, session=old,
+                                                  new_session=sid)
+                if not moved:
+                    self._bc.register_callback(**key, session=sid)
+                done.append((rec, moved))
+        except BaseException:
+            for rec, moved in reversed(done):
+                key = self._own_key(rec[0], rec[1])
+                try:
+                    if moved:
+                        self._bc.rescope_callback(**key, session=sid,
+                                                  new_session=rec[2])
+                    else:
+                        self._bc.unregister_callback(**key, session=sid)
+                except Exception as e:
+                    log.warning("[rhapsody] cannot restore the scope of "
+                                "%s: %r", rec[0], e)
+            raise
+        for rec, _ in done:
+            rec[2] = sid
+
     def _on_task_done(self, endpoint, plugin, topic, data):
         """Persistent SSE callback: accumulate terminal task states.
 
@@ -1484,8 +1579,8 @@ class RhapsodyClient(PluginClient):
                         st, data.get('error', 'unknown init error'))
                     changed.set()
 
-            self.register_notification_callback(_on_session_status,
-                                                topic="session_status")
+            # unscoped until the POST returns our sid, then moved to it
+            self._register_own(_on_session_status, "session_status", None)
         try:
             self._register_and_wait(backends, init_timeout, has_sse,
                                     outcomes, changed,
@@ -1493,8 +1588,7 @@ class RhapsodyClient(PluginClient):
         finally:
             # also when the POST fails: never leave the callback behind
             if has_sse:
-                self.unregister_notification_callback(_on_session_status,
-                                                      topic="session_status")
+                self._unregister_own(_on_session_status)
         self._start_task_listener()
 
     def _register_and_wait(self, backends, init_timeout, has_sse,
@@ -1512,13 +1606,18 @@ class RhapsodyClient(PluginClient):
         # Switch to the new session and reset the session-wide accumulators
         # in one step, so a late notification of the old session cannot pass
         # the sid check and land after the reset.  A reconnect to the same
-        # sid keeps them: completions already received stay valid.
+        # sid keeps them: completions already received stay valid.  The
+        # client's own callbacks move to the new sid in the same step, so no
+        # event of the new session is dropped as foreign meanwhile (on a
+        # same-sid reconnect only the waiter, still unscoped, moves).
         with self._cond:
             if data['sid'] != self._sid:
                 self._completed.clear()
                 self._submitted.clear()      # waits on old uids raise
                 self._cond.notify_all()
             self._sid = data['sid']
+            if has_sse:
+                self._rescope_own(self._sid)
 
         if status == 'ready':
             return  # fast path: init was synchronous
@@ -1571,11 +1670,22 @@ class RhapsodyClient(PluginClient):
         has_sse = (self._bc is not None and
                    self._endpoint_id is not None and
                    self._plugin_name is not None)
-        if has_sse:
-            self.register_notification_callback(self._on_task_done,
-                                                topic="task_status")
-            self.register_notification_callback(self._on_task_done,
-                                                topic="task_status_batch")
+        if not has_sse:
+            return
+        with self._cond:
+            have = {r[0] for r in self._own if r[1] == self._on_task_done}
+            for topic in ("task_status", "task_status_batch"):
+                if topic not in have:           # once per client
+                    self._register_own(self._on_task_done, topic, self._sid)
+
+    def close(self) -> None:
+        """Close the session, then unregister this client's own runtime
+        callbacks."""
+        try:
+            super().close()
+        finally:
+            if self._bc is not None:
+                self._unregister_own()
 
     def _poll_session_ready(self, timeout: float = 120) -> None:
         """Fallback: poll until the session is ready (no SSE available)."""
@@ -2189,7 +2299,7 @@ class PluginRhapsody(Plugin):
             self._dispatch_notify("session_status", {
                 "sid":    sid,
                 "status": "ready",
-            })
+            }, session=sid)
 
         except Exception as e:
             log.error("[%s] Session %s init failed: %s",
@@ -2198,7 +2308,7 @@ class PluginRhapsody(Plugin):
                 "sid":    sid,
                 "status": "failed",
                 "error":  str(e),
-            })
+            }, session=sid)
 
     # -- route handlers -----------------------------------------------------
 

@@ -746,6 +746,138 @@ def test_send_notification_sync_from_plain_thread(harness):
     assert data == {'via': 'thread'}
 
 
+def test_send_notification_sets_event_session():
+    """A session notification reaches the wire as an event with that
+    session; a plugin-level one stays session-less, called as before."""
+    from unittest.mock import MagicMock
+    from fastapi import FastAPI
+    from radical.orbit.runtime import EndpointRuntime
+
+    rt = EndpointRuntime.__new__(EndpointRuntime)
+    rt._name = 'epA'
+    rt._emit = MagicMock()
+    rt.send_notification('echo_rt', 'demo', {'k': 1}, session='sid.1')
+    rt.send_notification('echo_rt', 'demo', {'k': 2})
+    evs = [c.args[0] for c in rt._emit.call_args_list]
+    assert [(e.plugin, e.session, e.data) for e in evs] \
+        == [('echo_rt', 'sid.1', {'k': 1}), ('echo_rt', None, {'k': 2})]
+
+    # Plugin.send_notification: the session keyword only when set
+    app = FastAPI()
+    app.state.endpoint_service = MagicMock(spec=['send_notification'])
+    app.state.endpoint_service.send_notification.return_value = None
+    plugin = _EchoPlugin(app)
+    asyncio.run(plugin.send_notification('demo', {'k': 1}, session='s'))
+    asyncio.run(plugin.send_notification('demo', {'k': 2}))
+    calls = app.state.endpoint_service.send_notification.call_args_list
+    assert [(c.args, c.kwargs) for c in calls] == [
+        (('echo_rt', 'demo', {'k': 1}), {'session': 's'}),
+        (('echo_rt', 'demo', {'k': 2}), {})]
+
+
+def _bare_runtime(maxlen=1024):
+    """A runtime with a callback registry and a real (unstarted) dispatcher
+    queue, but no transport: what _on_event / register_callback touch."""
+    from unittest.mock import MagicMock
+    from radical.orbit.runtime import EndpointRuntime
+    from radical.orbit.runtime_support import CallbackDispatcher
+
+    rt = EndpointRuntime.__new__(EndpointRuntime)
+    rt._name      = 'consumer'
+    rt._callbacks = {}
+    rt._cb_lock   = threading.Lock()
+    rt._emit      = MagicMock()
+    rt._cb        = CallbackDispatcher(maxlen=maxlen)
+    return rt
+
+
+def _ev(session, topic='t', src='ep', plugin='rh', seq=0):
+    from radical.orbit import protocol
+    return protocol.Event(src=src, plugin=plugin, topic=topic,
+                          session=session, seq=seq, ts=0.0, data={})
+
+
+def test_session_callback_local_routing():
+    """A session callback never gets another session's event — it is dropped
+    before the callback queue — but still gets session-less events (older
+    endpoints).  The broker pattern carries no session (wire unchanged)."""
+    rt = _bare_runtime()
+    cb = lambda *a: None                              # noqa: E731
+    rt.register_callback(endpoint_id='ep', plugin_name='rh', topic='t',
+                         callback=cb, session='sid-a')
+    sub = rt._emit.call_args.args[0]
+    assert [p.model_dump() for p in sub.patterns] \
+        == [{'endpoint': 'ep', 'plugin': 'rh', 'topic': 't'}]
+
+    for _ in range(5):
+        rt._on_event(_ev('sid-b'))                    # foreign: not queued
+    assert rt._cb._q.qsize() == 0 and rt._cb.dropped == 0
+    rt._on_event(_ev('sid-a'))
+    rt._on_event(_ev(None))                           # older endpoint
+    assert rt._cb._q.qsize() == 2
+
+    # an unscoped registration of the same pattern still gets them all
+    other = lambda *a: None                           # noqa: E731
+    rt.register_callback(endpoint_id='ep', plugin_name='rh', topic='t',
+                         callback=other)
+    rt._on_event(_ev('sid-b'))
+    assert [rt._cb._q.get_nowait()[0] for _ in range(3)] == [cb, cb, other]
+
+
+def test_session_callback_unregister():
+    """With *session*, unregister removes that session's registrations
+    (``None``: the unscoped ones); without it, all of the callback's (by
+    equality, so a bound method unregisters).  The unsubscribe goes out
+    only when the call removed one and none is left on the pattern."""
+    rt = _bare_runtime()
+    cb = lambda *a: None                              # noqa: E731
+    for sid in ('sid-a', 'sid-b', None):
+        rt.register_callback(endpoint_id='ep', plugin_name='rh',
+                             callback=cb, session=sid)
+    rt.unregister_callback(endpoint_id='ep', plugin_name='rh',
+                           callback=cb, session='sid-a')
+    rt.unregister_callback(endpoint_id='ep', plugin_name='rh',
+                           callback=cb, session=None)
+    assert rt._callbacks[('ep', 'rh', None)] == [(cb, False, 'sid-b')]
+    rt.register_callback(endpoint_id='ep', plugin_name='rh', callback=cb,
+                         session='sid-c')
+    kinds = [type(c.args[0]).__name__ for c in rt._emit.call_args_list]
+    assert kinds.count('Unsubscribe') == 0     # others still listen
+    rt.unregister_callback(endpoint_id='ep', plugin_name='rh', callback=cb,
+                           session='nope')     # removes nothing
+    rt.unregister_callback(endpoint_id='ep', plugin_name='rh', callback=cb)
+    assert ('ep', 'rh', None) not in rt._callbacks
+    kinds = [type(c.args[0]).__name__ for c in rt._emit.call_args_list]
+    assert (kinds.count('Subscribe'), kinds.count('Unsubscribe')) == (4, 1)
+
+    class _C:
+        def on(self, *a):
+            pass
+    c = _C()
+    rt.register_callback(endpoint_id='ep', callback=c.on, session='s')
+    rt.unregister_callback(endpoint_id='ep', callback=c.on, session='s')
+    assert ('ep', None, None) not in rt._callbacks
+
+
+def test_rescope_callback_is_atomic():
+    """A registration moves to a new session in one step: an event of the
+    new session is queued once, one of the old not at all; the wire is not
+    touched."""
+    rt = _bare_runtime()
+    cb = lambda *a: None                              # noqa: E731
+    rt.register_callback(endpoint_id='ep', callback=cb, with_meta=True,
+                         session='old')
+    assert rt.rescope_callback(endpoint_id='ep', callback=cb,
+                               session='old', new_session='new')
+    assert rt._callbacks[('ep', None, None)] == [(cb, True, 'new')]
+    assert len(rt._emit.call_args_list) == 1
+    for sid in ('old', 'new'):
+        rt._on_event(_ev(sid))
+    assert rt._cb._q.qsize() == 1
+    assert not rt.rescope_callback(endpoint_id='ep', callback=cb,
+                                   session='old', new_session='x')
+
+
 # ---------------------------------------------------------------------------
 # item 4: with_meta delivers broker-stamped seq matching what replay retains
 # ---------------------------------------------------------------------------

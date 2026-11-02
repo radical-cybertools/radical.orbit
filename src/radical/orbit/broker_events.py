@@ -12,8 +12,16 @@ Guarantees:
   subscribers — enqueue is non-blocking; overflow drops the *oldest* frame and
   bumps a per-subscriber counter so the consumer sees the loss as a ``seq`` gap
   (see :class:`radical.orbit.queues.BoundedDropOldestQueue`).
-* ``seq`` is broker-assigned and frozen with the envelope: monotone per session
-  for session-scoped events, monotone per the global stream otherwise.
+* ``seq`` is broker-assigned and frozen with the envelope: monotone per
+  ``(src, plugin, session)`` for session-scoped events, monotone per the global
+  stream otherwise.  Session ids are not unique across endpoints and plugins
+  (every plugin has a ``'default'`` session), so the bare sid is not a key.
+  A session stream does not start at 0: a new (or pruned) stream starts at
+  the broker-wide high-water mark of session seqs, so a stream's seq never
+  goes backwards while the broker runs; consumers start at the first seq they
+  see.  A pruned stream's jump to that mark looks like a gap to its
+  consumers: a known, rare false positive (pruning needs more than
+  ``SESSION_SEQ_MAX`` streams).
 * The raw tap sees *every* event (stateless, unfiltered) and runs on the
   plugin-host loop — never the routing loop.
 """
@@ -22,6 +30,7 @@ import asyncio
 import logging
 import time
 
+from collections import OrderedDict
 from typing import Any, Callable, Dict, List, Optional
 
 import msgpack
@@ -32,6 +41,11 @@ from .queues import BoundedDropOldestQueue
 
 
 log = logging.getLogger("radical.orbit.broker")
+
+# Bound on the per-session seq table (one counter per ``(src, plugin,
+# session)``), least recently used pruned first.  A pruned stream restarts at
+# the broker-wide session-seq high-water mark, never below its own past.
+SESSION_SEQ_MAX = 65536
 
 
 class EventRouter:
@@ -57,10 +71,16 @@ class EventRouter:
         self._subscriptions: Dict[str, List[protocol.SubscribePattern]] = {}
         self._out:           Dict[str, BoundedDropOldestQueue] = {}
         self._senders:       Dict[str, asyncio.Task] = {}
-        # One monotone seq counter per session-id ever seen.  Intentionally
-        # never pruned: sessions are re-registrable, and a stale counter keeps a
-        # re-registered session from re-using seq numbers a consumer already saw.
-        self._session_seq:   Dict[str, int]          = {}
+        # One monotone seq counter per ``(src, plugin, session)``.  Counters
+        # outlive their session (sessions are re-registrable, and a stale
+        # counter keeps a re-registered session from re-using seq numbers a
+        # consumer already saw), but the table is bounded: the least recently
+        # used counter goes first.  A new or pruned stream starts at
+        # ``_session_seq_base``, the high-water mark of every session seq
+        # issued so far, so a key's seq never goes backwards.
+        self._session_seq:   'OrderedDict[tuple, int]' = OrderedDict()
+        self._session_seq_max: int                   = SESSION_SEQ_MAX
+        self._session_seq_base: int                  = 0
         self._global_seq:    int                     = 0
         self._taps:          list                    = []
 
@@ -177,8 +197,15 @@ class EventRouter:
         raw['src'] = src_name
         session    = raw.get('session')
         if session:
-            seq = self._session_seq.get(session, 0)
-            self._session_seq[session] = seq + 1
+            key   = (src_name, raw.get('plugin'), session)
+            table = self._session_seq
+            seq   = table.get(key, self._session_seq_base)
+            table[key] = seq + 1
+            table.move_to_end(key)
+            if seq + 1 > self._session_seq_base:
+                self._session_seq_base = seq + 1
+            if len(table) > self._session_seq_max:
+                table.popitem(last=False)
             raw['seq'] = seq
         else:
             raw['seq'] = self._global_seq

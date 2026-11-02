@@ -13,7 +13,7 @@ from typing import Type, Optional, Dict, Callable, Any, Union
 from fastapi import FastAPI, HTTPException, Request
 from starlette.responses import JSONResponse
 
-from .plugin_session_base import PluginSession
+from .plugin_session_base import PluginSession, call_with_session
 from .ui_schema import UIConfig, ui_config_to_dict
 from .utils import HOST_ROLES
 
@@ -149,7 +149,10 @@ class Plugin(object):
     A session notifies via ``self.notify(topic, data)``; a plugin via
     ``await self.send_notification(topic, data)``.  Both flow Session ->
     Plugin -> runtime -> Broker -> subscribed consumers (and the gateway's SSE
-    fan-out), reaching HTTP clients over ``/events``.
+    fan-out), reaching HTTP clients over ``/events``.  A session's
+    notifications carry its sid as the event ``session`` (the broker numbers
+    them per ``(endpoint, plugin, session)``); a plugin-level send is
+    session-less unless it passes ``session=``.
 
     Topology updates
     ----------------
@@ -465,20 +468,25 @@ class Plugin(object):
         session._plugin = self
         return session
 
-    def _dispatch_notify(self, topic: str, data: dict) -> None:
+    def _dispatch_notify(self, topic: str, data: dict,
+                         session: Optional[str] = None) -> None:
         """
         Schedule a notification to be sent asynchronously.
 
-        Called by sessions via ``self._plugin._dispatch_notify(topic, data)``.
-        Works from both async contexts and background threads.
+        Called by sessions via ``self._plugin._dispatch_notify(topic, data,
+        session=sid)``.  Works from both async contexts and background
+        threads.
 
         Args:
-            topic: Notification topic string.
-            data:  Notification payload dict.
+            topic:   Notification topic string.
+            data:    Notification payload dict.
+            session: The session the notification belongs to (the event's
+                     ``session``); ``None`` for a plugin-level notification.
         """
         async def _send():
             try:
-                await self.send_notification(topic, data)
+                await call_with_session(self.send_notification, topic, data,
+                                        session=session)
             except Exception as e:
                 log.error("[%s] Notification send failed for %s: %s",
                           self.instance_name, topic, e)
@@ -789,18 +797,23 @@ class Plugin(object):
         """
         return True
 
-    async def send_notification(self, topic: str, data: dict):
+    async def send_notification(self, topic: str, data: dict,
+                                session: Optional[str] = None):
         """
         Broadcast a UI event over the broker SSE channels.
         Depends on `app.state.endpoint_service` having been injected by EndpointService.
+        *session* becomes the event's ``session`` (``None``: session-less).
         """
         endpoint_svc = getattr(self._app.state, "endpoint_service", None)
         if endpoint_svc is not None and hasattr(endpoint_svc, "send_notification"):
             # The endpoint runtime's send_notification is sync (it only hands the
             # event off to its transport loop); the broker plugin host's is
             # async.  Await only when the call returned an awaitable.
-            result = endpoint_svc.send_notification(
-                self.instance_name, topic, data)
+            # session-less sends keep the three-argument call, and so does
+            # a host shim without the ``session`` keyword
+            result = call_with_session(endpoint_svc.send_notification,
+                                       self.instance_name, topic, data,
+                                       session=session)
             if inspect.isawaitable(result):
                 await result
         else:
