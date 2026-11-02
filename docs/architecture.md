@@ -46,11 +46,12 @@ heartbeat kind. A frame-size cap bounds each frame.
 ## Session lifecycle
 
 A consumer opens a session on a plugin with `register_session` (create or
-reconnect), which selects a lifetime policy (`ephemeral` / `ttl` /
-`persistent`) and records the trusted owner identity; it releases it with
-`unregister_session`. Reattach is owner-checked; TTL and idle policies expire
-sessions on time; owner-bound ephemeral sessions are reclaimed a grace period
-after their owner is declared `lost`. See [Plugin Development](plugin_development.md) for the
+reconnect), which fixes its idle timeout (`ttl`, default: the plugin's
+`session_ttl`); it releases it with `unregister_session`. Any client holding
+the sid can attach; participant loss does not end a session.  A session idle
+longer than its timeout expires (requests, notifications and running work
+count as activity), and requests on an ended session answer 410 with the
+reason. See [Plugin Development](plugin_development.md) for the
 full model.
 
 

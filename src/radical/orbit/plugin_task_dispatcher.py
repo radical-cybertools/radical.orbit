@@ -27,8 +27,8 @@ no second process, and one endpoint's liveness to track instead of two.
 
 Pools are strictly per-session: keyed ``(owning_sid, pool_name)``, pool names
 are session-local, and there is no cross-session attach.  A pool's pilots
-follow the owning session's lifetime — session close (owner ``lost`` +
-reclaim-drain, ttl expiry, or explicit ``cancel_all``) tears the pools down.
+follow the owning session's lifetime — session close (idle expiry,
+``unregister_session``, or explicit ``cancel_all``) tears the pools down.
 Pools arrive only via ``register_session``.
 '''
 
@@ -724,16 +724,57 @@ class PoolState:
 # Session — thin identity handle
 # ---------------------------------------------------------------------------
 
+# How long queued tasks waiting on a pending pilot keep their session busy
+# without any task running (s): bounds an abandoned pool that keeps
+# resubmitting failing pilots.
+QUEUE_WAIT_MAX = 7 * 86400
+
+
 class TaskDispatcherSession(PluginSession):
     '''Session handle — owns this session's pools by lifetime.
 
     Pool/pilot state lives on :class:`PluginTaskDispatcher`, keyed by
-    ``(owning_sid, pool_name)``.  The session is the owner: closing it (owner
-    ``lost`` + reclaim-drain, ttl expiry, ``unregister_session``, or
-    ``cancel_all``) tears down *this session's* pools — cancelling their pilots
-    and marking the durable store — so a pool's pilots follow the session
-    lifetime policy.
+    ``(owning_sid, pool_name)``.  The session is the owner: closing it (idle
+    expiry, ``unregister_session``, or ``cancel_all``) tears down *this
+    session's* pools — cancelling their pilots and marking the durable store
+    — so a pool's pilots follow the session lifetime policy.
     '''
+
+    # Since when the session has had queued work but no running task
+    # (``None``: something runs, or nothing is queued).
+    _stalled_since: float | None = None
+
+    def is_busy(self) -> bool:
+        '''Probed at the idle deadline (the dispatcher notifies at plugin
+        level, so task events do not reset the idle clock themselves).
+
+        Busy while one of this session's pool tasks runs, or is queued while
+        a pilot of its pool is pending or starting (e.g. a long batch-queue
+        wait).  Queued tasks stop counting after ``QUEUE_WAIT_MAX`` without
+        any running task: an abandoned pool whose pilots keep failing (each
+        replacement pending again) must not keep submitting forever.  The
+        stall is first seen at a deadline probe, so such a pool ends one
+        idle timeout plus ``QUEUE_WAIT_MAX`` after its last access.
+        '''
+        if self._plugin is None:
+            return False
+        pools = self._plugin._pool_states.get(self._sid) or {}
+        if any(t.state == TASK_RUNNING
+               for ps in pools.values() for t in ps.tasks.values()):
+            self._stalled_since = None
+            return True
+        waiting = any(
+            any(t.state == TASK_QUEUED for t in ps.tasks.values())
+            and any(p.state in (PILOT_PENDING, PILOT_STARTING)
+                    for p in ps.pilots.values())
+            for ps in pools.values())
+        if not waiting:
+            self._stalled_since = None
+            return False
+        now = time.time()
+        if self._stalled_since is None:
+            self._stalled_since = now
+        return now - self._stalled_since < QUEUE_WAIT_MAX
 
     async def close(self) -> dict:
         '''Tear down this session's pools, then run the base close.'''
@@ -763,18 +804,14 @@ class TaskDispatcherClient(PluginClient):
 
         *sid* reconnects to (or names) an existing session -- pools are
         keyed per session, so a second client that should see a session's
-        pools has to join it by sid rather than mint its own.  *lifetime* /
-        *ttl* are the base session-policy fields.
+        pools has to join it by sid rather than mint its own.  *ttl* is the
+        session's idle timeout, fixed at creation (default: one day; ``0``:
+        never); *lifetime* is the legacy policy name.
         '''
         body: dict = {}
         if pools is not None:
             body['pools'] = pools
-        if sid is not None:
-            body['sid'] = sid
-        if lifetime is not None:
-            body['lifetime'] = lifetime
-        if ttl is not None:
-            body['ttl'] = ttl
+        body.update(self._session_payload(sid, lifetime, ttl) or {})
         resp = self._http.post(self._url('register_session'), json=body)
         self._raise(resp)
         self._sid = resp.json()['sid']
@@ -969,7 +1006,7 @@ class TaskDispatcherClient(PluginClient):
         '''Tear down this session's pools: cancel their pilots, drop the pools.
 
         The explicit reclaim path for ``persistent``/``default`` pools, which
-        have no liveness-driven expiry.
+        never idle-expire.
         '''
         self._require_session()
         resp = self._http.post(self._url(f'cancel_all/{self.sid}'))
@@ -1017,6 +1054,10 @@ class PluginTaskDispatcher(Plugin):
     session_class = TaskDispatcherSession
     client_class  = TaskDispatcherClient
     version       = '0.0.1'
+    # a day: broker-hosted state clients reconnect to, but an abandoned pool
+    # can keep submitting batch jobs for child endpoints (walltime bounds
+    # each job, not the replacements), so not forever
+    session_ttl   = 86400
 
     ui_config = {
         'icon'          : '📦',
@@ -1228,7 +1269,8 @@ class PluginTaskDispatcher(Plugin):
         Scan ``<state_root>/<sid>/<pool>__<endpoint>/state.json``, reload each
         pool's config, and re-materialise its :class:`PoolState` (which loads
         the pilot/task maps).  Owner reconnection then reconciles naturally; a
-        pool whose owner never returns is drained by the reclaim / ttl path.
+        pool whose owner never returns stays dormant (housekeeping ticks only
+        pools of live sessions).
         '''
         if not self._state_root.exists():
             return
@@ -1440,6 +1482,11 @@ class PluginTaskDispatcher(Plugin):
         *register_kwargs* to ``register_session``, and caches the client
         under *key*.  Returns ``None`` when no caller is wired or *dst* /
         its *plugin* is unreachable.
+
+        The session never idle-expires (``ttl=0``): the client stays cached
+        across arbitrarily long idle phases of the pools that use it.  It is
+        bounded by its endpoint -- a pilot's child endpoint ends with its
+        batch job, and the cache entry is dropped when *dst* is lost.
         '''
         if self._broker_caller is None:
             return None
@@ -1448,7 +1495,7 @@ class PluginTaskDispatcher(Plugin):
             return client
         client = self._make_child_client(cls, plugin, dst)
         try:
-            await asyncio.to_thread(client.register_session,
+            await asyncio.to_thread(client.register_session, ttl=0,
                                     **register_kwargs)
         except Exception as e:
             log.warning('[%s] %s session unavailable on %s: %s',
@@ -2210,7 +2257,7 @@ class PluginTaskDispatcher(Plugin):
         '''Tear down this session's pools (cancel pilots, drop the pools).
 
         The explicit reclaim path for ``persistent``/``default`` pools, which
-        have no liveness-driven expiry.  Idempotent.
+        never idle-expire.  Idempotent.
         '''
         sid = request.path_params['sid']
         self._require_known_session(sid)
@@ -2433,21 +2480,16 @@ class PluginTaskDispatcher(Plugin):
                             detail=f'unknown task: {task_id}')
 
     async def on_topology_change(self, participants: dict) -> None:
-        '''Rich-topology hook: bind pilots + honour the owner-session reclaim.
+        '''Rich-topology hook: bind pilots to child-endpoint liveness.
 
         The broker delivers the rich topology
         (``name -> {role, plugins, liveness}``) on every change, synthesizing a
         ``liveness == 'lost'`` entry for a participant that vanishes after the
-        grace.  Two concerns share this signal:
-
-        - **Pilot child liveness.**  A child that becomes ``present`` activates
-          a PENDING/STARTING pilot; ``suspect`` pauses scheduling to it (a blip
-          must not tear it down); ``lost`` finalises the pilot — DONE if
-          walltime elapsed, else FAILED — reclaiming its capacity and
-          re-enqueuing unfinished tasks.
-        - **Owner-session reclaim.**  ``super().on_topology_change`` arms the
-          reclaim-drain for a *session owner* declared ``lost``; the drain then
-          closes the session, which tears down its pools.
+        grace.  A child that becomes ``present`` activates a PENDING/STARTING
+        pilot; ``suspect`` pauses scheduling to it (a blip must not tear it
+        down); ``lost`` finalises the pilot — DONE if walltime elapsed, else
+        FAILED — reclaiming its capacity and re-enqueuing unfinished tasks.
+        Session owners' loss does not end sessions (idle expiry does).
 
         Also refreshes the cached per-endpoint plugin set and the cached
         topology from the non-lost participants.
@@ -2479,8 +2521,6 @@ class PluginTaskDispatcher(Plugin):
         for ps in self._all_pools():
             self._reconcile_pilots_for(ps, participants)
 
-        # Owner-session reclaim-drain: arms on a *lost* owner of ephemeral
-        # sessions, cancels on its return.
         await super().on_topology_change(participants)
 
     def _reconcile_pilots_for(self, ps: 'PoolState',

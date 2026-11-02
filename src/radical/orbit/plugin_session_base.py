@@ -72,11 +72,30 @@ class PluginSession:
     def notify(self, topic: str, data: dict) -> None:
         """Send a notification to consumers via the parent plugin.
 
-        A no-op when the session has no plugin (e.g. built directly in a
-        test).  Safe from sync/async contexts and background threads.
+        A notification is activity of this session (its idle clock restarts:
+        work events mark when work last moved).  A no-op when the session
+        has no plugin (e.g. built directly in a test).  Safe from sync/async
+        contexts and background threads.
         """
         if self._plugin is not None:
+            touch = getattr(self._plugin, '_touch', None)
+            if touch is not None:
+                touch(self._sid)    # no-op once the session's record is gone
             self._plugin._dispatch_notify(topic, data)
+
+    async def ping(self) -> dict:
+        """No-op session call: ``touch/{sid}`` forwards it, so that it counts
+        as an access without any other effect."""
+        return {}
+
+    def is_busy(self) -> bool:
+        """Whether the session has work in flight that emits no events.
+
+        Probed only when the session reaches its idle deadline: True counts
+        as activity (see the lifetime policy on :class:`Plugin`).  Override
+        in sessions that run long work; keep it cheap.
+        """
+        return False
 
     def start_status_poller(
         self, *,

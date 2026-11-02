@@ -123,8 +123,12 @@ class BrokerPluginHost(PluginHostBase):
         # NOTE: headers are deliberately NOT passed into the shim -- this
         # path serves gateway and in-process callers, where a client-supplied
         # `x-orbit-src` must not surface as a trusted owner (see RequestShim).
+        # Only the X-Orbit-Client tag passes: it merely selects how an idle
+        # expiry is logged (an Explorer tab's end is not API misuse).
         content_type = headers.get('content-type', 'application/json')
-        shim = RequestShim(path_params, query_params, body_bytes, content_type)
+        client       = headers.get('x-orbit-client')
+        shim = RequestShim(path_params, query_params, body_bytes, content_type,
+                           {'x-orbit-client': client} if client else None)
 
         try:
             result = await handler(shim)
@@ -174,7 +178,7 @@ class BrokerPluginHost(PluginHostBase):
         """Stop every hosted plugin's background work (broker shutdown path).
 
         Runs on the host loop; drives each plugin's ``shutdown`` hook (cancel
-        cleanup / reclaim-drain tasks, close sessions) so the host loop can be
+        cleanup tasks, close sessions) so the host loop can be
         torn down without pending plugin tasks.
         """
         for pname, plugin in list(self._plugins.items()):

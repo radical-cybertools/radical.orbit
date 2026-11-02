@@ -40,13 +40,11 @@ Why it is built this way
   so re-sending every class pool is both required and free.  One helper,
   ``_class_pool_decls``, builds it for join, restart replay and liveness
   re-attach alike — three callers, one declaration shape, no drift.
-- **Dispatcher sessions expire.**  A session registered through the
-  in-process host path carries no ``x-orbit-src`` owner, so it is an
-  owner-less *ephemeral* session and the base sweep drops it
-  ``session_ttl`` (3600 s) after its last access — and dropping a dispatcher
-  session cancels its pools and pilots.  Dispatcher routes do not bump
-  ``last_access``.  Therefore every session the federation creates is
-  registered ``lifetime='persistent'`` and released explicitly on ``leave``.
+- **Dispatcher sessions expire.**  A dispatcher session idle longer than
+  its timeout is dropped by the base sweep — and dropping a dispatcher
+  session cancels its pools and pilots.  A federation pool can idle for
+  arbitrarily long, so every session the federation creates is registered
+  ``lifetime='persistent'`` and released explicitly on ``leave``.
   The federation's *own* routes all run on the reserved ``default`` session,
   which is always persistent.
 - **Broker-hosted plugins cannot call each other through the broker
@@ -351,8 +349,8 @@ class FederationClient(PluginClient):
     '''Application-side client for the federation plugin.
 
     Every call uses the reserved ``default`` session: federation state is
-    global to the plugin instance, and a client-minted session would be
-    swept after an idle hour.
+    global to the plugin instance, and a client-minted session would
+    idle-expire (it owns nothing, so other sessions keep the default timeout).
     '''
 
     # Every federation route is addressed with the reserved persistent

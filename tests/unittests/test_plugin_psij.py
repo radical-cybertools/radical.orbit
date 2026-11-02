@@ -553,3 +553,89 @@ def test_psij_dir_follows_the_environment(monkeypatch, tmp_path):
     monkeypatch.setenv('RADICAL_ORBIT_PSIJ_DIR', str(tmp_path / 'psij'))
     assert m._psij_dir() == tmp_path / 'psij'
     assert m._output_base() == tmp_path / 'psij' / 'output'
+
+
+# --- session lifetime: is_busy and final terminal states --------------------
+
+def _psij_session(mock_psij):
+    app    = FastAPI()
+    plugin = PluginPSIJ(app)
+    sid    = TestClient(app).post(
+        f"{plugin.namespace}/register_session").json()['sid']
+    sess   = plugin._sessions[sid]
+    sent   = []
+    sess.notify = lambda topic, data: sent.append(data)
+    return sess, sent
+
+
+def _status(state):
+    st = MagicMock()
+    st.state     = state
+    st.exit_code = 0
+    return st
+
+
+def test_psij_failed_submit_is_recorded_failed(mock_psij):
+    sess, sent = _psij_session(mock_psij)
+    job        = MagicMock()
+    job.id     = 'job.1'
+    mock_psij.Job.return_value = job
+    mock_psij.JobExecutor.get_instance.return_value.submit.side_effect = \
+        RuntimeError('no scheduler')
+
+    with pytest.raises(Exception):
+        asyncio.run(sess.submit_job({'executable': '/bin/true'}, 'local'))
+
+    assert sess._job_states['job.1'] == 'FAILED'
+    assert sent[-1]['state'] == 'FAILED'
+    assert 'no scheduler' in sent[-1]['stderr']
+    assert sess.is_busy() is False
+
+
+def test_psij_is_busy_while_a_job_is_not_terminal(mock_psij):
+    sess, _ = _psij_session(mock_psij)
+    assert sess.is_busy() is False
+    sess._jobs['job.1'] = MagicMock()
+    assert sess.is_busy() is True
+    sess._notify_state('job.1', _status('COMPLETED'))
+    assert sess.is_busy() is False
+
+
+def test_psij_terminal_state_is_final(mock_psij):
+    sess, sent = _psij_session(mock_psij)
+    sess._jobs['job.1'] = MagicMock()
+    sess._notify_state('job.1', _status('COMPLETED'))
+    sess._notify_state('job.1', _status('ACTIVE'))
+    assert sess._job_states['job.1'] == 'COMPLETED'
+    assert [d['state'] for d in sent] == ['COMPLETED']
+
+
+def test_psij_requested_cancel_remaps_a_racing_completion(mock_psij):
+    sess, sent = _psij_session(mock_psij)
+    sess._jobs['job.1'] = MagicMock()
+    sess._notify_state('job.1', _status('ACTIVE'))
+    asyncio.run(sess.cancel_job('job.1'))
+    sess._notify_state('job.1', _status('COMPLETED'))
+    assert sess._job_states['job.1'] == 'CANCELED'
+
+
+def test_psij_cancel_of_a_finished_job_keeps_its_state(mock_psij):
+    sess, sent = _psij_session(mock_psij)
+    sess._jobs['job.1'] = MagicMock()
+    sess._notify_state('job.1', _status('COMPLETED'))
+    asyncio.run(sess.cancel_job('job.1'))
+    sess._notify_state('job.1', _status('COMPLETED'))
+    assert sess._job_states['job.1'] == 'COMPLETED'
+    assert 'job.1' not in sess._cancelled_jobs
+
+
+def test_psij_cancel_racing_a_recorded_completion_keeps_it(mock_psij):
+    '''A job recorded COMPLETED stays COMPLETED even if a cancel lands in
+    _cancelled_jobs afterwards (race with the status callback).'''
+    sess, sent = _psij_session(mock_psij)
+    sess._jobs['job.1'] = MagicMock()
+    sess._notify_state('job.1', _status('COMPLETED'))
+    sess._cancelled_jobs.add('job.1')
+    sess._notify_state('job.1', _status('COMPLETED'))
+    assert sess._job_states['job.1'] == 'COMPLETED'
+    assert [d['state'] for d in sent] == ['COMPLETED']
