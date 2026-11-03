@@ -848,6 +848,28 @@ def test_empty_session_is_session_less_at_ingest():
     assert len(router._out['c'].buf) == 1        # passes as session-less
 
 
+def test_empty_session_in_pattern_is_none():
+    """An empty session in a subscribe pattern is no session (as on
+    events): the pattern is the plain one, and unsubscribing either form
+    removes it."""
+    from radical.orbit.broker_events import EventRouter
+
+    router = EventRouter({}, lambda *a: None, MagicMock(), 8, lambda: None)
+    router.add_endpoint('c')
+    router.update_subscription('c', {'patterns': [
+        {'endpoint': 'ep', 'plugin': 'rh', 'session': ''}]}, True)
+    assert router._subscriptions['c'] == [
+        protocol.SubscribePattern(endpoint='ep', plugin='rh')]
+    rest, streams, pairs = router._index['c']
+    assert len(rest) == 1 and not streams and not pairs
+    router.ingest('ep', {'kind': 'event', 'plugin': 'rh', 'topic': 't',
+                         'session': 'x', 'data': {}})
+    assert len(router._out['c'].buf) == 1        # plain: every session
+    router.update_subscription('c', {'patterns': [
+        {'endpoint': 'ep', 'plugin': 'rh'}]}, False)
+    assert router._subscriptions['c'] == []
+
+
 @pytest.mark.asyncio
 async def test_event_queue_drop_oldest_with_counter(make_broker):
     broker = make_broker(event_queue=2)

@@ -157,7 +157,10 @@ class EventRouter:
         try:
             for p in raw.get('patterns') or []:
                 try:
-                    patterns.append(protocol.SubscribePattern(**p))
+                    pat = protocol.SubscribePattern(**p)
+                    if pat.session == '':        # no session, as on events
+                        pat = pat.model_copy(update={'session': None})
+                    patterns.append(pat)
                 except (TypeError, ValueError) as e:
                     log.warning("[Broker] %s: rejected %s pattern %r: %s",
                                 name, raw.get('kind'), p, e)

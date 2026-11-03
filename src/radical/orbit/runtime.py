@@ -1055,10 +1055,17 @@ class EndpointRuntime(PluginHostBase):
                          session: Optional[str] = None,
                          new_session: Optional[str] = None) -> bool:
         """Move the registrations of *callback* for this pattern from
-        *session* to *new_session* in one step under the registry lock: no
-        event sees both scopes, or neither.  Where the broker routes the
-        session, the session pattern moves too (the new one subscribed
-        first).  Returns ``False`` when there was nothing to move."""
+        *session* to *new_session* in one step under the registry lock, so
+        the local filter never passes an event to both scopes, or to
+        neither.  Returns ``False`` when there was nothing to move.
+
+        Where the broker routes sessions, the broker pattern moves too (the
+        new one subscribed first).  Events of *new_session* the broker
+        ingests before it processes that ``subscribe`` are not delivered: a
+        caller moving to a session that may already be emitting holds the
+        plain pattern across the move (:meth:`hold_subscription` …
+        :meth:`release_subscription`), as ``RhapsodyClient`` does around
+        ``register_session``."""
         session, new_session = session or None, new_session or None
         protocol.SubscribePattern(endpoint=endpoint_id, plugin=plugin_name,
                                   topic=topic,
@@ -1234,7 +1241,7 @@ class EndpointRuntime(PluginHostBase):
         for cb, with_meta in matched:
             if with_meta:
                 if meta is None:
-                    meta = {'seq': ev.seq, 'ts': ev.ts, 'session': ev.session}
+                    meta = {'seq': ev.seq, 'ts': ev.ts, 'session': session}
                 self._cb.submit(cb, endpoint, plugin, topic, data, meta)
             else:
                 self._cb.submit(cb, endpoint, plugin, topic, data)

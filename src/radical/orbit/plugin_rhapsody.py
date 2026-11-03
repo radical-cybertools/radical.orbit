@@ -1370,6 +1370,9 @@ class RhapsodyClient(PluginClient):
         # with the sid.  Callbacks registered through
         # ``register_notification_callback`` stay unscoped.
         self._own: list[list] = []
+        # topics held across a session switch (``_hold_own``), None while
+        # none is in progress; guarded by ``_cond``
+        self._switch_held: list | None = None
         self._scoping: bool | None = None       # see _can_scope
 
     # -- this client's own, session-scoped runtime callbacks -----------------
@@ -1401,6 +1404,12 @@ class RhapsodyClient(PluginClient):
         (``None``: unscoped until the sid is known)."""
         with self._cond:
             sid = sid if self._can_scope() else None
+            held = self._switch_held
+            if held is not None and sid is not None and topic not in held:
+                # registered during a switch: its move needs the hold too
+                self._bc.hold_subscription(self._endpoint_id,
+                                           self._plugin_name, topic)
+                held.append(topic)
             self._bc.register_callback(**self._own_key(topic, fn),
                                        **self._scope_kw(sid))
             self._own.append([topic, fn, sid])
@@ -1463,26 +1472,31 @@ class RhapsodyClient(PluginClient):
         (``hold_subscription``) and return their topics, for a session
         switch: where the broker filters by session, events of the new
         session (an existing one may already send) are not dropped at the
-        broker before the callbacks move.  Nothing for a broker client
-        without it."""
+        broker before the callbacks move.  Snapshot and holds are one
+        ``_cond`` section, and a scoped callback registered before the
+        release (``_register_own``) holds its topic too, so no record moves
+        unheld.  Nothing for a broker client without it."""
         if not (self._can_scope()
                 and callable(getattr(self._bc, 'hold_subscription', None))):
             return []
+        held: list = []
         with self._cond:
-            topics = list(dict.fromkeys(r[0] for r in self._own
-                                        if r[2] is not None))
-        held = []
-        try:
-            for topic in topics:
-                self._bc.hold_subscription(self._endpoint_id,
-                                           self._plugin_name, topic)
-                held.append(topic)
-        except BaseException:
-            self._release_own(held)             # never left held
-            raise
-        return topics
+            try:
+                for topic in dict.fromkeys(r[0] for r in self._own
+                                           if r[2] is not None):
+                    self._bc.hold_subscription(self._endpoint_id,
+                                               self._plugin_name, topic)
+                    held.append(topic)
+            except BaseException:
+                self._release_own(held)         # never left held
+                raise
+            self._switch_held = held
+        return held
 
     def _release_own(self, topics) -> None:
+        with self._cond:
+            if topics is self._switch_held:
+                self._switch_held = None        # the switch is over
         for topic in topics:
             try:
                 self._bc.release_subscription(self._endpoint_id,

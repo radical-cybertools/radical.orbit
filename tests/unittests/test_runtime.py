@@ -1114,6 +1114,18 @@ def test_empty_session_is_none():
     assert rt._callbacks[('ep', 'rh', None)] == [(scoped, False, 'sid-a')]
 
 
+def test_meta_session_normalised():
+    """with_meta carries the normalised session: an empty one is None."""
+    rt = _topo_runtime()
+    cb = lambda *a: None                              # noqa: E731
+    rt.register_callback(endpoint_id='ep', plugin_name='rh', callback=cb,
+                         with_meta=True)
+    rt._on_event(_ev(''))
+    rt._on_event(_ev('sid-a'))
+    metas = [rt._cb._q.get_nowait()[1][-1]['session'] for _ in range(2)]
+    assert metas == [None, 'sid-a']
+
+
 def test_malformed_pattern_never_sent():
     """An argument the broker could not parse as a pattern raises before
     any state changes: nothing registered, nothing sent."""
