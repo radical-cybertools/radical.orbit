@@ -640,3 +640,64 @@ def test_non_string_id_400(env, did):
     _, _, tc, sid = env
     r = tc.post(f'/dragon/ddict/keys/{sid}', json={'id': did})
     assert r.status_code == 400
+
+
+# ── review round 4 ──────────────────────────────────────────────────────────
+
+def test_runtime_native_under_launcher(monkeypatch):
+    import sys
+    import types
+    monkeypatch.setitem(sys.modules, 'dragon',
+                        types.SimpleNamespace(in_dragon=lambda: True))
+    backend = DDictBackend('start')
+    backend._runtime_up()
+    assert backend._rt == 'native'
+    backend._runtime_down()             # not ours: nothing to stop
+    assert backend._rt is None
+
+
+def test_calls_after_close_503():
+    from fastapi import HTTPException
+    backend = _FakeBackend()
+    asyncio.run(backend.close())
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(backend.keys('x'))
+    assert e.value.status_code == 503
+
+
+def test_failed_destroy_marks_failed_and_retries(env):
+    plugin, backend, tc, sid = env
+    did = _create(tc, sid)['id']
+    dd  = backend._ddicts[did]
+
+    def _boom():
+        raise RuntimeError('manager error')
+    dd.destroy = _boom
+    r = tc.post(f'/dragon/ddict/destroy/{sid}', json={'id': did})
+    assert r.status_code == 500
+    assert plugin.entries[did]['state'] == 'failed'
+    r = tc.post(f'/dragon/ddict/put/{sid}', json={'id': did, 'items': {}})
+    assert r.status_code == 409                     # not usable
+    dd.destroy = lambda: None
+    r = tc.post(f'/dragon/ddict/destroy/{sid}', json={'id': did})
+    assert r.status_code == 200
+    assert did not in plugin.entries
+
+
+def test_get_errors_count_toward_reply_limit(env):
+    plugin, backend, tc, sid = env
+    did = _create(tc, sid)['id']
+    backend._ddicts[did].update({f'k{i}': {i} for i in range(20)})   # sets
+    plugin.reply_limit = 200
+    r = tc.post(f'/dragon/ddict/get/{sid}',
+                json={'id': did, 'keys': [f'k{i}' for i in range(20)]})
+    assert r.status_code == 413
+
+
+def test_keys_size_counts_json_escapes(env):
+    plugin, backend, tc, sid = env
+    did = _create(tc, sid)['id']
+    backend._ddicts[did].update({'\x01' * 10: 1})     # 10 B, 60 B escaped
+    plugin.reply_limit = 40
+    r = tc.post(f'/dragon/ddict/keys/{sid}', json={'id': did})
+    assert r.status_code == 413

@@ -20,7 +20,10 @@ and is not in any default plugin set:
 
 ## Dragon runtime
 
-`$RADICAL_ORBIT_DRAGON_RUNTIME` selects how the plugin reaches a runtime:
+An endpoint launched by the `dragon` launcher (the endpoint wrapper does
+that when dragonhpc is in its venv, inside an allocation) uses the runtime
+it runs in.  Otherwise `$RADICAL_ORBIT_DRAGON_RUNTIME` selects how the
+plugin reaches a runtime:
 
 - `attach`: join a running runtime (`$DRAGON_ATTACH_TOKEN`, printed by
   `dragon -s -a dragon-waiting-runtime-head` or set by a launcher);
@@ -41,8 +44,9 @@ When the endpoint exits, the plugin destroys its DDicts.
 
 Keys are strings (keys of other types written inside the runtime are
 counted by `len()` and reported as `n_other` by `keys`).  Values are
-JSON-serializable objects or `bytes`; bytes travel as
-`{"$b64": "<base64>"}`, and a malformed marker is a 400.  A value written inside the runtime that
+JSON-serializable objects or `bytes` (top level only; bytes nested in a
+JSON value are not encoded); bytes travel as `{"$b64": "<base64>"}`,
+and a malformed marker is a 400.  A value written inside the runtime that
 is neither (e.g. a numpy array) is reported per key in `errors`.  A `get`
 reply above half the transport frame cap fails with 413: get fewer keys per
 call.

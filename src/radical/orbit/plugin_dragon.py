@@ -15,7 +15,8 @@ and is not part of any default plugin set::
 
     ./bin/radical-orbit-endpoint-wrapper.sh --plugins default,dragon
 
-Runtime selection (``$RADICAL_ORBIT_DRAGON_RUNTIME``):
+An endpoint launched by the ``dragon`` launcher uses the runtime it runs
+in.  Otherwise, runtime selection (``$RADICAL_ORBIT_DRAGON_RUNTIME``):
 
 - ``attach``: join a running Dragon runtime (``$DRAGON_ATTACH_TOKEN``);
 - ``start``:  start a single-node runtime on first use, stop it at
@@ -67,6 +68,8 @@ NAME_RE          = re.compile(r'[A-Za-z0-9_.-]{1,64}')
 ID_PREFIX        = 'ddict.'           # DDict IDs; reserved for names
 MEM_RE           = re.compile(r'(\d+)\s*([KMGT]?)B?', re.IGNORECASE)
 MEM_UNITS        = {'': 1, 'K': 2**10, 'M': 2**20, 'G': 2**30, 'T': 2**40}
+
+NATIVE           = 'native'            # _rt: running inside a runtime
 
 # bytes values travel as ``{B64_KEY: "<base64>"}``; everything else as JSON
 B64_KEY          = '$b64'
@@ -158,6 +161,9 @@ class DDictBackend:
         self._ddicts: Dict[str, Any] = {}
 
     async def _call(self, fn, *args, **kwargs) -> Any:
+        if self._pool_down:
+            raise HTTPException(status_code=503,
+                                detail="dragon backend is closed")
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             self._pool, functools.partial(fn, *args, **kwargs))
@@ -167,12 +173,23 @@ class DDictBackend:
     def _runtime_up(self) -> None:
         if self._rt is not None:
             return
+
+        # launched by the `dragon` launcher (the endpoint wrapper does that
+        # when dragonhpc is installed): use the runtime we run in
+        import dragon
+        if dragon.in_dragon():
+            self._rt = NATIVE
+            log.info("[dragon] running inside a Dragon runtime")
+            return
+
         # the runtime is spawned through the `dragon` launcher, which sits
         # next to the interpreter when the venv is not activated
         if not shutil.which('dragon'):
             bindir = os.path.dirname(sys.executable)
             if os.path.exists(os.path.join(bindir, 'dragon')):
-                os.environ['PATH'] = bindir + os.pathsep + os.environ['PATH']
+                path = os.environ.get('PATH')
+                os.environ['PATH'] = bindir + (os.pathsep + path
+                                               if path else '')
 
         from dragon.workflows import runtime as drt
         t0 = time.time()
@@ -185,7 +202,8 @@ class DDictBackend:
     def _runtime_down(self) -> None:
         if self._rt is None:
             return
-        if self._mode == 'start': self._rt.stop()
+        if   self._rt is NATIVE   : pass         # not ours to stop
+        elif self._mode == 'start': self._rt.stop()
         else                    : self._rt.detach()
         self._rt = None
 
@@ -388,24 +406,27 @@ class DragonSession(PluginSession):
                   values: bool = True) -> dict:
         self._check_active()
         self._p.entry(did)
+        hint = 'get fewer keys per call'
         if not values:
             missing = await self._p.backend.contains(did, keys)
+            self._p.check_reply(len(json.dumps(missing)), hint)
             return {"items": {}, "missing": missing, "errors": {}}
         found, missing = await self._p.backend.get(did, keys)
         items, errors = {}, {}
+        # sizes as escaped JSON (ensure_ascii): an upper bound of the reply
         size = len(json.dumps(missing))
         for k, v in found.items():
             v = encode_value(v)
             try:
                 # strict JSON: the reply renderer rejects NaN / inf
-                size += len(json.dumps(v, allow_nan=False)) \
-                      + len(k.encode()) + 8
+                size += len(json.dumps(v, allow_nan=False))
+                items[k] = v
             except (TypeError, ValueError):
                 errors[k] = f"value of type {type(v).__name__} is not " \
                             f"JSON-serializable"
-                continue
-            self._p.check_reply(size, 'get fewer keys per call')
-            items[k] = v
+                size += len(json.dumps(errors[k]))
+            size += len(json.dumps(k)) + 4
+            self._p.check_reply(size, hint)
         return {"items": items, "missing": missing, "errors": errors}
 
     @_not_found_404
@@ -414,7 +435,7 @@ class DragonSession(PluginSession):
         self._p.entry(did)
         keys = await self._p.backend.keys(did)
         strs = [k for k in keys if isinstance(k, str)]
-        self._p.check_reply(sum(len(k.encode()) + 4 for k in strs),
+        self._p.check_reply(len(json.dumps(strs)),
                             'too many keys for one reply')
         # keys written in-runtime may be of any type; the handle uses str
         return {"keys": strs, "n_other": len(keys) - len(strs)}
@@ -693,7 +714,10 @@ class PluginDragon(Plugin):
         return dict(entry)
 
     async def ddict_destroy(self, did: str) -> dict:
-        entry = self.entry(did)
+        entry = self.entry(did, ready=False)
+        if entry['state'] not in ('ready', 'failed'):
+            raise http_exception(FileExistsError(
+                f"ddict {did} is {entry['state']}"))
         entry['state'] = 'destroying'
         try:
             await self.backend.destroy(did)
@@ -704,7 +728,8 @@ class PluginDragon(Plugin):
             self.backend.discard(did)
             raise
         except BaseException:
-            entry['state'] = 'ready'
+            # may be partly torn down: not usable, destroy can be retried
+            entry['state'] = 'failed'
             raise
         self.entries.pop(did, None)
         log.info("[dragon] destroyed %s (%s)", did, entry['name'])
