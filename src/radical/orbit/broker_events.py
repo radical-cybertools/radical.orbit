@@ -242,7 +242,9 @@ class EventRouter:
         enqueue, so a storm never stalls routing.
         """
         raw['src'] = src_name
-        session    = raw.get('session')
+        # an empty session is none: numbering and routing agree on it
+        session    = raw.get('session') or None
+        raw['session'] = session
         if session:
             key   = (src_name, raw.get('plugin'), session)
             table = self._session_seq

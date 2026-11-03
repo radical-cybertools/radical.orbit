@@ -677,7 +677,6 @@ class PluginPSIJ(Plugin):
     session_class = PSIJSession
     client_class = PSIJClient
     version = '0.0.1'
-    session_events = True       # all its events are session events
 
     ui_config = {
         "icon": "🚀",

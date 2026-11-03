@@ -38,10 +38,11 @@ payload:
 - `register` / `register_ack` — the identity + resume-key handshake.
 - `subscribe` / `unsubscribe` — live-event interest patterns
   (`endpoint`, `plugin`, `topic`, optional `session`); a runtime sends a
-  `session` pattern only where the broker and the endpoint plugin advertise
-  `session_events` in topology, and only for session-scoped registrations
-  (unscoped ones keep the plain pattern and still receive every session's
-  events).
+  `session` pattern only where the broker advertises `session_events` in
+  topology, and only for session-scoped registrations on a concrete
+  endpoint and plugin (unscoped ones keep the plain pattern and still
+  receive every session's events).  A session pattern narrows
+  session-stamped events only; session-less events always pass.
 - `topology` — a rich participant/plugin/liveness snapshot.
 - `control` — `shutdown` / `error` / `terminate` / `disconnect`.
 

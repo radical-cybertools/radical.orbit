@@ -954,7 +954,6 @@ def test_notification_callbacks_fire_in_registration_order():
     rt = EndpointRuntime.__new__(EndpointRuntime)
     rt._callbacks = {}
     rt._cb_lock   = _threading.Lock()
-    rt._session_capable = set()
     rt._broker_routes   = False
     rt._wire_count     = Counter()
     rt._held           = Counter()
@@ -3096,7 +3095,6 @@ def _bare_runtime(maxlen=1024):
     rt._name      = 'consumer'
     rt._callbacks = {}
     rt._cb_lock   = threading.Lock()
-    rt._session_capable = set()
     rt._broker_routes   = False
     rt._wire_count     = Counter()
     rt._held           = Counter()
@@ -3122,16 +3120,16 @@ def _scopes(rt, fn=None):
 
 
 def _routed_runtime():
-    """A bare runtime that learned the session capability from topology
-    as a real one does: the endpoint entry is what a runtime serving the
-    real PluginRhapsody registers, the broker entry carries its caps."""
+    """A bare runtime that learned session routing from topology as a
+    real one does: the endpoint entry is what a runtime serving the real
+    PluginRhapsody registers, the broker entry carries its caps (the only
+    flag routing needs)."""
     from radical.orbit import protocol
     from radical.orbit.runtime import EndpointRuntime
 
     served = EndpointRuntime.__new__(EndpointRuntime)
     served._plugins = {'rhapsody': PluginRhapsody(FastAPI())}
     plugins = {d['name']: d for d in served._plugin_dicts()}
-    assert plugins['rhapsody']['session_events'] is True
 
     rt = _bare_runtime()
     rt._topology, rt._topology_callbacks, rt._plugins = {}, [], {}
@@ -3142,7 +3140,7 @@ def _routed_runtime():
             plugins={protocol.BROKER_CAPS: protocol.broker_caps_entry()}),
         'ep': protocol.ParticipantInfo(role='endpoint', liveness='present',
                                        plugins=plugins)}))
-    assert rt._broker_routes and ('ep', 'rhapsody') in rt._session_capable
+    assert rt._broker_routes
     return rt
 
 
@@ -3150,16 +3148,6 @@ def _sub_frames(rt):
     return [(m.kind, [(p.topic, p.session) for p in m.patterns])
             for m in (c.args[0] for c in rt._emit.call_args_list)
             if m.kind in ('subscribe', 'unsubscribe')]
-
-
-def test_session_events_advertised_by_session_plugins():
-    """The plugins whose events are all session-stamped say so (the flag
-    is per class: a lost one silently stops broker routing)."""
-    from radical.orbit.plugin_math     import PluginMath
-    from radical.orbit.plugin_psij     import PluginPSIJ
-    from radical.orbit.plugin_xgfabric import PluginXGFabric
-    for cls in (PluginRhapsody, PluginPSIJ, PluginMath, PluginXGFabric):
-        assert cls.session_events is True, cls
 
 
 def test_hold_own_releases_taken_holds_on_failure():

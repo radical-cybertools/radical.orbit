@@ -748,15 +748,14 @@ async def test_malformed_subscribe_pattern_rejects_pattern_not_socket(
 async def test_broker_topology_advertises_session_events(make_broker):
     """The broker advertises its own ``session_events`` under the reserved
     key of its topology entry — with no hosted plugins too — and keeps the
-    key out of the snapshot (the gateway and host source); plugins carry
-    their own flag."""
+    key out of the snapshot (the gateway and host source)."""
     for spec in ('', 'sysinfo'):
         broker = make_broker(plugins=spec)
         await broker.startup()
         try:
             ws1 = FakeWS()
             await _register(broker, 'e1', ws1, plugins=[
-                {'name': 'rh', 'namespace': '/rh', 'session_events': True}])
+                {'name': 'rh', 'namespace': '/rh'}])
             topo = [m for m in ws1.msgs() if m.kind == 'topology'][-1]
             bplugins = topo.participants['broker'].plugins
             caps = bplugins[protocol.BROKER_CAPS]
@@ -765,14 +764,10 @@ async def test_broker_topology_advertises_session_events(make_broker):
             assert caps['namespace'] == '/broker/_broker'
             assert caps['enabled'] is False and caps['version']
             assert 'ui_config' in caps and caps['ui_config'] is None
-            assert topo.participants['e1'].plugins['rh']['session_events']
             snap = broker.topology_snapshot()
             assert protocol.BROKER_CAPS not in snap['broker']['plugins']
             assert sorted(snap['broker']['plugins']) \
                 == ([] if not spec else ['sysinfo'])
-            if spec:
-                assert snap['broker']['plugins']['sysinfo'][
-                    'session_events'] is False
         finally:
             await broker.shutdown()
 
@@ -835,6 +830,22 @@ async def test_registered_reserved_plugin_name_dropped(make_broker):
         assert list(parts['e1'].plugins) == ['rh']
     finally:
         await broker.shutdown()
+
+
+def test_empty_session_is_session_less_at_ingest():
+    """An empty session is normalised to none on ingest: it is numbered on
+    the global stream and routed as session-less."""
+    from radical.orbit.broker_events import EventRouter
+
+    router = EventRouter({}, lambda *a: None, MagicMock(), 8, lambda: None)
+    router.add_endpoint('c')
+    router.update_subscription('c', {'patterns': [
+        {'endpoint': 'ep', 'plugin': 'rh', 'session': 's'}]}, True)
+    raw = {'kind': 'event', 'plugin': 'rh', 'topic': 't', 'session': '',
+           'data': {}}
+    router.ingest('ep', raw)
+    assert raw['session'] is None and router._session_seq == {}
+    assert len(router._out['c'].buf) == 1        # passes as session-less
 
 
 @pytest.mark.asyncio

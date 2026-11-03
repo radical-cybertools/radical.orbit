@@ -278,17 +278,16 @@ class EndpointRuntime(PluginHostBase):
         self._cb_lock = threading.Lock()
         self._callbacks: Dict[Any, List[tuple]] = {}
         self._topology_callbacks: List[Callable] = []
-        # Session capability, from topology (guarded by ``_cb_lock``):
-        # ``_session_capable`` holds the (endpoint, plugin) pairs whose plugin
-        # advertises ``session_events``; ``_broker_routes`` whether the broker
-        # advertises it too, so that a session callback on such a pair
-        # subscribes with a session pattern.  Both are reset by every resync
-        # until the new connection's topology.  ``_wire_count`` counts
+        # Session routing, from topology (guarded by ``_cb_lock``):
+        # ``_broker_routes`` whether the broker advertises ``session_events``
+        # (its ``_broker`` caps entry), so that a session callback on a
+        # concrete (endpoint, plugin) subscribes with a session pattern.
+        # Reset by every resync until the new connection's topology.
+        # ``_wire_count`` counts
         # registrations per wire pattern ``(endpoint, plugin, topic,
         # session-or-None)``: ``subscribe`` on its first, ``unsubscribe`` on
         # its last.  ``_conn_gen`` numbers connections (bumped by each
         # resync), so a topology frame of an earlier one cannot re-scope.
-        self._session_capable: set = set()
         self._broker_routes:  bool = False
         self._wire_count:  Counter = Counter()
         self._conn_gen:        int = 0
@@ -716,11 +715,7 @@ class EndpointRuntime(PluginHostBase):
     def _plugin_dicts(self) -> List[Dict[str, Any]]:
         """Rich per-plugin register dicts.  Namespaces are **endpoint-relative**
         (``/{instance}``) — routing is by ``dst``, so the consumer builds paths
-        relative to the target endpoint.
-
-        ``session_events`` (``Plugin.session_events``): every session event
-        of the plugin carries its session, so a consumer may subscribe to
-        one session at the broker (see :meth:`register_callback`)."""
+        relative to the target endpoint."""
         out: List[Dict[str, Any]] = []
         for pname, plugin in self._plugins.items():
             out.append({
@@ -729,8 +724,6 @@ class EndpointRuntime(PluginHostBase):
                 'namespace': plugin.namespace,
                 'version':   getattr(plugin, 'version', '0.0.1'),
                 'enabled':   True,
-                'session_events': bool(getattr(plugin, 'session_events',
-                                               False)),
                 'ui_config': ui_config_to_dict(
                     getattr(plugin, 'ui_config', None)),
             })
@@ -986,13 +979,15 @@ class EndpointRuntime(PluginHostBase):
         With *session* the callback gets only that session's events plus the
         session-less ones (plugin-level notifications, and everything from an
         older endpoint) — other sessions' events are dropped locally, before
-        they reach the callback queue.  Where the broker and the plugin on
-        *endpoint_id* both advertise ``session_events`` in topology, the
-        broker filters as well: the subscription then carries the session,
-        and the broker sends that session's events and the session-less
-        ones only.  Otherwise the subscription stays the v1
-        ``(endpoint, plugin, topic)`` pattern.  The form follows the
-        capability as topology changes (:meth:`_rescope_sessions`).
+        they reach the callback queue.  Where the broker advertises
+        ``session_events`` in topology and *endpoint_id* and *plugin_name*
+        are given, the broker filters as well: the subscription then carries
+        the session, and the broker sends that session's events and the
+        session-less ones only (a session pattern narrows session-stamped
+        events, session-less ones always pass).  Otherwise the subscription
+        stays the v1 ``(endpoint, plugin, topic)`` pattern.  The form
+        follows the broker capability as topology changes
+        (:meth:`_rescope_sessions`).  An empty *session* is ``None``.
         :meth:`rescope_callback` moves a registration to another session.
 
         The broker subscription is counted per wire pattern: ``subscribe``
@@ -1008,6 +1003,7 @@ class EndpointRuntime(PluginHostBase):
         """
         if callback is None:
             raise ValueError("callback is required")
+        session = session or None
         # a pattern the broker cannot parse raises here, before any state
         # changes: the runtime never sends one (the broker's skip of a
         # malformed pattern is a defense only)
@@ -1035,6 +1031,8 @@ class EndpointRuntime(PluginHostBase):
         unregister must not cut the subscription another one (or another
         session's callback) on this runtime still relies on.
         """
+        if session is not _ANY:
+            session = session or None
         key = (endpoint_id, plugin_name, topic)
         with self._cb_lock:
             keep, gone = [], []
@@ -1061,6 +1059,10 @@ class EndpointRuntime(PluginHostBase):
         event sees both scopes, or neither.  Where the broker routes the
         session, the session pattern moves too (the new one subscribed
         first).  Returns ``False`` when there was nothing to move."""
+        session, new_session = session or None, new_session or None
+        protocol.SubscribePattern(endpoint=endpoint_id, plugin=plugin_name,
+                                  topic=topic,
+                                  session=new_session)  # raises if malformed
         key = (endpoint_id, plugin_name, topic)
         with self._cb_lock:
             cbs = self._callbacks.get(key) or []
@@ -1074,16 +1076,17 @@ class EndpointRuntime(PluginHostBase):
             return moved > 0
 
     def _wire_key(self, key: tuple, session: Optional[str],
-                  capable: Optional[set] = None,
                   routes: Optional[bool] = None) -> tuple:
         """The broker pattern of a registration on *key* with *session*, as
         ``(endpoint, plugin, topic, session)``: the session only where the
-        broker routes sessions and the plugin is capable (the current state
-        unless *capable* / *routes* are given; under ``_cb_lock``)."""
-        if capable is None:
-            capable, routes = self._session_capable, self._broker_routes
+        broker routes sessions (*routes*, else the current state; under
+        ``_cb_lock``) and endpoint and plugin are concrete — a sid alone
+        names no stream."""
+        if routes is None:
+            routes = self._broker_routes
         endpoint, plugin, topic = key
-        if session is not None and routes and (endpoint, plugin) in capable:
+        if session is not None and routes and endpoint is not None \
+                and plugin is not None:
             return (endpoint, plugin, topic, session)
         return (endpoint, plugin, topic, None)
 
@@ -1117,42 +1120,29 @@ class EndpointRuntime(PluginHostBase):
                                           session=s)
                 for (e, p, t, s) in wkeys]
 
-    def _rescope_sessions(self, topo: Dict[str, Dict[str, Any]],
-                          broker_routes: bool,
+    def _rescope_sessions(self, broker_routes: bool,
                           gen: Optional[int] = None) -> None:
-        """Follow the ``session_events`` capability: of the plugins in
-        topology *topo* (reserved keys already dropped) and of the broker
+        """Follow the broker's ``session_events`` capability
         (*broker_routes*), received on connection *gen* (an earlier
         connection's is ignored).
 
-        Session registrations of an ``(endpoint, plugin)`` pair whose
-        routing appeared (both the broker and that endpoint plugin advertise
-        the capability) move to session patterns at the broker; those whose
-        routing vanished move back to the plain pattern.  Only those pairs'
-        registrations are recounted (:meth:`_move_wire`).
+        When it appears, the session registrations move to session patterns
+        at the broker; when it vanishes, back to the plain pattern (the new
+        form subscribed before the old one is withdrawn, :meth:`_move_wire`).
         """
-        capable = {(name, pname)
-                   for name, info in topo.items()
-                   for pname, pinfo in (info.get('plugins') or {}).items()
-                   if (pinfo or {}).get('session_events')}
         with self._cb_lock:
             if gen is not None and gen != self._conn_gen:
                 return                          # an earlier connection's
-            old_cap, old_routes = self._session_capable, self._broker_routes
-            flipped = (capable if broker_routes else set()) \
-                ^ (old_cap if old_routes else set())
+            old_routes = self._broker_routes
+            if broker_routes == old_routes:
+                return
             old, new = [], []
             for key, cbs in self._callbacks.items():
-                if key[:2] not in flipped:
-                    continue
                 for (_, _, s) in cbs:
                     if s is not None:
-                        old.append(self._wire_key(key, s, old_cap,
-                                                  old_routes))
-                        new.append(self._wire_key(key, s, capable,
-                                                  broker_routes))
-            self._session_capable = capable
-            self._broker_routes   = broker_routes
+                        old.append(self._wire_key(key, s, old_routes))
+                        new.append(self._wire_key(key, s, broker_routes))
+            self._broker_routes = broker_routes
             self._move_wire(old, new)
 
     def register_topology_callback(self, callback: Callable) -> None:
@@ -1177,7 +1167,6 @@ class EndpointRuntime(PluginHostBase):
         """
         with self._cb_lock:
             self._conn_gen        += 1
-            self._session_capable  = set()
             self._broker_routes    = False
             self._subs_live        = True
             self._wire_count = Counter(
@@ -1228,7 +1217,7 @@ class EndpointRuntime(PluginHostBase):
 
     def _on_event(self, ev: protocol.Event) -> None:
         endpoint, plugin, topic = ev.src, ev.plugin, ev.topic
-        session = ev.session
+        session = ev.session or None
         data = ev.data
         with self._cb_lock:
             matched: List[tuple] = []
@@ -1258,7 +1247,6 @@ class EndpointRuntime(PluginHostBase):
         new_topo = protocol.public_topology(raw)
         bcaps = (raw.get(protocol.BROKER_NAME) or {}).get('plugins') or {}
         self._rescope_sessions(
-            new_topo,
             bool((bcaps.get(protocol.BROKER_CAPS) or {}).get('session_events')),
             gen)
         prev = self._topology

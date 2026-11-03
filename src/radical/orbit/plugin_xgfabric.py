@@ -1283,7 +1283,6 @@ class PluginXGFabric(Plugin):
     session_class = XGFabricSession
     client_class = XGFabricClient
     version = '0.1.0'
-    session_events = True       # all its events are session events
     # Idle timeout of a session (s): the Explorer's keepalive holds an open
     # tab's session, so the countdown starts when the tab closes; a running
     # workflow keeps it (is_busy).  Clients that reconnect after longer idle

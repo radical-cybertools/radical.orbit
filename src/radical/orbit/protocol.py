@@ -155,8 +155,7 @@ class SubscribePattern(BaseModel):
     ``endpoint`` and ``plugin``: a sid alone names no stream.  It is only
     on the wire when set, so a session-less pattern packs exactly as in v1
     -- an older broker rejects the unknown field, so a client sends it only
-    when the broker and the endpoint plugin advertise ``session_events`` in
-    topology.
+    when the broker advertises ``session_events`` in topology.
     """
     model_config = ConfigDict(extra='forbid')
 
