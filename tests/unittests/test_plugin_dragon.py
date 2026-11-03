@@ -797,3 +797,12 @@ def test_close_sync_unused_backend_starts_no_thread():
     backend = _FakeBackend()
     backend.close_sync()
     assert not backend._pool.started
+
+
+# ── review round 7 ──────────────────────────────────────────────────────────
+
+def test_client_rejects_non_str_keys(client):
+    dd = client.ddict.create()
+    with pytest.raises(TypeError, match='str'):
+        dd[1] = 'x'
+    assert dd.keys() == []

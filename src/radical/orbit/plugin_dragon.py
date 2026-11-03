@@ -596,6 +596,10 @@ class DDictHandle:
         self.update({key: value})
 
     def update(self, items: Dict[str, Any]) -> None:
+        bad = [k for k in items if not isinstance(k, str)]
+        if bad:
+            # JSON would turn them into str keys the reads cannot match
+            raise TypeError(f"ddict keys must be str, got {bad[0]!r}")
         self._client._call('POST', 'ddict/put/{sid}', id=self.id,
                            items={k: encode_value(v)
                                   for k, v in items.items()})
