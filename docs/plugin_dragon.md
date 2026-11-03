@@ -39,8 +39,10 @@ DDicts belong to the plugin, not to the session that created them: like
 Dragon services, they outlive their creator and are shared by ID or name.
 When the endpoint exits, the plugin destroys its DDicts.
 
-Keys are strings.  Values are JSON-serializable objects or `bytes`; bytes
-travel as `{"$b64": "<base64>"}`.  A value written inside the runtime that
+Keys are strings (keys of other types written inside the runtime are
+counted by `len()` and reported as `n_other` by `keys`).  Values are
+JSON-serializable objects or `bytes`; bytes travel as
+`{"$b64": "<base64>"}`, and a malformed marker is a 400.  A value written inside the runtime that
 is neither (e.g. a numpy array) is reported per key in `errors`.  A `get`
 reply above half the transport frame cap fails with 413: get fewer keys per
 call.
@@ -89,8 +91,8 @@ Through the gateway at `/{endpoint}/dragon/...`:
 | GET  | `ddict/info/{sid}/{id}` | → entry + `n_keys` |
 | POST | `ddict/destroy/{sid}` | `{id}` |
 | POST | `ddict/put/{sid}` | `{id, items}` → `{n}` |
-| POST | `ddict/get/{sid}` | `{id, keys}` → `{items, missing, errors}` |
-| POST | `ddict/keys/{sid}` | `{id}` → `{keys}` |
+| POST | `ddict/get/{sid}` | `{id, keys, values?}` → `{items, missing, errors}`; `values: false` checks presence only |
+| POST | `ddict/keys/{sid}` | `{id}` → `{keys, n_other}`: str keys, count of other keys |
 | POST | `ddict/pop/{sid}` | `{id, keys}` → `{n, missing}` |
 | POST | `ddict/clear/{sid}` | `{id}` |
 

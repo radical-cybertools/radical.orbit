@@ -1125,15 +1125,22 @@ class _ShutdownPlugin:
 
 
 def _unstarted_runtime():
+    """Just the state _work_teardown / _on_control touch (no cert lookup,
+    no transport)."""
     from radical.orbit.runtime import EndpointRuntime
-    return EndpointRuntime(broker_url='https://127.0.0.1:1', token=None)
+    rt = EndpointRuntime.__new__(EndpointRuntime)
+    rt._plugins     = {}
+    rt._stopping    = False
+    rt._terminated  = False
+    rt._transport_loop = None
+    return rt
 
 
 def test_work_teardown_shuts_plugins_down(monkeypatch):
     import radical.orbit.runtime as rtm
     monkeypatch.setattr(rtm, '_PLUGIN_SHUTDOWN', 0.5)
     rt   = _unstarted_runtime()
-    ok   = _ShutdownPlugin('ok')
+    ok   = _ShutdownPlugin('ok', delay=0.3)
     bad  = _ShutdownPlugin('bad', fail=True)
     slow = _ShutdownPlugin('slow', delay=5.0)
     rt._plugins = {'ok': ok, 'bad': bad, 'slow': slow}
@@ -1145,7 +1152,7 @@ def test_work_teardown_shuts_plugins_down(monkeypatch):
         return time.time() - t0, slow._cleanup_task
 
     elapsed, task = asyncio.run(_run())
-    assert ok.done
+    assert ok.done                  # not cut short by the slow one
     assert not slow.done
     assert elapsed < 2.0
     assert task.cancelled()

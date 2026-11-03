@@ -162,7 +162,9 @@ def test_create_duplicate_name_409(env):
 
 @pytest.mark.parametrize('body', [{'name': 'a b'}, {'name': 5},
                                   {'total_mem': 'lots'},
-                                  {'n_nodes': 0}, {'managers_per_node': 'x'}])
+                                  {'n_nodes': 0}, {'n_nodes': 1.5},
+                                  {'n_nodes': True},
+                                  {'managers_per_node': 'x'}])
 def test_create_invalid_400(env, body):
     _, _, tc, sid = env
     r = tc.post(f'/dragon/ddict/create/{sid}', json=body)
@@ -271,6 +273,7 @@ def test_get_reply_limit_413(env):
     ('get',  {'id': 'x', 'keys': 'a'}),
     ('get',  {'id': 'x', 'keys': [1]}),
     ('keys', {}),
+    ('get',  {'id': 'x', 'keys': [], 'values': 'no'}),
 ])
 def test_bad_bodies_400(env, path, body):
     _, _, tc, sid = env
@@ -404,3 +407,133 @@ def test_dragon_available_ignores_namespace_dir(tmp_path, monkeypatch):
     assert not dragon_available()
     (tmp_path / 'dragon' / '__init__.py').write_text('')
     assert dragon_available()
+
+
+# ── review round 1 ──────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize('val', [{'$b64': 5}, {'$b64': 'not base64!'}])
+def test_put_malformed_b64_400(env, val):
+    _, _, tc, sid = env
+    did = _create(tc, sid)['id']
+    r = tc.post(f'/dragon/ddict/put/{sid}', json={'id': did,
+                                                 'items': {'k': val}})
+    assert r.status_code == 400, r.text
+
+
+def test_decode_value_rejects_malformed():
+    with pytest.raises(ValueError):
+        decode_value({'$b64': '###'})
+
+
+def test_get_presence_only(env):
+    _, backend, tc, sid = env
+    did = _create(tc, sid)['id']
+    backend._ddicts[did]['big'] = 'x' * 200
+    plugin = env[0]
+    plugin.reply_limit = 100            # a value fetch would be 413
+    r = tc.post(f'/dragon/ddict/get/{sid}', json={
+        'id': did, 'keys': ['big', 'zz'], 'values': False}).json()
+    assert r == {'items': {}, 'missing': ['zz'], 'errors': {}}
+
+
+def test_keys_reports_other_keys(env):
+    _, backend, tc, sid = env
+    did = _create(tc, sid)['id']
+    backend._ddicts[did].update({'a': 1, 7: 2})      # 7: written in-runtime
+    r = tc.post(f'/dragon/ddict/keys/{sid}', json={'id': did}).json()
+    assert r == {'keys': ['a'], 'n_other': 1}
+
+
+def test_create_cancelled_discards_ddict():
+    plugin, backend, _, _ = _mk()
+
+    async def _run():
+        gate = asyncio.Event()
+        orig = backend._new_ddict
+
+        def _slow(*a):
+            asyncio.run_coroutine_threadsafe(_set(gate), loop).result()
+            import time
+            time.sleep(0.2)
+            return orig(*a)
+
+        async def _set(ev):
+            ev.set()
+
+        loop = asyncio.get_running_loop()
+        backend._new_ddict = _slow
+        task = asyncio.ensure_future(
+            plugin.ddict_create('a', 1, 1, 1024, None))
+        await gate.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await backend._call(lambda: None)    # after create + discard
+    asyncio.run(_run())
+    assert plugin.entries  == {}
+    assert backend._ddicts == {}
+
+
+def test_destroy_cancelled_drops_entry(env):
+    plugin, backend, tc, sid = env
+    did = _create(tc, sid)['id']
+
+    async def _run():
+        task = asyncio.ensure_future(plugin.ddict_destroy(did))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await backend._call(lambda: None)
+    asyncio.run(_run())
+    assert did not in plugin.entries
+    assert did not in backend._ddicts
+
+
+def test_destroy_after_shutdown_cleared_entries(env):
+    plugin, _, tc, sid = env
+    did = _create(tc, sid)['id']
+
+    async def _run():
+        task = asyncio.ensure_future(plugin.ddict_destroy(did))
+        await asyncio.sleep(0)
+        plugin.entries.clear()
+        return await task
+    assert asyncio.run(_run()) == {}
+
+
+def test_close_cancelled_then_close_sync_closes():
+    backend = _FakeBackend()
+
+    async def _run():
+        await backend.create('d', 1, 1, 1024)
+        block = asyncio.ensure_future(backend._call(__import__('time').sleep,
+                                                    0.2))
+        task  = asyncio.ensure_future(backend.close())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await block
+    asyncio.run(_run())
+    dd = backend._ddicts.get('d')
+    backend.close_sync()
+    assert backend.down == 1
+    assert dd is None or dd.destroyed
+
+
+def test_client_attach_not_ready(client, env):
+    plugin = env[0]
+    dd = client.ddict.create(name='busy')
+    plugin.entries[dd.id]['state'] = 'creating'
+    with pytest.raises(KeyError, match='creating'):
+        client.ddict.attach('busy')
+
+
+def test_client_contains_skips_value(client, env):
+    plugin = env[0]
+    dd = client.ddict.create()
+    dd['big'] = 'x' * 300
+    plugin.reply_limit = 100
+    assert 'big' in dd
+    assert 'nope' not in dd

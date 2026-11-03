@@ -33,6 +33,7 @@ __license__   = 'MIT'
 import asyncio
 import atexit
 import base64
+import binascii
 import functools
 import importlib.util
 import json
@@ -52,9 +53,8 @@ from starlette.requests import Request
 
 from .client import PluginClient
 from .errors import http_exception
-from .plugin_base import Plugin
+from .plugin_base import Plugin, resolve_frame_cap
 from .plugin_session_base import PluginSession
-from .protocol import FRAME_CAP
 
 log = logging.getLogger("radical.orbit")
 
@@ -81,9 +81,16 @@ def encode_value(value: Any) -> Any:
 
 
 def decode_value(value: Any) -> Any:
-    """Inverse of :func:`encode_value`."""
+    """Inverse of :func:`encode_value`.  A malformed marker raises
+    ``ValueError``."""
     if isinstance(value, dict) and len(value) == 1 and B64_KEY in value:
-        return base64.b64decode(value[B64_KEY])
+        data = value[B64_KEY]
+        if not isinstance(data, str):
+            raise ValueError(f"{B64_KEY}: expected a base64 string")
+        try:
+            return base64.b64decode(data, validate=True)
+        except binascii.Error as e:
+            raise ValueError(f"{B64_KEY}: invalid base64: {e}") from e
     return value
 
 
@@ -101,14 +108,6 @@ def parse_mem(value: Any) -> int:
     if mem <= 0:
         raise ValueError(f"invalid memory size: {value!r}")
     return mem
-
-
-def _frame_cap(app: FastAPI) -> int:
-    """The serving runtime's transport frame cap (tunable), else the
-    protocol default (same lookup as ``plugin_rhapsody``)."""
-    svc = getattr(getattr(app, 'state', None), 'endpoint_service', None)
-    cap = getattr(svc, '_frame_cap', None)
-    return cap if isinstance(cap, int) and cap > 0 else FRAME_CAP
 
 
 def dragon_available() -> bool:
@@ -238,6 +237,29 @@ class DDictBackend:
             return found, missing
         return await self._call(_get)
 
+    async def contains(self, did: str, keys: List[str]) -> List[str]:
+        """Returns the keys of *keys* that are missing (values not read)."""
+        def _contains():
+            dd = self._ddict(did)
+            return [k for k in keys if k not in dd]
+        return await self._call(_contains)
+
+    def discard(self, did: str) -> None:
+        """Queue the destroy of *did*, if it exists by then: for a create
+        whose caller went away while the create still runs (the single
+        Dragon thread runs this after it)."""
+        def _discard():
+            dd = self._ddicts.pop(did, None)
+            if dd is not None:
+                try:
+                    dd.destroy()
+                except Exception as e:
+                    log.warning("[dragon] discard %s failed: %s", did, e)
+        try:
+            self._pool.submit(_discard)
+        except RuntimeError:
+            pass                        # closed: close() destroyed it
+
     async def pop(self, did: str, keys: List[str]) -> List[str]:
         """Remove *keys*; returns the ones that were missing."""
         def _pop():
@@ -268,12 +290,14 @@ class DDictBackend:
                 log.warning("[dragon] destroy %s failed: %s", did, e)
         self._ddicts.clear()
         self._runtime_down()
+        self._closed = True
 
     async def close(self) -> None:
-        """Destroy every DDict, then stop or detach the runtime."""
+        """Destroy every DDict, then stop or detach the runtime.  When the
+        await is cancelled before the close ran, :meth:`close_sync` still
+        does it at exit."""
         if self._closed:
             return
-        self._closed = True
         try:
             await self._call(self._close)
         finally:
@@ -285,10 +309,12 @@ class DDictBackend:
         not outlive the process.  A no-op after :meth:`close`."""
         if self._closed:
             return
-        self._closed = True
-        # at interpreter exit the pool is already shut down: drain it, then
-        # close from this thread (serialized calls work from any thread)
+        # at interpreter exit the pool is already shut down: drain it (a
+        # running close finishes), then close from this thread (serialized
+        # calls work from any thread)
         self._pool.shutdown(wait=True, cancel_futures=True)
+        if self._closed:
+            return
         try:
             self._close()
         except Exception as e:
@@ -333,12 +359,19 @@ class DragonSession(PluginSession):
     async def put(self, did: str, items: Dict[str, Any]) -> dict:
         self._check_active()
         self._p.entry(did)
-        items = {k: decode_value(v) for k, v in items.items()}
+        try:
+            items = {k: decode_value(v) for k, v in items.items()}
+        except ValueError as e:
+            raise http_exception(e) from e
         return {"n": await self._p.backend.put(did, items)}
 
-    async def get(self, did: str, keys: List[str]) -> dict:
+    async def get(self, did: str, keys: List[str],
+                  values: bool = True) -> dict:
         self._check_active()
         self._p.entry(did)
+        if not values:
+            missing = await self._p.backend.contains(did, keys)
+            return {"items": {}, "missing": missing, "errors": {}}
         found, missing = await self._p.backend.get(did, keys)
         items, errors = {}, {}
         for k, v in found.items():
@@ -359,8 +392,10 @@ class DragonSession(PluginSession):
     async def keys(self, did: str) -> dict:
         self._check_active()
         self._p.entry(did)
-        return {"keys": [k for k in await self._p.backend.keys(did)
-                         if isinstance(k, str)]}
+        keys = await self._p.backend.keys(did)
+        strs = [k for k in keys if isinstance(k, str)]
+        # keys written in-runtime may be of any type; the handle uses str
+        return {"keys": strs, "n_other": len(keys) - len(strs)}
 
     async def pop(self, did: str, keys: List[str]) -> dict:
         self._check_active()
@@ -445,7 +480,9 @@ class DDictHandle:
         return r
 
     def __contains__(self, key: str) -> bool:
-        return key not in self.get_many([key])['missing']
+        r = self._client._call('POST', 'ddict/get/{sid}', id=self.id,
+                               keys=[key], values=False)
+        return key not in r['missing']
 
     def __delitem__(self, key: str) -> None:
         r = self._client._call('POST', 'ddict/pop/{sid}', id=self.id,
@@ -454,6 +491,8 @@ class DDictHandle:
             raise KeyError(key)
 
     def keys(self) -> List[str]:
+        """The ``str`` keys; ``len()`` also counts keys of other types
+        written inside the runtime."""
         return self._client._call('POST', 'ddict/keys/{sid}',
                                   id=self.id)['keys']
 
@@ -482,9 +521,11 @@ class DDictAPI:
         return DDictHandle(self._client, entry)
 
     def attach(self, ddict_id: str) -> DDictHandle:
-        """Handle on an existing DDict, by ID (or by name)."""
+        """Handle on an existing, ready DDict, by ID (or by name)."""
         for entry in self.list():
             if ddict_id in (entry['id'], entry['name']):
+                if entry['state'] != 'ready':
+                    raise KeyError(f"ddict {ddict_id} is {entry['state']}")
                 return DDictHandle(self._client, entry)
         raise KeyError(f"unknown ddict: {ddict_id}")
 
@@ -545,7 +586,7 @@ class PluginDragon(Plugin):
 
         self.backend     = backend or DDictBackend(runtime_mode())
         self.entries: Dict[str, dict] = {}
-        self.reply_limit = _frame_cap(app) // 2
+        self.reply_limit = resolve_frame_cap(app) // 2
 
         # fallback for a host exiting without plugin shutdown()
         atexit.register(self.backend.close_sync)
@@ -598,7 +639,10 @@ class PluginDragon(Plugin):
             entry['descriptor'] = await self.backend.create(
                 did, managers_per_node, n_nodes, total_mem)
         except BaseException:
-            del self.entries[did]
+            self.entries.pop(did, None)
+            # a cancelled await may leave the create running on the Dragon
+            # thread: destroy what it makes
+            self.backend.discard(did)
             raise
         entry['state'] = 'ready'
         log.info("[dragon] created %s (%s)", did, name)
@@ -611,10 +655,16 @@ class PluginDragon(Plugin):
         entry['state'] = 'destroying'
         try:
             await self.backend.destroy(did)
+        except asyncio.CancelledError:
+            # the destroy may still run on the Dragon thread, or was
+            # dropped from its queue: make sure it happens
+            self.entries.pop(did, None)
+            self.backend.discard(did)
+            raise
         except BaseException:
             entry['state'] = 'ready'
             raise
-        del self.entries[did]
+        self.entries.pop(did, None)
         log.info("[dragon] destroyed %s (%s)", did, entry['name'])
         self._dispatch_notify('ddict_status', {"id": did,
                                                "name": entry['name'],
@@ -637,6 +687,14 @@ class PluginDragon(Plugin):
         return body
 
     @staticmethod
+    def _pos_int(body: dict, field: str) -> int:
+        val = body.get(field, 1)
+        if isinstance(val, bool) or not isinstance(val, int) or val < 1:
+            raise http_exception(ValueError(f"{field!r} must be an integer "
+                                            f">= 1"))
+        return val
+
+    @staticmethod
     def _str_list(body: dict, field: str) -> List[str]:
         val = body[field]
         if not isinstance(val, list) or \
@@ -654,15 +712,12 @@ class PluginDragon(Plugin):
         if name is not None and \
                 not (isinstance(name, str) and NAME_RE.fullmatch(name)):
             raise http_exception(ValueError(f"invalid ddict name {name!r}"))
+        mpn = self._pos_int(body, 'managers_per_node')
+        nn  = self._pos_int(body, 'n_nodes')
         try:
-            mpn = int(body.get('managers_per_node', 1))
-            nn  = int(body.get('n_nodes', 1))
             mem = parse_mem(body.get('total_mem', DEFAULT_MEM))
-        except (TypeError, ValueError) as e:
-            raise http_exception(ValueError(str(e))) from e
-        if mpn < 1 or nn < 1:
-            raise http_exception(ValueError(
-                "managers_per_node and n_nodes must be >= 1"))
+        except ValueError as e:
+            raise http_exception(e) from e
         return await self._forward(sid, DragonSession.create, name=name,
                                    managers_per_node=mpn, n_nodes=nn,
                                    total_mem=mem,
@@ -696,15 +751,20 @@ class PluginDragon(Plugin):
                                    items=items)
 
     async def r_get(self, request: Request) -> dict:
-        """``POST ddict/get/{sid}``: ``{id, keys}`` ->
-        ``{items, missing, errors}``."""
-        body = await self._body(request, 'id', 'keys')
+        """``POST ddict/get/{sid}``: ``{id, keys, values?}`` ->
+        ``{items, missing, errors}``; ``values=false`` checks presence
+        only."""
+        body   = await self._body(request, 'id', 'keys')
+        values = body.get('values', True)
+        if not isinstance(values, bool):
+            raise http_exception(ValueError("'values' must be a boolean"))
         return await self._forward(request.path_params['sid'],
                                    DragonSession.get, did=body['id'],
-                                   keys=self._str_list(body, 'keys'))
+                                   keys=self._str_list(body, 'keys'),
+                                   values=values)
 
     async def r_keys(self, request: Request) -> dict:
-        """``POST ddict/keys/{sid}``: ``{id}`` -> ``{keys}``."""
+        """``POST ddict/keys/{sid}``: ``{id}`` -> ``{keys, n_other}``."""
         body = await self._body(request, 'id')
         return await self._forward(request.path_params['sid'],
                                    DragonSession.keys, did=body['id'])

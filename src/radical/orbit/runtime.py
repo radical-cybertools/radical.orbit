@@ -90,7 +90,7 @@ _PING_TIMEOUT   = 3.0     # websockets client keepalive answer deadline
 _BACKOFF_START  = 0.5     # (re)connect backoff floor (seconds)
 _BACKOFF_MAX    = 10.0    # (re)connect backoff ceiling (seconds)
 _BACKOFF_FACTOR = 1.5     # (re)connect backoff growth factor
-_PLUGIN_SHUTDOWN = 15.0   # served plugins' shutdown() bound at stop()
+_PLUGIN_SHUTDOWN = 15.0   # bound per served plugin's shutdown() at stop()
 
 # Legacy per-instance tunables still accepted as keyword arguments (they feed
 # private attributes) so existing harnesses keep constructing runtimes without
@@ -494,20 +494,20 @@ class EndpointRuntime(PluginHostBase):
     async def _work_teardown(self) -> None:
         plugins = list(self._plugins.values())
 
+        # concurrently, each bounded on its own: a slow plugin must not cut
+        # the others' shutdown short
         async def _shutdown(plugin) -> None:
             try:
-                await plugin.shutdown()
+                await asyncio.wait_for(plugin.shutdown(),
+                                       timeout=_PLUGIN_SHUTDOWN)
+            except asyncio.TimeoutError:
+                log.warning("[Runtime] %s.shutdown exceeded %.0fs",
+                            plugin.instance_name, _PLUGIN_SHUTDOWN)
             except Exception as e:
                 log.warning("[Runtime] %s.shutdown failed: %s",
                             plugin.instance_name, e)
 
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*[_shutdown(p) for p in plugins]),
-                timeout=_PLUGIN_SHUTDOWN)
-        except asyncio.TimeoutError:
-            log.warning("[Runtime] plugin shutdown exceeded %.0fs",
-                        _PLUGIN_SHUTDOWN)
+        await asyncio.gather(*[_shutdown(p) for p in plugins])
 
         # a plugin whose shutdown failed or timed out may leave its cleanup
         # task running: cancel what is left

@@ -49,9 +49,9 @@ access; the backend seam below is where it slots in.
 | GET  | `ddict/list/{sid}` | → `{ddicts: [entry]}` |
 | GET  | `ddict/info/{sid}/{id}` | → entry + `n_keys` |
 | POST | `ddict/destroy/{sid}` | `{id}` |
-| POST | `ddict/put/{sid}` | `{id, items, encoding?}` → `{n}` |
-| POST | `ddict/get/{sid}` | `{id, keys, encoding?}` → `{items, missing}` |
-| POST | `ddict/keys/{sid}` | `{id}` → `{keys}` |
+| POST | `ddict/put/{sid}` | `{id, items}` → `{n}` |
+| POST | `ddict/get/{sid}` | `{id, keys, values?}` → `{items, missing, errors}` |
+| POST | `ddict/keys/{sid}` | `{id}` → `{keys, n_other}` |
 | POST | `ddict/pop/{sid}` | `{id, keys}` → `{n}` |
 | POST | `ddict/clear/{sid}` | `{id}` |
 
