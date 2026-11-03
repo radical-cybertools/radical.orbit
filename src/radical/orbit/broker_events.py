@@ -71,10 +71,13 @@ class EventRouter:
         self._subscriptions: Dict[str, List[protocol.SubscribePattern]] = {}
         # Per subscriber, its patterns as matched on ingest: session patterns
         # naming endpoint and plugin indexed by their (endpoint, plugin,
-        # session) stream, all others in a list.  An event then checks the
-        # list plus its own stream's patterns, not every session pattern.
-        # Rebuilt from ``_subscriptions`` on each change (``_reindex``).
+        # session) stream and, for session-less events (which every session
+        # pattern of the pair matches), by (endpoint, plugin); all others in
+        # a list.  An event then checks the list plus its own stream's (or
+        # pair's) patterns, not every session pattern.  Rebuilt from
+        # ``_subscriptions`` on each change (``_reindex``).
         self._index: Dict[str, Tuple[List[protocol.SubscribePattern],
+                                     Dict[tuple, list],
                                      Dict[tuple, list]]] = {}
         self._out:           Dict[str, BoundedDropOldestQueue] = {}
         self._senders:       Dict[str, asyncio.Task] = {}
@@ -174,14 +177,16 @@ class EventRouter:
         """Rebuild *name*'s ingest index from its pattern list."""
         rest: List[protocol.SubscribePattern] = []
         streams: Dict[tuple, list] = {}
+        pairs:   Dict[tuple, list] = {}
         for p in self._subscriptions.get(name, []):
             if p.session is not None and p.endpoint is not None \
                     and p.plugin is not None:
                 streams.setdefault((p.endpoint, p.plugin, p.session),
                                    []).append(p)
+                pairs.setdefault((p.endpoint, p.plugin), []).append(p)
             else:
                 rest.append(p)
-        self._index[name] = (rest, streams)
+        self._index[name] = (rest, streams, pairs)
 
     @staticmethod
     def _matches(patterns: List[protocol.SubscribePattern],
@@ -194,7 +199,10 @@ class EventRouter:
                 continue
             if p.topic    is not None and p.topic    != topic:
                 continue
-            if p.session  is not None and p.session  != session:
+            # a session pattern narrows session events only: session-less
+            # ones (plugin-level notifications) still match
+            if p.session  is not None and session is not None \
+                    and p.session != session:
                 continue
             return True
         return False
@@ -257,12 +265,13 @@ class EventRouter:
         packed = msgpack.packb(raw, use_bin_type=True)
         plugin = raw.get('plugin')
         topic  = raw.get('topic')
-        stream = (src_name, plugin, session)
-        for sub_name, (rest, streams) in self._index.items():
+        stream = (src_name, plugin, session) if session is not None \
+            else (src_name, plugin)
+        for sub_name, (rest, streams, pairs) in self._index.items():
+            index = streams if session is not None else pairs
             if self._matches(rest, src_name, plugin, topic, session) or \
-               (session is not None and
-                    self._matches(streams.get(stream, ()), src_name,
-                                  plugin, topic, session)):
+               self._matches(index.get(stream, ()), src_name, plugin, topic,
+                             session):
                 oq = self._out.get(sub_name)
                 if oq is not None:
                     oq.push(packed)

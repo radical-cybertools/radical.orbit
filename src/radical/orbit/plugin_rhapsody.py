@@ -1471,9 +1471,15 @@ class RhapsodyClient(PluginClient):
         with self._cond:
             topics = list(dict.fromkeys(r[0] for r in self._own
                                         if r[2] is not None))
-        for topic in topics:
-            self._bc.hold_subscription(self._endpoint_id, self._plugin_name,
-                                       topic)
+        held = []
+        try:
+            for topic in topics:
+                self._bc.hold_subscription(self._endpoint_id,
+                                           self._plugin_name, topic)
+                held.append(topic)
+        except BaseException:
+            self._release_own(held)             # never left held
+            raise
         return topics
 
     def _release_own(self, topics) -> None:

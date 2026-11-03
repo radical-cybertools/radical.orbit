@@ -3162,6 +3162,28 @@ def test_session_events_advertised_by_session_plugins():
         assert cls.session_events is True, cls
 
 
+def test_hold_own_releases_taken_holds_on_failure():
+    """If a later hold fails, the holds already taken are released before
+    the error propagates: no plain pattern stays held."""
+    rt     = _routed_runtime()
+    client = _scoped_client(rt, 'sid-a')
+    client._start_task_listener()
+    orig, n = rt.hold_subscription, []
+
+    def _hold(*a):
+        if n:
+            raise RuntimeError('boom')
+        n.append(a)
+        return orig(*a)
+    rt.hold_subscription = _hold
+    rt._emit.reset_mock()
+    with pytest.raises(RuntimeError, match='boom'):
+        client._hold_own()
+    assert not rt._held
+    assert _sub_frames(rt) == [('subscribe',   [('task_status', None)]),
+                               ('unsubscribe', [('task_status', None)])]
+
+
 def test_session_switch_routed_frame_order():
     """With broker routing on (learned from a real served-plugin
     topology), the client's own callbacks subscribe their sid at the

@@ -672,8 +672,8 @@ async def test_subscribe_session_pattern(make_broker):
 
         evs = c_sid.msgs()
         assert [(e.src, e.plugin, e.session) for e in evs] \
-            == [('e1', 'rh', 'a')] * 2
-        assert evs[1].seq == evs[0].seq + 1
+            == [('e1', 'rh', 'a'), ('e1', 'rh', None), ('e1', 'rh', 'a')]
+        assert evs[2].seq == evs[0].seq + 1           # session-less: own seq
         assert [(e.src, e.plugin, e.session) for e in c_wild.msgs()] == sent
 
         unsub = protocol.Unsubscribe(
@@ -789,8 +789,9 @@ def test_session_patterns_indexed_per_stream(monkeypatch):
     router.update_subscription('c', {'patterns': [
         {'endpoint': 'ep', 'plugin': 'rh', 'session': 's%d' % i}
         for i in range(n)] + [{'plugin': 'other'}]}, True)
-    rest, streams = router._index['c']
+    rest, streams, pairs = router._index['c']
     assert len(rest) == 1 and len(streams) == n
+    assert len(pairs[('ep', 'rh')]) == n
 
     checked = []
     real = EventRouter._matches
@@ -810,7 +811,8 @@ def test_session_patterns_indexed_per_stream(monkeypatch):
     assert sum(checked) <= 1                     # O(1), not O(n)
     assert _delivered('ep', 'rh', 's7')
     assert not _delivered('ep2', 'rh', 's7')     # stream includes endpoint
-    assert not _delivered('ep', 'rh', None)      # session-less: no match
+    assert _delivered('ep', 'rh', None)          # session-less: matches
+    assert not _delivered('ep2', 'rh', None)
     assert _delivered('ep', 'other', None)       # wildcard list still works
 
     router.update_subscription('c', {'patterns': [

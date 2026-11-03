@@ -148,8 +148,9 @@ class SubscribePattern(BaseModel):
     A ``None`` field is a wildcard -- mirrors the client callback-registry
     tuples (``endpoint_id``/``plugin_name``/``topic`` all optional).
 
-    ``session`` narrows the pattern to the events of one session (the
-    event's ``session``; session-less events do not match).  Like the
+    ``session`` narrows the pattern's session events to one session (the
+    event's ``session``); session-less events -- plugin-level notifications
+    -- still match it, as they do a pattern without one.  Like the
     broker's seq key ``(src, plugin, session)``, it is meant together with
     ``endpoint`` and ``plugin``: a sid alone names no stream.  It is only
     on the wire when set, so a session-less pattern packs exactly as in v1

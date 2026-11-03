@@ -280,8 +280,7 @@ class EndpointRuntime(PluginHostBase):
         self._topology_callbacks: List[Callable] = []
         # Session capability, from topology (guarded by ``_cb_lock``):
         # ``_session_capable`` holds the (endpoint, plugin) pairs whose plugin
-        # advertises ``session_events`` (a session callback there never gets
-        # session-less events); ``_broker_routes`` whether the broker
+        # advertises ``session_events``; ``_broker_routes`` whether the broker
         # advertises it too, so that a session callback on such a pair
         # subscribes with a session pattern.  Both are reset by every resync
         # until the new connection's topology.  ``_wire_count`` counts
@@ -984,16 +983,15 @@ class EndpointRuntime(PluginHostBase):
         Tuple semantics: ``None`` is a wildcard; filtering happens at the
         boundary.
 
-        With *session* the callback gets only that session's events —
-        other sessions' events are dropped locally, before they reach the
-        callback queue.  Session-less events reach it only from a plugin
-        that does not advertise ``session_events`` in topology (an older
-        endpoint, or a plugin with session-less session events); from one
-        that does, they are not about its session and are dropped too.
-        Where the broker advertises ``session_events`` as well, it filters
-        too: the subscription then carries the session, and the broker
-        sends only that session's events.  Otherwise the subscription stays
-        the v1 ``(endpoint, plugin, topic)`` pattern.  The form follows the
+        With *session* the callback gets only that session's events plus the
+        session-less ones (plugin-level notifications, and everything from an
+        older endpoint) — other sessions' events are dropped locally, before
+        they reach the callback queue.  Where the broker and the plugin on
+        *endpoint_id* both advertise ``session_events`` in topology, the
+        broker filters as well: the subscription then carries the session,
+        and the broker sends that session's events and the session-less
+        ones only.  Otherwise the subscription stays the v1
+        ``(endpoint, plugin, topic)`` pattern.  The form follows the
         capability as topology changes (:meth:`_rescope_sessions`).
         :meth:`rescope_callback` moves a registration to another session.
 
@@ -1010,6 +1008,11 @@ class EndpointRuntime(PluginHostBase):
         """
         if callback is None:
             raise ValueError("callback is required")
+        # a pattern the broker cannot parse raises here, before any state
+        # changes: the runtime never sends one (the broker's skip of a
+        # malformed pattern is a defense only)
+        protocol.SubscribePattern(endpoint=endpoint_id, plugin=plugin_name,
+                                  topic=topic, session=session)
         key = (endpoint_id, plugin_name, topic)
         with self._cb_lock:
             self._callbacks.setdefault(key, []).append(
@@ -1202,6 +1205,8 @@ class EndpointRuntime(PluginHostBase):
         session pattern moves are not filtered out at the broker.  Counted
         with the registrations (no frame if the pattern is subscribed
         already)."""
+        protocol.SubscribePattern(endpoint=endpoint_id, plugin=plugin_name,
+                                  topic=topic)  # raises on a malformed one
         key = (endpoint_id, plugin_name, topic, None)
         with self._cb_lock:
             self._held[key] += 1
@@ -1226,19 +1231,16 @@ class EndpointRuntime(PluginHostBase):
         session = ev.session
         data = ev.data
         with self._cb_lock:
-            capable = (endpoint, plugin) in self._session_capable
             matched: List[tuple] = []
             for (e, p, t), cbs in self._callbacks.items():
                 if (e is None or e == endpoint) and \
                    (p is None or p == plugin) and \
                    (t is None or t == topic):
                     # a session callback skips other sessions' events here,
-                    # before they take room in the callback queue — and
-                    # session-less ones from a plugin whose session events
-                    # all carry their session
+                    # before they take room in the callback queue
                     matched.extend((cb, m) for (cb, m, s) in cbs
-                                   if s is None or s == session
-                                   or (session is None and not capable))
+                                   if s is None or session is None
+                                   or s == session)
         meta = None
         for cb, with_meta in matched:
             if with_meta:

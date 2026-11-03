@@ -1002,10 +1002,10 @@ def test_session_subscription_follows_topology_and_resync():
     assert rt._callbacks == {}
 
 
-def test_session_callback_drops_session_less_from_capable_plugin():
-    """From a plugin advertising ``session_events`` a session callback gets
-    no session-less events, routed at the broker or not; a session-less
-    callback still does."""
+def test_session_callback_gets_session_less_events():
+    """A session callback gets session-less events (plugin-level
+    notifications) also from a plugin advertising ``session_events``,
+    routed at the broker or not, and across a resync."""
     for broker_caps in (True, False):
         rt = _topo_runtime()
         rt._on_topology(_topo_msg(broker_caps=broker_caps))
@@ -1015,27 +1015,95 @@ def test_session_callback_drops_session_less_from_capable_plugin():
         rt.register_callback(endpoint_id='ep', plugin_name='rh',
                              callback=other)
         rt._on_event(_ev(None))
-        rt._on_event(_ev('sid-a'))
+        rt._on_event(_ev('sid-b'))
         assert [rt._cb._q.get_nowait()[0] for _ in range(3)] \
-            == [other, cb, other]
+            == [cb, other, other]
         assert rt._cb._q.qsize() == 0
 
 
-def test_resync_resets_session_capability():
-    """A reconnect forgets both capabilities until the new topology: no
-    routing, and session-less events are not filtered on stale info."""
+def test_session_less_event_of_flagged_subclass_reaches_scoped_callback():
+    """A plugin subclass inherits ``session_events`` but sends a
+    plugin-level (session-less) notification: with broker routing on, the
+    session pattern still lets it through the broker, and the runtime hands
+    it to the session callback (as without routing)."""
+    from unittest.mock import MagicMock
+    from radical.orbit import protocol
+    from radical.orbit.broker_events import EventRouter
+    from radical.orbit.plugin_rhapsody import PluginRhapsody
+
+    class _Sub(PluginRhapsody):
+        plugin_name = 'rh_sub_test'
+    assert _Sub.session_events is True
+
     rt = _topo_runtime()
     rt._on_topology(_topo_msg())
+    router = EventRouter({}, lambda *a: None, MagicMock(), 8, lambda: None)
+    router.add_endpoint('consumer')
     cb = lambda *a: None                              # noqa: E731
     rt.register_callback(endpoint_id='ep', plugin_name='rh', callback=cb,
                          session='sid-a')
-    rt._on_event(_ev(None))
-    assert rt._cb._q.qsize() == 0                     # capable: dropped
-    rt._resync_subscriptions()
-    assert not rt._broker_routes and rt._session_capable == set()
-    assert _emitted(rt)[-1] == ('subscribe', [_PLAIN])
-    rt._on_event(_ev(None))
-    assert rt._cb._q.qsize() == 1                     # unknown: passed
+    for kind, pats in _emitted(rt):
+        router.update_subscription('consumer', {'patterns': pats},
+                                   kind == 'subscribe')
+    assert router._subscriptions['consumer'] == [
+        protocol.SubscribePattern(**_SID_A)]
+    for sid in (None, 'sid-b', 'sid-a'):
+        router.ingest('ep', {'kind': 'event', 'plugin': 'rh', 'topic': 't',
+                             'version': protocol.PROTOCOL_VERSION,
+                             'session': sid, 'data': {}})
+    got = [protocol.parse_message(d) for d in router._out['consumer'].buf]
+    assert [e.session for e in got] == [None, 'sid-a']
+    for ev in got:
+        rt._on_event(ev)
+    assert rt._cb._q.qsize() == 2
+
+
+def test_capability_downgrade_drops_nothing():
+    """When the endpoint stops advertising ``session_events``, the plain
+    pattern is subscribed before the session pattern is withdrawn: an event
+    of the session between any two frames still reaches the subscriber."""
+    from unittest.mock import MagicMock
+    from radical.orbit.broker_events import EventRouter
+
+    rt = _topo_runtime()
+    rt._on_topology(_topo_msg())
+    router = EventRouter({}, lambda *a: None, MagicMock(), 64, lambda: None)
+    router.add_endpoint('consumer')
+    cb = lambda *a: None                              # noqa: E731
+    rt.register_callback(endpoint_id='ep', plugin_name='rh', callback=cb,
+                         session='sid-a')
+
+    def _apply_each_and_probe(frames):
+        for kind, pats in frames:
+            router.update_subscription('consumer', {'patterns': pats},
+                                       kind == 'subscribe')
+            before = len(router._out['consumer'].buf)
+            router.ingest('ep', {'kind': 'event', 'plugin': 'rh',
+                                 'topic': 't', 'session': 'sid-a',
+                                 'data': {}})
+            assert len(router._out['consumer'].buf) == before + 1, kind
+
+    _apply_each_and_probe(_emitted(rt))
+    rt._on_topology(_topo_msg(ep_caps=False))         # downgrade
+    frames = _emitted(rt)
+    assert frames == [('subscribe', [_PLAIN]), ('unsubscribe', [_SID_A])]
+    _apply_each_and_probe(frames)
+
+
+def test_malformed_pattern_never_sent():
+    """An argument the broker could not parse as a pattern raises before
+    any state changes: nothing registered, nothing sent."""
+    rt = _topo_runtime()
+    cb = lambda *a: None                              # noqa: E731
+    with pytest.raises(ValueError):
+        rt.register_callback(endpoint_id=7, plugin_name='rh', callback=cb)
+    with pytest.raises(ValueError):
+        rt.register_callback(endpoint_id='ep', plugin_name='rh', callback=cb,
+                             session=['not', 'a', 'sid'])
+    with pytest.raises(ValueError):
+        rt.hold_subscription('ep', {'bad': 1})
+    assert rt._callbacks == {} and not rt._wire_count and not rt._held
+    assert _emitted(rt) == []
 
 
 def test_topology_hides_reserved_plugin_keys():
