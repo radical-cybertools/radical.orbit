@@ -90,6 +90,7 @@ _PING_TIMEOUT   = 3.0     # websockets client keepalive answer deadline
 _BACKOFF_START  = 0.5     # (re)connect backoff floor (seconds)
 _BACKOFF_MAX    = 10.0    # (re)connect backoff ceiling (seconds)
 _BACKOFF_FACTOR = 1.5     # (re)connect backoff growth factor
+_PLUGIN_SHUTDOWN = 15.0   # served plugins' shutdown() bound at stop()
 
 # Legacy per-instance tunables still accepted as keyword arguments (they feed
 # private attributes) so existing harnesses keep constructing runtimes without
@@ -253,8 +254,9 @@ class EndpointRuntime(PluginHostBase):
 
         # ── State ──────────────────────────────────────────────────────
         self._ws = None
-        self._stopping = False
-        self._fatal    = False
+        self._stopping   = False
+        self._terminated = False
+        self._fatal      = False
         # Human-readable, actionable reason for a fatal transport failure —
         # surfaced via the ``fatal_reason`` property and raised from
         # ``start(wait=True)`` so callers never sit on a dead runtime.
@@ -313,6 +315,13 @@ class EndpointRuntime(PluginHostBase):
         TLS pin mismatch, tunnel failure, protocol error).  The runtime will
         not retry; check :attr:`fatal_reason` for the actionable cause."""
         return self._fatal
+
+    @property
+    def terminated(self) -> bool:
+        """True once the broker sent ``shutdown`` / ``terminate``: the
+        runtime closed its connection and does not reconnect, so a process
+        that only serves this runtime should :meth:`stop` and exit."""
+        return self._terminated
 
     @property
     def fatal_reason(self) -> Optional[str]:
@@ -445,14 +454,16 @@ class EndpointRuntime(PluginHostBase):
         if self._transport_future is not None:
             self._transport_future.cancel()
             self._transport_future = None
-        # Cancel served-plugin background tasks on the work loop before it
-        # stops, so no task is destroyed while pending.
+        # Shut served plugins down on the work loop before it stops: they
+        # close their sessions and release what they hold, and no task is
+        # destroyed while pending.
         if self._work_loop is not None and self._work_loop.is_running() \
                 and self._plugins:
             coro = self._work_teardown()
             try:
                 asyncio.run_coroutine_threadsafe(
-                    coro, self._work_loop).result(timeout=3.0)
+                    coro, self._work_loop).result(
+                        timeout=_PLUGIN_SHUTDOWN + 3.0)
             except Exception:
                 coro.close()
         for loop, thread in ((self._transport_loop, self._transport_thread),
@@ -481,8 +492,27 @@ class EndpointRuntime(PluginHostBase):
                 pass
 
     async def _work_teardown(self) -> None:
+        plugins = list(self._plugins.values())
+
+        async def _shutdown(plugin) -> None:
+            try:
+                await plugin.shutdown()
+            except Exception as e:
+                log.warning("[Runtime] %s.shutdown failed: %s",
+                            plugin.instance_name, e)
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*[_shutdown(p) for p in plugins]),
+                timeout=_PLUGIN_SHUTDOWN)
+        except asyncio.TimeoutError:
+            log.warning("[Runtime] plugin shutdown exceeded %.0fs",
+                        _PLUGIN_SHUTDOWN)
+
+        # a plugin whose shutdown failed or timed out may leave its cleanup
+        # task running: cancel what is left
         tasks = []
-        for plugin in list(self._plugins.values()):
+        for plugin in plugins:
             task = getattr(plugin, '_cleanup_task', None)
             if task is not None and not task.done():
                 task.cancel()
@@ -1135,7 +1165,8 @@ class EndpointRuntime(PluginHostBase):
         if msg.op in ('shutdown', 'terminate'):
             log.info("[Runtime] control %s received; closing connection",
                      msg.op)
-            self._stopping = True
+            self._stopping   = True
+            self._terminated = True
             if self._transport_loop is not None:
                 asyncio.run_coroutine_threadsafe(
                     self._graceful_close(), self._transport_loop)

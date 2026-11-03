@@ -1104,3 +1104,58 @@ def test_emit_oversized_event_stays_lenient(harness):
     a = make_runtime(srv.url, name='epA', frame_cap=64 * 1024)
     a._emit(protocol.Event(src='epA', plugin='p', topic='t',
                            data={'x': 'y' * 128 * 1024}))   # must not raise
+
+
+# ── stop: plugin shutdown; terminate ───────────────────────────────────────
+
+class _ShutdownPlugin:
+
+    def __init__(self, name, delay=0.0, fail=False):
+        self.instance_name = name
+        self._cleanup_task = None
+        self.delay         = delay
+        self.fail          = fail
+        self.done          = False
+
+    async def shutdown(self):
+        await asyncio.sleep(self.delay)
+        if self.fail:
+            raise RuntimeError('boom')
+        self.done = True
+
+
+def _unstarted_runtime():
+    from radical.orbit.runtime import EndpointRuntime
+    return EndpointRuntime(broker_url='https://127.0.0.1:1', token=None)
+
+
+def test_work_teardown_shuts_plugins_down(monkeypatch):
+    import radical.orbit.runtime as rtm
+    monkeypatch.setattr(rtm, '_PLUGIN_SHUTDOWN', 0.5)
+    rt   = _unstarted_runtime()
+    ok   = _ShutdownPlugin('ok')
+    bad  = _ShutdownPlugin('bad', fail=True)
+    slow = _ShutdownPlugin('slow', delay=5.0)
+    rt._plugins = {'ok': ok, 'bad': bad, 'slow': slow}
+
+    async def _run():
+        slow._cleanup_task = asyncio.ensure_future(asyncio.sleep(60))
+        t0 = time.time()
+        await rt._work_teardown()
+        return time.time() - t0, slow._cleanup_task
+
+    elapsed, task = asyncio.run(_run())
+    assert ok.done
+    assert not slow.done
+    assert elapsed < 2.0
+    assert task.cancelled()
+
+
+def test_control_terminate_marks_terminated():
+    from radical.orbit import protocol
+    rt = _unstarted_runtime()
+    assert not rt.terminated
+    rt._on_control(protocol.Control(src='broker', op='error'))
+    assert not rt.terminated
+    rt._on_control(protocol.Control(src='broker', op='terminate'))
+    assert rt.terminated
