@@ -194,6 +194,15 @@ class DragonThread(Executor):
         if wait:
             self.join()
 
+    @property
+    def down(self) -> bool:
+        """True once :meth:`shutdown` was called: no new work."""
+        return self._down
+
+    @property
+    def started(self) -> bool:
+        return self._thread is not None
+
     def join(self, timeout: Optional[float] = None) -> bool:
         """Wait for the worker to finish; False if it is still busy."""
         if self._thread is None:
@@ -222,11 +231,10 @@ class DDictBackend:
         self._pool    = DragonThread()
         self._rt      = None
         self._closed  = False
-        self._pool_down = False
         self._ddicts: Dict[str, Any] = {}
 
     async def _call(self, fn, *args, **kwargs) -> Any:
-        if self._pool_down:
+        if self._pool.down:
             raise HTTPException(status_code=503,
                                 detail="dragon backend is closed")
         loop = asyncio.get_running_loop()
@@ -236,6 +244,9 @@ class DDictBackend:
     # -- Dragon specifics (run on the Dragon thread) -------------------------
 
     def _runtime_up(self) -> None:
+        if self._closed:
+            raise HTTPException(status_code=503,
+                                detail="dragon backend is closed")
         if self._rt is not None:
             return
 
@@ -275,7 +286,10 @@ class DDictBackend:
     def _new_ddict(self, managers_per_node: int, n_nodes: int,
                    total_mem: int) -> Any:
         from dragon.data.ddict import DDict
-        return DDict(managers_per_node, n_nodes, total_mem)
+        # bounds Dragon's timed operations (default: wait forever), so a
+        # stuck one fails instead of blocking the Dragon thread for good
+        return DDict(managers_per_node, n_nodes, total_mem,
+                     timeout=RUNTIME_TIMEOUT)
 
     # -- DDict operations ----------------------------------------------------
 
@@ -386,24 +400,24 @@ class DDictBackend:
         """Destroy every DDict, then stop or detach the runtime.  When the
         await is cancelled before the close ran, :meth:`close_sync` still
         does it at exit."""
-        if self._closed or self._pool_down:
+        if self._closed or self._pool.down:
             return                      # a cancelled close: close_sync
-        try:
-            await self._call(self._close)
-        finally:
-            self._pool_down = True
-            self._pool.shutdown(wait=False)
+        # the close is the last job: no create can queue behind it
+        fut = self._pool.submit(self._close)
+        self._pool.shutdown(wait=False)
+        await asyncio.wrap_future(fut)
 
     def close_sync(self) -> None:
         """:meth:`close` for process exit (no event loop), for hosts that
         exit without running plugin ``shutdown()``: a started runtime must
         not outlive the process.  A no-op after :meth:`close`."""
-        if self._closed:
-            return
+        if self._closed or not self._pool.started:
+            return                      # closed, or Dragon never used
         try:
-            if not self._pool_down:
-                self._pool_down = True
-                self._pool.submit(self._close).result(timeout=EXIT_TIMEOUT)
+            if not self._pool.down:
+                fut = self._pool.submit(self._close)
+                self._pool.shutdown(wait=False)
+                fut.result(timeout=EXIT_TIMEOUT)
                 return
             # a close was cancelled: let the worker finish what it runs,
             # then close from this thread (serialized calls work from any
@@ -448,6 +462,7 @@ class DragonSession(PluginSession):
     def _p(self) -> "PluginDragon":
         return self._plugin
 
+    @_not_found_404
     async def create(self, name: Optional[str], managers_per_node: int,
                      n_nodes: int, total_mem: int,
                      creator: Optional[str]) -> dict:

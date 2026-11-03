@@ -613,7 +613,6 @@ def test_keys_reply_limit_counts_utf8(env):
 
 def test_close_after_cancelled_close_is_noop():
     backend = _FakeBackend()
-    backend._pool_down = True
     backend._pool.shutdown(wait=False)
     asyncio.run(backend.close())        # no "cannot schedule" error
 
@@ -773,3 +772,28 @@ def test_partial_put_reports_progress():
         await backend.put('d', {'a': 1, 'b': 2, 'c': 3})
     with pytest.raises(RuntimeError, match="after 2 of 3 items"):
         asyncio.run(_run())
+
+
+# ── review round 6 ──────────────────────────────────────────────────────────
+
+def test_create_racing_close_starts_no_runtime():
+    from fastapi import HTTPException
+    backend = _FakeBackend()
+
+    async def _run():
+        await backend.create('a', 1, 1, 1024)
+        close = asyncio.ensure_future(backend.close())
+        await asyncio.sleep(0)              # close submitted, not finished
+        with pytest.raises(HTTPException) as e:
+            await backend.create('b', 1, 1, 1024)
+        await close
+        return e.value.status_code
+    assert asyncio.run(_run()) == 503
+    assert backend.up   == 1                # no second runtime
+    assert backend.down == 1
+
+
+def test_close_sync_unused_backend_starts_no_thread():
+    backend = _FakeBackend()
+    backend.close_sync()
+    assert not backend._pool.started
