@@ -114,16 +114,16 @@ rt.stop()
 ## Naming and session recovery
 
 A runtime given no `name` is auto-named `consumer.<uuid8>` — fine for
-fire-and-forget consumers, but such a name cannot recover sessions on restart.
-Session reattach is **owner-checked**, so it needs a **stable, client-supplied**
-name: restart the runtime with the *same* `name` and its sessions come back.
-A `name-in-use` registration is retried with capped exponential backoff until
-the stale registration passes `lost` — a crashed predecessor holds no resume
-key and, under the fast keepalive, the name frees within seconds — so "restart
-with the same name → sessions return" is automatic from the application's view.
+fire-and-forget consumers.  Sessions do not depend on the name: any runtime
+holding a session id reattaches with `register_session(sid=...)` (or
+`get_plugin(..., sid=...)`) until the session idle-expires; set `ttl=` at
+creation for long gaps.  A `name-in-use` registration is retried with capped
+exponential backoff until the stale registration passes `lost` — a crashed
+predecessor holds no resume key and, under the fast keepalive, the name frees
+within seconds.
 
 ``` python
-rt = EndpointRuntime(name='my-workflow')   # stable name → recoverable sessions
+rt = EndpointRuntime(name='my-workflow')   # stable, recognizable name
 ```
 
 The `radical-orbit-endpoint` entry point follows this: a serving endpoint

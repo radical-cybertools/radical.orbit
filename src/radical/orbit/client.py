@@ -148,11 +148,15 @@ class PluginClient:
 
         Args:
             sid:      Client-supplied session ID for create-or-reconnect
-                      (``None`` mints a fresh one).
-            lifetime: Session lifetime policy — ``'ephemeral'`` (default),
-                      ``'ttl'``, or ``'persistent'``.
-            ttl:      Seconds until expiry; required (and only valid) when
-                      ``lifetime='ttl'``.
+                      (``None`` mints a fresh one).  Any client holding a
+                      sid can reconnect to it; an ended one raises (410).
+            lifetime: Legacy policy name -- ``'ephemeral'`` (the plugin's
+                      default timeout) or ``'persistent'`` (never expires);
+                      prefer *ttl*.
+            ttl:      Idle timeout of the session in seconds, fixed at
+                      creation (``0``: never expires); default: the
+                      plugin's.  Set it for sessions that are reconnected to
+                      after long idle phases.
 
         Subclasses may override to accept plugin-specific keyword
         arguments (e.g. ``backends``).
@@ -165,12 +169,29 @@ class PluginClient:
     @staticmethod
     def _session_payload(sid: Optional[str], lifetime: Optional[str],
                          ttl: Optional[float]):
-        """Build the ``register_session`` request body (``None`` when empty)."""
+        """Build the ``register_session`` request body (``None`` when empty).
+
+        A bare ``ttl`` is sent in the legacy form endpoints of the previous
+        release accept too: ``lifetime='persistent'`` for ``0``, else
+        ``lifetime='ttl'`` plus the ttl.
+        """
+        if ttl is not None and lifetime is None:
+            if ttl == 0: lifetime, ttl = 'persistent', None
+            else:        lifetime      = 'ttl'
         payload = {}
         if sid      is not None: payload['sid']      = sid
         if lifetime is not None: payload['lifetime'] = lifetime
         if ttl      is not None: payload['ttl']      = ttl
         return payload or None
+
+    def touch(self) -> None:
+        """Count as an access of the session, so it does not idle-expire.
+
+        No other effect; an ended session raises (HTTP 410).
+        """
+        self._require_session()
+        resp = self._request("POST", self._url(f"touch/{self._sid}"))
+        self._raise(resp)
 
     def unregister_session(self) -> None:
         """

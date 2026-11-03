@@ -3361,3 +3361,12 @@ class TestUnsharedScratch:
         assert rec.shared_fs   is False
         assert rec.scratch_base == _REMOTE_SCRATCH
         assert rec.members['default'].shared_fs is False
+
+
+def test_federation_handle_sessions_idle_expire():
+    '''Federation state lives on the persistent `default` session; other
+    (handle-only) sessions, e.g. from Explorer tabs, keep the default
+    timeout instead of living forever.'''
+    from radical.orbit.plugin_base import Plugin
+    from radical.orbit.plugin_federation import PluginFederation
+    assert PluginFederation.session_ttl == Plugin.session_ttl > 0

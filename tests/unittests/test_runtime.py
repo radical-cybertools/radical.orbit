@@ -87,6 +87,7 @@ class _EchoPlugin(Plugin):
         self.add_route_get('slow/{ms}',   self._slow)
         self.add_route_get('block/{ms}',  self._block)
         self.add_route_get('busy',        self._busy)
+        self.add_route_get('big/{n}',     self._big)
 
     async def _ping(self, request):
         return {'pong': True}
@@ -111,6 +112,9 @@ class _EchoPlugin(Plugin):
         raise HTTPException(status_code=429, detail='slow down',
                             headers={'Retry-After' : '7',
                                      'Content-Type': 'text/plain'})
+
+    async def _big(self, request):
+        return {'big': 'x' * int(request.path_params['n'])}
 
     async def _block(self, request):
         # A synchronous sleep pins the WORK loop — the transport thread must
@@ -515,10 +519,10 @@ def test_owner_channel_broker_stamped_not_spoofable(harness):
 
 # ---------------------------------------------------------------------------
 # runtime wires on_topology_change to served plugins incl. synthesized 'lost';
-# an owner-bound ephemeral session is reclaimed after the drain
+# the session survives its owner's loss (clients may reconnect later)
 # ---------------------------------------------------------------------------
 
-def test_served_plugin_observes_lost_and_reclaims(harness):
+def test_served_plugin_observes_lost_and_keeps_session(harness):
     make_broker, make_runtime = harness
     # Aggressive broker keepalive + tiny grace so a hard-dropped consumer
     # reaches suspect then lost within the test window.
@@ -531,7 +535,6 @@ def test_served_plugin_observes_lost_and_reclaims(harness):
     assert _wait_topology(b, 'epA', 'liveness_rt', timeout=5.0)
 
     plugin = a._plugins['liveness_rt']
-    plugin.reclaim_drain = 0.2
 
     # B registers an owner-bound ephemeral session on epA's plugin.
     resp = b.call('epA', 'POST', '/liveness_rt/register_session', body=b'{}')
@@ -556,8 +559,9 @@ def test_served_plugin_observes_lost_and_reclaims(harness):
     assert _wait(lambda: ('epB', 'suspect') in plugin.observed, timeout=5.0)
     assert _wait(lambda: ('epB', 'lost')    in plugin.observed, timeout=5.0)
 
-    # The owner-bound ephemeral session is reclaimed after the drain.
-    assert _wait(lambda: sid not in plugin._sessions, timeout=5.0)
+    # Owner loss does not end the session: a client may reconnect later.
+    time.sleep(0.5)
+    assert sid in plugin._sessions
 
 
 # ---------------------------------------------------------------------------
@@ -1257,3 +1261,91 @@ def test_tls_pin_mismatch_is_fatal_and_actionable(self_signed, tmp_path,
         rt.stop()
         httpd.shutdown()
         httpd.server_close()
+
+
+# ---------------------------------------------------------------------------
+# frame cap: oversized requests / responses fail fast, events stay lenient
+# ---------------------------------------------------------------------------
+
+def test_call_oversized_request_is_413_fast(harness):
+    make_broker, make_runtime = harness
+    srv = make_broker()
+    a = make_runtime(srv.url, name='epA', plugins=['echo_rt'])
+    assert a.wait_registered(timeout=5.0)
+    b = make_runtime(srv.url, name='epB', frame_cap=64 * 1024)
+
+    t0   = time.time()
+    resp = b.call('epA', 'POST', '/echo_rt/echo/x', body=b'x' * 128 * 1024)
+    assert time.time() - t0 < 1.0
+    assert resp.status_code == 413
+    assert 'exceeds cap 65536' in resp.json()['detail']
+    assert b._pending == {}
+
+
+def test_call_transport_down_raises_connection_error_fast(harness):
+    """A frame that cannot be queued -- no transport, or its loop closed --
+    fails at once as a ConnectionError (retryable like a lost connection),
+    and leaves no pending call behind."""
+    import asyncio as _asyncio
+    make_broker, make_runtime = harness
+    srv = make_broker()
+    b = make_runtime(srv.url, name='epB')
+    outbox, loop = b._outbox, b._transport_loop
+    closed = _asyncio.new_event_loop()
+    closed.close()
+    try:
+        for attr, val in (('_outbox', None), ('_transport_loop', closed)):
+            setattr(b, attr, val)
+            t0 = time.time()
+            with pytest.raises(ConnectionError, match='not up'):
+                b.call('broker', 'GET', '/nope', timeout=30.0)
+            assert time.time() - t0 < 1.0
+            assert b._pending == {}
+            b._outbox, b._transport_loop = outbox, loop
+    finally:
+        b._outbox, b._transport_loop = outbox, loop
+    assert b.call('broker', 'GET', '/nope').status_code in (404, 503)
+
+
+def test_gateway_body_too_large_for_the_frame_is_413(harness):
+    """A body the gateway reads (up to FRAME_CAP) but that no frame can
+    carry with its envelope is a 413 with detail, not a bare 500."""
+    import httpx
+    from radical.orbit import protocol
+    make_broker, make_runtime = harness
+    srv = make_broker()
+    a = make_runtime(srv.url, name='epA', plugins=['echo_rt'])
+    assert a.wait_registered(timeout=5.0)
+    with httpx.Client(timeout=30.0) as c:
+        r = c.post('%s/epA/echo_rt/echo/x' % srv.url,
+                   content=b'x' * (protocol.FRAME_CAP - 64))
+    assert r.status_code == 413, r.text
+    assert 'too large' in r.json()['detail']
+
+
+def test_served_oversized_response_is_500_fast(harness):
+    make_broker, make_runtime = harness
+    srv = make_broker()
+    a = make_runtime(srv.url, name='epA', plugins=['echo_rt'],
+                     frame_cap=64 * 1024)
+    assert a.wait_registered(timeout=5.0)
+    b = make_runtime(srv.url, name='epB')
+    assert _wait_topology(b, 'epA', 'echo_rt', timeout=5.0)
+
+    t0   = time.time()
+    resp = b.call('epA', 'GET', '/echo_rt/big/200000', timeout=30.0)
+    assert time.time() - t0 < 1.0
+    assert resp.status_code == 500
+    assert 'response not sent' in resp.json()['detail']
+    assert b.call('epA', 'GET', '/echo_rt/big/10').status_code == 200
+
+
+def test_emit_oversized_event_stays_lenient(harness):
+    """Event publish (``_emit``) is reached from plugin threads: an oversized
+    event is logged and dropped, never raised."""
+    from radical.orbit import protocol
+    make_broker, make_runtime = harness
+    srv = make_broker()
+    a = make_runtime(srv.url, name='epA', frame_cap=64 * 1024)
+    a._emit(protocol.Event(src='epA', plugin='p', topic='t',
+                           data={'x': 'y' * 128 * 1024}))   # must not raise
