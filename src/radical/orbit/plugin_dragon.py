@@ -1,0 +1,731 @@
+"""Dragon plugin: Dragon distributed dictionaries (DDict) through ORBIT.
+
+First slice of Orbit-Dragon (SwarmSlicer): ORBIT as the access layer for
+Dragon services.  A client creates a DDict on an endpoint that runs next to
+a Dragon runtime, reads and writes it through the broker, and hands the
+DDict's serialized descriptor to processes inside the runtime, which attach
+to the same data with ``DDict.attach(descriptor)``.
+
+The plugin drives DDicts directly through ``dragonhpc`` (>= 0.15.0, for
+attaching from plain python).  :class:`DDictBackend` is the seam where the
+Dragon services API server replaces the direct calls later.
+
+The plugin is endpoint-only, loads only when ``dragonhpc`` is importable,
+and is not part of any default plugin set::
+
+    ./bin/radical-orbit-endpoint-wrapper.sh --plugins default,dragon
+
+Runtime selection (``$RADICAL_ORBIT_DRAGON_RUNTIME``):
+
+- ``attach``: join a running Dragon runtime (``$DRAGON_ATTACH_TOKEN``);
+- ``start``:  start a single-node runtime on first use, stop it at
+              plugin shutdown.
+
+Default: ``attach`` when ``$DRAGON_ATTACH_TOKEN`` is set, else ``start``.
+"""
+
+__author__    = 'Radical Development Team'
+__email__     = 'radical@radical-project.org'
+__copyright__ = 'Copyright 2026, RADICAL@Rutgers'
+__license__   = 'MIT'
+
+
+import asyncio
+import atexit
+import base64
+import functools
+import importlib.util
+import json
+import logging
+import os
+import re
+import shutil
+import sys
+import time
+import uuid
+
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional
+
+from fastapi import FastAPI, HTTPException
+from starlette.requests import Request
+
+from .client import PluginClient
+from .errors import http_exception
+from .plugin_base import Plugin
+from .plugin_session_base import PluginSession
+from .protocol import FRAME_CAP
+
+log = logging.getLogger("radical.orbit")
+
+
+ENV_RUNTIME      = 'RADICAL_ORBIT_DRAGON_RUNTIME'
+RUNTIME_MODES    = ('attach', 'start')
+RUNTIME_TIMEOUT  = 120                  # s, runtime start / attach
+DEFAULT_MEM      = 64 * 1024 * 1024     # bytes, DDict total_mem default
+NAME_RE          = re.compile(r'[A-Za-z0-9_.-]{1,64}')
+MEM_RE           = re.compile(r'(\d+)\s*([KMGT]?)B?', re.IGNORECASE)
+MEM_UNITS        = {'': 1, 'K': 2**10, 'M': 2**20, 'G': 2**30, 'T': 2**40}
+
+# bytes values travel as ``{B64_KEY: "<base64>"}``; everything else as JSON
+B64_KEY          = '$b64'
+
+
+# ------------------------------------------------------------------------
+#
+def encode_value(value: Any) -> Any:
+    """Wire form of a DDict value: bytes as a base64 marker, else as is."""
+    if isinstance(value, (bytes, bytearray)):
+        return {B64_KEY: base64.b64encode(value).decode()}
+    return value
+
+
+def decode_value(value: Any) -> Any:
+    """Inverse of :func:`encode_value`."""
+    if isinstance(value, dict) and len(value) == 1 and B64_KEY in value:
+        return base64.b64decode(value[B64_KEY])
+    return value
+
+
+def parse_mem(value: Any) -> int:
+    """Parse a memory size: an int (bytes) or a string like ``'512M'``."""
+    if isinstance(value, bool):
+        raise ValueError(f"invalid memory size: {value!r}")
+    if isinstance(value, int):
+        mem = value
+    else:
+        m = MEM_RE.fullmatch(str(value).strip())
+        if not m:
+            raise ValueError(f"invalid memory size: {value!r}")
+        mem = int(m.group(1)) * MEM_UNITS[m.group(2).upper()]
+    if mem <= 0:
+        raise ValueError(f"invalid memory size: {value!r}")
+    return mem
+
+
+def _frame_cap(app: FastAPI) -> int:
+    """The serving runtime's transport frame cap (tunable), else the
+    protocol default (same lookup as ``plugin_rhapsody``)."""
+    svc = getattr(getattr(app, 'state', None), 'endpoint_service', None)
+    cap = getattr(svc, '_frame_cap', None)
+    return cap if isinstance(cap, int) and cap > 0 else FRAME_CAP
+
+
+def dragon_available() -> bool:
+    """Whether ``dragonhpc`` is importable (without importing it).  A
+    directory named ``dragon`` on ``sys.path`` (a namespace package, no
+    origin) does not count."""
+    try:
+        spec = importlib.util.find_spec('dragon')
+    except (ImportError, ValueError):
+        return False
+    return spec is not None and spec.origin is not None
+
+
+def runtime_mode() -> str:
+    """The runtime mode from ``$RADICAL_ORBIT_DRAGON_RUNTIME``, defaulting
+    to ``attach`` when ``$DRAGON_ATTACH_TOKEN`` is set, else ``start``."""
+    mode = os.environ.get(ENV_RUNTIME, '').strip().lower()
+    if not mode:
+        return 'attach' if os.environ.get('DRAGON_ATTACH_TOKEN') else 'start'
+    if mode not in RUNTIME_MODES:
+        raise ValueError(f"${ENV_RUNTIME}={mode!r}: expected one of "
+                         f"{RUNTIME_MODES}")
+    return mode
+
+
+# ------------------------------------------------------------------------
+#
+class DDictBackend:
+    """
+    Owns the Dragon runtime connection and the DDicts of one plugin.
+
+    Every Dragon call runs on one dedicated thread: concurrent DDict calls
+    from several threads hang (dragonhpc 0.15.0), and serializing them
+    keeps the endpoint's loops free.  The runtime is started or attached on
+    first use, so loading the plugin costs nothing.
+
+    Subclasses (tests, later the Dragon services API server) override
+    :meth:`_runtime_up`, :meth:`_runtime_down` and :meth:`_new_ddict`.
+    """
+
+    def __init__(self, mode: str):
+        self._mode    = mode
+        self._pool    = ThreadPoolExecutor(1, thread_name_prefix='dragon')
+        self._rt      = None
+        self._closed  = False
+        self._ddicts: Dict[str, Any] = {}
+
+    async def _call(self, fn, *args, **kwargs) -> Any:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._pool, functools.partial(fn, *args, **kwargs))
+
+    # -- Dragon specifics (run on the Dragon thread) -------------------------
+
+    def _runtime_up(self) -> None:
+        if self._rt is not None:
+            return
+        # the runtime is spawned through the `dragon` launcher, which sits
+        # next to the interpreter when the venv is not activated
+        if not shutil.which('dragon'):
+            bindir = os.path.dirname(sys.executable)
+            if os.path.exists(os.path.join(bindir, 'dragon')):
+                os.environ['PATH'] = bindir + os.pathsep + os.environ['PATH']
+
+        from dragon.workflows import runtime as drt
+        t0 = time.time()
+        if self._mode == 'start':
+            self._rt = drt.LocalRuntime.start(timeout=RUNTIME_TIMEOUT)
+        else:
+            self._rt = drt.attach(timeout=RUNTIME_TIMEOUT)
+        log.info("[dragon] runtime %s in %.1fs", self._mode, time.time() - t0)
+
+    def _runtime_down(self) -> None:
+        if self._rt is None:
+            return
+        if self._mode == 'start': self._rt.stop()
+        else                    : self._rt.detach()
+        self._rt = None
+
+    def _new_ddict(self, managers_per_node: int, n_nodes: int,
+                   total_mem: int) -> Any:
+        from dragon.data.ddict import DDict
+        return DDict(managers_per_node, n_nodes, total_mem)
+
+    # -- DDict operations ----------------------------------------------------
+
+    def _ddict(self, did: str) -> Any:
+        try:
+            return self._ddicts[did]
+        except KeyError:
+            raise FileNotFoundError(f"unknown ddict: {did}") from None
+
+    async def create(self, did: str, managers_per_node: int, n_nodes: int,
+                     total_mem: int) -> str:
+        """Create a DDict under *did*; returns its serialized descriptor."""
+        def _create():
+            self._runtime_up()
+            dd = self._new_ddict(managers_per_node, n_nodes, total_mem)
+            self._ddicts[did] = dd
+            return dd.serialize()
+        return await self._call(_create)
+
+    async def destroy(self, did: str) -> None:
+        def _destroy():
+            self._ddict(did).destroy()
+            del self._ddicts[did]
+        await self._call(_destroy)
+
+    async def put(self, did: str, items: Dict[str, Any]) -> int:
+        def _put():
+            dd = self._ddict(did)
+            for k, v in items.items():
+                dd[k] = v
+            return len(items)
+        return await self._call(_put)
+
+    async def get(self, did: str, keys: List[str]) -> tuple:
+        """Returns ``({key: value}, [missing keys])``."""
+        def _get():
+            dd = self._ddict(did)
+            found, missing = {}, []
+            for k in keys:
+                try:
+                    found[k] = dd[k]
+                except KeyError:
+                    missing.append(k)
+            return found, missing
+        return await self._call(_get)
+
+    async def pop(self, did: str, keys: List[str]) -> List[str]:
+        """Remove *keys*; returns the ones that were missing."""
+        def _pop():
+            dd = self._ddict(did)
+            missing = []
+            for k in keys:
+                try:
+                    del dd[k]
+                except KeyError:
+                    missing.append(k)
+            return missing
+        return await self._call(_pop)
+
+    async def keys(self, did: str) -> List[Any]:
+        return await self._call(lambda: list(self._ddict(did).keys()))
+
+    async def length(self, did: str) -> int:
+        return await self._call(lambda: len(self._ddict(did)))
+
+    async def clear(self, did: str) -> None:
+        await self._call(lambda: self._ddict(did).clear())
+
+    def _close(self) -> None:
+        for did, dd in list(self._ddicts.items()):
+            try:
+                dd.destroy()
+            except Exception as e:
+                log.warning("[dragon] destroy %s failed: %s", did, e)
+        self._ddicts.clear()
+        self._runtime_down()
+
+    async def close(self) -> None:
+        """Destroy every DDict, then stop or detach the runtime."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self._call(self._close)
+        finally:
+            self._pool.shutdown(wait=False)
+
+    def close_sync(self) -> None:
+        """:meth:`close` for process exit (no event loop), for hosts that
+        exit without running plugin ``shutdown()``: a started runtime must
+        not outlive the process.  A no-op after :meth:`close`."""
+        if self._closed:
+            return
+        self._closed = True
+        # at interpreter exit the pool is already shut down: drain it, then
+        # close from this thread (serialized calls work from any thread)
+        self._pool.shutdown(wait=True, cancel_futures=True)
+        try:
+            self._close()
+        except Exception as e:
+            log.warning("[dragon] close at exit failed: %s", e)
+
+
+# ------------------------------------------------------------------------
+#
+class DragonSession(PluginSession):
+    """
+    Dragon session (service side).
+
+    DDicts belong to the plugin, not to a session: like Dragon services they
+    outlive their creator and are shared by ID.  The session is the access
+    path only.
+    """
+
+    @property
+    def _p(self) -> "PluginDragon":
+        return self._plugin
+
+    async def create(self, name: Optional[str], managers_per_node: int,
+                     n_nodes: int, total_mem: int,
+                     creator: Optional[str]) -> dict:
+        self._check_active()
+        return await self._p.ddict_create(name, managers_per_node, n_nodes,
+                                          total_mem, creator)
+
+    async def list(self) -> dict:
+        self._check_active()
+        return {"ddicts": [dict(e) for e in self._p.entries.values()]}
+
+    async def info(self, did: str) -> dict:
+        self._check_active()
+        entry = self._p.entry(did)
+        return dict(entry, n_keys=await self._p.backend.length(did))
+
+    async def destroy(self, did: str) -> dict:
+        self._check_active()
+        return await self._p.ddict_destroy(did)
+
+    async def put(self, did: str, items: Dict[str, Any]) -> dict:
+        self._check_active()
+        self._p.entry(did)
+        items = {k: decode_value(v) for k, v in items.items()}
+        return {"n": await self._p.backend.put(did, items)}
+
+    async def get(self, did: str, keys: List[str]) -> dict:
+        self._check_active()
+        self._p.entry(did)
+        found, missing = await self._p.backend.get(did, keys)
+        items, errors = {}, {}
+        for k, v in found.items():
+            v = encode_value(v)
+            try:
+                json.dumps(v)
+                items[k] = v
+            except (TypeError, ValueError):
+                errors[k] = f"value of type {type(v).__name__} is not " \
+                            f"JSON-serializable"
+        result = {"items": items, "missing": missing, "errors": errors}
+        if len(json.dumps(result)) > self._p.reply_limit:
+            raise HTTPException(status_code=413,
+                                detail=f"reply exceeds {self._p.reply_limit}"
+                                       f" bytes: get fewer keys per call")
+        return result
+
+    async def keys(self, did: str) -> dict:
+        self._check_active()
+        self._p.entry(did)
+        return {"keys": [k for k in await self._p.backend.keys(did)
+                         if isinstance(k, str)]}
+
+    async def pop(self, did: str, keys: List[str]) -> dict:
+        self._check_active()
+        self._p.entry(did)
+        missing = await self._p.backend.pop(did, keys)
+        return {"n": len(keys) - len(missing), "missing": missing}
+
+    async def clear(self, did: str) -> dict:
+        self._check_active()
+        self._p.entry(did)
+        await self._p.backend.clear(did)
+        return {}
+
+
+# ------------------------------------------------------------------------
+#
+class DDictHandle:
+    """
+    Client-side handle on one DDict, with native ``DDict`` semantics::
+
+        dd = dragon.ddict.create(name='scratch')
+        dd['k'] = {'v': 1}
+        dd['k']             # -> {'v': 1}
+        'k' in dd, len(dd), dd.keys()
+        del dd['k']
+        dd.descriptor       # for DDict.attach() inside the Dragon runtime
+        dd.destroy()
+
+    Values are JSON-serializable objects or ``bytes``.
+    """
+
+    def __init__(self, client: "DragonClient", entry: dict):
+        self._client = client
+        self._entry  = entry
+
+    def __repr__(self) -> str:
+        return f"DDictHandle({self.id!r}, name={self.name!r})"
+
+    @property
+    def id(self) -> str:
+        return self._entry['id']
+
+    @property
+    def name(self) -> str:
+        return self._entry['name']
+
+    @property
+    def descriptor(self) -> str:
+        """Serialized descriptor for ``DDict.attach()`` in the runtime."""
+        return self._entry['descriptor']
+
+    def info(self) -> dict:
+        return self._client._call('GET', f'ddict/info/{{sid}}/{self.id}')
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self.update({key: value})
+
+    def update(self, items: Dict[str, Any]) -> None:
+        self._client._call('POST', 'ddict/put/{sid}', id=self.id,
+                           items={k: encode_value(v)
+                                  for k, v in items.items()})
+
+    def __getitem__(self, key: str) -> Any:
+        r = self.get_many([key])
+        if key in r['missing']:
+            raise KeyError(key)
+        if key in r['errors']:
+            raise TypeError(f"{key}: {r['errors'][key]}")
+        return r['items'][key]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def get_many(self, keys: List[str]) -> dict:
+        """``{items, missing, errors}`` for *keys*, values decoded."""
+        r = self._client._call('POST', 'ddict/get/{sid}', id=self.id,
+                               keys=list(keys))
+        r['items'] = {k: decode_value(v) for k, v in r['items'].items()}
+        return r
+
+    def __contains__(self, key: str) -> bool:
+        return key not in self.get_many([key])['missing']
+
+    def __delitem__(self, key: str) -> None:
+        r = self._client._call('POST', 'ddict/pop/{sid}', id=self.id,
+                               keys=[key])
+        if r['missing']:
+            raise KeyError(key)
+
+    def keys(self) -> List[str]:
+        return self._client._call('POST', 'ddict/keys/{sid}',
+                                  id=self.id)['keys']
+
+    def __len__(self) -> int:
+        return self.info()['n_keys']
+
+    def clear(self) -> None:
+        self._client._call('POST', 'ddict/clear/{sid}', id=self.id)
+
+    def destroy(self) -> None:
+        self._client._call('POST', 'ddict/destroy/{sid}', id=self.id)
+
+
+class DDictAPI:
+    """``DragonClient.ddict``: create, attach to and list DDicts."""
+
+    def __init__(self, client: "DragonClient"):
+        self._client = client
+
+    def create(self, name: Optional[str] = None, managers_per_node: int = 1,
+               n_nodes: int = 1, total_mem: Any = DEFAULT_MEM) -> DDictHandle:
+        """Create a DDict; *total_mem* in bytes or as ``'512M'``."""
+        entry = self._client._call('POST', 'ddict/create/{sid}', name=name,
+                                   managers_per_node=managers_per_node,
+                                   n_nodes=n_nodes, total_mem=total_mem)
+        return DDictHandle(self._client, entry)
+
+    def attach(self, ddict_id: str) -> DDictHandle:
+        """Handle on an existing DDict, by ID (or by name)."""
+        for entry in self.list():
+            if ddict_id in (entry['id'], entry['name']):
+                return DDictHandle(self._client, entry)
+        raise KeyError(f"unknown ddict: {ddict_id}")
+
+    def list(self) -> List[dict]:
+        return self._client._call('GET', 'ddict/list/{sid}')['ddicts']
+
+
+class DragonClient(PluginClient):
+    """
+    Client-side interface for the Dragon plugin.
+
+    Obtained via ``runtime.get_plugin(endpoint_name, 'dragon')``, which also
+    registers a session.  DDicts live at ``client.ddict``.
+    """
+
+    @property
+    def ddict(self) -> DDictAPI:
+        return DDictAPI(self)
+
+    def _call(self, method: str, path: str, **body) -> dict:
+        """One request; ``{sid}`` in *path* is the session ID."""
+        self._require_session()
+        url  = self._url(path.format(sid=self.sid))
+        resp = self._request(method, url, json=body) if method == 'POST' \
+               else self._request(method, url)
+        self._raise(resp, path.split('/{sid}')[0])
+        return resp.json()
+
+
+# ------------------------------------------------------------------------
+#
+class PluginDragon(Plugin):
+    """
+    Dragon plugin for ORBIT: Dragon DDicts created, read and written through
+    the broker.  See the module docstring.
+    """
+
+    plugin_name   = 'dragon'
+    session_class = DragonSession
+    client_class  = DragonClient
+    version       = '0.1.0'
+
+    ui_config = {
+        "icon"       : "🐉",
+        "title"      : "Dragon",
+        "description": "Dragon distributed dictionaries (DDict)."
+    }
+
+    @classmethod
+    def is_enabled(cls, app: FastAPI) -> bool:
+        """Endpoint-only, and only when dragonhpc is importable."""
+        return dragon_available() and not getattr(app.state, 'is_broker',
+                                                  False)
+
+    def __init__(self, app: FastAPI, instance_name: str = 'dragon',
+                 backend: Optional[DDictBackend] = None):
+        super().__init__(app, instance_name)
+
+        self.backend     = backend or DDictBackend(runtime_mode())
+        self.entries: Dict[str, dict] = {}
+        self.reply_limit = _frame_cap(app) // 2
+
+        # fallback for a host exiting without plugin shutdown()
+        atexit.register(self.backend.close_sync)
+
+        self.add_route_post('ddict/create/{sid}',     self.r_create)
+        self.add_route_get ('ddict/list/{sid}',       self.r_list)
+        self.add_route_get ('ddict/info/{sid}/{did}', self.r_info)
+        self.add_route_post('ddict/destroy/{sid}',    self.r_destroy)
+        self.add_route_post('ddict/put/{sid}',        self.r_put)
+        self.add_route_post('ddict/get/{sid}',        self.r_get)
+        self.add_route_post('ddict/keys/{sid}',       self.r_keys)
+        self.add_route_post('ddict/pop/{sid}',        self.r_pop)
+        self.add_route_post('ddict/clear/{sid}',      self.r_clear)
+
+    # -- registry --------------------------------------------------------------
+
+    def entry(self, did: str, ready: bool = True) -> dict:
+        """The registry entry of *did* (404 when unknown); with *ready*,
+        409 while it is still being created or destroyed."""
+        try:
+            entry = self.entries[did]
+        except KeyError:
+            raise http_exception(FileNotFoundError(
+                f"unknown ddict: {did}")) from None
+        if ready and entry['state'] != 'ready':
+            raise http_exception(FileExistsError(
+                f"ddict {did} is {entry['state']}"))
+        return entry
+
+    async def ddict_create(self, name: Optional[str], managers_per_node: int,
+                           n_nodes: int, total_mem: int,
+                           creator: Optional[str]) -> dict:
+        did  = f'ddict.{uuid.uuid4().hex[:8]}'
+        name = name or did
+        if any(e['name'] == name for e in self.entries.values()):
+            raise http_exception(FileExistsError(f"ddict {name!r} exists"))
+
+        # reserve the name before the (slow) create
+        entry = {"id"               : did,
+                 "name"             : name,
+                 "managers_per_node": managers_per_node,
+                 "n_nodes"          : n_nodes,
+                 "total_mem"        : total_mem,
+                 "created"          : time.time(),
+                 "creator"          : creator,
+                 "state"            : "creating",
+                 "descriptor"       : None}
+        self.entries[did] = entry
+        try:
+            entry['descriptor'] = await self.backend.create(
+                did, managers_per_node, n_nodes, total_mem)
+        except BaseException:
+            del self.entries[did]
+            raise
+        entry['state'] = 'ready'
+        log.info("[dragon] created %s (%s)", did, name)
+        self._dispatch_notify('ddict_status', {"id": did, "name": name,
+                                               "state": "ready"})
+        return dict(entry)
+
+    async def ddict_destroy(self, did: str) -> dict:
+        entry = self.entry(did)
+        entry['state'] = 'destroying'
+        try:
+            await self.backend.destroy(did)
+        except BaseException:
+            entry['state'] = 'ready'
+            raise
+        del self.entries[did]
+        log.info("[dragon] destroyed %s (%s)", did, entry['name'])
+        self._dispatch_notify('ddict_status', {"id": did,
+                                               "name": entry['name'],
+                                               "state": "destroyed"})
+        return {}
+
+    # -- route handlers --------------------------------------------------------
+
+    @staticmethod
+    async def _body(request: Request, *required: str) -> dict:
+        try:
+            body = await request.json()
+        except ValueError:
+            body = None
+        if not isinstance(body, dict):
+            raise http_exception(ValueError("body must be a JSON object"))
+        for field in required:
+            if field not in body:
+                raise http_exception(ValueError(f"missing field {field!r}"))
+        return body
+
+    @staticmethod
+    def _str_list(body: dict, field: str) -> List[str]:
+        val = body[field]
+        if not isinstance(val, list) or \
+                not all(isinstance(k, str) for k in val):
+            raise http_exception(ValueError(f"{field!r} must be a list of "
+                                            f"strings"))
+        return val
+
+    async def r_create(self, request: Request) -> dict:
+        """``POST ddict/create/{sid}``:
+        ``{name?, managers_per_node?, n_nodes?, total_mem?}`` -> entry."""
+        sid  = request.path_params['sid']
+        body = await self._body(request)
+        name = body.get('name')
+        if name is not None and \
+                not (isinstance(name, str) and NAME_RE.fullmatch(name)):
+            raise http_exception(ValueError(f"invalid ddict name {name!r}"))
+        try:
+            mpn = int(body.get('managers_per_node', 1))
+            nn  = int(body.get('n_nodes', 1))
+            mem = parse_mem(body.get('total_mem', DEFAULT_MEM))
+        except (TypeError, ValueError) as e:
+            raise http_exception(ValueError(str(e))) from e
+        if mpn < 1 or nn < 1:
+            raise http_exception(ValueError(
+                "managers_per_node and n_nodes must be >= 1"))
+        return await self._forward(sid, DragonSession.create, name=name,
+                                   managers_per_node=mpn, n_nodes=nn,
+                                   total_mem=mem,
+                                   creator=self._request_owner(request))
+
+    async def r_list(self, request: Request) -> dict:
+        """``GET ddict/list/{sid}`` -> ``{ddicts: [entry]}``."""
+        return await self._forward(request.path_params['sid'],
+                                   DragonSession.list)
+
+    async def r_info(self, request: Request) -> dict:
+        """``GET ddict/info/{sid}/{did}`` -> entry + ``n_keys``."""
+        return await self._forward(request.path_params['sid'],
+                                   DragonSession.info,
+                                   did=request.path_params['did'])
+
+    async def r_destroy(self, request: Request) -> dict:
+        """``POST ddict/destroy/{sid}``: ``{id}``."""
+        body = await self._body(request, 'id')
+        return await self._forward(request.path_params['sid'],
+                                   DragonSession.destroy, did=body['id'])
+
+    async def r_put(self, request: Request) -> dict:
+        """``POST ddict/put/{sid}``: ``{id, items}`` -> ``{n}``."""
+        body  = await self._body(request, 'id', 'items')
+        items = body['items']
+        if not isinstance(items, dict):
+            raise http_exception(ValueError("'items' must be an object"))
+        return await self._forward(request.path_params['sid'],
+                                   DragonSession.put, did=body['id'],
+                                   items=items)
+
+    async def r_get(self, request: Request) -> dict:
+        """``POST ddict/get/{sid}``: ``{id, keys}`` ->
+        ``{items, missing, errors}``."""
+        body = await self._body(request, 'id', 'keys')
+        return await self._forward(request.path_params['sid'],
+                                   DragonSession.get, did=body['id'],
+                                   keys=self._str_list(body, 'keys'))
+
+    async def r_keys(self, request: Request) -> dict:
+        """``POST ddict/keys/{sid}``: ``{id}`` -> ``{keys}``."""
+        body = await self._body(request, 'id')
+        return await self._forward(request.path_params['sid'],
+                                   DragonSession.keys, did=body['id'])
+
+    async def r_pop(self, request: Request) -> dict:
+        """``POST ddict/pop/{sid}``: ``{id, keys}`` -> ``{n, missing}``."""
+        body = await self._body(request, 'id', 'keys')
+        return await self._forward(request.path_params['sid'],
+                                   DragonSession.pop, did=body['id'],
+                                   keys=self._str_list(body, 'keys'))
+
+    async def r_clear(self, request: Request) -> dict:
+        """``POST ddict/clear/{sid}``: ``{id}``."""
+        body = await self._body(request, 'id')
+        return await self._forward(request.path_params['sid'],
+                                   DragonSession.clear, did=body['id'])
+
+    async def shutdown(self) -> None:
+        """Destroy the plugin's DDicts and release the runtime."""
+        try:
+            await super().shutdown()
+        finally:
+            self.entries.clear()
+            await self.backend.close()

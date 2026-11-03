@@ -1,0 +1,406 @@
+# pylint: disable=protected-access,redefined-outer-name
+
+import asyncio
+
+import pytest
+from fastapi import FastAPI
+from starlette.testclient import TestClient
+
+from radical.orbit.plugin_dragon import (PluginDragon, DDictBackend,
+                                         DDictHandle, DragonClient,
+                                         encode_value, decode_value,
+                                         parse_mem, runtime_mode)
+
+
+# ── fake Dragon ─────────────────────────────────────────────────────────────
+
+class _FakeDDict(dict):
+    """dict with the DDict calls the backend uses."""
+
+    def __init__(self, *args):
+        super().__init__()
+        self.args      = args
+        self.destroyed = False
+
+    def serialize(self):
+        return f'desc:{id(self)}'
+
+    def destroy(self):
+        self.destroyed = True
+
+
+class _FakeBackend(DDictBackend):
+
+    def __init__(self):
+        super().__init__('start')
+        self.up    = 0
+        self.down  = 0
+        self.fail  = None
+
+    def _runtime_up(self):
+        if self._rt is None:
+            self._rt  = object()
+            self.up  += 1
+
+    def _runtime_down(self):
+        if self._rt is not None:
+            self._rt   = None
+            self.down += 1
+
+    def _new_ddict(self, managers_per_node, n_nodes, total_mem):
+        if self.fail:
+            raise self.fail
+        return _FakeDDict(managers_per_node, n_nodes, total_mem)
+
+
+def _mk():
+    app     = FastAPI()
+    backend = _FakeBackend()
+    plugin  = PluginDragon(app, backend=backend)
+    tc      = TestClient(app)
+    sid     = tc.post('/dragon/register_session').json()['sid']
+    return plugin, backend, tc, sid
+
+
+@pytest.fixture
+def env():
+    return _mk()
+
+
+def _create(tc, sid, **body):
+    r = tc.post(f'/dragon/ddict/create/{sid}', json=body)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+# ── helpers ─────────────────────────────────────────────────────────────────
+
+def test_value_codec_roundtrip():
+    for v in (1, 'a', [1, 2], {'x': None}, b'\x00\xff'):
+        assert decode_value(encode_value(v)) == v
+    assert encode_value(b'ab') == {'$b64': 'YWI='}
+
+
+@pytest.mark.parametrize('val, exp', [(1024, 1024), ('2K', 2048),
+                                      ('64M', 64 * 2**20), ('1GB', 2**30)])
+def test_parse_mem(val, exp):
+    assert parse_mem(val) == exp
+
+
+@pytest.mark.parametrize('val', ['x', '', 0, -1, True, '1Q'])
+def test_parse_mem_invalid(val):
+    with pytest.raises(ValueError):
+        parse_mem(val)
+
+
+def test_runtime_mode(monkeypatch):
+    monkeypatch.delenv('RADICAL_ORBIT_DRAGON_RUNTIME', raising=False)
+    monkeypatch.delenv('DRAGON_ATTACH_TOKEN', raising=False)
+    assert runtime_mode() == 'start'
+    monkeypatch.setenv('DRAGON_ATTACH_TOKEN', 't')
+    assert runtime_mode() == 'attach'
+    monkeypatch.setenv('RADICAL_ORBIT_DRAGON_RUNTIME', 'start')
+    assert runtime_mode() == 'start'
+    monkeypatch.setenv('RADICAL_ORBIT_DRAGON_RUNTIME', 'bogus')
+    with pytest.raises(ValueError):
+        runtime_mode()
+
+
+def test_is_enabled(monkeypatch):
+    import radical.orbit.plugin_dragon as pd
+    app = FastAPI()
+    monkeypatch.setattr(pd, 'dragon_available', lambda: True)
+    assert PluginDragon.is_enabled(app)
+    app.state.is_broker = True
+    assert not PluginDragon.is_enabled(app)
+    app.state.is_broker = False
+    monkeypatch.setattr(pd, 'dragon_available', lambda: False)
+    assert not PluginDragon.is_enabled(app)
+
+
+# ── lifecycle ───────────────────────────────────────────────────────────────
+
+def test_create_list_info_destroy(env):
+    plugin, backend, tc, sid = env
+
+    e = _create(tc, sid, name='scratch', total_mem='1M')
+    assert e['name']       == 'scratch'
+    assert e['state']      == 'ready'
+    assert e['total_mem']  == 2**20
+    assert e['descriptor'].startswith('desc:')
+    assert backend.up      == 1
+
+    did = e['id']
+    assert backend._ddicts[did].args == (1, 1, 2**20)
+
+    ls = tc.get(f'/dragon/ddict/list/{sid}').json()['ddicts']
+    assert [x['id'] for x in ls] == [did]
+
+    info = tc.get(f'/dragon/ddict/info/{sid}/{did}').json()
+    assert info['n_keys'] == 0
+
+    dd = backend._ddicts[did]
+    r  = tc.post(f'/dragon/ddict/destroy/{sid}', json={'id': did})
+    assert r.status_code == 200
+    assert dd.destroyed
+    assert plugin.entries  == {}
+    assert backend._ddicts == {}
+
+
+def test_create_defaults_name_to_id(env):
+    _, _, tc, sid = env
+    e = _create(tc, sid)
+    assert e['name'] == e['id']
+
+
+def test_create_duplicate_name_409(env):
+    _, _, tc, sid = env
+    _create(tc, sid, name='a')
+    r = tc.post(f'/dragon/ddict/create/{sid}', json={'name': 'a'})
+    assert r.status_code == 409
+
+
+@pytest.mark.parametrize('body', [{'name': 'a b'}, {'name': 5},
+                                  {'total_mem': 'lots'},
+                                  {'n_nodes': 0}, {'managers_per_node': 'x'}])
+def test_create_invalid_400(env, body):
+    _, _, tc, sid = env
+    r = tc.post(f'/dragon/ddict/create/{sid}', json=body)
+    assert r.status_code == 400, r.text
+
+
+def test_create_failure_releases_name(env):
+    plugin, backend, tc, sid = env
+    backend.fail = RuntimeError('no runtime')
+    r = tc.post(f'/dragon/ddict/create/{sid}', json={'name': 'a'})
+    assert r.status_code == 500
+    assert plugin.entries == {}
+    backend.fail = None
+    _create(tc, sid, name='a')
+
+
+def test_unknown_ddict_404(env):
+    _, _, tc, sid = env
+    for path, body in (('put',     {'id': 'x', 'items': {}}),
+                       ('get',     {'id': 'x', 'keys': []}),
+                       ('keys',    {'id': 'x'}),
+                       ('pop',     {'id': 'x', 'keys': []}),
+                       ('clear',   {'id': 'x'}),
+                       ('destroy', {'id': 'x'})):
+        r = tc.post(f'/dragon/ddict/{path}/{sid}', json=body)
+        assert r.status_code == 404, path
+    assert tc.get(f'/dragon/ddict/info/{sid}/x').status_code == 404
+
+
+def test_not_ready_409(env):
+    plugin, _, tc, sid = env
+    e = _create(tc, sid)
+    plugin.entries[e['id']]['state'] = 'creating'
+    r = tc.post(f'/dragon/ddict/put/{sid}', json={'id': e['id'],
+                                                 'items': {}})
+    assert r.status_code == 409
+
+
+def test_unknown_session_404(env):
+    _, _, tc, _ = env
+    assert tc.get('/dragon/ddict/list/nope').status_code == 404
+
+
+def test_ddicts_outlive_sessions(env):
+    plugin, _, tc, sid = env
+    e = _create(tc, sid)
+    tc.post(f'/dragon/unregister_session/{sid}')
+    sid2 = tc.post('/dragon/register_session').json()['sid']
+    ls = tc.get(f'/dragon/ddict/list/{sid2}').json()['ddicts']
+    assert [x['id'] for x in ls] == [e['id']]
+    assert e['id'] in plugin.entries
+
+
+# ── data ────────────────────────────────────────────────────────────────────
+
+def test_put_get_keys_pop_clear(env):
+    _, backend, tc, sid = env
+    did = _create(tc, sid)['id']
+    url = f'/dragon/ddict/{{}}/{sid}'
+
+    r = tc.post(url.format('put'), json={'id': did, 'items': {
+        'a': 1, 'b': {'x': [1, 2]}, 'c': encode_value(b'\x01\x02')}})
+    assert r.json() == {'n': 3}
+    assert backend._ddicts[did]['c'] == b'\x01\x02'
+
+    r = tc.post(url.format('get'), json={'id': did,
+                                          'keys': ['a', 'c', 'zz']}).json()
+    assert r['items']   == {'a': 1, 'c': {'$b64': 'AQI='}}
+    assert r['missing'] == ['zz']
+    assert r['errors']  == {}
+
+    r = tc.post(url.format('keys'), json={'id': did}).json()
+    assert sorted(r['keys']) == ['a', 'b', 'c']
+
+    r = tc.post(url.format('pop'), json={'id': did,
+                                          'keys': ['a', 'zz']}).json()
+    assert r == {'n': 1, 'missing': ['zz']}
+
+    tc.post(url.format('clear'), json={'id': did})
+    assert backend._ddicts[did] == {}
+
+
+def test_get_non_json_value_reports_error(env):
+    _, backend, tc, sid = env
+    did = _create(tc, sid)['id']
+    backend._ddicts[did]['s'] = {1, 2}          # written in-runtime
+    r = tc.post(f'/dragon/ddict/get/{sid}',
+                json={'id': did, 'keys': ['s']}).json()
+    assert r['items'] == {}
+    assert 'set' in r['errors']['s']
+
+
+def test_get_reply_limit_413(env):
+    plugin, backend, tc, sid = env
+    did = _create(tc, sid)['id']
+    plugin.reply_limit = 100
+    backend._ddicts[did]['big'] = 'x' * 200
+    r = tc.post(f'/dragon/ddict/get/{sid}', json={'id': did,
+                                                 'keys': ['big']})
+    assert r.status_code == 413
+
+
+@pytest.mark.parametrize('path, body', [
+    ('put',  {'id': 'x'}),
+    ('put',  {'id': 'x', 'items': [1]}),
+    ('get',  {'id': 'x', 'keys': 'a'}),
+    ('get',  {'id': 'x', 'keys': [1]}),
+    ('keys', {}),
+])
+def test_bad_bodies_400(env, path, body):
+    _, _, tc, sid = env
+    r = tc.post(f'/dragon/ddict/{path}/{sid}', json=body)
+    assert r.status_code == 400, r.text
+
+
+def test_non_object_body_400(env):
+    _, _, tc, sid = env
+    r = tc.post(f'/dragon/ddict/keys/{sid}', content=b'[1]',
+                headers={'content-type': 'application/json'})
+    assert r.status_code == 400
+
+
+# ── notifications, shutdown ─────────────────────────────────────────────────
+
+def test_status_notifications(env, monkeypatch):
+    plugin, _, tc, sid = env
+    sent = []
+    monkeypatch.setattr(plugin, '_dispatch_notify',
+                        lambda topic, data, session=None:
+                        sent.append((topic, data['state'])))
+    did = _create(tc, sid)['id']
+    tc.post(f'/dragon/ddict/destroy/{sid}', json={'id': did})
+    assert sent == [('ddict_status', 'ready'), ('ddict_status', 'destroyed')]
+
+
+def test_shutdown_destroys_and_stops(env):
+    plugin, backend, tc, sid = env
+    dds = [backend._ddicts[_create(tc, sid)['id']] for _ in range(2)]
+    asyncio.run(plugin.shutdown())
+    assert all(dd.destroyed for dd in dds)
+    assert backend.down   == 1
+    assert plugin.entries == {}
+
+
+def test_backend_runs_on_one_thread():
+    import threading
+    backend = _FakeBackend()
+    seen    = set()
+
+    async def _run():
+        await asyncio.gather(*[backend._call(
+            lambda: seen.add(threading.get_ident())) for _ in range(20)])
+    asyncio.run(_run())
+    assert len(seen) == 1
+
+
+# ── client ──────────────────────────────────────────────────────────────────
+
+class _Http:
+    """httpx-like shim over the TestClient (the real one rides the WS)."""
+
+    def __init__(self, tc):
+        self._tc = tc
+
+    def get(self, url, **kw):
+        return self._tc.get(url, **kw)
+
+    def post(self, url, **kw):
+        return self._tc.post(url, **kw)
+
+
+@pytest.fixture
+def client(env):
+    _, _, tc, _ = env
+    c = DragonClient(_Http(tc), '/dragon')
+    c.register_session()
+    return c
+
+
+def test_client_handle_dict_semantics(client):
+    dd = client.ddict.create(name='scratch', total_mem='1M')
+    assert isinstance(dd, DDictHandle)
+    assert dd.name == 'scratch'
+    assert dd.descriptor.startswith('desc:')
+
+    dd['k'] = {'v': 1}
+    dd['b'] = b'\x00\x01'
+    assert dd['k'] == {'v': 1}
+    assert dd['b'] == b'\x00\x01'
+    assert 'k' in dd and 'zz' not in dd
+    assert len(dd) == 2
+    assert sorted(dd.keys()) == ['b', 'k']
+    assert dd.get('zz', 7) == 7
+
+    with pytest.raises(KeyError):
+        dd['zz']
+    del dd['k']
+    with pytest.raises(KeyError):
+        del dd['k']
+
+    dd.update({'x': 1, 'y': 2})
+    assert dd.get_many(['x', 'y'])['items'] == {'x': 1, 'y': 2}
+    dd.clear()
+    assert len(dd) == 0
+
+
+def test_client_attach_list_destroy(client):
+    dd = client.ddict.create(name='shared')
+    dd['k'] = 1
+    same = client.ddict.attach('shared')
+    assert same.id == dd.id and same['k'] == 1
+    assert client.ddict.attach(dd.id).name == 'shared'
+    assert [e['name'] for e in client.ddict.list()] == ['shared']
+    with pytest.raises(KeyError):
+        client.ddict.attach('nope')
+    dd.destroy()
+    assert client.ddict.list() == []
+    with pytest.raises(RuntimeError, match='404'):
+        dd['k']
+
+
+def test_close_sync_at_exit_and_idempotent(env):
+    plugin, backend, tc, sid = env
+    dd = backend._ddicts[_create(tc, sid)['id']]
+    backend.close_sync()
+    assert dd.destroyed
+    assert backend.down == 1
+    backend.close_sync()
+    asyncio.run(plugin.shutdown())
+    assert backend.down == 1
+
+
+def test_dragon_available_ignores_namespace_dir(tmp_path, monkeypatch):
+    import sys
+    from radical.orbit.plugin_dragon import dragon_available
+    (tmp_path / 'dragon').mkdir()                 # no __init__.py
+    monkeypatch.setattr(sys, 'path', [str(tmp_path)])
+    monkeypatch.delitem(sys.modules, 'dragon', raising=False)
+    assert not dragon_available()
+    (tmp_path / 'dragon' / '__init__.py').write_text('')
+    assert dragon_available()
