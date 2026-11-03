@@ -461,11 +461,14 @@ class EndpointRuntime(PluginHostBase):
                 and self._plugins:
             coro = self._work_teardown()
             try:
-                asyncio.run_coroutine_threadsafe(
-                    coro, self._work_loop).result(
-                        timeout=_PLUGIN_SHUTDOWN + 3.0)
+                fut = asyncio.run_coroutine_threadsafe(coro, self._work_loop)
             except Exception:
-                coro.close()
+                coro.close()            # never scheduled
+            else:
+                try:
+                    fut.result(timeout=_PLUGIN_SHUTDOWN + 3.0)
+                except Exception:
+                    fut.cancel()        # running on the work loop
         for loop, thread in ((self._transport_loop, self._transport_thread),
                              (self._work_loop, self._work_thread)):
             if loop is not None and loop.is_running():
@@ -508,8 +511,7 @@ class EndpointRuntime(PluginHostBase):
                 log.warning("[Runtime] %s.on_host_stop failed: %s",
                             plugin.instance_name, e)
 
-        await asyncio.gather(*[_release(p) for p in plugins
-                               if hasattr(p, 'on_host_stop')])
+        await asyncio.gather(*[_release(p) for p in plugins])
 
         tasks = []
         for plugin in plugins:

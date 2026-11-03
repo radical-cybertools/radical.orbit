@@ -154,6 +154,7 @@ class DDictBackend:
         self._pool    = ThreadPoolExecutor(1, thread_name_prefix='dragon')
         self._rt      = None
         self._closed  = False
+        self._pool_down = False
         self._ddicts: Dict[str, Any] = {}
 
     async def _call(self, fn, *args, **kwargs) -> Any:
@@ -297,11 +298,12 @@ class DDictBackend:
         """Destroy every DDict, then stop or detach the runtime.  When the
         await is cancelled before the close ran, :meth:`close_sync` still
         does it at exit."""
-        if self._closed:
-            return
+        if self._closed or self._pool_down:
+            return                      # a cancelled close: close_sync
         try:
             await self._call(self._close)
         finally:
+            self._pool_down = True
             self._pool.shutdown(wait=False)
 
     def close_sync(self) -> None:
@@ -320,6 +322,18 @@ class DDictBackend:
             self._close()
         except Exception as e:
             log.warning("[dragon] close at exit failed: %s", e)
+
+
+def _not_found_404(method):
+    """A DDict destroyed while the call waited for the Dragon thread is a
+    404, not a 500 (``Plugin._forward`` maps unknown exceptions to 500)."""
+    @functools.wraps(method)
+    async def _wrapped(*args, **kwargs):
+        try:
+            return await method(*args, **kwargs)
+        except FileNotFoundError as e:
+            raise http_exception(e) from e
+    return _wrapped
 
 
 # ------------------------------------------------------------------------
@@ -348,15 +362,18 @@ class DragonSession(PluginSession):
         self._check_active()
         return {"ddicts": [dict(e) for e in self._p.entries.values()]}
 
+    @_not_found_404
     async def info(self, did: str) -> dict:
         self._check_active()
         entry = self._p.entry(did)
         return dict(entry, n_keys=await self._p.backend.length(did))
 
+    @_not_found_404
     async def destroy(self, did: str) -> dict:
         self._check_active()
         return await self._p.ddict_destroy(did)
 
+    @_not_found_404
     async def put(self, did: str, items: Dict[str, Any]) -> dict:
         self._check_active()
         self._p.entry(did)
@@ -366,6 +383,7 @@ class DragonSession(PluginSession):
             raise http_exception(e) from e
         return {"n": await self._p.backend.put(did, items)}
 
+    @_not_found_404
     async def get(self, did: str, keys: List[str],
                   values: bool = True) -> dict:
         self._check_active()
@@ -380,7 +398,8 @@ class DragonSession(PluginSession):
             v = encode_value(v)
             try:
                 # strict JSON: the reply renderer rejects NaN / inf
-                size += len(json.dumps(v, allow_nan=False)) + len(k) + 8
+                size += len(json.dumps(v, allow_nan=False)) \
+                      + len(k.encode()) + 8
             except (TypeError, ValueError):
                 errors[k] = f"value of type {type(v).__name__} is not " \
                             f"JSON-serializable"
@@ -389,22 +408,25 @@ class DragonSession(PluginSession):
             items[k] = v
         return {"items": items, "missing": missing, "errors": errors}
 
+    @_not_found_404
     async def keys(self, did: str) -> dict:
         self._check_active()
         self._p.entry(did)
         keys = await self._p.backend.keys(did)
         strs = [k for k in keys if isinstance(k, str)]
-        self._p.check_reply(sum(len(k) + 4 for k in strs),
+        self._p.check_reply(sum(len(k.encode()) + 4 for k in strs),
                             'too many keys for one reply')
         # keys written in-runtime may be of any type; the handle uses str
         return {"keys": strs, "n_other": len(keys) - len(strs)}
 
+    @_not_found_404
     async def pop(self, did: str, keys: List[str]) -> dict:
         self._check_active()
         self._p.entry(did)
         missing = await self._p.backend.pop(did, keys)
         return {"n": len(keys) - len(missing), "missing": missing}
 
+    @_not_found_404
     async def clear(self, did: str) -> dict:
         self._check_active()
         self._p.entry(did)
@@ -659,6 +681,11 @@ class PluginDragon(Plugin):
             # thread: destroy what it makes
             self.backend.discard(did)
             raise
+        if self.entries.get(did) is not entry:
+            # released (endpoint stopping) while the create ran: close()
+            # destroys what it made
+            raise HTTPException(status_code=503,
+                                detail="endpoint is stopping")
         entry['state'] = 'ready'
         log.info("[dragon] created %s (%s)", did, name)
         self._dispatch_notify('ddict_status', {"id": did, "name": name,
@@ -699,6 +726,8 @@ class PluginDragon(Plugin):
         for field in required:
             if field not in body:
                 raise http_exception(ValueError(f"missing field {field!r}"))
+        if 'id' in body and not isinstance(body['id'], str):
+            raise http_exception(ValueError("'id' must be a string"))
         return body
 
     @staticmethod

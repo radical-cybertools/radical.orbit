@@ -589,3 +589,54 @@ def test_client_malformed_marker_is_per_key_error(client, env):
     r = dd.get_many(['ok', 'bad'])
     assert r['items'] == {'ok': 1}
     assert 'bad' in r['errors']
+
+
+# ── review round 3 ──────────────────────────────────────────────────────────
+
+def test_destroyed_while_waiting_is_404(env):
+    _, backend, tc, sid = env
+    did = _create(tc, sid)['id']
+    del backend._ddicts[did]            # destroyed behind the entry check
+    r = tc.post(f'/dragon/ddict/put/{sid}', json={'id': did, 'items': {}})
+    assert r.status_code == 404
+    assert tc.get(f'/dragon/ddict/info/{sid}/{did}').status_code == 404
+
+
+def test_keys_reply_limit_counts_utf8(env):
+    plugin, backend, tc, sid = env
+    did = _create(tc, sid)['id']
+    backend._ddicts[did].update({'\U0001f600' * 10: 1})   # 10 chars, 40 B
+    plugin.reply_limit = 30
+    r = tc.post(f'/dragon/ddict/keys/{sid}', json={'id': did})
+    assert r.status_code == 413
+
+
+def test_close_after_cancelled_close_is_noop():
+    backend = _FakeBackend()
+    backend._pool_down = True
+    backend._pool.shutdown(wait=False)
+    asyncio.run(backend.close())        # no "cannot schedule" error
+
+
+def test_create_released_meanwhile_503():
+    plugin, backend, _, _ = _mk()
+    orig = backend._new_ddict
+
+    def _new(*a):
+        plugin.entries.clear()          # on_host_stop ran meanwhile
+        return orig(*a)
+    backend._new_ddict = _new
+
+    async def _run():
+        return await plugin.ddict_create('a', 1, 1, 1024, None)
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(_run())
+    assert e.value.status_code == 503
+
+
+@pytest.mark.parametrize('did', [['x'], {'a': 1}, 5])
+def test_non_string_id_400(env, did):
+    _, _, tc, sid = env
+    r = tc.post(f'/dragon/ddict/keys/{sid}', json={'id': did})
+    assert r.status_code == 400
