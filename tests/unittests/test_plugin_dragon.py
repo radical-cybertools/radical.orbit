@@ -537,3 +537,55 @@ def test_client_contains_skips_value(client, env):
     plugin.reply_limit = 100
     assert 'big' in dd
     assert 'nope' not in dd
+
+
+# ── review round 2 ──────────────────────────────────────────────────────────
+
+def test_on_host_stop_releases_and_unregisters(env, monkeypatch):
+    import atexit
+    plugin, backend, tc, sid = env
+    gone = []
+    monkeypatch.setattr(atexit, 'unregister', gone.append)
+    dd = backend._ddicts[_create(tc, sid)['id']]
+    asyncio.run(plugin.on_host_stop())
+    assert dd.destroyed
+    assert backend.down   == 1
+    assert plugin.entries == {}
+    assert gone == [backend.close_sync]
+    assert plugin._sessions             # client sessions survive
+
+
+def test_keys_reply_limit_413(env):
+    plugin, backend, tc, sid = env
+    did = _create(tc, sid)['id']
+    backend._ddicts[did].update({f'key{i:04d}': i for i in range(50)})
+    plugin.reply_limit = 100
+    r = tc.post(f'/dragon/ddict/keys/{sid}', json={'id': did})
+    assert r.status_code == 413
+
+
+def test_get_nan_is_per_key_error(env):
+    _, backend, tc, sid = env
+    did = _create(tc, sid)['id']
+    backend._ddicts[did].update({'a': 1, 'n': float('nan')})
+    r = tc.post(f'/dragon/ddict/get/{sid}', json={'id': did,
+                                                 'keys': ['a', 'n']})
+    assert r.status_code == 200
+    assert r.json()['items'] == {'a': 1}
+    assert 'n' in r.json()['errors']
+
+
+def test_create_reserved_name_prefix_400(env):
+    _, _, tc, sid = env
+    r = tc.post(f'/dragon/ddict/create/{sid}', json={'name': 'ddict.1234'})
+    assert r.status_code == 400
+
+
+def test_client_malformed_marker_is_per_key_error(client, env):
+    _, backend, _, _ = env
+    dd = client.ddict.create()
+    dd.update({'ok': 1})
+    backend._ddicts[dd.id]['bad'] = {'$b64': '###'}     # written in-runtime
+    r = dd.get_many(['ok', 'bad'])
+    assert r['items'] == {'ok': 1}
+    assert 'bad' in r['errors']

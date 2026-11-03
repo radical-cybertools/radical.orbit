@@ -863,6 +863,16 @@ class Plugin(object):
                 (``{role, plugins, liveness}``).
         """
 
+    async def on_host_stop(self) -> None:
+        """Release what the plugin holds outside the process (a started
+        runtime, child processes) when the hosting runtime stops.
+
+        Called by ``EndpointRuntime.stop()``, bounded in time.  Sessions are
+        deliberately *not* closed here: they belong to clients and may
+        outlive an endpoint restart (e.g. psij sessions keep the output of
+        batch jobs that are still running).  Default: nothing.
+        """
+
     async def _forward(self, sid: str, func: Callable, *args: Any, **kwargs: Any) -> dict:
         """
         Forward a request to the specified session instance.

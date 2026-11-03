@@ -1116,12 +1116,16 @@ class _ShutdownPlugin:
         self.delay         = delay
         self.fail          = fail
         self.done          = False
+        self.shut          = False
 
-    async def shutdown(self):
+    async def on_host_stop(self):
         await asyncio.sleep(self.delay)
         if self.fail:
             raise RuntimeError('boom')
         self.done = True
+
+    async def shutdown(self):           # ends sessions: not for stop()
+        self.shut = True
 
 
 def _unstarted_runtime():
@@ -1136,7 +1140,7 @@ def _unstarted_runtime():
     return rt
 
 
-def test_work_teardown_shuts_plugins_down(monkeypatch):
+def test_work_teardown_releases_plugins(monkeypatch):
     import radical.orbit.runtime as rtm
     monkeypatch.setattr(rtm, '_PLUGIN_SHUTDOWN', 0.5)
     rt   = _unstarted_runtime()
@@ -1154,6 +1158,7 @@ def test_work_teardown_shuts_plugins_down(monkeypatch):
     elapsed, task = asyncio.run(_run())
     assert ok.done                  # not cut short by the slow one
     assert not slow.done
+    assert not any(p.shut for p in (ok, bad, slow))
     assert elapsed < 2.0
     assert task.cancelled()
 

@@ -64,6 +64,7 @@ RUNTIME_MODES    = ('attach', 'start')
 RUNTIME_TIMEOUT  = 120                  # s, runtime start / attach
 DEFAULT_MEM      = 64 * 1024 * 1024     # bytes, DDict total_mem default
 NAME_RE          = re.compile(r'[A-Za-z0-9_.-]{1,64}')
+ID_PREFIX        = 'ddict.'           # DDict IDs; reserved for names
 MEM_RE           = re.compile(r'(\d+)\s*([KMGT]?)B?', re.IGNORECASE)
 MEM_UNITS        = {'': 1, 'K': 2**10, 'M': 2**20, 'G': 2**30, 'T': 2**40}
 
@@ -374,26 +375,27 @@ class DragonSession(PluginSession):
             return {"items": {}, "missing": missing, "errors": {}}
         found, missing = await self._p.backend.get(did, keys)
         items, errors = {}, {}
+        size = len(json.dumps(missing))
         for k, v in found.items():
             v = encode_value(v)
             try:
-                json.dumps(v)
-                items[k] = v
+                # strict JSON: the reply renderer rejects NaN / inf
+                size += len(json.dumps(v, allow_nan=False)) + len(k) + 8
             except (TypeError, ValueError):
                 errors[k] = f"value of type {type(v).__name__} is not " \
                             f"JSON-serializable"
-        result = {"items": items, "missing": missing, "errors": errors}
-        if len(json.dumps(result)) > self._p.reply_limit:
-            raise HTTPException(status_code=413,
-                                detail=f"reply exceeds {self._p.reply_limit}"
-                                       f" bytes: get fewer keys per call")
-        return result
+                continue
+            self._p.check_reply(size, 'get fewer keys per call')
+            items[k] = v
+        return {"items": items, "missing": missing, "errors": errors}
 
     async def keys(self, did: str) -> dict:
         self._check_active()
         self._p.entry(did)
         keys = await self._p.backend.keys(did)
         strs = [k for k in keys if isinstance(k, str)]
+        self._p.check_reply(sum(len(k) + 4 for k in strs),
+                            'too many keys for one reply')
         # keys written in-runtime may be of any type; the handle uses str
         return {"keys": strs, "n_other": len(keys) - len(strs)}
 
@@ -476,7 +478,13 @@ class DDictHandle:
         """``{items, missing, errors}`` for *keys*, values decoded."""
         r = self._client._call('POST', 'ddict/get/{sid}', id=self.id,
                                keys=list(keys))
-        r['items'] = {k: decode_value(v) for k, v in r['items'].items()}
+        items = {}
+        for k, v in r['items'].items():
+            try:
+                items[k] = decode_value(v)
+            except ValueError as e:     # malformed marker written in-runtime
+                r['errors'][k] = str(e)
+        r['items'] = items
         return r
 
     def __contains__(self, key: str) -> bool:
@@ -588,7 +596,7 @@ class PluginDragon(Plugin):
         self.entries: Dict[str, dict] = {}
         self.reply_limit = resolve_frame_cap(app) // 2
 
-        # fallback for a host exiting without plugin shutdown()
+        # fallback for a host exiting without stop() / shutdown()
         atexit.register(self.backend.close_sync)
 
         self.add_route_post('ddict/create/{sid}',     self.r_create)
@@ -600,6 +608,13 @@ class PluginDragon(Plugin):
         self.add_route_post('ddict/keys/{sid}',       self.r_keys)
         self.add_route_post('ddict/pop/{sid}',        self.r_pop)
         self.add_route_post('ddict/clear/{sid}',      self.r_clear)
+
+    def check_reply(self, size: int, hint: str) -> None:
+        """413 when a reply of *size* bytes would exceed the reply limit."""
+        if size > self.reply_limit:
+            raise HTTPException(status_code=413,
+                                detail=f"reply exceeds {self.reply_limit} "
+                                       f"bytes: {hint}")
 
     # -- registry --------------------------------------------------------------
 
@@ -619,7 +634,7 @@ class PluginDragon(Plugin):
     async def ddict_create(self, name: Optional[str], managers_per_node: int,
                            n_nodes: int, total_mem: int,
                            creator: Optional[str]) -> dict:
-        did  = f'ddict.{uuid.uuid4().hex[:8]}'
+        did  = f'{ID_PREFIX}{uuid.uuid4().hex[:8]}'
         name = name or did
         if any(e['name'] == name for e in self.entries.values()):
             raise http_exception(FileExistsError(f"ddict {name!r} exists"))
@@ -712,6 +727,10 @@ class PluginDragon(Plugin):
         if name is not None and \
                 not (isinstance(name, str) and NAME_RE.fullmatch(name)):
             raise http_exception(ValueError(f"invalid ddict name {name!r}"))
+        if name is not None and name.startswith(ID_PREFIX):
+            # attach() resolves IDs and names alike
+            raise http_exception(ValueError(f"ddict names must not start "
+                                            f"with {ID_PREFIX!r}"))
         mpn = self._pos_int(body, 'managers_per_node')
         nn  = self._pos_int(body, 'n_nodes')
         try:
@@ -782,10 +801,19 @@ class PluginDragon(Plugin):
         return await self._forward(request.path_params['sid'],
                                    DragonSession.clear, did=body['id'])
 
+    async def _release(self) -> None:
+        self.entries.clear()
+        await self.backend.close()
+        atexit.unregister(self.backend.close_sync)
+
+    async def on_host_stop(self) -> None:
+        """The hosting runtime stops: destroy the DDicts, release the
+        Dragon runtime."""
+        await self._release()
+
     async def shutdown(self) -> None:
-        """Destroy the plugin's DDicts and release the runtime."""
+        """Plugin teardown: sessions, then DDicts and runtime."""
         try:
             await super().shutdown()
         finally:
-            self.entries.clear()
-            await self.backend.close()
+            await self._release()
