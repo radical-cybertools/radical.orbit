@@ -701,3 +701,75 @@ def test_keys_size_counts_json_escapes(env):
     plugin.reply_limit = 40
     r = tc.post(f'/dragon/ddict/keys/{sid}', json={'id': did})
     assert r.status_code == 413
+
+
+# ── review round 5 ──────────────────────────────────────────────────────────
+
+def test_close_sync_bounded_when_dragon_thread_hangs(monkeypatch):
+    import threading
+    import time
+    import radical.orbit.plugin_dragon as pd
+    monkeypatch.setattr(pd, 'EXIT_TIMEOUT', 0.3)
+    backend = _FakeBackend()
+    gate    = threading.Event()
+    backend._pool.submit(gate.wait)     # a hung Dragon call
+    t0 = time.time()
+    backend.close_sync()
+    assert time.time() - t0 < 2.0
+    assert backend._pool._thread.daemon  # not joined at interpreter exit
+    gate.set()
+
+
+def test_list_reply_limit_413(env):
+    plugin, _, tc, sid = env
+    for i in range(5):
+        _create(tc, sid, name=f'n{i}')
+    plugin.reply_limit = 100
+    assert tc.get(f'/dragon/ddict/list/{sid}').status_code == 413
+
+
+def test_get_all_missing_reply_limit_413(env):
+    plugin, _, tc, sid = env
+    did = _create(tc, sid)['id']
+    plugin.reply_limit = 100
+    r = tc.post(f'/dragon/ddict/get/{sid}',
+                json={'id': did, 'keys': [f'missing-key-{i}'
+                                          for i in range(20)]})
+    assert r.status_code == 413
+
+
+def test_cancelled_destroy_notifies(env, monkeypatch):
+    plugin, backend, tc, sid = env
+    did  = _create(tc, sid)['id']
+    sent = []
+    monkeypatch.setattr(plugin, '_dispatch_notify',
+                        lambda topic, data, session=None:
+                        sent.append(data['state']))
+
+    async def _run():
+        task = asyncio.ensure_future(plugin.ddict_destroy(did))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await backend._call(lambda: None)
+    asyncio.run(_run())
+    assert sent == ['destroyed']
+
+
+def test_partial_put_reports_progress():
+    backend = _FakeBackend()
+
+    class _Full(_FakeDDict):
+        def __setitem__(self, k, v):
+            if len(self) >= 2:
+                raise RuntimeError('ddict full')
+            super().__setitem__(k, v)
+
+    backend._new_ddict = lambda *a: _Full(*a)
+
+    async def _run():
+        await backend.create('d', 1, 1, 1024)
+        await backend.put('d', {'a': 1, 'b': 2, 'c': 3})
+    with pytest.raises(RuntimeError, match="after 2 of 3 items"):
+        asyncio.run(_run())

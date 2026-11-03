@@ -46,7 +46,11 @@ import sys
 import time
 import uuid
 
-from concurrent.futures import ThreadPoolExecutor
+import queue
+import threading
+
+from concurrent.futures import Executor, Future
+from concurrent.futures import TimeoutError as FutureTimeout
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -63,6 +67,7 @@ log = logging.getLogger("radical.orbit")
 ENV_RUNTIME      = 'RADICAL_ORBIT_DRAGON_RUNTIME'
 RUNTIME_MODES    = ('attach', 'start')
 RUNTIME_TIMEOUT  = 120                  # s, runtime start / attach
+EXIT_TIMEOUT     = 20                   # s, release at process exit
 DEFAULT_MEM      = 64 * 1024 * 1024     # bytes, DDict total_mem default
 NAME_RE          = re.compile(r'[A-Za-z0-9_.-]{1,64}')
 ID_PREFIX        = 'ddict.'           # DDict IDs; reserved for names
@@ -139,6 +144,66 @@ def runtime_mode() -> str:
 
 # ------------------------------------------------------------------------
 #
+class DragonThread(Executor):
+    """
+    One daemon worker thread for all Dragon calls.
+
+    A ``ThreadPoolExecutor`` worker is joined at interpreter exit, so one
+    hung Dragon call would keep the endpoint from exiting; a daemon thread
+    is not.  Started on first use.
+    """
+
+    def __init__(self):
+        self._q      = queue.SimpleQueue()
+        self._down   = False
+        self._lock   = threading.Lock()
+        self._thread = None
+
+    def _run(self) -> None:
+        while True:
+            item = self._q.get()
+            if item is None:
+                return
+            fut, fn = item
+            if not fut.set_running_or_notify_cancel():
+                continue                    # cancelled while queued
+            try:
+                fut.set_result(fn())
+            except BaseException as e:      # pylint: disable=broad-except
+                fut.set_exception(e)
+
+    def submit(self, fn, /, *args, **kwargs) -> Future:
+        with self._lock:
+            if self._down:
+                raise RuntimeError("cannot schedule new futures after "
+                                   "shutdown")
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._run,
+                                                name='dragon', daemon=True)
+                self._thread.start()
+            fut = Future()
+            self._q.put((fut, functools.partial(fn, *args, **kwargs)))
+            return fut
+
+    def shutdown(self, wait: bool = True, *,
+                 cancel_futures: bool = False) -> None:
+        with self._lock:
+            if not self._down:
+                self._down = True
+                self._q.put(None)           # after what is queued
+        if wait:
+            self.join()
+
+    def join(self, timeout: Optional[float] = None) -> bool:
+        """Wait for the worker to finish; False if it is still busy."""
+        if self._thread is None:
+            return True
+        self._thread.join(timeout)
+        return not self._thread.is_alive()
+
+
+# ------------------------------------------------------------------------
+#
 class DDictBackend:
     """
     Owns the Dragon runtime connection and the DDicts of one plugin.
@@ -154,7 +219,7 @@ class DDictBackend:
 
     def __init__(self, mode: str):
         self._mode    = mode
-        self._pool    = ThreadPoolExecutor(1, thread_name_prefix='dragon')
+        self._pool    = DragonThread()
         self._rt      = None
         self._closed  = False
         self._pool_down = False
@@ -239,8 +304,13 @@ class DDictBackend:
     async def put(self, did: str, items: Dict[str, Any]) -> int:
         def _put():
             dd = self._ddict(did)
-            for k, v in items.items():
-                dd[k] = v
+            for n, (k, v) in enumerate(items.items()):
+                try:
+                    dd[k] = v
+                except Exception as e:
+                    raise RuntimeError(f"put stopped at key {k!r} after "
+                                       f"{n} of {len(items)} items: "
+                                       f"{e}") from e
             return len(items)
         return await self._call(_put)
 
@@ -330,16 +400,25 @@ class DDictBackend:
         not outlive the process.  A no-op after :meth:`close`."""
         if self._closed:
             return
-        # at interpreter exit the pool is already shut down: drain it (a
-        # running close finishes), then close from this thread (serialized
-        # calls work from any thread)
-        self._pool.shutdown(wait=True, cancel_futures=True)
-        if self._closed:
-            return
         try:
-            self._close()
+            if not self._pool_down:
+                self._pool_down = True
+                self._pool.submit(self._close).result(timeout=EXIT_TIMEOUT)
+                return
+            # a close was cancelled: let the worker finish what it runs,
+            # then close from this thread (serialized calls work from any
+            # thread)
+            if not self._pool.join(EXIT_TIMEOUT):
+                raise FutureTimeout()
+            if not self._closed:
+                self._close()
+        except FutureTimeout:
+            log.warning("[dragon] Dragon thread busy after %ds at exit: "
+                        "runtime and DDicts may be left behind", EXIT_TIMEOUT)
         except Exception as e:
             log.warning("[dragon] close at exit failed: %s", e)
+        finally:
+            self._pool.shutdown(wait=False)
 
 
 def _not_found_404(method):
@@ -378,7 +457,9 @@ class DragonSession(PluginSession):
 
     async def list(self) -> dict:
         self._check_active()
-        return {"ddicts": [dict(e) for e in self._p.entries.values()]}
+        ddicts = [dict(e) for e in self._p.entries.values()]
+        self._p.check_reply(len(json.dumps(ddicts)), 'too many ddicts')
+        return {"ddicts": ddicts}
 
     @_not_found_404
     async def info(self, did: str) -> dict:
@@ -427,6 +508,7 @@ class DragonSession(PluginSession):
                 size += len(json.dumps(errors[k]))
             size += len(json.dumps(k)) + 4
             self._p.check_reply(size, hint)
+        self._p.check_reply(size, hint)     # also when nothing was found
         return {"items": items, "missing": missing, "errors": errors}
 
     @_not_found_404
@@ -726,6 +808,9 @@ class PluginDragon(Plugin):
             # dropped from its queue: make sure it happens
             self.entries.pop(did, None)
             self.backend.discard(did)
+            self._dispatch_notify('ddict_status', {"id": did,
+                                                   "name": entry['name'],
+                                                   "state": "destroyed"})
             raise
         except BaseException:
             # may be partly torn down: not usable, destroy can be retried
