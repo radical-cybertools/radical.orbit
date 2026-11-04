@@ -1276,10 +1276,15 @@
         async getSession(plugin = pluginName, regBody = {}) {
           return await registerSession(endpointName, plugin, regBody);
         },
-        // keep a session the panel registered itself alive while open
-        keepSession(sid, plugin = pluginName) {
+        // keep a session the panel registered itself alive while open;
+        // onLost(detail) is called when the keepalive finds it has ended
+        keepSession(sid, plugin = pluginName, onLost = null) {
           keptSessions[`${endpointName}/${plugin}/${sid}`] =
-              { endpoint: endpointName, plugin, sid };
+              { endpoint: endpointName, plugin, sid, onLost };
+        },
+        // whether a failed request's error means its session has ended
+        async isStaleSession(err) {
+          return (await ensureSU()).isStaleSession(err?.status, err?.detail);
         },
         releaseSession(sid, plugin = pluginName) {
           delete keptSessions[`${endpointName}/${plugin}/${sid}`];
@@ -1977,7 +1982,10 @@
             // route ("No route" 404) keep the session as it is
             const su = await ensureSU();
             if (!su.isStaleSession(err.status, err.detail)) return;
-            if (s.kept) delete keptSessions[s.key];
+            if (s.kept) {
+              delete keptSessions[s.key];
+              try { s.onLost?.(err.detail); } catch (e) { console.log(e); }
+            }
             else if (sessions[s.key] === s.sid) delete sessions[s.key];
           });
       }

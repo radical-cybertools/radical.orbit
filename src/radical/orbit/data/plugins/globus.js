@@ -238,7 +238,9 @@ async function connect(page, api, silent = false) {
     // its transfers may still run (and be tracked), and it may be shared
     if (state[endpoint].sid) api.releaseSession?.(state[endpoint].sid);
     state[endpoint].sid = data.sid;
-    api.keepSession?.(data.sid);    // keep it (and its credential) while open
+    // keep it (and its credential) while open; told when it has ended
+    const sid = data.sid;
+    api.keepSession?.(sid, undefined, (detail) => sessionLost(page, api, sid, detail));
 
     if (page.querySelector('.globus-remember').checked) saveTokens(endpoint, payload);
 
@@ -254,6 +256,31 @@ async function connect(page, api, silent = false) {
     status.innerHTML = `<span style="color:var(--danger);">Error: ${escHtml(e.message)}</span>`;
     if (!silent) api.flash('Globus connect failed: ' + e.message, false);
   }
+}
+
+// The session has ended (idle expiry, endpoint restart): reported by the
+// Explorer keepalive or by a failed request.  Reset the panel and show why;
+// reconnect silently when a credential is remembered for this endpoint.
+function sessionLost(page, api, sid, detail) {
+  const endpoint = api.endpointName;
+  if (!state[endpoint] || state[endpoint].sid !== sid) return;   // replaced
+  api.releaseSession?.(sid);
+  state[endpoint].sid = null;
+  let why = detail || 'session ended';
+  try { why = JSON.parse(detail).detail || why; } catch (e) { /* raw text */ }
+  const label = page.querySelector('.globus-conn-state');
+  label.textContent = 'not connected';
+  label.style.color = 'var(--muted)';
+  page.querySelector('.globus-conn-status').innerHTML =
+      `<span style="color:var(--danger);">Globus session ended: ${escHtml(why)}</span>`;
+  const stored = loadTokens()[endpoint];
+  if (stored && (stored.access_token || (stored.refresh_token && stored.client_id)))
+    connect(page, api, /*silent=*/true);
+}
+
+// A request failed: if its session is dead, handle it as lost.
+async function checkLost(page, api, sid, e) {
+  if (sid && await api.isStaleSession?.(e)) sessionLost(page, api, sid, e.detail);
 }
 
 function sidOrThrow(page, api) {
@@ -272,6 +299,7 @@ async function browse(page, api) {
   const path       = page.querySelector('.globus-ls-path').value.trim() || null;
 
   browser.innerHTML = '<div class="empty" style="padding:20px;"><div class="spinner"></div><p>Loading…</p></div>';
+  const held = state[api.endpointName]?.sid;
   try {
     const sid  = sidOrThrow(page, api);
     const data = await api.fetch(`ls/${sid}`, {
@@ -282,6 +310,7 @@ async function browse(page, api) {
   } catch (e) {
     browser.innerHTML = `<div class="empty" style="padding:20px;"><p style="color:var(--danger);">Error: ${escHtml(e.message)}</p></div>`;
     api.flash('Globus ls error: ' + e.message, false);
+    checkLost(page, api, held, e);
   }
 }
 
@@ -330,6 +359,7 @@ async function submit(page, api) {
   }
 
   status.innerHTML = '<span style="color:var(--accent);">Submitting…</span>';
+  const held = state[api.endpointName]?.sid;
   try {
     const sid  = sidOrThrow(page, api);
     const body = {
@@ -349,6 +379,7 @@ async function submit(page, api) {
   } catch (e) {
     status.innerHTML = `<span style="color:var(--danger);">Error: ${escHtml(e.message)}</span>`;
     api.flash('Globus submit failed: ' + e.message, false);
+    checkLost(page, api, held, e);
   }
 }
 
@@ -360,12 +391,13 @@ async function refreshTasks(page, api) {
   const endpoint = api.endpointName;
   const st   = state[endpoint];
   if (!st || !st.sid) { api.flash('Connect first', false); return; }
+  const held = st.sid;
   await Promise.all(Object.keys(st.tasks).map(async tid => {
     try {
-      const data = await api.fetch(`task/${st.sid}/${tid}`);
+      const data = await api.fetch(`task/${held}/${tid}`);
       st.tasks[tid].status = data.status || st.tasks[tid].status;
       st.tasks[tid].nice   = data.nice_status || '';
-    } catch (e) { /* leave as-is */ }
+    } catch (e) { checkLost(page, api, held, e); }   // else leave as-is
   }));
   renderTasks(page, api);
 }
@@ -373,13 +405,15 @@ async function refreshTasks(page, api) {
 async function cancelTask(page, api, tid) {
   const st = state[api.endpointName];
   if (!st || !st.sid) return;
+  const held = st.sid;
   try {
-    await api.fetch(`cancel/${st.sid}/${tid}`, { method: 'POST' });
+    await api.fetch(`cancel/${held}/${tid}`, { method: 'POST' });
     st.tasks[tid].status = 'CANCELED';
     renderTasks(page, api);
     api.flash('Globus transfer cancelled');
   } catch (e) {
     api.flash('Cancel failed: ' + e.message, false);
+    checkLost(page, api, held, e);
   }
 }
 
