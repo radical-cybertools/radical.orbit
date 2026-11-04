@@ -6,6 +6,7 @@ package to be installed.
 '''
 
 import threading
+from collections import Counter
 import time
 import json
 import asyncio
@@ -953,6 +954,11 @@ def test_notification_callbacks_fire_in_registration_order():
     rt = EndpointRuntime.__new__(EndpointRuntime)
     rt._callbacks = {}
     rt._cb_lock   = _threading.Lock()
+    rt._broker_routes   = False
+    rt._wire_count     = Counter()
+    rt._held           = Counter()
+    rt._subs_live      = True
+    rt._conn_gen       = 0
     rt._name      = 'test-consumer'
     rt._emit      = MagicMock()
 
@@ -3089,6 +3095,11 @@ def _bare_runtime(maxlen=1024):
     rt._name      = 'consumer'
     rt._callbacks = {}
     rt._cb_lock   = threading.Lock()
+    rt._broker_routes   = False
+    rt._wire_count     = Counter()
+    rt._held           = Counter()
+    rt._subs_live      = True
+    rt._conn_gen       = 0
     rt._emit      = MagicMock()
     rt._cb        = CallbackDispatcher(maxlen=maxlen)
     return rt
@@ -3106,6 +3117,126 @@ def _scopes(rt, fn=None):
     return {t: [s for cb, _, s in rt._callbacks.get(('ep', 'rhapsody', t), [])
                 if fn is None or cb == fn]
             for t in ('task_status', 'task_status_batch', 'session_status')}
+
+
+def _routed_runtime():
+    """A bare runtime that learned session routing from topology as a
+    real one does: the endpoint entry is what a runtime serving the real
+    PluginRhapsody registers, the broker entry carries its caps (the only
+    flag routing needs)."""
+    from radical.orbit import protocol
+    from radical.orbit.runtime import EndpointRuntime
+
+    served = EndpointRuntime.__new__(EndpointRuntime)
+    served._plugins = {'rhapsody': PluginRhapsody(FastAPI())}
+    plugins = {d['name']: d for d in served._plugin_dicts()}
+
+    rt = _bare_runtime()
+    rt._topology, rt._topology_callbacks, rt._plugins = {}, [], {}
+    rt._topology_ready = threading.Event()
+    rt._on_topology(protocol.Topology(src='broker', participants={
+        'broker': protocol.ParticipantInfo(
+            role='broker', liveness='present',
+            plugins={protocol.BROKER_CAPS: protocol.broker_caps_entry()}),
+        'ep': protocol.ParticipantInfo(role='endpoint', liveness='present',
+                                       plugins=plugins)}))
+    assert rt._broker_routes
+    return rt
+
+
+def _sub_frames(rt):
+    return [(m.kind, [(p.topic, p.session) for p in m.patterns])
+            for m in (c.args[0] for c in rt._emit.call_args_list)
+            if m.kind in ('subscribe', 'unsubscribe')]
+
+
+def test_hold_own_releases_taken_holds_on_failure():
+    """If a later hold fails, the holds already taken are released before
+    the error propagates: no plain pattern stays held."""
+    rt     = _routed_runtime()
+    client = _scoped_client(rt, 'sid-a')
+    client._start_task_listener()
+    orig, n = rt.hold_subscription, []
+
+    def _hold(*a):
+        if n:
+            raise RuntimeError('boom')
+        n.append(a)
+        return orig(*a)
+    rt.hold_subscription = _hold
+    rt._emit.reset_mock()
+    with pytest.raises(RuntimeError, match='boom'):
+        client._hold_own()
+    assert not rt._held
+    assert _sub_frames(rt) == [('subscribe',   [('task_status', None)]),
+                               ('unsubscribe', [('task_status', None)])]
+
+
+def test_own_callback_registered_during_switch_is_held():
+    """A scoped own callback registered after the switch's holds were taken
+    (before their release) holds its topic too, before it subscribes: its
+    move is covered, and everything is released after the switch."""
+    rt     = _routed_runtime()
+    client = _scoped_client(rt, 'sid-a')
+    client._start_task_listener()
+    rt._emit.reset_mock()
+
+    held = client._hold_own()                   # switch begins
+    assert held == ['task_status', 'task_status_batch']
+    client._register_own(MagicMock(), 'session_status', 'sid-a')  # racing
+    assert held == ['task_status', 'task_status_batch', 'session_status']
+    with client._cond:
+        client._rescope_own('sid-b')
+    client._release_own(held)                   # switch ends
+    assert not rt._held and client._switch_held is None
+
+    frames = _sub_frames(rt)
+    ss = [f for f in frames if f[1][0][0] == 'session_status']
+    assert ss == [('subscribe',   [('session_status', None)]),     # hold
+                  ('subscribe',   [('session_status', 'sid-a')]),
+                  ('subscribe',   [('session_status', 'sid-b')]),
+                  ('unsubscribe', [('session_status', 'sid-a')]),
+                  ('unsubscribe', [('session_status', None)])]     # release
+    # after the switch, a registration takes no hold
+    client._register_own(MagicMock(), 'other_topic', 'sid-b')
+    assert not rt._held
+
+
+def test_session_switch_routed_frame_order():
+    """With broker routing on (learned from a real served-plugin
+    topology), the client's own callbacks subscribe their sid at the
+    broker, unscoped ones keep the plain pattern; a session switch holds
+    the plain patterns from before the POST until the callbacks moved:
+    Sub(plain), Sub(new), Unsub(old), Unsub(plain)."""
+    rt   = _routed_runtime()
+    resp = MagicMock()
+    resp.is_error, resp.status_code = False, 200
+    resp.json = MagicMock(return_value={'sid': 'sid-b', 'status': 'ready'})
+    http    = MagicMock()
+    at_post = []
+
+    def _post(*a, **kw):
+        at_post.extend(_sub_frames(rt))
+        return resp
+    http.post.side_effect = _post
+    client = _scoped_client(rt, 'sid-a', http)
+    client._start_task_listener()
+    topics = ('task_status', 'task_status_batch')
+    assert _sub_frames(rt) == [('subscribe', [(t, 'sid-a')]) for t in topics]
+    client.register_notification_callback(MagicMock(), topic='task_status')
+    assert _sub_frames(rt)[-1] == ('subscribe', [('task_status', None)])
+    rt._emit.reset_mock()
+
+    client._register_and_wait(None, 5, True, {}, threading.Event())
+    assert at_post == [('subscribe', [('task_status_batch', None)])]
+    assert _sub_frames(rt) == [
+        ('subscribe',   [('task_status_batch', None)]),   # held
+        ('subscribe',   [('task_status', 'sid-b')]),
+        ('unsubscribe', [('task_status', 'sid-a')]),
+        ('subscribe',   [('task_status_batch', 'sid-b')]),
+        ('unsubscribe', [('task_status_batch', 'sid-a')]),
+        ('unsubscribe', [('task_status_batch', None)])]   # released
+    assert not rt._held
 
 
 def test_client_scopes_its_own_callbacks_moves_and_drops_them():

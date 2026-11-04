@@ -36,7 +36,13 @@ payload:
 - `event` — push notification (`plugin, topic, session?, ts, seq, data`);
   the broker stamps an authoritative `seq`/`ts` on ingest.
 - `register` / `register_ack` — the identity + resume-key handshake.
-- `subscribe` / `unsubscribe` — live-event interest patterns.
+- `subscribe` / `unsubscribe` — live-event interest patterns
+  (`endpoint`, `plugin`, `topic`, optional `session`); a runtime sends a
+  `session` pattern only where the broker advertises `session_events` in
+  topology, and only for session-scoped registrations on a concrete
+  endpoint and plugin (unscoped ones keep the plain pattern and still
+  receive every session's events).  A session pattern narrows
+  session-stamped events only; session-less events always pass.
 - `topology` — a rich participant/plugin/liveness snapshot.
 - `control` — `shutdown` / `error` / `terminate` / `disconnect`.
 

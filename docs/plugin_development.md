@@ -283,6 +283,13 @@ registered with `session=sid` gets only its own session's events. A
 plugin-level notification (`self._dispatch_notify(topic, data)` or
 `send_notification`) is session-less unless it passes `session=sid`.
 
+Where the broker supports it, a consumer's session-scoped callback is
+filtered by the broker itself: its subscription carries the session and
+narrows session-stamped events to that session. Session-less events — your
+plugin-level notifications — always pass, so nothing is lost if some of
+them carry no session; stamp the ones that belong to a session so they are
+routed.
+
 From a plugin (async context):
 
 ``` python
