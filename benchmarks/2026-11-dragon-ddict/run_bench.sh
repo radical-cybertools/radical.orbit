@@ -76,7 +76,12 @@ start_endpoint() {          # $1: name  $2: K nodes (0: dragon -s on $3)
     else
         launch="$HERE/step_env.sh dragon -m -N $k"
     fi
+    local pp=$PYTHONPATH diag=
+    if [ -n "${DIAG:-}" ]; then                 # diag/sitecustomize.py
+        pp=$HERE/diag:$PYTHONPATH; diag=$dir/diag
+    fi
     # SLURM_OVERLAP: the launcher's inner sruns share the allocation
+    PYTHONPATH=$pp ORBIT_BENCH_DIAG=$diag \
     RADICAL_ORBIT_BROKER_URL=$(broker_url) SLURM_OVERLAP=1 \
     RADICAL_ORBIT_LOG_FILE=$dir/endpoint.log \
     $SRUN -N1 -n1 -w $node --chdir $dir $launch \
@@ -90,10 +95,17 @@ stop_endpoints() {          # destroy the DDicts first, then TERM, then kill
     for ep in "$@"; do
         client destroy --ep $ep --wait 5 >> $RUNS/ep-$ep/destroy.log 2>&1 || true
     done
+    # SIGTERM to the endpoint process only, never to the dragon launcher
+    # (whose command line also names the endpoint script): a signalled
+    # launcher tears the runtime down under the endpoint (README, Teardown)
     $SRUN -N ${#NODES[@]} -n ${#NODES[@]} \
-        pkill -TERM -u $USER -f radical-orbit-endpoint.py 2>/dev/null
-    sleep 25
+        pkill -TERM -u $USER -f '^[^ ]*python3 [^ ]*radical-orbit-endpoint.py' \
+        2>/dev/null
+    local t=0
     for ep in "$@"; do
+        while kill -0 $(cat $RUNS/ep-$ep/srun.pid) 2>/dev/null \
+                && [ $t -lt 40 ]; do sleep 1; t=$((t + 1)); done
+        echo "$ep: step gone after ${t}s" >> $RUNS/ep-$ep/destroy.log
         kill $(cat $RUNS/ep-$ep/srun.pid) 2>/dev/null
     done
     sleep 3
@@ -105,27 +117,30 @@ stop_endpoints() {          # destroy the DDicts first, then TERM, then kill
     log "endpoints stopped: $*"
 }
 
-setup() {                   # $1 ep  $2 n_nodes  $3 tag
-    client setup --ep $1 --n-nodes $2 --wait 300 \
-        --out $DATA/setup-$3.json && log "ddict on $1: $(cat $DATA/setup-$3.json | tr -d '\n ')"
+setup() {                   # $1 ep  $2 n_nodes  $3 tag  [args]
+    local ep=$1 nn=$2 tag=$3; shift 3
+    client setup --ep $ep --n-nodes $nn --wait 300 "$@" \
+        --out $DATA/setup-$tag.json && log "ddict on $ep: $(tr -d '\n ' < $DATA/setup-$tag.json)"
 }
 
-conc() {                    # $1 ep(s)  $2 clients  $3 batch  $4 tag
-    local c=$2 nn=$2 wl
+conc() {                    # $1 ep(s)  $2 clients  $3 batch  $4 tag  [args]
+    local ep=$1 c=$2 b=$3 tag=$4 nn=$2 wl; shift 4
     if [ $c -lt 4 ]; then
         wl=$(IFS=,; echo "${NODES[*]:1:$c}")    # off node 0 (broker)
     else
         nn=4; wl=$(IFS=,; echo "${NODES[*]}")
     fi
     local t=$(python -c "import time; print(time.time() + 15 + $c * 0.5)")
-    mkdir -p $DATA/conc-$4
+    mkdir -p $DATA/conc-$tag
     RADICAL_ORBIT_BROKER_URL=$(broker_url) \
-    $SRUN -N $nn -n $c -w $wl python $HERE/bench_client.py conc --ep $1 \
-        --batch $3 --duration $DUR --start-at $t \
-        --out "$DATA/conc-$4/c$c-b$3-r{rank}.json" \
-        > $RUNS/conc-$4-c$c-b$3.log 2>&1
-    log "conc $4 c=$c b=$3: rc=$? ($(ls $DATA/conc-$4/c$c-b$3-r*.json 2>/dev/null | wc -l) ranks)"
+    $SRUN -N $nn -n $c -w $wl python $HERE/bench_client.py conc --ep $ep \
+        --batch $b --duration $DUR --start-at $t \
+        --out "$DATA/conc-$tag/c$c-b$b-r{rank}.json" "$@" \
+        > $RUNS/conc-$tag-c$c-b$b.log 2>&1
+    log "conc $tag c=$c b=$b $*: rc=$? ($(ls $DATA/conc-$tag/c$c-b$b-r*.json 2>/dev/null | wc -l) ranks)"
 }
+
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0      # sourced: functions only
 
 for stage in "$@"; do
     log "=== $stage (nodes ${NODES[*]})"

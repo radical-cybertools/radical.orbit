@@ -1,0 +1,38 @@
+{
+ "procs": 2,
+ "runtime_nodes": 1,
+ "shared": false,
+ "vsize": 1024,
+ "mpn": 1,
+ "ranks": [
+  {
+   "rank": 0,
+   "host": "nid200056",
+   "put": {
+    "ops": 10612,
+    "elapsed": 5.000399074982852
+   },
+   "get": {
+    "ops": 15149,
+    "elapsed": 5.000050029950216
+   }
+  },
+  {
+   "rank": 1,
+   "host": "nid200056",
+   "put": {
+    "ops": 10616,
+    "elapsed": 5.000199289992452
+   },
+   "get": {
+    "ops": 15148,
+    "elapsed": 5.000219056964852
+   }
+  }
+ ],
+ "put_ops_s": 4245.345991041322,
+ "get_ops_s": 6059.236958973439,
+ "mode": "conc",
+ "n_nodes": 1,
+ "host": "nid200056"
+}

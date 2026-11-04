@@ -17,8 +17,9 @@ Modes::
                                       with ~5 keys: ORBIT + the Dragon thread)
     batch [--batches ..] [--vsize B]  update / get_many with B keys per call
     conc  --start-at T --duration D   one of N concurrent clients (rank from
-          [--batch B]                 $SLURM_PROCID): update phase [T, T+D],
-                                      get phase [T+D+1, T+2D+1]
+          [--batch B] [--shared]      $SLURM_PROCID): update phase [T, T+D],
+                                      get phase [T+D+1, T+2D+1]; --shared:
+                                      all ranks write the same keys
 
 ``--ep`` may list several endpoints (``a,b,c``): rank r uses the
 (r % n)-th.  ``{rank}`` in ``--out`` is replaced by the rank.
@@ -78,9 +79,9 @@ def m_destroy(dragon):
 def m_setup(dragon, a):
     m_destroy(dragon)
     t0 = time.perf_counter()
-    dd = dragon.ddict.create(name=DDICT, managers_per_node=1,
+    dd = dragon.ddict.create(name=DDICT, managers_per_node=a.mpn,
                              n_nodes=a.n_nodes, total_mem=a.mem)
-    return {'id': dd.id, 'n_nodes': a.n_nodes, 'mem': a.mem,
+    return {'id': dd.id, 'n_nodes': a.n_nodes, 'mpn': a.mpn, 'mem': a.mem,
             'create_s': time.perf_counter() - t0}
 
 
@@ -117,11 +118,12 @@ def m_batch(dd, a):
 def m_conc(dd, a):
     rank  = int(os.environ.get('SLURM_PROCID', 0))
     val   = os.urandom(a.vsize)
-    items = {f'c{rank}-{i}': val for i in range(a.batch)}
+    pre   = 's' if a.shared else f'c{rank}'           # overlapping key sets?
+    items = {f'{pre}-{i}': val for i in range(a.batch)}
     keys  = list(items)
     dd.update(items)                                    # warm-up
     res = {'rank': rank, 'host': socket.gethostname(), 'batch': a.batch,
-           'vsize': a.vsize}
+           'vsize': a.vsize, 'shared': a.shared}
     for phase, fn, t0 in (('put', lambda: dd.update(items), a.start_at),
                           ('get', lambda: dd.get_many(keys),
                            a.start_at + a.duration + 1)):
@@ -142,6 +144,7 @@ def main():
     p.add_argument('--out')
     p.add_argument('--n-nodes', type=int, default=1)
     p.add_argument('--mem', default='8G')
+    p.add_argument('--mpn', type=int, default=1, help='managers per node')
     p.add_argument('--sizes', type=int, nargs='+',
                    default=[64, 1024, 16384, 262144, 1048576])
     p.add_argument('--samples', type=int, default=200)
@@ -151,6 +154,8 @@ def main():
     p.add_argument('--batch', type=int, default=1)
     p.add_argument('--duration', type=float, default=3.0)
     p.add_argument('--start-at', type=float, default=0.0)
+    p.add_argument('--shared', action='store_true',
+                   help='conc: all ranks use the same keys (default: own)')
     p.add_argument('--wait', type=float, default=60.0,
                    help='max s to wait for the endpoint to register')
     a = p.parse_args()

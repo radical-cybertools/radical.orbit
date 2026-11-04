@@ -176,9 +176,9 @@ Other ports were not tested.
    about 1.9k at 16 clients. Gets do not show this. The native run shows a
    similar collapse on a single manager (4 writer processes: 4.3k puts/s,
    16 processes: 503 puts/s). Through ORBIT, however, all puts come from the
-   one Dragon thread, so this is not explained yet. This is a single run; the
-   endpoint's ORBIT profile is kept with the raw logs. It needs a repeat
-   before anyone acts on it.
+   one Dragon thread, so this is not explained yet. **Resolved:** a
+   history-dependent slow mode in Dragon's DDict put path, not concurrency.
+   See [Put collapse](#put-collapse-investigation-2026-11-04).
 6. **Broker placement does not matter inside NERSC.** A broker on the login
    node gives the same latency and throughput as one on a compute node,
    within about 5%. The 1 MiB latency is about 6–8% higher, which may come
@@ -195,7 +195,9 @@ Other ports were not tested.
    "Detected an abnormal exit", then a paramiko ssh cleanup attempt failing
    on an encrypted key. With `dragon -s` the step had to be terminated. The script then kills the step and runs
    `dragon-cleanup` on every node. After the step kill, 2–6 Dragon processes
-   were left on one node per teardown.
+   were left on one node per teardown. **Resolved:** our stop method also
+   signalled the `dragon` launcher. An endpoint-only SIGTERM shuts down
+   cleanly within seconds. See [Teardown](#teardown-investigation-2026-11-04).
 8. **Launch pitfall: `dragon -m` from inside an srun step.** Inside a step,
    Slurm sets `SLURM_JOB_NODELIST` to the step's node and leaves out
    `SLURM_JOB_NUM_NODES`, so the launcher fails ("SLURM_JOB_NUM_NODES
@@ -208,6 +210,196 @@ Other ports were not tested.
    up to 16 concurrent clients, 1024-key batches (about 1.4 MB request bodies)
    and 1 MiB values. Endpoint start under `dragon -m -N 4` took about 15 s,
    and a DDict create took about 2 s.
+
+## Put collapse (investigation, 2026-11-04)
+
+Follow-up to finding 5. Allocation 60801663, 4 CPU nodes
+`nid[200056-200059]`, the same software as above. The scripts are
+`inv_bench.sh`, `inv2_bench.sh` and `native_bench.py` (modes `replay` and
+`trend`), and the analysis is `inv_analyze.py`. The endpoint ran with
+`diag/sitecustomize.py`, a diagnostic import hook (no ORBIT change). It logs
+every Dragon-thread call with its queue wait, exec time and the time spent
+inside `DDict.__setitem__`/`__getitem__`, plus the route-handler time.
+
+**Answer: neither concurrency nor ORBIT causes it. It is a history-dependent
+slow mode inside the Dragon DDict put path.** The manager spends the extra
+time in Dragon's heap allocator. The concurrency in the first run only
+coincided with the key pattern that triggers the slow mode.
+
+![F6](figs/F6_put_collapse.png)
+
+![F8](figs/F8_native_replay.png)
+
+Evidence:
+
+1. **The time is inside `DDict.__setitem__`, not in ORBIT.** Per key, put
+   takes 380–390 µs in fast mode and 1,060–1,130 µs in slow mode, while get
+   stays at 270–300 µs in both. The route handler time equals the Dragon
+   thread's queue wait plus exec time, so the transport adds nothing. The
+   queue wait only reflects the serial Dragon thread: c clients wait about
+   (c−1) × exec. (`data/inv-summary.json`, columns
+   `put_dragon.key_us / q_ms / x_ms`.)
+2. **It is not concurrency.** Once it starts, a single client is as slow as
+   four (A-m1, 3 reps; per key in µs):
+
+   | rep | c = 1 | c = 2 | c = 4 |
+   |---|---|---|---|
+   | 1 | 392 | 383 | **1,105** |
+   | 2 | **1,124** | 1,104 | 1,061 |
+   | 3 | **1,111** | 1,103 | 1,060 |
+
+   Fresh endpoints repeat the same pattern (F6). Q-m (`-m -N 1`) goes
+   380 → 387 → **1,120** µs/key at the first 4-set phase, and Q-s (`-s`)
+   goes 367 → 591 → **1,446**. Every later phase stays at about 1,060–1,450
+   µs/key, whatever the client count. Leaving the slow mode is less
+   predictable:
+   - writing 64 B values cleared it in every sequence (A-m1, Q-m, Q-s:
+     346–394 µs/key);
+   - writing new key names cleared it in A-m1 and partly in Q-m (604), but
+     not in Q-s (1,258);
+   - in Q-m, 1 KiB writes to the old keys went slow again afterwards
+     (`final`: 1,093).
+
+   Keys per call (1, 16, 64, 256) matter only through which key sets they
+   touch: `b256` (256 keys) entered the slow mode in A-m1, too.
+3. **It is not ORBIT, and not the launcher.** One native writer (no ORBIT,
+   no threads, no concurrency) that writes the same 64-key sets in the same
+   order (`native_bench.py replay`) reproduces it exactly (µs per put):
+
+   | launcher | rep1 c=1 | rep1 c=2 | rep1 c=4 | rep2/3, any c | 64 new keys | then anything, incl. c=4 |
+   |---|---|---|---|---|---|---|
+   | `dragon -m -N 1` | 414 | 398 | **1,055** | 1,096–1,121 | 394 | 393–398 |
+   | `dragon -s` | 364 | 355 | **950** | 977–986 | 359 | 357–358 |
+
+   Here, writing new keys cleared the slow mode, and it stayed fast even for
+   the 4-set pattern afterwards. Overwriting a single 64-key set for 40 s
+   (`trend`, about 100k puts) never slows down (2.4–2.9k puts/s throughout),
+   nor does a 2× value size.
+4. **Where the manager spends the time** (py-spy with native frames, DDict
+   manager process, 3 s samples during put phases): in the slow phase,
+   169/298 samples are at `manager.py:3468` (`recvh.close()` at the end of
+   `put`). That call goes `dragon_fli_close_recv_handle` →
+   `_send_stream_channel` → `dragon_memory_alloc_blocking` →
+   `dragon_heap_malloc_blocking` → `_dragon_heap_malloc` →
+   `dragon_bitset_reset` → **`dragon_bitset_zeroes_to_right`**, a bitset scan
+   in Dragon's heap allocator. In a fast phase the manager mostly waits in its
+   receive loop and the allocation barely appears. On the endpoint side the
+   Dragon thread spends 90% of `__setitem__` waiting for the manager's reply
+   (`_recv_resp`) in slow mode, against 64% in the faster phase.
+   Raw samples: `data/inv-pyspy/`. The other busy Dragon process is a
+   ProcessGroup exception-queue monitor busy-polling `dragon_fli_poll`; it
+   looks the same in both phases.
+5. **More managers or nodes:** `managers_per_node=2` and `n_nodes=2` stay fast
+   at 1–2 clients (369–382 and 450–459 µs/key). Their short sequences never
+   ran the 4-set pattern that triggers the slow mode, so they are not
+   evidence that more managers prevent it.
+6. **A separate, native-only effect:** many concurrent writers on one
+   manager. One fresh DDict per run, 1 KiB values, puts/s:
+
+   | writers | `-m`, 1 manager | `-s`, 1 manager | `-m`, 2 managers |
+   |---|---|---|---|
+   | 1 | 2,533 | 2,818 | |
+   | 2 | 4,245 | 4,652 | 4,636 |
+   | 4 | 4,135 | | |
+   | 16 | **1,501** | **1,785** | 4,340 (gets 11,278) |
+
+   At 2 writers, shared keys give 4,031 and 64 B values 3,198 puts/s. The
+   16-writer drop points at contention when writers outnumber the manager's streams
+   (`streams_per_manager=5` by default), but I have not verified that inside
+   Dragon. ORBIT never shows this effect: the endpoint is a single writer.
+
+**Fix and where it belongs:** in Dragon (not ORBIT, not the plugin). Report it to HPE with the native
+reproducer:
+`dragon -s native_bench.py replay --duration 4`. It needs one node and runs
+in under a minute, and the slow mode starts at the `rep1-c4` phase. The
+blocking allocation in the FLI stream-channel return path (`recvh.close()`)
+degrades with the allocator's history. Nothing to fix in `plugin_dragon`
+(no plugin change was made). Possible workarounds, untested: more managers
+per node, or a larger DDict pool (`total_mem`).
+
+## Teardown (investigation, 2026-11-04)
+
+Follow-up to finding 7. `teardown_probe.sh` records the surviving process
+list once per loop tick (about 1 s, longer while a dump runs) for up to 60
+ticks, plus py-spy dumps (native frames) of the
+endpoint at +2/+8/+16/+24/+40 s. Leftovers (`/dev/shm` files and Dragon
+processes per node) are recorded before each `dragon-cleanup`. The
+"dragon_procs=2" baseline on every node is the pgrep's own shell.
+
+**Answer: the shutdown is clean when SIGTERM reaches only the endpoint
+process. It breaks when the signal reaches the `dragon` launcher.** The
+first benchmark's "endpoint does not exit in 25 s" was caused by how it
+stopped endpoints: `pkill -f radical-orbit-endpoint.py` also matches the
+launcher, whose command line names the endpoint script.
+
+| case (live DDict) | where | endpoint exits | leftovers |
+|---|---|---|---|
+| SIGTERM to the endpoint only, `dragon -s` | login, compute | a few seconds; DDict destroyed; launcher reports "head proc exited, code 0" | none |
+| SIGTERM to the endpoint only, `dragon -m -N 1` | compute | a few seconds | none |
+| endpoint-only stops of all A-stage endpoints (`-s`, `-m -N 1/2`) | compute | 0–2 s | none |
+| SIGTERM to launcher and endpoint, `-s` | login | **35 s** (15 s `on_host_stop` bound + 20 s `close_sync` join) | 3 DDict processes, 4 `/dev/shm` pools |
+| same, after destroying the DDict through ORBIT | login | about 1 s | the launcher's 3 pools |
+| SIGINT to the launcher only, `-s` | login | not at all (both stay up > 60 s); a later endpoint SIGTERM is clean | none |
+| SIGTERM to the srun step (scancel-like), `-s` | compute | killed: srun SIGKILLs the step within 2 s | 4 pools |
+| SIGTERM to the srun step, `-m -N 1` | compute | **never**: still serving after 60 s | 7 pools, 3 processes |
+
+One more endpoint-only stop (Q-m's `ep-aqm`) took 40 s. My blocking py-spy
+sampler was attached to the endpoint at that moment, and under ptrace a
+signal goes to the tracer first, so I count it as a measurement artefact.
+Evidence (events, leftovers, py-spy dumps) is in `data/inv-teardown/`
+(`login/` for B1–B5, `compute/` for the four compute cases).
+
+What happens in each failure:
+
+- **`dragon -s` installs no SIGTERM handler** (`launcher/dragon_single.py`
+  handles only KeyboardInterrupt), so a SIGTERM kills it outright. The
+  runtime services go with it, and the DDict orchestrator and manager
+  processes are orphaned. The endpoint's `on_host_stop` then calls
+  `DDict.destroy()`, which blocks waiting for a reply that never comes. py-spy
+  at +16 s on the Dragon thread shows `destroy (ddict.py:2439)` →
+  `_send_receive` → `_recv_resp` → `dragon_fli_recv_bytes`. The endpoint
+  log shows `dragon.on_host_stop exceeded 15s`, then the atexit
+  `close_sync` join waits another 20 s (`Dragon thread busy after 20s at
+  exit`), then the process exits. ORBIT's bounds work, but the endpoint
+  needs about 35 s and leaves the DDict processes and pools behind.
+  `DDict.destroy()` takes no timeout argument (0.15.0); the DDict's
+  `timeout=120` bounds it.
+- **The `dragon -m` frontend runs `_dragon_cleanup_bumpy_exit` on SIGTERM**
+  ("Detected an abnormal exit", then `dragon-cleanup` over ssh, which fails
+  here on an encrypted key). Under srun, a SIGTERM kills the frontend's step,
+  while the backend runtime (`dragon-backend`, global services, the endpoint,
+  the DDict) runs in a separate step started by the frontend's own srun. That
+  step survives orphaned: the endpoint never gets a signal, idles in its main
+  loop, and stays registered with the broker until the allocation ends.
+- **Not the plugin's DragonThread, not ORBIT's stop ordering:** with an
+  intact runtime, `on_host_stop` destroys the DDict, the thread stops and
+  the process exits within seconds. The #158 bounds (15 s per plugin) hold.
+  The extra 20 s at exit comes from `close_sync` re-joining a thread that
+  is already known to be stuck.
+
+**Clean shutdown sequence:** send SIGTERM to the endpoint process only, then
+let the endpoint destroy its DDicts, stop the Dragon thread and exit. When
+the head process exits, the launcher tears the runtime down normally. This
+benchmark now stops endpoints that way (`stop_endpoints`:
+`pkill -f '^[^ ]*python3 [^ ]*radical-orbit-endpoint.py'`, which never
+matches the launcher).
+
+**Fixes and where they belong:**
+- **ORBIT endpoint wrapper / launch (#158 territory):** make sure that
+  orchestrated stops reach the endpoint, not the launcher. The wrapper could
+  stay the parent of `dragon` (no `exec`), trap TERM/INT and forward SIGTERM
+  to the endpoint process. For batch jobs, use `--signal=TERM@<lead>` (or
+  `B:USR1@…`) so the endpoint is told before Slurm SIGTERMs every
+  process at the walltime. ORBIT's broker `endpoint/disconnect` control
+  stops the endpoint from inside and is the cleanest remote stop.
+- **Plugin (optional, small):** `close_sync` could skip its 20 s join when the
+  async close already timed out. That would cut a broken teardown from about
+  35 s to about 15 s. It is a nit, not a correctness bug, so I left it
+  unchanged.
+- **Dragon:** `dragon -s` should handle SIGTERM like SIGINT (tear down the
+  runtime). The `-m` frontend's step kill should take the backend step with
+  it. SIGINT to `dragon -s` did not stop a running head process within
+  60 s either. Report these to HPE.
 
 ## Caveats
 
@@ -234,10 +426,15 @@ Other ports were not tested.
 | `env.sh` | environment: venv, PATH, PYTHONPATH, cert/key, token (from `$RUNS/token`), log level |
 | `run_bench.sh` | launch script (login node, against an existing allocation): stages `probe native broker-compute k1 k1nd k2 k4 varb native1 native2 native4 broker-login stop` |
 | `step_env.sh` | lets `dragon -m` run from a one-node step (finding 8) |
-| `bench_client.py` | ORBIT client: modes `setup destroy lat batch conc` |
-| `native_bench.py` | native DDict baseline (a Dragon program): modes `lat conc` |
+| `bench_client.py` | ORBIT client: modes `setup destroy lat batch conc` (`--shared`, `--mpn`) |
+| `native_bench.py` | native DDict baseline (a Dragon program): modes `lat conc replay trend` |
 | `nodeflate/sitecustomize.py` | diagnostic for `k1nd`: no permessage-deflate on ORBIT's `websockets.connect` |
 | `analyze.py` | reduces `data/` to `data/summary.json` and plots F1–F5 into `figs/` |
+| `inv_bench.sh`, `inv2_bench.sh` | put-collapse and teardown investigation (they source `run_bench.sh` for its functions) |
+| `diag/sitecustomize.py` | diagnostic import hook: per Dragon-thread call queue wait, exec time and time in DDict set/get, plus handler time |
+| `teardown_probe.sh` | signals (or watches) an endpoint, records survivors and py-spy dumps |
+| `inv_analyze.py` | joins client windows with the endpoint diag logs: `data/inv-summary.json`, `data/inv-table.md`, F6 and F8 |
+| `data/inv-*`, `data/conc-inv-*` | investigation data: per-rank JSON, native replay/trend/conc, py-spy profiles, teardown evidence, `inv-m1-put-timeline.csv` |
 | `data/` | raw per-run JSON (per-rank JSON for the concurrent runs), `probe.txt` |
 | `figs/` | F1–F5 as PNG and SVG |
 
@@ -258,6 +455,15 @@ scancel $JOB
 python analyze.py $RUNS/data figs
 ```
 
-The whole sequence ran in 42 minutes on 4 nodes (about 2.8 node-hours),
-including one failed attempt. Do not edit `run_bench.sh` while it runs:
-bash reads the script as it goes.
+Investigation (allocation of up to 90 min, the broker on node 0):
+
+```sh
+./inv_bench.sh  broker-compute A-m1 A-s A-mpn2 A-n2 B-m B-s A-native stop
+./inv2_bench.sh broker-compute T-native Q-m Q-s stop
+python inv_analyze.py $RUNS data figs > data/inv-table.md   # needs $RUNS diag logs
+```
+
+The whole first sequence ran in 42 minutes on 4 nodes (about 2.8 node-hours),
+including one failed attempt. The investigation used 53 minutes on 4 nodes
+(about 3.6 node-hours). Do not edit `run_bench.sh` while it runs: bash reads
+the script as it goes.
