@@ -151,7 +151,8 @@ class _RunningBroker:
         config = uvicorn.Config(
             broker.app, host='127.0.0.1', port=0, log_level='error',
             ws_ping_interval=ws_ping_interval,
-            ws_ping_timeout=ws_ping_timeout)
+            ws_ping_timeout=ws_ping_timeout,
+            ws_per_message_deflate=broker._ws_compression)
         self._server = uvicorn.Server(config)
         self._thread = threading.Thread(target=self._server.run, daemon=True)
 
@@ -336,6 +337,31 @@ def test_serve_and_call_plugin_end_to_end(harness):
     assert body['error']       is True
     assert body['status_code'] == 404
     assert 'No route' in body['detail']
+
+
+# ---------------------------------------------------------------------------
+# permessage-deflate is negotiated per connection: mixed settings interoperate
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize('broker_on, client_on', [
+    (False, False), (True, False), (False, True), (True, True)])
+def test_ws_compression_interop(harness, monkeypatch, broker_on, client_on):
+    monkeypatch.delenv('RADICAL_ORBIT_WS_COMPRESSION', raising=False)
+    make_broker, make_runtime = harness
+    srv = make_broker(ws_compression=broker_on)
+
+    a = make_runtime(srv.url, name='epA', plugins=['echo_rt'],
+                     ws_compression=client_on)
+    b = make_runtime(srv.url, name='epB', ws_compression=client_on)
+    assert a.wait_registered(timeout=5.0)
+    assert _wait_topology(b, 'epA', 'echo_rt', timeout=5.0)
+    assert b.get_plugin('epA', 'echo_rt').echo('x' * 4096) == \
+        {'echo': 'x' * 4096}
+
+    # Deflate is in effect only when both sides offer / accept it.
+    negotiated = [e.name for e in b._ws.protocol.extensions]
+    expected   = ['permessage-deflate'] if broker_on and client_on else []
+    assert negotiated == expected
 
 
 # ---------------------------------------------------------------------------

@@ -140,6 +140,12 @@ precedence **constructor argument > environment variable > file under
 - `RADICAL_ORBIT_BROKER_CERT` — the broker TLS cert.
 - `RADICAL_ORBIT_BROKER_TOKEN` — the shared ingress token.
 
+WebSocket permessage-deflate is off by default; the `ws_compression=True`
+keyword, or `RADICAL_ORBIT_WS_COMPRESSION=1` (`1/true/on/yes` vs
+`0/false/off/no`), turns it on — the keyword wins over the env var.  It
+takes effect only if the broker enables it too (negotiated per connection;
+mixed settings still connect, uncompressed).
+
 Log level follows `RADICAL_ORBIT_LOG_LVL` (or the generic `RADICAL_LOG_LVL`).
 
 ## API Reference

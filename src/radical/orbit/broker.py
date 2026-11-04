@@ -100,6 +100,9 @@ class BrokerTuning:
     * ``reap_interval`` — how often the reaper sweeps for expired calls.
     * ``event_queue`` — per-subscriber delivery-queue depth.
     * ``frame_cap`` — uvicorn ``ws_max_size`` / the protocol frame cap.
+    * ``ws_compression`` — offer WS permessage-deflate (uvicorn
+      ``ws_per_message_deflate``); ``None`` defers to
+      ``$RADICAL_ORBIT_WS_COMPRESSION``, unset means off.
     """
 
     ping_interval: float = 1.0
@@ -111,6 +114,7 @@ class BrokerTuning:
     reap_interval: float = 5.0
     event_queue:   int   = 1024
     frame_cap:     int   = protocol.FRAME_CAP
+    ws_compression: Optional[bool] = None
 
 
 class _Call:
@@ -268,6 +272,8 @@ class Broker:
         self._reap_interval = tuning.reap_interval
         self._event_queue   = tuning.event_queue
         self._frame_cap     = tuning.frame_cap
+        self._ws_compression = utils.resolve_ws_compression(
+            tuning.ws_compression)
         self._plugins_spec: str = plugins or ''
         self._gateway_enabled   = gateway
 
@@ -624,7 +630,7 @@ class Broker:
                     log_level="info",
                     # Transport enforces the frame cap on inbound frames.
                     ws_max_size=self._frame_cap,
-                    ws_per_message_deflate=True,
+                    ws_per_message_deflate=self._ws_compression,
                     # Server-wide WS keepalive disconnects a silent client at
                     # ping_interval + ping_timeout.
                     ws_ping_interval=self._ping_interval,

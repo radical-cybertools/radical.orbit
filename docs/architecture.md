@@ -49,6 +49,14 @@ payload:
 Liveness is transport-level only (WebSocket keepalive); there is no app-level
 heartbeat kind. A frame-size cap bounds each frame.
 
+WebSocket permessage-deflate is off by default (it dominated large payloads:
+1 MiB round trips went from ~100 ms to 16–19 ms without it; small frames are
+unaffected).  Enable it with `BrokerTuning(ws_compression=True)` on the
+broker, the `ws_compression=True` keyword on an `EndpointRuntime`, or
+`RADICAL_ORBIT_WS_COMPRESSION=1` on either side (an explicit setting wins
+over the env var).  The extension is negotiated per connection, so mixed
+settings interoperate: frames are compressed only when both sides enable it.
+
 ## Session lifecycle
 
 A consumer opens a session on a plugin with `register_session` (create or

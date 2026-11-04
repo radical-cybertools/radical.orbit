@@ -56,6 +56,33 @@ def _env(name: str) -> str:
     return os.environ.get(name, '').strip()
 
 
+# WebSocket permessage-deflate (RFC 7692), negotiated per connection: frames
+# are compressed only when both sides offer / accept it, so a mixed setup
+# interoperates.  Off by default — deflate dominates large payloads (1 MiB
+# put/get p50 ~100 ms with, 16-19 ms without, on Perlmutter).
+ENV_WS_COMPRESSION = 'RADICAL_ORBIT_WS_COMPRESSION'
+
+_TRUE  = ('1', 'true',  'on',  'yes')
+_FALSE = ('0', 'false', 'off', 'no')
+
+
+def resolve_ws_compression(value: Optional[bool] = None) -> bool:
+    """Explicit setting > ``$RADICAL_ORBIT_WS_COMPRESSION`` > off.
+
+    ``value=None`` means "not set": the env var decides, and an unset (or
+    empty) env var means off.  An unrecognised env value raises.
+    """
+    if value is not None:
+        return bool(value)
+    raw = _env(ENV_WS_COMPRESSION).lower()
+    if raw in _TRUE:
+        return True
+    if raw in _FALSE or not raw:
+        return False
+    raise ValueError(f"${ENV_WS_COMPRESSION}={raw!r}: expected one of "
+                     f"{'/'.join(_TRUE)} or {'/'.join(_FALSE)}")
+
+
 # Cookie the browser/SSE path carries (set by the broker's POST /auth).  The
 # token never lives in a query string, only this HttpOnly cookie or a
 # request header.

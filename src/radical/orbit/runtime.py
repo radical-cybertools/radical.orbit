@@ -97,7 +97,8 @@ _BACKOFF_FACTOR = 1.5     # (re)connect backoff growth factor
 # change; they are deliberately absent from the visible signature.
 _TUNING_KEYS = {'request_concurrency', 'accept_queue', 'callback_queue',
                 'call_timeout', 'retry_after', 'frame_cap',
-                'backoff_start', 'backoff_max', 'backoff_factor'}
+                'backoff_start', 'backoff_max', 'backoff_factor',
+                'ws_compression'}
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +136,10 @@ class EndpointRuntime(PluginHostBase):
     constants (``_REQUEST_CAP``, ``_BACKOFF_*`` …), not per-instance knobs; they
     are still accepted as keyword arguments for existing test harnesses but are
     intentionally absent from the visible signature.
+
+    ``ws_compression`` (keyword, bool) offers WS permessage-deflate; unset
+    defers to ``$RADICAL_ORBIT_WS_COMPRESSION``, then off.  Negotiated per
+    connection: frames compress only if the broker accepts it too.
     """
 
     def __init__(self,
@@ -231,6 +236,9 @@ class EndpointRuntime(PluginHostBase):
         self._ping_interval  = ping_interval
         self._ping_timeout   = ping_timeout
         self._frame_cap      = tuning.get('frame_cap',      protocol.FRAME_CAP)
+        # permessage-deflate: tuning > $RADICAL_ORBIT_WS_COMPRESSION > off.
+        self._ws_compression = utils.resolve_ws_compression(
+            tuning.get('ws_compression'))
         self._backoff_start  = tuning.get('backoff_start',  _BACKOFF_START)
         self._backoff_max    = tuning.get('backoff_max',    _BACKOFF_MAX)
         self._backoff_factor = tuning.get('backoff_factor', _BACKOFF_FACTOR)
@@ -546,6 +554,15 @@ class EndpointRuntime(PluginHostBase):
 
     # ── transport loop: connect / register / recv / send ───────────────
 
+    def _ws_connect_kwargs(self, ssl_ctx) -> dict:
+        """Keyword arguments for ``websockets.connect`` (minus the URL)."""
+        return dict(ssl=ssl_ctx,
+                    ping_interval=self._ping_interval,
+                    ping_timeout=self._ping_timeout,
+                    close_timeout=2,
+                    max_size=self._frame_cap,
+                    compression='deflate' if self._ws_compression else None)
+
     async def _transport_main(self) -> None:
         # One-time tunnel setup before the connect/reconnect loop.
         try:
@@ -563,12 +580,7 @@ class EndpointRuntime(PluginHostBase):
                 ws_url  = self._ws_url()
                 ssl_ctx = self._ssl_context(ws_url)
                 async with websockets.connect(
-                        ws_url, ssl=ssl_ctx,
-                        ping_interval=self._ping_interval,
-                        ping_timeout=self._ping_timeout,
-                        close_timeout=2,
-                        max_size=self._frame_cap,
-                        compression='deflate') as ws:
+                        ws_url, **self._ws_connect_kwargs(ssl_ctx)) as ws:
 
                     ok = await self._do_register(ws)
                     if not ok:
