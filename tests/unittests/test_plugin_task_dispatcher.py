@@ -800,6 +800,30 @@ class TestPilotSubmitTransport:
         assert got is client
         assert client.register_session.call_args.kwargs['ttl'] == 0
 
+    def test_child_sessions_reattach_by_a_stable_sid(self, tmp_path):
+        """After the cache entry is dropped (endpoint lost and back, or a
+        broker restart), the dispatcher re-registers the same sid, so it
+        reattaches to its session instead of leaving it behind."""
+        _, plugin = _make_plugin(tmp_path, broker_caller=MagicMock())
+        sids = []
+
+        def _client(*_a, **_k):
+            c = MagicMock()
+            c.register_session.side_effect = \
+                lambda **kw: sids.append(kw['sid'])
+            return c
+
+        with patch.object(plugin, '_make_child_client', side_effect=_client):
+            asyncio.run(plugin._get_psij_client('ep'))
+            plugin._child_clients.clear()                  # lost / restart
+            asyncio.run(plugin._get_psij_client('ep'))
+            asyncio.run(plugin._get_rhapsody_client('ep', 'dragon_v3'))
+            asyncio.run(plugin._get_rhapsody_client('ep', 'local'))
+        assert sids[0] == sids[1]
+        assert sids[0].startswith('dispatcher.') and sids[0].endswith('.psij')
+        assert len(set(sids[1:])) == 3                     # per plugin/backend
+        assert plugin.instance_name in sids[0]
+
 
 # ---------------------------------------------------------------------------
 # Endpoint-mode submit (transparent proxy to a target endpoint's rhapsody)

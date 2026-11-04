@@ -1484,9 +1484,11 @@ class PluginTaskDispatcher(Plugin):
         its *plugin* is unreachable.
 
         The session never idle-expires (``ttl=0``): the client stays cached
-        across arbitrarily long idle phases of the pools that use it.  It is
-        bounded by its endpoint -- a pilot's child endpoint ends with its
-        batch job, and the cache entry is dropped when *dst* is lost.
+        across arbitrarily long idle phases of the pools that use it.  Its
+        sid is stable (:meth:`_child_sid`), so re-registering after the
+        cache entry was dropped (*dst* lost and back) or lost (broker
+        restart) reattaches to the same session on *dst* rather than leaving
+        the old one behind; if *dst* restarted, it is created afresh.
         '''
         if self._broker_caller is None:
             return None
@@ -1496,6 +1498,7 @@ class PluginTaskDispatcher(Plugin):
         client = self._make_child_client(cls, plugin, dst)
         try:
             await asyncio.to_thread(client.register_session, ttl=0,
+                                    sid=self._child_sid(key),
                                     **register_kwargs)
         except Exception as e:
             log.warning('[%s] %s session unavailable on %s: %s',
@@ -1503,6 +1506,17 @@ class PluginTaskDispatcher(Plugin):
             return None
         self._child_clients[key] = client
         return client
+
+    def _child_sid(self, key: tuple) -> str:
+        '''The stable sid of this dispatcher's child session for *key*
+        (``(dst, plugin, backend)``): unique per broker, dispatcher instance,
+        plugin and backend, so it never collides with another client's.'''
+        _, plugin, backend = key
+        broker = getattr(self._app.state, 'endpoint_name', None) or 'broker'
+        parts  = ['dispatcher', broker, self.instance_name, plugin]
+        if backend:
+            parts.append(backend)
+        return '.'.join(parts)
 
     async def _get_psij_client(self, endpoint_name: str):
         '''Return a caller-backed :class:`PSIJClient` for *endpoint_name*.'''
