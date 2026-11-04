@@ -146,6 +146,7 @@ export function init(page, api) {
   escHtml = api.escHtml;
   const endpoint = api.endpointName;
   if (!state[endpoint]) state[endpoint] = { sid: null, tasks: {} };
+  state[endpoint].page = page;      // the panel shown now (re-rendered on revisit)
 
   // Prefill auth fields from localStorage.
   const stored = loadTokens()[endpoint];
@@ -235,6 +236,7 @@ async function connect(page, api, silent = false, creds = null, ended = '') {
   // reconnect racing a manual Connect) must not replace its session
   const gen = state[endpoint].gen = (state[endpoint].gen || 0) + 1;
   const note = ended ? ` (previous session ended: ${ended})` : '';
+  state[endpoint].connecting = true;
   try {
     // Register a fresh session carrying the token (bypass the shared cache
     // so re-connecting with a new token always re-registers).
@@ -267,6 +269,8 @@ async function connect(page, api, silent = false, creds = null, ended = '') {
     label.style.color = 'var(--muted)';
     status.innerHTML = `<span style="color:var(--danger);">Error: ${escHtml(e.message)}${escHtml(note)}</span>`;
     if (!silent) api.flash('Globus connect failed: ' + e.message, false);
+  } finally {
+    if (gen === state[endpoint].gen) state[endpoint].connecting = false;
   }
 }
 
@@ -277,6 +281,7 @@ async function connect(page, api, silent = false, creds = null, ended = '') {
 function sessionLost(page, api, sid, detail) {
   const endpoint = api.endpointName;
   if (!state[endpoint] || state[endpoint].sid !== sid) return;   // replaced
+  page = state[endpoint].page || page;    // the panel shown now
   api.releaseSession?.(sid);
   state[endpoint].sid = null;
   let why = detail || 'session ended';
@@ -286,8 +291,10 @@ function sessionLost(page, api, sid, detail) {
   label.style.color = 'var(--muted)';
   page.querySelector('.globus-conn-status').innerHTML =
       `<span style="color:var(--danger);">Globus session ended: ${escHtml(why)}</span>`;
+  // reconnect unless a Connect is already running (it wins)
   const creds = state[endpoint].creds;
-  if (creds && creds.refresh_token && creds.client_id)        // renewable
+  if (creds && creds.refresh_token && creds.client_id         // renewable
+      && !state[endpoint].connecting)
     connect(page, api, /*silent=*/true, creds, why);
 }
 

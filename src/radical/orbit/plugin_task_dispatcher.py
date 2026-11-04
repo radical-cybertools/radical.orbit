@@ -73,7 +73,6 @@ from .task_dispatcher_state             import (
     TASK_TERMINAL_STATES,
 )
 from .task_dispatcher_policy               import make_policy
-from .client                               import SessionInitFailed
 
 log = logging.getLogger('radical.orbit')
 
@@ -731,6 +730,11 @@ class PoolState:
 QUEUE_WAIT_MAX = 7 * 86400
 
 
+# How long the sessions of a lost endpoint's dropped child clients are
+# remembered for release when it returns (s).
+CHILD_ORPHAN_KEEP = 86400
+
+
 class TaskDispatcherSession(PluginSession):
     '''Session handle — owns this session's pools by lifetime.
 
@@ -1097,8 +1101,12 @@ class PluginTaskDispatcher(Plugin):
         # over the caller), keyed (dst, plugin, backend).  Invalidated for a
         # dst when it goes ``lost``.
         self._child_clients: dict[tuple, Any] = {}
-        self._child_locks:   dict[tuple, asyncio.Lock] = {}
-        self._child_lost:    dict[str, int] = {}   # dst -> times seen lost
+        # Clients dropped when their endpoint went lost: name -> (time,
+        # [clients]).  Their (ttl=0) sessions are unregistered when the
+        # endpoint is present again; entries older than CHILD_ORPHAN_KEEP
+        # are forgotten (e.g. a pilot child that ended with its job).
+        self._child_orphans: dict[str, tuple[float, list]] = {}
+        self._release_tasks: set[asyncio.Task] = set()
 
         # endpoint_name → set of loaded plugin names, refreshed on every
         # topology change.  Used to auto-resolve a pool's endpoint_name and to
@@ -1405,6 +1413,8 @@ class PluginTaskDispatcher(Plugin):
             except Exception:
                 pass
             self._untap = None
+        if self._release_tasks:     # threads: wait briefly, not cancellable
+            await asyncio.wait(set(self._release_tasks), timeout=5)
         await super().shutdown()
 
     async def _reconcile_overdue_pilots(self, now: float) -> None:
@@ -1487,69 +1497,43 @@ class PluginTaskDispatcher(Plugin):
         its *plugin* is unreachable.
 
         The session never idle-expires (``ttl=0``): the client stays cached
-        across arbitrarily long idle phases of the pools that use it.  Its
-        sid is stable (:meth:`_child_sid`), so re-registering after the
-        cache entry was dropped (*dst* lost and back) or lost (broker
-        restart) reattaches to the same session on *dst* rather than leaving
-        the old one behind; if *dst* restarted, it is created afresh.  A
-        session whose init failed (:class:`SessionInitFailed`, reported by
-        the endpoint) is dropped and created once more, so it cannot block
-        its sid; any other failure (timeout, transport) leaves the session
-        alone -- it may hold running work.  One registration per *key* at a
-        time.
+        across arbitrarily long idle phases of the pools that use it.  It is
+        bounded by its endpoint -- a pilot's child endpoint ends with its
+        batch job, and the cache entry is dropped when *dst* is lost.
         '''
         if self._broker_caller is None:
             return None
-        async with self._child_locks.setdefault(key, asyncio.Lock()):
-            client = self._child_clients.get(key)
-            if client is not None:
-                return client
-            sid  = self._child_sid(key)
-            lost = self._child_lost.get(dst, 0)
-            for attempt in (1, 2):
-                client = self._make_child_client(cls, plugin, dst)
-                try:
-                    await asyncio.to_thread(client.register_session, ttl=0,
-                                            sid=sid, **register_kwargs)
-                    break
-                except SessionInitFailed as e:
-                    # drop the failed session under the sid (ttl=0 sessions
-                    # are not remembered once ended, so it can be recreated)
-                    await asyncio.to_thread(self._drop_child_session, client)
-                    if attempt == 2:
-                        log.warning('[%s] %s session unavailable on %s: %s',
-                                    self.instance_name, plugin, dst, e)
-                        return None
-                except Exception as e:
-                    log.warning('[%s] %s session unavailable on %s: %s',
-                                self.instance_name, plugin, dst, e)
-                    return None
-            if self._child_lost.get(dst, 0) != lost:
-                return None     # dst was lost meanwhile: do not cache it
-            self._child_clients[key] = client
+        client = self._child_clients.get(key)
+        if client is not None:
             return client
-
-    @staticmethod
-    def _drop_child_session(client) -> None:
-        '''Best effort: unregister the session *client* registered (or
-        reattached to).'''
-        if not getattr(client, 'sid', None):
-            return
+        client = self._make_child_client(cls, plugin, dst)
         try:
-            client.unregister_session()
+            await asyncio.to_thread(client.register_session, ttl=0,
+                                    **register_kwargs)
         except Exception as e:
-            log.debug('cannot drop child session %s: %s', client.sid, e)
+            log.warning('[%s] %s session unavailable on %s: %s',
+                        self.instance_name, plugin, dst, e)
+            return None
+        self._child_clients[key] = client
+        return client
 
-    def _child_sid(self, key: tuple) -> str:
-        '''The stable sid of this dispatcher's child session for *key*
-        (``(dst, plugin, backend)``): unique per broker name, dispatcher
-        instance, plugin and backend (an endpoint dials one broker).'''
-        _, plugin, backend = key
-        broker = getattr(self._app.state, 'endpoint_name', None) or 'broker'
-        parts  = ['dispatcher', broker, self.instance_name, plugin]
-        if backend:
-            parts.append(backend)
-        return '.'.join(parts)
+    def _release_child_sessions(self, dst: str, clients: list) -> None:
+        '''Unregister the sessions of *clients* (dropped when *dst* went
+        lost) in the background, best effort: *dst* is back, and those
+        ``ttl=0`` sessions would otherwise stay until its process exits.'''
+        def _release():
+            for client in clients:
+                try:
+                    client.unregister_session()
+                except Exception as e:
+                    log.debug('[%s] cannot release %s session on %s: %s',
+                              self.instance_name,
+                              getattr(client, '_plugin_name', '?'), dst, e)
+
+        task = asyncio.get_running_loop().create_task(
+            asyncio.to_thread(_release))
+        self._release_tasks.add(task)
+        task.add_done_callback(self._release_tasks.discard)
 
     async def _get_psij_client(self, endpoint_name: str):
         '''Return a caller-backed :class:`PSIJClient` for *endpoint_name*.'''
@@ -2552,16 +2536,23 @@ class PluginTaskDispatcher(Plugin):
             if name == self_name:
                 continue
             if (info or {}).get('liveness') == 'lost':
-                # Drop cached plugin-clients on a lost endpoint; a
-                # reconnecting one re-registers under the same (stable) sid,
-                # reattaching to its session if the endpoint kept running.
-                self._child_lost[name] = self._child_lost.get(name, 0) + 1
-                for key in [k for k in self._child_clients if k[0] == name]:
-                    self._child_clients.pop(key, None)
-                for key in [k for k, lk in self._child_locks.items()
-                            if k[0] == name and not lk.locked()]:
-                    self._child_locks.pop(key, None)
+                # Drop cached plugin-clients on a lost endpoint so a
+                # reconnecting one re-registers fresh; their sessions are
+                # released once it is back (they never idle-expire).
+                cutoff = time.time() - CHILD_ORPHAN_KEEP
+                for n in [n for n, (t, _) in self._child_orphans.items()
+                          if t < cutoff]:
+                    self._child_orphans.pop(n, None)
+                dropped = [self._child_clients.pop(k)
+                           for k in [k for k in self._child_clients
+                                     if k[0] == name]]
+                if dropped:
+                    _, prev = self._child_orphans.get(name, (0, []))
+                    self._child_orphans[name] = (time.time(), prev + dropped)
                 continue
+            if name in self._child_orphans:
+                _, orphans = self._child_orphans.pop(name)
+                self._release_child_sessions(name, orphans)
             plugins = (info or {}).get('plugins', {})
             if isinstance(plugins, dict):
                 plugins = list(plugins.keys())

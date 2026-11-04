@@ -790,6 +790,41 @@ class TestPilotSubmitTransport:
         assert asyncio.run(plugin._get_psij_client('someone')) is None
         assert asyncio.run(plugin._get_rhapsody_client('someone')) is None
 
+    def test_dropped_child_sessions_are_released_when_back(self, tmp_path):
+        """A lost endpoint's cached clients are dropped; when it is present
+        again their (ttl=0) sessions are unregistered, so they do not stay
+        behind next to the fresh ones."""
+        _, plugin = _make_plugin(tmp_path, broker_caller=MagicMock())
+        old = MagicMock()
+        plugin._child_clients[('ep', 'psij', None)] = old
+
+        async def scenario():
+            await plugin.on_topology_change(
+                {'ep': {'role': 'endpoint', 'plugins': {},
+                        'liveness': 'lost'}})
+            assert not plugin._child_clients
+            old.unregister_session.assert_not_called()   # unreachable now
+            await plugin.on_topology_change(
+                {'ep': {'role': 'endpoint', 'plugins': {'psij': {}},
+                        'liveness': 'present'}})
+            await asyncio.wait(set(plugin._release_tasks), timeout=5)
+
+        asyncio.run(scenario())
+        old.unregister_session.assert_called_once()
+        assert 'ep' not in plugin._child_orphans
+
+    def test_orphans_of_endpoints_that_never_return_are_forgotten(
+            self, tmp_path):
+        from radical.orbit import plugin_task_dispatcher as ptd
+        _, plugin = _make_plugin(tmp_path, broker_caller=MagicMock())
+        plugin._child_orphans['gone'] = (
+            time.time() - ptd.CHILD_ORPHAN_KEEP - 1, [MagicMock()])
+        plugin._child_clients[('ep', 'psij', None)] = MagicMock()
+        asyncio.run(plugin.on_topology_change(
+            {'ep': {'role': 'endpoint', 'plugins': {}, 'liveness': 'lost'}}))
+        assert 'gone' not in plugin._child_orphans
+        assert 'ep' in plugin._child_orphans
+
     def test_child_sessions_never_idle_expire(self, tmp_path):
         """Child sessions are cached across arbitrarily long pool idle
         phases, so they are registered with ttl=0."""
@@ -799,92 +834,6 @@ class TestPilotSubmitTransport:
             got = asyncio.run(plugin._get_psij_client('ep'))
         assert got is client
         assert client.register_session.call_args.kwargs['ttl'] == 0
-
-    def test_child_sessions_reattach_by_a_stable_sid(self, tmp_path):
-        """After the cache entry is dropped (endpoint lost and back, or a
-        broker restart), the dispatcher re-registers the same sid, so it
-        reattaches to its session instead of leaving it behind."""
-        _, plugin = _make_plugin(tmp_path, broker_caller=MagicMock())
-        sids = []
-
-        def _client(*_a, **_k):
-            c = MagicMock()
-            c.register_session.side_effect = \
-                lambda **kw: sids.append(kw['sid'])
-            return c
-
-        with patch.object(plugin, '_make_child_client', side_effect=_client):
-            asyncio.run(plugin._get_psij_client('ep'))
-            plugin._child_clients.clear()                  # lost / restart
-            asyncio.run(plugin._get_psij_client('ep'))
-            asyncio.run(plugin._get_rhapsody_client('ep', 'dragon_v3'))
-            asyncio.run(plugin._get_rhapsody_client('ep', 'local'))
-        assert sids[0] == sids[1]
-        assert sids[0].startswith('dispatcher.') and sids[0].endswith('.psij')
-        assert len(set(sids[1:])) == 3                     # per plugin/backend
-        assert plugin.instance_name in sids[0]
-
-    def test_a_failed_child_session_does_not_block_its_sid(self, tmp_path):
-        """A session under the stable sid whose init failed is dropped and
-        created once more; a timeout leaves the session (it may hold
-        running work) alone."""
-        from radical.orbit.client import SessionInitFailed
-        _, plugin = _make_plugin(tmp_path, broker_caller=MagicMock())
-
-        def _run(first_error):
-            made = []
-
-            def _client(*_a, **_k):
-                c = MagicMock()
-                c.sid = 'dispatcher.x'
-                if not made:
-                    c.register_session.side_effect = first_error
-                made.append(c)
-                return c
-
-            plugin._child_clients.clear()
-            with patch.object(plugin, '_make_child_client',
-                              side_effect=_client):
-                got = asyncio.run(
-                    plugin._get_rhapsody_client('ep', 'dragon_v3'))
-            return got, made
-
-        got, made = _run(SessionInitFailed('init failed'))
-        assert got is made[1]
-        made[0].unregister_session.assert_called_once()
-
-        got, made = _run(RuntimeError('timed out waiting for init'))
-        assert got is None and len(made) == 1
-        made[0].unregister_session.assert_not_called()
-
-    def test_a_registration_overtaken_by_loss_is_not_cached(self, tmp_path):
-        """A child session registered while its endpoint was reported lost
-        is not cached (the endpoint may have restarted meanwhile)."""
-        _, plugin = _make_plugin(tmp_path, broker_caller=MagicMock())
-        client = MagicMock()
-        client.register_session.side_effect = \
-            lambda **kw: plugin._child_lost.update(ep=1)
-        with patch.object(plugin, '_make_child_client', return_value=client):
-            assert asyncio.run(plugin._get_psij_client('ep')) is None
-        assert not plugin._child_clients
-
-    def test_concurrent_child_lookups_register_once(self, tmp_path):
-        _, plugin = _make_plugin(tmp_path, broker_caller=MagicMock())
-        made = []
-
-        def _client(*_a, **_k):
-            c = MagicMock()
-            c.register_session.side_effect = lambda **kw: time.sleep(0.05)
-            made.append(c)
-            return c
-
-        async def _both():
-            return await asyncio.gather(plugin._get_psij_client('ep'),
-                                        plugin._get_psij_client('ep'))
-
-        with patch.object(plugin, '_make_child_client', side_effect=_client):
-            a, b = asyncio.run(_both())
-        assert a is b and len(made) == 1
 
 
 # ---------------------------------------------------------------------------

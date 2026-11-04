@@ -23,7 +23,7 @@ from fastapi import FastAPI, HTTPException, Request
 
 from .plugin_session_base import PluginSession, _takes_session
 from .plugin_base import Plugin, DEFAULT_SID
-from .client import PluginClient, SessionInitFailed  # noqa: F401 (re-export)
+from .client import PluginClient
 from .protocol import FRAME_CAP
 
 log = logging.getLogger("radical.orbit")
@@ -1640,7 +1640,7 @@ class RhapsodyClient(PluginClient):
         if status == 'failed':
             # reconnect to a session whose init already failed: its
             # session_status event went out before we listened
-            raise SessionInitFailed(
+            raise RuntimeError(
                 f"Session init failed on endpoint: "
                 f"{data.get('error', 'unknown init error')}")
 
@@ -1662,7 +1662,7 @@ class RhapsodyClient(PluginClient):
             raise RuntimeError(
                 f"Session init timed out after {init_timeout}s")
         if mine[0] == 'failed':
-            raise SessionInitFailed(
+            raise RuntimeError(
                 f"Session init failed on endpoint: {mine[1]}")
 
     def _start_task_listener(self):
@@ -1698,7 +1698,7 @@ class RhapsodyClient(PluginClient):
             except Exception:
                 status = None                # transient: retry
             if status == 500 and self._init_failed(resp):
-                raise SessionInitFailed(
+                raise RuntimeError(
                     f"Session init failed on endpoint: "
                     f"{resp.json().get('detail')}")
             if status == 410:
