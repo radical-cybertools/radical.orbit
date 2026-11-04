@@ -824,6 +824,43 @@ class TestPilotSubmitTransport:
         assert len(set(sids[1:])) == 3                     # per plugin/backend
         assert plugin.instance_name in sids[0]
 
+    def test_a_failed_child_session_does_not_block_its_sid(self, tmp_path):
+        """A session under the stable sid that fails to register (e.g. its
+        init failed) is dropped and created once more."""
+        _, plugin = _make_plugin(tmp_path, broker_caller=MagicMock())
+        made = []
+
+        def _client(*_a, **_k):
+            c = MagicMock()
+            c.sid = 'dispatcher.x'
+            if not made:                                   # first: failed
+                c.register_session.side_effect = RuntimeError('init failed')
+            made.append(c)
+            return c
+
+        with patch.object(plugin, '_make_child_client', side_effect=_client):
+            got = asyncio.run(plugin._get_rhapsody_client('ep', 'dragon_v3'))
+        assert got is made[1]
+        made[0].unregister_session.assert_called_once()
+
+    def test_concurrent_child_lookups_register_once(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path, broker_caller=MagicMock())
+        made = []
+
+        def _client(*_a, **_k):
+            c = MagicMock()
+            c.register_session.side_effect = lambda **kw: time.sleep(0.05)
+            made.append(c)
+            return c
+
+        async def _both():
+            return await asyncio.gather(plugin._get_psij_client('ep'),
+                                        plugin._get_psij_client('ep'))
+
+        with patch.object(plugin, '_make_child_client', side_effect=_client):
+            a, b = asyncio.run(_both())
+        assert a is b and len(made) == 1
+
 
 # ---------------------------------------------------------------------------
 # Endpoint-mode submit (transparent proxy to a target endpoint's rhapsody)

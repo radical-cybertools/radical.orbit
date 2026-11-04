@@ -508,7 +508,8 @@ const vm = require('vm');
 let src = fs.readFileSync(process.argv[2], 'utf8')
             .replace(/^export\s+/gm, '')
             .replace(/^(const|let) /gm, 'var ');
-const remember = process.argv[3] === 'remember';
+const mode     = process.argv[3];
+const remember = mode !== 'forget';
 
 const els = {};
 const page = { querySelector: sel => els[sel] || (els[sel] = {
@@ -533,8 +534,10 @@ const api = {
   async isStaleSession(err) { return err.status === 410; },
 };
 const store = {};
-if (remember) store.globus_tokens = JSON.stringify(
+if (mode === 'remember') store.globus_tokens = JSON.stringify(
     { ep: { refresh_token: 'rt', client_id: 'cid' } });
+if (mode === 'access') store.globus_tokens = JSON.stringify(
+    { ep: { access_token: 'at' } });
 const ctx = vm.createContext({ api, page, localStorage: {
   getItem: k => store[k] || null, setItem: (k, v) => { store[k] = v; } } });
 vm.runInContext(src, ctx);
@@ -581,3 +584,12 @@ def test_globus_lost_session_resets_the_panel(tmp_path):
     # a request failing on a dead session is handled the same way
     assert 'cancel/s2/t1' in res['log'] and res['sid'] is None
     assert res['log'].count('register_session') == 1
+
+
+def test_globus_lost_session_with_only_an_access_token_does_not_reconnect(
+        tmp_path):
+    """A remembered access token does not renew itself and may have expired
+    with the session: the panel resets instead of reconnecting silently."""
+    res = _globus_run(tmp_path, 'access')
+    assert res['afterLost']['sid'] is None
+    assert res['afterLost']['label'] == 'not connected'

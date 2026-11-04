@@ -1096,6 +1096,7 @@ class PluginTaskDispatcher(Plugin):
         # over the caller), keyed (dst, plugin, backend).  Invalidated for a
         # dst when it goes ``lost``.
         self._child_clients: dict[tuple, Any] = {}
+        self._child_locks:   dict[tuple, asyncio.Lock] = {}
 
         # endpoint_name → set of loaded plugin names, refreshed on every
         # topology change.  Used to auto-resolve a pool's endpoint_name and to
@@ -1488,24 +1489,47 @@ class PluginTaskDispatcher(Plugin):
         sid is stable (:meth:`_child_sid`), so re-registering after the
         cache entry was dropped (*dst* lost and back) or lost (broker
         restart) reattaches to the same session on *dst* rather than leaving
-        the old one behind; if *dst* restarted, it is created afresh.
+        the old one behind; if *dst* restarted, it is created afresh.  A
+        session that exists but fails to register (e.g. a rhapsody session
+        whose init failed) is dropped and created once more, so it cannot
+        block its sid.  One registration per *key* at a time.
         '''
         if self._broker_caller is None:
             return None
-        client = self._child_clients.get(key)
-        if client is not None:
+        async with self._child_locks.setdefault(key, asyncio.Lock()):
+            client = self._child_clients.get(key)
+            if client is not None:
+                return client
+            sid = self._child_sid(key)
+            for attempt in (1, 2):
+                client = self._make_child_client(cls, plugin, dst)
+                try:
+                    await asyncio.to_thread(client.register_session, ttl=0,
+                                            sid=sid, **register_kwargs)
+                    break
+                except Exception as e:
+                    # drop a session left under the sid (ttl=0 sessions are
+                    # not remembered once ended, so it can be created anew)
+                    existed = await asyncio.to_thread(
+                        self._drop_child_session, client)
+                    if attempt == 2 or not existed:
+                        log.warning('[%s] %s session unavailable on %s: %s',
+                                    self.instance_name, plugin, dst, e)
+                        return None
+            self._child_clients[key] = client
             return client
-        client = self._make_child_client(cls, plugin, dst)
+
+    @staticmethod
+    def _drop_child_session(client) -> bool:
+        '''Best effort: unregister the session *client* registered (or
+        reattached to).  Returns whether there was one.'''
+        if not getattr(client, 'sid', None):
+            return False
         try:
-            await asyncio.to_thread(client.register_session, ttl=0,
-                                    sid=self._child_sid(key),
-                                    **register_kwargs)
+            client.unregister_session()
         except Exception as e:
-            log.warning('[%s] %s session unavailable on %s: %s',
-                        self.instance_name, plugin, dst, e)
-            return None
-        self._child_clients[key] = client
-        return client
+            log.debug('cannot drop child session %s: %s', client.sid, e)
+        return True
 
     def _child_sid(self, key: tuple) -> str:
         '''The stable sid of this dispatcher's child session for *key*
@@ -2519,8 +2543,9 @@ class PluginTaskDispatcher(Plugin):
             if name == self_name:
                 continue
             if (info or {}).get('liveness') == 'lost':
-                # Drop cached plugin-clients on a lost endpoint so a
-                # reconnecting one re-registers fresh.
+                # Drop cached plugin-clients on a lost endpoint; a
+                # reconnecting one re-registers under the same (stable) sid,
+                # reattaching to its session if the endpoint kept running.
                 for key in [k for k in self._child_clients if k[0] == name]:
                     self._child_clients.pop(key, None)
                 continue

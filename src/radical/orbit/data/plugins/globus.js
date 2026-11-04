@@ -164,7 +164,7 @@ export function init(page, api) {
   renderTasks(page, api);
 
   // Auto-connect if a token is already stored.
-  if (stored && (stored.access_token || (stored.refresh_token && stored.client_id))) {
+  if (hasCredential(stored)) {
     connect(page, api, /*silent=*/true);
   }
 }
@@ -198,6 +198,10 @@ function saveTokens(endpoint, payload) {
   localStorage.setItem(LS_KEY, JSON.stringify(all));
 }
 
+function hasCredential(c) {
+  return !!(c && (c.access_token || (c.refresh_token && c.client_id)));
+}
+
 function authPayload(page) {
   const access  = page.querySelector('.globus-access-token').value.trim();
   const refresh = page.querySelector('.globus-refresh-token').value.trim();
@@ -212,11 +216,11 @@ function authPayload(page) {
   return payload;
 }
 
-async function connect(page, api, silent = false) {
+async function connect(page, api, silent = false, creds = null) {
   const endpoint   = api.endpointName;
   const status = page.querySelector('.globus-conn-status');
   const label  = page.querySelector('.globus-conn-state');
-  const payload = authPayload(page);
+  const payload = creds || authPayload(page);
 
   if (!payload.access_token && !(payload.refresh_token && payload.client_id)) {
     if (!silent) {
@@ -260,7 +264,8 @@ async function connect(page, api, silent = false) {
 
 // The session has ended (idle expiry, endpoint restart): reported by the
 // Explorer keepalive or by a failed request.  Reset the panel and show why;
-// reconnect silently when a credential is remembered for this endpoint.
+// reconnect silently with the remembered credential when it renews itself
+// (refresh token) -- an access token alone may have expired too.
 function sessionLost(page, api, sid, detail) {
   const endpoint = api.endpointName;
   if (!state[endpoint] || state[endpoint].sid !== sid) return;   // replaced
@@ -274,8 +279,8 @@ function sessionLost(page, api, sid, detail) {
   page.querySelector('.globus-conn-status').innerHTML =
       `<span style="color:var(--danger);">Globus session ended: ${escHtml(why)}</span>`;
   const stored = loadTokens()[endpoint];
-  if (stored && (stored.access_token || (stored.refresh_token && stored.client_id)))
-    connect(page, api, /*silent=*/true);
+  if (hasCredential(stored) && stored.refresh_token)
+    connect(page, api, /*silent=*/true, stored);
 }
 
 // A request failed: if its session is dead, handle it as lost.
