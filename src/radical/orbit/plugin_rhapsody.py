@@ -23,7 +23,7 @@ from fastapi import FastAPI, HTTPException, Request
 
 from .plugin_session_base import PluginSession, _takes_session
 from .plugin_base import Plugin, DEFAULT_SID
-from .client import PluginClient
+from .client import PluginClient, SessionInitFailed  # noqa: F401 (re-export)
 from .protocol import FRAME_CAP
 
 log = logging.getLogger("radical.orbit")
@@ -1344,11 +1344,6 @@ class RhapsodySession(PluginSession):
 # ---------------------------------------------------------------------------
 # Application-side client
 # ---------------------------------------------------------------------------
-
-class SessionInitFailed(RuntimeError):
-    """The endpoint reported that the session's initialization failed (as
-    opposed to a timeout or transport error while waiting for it)."""
-
 
 class RhapsodyClient(PluginClient):
     """

@@ -47,6 +47,11 @@ def _raise(resp, context: str = '') -> None:
         raise exc
 
 
+class SessionInitFailed(RuntimeError):
+    """The endpoint reported that a session's initialization failed (as
+    opposed to a timeout or transport error while waiting for it)."""
+
+
 class PluginClient:
     """
     Base helper class for Endpoint Plugins (Application side).

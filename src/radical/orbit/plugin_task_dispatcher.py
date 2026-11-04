@@ -73,6 +73,7 @@ from .task_dispatcher_state             import (
     TASK_TERMINAL_STATES,
 )
 from .task_dispatcher_policy               import make_policy
+from .client                               import SessionInitFailed
 
 log = logging.getLogger('radical.orbit')
 
@@ -1097,6 +1098,7 @@ class PluginTaskDispatcher(Plugin):
         # dst when it goes ``lost``.
         self._child_clients: dict[tuple, Any] = {}
         self._child_locks:   dict[tuple, asyncio.Lock] = {}
+        self._child_lost:    dict[str, int] = {}   # dst -> times seen lost
 
         # endpoint_name → set of loaded plugin names, refreshed on every
         # topology change.  Used to auto-resolve a pool's endpoint_name and to
@@ -1496,14 +1498,14 @@ class PluginTaskDispatcher(Plugin):
         alone -- it may hold running work.  One registration per *key* at a
         time.
         '''
-        from .plugin_rhapsody import SessionInitFailed
         if self._broker_caller is None:
             return None
         async with self._child_locks.setdefault(key, asyncio.Lock()):
             client = self._child_clients.get(key)
             if client is not None:
                 return client
-            sid = self._child_sid(key)
+            sid  = self._child_sid(key)
+            lost = self._child_lost.get(dst, 0)
             for attempt in (1, 2):
                 client = self._make_child_client(cls, plugin, dst)
                 try:
@@ -1522,6 +1524,8 @@ class PluginTaskDispatcher(Plugin):
                     log.warning('[%s] %s session unavailable on %s: %s',
                                 self.instance_name, plugin, dst, e)
                     return None
+            if self._child_lost.get(dst, 0) != lost:
+                return None     # dst was lost meanwhile: do not cache it
             self._child_clients[key] = client
             return client
 
@@ -2551,9 +2555,11 @@ class PluginTaskDispatcher(Plugin):
                 # Drop cached plugin-clients on a lost endpoint; a
                 # reconnecting one re-registers under the same (stable) sid,
                 # reattaching to its session if the endpoint kept running.
+                self._child_lost[name] = self._child_lost.get(name, 0) + 1
                 for key in [k for k in self._child_clients if k[0] == name]:
                     self._child_clients.pop(key, None)
-                for key in [k for k in self._child_locks if k[0] == name]:
+                for key in [k for k, lk in self._child_locks.items()
+                            if k[0] == name and not lk.locked()]:
                     self._child_locks.pop(key, None)
                 continue
             plugins = (info or {}).get('plugins', {})

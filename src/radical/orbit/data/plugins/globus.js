@@ -216,13 +216,13 @@ function authPayload(page) {
   return payload;
 }
 
-async function connect(page, api, silent = false, creds = null, note = '') {
+async function connect(page, api, silent = false, creds = null, ended = '') {
   const endpoint   = api.endpointName;
   const status = page.querySelector('.globus-conn-status');
   const label  = page.querySelector('.globus-conn-state');
   const payload = creds || authPayload(page);
 
-  if (!payload.access_token && !(payload.refresh_token && payload.client_id)) {
+  if (!hasCredential(payload)) {
     if (!silent) {
       status.innerHTML = '<span style="color:var(--danger);">Provide an access token, or a refresh token + client ID.</span>';
       api.flash('Globus: missing credential', false);
@@ -231,6 +231,10 @@ async function connect(page, api, silent = false, creds = null, note = '') {
   }
 
   status.innerHTML = '<span style="color:var(--accent);">Connecting…</span>';
+  // the last connect wins: an older one finishing later (e.g. a silent
+  // reconnect racing a manual Connect) must not replace its session
+  const gen = state[endpoint].gen = (state[endpoint].gen || 0) + 1;
+  const note = ended ? ` (previous session ended: ${ended})` : '';
   try {
     // Register a fresh session carrying the token (bypass the shared cache
     // so re-connecting with a new token always re-registers).
@@ -238,6 +242,7 @@ async function connect(page, api, silent = false, creds = null, note = '') {
       method: 'POST',
       body  : JSON.stringify(payload),
     });
+    if (gen !== state[endpoint].gen) return;   // superseded: not kept, idle-expires
     // the previous session is no longer kept alive; it is not unregistered:
     // its transfers may still run (and be tracked), and it may be shared
     if (state[endpoint].sid) api.releaseSession?.(state[endpoint].sid);
@@ -255,11 +260,12 @@ async function connect(page, api, silent = false, creds = null, note = '') {
     label.style.color = 'var(--success)';
     if (!silent) api.flash('Globus connected');
   } catch (e) {
+    if (gen !== state[endpoint].gen) return;      // superseded
     if (state[endpoint].sid) api.releaseSession?.(state[endpoint].sid);
     state[endpoint].sid = null;
     label.textContent = 'not connected';
     label.style.color = 'var(--muted)';
-    status.innerHTML = `<span style="color:var(--danger);">Error: ${escHtml(e.message)}</span>`;
+    status.innerHTML = `<span style="color:var(--danger);">Error: ${escHtml(e.message)}${escHtml(note)}</span>`;
     if (!silent) api.flash('Globus connect failed: ' + e.message, false);
   }
 }
@@ -281,9 +287,8 @@ function sessionLost(page, api, sid, detail) {
   page.querySelector('.globus-conn-status').innerHTML =
       `<span style="color:var(--danger);">Globus session ended: ${escHtml(why)}</span>`;
   const creds = state[endpoint].creds;
-  if (hasCredential(creds) && creds.refresh_token)
-    connect(page, api, /*silent=*/true, creds,
-            `(reconnected; previous session ended: ${why})`);
+  if (creds && creds.refresh_token && creds.client_id)        // renewable
+    connect(page, api, /*silent=*/true, creds, why);
 }
 
 // A request failed: if its session is dead, handle it as lost.
@@ -404,7 +409,7 @@ async function refreshTasks(page, api) {
   const held = st.sid;
   await Promise.all(Object.keys(st.tasks).map(async tid => {
     try {
-      const data = await api.fetch(`task/${held}/${tid}`);
+      const data = await api.fetch(`task/${held}/${tid}`, { quiet: true });
       st.tasks[tid].status = data.status || st.tasks[tid].status;
       st.tasks[tid].nice   = data.nice_status || '';
     } catch (e) { checkLost(page, api, held, e); }   // else leave as-is

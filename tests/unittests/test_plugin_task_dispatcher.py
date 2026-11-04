@@ -828,7 +828,7 @@ class TestPilotSubmitTransport:
         """A session under the stable sid whose init failed is dropped and
         created once more; a timeout leaves the session (it may hold
         running work) alone."""
-        from radical.orbit.plugin_rhapsody import SessionInitFailed
+        from radical.orbit.client import SessionInitFailed
         _, plugin = _make_plugin(tmp_path, broker_caller=MagicMock())
 
         def _run(first_error):
@@ -856,6 +856,17 @@ class TestPilotSubmitTransport:
         got, made = _run(RuntimeError('timed out waiting for init'))
         assert got is None and len(made) == 1
         made[0].unregister_session.assert_not_called()
+
+    def test_a_registration_overtaken_by_loss_is_not_cached(self, tmp_path):
+        """A child session registered while its endpoint was reported lost
+        is not cached (the endpoint may have restarted meanwhile)."""
+        _, plugin = _make_plugin(tmp_path, broker_caller=MagicMock())
+        client = MagicMock()
+        client.register_session.side_effect = \
+            lambda **kw: plugin._child_lost.update(ep=1)
+        with patch.object(plugin, '_make_child_client', return_value=client):
+            assert asyncio.run(plugin._get_psij_client('ep')) is None
+        assert not plugin._child_clients
 
     def test_concurrent_child_lookups_register_once(self, tmp_path):
         _, plugin = _make_plugin(tmp_path, broker_caller=MagicMock())
