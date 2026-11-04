@@ -1,0 +1,10 @@
+{
+ "id": "ddict.1d1c58f2",
+ "n_nodes": 1,
+ "mem": "8G",
+ "create_s": 2.328788088983856,
+ "mode": "setup",
+ "ep": "ep-L1",
+ "client_host": "nid200033",
+ "broker": "https://login20:18432"
+}
