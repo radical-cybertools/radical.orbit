@@ -216,7 +216,7 @@ function authPayload(page) {
   return payload;
 }
 
-async function connect(page, api, silent = false, creds = null) {
+async function connect(page, api, silent = false, creds = null, note = '') {
   const endpoint   = api.endpointName;
   const status = page.querySelector('.globus-conn-status');
   const label  = page.querySelector('.globus-conn-state');
@@ -241,14 +241,16 @@ async function connect(page, api, silent = false, creds = null) {
     // the previous session is no longer kept alive; it is not unregistered:
     // its transfers may still run (and be tracked), and it may be shared
     if (state[endpoint].sid) api.releaseSession?.(state[endpoint].sid);
-    state[endpoint].sid = data.sid;
+    state[endpoint].sid   = data.sid;
+    state[endpoint].creds = payload;    // the credential this session uses
     // keep it (and its credential) while open; told when it has ended
     const sid = data.sid;
     api.keepSession?.(sid, undefined, (detail) => sessionLost(page, api, sid, detail));
 
     if (page.querySelector('.globus-remember').checked) saveTokens(endpoint, payload);
 
-    status.innerHTML = '<span style="color:var(--success);">Connected.</span>';
+    status.innerHTML = '<span style="color:var(--success);">Connected.</span>'
+                     + (note ? ` <span style="color:var(--muted);">${escHtml(note)}</span>` : '');
     label.textContent = 'connected';
     label.style.color = 'var(--success)';
     if (!silent) api.flash('Globus connected');
@@ -264,8 +266,8 @@ async function connect(page, api, silent = false, creds = null) {
 
 // The session has ended (idle expiry, endpoint restart): reported by the
 // Explorer keepalive or by a failed request.  Reset the panel and show why;
-// reconnect silently with the remembered credential when it renews itself
-// (refresh token) -- an access token alone may have expired too.
+// reconnect silently with the credential that session used when it renews
+// itself (refresh token) -- an access token alone may have expired too.
 function sessionLost(page, api, sid, detail) {
   const endpoint = api.endpointName;
   if (!state[endpoint] || state[endpoint].sid !== sid) return;   // replaced
@@ -278,14 +280,17 @@ function sessionLost(page, api, sid, detail) {
   label.style.color = 'var(--muted)';
   page.querySelector('.globus-conn-status').innerHTML =
       `<span style="color:var(--danger);">Globus session ended: ${escHtml(why)}</span>`;
-  const stored = loadTokens()[endpoint];
-  if (hasCredential(stored) && stored.refresh_token)
-    connect(page, api, /*silent=*/true, stored);
+  const creds = state[endpoint].creds;
+  if (hasCredential(creds) && creds.refresh_token)
+    connect(page, api, /*silent=*/true, creds,
+            `(reconnected; previous session ended: ${why})`);
 }
 
 // A request failed: if its session is dead, handle it as lost.
 async function checkLost(page, api, sid, e) {
-  if (sid && await api.isStaleSession?.(e)) sessionLost(page, api, sid, e.detail);
+  try {
+    if (sid && await api.isStaleSession?.(e)) sessionLost(page, api, sid, e.detail);
+  } catch (err) { console.log('globus: session check failed', err); }
 }
 
 function sidOrThrow(page, api) {

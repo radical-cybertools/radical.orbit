@@ -1490,10 +1490,13 @@ class PluginTaskDispatcher(Plugin):
         cache entry was dropped (*dst* lost and back) or lost (broker
         restart) reattaches to the same session on *dst* rather than leaving
         the old one behind; if *dst* restarted, it is created afresh.  A
-        session that exists but fails to register (e.g. a rhapsody session
-        whose init failed) is dropped and created once more, so it cannot
-        block its sid.  One registration per *key* at a time.
+        session whose init failed (:class:`SessionInitFailed`, reported by
+        the endpoint) is dropped and created once more, so it cannot block
+        its sid; any other failure (timeout, transport) leaves the session
+        alone -- it may hold running work.  One registration per *key* at a
+        time.
         '''
+        from .plugin_rhapsody import SessionInitFailed
         if self._broker_caller is None:
             return None
         async with self._child_locks.setdefault(key, asyncio.Lock()):
@@ -1507,34 +1510,36 @@ class PluginTaskDispatcher(Plugin):
                     await asyncio.to_thread(client.register_session, ttl=0,
                                             sid=sid, **register_kwargs)
                     break
-                except Exception as e:
-                    # drop a session left under the sid (ttl=0 sessions are
-                    # not remembered once ended, so it can be created anew)
-                    existed = await asyncio.to_thread(
-                        self._drop_child_session, client)
-                    if attempt == 2 or not existed:
+                except SessionInitFailed as e:
+                    # drop the failed session under the sid (ttl=0 sessions
+                    # are not remembered once ended, so it can be recreated)
+                    await asyncio.to_thread(self._drop_child_session, client)
+                    if attempt == 2:
                         log.warning('[%s] %s session unavailable on %s: %s',
                                     self.instance_name, plugin, dst, e)
                         return None
+                except Exception as e:
+                    log.warning('[%s] %s session unavailable on %s: %s',
+                                self.instance_name, plugin, dst, e)
+                    return None
             self._child_clients[key] = client
             return client
 
     @staticmethod
-    def _drop_child_session(client) -> bool:
+    def _drop_child_session(client) -> None:
         '''Best effort: unregister the session *client* registered (or
-        reattached to).  Returns whether there was one.'''
+        reattached to).'''
         if not getattr(client, 'sid', None):
-            return False
+            return
         try:
             client.unregister_session()
         except Exception as e:
             log.debug('cannot drop child session %s: %s', client.sid, e)
-        return True
 
     def _child_sid(self, key: tuple) -> str:
         '''The stable sid of this dispatcher's child session for *key*
-        (``(dst, plugin, backend)``): unique per broker, dispatcher instance,
-        plugin and backend, so it never collides with another client's.'''
+        (``(dst, plugin, backend)``): unique per broker name, dispatcher
+        instance, plugin and backend (an endpoint dials one broker).'''
         _, plugin, backend = key
         broker = getattr(self._app.state, 'endpoint_name', None) or 'broker'
         parts  = ['dispatcher', broker, self.instance_name, plugin]
@@ -2548,6 +2553,8 @@ class PluginTaskDispatcher(Plugin):
                 # reattaching to its session if the endpoint kept running.
                 for key in [k for k in self._child_clients if k[0] == name]:
                     self._child_clients.pop(key, None)
+                for key in [k for k in self._child_locks if k[0] == name]:
+                    self._child_locks.pop(key, None)
                 continue
             plugins = (info or {}).get('plugins', {})
             if isinstance(plugins, dict):

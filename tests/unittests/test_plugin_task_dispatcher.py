@@ -825,23 +825,37 @@ class TestPilotSubmitTransport:
         assert plugin.instance_name in sids[0]
 
     def test_a_failed_child_session_does_not_block_its_sid(self, tmp_path):
-        """A session under the stable sid that fails to register (e.g. its
-        init failed) is dropped and created once more."""
+        """A session under the stable sid whose init failed is dropped and
+        created once more; a timeout leaves the session (it may hold
+        running work) alone."""
+        from radical.orbit.plugin_rhapsody import SessionInitFailed
         _, plugin = _make_plugin(tmp_path, broker_caller=MagicMock())
-        made = []
 
-        def _client(*_a, **_k):
-            c = MagicMock()
-            c.sid = 'dispatcher.x'
-            if not made:                                   # first: failed
-                c.register_session.side_effect = RuntimeError('init failed')
-            made.append(c)
-            return c
+        def _run(first_error):
+            made = []
 
-        with patch.object(plugin, '_make_child_client', side_effect=_client):
-            got = asyncio.run(plugin._get_rhapsody_client('ep', 'dragon_v3'))
+            def _client(*_a, **_k):
+                c = MagicMock()
+                c.sid = 'dispatcher.x'
+                if not made:
+                    c.register_session.side_effect = first_error
+                made.append(c)
+                return c
+
+            plugin._child_clients.clear()
+            with patch.object(plugin, '_make_child_client',
+                              side_effect=_client):
+                got = asyncio.run(
+                    plugin._get_rhapsody_client('ep', 'dragon_v3'))
+            return got, made
+
+        got, made = _run(SessionInitFailed('init failed'))
         assert got is made[1]
         made[0].unregister_session.assert_called_once()
+
+        got, made = _run(RuntimeError('timed out waiting for init'))
+        assert got is None and len(made) == 1
+        made[0].unregister_session.assert_not_called()
 
     def test_concurrent_child_lookups_register_once(self, tmp_path):
         _, plugin = _make_plugin(tmp_path, broker_caller=MagicMock())

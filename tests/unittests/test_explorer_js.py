@@ -508,15 +508,18 @@ const vm = require('vm');
 let src = fs.readFileSync(process.argv[2], 'utf8')
             .replace(/^export\s+/gm, '')
             .replace(/^(const|let) /gm, 'var ');
-const mode     = process.argv[3];
-const remember = mode !== 'forget';
+const mode     = process.argv[3];      // the credential: refresh | access
 
 const els = {};
 const page = { querySelector: sel => els[sel] || (els[sel] = {
   value: '', checked: false, textContent: '', innerHTML: '', style: {},
   addEventListener: () => {} }) };
-page.querySelector('.globus-refresh-token').value = 'rt';
-page.querySelector('.globus-client-id').value     = 'cid';
+if (mode === 'refresh') {
+  page.querySelector('.globus-refresh-token').value = 'rt';
+  page.querySelector('.globus-client-id').value     = 'cid';
+} else {
+  page.querySelector('.globus-access-token').value  = 'at';
+}
 
 const log = [];
 let n = 0, onLost = null;
@@ -534,17 +537,13 @@ const api = {
   async isStaleSession(err) { return err.status === 410; },
 };
 const store = {};
-if (mode === 'remember') store.globus_tokens = JSON.stringify(
-    { ep: { refresh_token: 'rt', client_id: 'cid' } });
-if (mode === 'access') store.globus_tokens = JSON.stringify(
-    { ep: { access_token: 'at' } });
 const ctx = vm.createContext({ api, page, localStorage: {
   getItem: k => store[k] || null, setItem: (k, v) => { store[k] = v; } } });
 vm.runInContext(src, ctx);
 
 (async () => {
-  ctx.init(page, api);                         // auto-connects if remembered
-  if (!remember) await ctx.connect(page, api);
+  ctx.init(page, api);
+  await ctx.connect(page, api);
   await new Promise(r => setTimeout(r, 10));
   onLost('{"detail": "session s1 expired after 900 s"}');
   await new Promise(r => setTimeout(r, 10));
@@ -569,27 +568,22 @@ def _globus_run(tmp_path, mode):
     return json.loads(out)
 
 
-def test_globus_lost_session_reconnects_with_a_remembered_credential(tmp_path):
-    res = _globus_run(tmp_path, 'remember')
+def test_globus_lost_session_reconnects_with_its_refresh_token(tmp_path):
+    """The session's own renewable credential reconnects it silently, and
+    the status keeps the reason the previous session ended."""
+    res = _globus_run(tmp_path, 'refresh')
     assert res['log'][:3] == ['register_session', 'keep s1', 'release s1']
     assert res['afterLost']['sid'] == 's2'               # reconnected
-    assert 'register_session' in res['log'][3:]
+    assert 's1 expired after 900 s' in res['afterLost']['status']
 
 
-def test_globus_lost_session_resets_the_panel(tmp_path):
-    res = _globus_run(tmp_path, 'forget')
+def test_globus_lost_session_with_an_access_token_resets_the_panel(tmp_path):
+    """An access token does not renew itself and may have expired with the
+    session: the panel resets, shows why, and does not reconnect."""
+    res = _globus_run(tmp_path, 'access')
     assert res['afterLost']['sid'] is None
     assert res['afterLost']['label'] == 'not connected'
     assert 's1 expired after 900 s' in res['afterLost']['status']
     # a request failing on a dead session is handled the same way
     assert 'cancel/s2/t1' in res['log'] and res['sid'] is None
     assert res['log'].count('register_session') == 1
-
-
-def test_globus_lost_session_with_only_an_access_token_does_not_reconnect(
-        tmp_path):
-    """A remembered access token does not renew itself and may have expired
-    with the session: the panel resets instead of reconnecting silently."""
-    res = _globus_run(tmp_path, 'access')
-    assert res['afterLost']['sid'] is None
-    assert res['afterLost']['label'] == 'not connected'

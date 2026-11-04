@@ -1345,6 +1345,11 @@ class RhapsodySession(PluginSession):
 # Application-side client
 # ---------------------------------------------------------------------------
 
+class SessionInitFailed(RuntimeError):
+    """The endpoint reported that the session's initialization failed (as
+    opposed to a timeout or transport error while waiting for it)."""
+
+
 class RhapsodyClient(PluginClient):
     """
     Client-side interface for the Rhapsody plugin.
@@ -1640,7 +1645,7 @@ class RhapsodyClient(PluginClient):
         if status == 'failed':
             # reconnect to a session whose init already failed: its
             # session_status event went out before we listened
-            raise RuntimeError(
+            raise SessionInitFailed(
                 f"Session init failed on endpoint: "
                 f"{data.get('error', 'unknown init error')}")
 
@@ -1662,7 +1667,7 @@ class RhapsodyClient(PluginClient):
             raise RuntimeError(
                 f"Session init timed out after {init_timeout}s")
         if mine[0] == 'failed':
-            raise RuntimeError(
+            raise SessionInitFailed(
                 f"Session init failed on endpoint: {mine[1]}")
 
     def _start_task_listener(self):
@@ -1698,7 +1703,7 @@ class RhapsodyClient(PluginClient):
             except Exception:
                 status = None                # transient: retry
             if status == 500 and self._init_failed(resp):
-                raise RuntimeError(
+                raise SessionInitFailed(
                     f"Session init failed on endpoint: "
                     f"{resp.json().get('detail')}")
             if status == 410:
