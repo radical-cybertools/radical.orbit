@@ -105,6 +105,9 @@ def main():
         # e.g. the broker restarted with a new token and the reconnect is
         # rejected.  Sitting silently would burn the job's walltime.
         while not stop.wait(timeout=5):
+            if runtime.terminated:
+                log.info("Terminated by the broker")
+                break
             if runtime.fatal:
                 reason = runtime.fatal_reason or 'transport failed fatally'
                 log.error("Endpoint giving up: %s", reason)
