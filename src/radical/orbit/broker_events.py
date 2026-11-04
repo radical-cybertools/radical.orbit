@@ -31,7 +31,7 @@ import logging
 import time
 
 from collections import OrderedDict
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import msgpack
 
@@ -69,6 +69,16 @@ class EventRouter:
         self._host_loop   = host_loop_getter
 
         self._subscriptions: Dict[str, List[protocol.SubscribePattern]] = {}
+        # Per subscriber, its patterns as matched on ingest: session patterns
+        # naming endpoint and plugin indexed by their (endpoint, plugin,
+        # session) stream and, for session-less events (which every session
+        # pattern of the pair matches), by (endpoint, plugin); all others in
+        # a list.  An event then checks the list plus its own stream's (or
+        # pair's) patterns, not every session pattern.  Rebuilt from
+        # ``_subscriptions`` on each change (``_reindex``).
+        self._index: Dict[str, Tuple[List[protocol.SubscribePattern],
+                                     Dict[tuple, list],
+                                     Dict[tuple, list]]] = {}
         self._out:           Dict[str, BoundedDropOldestQueue] = {}
         self._senders:       Dict[str, asyncio.Task] = {}
         # One monotone seq counter per ``(src, plugin, session)``.  Counters
@@ -88,11 +98,13 @@ class EventRouter:
 
     def add_endpoint(self, name: str) -> None:
         self._subscriptions.setdefault(name, [])
+        self._reindex(name)
         self._out[name] = BoundedDropOldestQueue(self._event_queue)
         self.restart_sender(name)
 
     def remove_endpoint(self, name: str) -> None:
         self._subscriptions.pop(name, None)
+        self._index.pop(name, None)
         self._out.pop(name, None)
         self.pause_sender(name)
         self._senders.pop(name, None)
@@ -136,8 +148,25 @@ class EventRouter:
     # ── subscriptions ─────────────────────────────────────────────────
 
     def update_subscription(self, name: str, raw: dict, add: bool) -> None:
-        patterns = [protocol.SubscribePattern(**p)
-                    for p in raw.get('patterns', [])]
+        """Add (or remove) *name*'s interest patterns.
+
+        A malformed pattern is logged and skipped: it rejects that one
+        pattern, never the subscriber's socket.
+        """
+        patterns = []
+        try:
+            for p in raw.get('patterns') or []:
+                try:
+                    pat = protocol.SubscribePattern(**p)
+                    if pat.session == '':        # no session, as on events
+                        pat = pat.model_copy(update={'session': None})
+                    patterns.append(pat)
+                except (TypeError, ValueError) as e:
+                    log.warning("[Broker] %s: rejected %s pattern %r: %s",
+                                name, raw.get('kind'), p, e)
+        except TypeError as e:
+            log.warning("[Broker] %s: rejected %s patterns %r: %s",
+                        name, raw.get('kind'), raw.get('patterns'), e)
         cur = self._subscriptions.setdefault(name, [])
         if add:
             cur.extend(patterns)
@@ -145,17 +174,38 @@ class EventRouter:
             for p in patterns:
                 if p in cur:
                     cur.remove(p)
+        self._reindex(name)
+
+    def _reindex(self, name: str) -> None:
+        """Rebuild *name*'s ingest index from its pattern list."""
+        rest: List[protocol.SubscribePattern] = []
+        streams: Dict[tuple, list] = {}
+        pairs:   Dict[tuple, list] = {}
+        for p in self._subscriptions.get(name, []):
+            if p.session is not None and p.endpoint is not None \
+                    and p.plugin is not None:
+                streams.setdefault((p.endpoint, p.plugin, p.session),
+                                   []).append(p)
+                pairs.setdefault((p.endpoint, p.plugin), []).append(p)
+            else:
+                rest.append(p)
+        self._index[name] = (rest, streams, pairs)
 
     @staticmethod
     def _matches(patterns: List[protocol.SubscribePattern],
                  endpoint: str, plugin: Optional[str],
-                 topic: Optional[str]) -> bool:
+                 topic: Optional[str], session: Optional[str] = None) -> bool:
         for p in patterns:
             if p.endpoint is not None and p.endpoint != endpoint:
                 continue
             if p.plugin   is not None and p.plugin   != plugin:
                 continue
             if p.topic    is not None and p.topic    != topic:
+                continue
+            # a session pattern narrows session events only: session-less
+            # ones (plugin-level notifications) still match
+            if p.session  is not None and session is not None \
+                    and p.session != session:
                 continue
             return True
         return False
@@ -195,7 +245,9 @@ class EventRouter:
         enqueue, so a storm never stalls routing.
         """
         raw['src'] = src_name
-        session    = raw.get('session')
+        # an empty session is none: numbering and routing agree on it
+        session    = raw.get('session') or None
+        raw['session'] = session
         if session:
             key   = (src_name, raw.get('plugin'), session)
             table = self._session_seq
@@ -218,8 +270,13 @@ class EventRouter:
         packed = msgpack.packb(raw, use_bin_type=True)
         plugin = raw.get('plugin')
         topic  = raw.get('topic')
-        for sub_name, patterns in self._subscriptions.items():
-            if self._matches(patterns, src_name, plugin, topic):
+        stream = (src_name, plugin, session) if session is not None \
+            else (src_name, plugin)
+        for sub_name, (rest, streams, pairs) in self._index.items():
+            index = streams if session is not None else pairs
+            if self._matches(rest, src_name, plugin, topic, session) or \
+               self._matches(index.get(stream, ()), src_name, plugin, topic,
+                             session):
                 oq = self._out.get(sub_name)
                 if oq is not None:
                     oq.push(packed)

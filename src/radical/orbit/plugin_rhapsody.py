@@ -1347,6 +1347,9 @@ class RhapsodyClient(PluginClient):
         # with the sid.  Callbacks registered through
         # ``register_notification_callback`` stay unscoped.
         self._own: list[list] = []
+        # topics held across a session switch (``_hold_own``), None while
+        # none is in progress; guarded by ``_cond``
+        self._switch_held: list | None = None
         self._scoping: bool | None = None       # see _can_scope
 
     # -- this client's own, session-scoped runtime callbacks -----------------
@@ -1378,6 +1381,12 @@ class RhapsodyClient(PluginClient):
         (``None``: unscoped until the sid is known)."""
         with self._cond:
             sid = sid if self._can_scope() else None
+            held = self._switch_held
+            if held is not None and sid is not None and topic not in held:
+                # registered during a switch: its move needs the hold too
+                self._bc.hold_subscription(self._endpoint_id,
+                                           self._plugin_name, topic)
+                held.append(topic)
             self._bc.register_callback(**self._own_key(topic, fn),
                                        **self._scope_kw(sid))
             self._own.append([topic, fn, sid])
@@ -1434,6 +1443,43 @@ class RhapsodyClient(PluginClient):
             raise
         for rec, _ in done:
             rec[2] = sid
+
+    def _hold_own(self) -> list:
+        """Hold the plain broker patterns of this client's scoped callbacks
+        (``hold_subscription``) and return their topics, for a session
+        switch: where the broker filters by session, events of the new
+        session (an existing one may already send) are not dropped at the
+        broker before the callbacks move.  Snapshot and holds are one
+        ``_cond`` section, and a scoped callback registered before the
+        release (``_register_own``) holds its topic too, so no record moves
+        unheld.  Nothing for a broker client without it."""
+        if not (self._can_scope()
+                and callable(getattr(self._bc, 'hold_subscription', None))):
+            return []
+        held: list = []
+        with self._cond:
+            try:
+                for topic in dict.fromkeys(r[0] for r in self._own
+                                           if r[2] is not None):
+                    self._bc.hold_subscription(self._endpoint_id,
+                                               self._plugin_name, topic)
+                    held.append(topic)
+            except BaseException:
+                self._release_own(held)         # never left held
+                raise
+            self._switch_held = held
+        return held
+
+    def _release_own(self, topics) -> None:
+        with self._cond:
+            if topics is self._switch_held:
+                self._switch_held = None        # the switch is over
+        for topic in topics:
+            try:
+                self._bc.release_subscription(self._endpoint_id,
+                                              self._plugin_name, topic)
+            except Exception as e:
+                log.warning("[rhapsody] cannot release %s: %r", topic, e)
 
     def _on_task_done(self, endpoint, plugin, topic, data):
         """Persistent SSE callback: accumulate terminal task states.
@@ -1574,27 +1620,31 @@ class RhapsodyClient(PluginClient):
         payload = dict(payload or {})
         if backends:
             payload['backends'] = backends
-        resp = self._http.post(self._url('register_session'), json=payload)
-        self._raise(resp)
+        # the plain patterns are held until the callbacks have moved
+        held = self._hold_own() if has_sse else []
+        try:
+            resp = self._http.post(self._url('register_session'),
+                                   json=payload)
+            self._raise(resp)
 
-        data   = resp.json()
-        status = data.get('status')
+            data   = resp.json()
+            status = data.get('status')
 
-        # Switch to the new session and reset the session-wide accumulators
-        # in one step, so a late notification of the old session cannot pass
-        # the sid check and land after the reset.  A reconnect to the same
-        # sid keeps them: completions already received stay valid.  The
-        # client's own callbacks move to the new sid in the same step, so no
-        # event of the new session is dropped as foreign meanwhile (on a
-        # same-sid reconnect only the waiter, still unscoped, moves).
-        with self._cond:
-            if data['sid'] != self._sid:
-                self._completed.clear()
-                self._submitted.clear()      # waits on old uids raise
-                self._cond.notify_all()
-            self._sid = data['sid']
-            if has_sse:
-                self._rescope_own(self._sid)
+            # Switch to the new session and reset the session-wide
+            # accumulators in one step, so a late notification of the old
+            # session cannot pass the sid check and land after the reset.  A
+            # reconnect to the same sid keeps them.  The client's own
+            # callbacks move to the new sid in the same step.
+            with self._cond:
+                if data['sid'] != self._sid:
+                    self._completed.clear()
+                    self._submitted.clear()      # waits on old uids raise
+                    self._cond.notify_all()
+                self._sid = data['sid']
+                if has_sse:
+                    self._rescope_own(self._sid)
+        finally:
+            self._release_own(held)
 
         if status == 'ready':
             return  # fast path: init was synchronous

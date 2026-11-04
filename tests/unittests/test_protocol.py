@@ -164,6 +164,28 @@ class TestRoundTrip:
         assert isinstance(parsed, Unsubscribe)
         assert parsed.patterns[0].endpoint == 'e1'
 
+    def test_session_less_pattern_wire_bytes_unchanged(self):
+        """A pattern without a session packs to the exact v1 bytes (no
+        ``session`` key), so an older broker accepts it."""
+        v1 = [{'endpoint': 'e1', 'plugin': 'p', 'topic': None},
+              {'endpoint': None, 'plugin': None, 'topic': None}]
+        for cls, kind in ((Subscribe, 'subscribe'),
+                          (Unsubscribe, 'unsubscribe')):
+            msg = cls(id='i', src='c', patterns=[SubscribePattern(**p)
+                                                 for p in v1])
+            assert pack_message(msg) == msgpack.packb(
+                {'version': PROTOCOL_VERSION, 'id': 'i', 'corr_id': None,
+                 'src': 'c', 'dst': None, 'kind': kind, 'patterns': v1},
+                use_bin_type=True)
+
+    def test_session_pattern_roundtrip(self):
+        msg = Subscribe(src='c', patterns=[
+            SubscribePattern(endpoint='e1', plugin='p', session='s')])
+        parsed, data = _roundtrip(msg)
+        assert parsed.patterns[0].session == 's'
+        assert msgpack.unpackb(data)['patterns'] == [
+            {'endpoint': 'e1', 'plugin': 'p', 'topic': None, 'session': 's'}]
+
     def test_topology_roundtrip(self):
         msg = Topology(
             src='broker', dst='endpoint.1',
