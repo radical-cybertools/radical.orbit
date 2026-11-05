@@ -847,8 +847,7 @@ class TestPilotSubmitTransport:
             client = MagicMock()
             client._orbit_persistent = False
             with patch.object(plugin, '_make_child_client',
-                              return_value=client), \
-                 patch.object(ptd.copy, 'copy', side_effect=lambda c: c):
+                              return_value=client):
                 client.touch.side_effect = probe_error
                 plugin._child_clients.clear()
                 assert asyncio.run(plugin._get_psij_client('ep')) is client
@@ -868,6 +867,15 @@ class TestPilotSubmitTransport:
         ttl, c = _run(_err(504, 'timeout'))                # inconclusive
         assert ttl == 0 and c._orbit_persistent is True
         assert 'ep' not in plugin._child_touchable          # probe again
+
+        # a missing plugin answers "No route" too: its failed registration
+        # must not mark the endpoint as an older release
+        client = MagicMock()
+        client.touch.side_effect = _err(404, 'No route: POST /staging/touch/x')
+        client.register_session.side_effect = _err(404, 'No route')
+        with patch.object(plugin, '_make_child_client', return_value=client):
+            assert asyncio.run(plugin._get_staging_client('ep')) is None
+        assert 'ep' not in plugin._child_touchable
 
     def test_lost_endpoint_drops_its_cached_child_clients(self, tmp_path):
         _, plugin = _make_plugin(tmp_path, broker_caller=MagicMock())

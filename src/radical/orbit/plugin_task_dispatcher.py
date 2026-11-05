@@ -35,7 +35,6 @@ Pools arrive only via ``register_session``.
 from __future__ import annotations
 
 import asyncio
-import copy
 import base64
 import logging
 import math
@@ -741,8 +740,15 @@ QUEUE_WAIT_MAX = 7 * 86400
 
 def _no_route(e: Exception) -> bool:
     """Whether a child-client call failed for lack of the route (an endpoint
-    of an older release)."""
+    of an older release, or the plugin is not loaded there)."""
     return getattr(e, 'status_code', None) == 404 and 'No route' in str(e)
+
+
+def _session_ended(e: Exception) -> bool:
+    """Whether a child-client call failed because its session has ended
+    (410) or is unknown to the endpoint (404 ``unknown session id``)."""
+    status = getattr(e, 'status_code', None)
+    return status == 410 or (status == 404 and 'unknown session' in str(e))
 
 
 class TaskDispatcherSession(PluginSession):
@@ -1528,15 +1534,20 @@ class PluginTaskDispatcher(Plugin):
         client = self._make_child_client(cls, plugin, dst)
         try:
             touchable = self._child_touchable.get(dst)
-            if touchable is None:
-                touchable = await asyncio.to_thread(self._probe_touch, client)
-                if touchable is not None:
-                    self._child_touchable[dst] = touchable
+            probed    = touchable is None
+            if probed:
+                touchable = await asyncio.to_thread(
+                    self._probe_touch, self._make_child_client(
+                        PluginClient, plugin, dst))
             await asyncio.to_thread(
                 client.register_session,
                 ttl=_CHILD_SESSION_TTL if touchable else 0, **register_kwargs)
             if not touchable:
                 client._orbit_persistent = True
+            # cache the probe only once *plugin* proved present on dst: a
+            # missing plugin also answers "No route"
+            if probed and touchable is not None:
+                self._child_touchable[dst] = touchable
         except Exception as e:
             log.warning('[%s] %s session unavailable on %s: %s',
                         self.instance_name, plugin, dst, e)
@@ -1545,20 +1556,17 @@ class PluginTaskDispatcher(Plugin):
         return client
 
     @staticmethod
-    def _probe_touch(client) -> bool | None:
-        '''Whether *client*'s endpoint has the ``touch`` route, probed with
+    def _probe_touch(probe: PluginClient) -> bool | None:
+        '''Whether *probe*'s endpoint has the ``touch`` route, probed with
         an unknown sid (no session needed): ``404 unknown session`` -> yes,
         ``404 No route`` (older release) -> no, else ``None`` (unknown; the
         caller then registers persistent, the safe choice).  Blocking.'''
-        probe      = copy.copy(client)
         probe._sid = '_dispatcher_touch_probe'
         try:
             probe.touch()
             return True
         except Exception as e:
-            status = getattr(e, 'status_code', None)
-            if status == 410 or (status == 404
-                                 and 'unknown session' in str(e)):
+            if _session_ended(e):
                 return True
             if _no_route(e):
                 return False
@@ -1571,7 +1579,8 @@ class PluginTaskDispatcher(Plugin):
         A session found ended (410, or 404 "unknown session") -- e.g. its
         endpoint restarted -- is dropped from the cache, so the next use
         registers a fresh one.  Other failures keep the entry.  Persistent
-        sessions (older endpoints, see :meth:`_register_child`) are skipped.
+        sessions (older endpoints, see :meth:`_get_child_client`) are
+        skipped.
         Each touch is bounded by the broker caller's call timeout.
         '''
         limit = asyncio.Semaphore(_CHILD_TOUCH_PARALLEL)
@@ -1581,9 +1590,7 @@ class PluginTaskDispatcher(Plugin):
                 try:
                     await asyncio.to_thread(client.touch)
                 except Exception as e:
-                    status = getattr(e, 'status_code', None)
-                    if status == 410 or (status == 404
-                                         and 'unknown session' in str(e)):
+                    if _session_ended(e):
                         if self._child_clients.get(key) is client:
                             self._child_clients.pop(key, None)
                         log.info('[%s] child session %s ended: %s',
