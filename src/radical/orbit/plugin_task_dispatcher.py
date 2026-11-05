@@ -35,6 +35,7 @@ Pools arrive only via ``register_session``.
 from __future__ import annotations
 
 import asyncio
+import copy
 import base64
 import logging
 import math
@@ -1110,6 +1111,8 @@ class PluginTaskDispatcher(Plugin):
         # over the caller), keyed (dst, plugin, backend).  Invalidated for a
         # dst when it goes ``lost``.
         self._child_clients: dict[tuple, Any] = {}
+        # dst -> whether it has the touch route (probed once; reset on lost)
+        self._child_touchable: dict[str, bool] = {}
 
         # endpoint_name → set of loaded plugin names, refreshed on every
         # topology change.  Used to auto-resolve a pool's endpoint_name and to
@@ -1513,8 +1516,9 @@ class PluginTaskDispatcher(Plugin):
         once its work is done -- never while tasks or jobs still run.
 
         An endpoint of an older release has no ``touch`` route and expires
-        sessions on idle time alone (no busy check), so there the session
-        is recreated persistent (``ttl=0``), as before, and never touched.
+        sessions on idle time alone (no busy check), so there -- and when
+        the probe (:meth:`_probe_touch`) is inconclusive -- the session is
+        registered persistent (``ttl=0``), as before, and never touched.
         '''
         if self._broker_caller is None:
             return None
@@ -1523,8 +1527,16 @@ class PluginTaskDispatcher(Plugin):
             return client
         client = self._make_child_client(cls, plugin, dst)
         try:
-            await asyncio.to_thread(self._register_child, client,
-                                    register_kwargs)
+            touchable = self._child_touchable.get(dst)
+            if touchable is None:
+                touchable = await asyncio.to_thread(self._probe_touch, client)
+                if touchable is not None:
+                    self._child_touchable[dst] = touchable
+            await asyncio.to_thread(
+                client.register_session,
+                ttl=_CHILD_SESSION_TTL if touchable else 0, **register_kwargs)
+            if not touchable:
+                client._orbit_persistent = True
         except Exception as e:
             log.warning('[%s] %s session unavailable on %s: %s',
                         self.instance_name, plugin, dst, e)
@@ -1533,19 +1545,24 @@ class PluginTaskDispatcher(Plugin):
         return client
 
     @staticmethod
-    def _register_child(client, register_kwargs: dict) -> None:
-        '''Register *client*'s session with the child idle timeout; on an
-        endpoint without the ``touch`` route (older release) recreate it
-        persistent instead and mark the client untouchable.  Blocking.'''
-        client.register_session(ttl=_CHILD_SESSION_TTL, **register_kwargs)
+    def _probe_touch(client) -> bool | None:
+        '''Whether *client*'s endpoint has the ``touch`` route, probed with
+        an unknown sid (no session needed): ``404 unknown session`` -> yes,
+        ``404 No route`` (older release) -> no, else ``None`` (unknown; the
+        caller then registers persistent, the safe choice).  Blocking.'''
+        probe      = copy.copy(client)
+        probe._sid = '_dispatcher_touch_probe'
         try:
-            client.touch()
+            probe.touch()
+            return True
         except Exception as e:
-            if not _no_route(e):
-                return          # a transient failure: the next pass retries
-            client.unregister_session()        # just created, still empty
-            client.register_session(ttl=0, **register_kwargs)
-            client._orbit_persistent = True
+            status = getattr(e, 'status_code', None)
+            if status == 410 or (status == 404
+                                 and 'unknown session' in str(e)):
+                return True
+            if _no_route(e):
+                return False
+            return None
 
     async def _touch_child_sessions(self) -> None:
         '''Touch every cached child session (a few in parallel, so a pass
@@ -2584,6 +2601,7 @@ class PluginTaskDispatcher(Plugin):
                 # reconnecting one re-registers fresh.
                 for key in [k for k in self._child_clients if k[0] == name]:
                     self._child_clients.pop(key, None)
+                self._child_touchable.pop(name, None)  # may come back upgraded
                 continue
             plugins = (info or {}).get('plugins', {})
             if isinstance(plugins, dict):
