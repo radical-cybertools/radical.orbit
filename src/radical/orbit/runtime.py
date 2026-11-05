@@ -532,7 +532,9 @@ class EndpointRuntime(PluginHostBase):
                 log.warning("[Runtime] %s.on_host_stop failed: %s",
                             plugin.instance_name, e)
 
-        await asyncio.gather(*[_release(p) for p in plugins])
+        # served objects need not subclass Plugin: no hook, nothing to call
+        await asyncio.gather(*[_release(p) for p in plugins
+                               if hasattr(p, 'on_host_stop')])
 
         tasks = []
         for plugin in plugins:

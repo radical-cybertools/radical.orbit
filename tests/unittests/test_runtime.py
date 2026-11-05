@@ -10,6 +10,7 @@ No test sleeps for more than ~2.5 s; liveness/backoff knobs are injected tiny.
 """
 
 import asyncio
+import logging
 import subprocess
 import threading
 from collections import Counter
@@ -1498,3 +1499,17 @@ def test_control_terminate_marks_terminated():
     assert not rt.terminated
     rt._on_control(protocol.Control(src='broker', op='terminate'))
     assert rt.terminated
+
+
+def test_work_teardown_skips_objects_without_hook(caplog):
+    """A served object that does not subclass Plugin has no on_host_stop:
+    skipped, not logged as a failure."""
+    class _Bare:
+        instance_name = 'bare'
+        _cleanup_task = None
+
+    rt = _unstarted_runtime()
+    rt._plugins = {'bare': _Bare()}
+    with caplog.at_level(logging.WARNING, logger='radical.orbit'):
+        asyncio.run(rt._work_teardown())
+    assert 'on_host_stop' not in caplog.text
