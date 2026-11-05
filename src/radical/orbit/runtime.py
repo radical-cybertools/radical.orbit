@@ -55,6 +55,11 @@ from urllib.parse import parse_qsl, urlparse, urlunparse
 
 import websockets
 from websockets import exceptions as ws_exc
+try:                                    # websockets >= 15 dials via env proxies
+    from websockets.proxy import get_proxy as _ws_get_proxy
+    from websockets.uri   import parse_uri as _ws_parse_uri
+except ImportError:                     # older: no proxy support, direct dial
+    _ws_get_proxy = None
 from websockets.extensions.permessage_deflate import \
     ClientPerMessageDeflateFactory
 
@@ -596,10 +601,27 @@ class EndpointRuntime(PluginHostBase):
         writer.close()
         return ms
 
+    @staticmethod
+    def _ws_proxy(ws_url: str) -> Optional[str]:
+        """The proxy websockets will dial *ws_url* through, if any."""
+        if _ws_get_proxy is None:
+            return None
+        try:
+            return _ws_get_proxy(_ws_parse_uri(ws_url))
+        except Exception:
+            return None
+
     async def _offer_deflate(self, ws_url: str) -> bool:
         """Decide, per (re)connect, whether to offer permessage-deflate."""
         if self._ws_compression != 'auto':
             return self._ws_compression == 'on'
+        proxy = self._ws_proxy(ws_url)
+        if proxy:
+            # websockets dials through the proxy, so a direct probe would time
+            # the wrong path (or stall on a firewalled route): treat as remote.
+            log.info("[Runtime] ws_compression=auto: via proxy %s -> "
+                     "deflate on", proxy)
+            return True
         u    = urlparse(ws_url)
         port = u.port or (443 if u.scheme == 'wss' else 80)
         ms   = await self._probe_connect_ms(u.hostname, port)

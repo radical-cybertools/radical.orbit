@@ -140,6 +140,28 @@ def _offer(rt, probe_ms=None):
     return asyncio.run(rt._offer_deflate(rt._ws_url())), calls
 
 
+@pytest.fixture(autouse=True)
+def _no_env_proxy(monkeypatch):
+    for k in ('http_proxy', 'https_proxy', 'all_proxy', 'ws_proxy',
+              'wss_proxy', 'socks_proxy', 'no_proxy'):
+        monkeypatch.delenv(k, raising=False)
+        monkeypatch.delenv(k.upper(), raising=False)
+
+
+def test_runtime_auto_via_proxy_skips_probe(monkeypatch):
+    from radical.orbit import runtime as rt_mod
+    if rt_mod._ws_get_proxy is None:
+        pytest.skip('websockets without proxy support')
+    monkeypatch.setenv('https_proxy', 'http://proxy.example:3128')
+    offer, calls = _offer(_runtime(), probe_ms=0.1)
+    assert offer is True
+    assert calls == []
+    monkeypatch.setenv('no_proxy', '127.0.0.1')
+    offer, calls = _offer(_runtime(), probe_ms=0.1)
+    assert offer is False
+    assert calls == [('127.0.0.1', 1)]
+
+
 def test_runtime_default_auto():
     assert _runtime()._ws_compression == 'auto'
 

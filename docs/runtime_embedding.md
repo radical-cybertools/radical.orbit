@@ -149,7 +149,9 @@ before each (re)connect and offers deflate if it took at least
 10 ms): compression pays off on WAN links and costs latency on fast ones
 (1 MiB round trips ~100 ms with vs 16–19 ms without on Perlmutter).  The
 probe measures the dialled hop — through a forward tunnel that is the local
-tunnel end, so use `on` there.  The broker accepts deflate by default;
+tunnel end, so use `on` there.  If websockets would dial through an
+environment proxy (`https_proxy`, `all_proxy`, ... minus `no_proxy`), `auto`
+skips the probe and offers deflate.  The broker accepts deflate by default;
 mixed settings still connect (uncompressed unless both agree).
 
 Log level follows `RADICAL_ORBIT_LOG_LVL` (or the generic `RADICAL_LOG_LVL`).
