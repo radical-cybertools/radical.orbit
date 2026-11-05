@@ -152,7 +152,8 @@ class _RunningBroker:
         config = uvicorn.Config(
             broker.app, host='127.0.0.1', port=0, log_level='error',
             ws_ping_interval=ws_ping_interval,
-            ws_ping_timeout=ws_ping_timeout)
+            ws_ping_timeout=ws_ping_timeout,
+            ws_per_message_deflate=broker._ws_compression)
         self._server = uvicorn.Server(config)
         self._thread = threading.Thread(target=self._server.run, daemon=True)
 
@@ -337,6 +338,35 @@ def test_serve_and_call_plugin_end_to_end(harness):
     assert body['error']       is True
     assert body['status_code'] == 404
     assert 'No route' in body['detail']
+
+
+# ---------------------------------------------------------------------------
+# permessage-deflate is negotiated per connection: mixed settings interoperate
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize('broker_mode, client_mode, expect', [
+    ('off', 'off',  False), ('on', 'off',  False), ('off', 'on', False),
+    ('on',  'on',   True),  ('on', 'auto', False),       # auto on localhost
+    ('off', 'auto', False)])
+def test_ws_compression_interop(harness, monkeypatch,
+                                broker_mode, client_mode, expect):
+    monkeypatch.delenv('RADICAL_ORBIT_WS_COMPRESSION',        raising=False)
+    monkeypatch.delenv('RADICAL_ORBIT_WS_COMPRESSION_RTT_MS', raising=False)
+    make_broker, make_runtime = harness
+    srv = make_broker(ws_compression=broker_mode)
+
+    a = make_runtime(srv.url, name='epA', plugins=['echo_rt'],
+                     ws_compression=client_mode)
+    b = make_runtime(srv.url, name='epB', ws_compression=client_mode)
+    assert a.wait_registered(timeout=5.0)
+    assert _wait_topology(b, 'epA', 'echo_rt', timeout=5.0)
+    assert b.get_plugin('epA', 'echo_rt').echo('x' * 4096) == \
+        {'echo': 'x' * 4096}
+
+    # Deflate is in effect only when the runtime offers it and the broker
+    # accepts it.
+    negotiated = [e.name for e in b._ws.protocol.extensions]
+    assert negotiated == (['permessage-deflate'] if expect else [])
 
 
 # ---------------------------------------------------------------------------
