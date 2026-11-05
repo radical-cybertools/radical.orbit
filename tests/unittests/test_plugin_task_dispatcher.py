@@ -790,50 +790,40 @@ class TestPilotSubmitTransport:
         assert asyncio.run(plugin._get_psij_client('someone')) is None
         assert asyncio.run(plugin._get_rhapsody_client('someone')) is None
 
-    def test_dropped_child_sessions_are_released_when_back(self, tmp_path):
-        """A lost endpoint's cached clients are dropped; when it is present
-        again their (ttl=0) sessions are unregistered, so they do not stay
-        behind next to the fresh ones."""
-        _, plugin = _make_plugin(tmp_path, broker_caller=MagicMock())
-        old = MagicMock()
-        plugin._child_clients[('ep', 'psij', None)] = old
-
-        async def scenario():
-            await plugin.on_topology_change(
-                {'ep': {'role': 'endpoint', 'plugins': {},
-                        'liveness': 'lost'}})
-            assert not plugin._child_clients
-            old.unregister_session.assert_not_called()   # unreachable now
-            await plugin.on_topology_change(
-                {'ep': {'role': 'endpoint', 'plugins': {'psij': {}},
-                        'liveness': 'present'}})
-            await asyncio.wait(set(plugin._release_tasks), timeout=5)
-
-        asyncio.run(scenario())
-        old.unregister_session.assert_called_once()
-        assert 'ep' not in plugin._child_orphans
-
-    def test_orphans_of_endpoints_that_never_return_are_forgotten(
-            self, tmp_path):
+    def test_child_sessions_have_a_finite_idle_timeout(self, tmp_path):
+        """Child sessions are registered with a finite ttl: a dropped one
+        expires on its endpoint once its work is done."""
         from radical.orbit import plugin_task_dispatcher as ptd
-        _, plugin = _make_plugin(tmp_path, broker_caller=MagicMock())
-        plugin._child_orphans['gone'] = (
-            time.time() - ptd.CHILD_ORPHAN_KEEP - 1, [MagicMock()])
-        plugin._child_clients[('ep', 'psij', None)] = MagicMock()
-        asyncio.run(plugin.on_topology_change(
-            {'ep': {'role': 'endpoint', 'plugins': {}, 'liveness': 'lost'}}))
-        assert 'gone' not in plugin._child_orphans
-        assert 'ep' in plugin._child_orphans
-
-    def test_child_sessions_never_idle_expire(self, tmp_path):
-        """Child sessions are cached across arbitrarily long pool idle
-        phases, so they are registered with ttl=0."""
         _, plugin = _make_plugin(tmp_path, broker_caller=MagicMock())
         client = MagicMock()
         with patch.object(plugin, '_make_child_client', return_value=client):
             got = asyncio.run(plugin._get_psij_client('ep'))
         assert got is client
-        assert client.register_session.call_args.kwargs['ttl'] == 0
+        assert client.register_session.call_args.kwargs['ttl'] == \
+            ptd._CHILD_SESSION_TTL > 0
+
+    def test_cached_child_sessions_are_touched(self, tmp_path):
+        """Housekeeping touches cached child sessions; one found ended (410
+        / 404 unknown session) is dropped, other failures keep it."""
+        _, plugin = _make_plugin(tmp_path, broker_caller=MagicMock())
+
+        def _err(status, text):
+            e = RuntimeError(f'HTTP {status} — {text}')
+            e.status_code = status
+            return e
+
+        live, ended, gone, flaky = (MagicMock() for _ in range(4))
+        ended.touch.side_effect = _err(410, 'session expired')
+        gone.touch.side_effect  = _err(404, 'unknown session id: s')
+        flaky.touch.side_effect = _err(504, 'timeout')
+        plugin._child_clients.update({('a', 'psij', None): live,
+                                      ('b', 'psij', None): ended,
+                                      ('c', 'psij', None): gone,
+                                      ('d', 'psij', None): flaky})
+        asyncio.run(plugin._touch_child_sessions())
+        live.touch.assert_called_once()
+        assert set(plugin._child_clients) == {('a', 'psij', None),
+                                              ('d', 'psij', None)}
 
 
 # ---------------------------------------------------------------------------

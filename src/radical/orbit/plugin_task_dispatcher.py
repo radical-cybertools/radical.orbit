@@ -94,6 +94,14 @@ _PRUNE_INTERVAL_SEC  = 86400.0   # stale-dir pruning: once a day
 # Housekeeping tick frequency.
 _TICK_INTERVAL_SEC = 5.0
 
+# Child sessions (psij / rhapsody / staging on other endpoints): their idle
+# timeout, and how often housekeeping touches the cached ones.  A dropped
+# client's session (endpoint lost, broker restarted) gets no more touches
+# and idle-expires on its endpoint once its work is done (is_busy).
+_CHILD_SESSION_TTL     = 3600.0
+_CHILD_TOUCH_INTERVAL  = 300.0
+_CHILD_TOUCH_TIMEOUT   = 60.0
+
 # Handshake timeout — a pilot that hasn't handshaken in this long is
 # reconciled against psij job state.
 _HANDSHAKE_TIMEOUT_SEC = 300.0
@@ -730,11 +738,6 @@ class PoolState:
 QUEUE_WAIT_MAX = 7 * 86400
 
 
-# How long the sessions of a lost endpoint's dropped child clients are
-# remembered for release when it returns (s).
-CHILD_ORPHAN_KEEP = 86400
-
-
 class TaskDispatcherSession(PluginSession):
     '''Session handle — owns this session's pools by lifetime.
 
@@ -1101,12 +1104,6 @@ class PluginTaskDispatcher(Plugin):
         # over the caller), keyed (dst, plugin, backend).  Invalidated for a
         # dst when it goes ``lost``.
         self._child_clients: dict[tuple, Any] = {}
-        # Clients dropped when their endpoint went lost: name -> (time,
-        # [clients]).  Their (ttl=0) sessions are unregistered when the
-        # endpoint is present again; entries older than CHILD_ORPHAN_KEEP
-        # are forgotten (e.g. a pilot child that ended with its job).
-        self._child_orphans: dict[str, tuple[float, list]] = {}
-        self._release_tasks: set[asyncio.Task] = set()
 
         # endpoint_name → set of loaded plugin names, refreshed on every
         # topology change.  Used to auto-resolve a pool's endpoint_name and to
@@ -1377,6 +1374,8 @@ class PluginTaskDispatcher(Plugin):
         exception to it.
         '''
         last_prune = time.time()
+        last_touch = time.time()
+        touching   = None
         while True:
             try:
                 await asyncio.sleep(_TICK_INTERVAL_SEC)
@@ -1387,10 +1386,17 @@ class PluginTaskDispatcher(Plugin):
                     ps.policy.on_tick(ps, self._make_submit_pilot(ps))
                     self._drain_pending(ps)
                 await self._reconcile_overdue_pilots(now)
+                if now - last_touch >= _CHILD_TOUCH_INTERVAL \
+                        and (touching is None or touching.done()):
+                    touching   = asyncio.get_running_loop().create_task(
+                        self._touch_child_sessions())
+                    last_touch = now
                 if now - last_prune >= _PRUNE_INTERVAL_SEC:
                     self._prune_stale_state_dirs()
                     last_prune = now
             except asyncio.CancelledError:
+                if touching is not None:
+                    touching.cancel()
                 return
             except Exception as e:
                 log.exception('[%s] housekeeping error: %s',
@@ -1413,8 +1419,6 @@ class PluginTaskDispatcher(Plugin):
             except Exception:
                 pass
             self._untap = None
-        if self._release_tasks:     # threads: wait briefly, not cancellable
-            await asyncio.wait(set(self._release_tasks), timeout=5)
         await super().shutdown()
 
     async def _reconcile_overdue_pilots(self, now: float) -> None:
@@ -1496,10 +1500,11 @@ class PluginTaskDispatcher(Plugin):
         under *key*.  Returns ``None`` when no caller is wired or *dst* /
         its *plugin* is unreachable.
 
-        The session never idle-expires (``ttl=0``): the client stays cached
-        across arbitrarily long idle phases of the pools that use it.  It is
-        bounded by its endpoint -- a pilot's child endpoint ends with its
-        batch job, and the cache entry is dropped when *dst* is lost.
+        The session idle-expires after ``_CHILD_SESSION_TTL``; housekeeping
+        touches cached clients (:meth:`_touch_child_sessions`), so a cached
+        one lives across arbitrarily long idle phases of its pools, and a
+        dropped one (*dst* lost, broker restarted) expires on its endpoint
+        once its work is done -- never while tasks or jobs still run.
         '''
         if self._broker_caller is None:
             return None
@@ -1508,8 +1513,8 @@ class PluginTaskDispatcher(Plugin):
             return client
         client = self._make_child_client(cls, plugin, dst)
         try:
-            await asyncio.to_thread(client.register_session, ttl=0,
-                                    **register_kwargs)
+            await asyncio.to_thread(client.register_session,
+                                    ttl=_CHILD_SESSION_TTL, **register_kwargs)
         except Exception as e:
             log.warning('[%s] %s session unavailable on %s: %s',
                         self.instance_name, plugin, dst, e)
@@ -1517,23 +1522,26 @@ class PluginTaskDispatcher(Plugin):
         self._child_clients[key] = client
         return client
 
-    def _release_child_sessions(self, dst: str, clients: list) -> None:
-        '''Unregister the sessions of *clients* (dropped when *dst* went
-        lost) in the background, best effort: *dst* is back, and those
-        ``ttl=0`` sessions would otherwise stay until its process exits.'''
-        def _release():
-            for client in clients:
-                try:
-                    client.unregister_session()
-                except Exception as e:
-                    log.debug('[%s] cannot release %s session on %s: %s',
-                              self.instance_name,
-                              getattr(client, '_plugin_name', '?'), dst, e)
+    async def _touch_child_sessions(self) -> None:
+        '''Touch every cached child session, in parallel, so it does not
+        idle-expire.  A session found ended (410, or 404 "unknown session")
+        -- e.g. its endpoint restarted -- is dropped from the cache, so the
+        next use registers a fresh one.  Other failures keep it.'''
+        async def _one(key, client):
+            try:
+                await asyncio.wait_for(asyncio.to_thread(client.touch),
+                                       _CHILD_TOUCH_TIMEOUT)
+            except Exception as e:
+                status = getattr(e, 'status_code', None)
+                if status == 410 or (status == 404
+                                     and 'unknown session' in str(e)):
+                    if self._child_clients.get(key) is client:
+                        self._child_clients.pop(key, None)
+                    log.info('[%s] child session %s ended: %s',
+                             self.instance_name, key, e)
 
-        task = asyncio.get_running_loop().create_task(
-            asyncio.to_thread(_release))
-        self._release_tasks.add(task)
-        task.add_done_callback(self._release_tasks.discard)
+        await asyncio.gather(*(_one(k, c) for k, c
+                               in list(self._child_clients.items())))
 
     async def _get_psij_client(self, endpoint_name: str):
         '''Return a caller-backed :class:`PSIJClient` for *endpoint_name*.'''
@@ -2537,22 +2545,10 @@ class PluginTaskDispatcher(Plugin):
                 continue
             if (info or {}).get('liveness') == 'lost':
                 # Drop cached plugin-clients on a lost endpoint so a
-                # reconnecting one re-registers fresh; their sessions are
-                # released once it is back (they never idle-expire).
-                cutoff = time.time() - CHILD_ORPHAN_KEEP
-                for n in [n for n, (t, _) in self._child_orphans.items()
-                          if t < cutoff]:
-                    self._child_orphans.pop(n, None)
-                dropped = [self._child_clients.pop(k)
-                           for k in [k for k in self._child_clients
-                                     if k[0] == name]]
-                if dropped:
-                    _, prev = self._child_orphans.get(name, (0, []))
-                    self._child_orphans[name] = (time.time(), prev + dropped)
+                # reconnecting one re-registers fresh.
+                for key in [k for k in self._child_clients if k[0] == name]:
+                    self._child_clients.pop(key, None)
                 continue
-            if name in self._child_orphans:
-                _, orphans = self._child_orphans.pop(name)
-                self._release_child_sessions(name, orphans)
             plugins = (info or {}).get('plugins', {})
             if isinstance(plugins, dict):
                 plugins = list(plugins.keys())
