@@ -146,6 +146,7 @@ export function init(page, api) {
   escHtml = api.escHtml;
   const endpoint = api.endpointName;
   if (!state[endpoint]) state[endpoint] = { sid: null, tasks: {} };
+  state[endpoint].page = page;      // the panel shown now (re-rendered on revisit)
 
   // Prefill auth fields from localStorage.
   const stored = loadTokens()[endpoint];
@@ -164,7 +165,7 @@ export function init(page, api) {
   renderTasks(page, api);
 
   // Auto-connect if a token is already stored.
-  if (stored && (stored.access_token || (stored.refresh_token && stored.client_id))) {
+  if (hasCredential(stored)) {
     connect(page, api, /*silent=*/true);
   }
 }
@@ -198,6 +199,10 @@ function saveTokens(endpoint, payload) {
   localStorage.setItem(LS_KEY, JSON.stringify(all));
 }
 
+function hasCredential(c) {
+  return !!(c && (c.access_token || (c.refresh_token && c.client_id)));
+}
+
 function authPayload(page) {
   const access  = page.querySelector('.globus-access-token').value.trim();
   const refresh = page.querySelector('.globus-refresh-token').value.trim();
@@ -212,13 +217,13 @@ function authPayload(page) {
   return payload;
 }
 
-async function connect(page, api, silent = false) {
+async function connect(page, api, silent = false, creds = null, ended = '') {
   const endpoint   = api.endpointName;
   const status = page.querySelector('.globus-conn-status');
   const label  = page.querySelector('.globus-conn-state');
-  const payload = authPayload(page);
+  const payload = creds || authPayload(page);
 
-  if (!payload.access_token && !(payload.refresh_token && payload.client_id)) {
+  if (!hasCredential(payload)) {
     if (!silent) {
       status.innerHTML = '<span style="color:var(--danger);">Provide an access token, or a refresh token + client ID.</span>';
       api.flash('Globus: missing credential', false);
@@ -227,6 +232,11 @@ async function connect(page, api, silent = false) {
   }
 
   status.innerHTML = '<span style="color:var(--accent);">Connecting…</span>';
+  // the last connect wins: an older one finishing later (e.g. a silent
+  // reconnect racing a manual Connect) must not replace its session
+  const gen = state[endpoint].gen = (state[endpoint].gen || 0) + 1;
+  const note = ended ? ` (previous session ended: ${ended})` : '';
+  state[endpoint].connecting = true;
   try {
     // Register a fresh session carrying the token (bypass the shared cache
     // so re-connecting with a new token always re-registers).
@@ -234,26 +244,65 @@ async function connect(page, api, silent = false) {
       method: 'POST',
       body  : JSON.stringify(payload),
     });
+    if (gen !== state[endpoint].gen) return;   // superseded: not kept, idle-expires
     // the previous session is no longer kept alive; it is not unregistered:
     // its transfers may still run (and be tracked), and it may be shared
     if (state[endpoint].sid) api.releaseSession?.(state[endpoint].sid);
-    state[endpoint].sid = data.sid;
-    api.keepSession?.(data.sid);    // keep it (and its credential) while open
+    state[endpoint].sid   = data.sid;
+    state[endpoint].creds = payload;    // the credential this session uses
+    // keep it (and its credential) while open; told when it has ended
+    const sid = data.sid;
+    api.keepSession?.(sid, undefined, (detail) => sessionLost(page, api, sid, detail));
 
     if (page.querySelector('.globus-remember').checked) saveTokens(endpoint, payload);
 
-    status.innerHTML = '<span style="color:var(--success);">Connected.</span>';
+    status.innerHTML = '<span style="color:var(--success);">Connected.</span>'
+                     + (note ? ` <span style="color:var(--muted);">${escHtml(note)}</span>` : '');
     label.textContent = 'connected';
     label.style.color = 'var(--success)';
     if (!silent) api.flash('Globus connected');
   } catch (e) {
+    if (gen !== state[endpoint].gen) return;      // superseded
     if (state[endpoint].sid) api.releaseSession?.(state[endpoint].sid);
     state[endpoint].sid = null;
     label.textContent = 'not connected';
     label.style.color = 'var(--muted)';
-    status.innerHTML = `<span style="color:var(--danger);">Error: ${escHtml(e.message)}</span>`;
+    status.innerHTML = `<span style="color:var(--danger);">Error: ${escHtml(e.message)}${escHtml(note)}</span>`;
     if (!silent) api.flash('Globus connect failed: ' + e.message, false);
+  } finally {
+    if (gen === state[endpoint].gen) state[endpoint].connecting = false;
   }
+}
+
+// The session has ended (idle expiry, endpoint restart): reported by the
+// Explorer keepalive or by a failed request.  Reset the panel and show why;
+// reconnect silently with the credential that session used when it renews
+// itself (refresh token) -- an access token alone may have expired too.
+function sessionLost(page, api, sid, detail) {
+  const endpoint = api.endpointName;
+  if (!state[endpoint] || state[endpoint].sid !== sid) return;   // replaced
+  page = state[endpoint].page || page;    // the panel shown now
+  api.releaseSession?.(sid);
+  state[endpoint].sid = null;
+  let why = detail || 'session ended';
+  try { why = JSON.parse(detail).detail || why; } catch (e) { /* raw text */ }
+  const label = page.querySelector('.globus-conn-state');
+  label.textContent = 'not connected';
+  label.style.color = 'var(--muted)';
+  page.querySelector('.globus-conn-status').innerHTML =
+      `<span style="color:var(--danger);">Globus session ended: ${escHtml(why)}</span>`;
+  // reconnect unless a Connect is already running (it wins)
+  const creds = state[endpoint].creds;
+  if (creds && creds.refresh_token && creds.client_id         // renewable
+      && !state[endpoint].connecting)
+    connect(page, api, /*silent=*/true, creds, why);
+}
+
+// A request failed: if its session is dead, handle it as lost.
+async function checkLost(page, api, sid, e) {
+  try {
+    if (sid && await api.isStaleSession?.(e)) sessionLost(page, api, sid, e.detail);
+  } catch (err) { console.log('globus: session check failed', err); }
 }
 
 function sidOrThrow(page, api) {
@@ -272,6 +321,7 @@ async function browse(page, api) {
   const path       = page.querySelector('.globus-ls-path').value.trim() || null;
 
   browser.innerHTML = '<div class="empty" style="padding:20px;"><div class="spinner"></div><p>Loading…</p></div>';
+  const held = state[api.endpointName]?.sid;
   try {
     const sid  = sidOrThrow(page, api);
     const data = await api.fetch(`ls/${sid}`, {
@@ -282,6 +332,7 @@ async function browse(page, api) {
   } catch (e) {
     browser.innerHTML = `<div class="empty" style="padding:20px;"><p style="color:var(--danger);">Error: ${escHtml(e.message)}</p></div>`;
     api.flash('Globus ls error: ' + e.message, false);
+    checkLost(page, api, held, e);
   }
 }
 
@@ -330,6 +381,7 @@ async function submit(page, api) {
   }
 
   status.innerHTML = '<span style="color:var(--accent);">Submitting…</span>';
+  const held = state[api.endpointName]?.sid;
   try {
     const sid  = sidOrThrow(page, api);
     const body = {
@@ -349,6 +401,7 @@ async function submit(page, api) {
   } catch (e) {
     status.innerHTML = `<span style="color:var(--danger);">Error: ${escHtml(e.message)}</span>`;
     api.flash('Globus submit failed: ' + e.message, false);
+    checkLost(page, api, held, e);
   }
 }
 
@@ -360,12 +413,13 @@ async function refreshTasks(page, api) {
   const endpoint = api.endpointName;
   const st   = state[endpoint];
   if (!st || !st.sid) { api.flash('Connect first', false); return; }
+  const held = st.sid;
   await Promise.all(Object.keys(st.tasks).map(async tid => {
     try {
-      const data = await api.fetch(`task/${st.sid}/${tid}`);
+      const data = await api.fetch(`task/${held}/${tid}`, { quiet: true });
       st.tasks[tid].status = data.status || st.tasks[tid].status;
       st.tasks[tid].nice   = data.nice_status || '';
-    } catch (e) { /* leave as-is */ }
+    } catch (e) { checkLost(page, api, held, e); }   // else leave as-is
   }));
   renderTasks(page, api);
 }
@@ -373,13 +427,15 @@ async function refreshTasks(page, api) {
 async function cancelTask(page, api, tid) {
   const st = state[api.endpointName];
   if (!st || !st.sid) return;
+  const held = st.sid;
   try {
-    await api.fetch(`cancel/${st.sid}/${tid}`, { method: 'POST' });
+    await api.fetch(`cancel/${held}/${tid}`, { method: 'POST' });
     st.tasks[tid].status = 'CANCELED';
     renderTasks(page, api);
     api.flash('Globus transfer cancelled');
   } catch (e) {
     api.flash('Cancel failed: ' + e.message, false);
+    checkLost(page, api, held, e);
   }
 }
 

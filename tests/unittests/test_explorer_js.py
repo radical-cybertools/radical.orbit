@@ -490,3 +490,110 @@ def test_fed_a_stale_refresh_says_so_in_the_tooltip(render_resources):
     html = render_resources([_fed_resource([member], state="stale")])
     assert "(stale)" in html
     assert "fed-live-stale" in html
+
+
+# ── globus.js: a lost session resets the panel and reconnects (node) ───────
+
+_GLOBUS_MODULE = (pathlib.Path(__file__).resolve().parents[2]
+                  / "src" / "radical" / "orbit" / "data" / "plugins"
+                  / "globus.js")
+
+# Driver: connect, report the session lost (as the Explorer keepalive does),
+# then fail a request on a dead session; print what the panel did.  `const`
+# / `let` module bindings are made context globals so the driver sees them.
+_GLOBUS_DRIVER = r"""
+const fs = require('fs');
+const vm = require('vm');
+
+let src = fs.readFileSync(process.argv[2], 'utf8')
+            .replace(/^export\s+/gm, '')
+            .replace(/^(const|let) /gm, 'var ');
+const mode     = process.argv[3];      // the credential: refresh | access
+const busy     = process.argv[4] === 'busy';   // a Connect is running
+
+const els = {};
+const page = { querySelector: sel => els[sel] || (els[sel] = {
+  value: '', checked: false, textContent: '', innerHTML: '', style: {},
+  addEventListener: () => {} }) };
+if (mode === 'refresh') {
+  page.querySelector('.globus-refresh-token').value = 'rt';
+  page.querySelector('.globus-client-id').value     = 'cid';
+} else {
+  page.querySelector('.globus-access-token').value  = 'at';
+}
+
+const log = [];
+let n = 0, onLost = null;
+const api = {
+  endpointName: 'ep', escHtml: s => String(s), flash: () => {},
+  async fetch(path) {
+    log.push(path);
+    if (path === 'register_session') return { sid: 's' + (++n) };
+    const e = new Error('HTTP 410'); e.status = 410;
+    e.detail = '{"detail": "session s2 expired"}';
+    throw e;
+  },
+  keepSession(sid, plugin, cb) { log.push('keep ' + sid); onLost = cb; },
+  releaseSession(sid) { log.push('release ' + sid); },
+  async isStaleSession(err) { return err.status === 410; },
+};
+const store = {};
+const ctx = vm.createContext({ api, page, localStorage: {
+  getItem: k => store[k] || null, setItem: (k, v) => { store[k] = v; } } });
+vm.runInContext(src, ctx);
+
+(async () => {
+  ctx.init(page, api);
+  await ctx.connect(page, api);
+  await new Promise(r => setTimeout(r, 10));
+  if (busy) ctx.state.ep.connecting = true;
+  onLost('{"detail": "session s1 expired after 900 s"}');
+  await new Promise(r => setTimeout(r, 10));
+  const afterLost = { sid: ctx.state.ep.sid,
+                      label: page.querySelector('.globus-conn-state').textContent,
+                      status: page.querySelector('.globus-conn-status').innerHTML };
+  ctx.state.ep.sid = ctx.state.ep.sid || 's2';
+  await ctx.cancelTask(page, api, 't1');
+  await new Promise(r => setTimeout(r, 10));
+  process.stdout.write(JSON.stringify({ log, afterLost, sid: ctx.state.ep.sid }));
+})();
+"""
+
+
+def _globus_run(tmp_path, mode, busy=''):
+    if not _NODE:
+        pytest.skip("node not installed")
+    driver = tmp_path / "globus_lost.js"
+    driver.write_text(_GLOBUS_DRIVER)
+    out = subprocess.run([_NODE, str(driver), str(_GLOBUS_MODULE), mode, busy],
+                         capture_output=True, text=True, check=True).stdout
+    return json.loads(out)
+
+
+def test_globus_lost_session_reconnects_with_its_refresh_token(tmp_path):
+    """The session's own renewable credential reconnects it silently, and
+    the status keeps the reason the previous session ended."""
+    res = _globus_run(tmp_path, 'refresh')
+    assert res['log'][:3] == ['register_session', 'keep s1', 'release s1']
+    assert res['afterLost']['sid'] == 's2'               # reconnected
+    assert 's1 expired after 900 s' in res['afterLost']['status']
+
+
+def test_globus_lost_session_with_an_access_token_resets_the_panel(tmp_path):
+    """An access token does not renew itself and may have expired with the
+    session: the panel resets, shows why, and does not reconnect."""
+    res = _globus_run(tmp_path, 'access')
+    assert res['afterLost']['sid'] is None
+    assert res['afterLost']['label'] == 'not connected'
+    assert 's1 expired after 900 s' in res['afterLost']['status']
+    # a request failing on a dead session is handled the same way
+    assert 'cancel/s2/t1' in res['log'] and res['sid'] is None
+    assert res['log'].count('register_session') == 1
+
+
+def test_globus_lost_session_does_not_race_a_running_connect(tmp_path):
+    """While a Connect is running, a lost session resets the panel but does
+    not start its own reconnect (the running Connect wins)."""
+    res = _globus_run(tmp_path, 'refresh', 'busy')
+    assert res['afterLost']['sid'] is None
+    assert res['log'].count('register_session') == 1

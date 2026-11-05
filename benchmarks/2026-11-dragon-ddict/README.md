@@ -197,7 +197,9 @@ Other ports were not tested.
    ORBIT change), 1 MiB took 16–19 ms (5.9×) and 256 KiB took 6 ms
    instead of 28 ms. Small-value latency and throughput did not change.
    Recommendation: make compression configurable, or default it off for
-   this traffic. PR #159 does that; see F1b. Base64 inside JSON inside msgpack adds a further 4/3 on
+   this traffic. PR #159 (merged) does that; see F1b. On devel since #159, use
+   `RADICAL_ORBIT_WS_COMPRESSION=off` instead of the patch, which no longer
+   has any effect. Base64 inside JSON inside msgpack adds a further 4/3 on
    bytes values.
 3. **Throughput ceiling: the single Dragon thread.** Batching helps up to
    about 256 keys per call. Beyond that, `get_many` levels off at about

@@ -790,6 +790,41 @@ class TestPilotSubmitTransport:
         assert asyncio.run(plugin._get_psij_client('someone')) is None
         assert asyncio.run(plugin._get_rhapsody_client('someone')) is None
 
+    def test_dropped_child_sessions_are_released_when_back(self, tmp_path):
+        """A lost endpoint's cached clients are dropped; when it is present
+        again their (ttl=0) sessions are unregistered, so they do not stay
+        behind next to the fresh ones."""
+        _, plugin = _make_plugin(tmp_path, broker_caller=MagicMock())
+        old = MagicMock()
+        plugin._child_clients[('ep', 'psij', None)] = old
+
+        async def scenario():
+            await plugin.on_topology_change(
+                {'ep': {'role': 'endpoint', 'plugins': {},
+                        'liveness': 'lost'}})
+            assert not plugin._child_clients
+            old.unregister_session.assert_not_called()   # unreachable now
+            await plugin.on_topology_change(
+                {'ep': {'role': 'endpoint', 'plugins': {'psij': {}},
+                        'liveness': 'present'}})
+            await asyncio.wait(set(plugin._release_tasks), timeout=5)
+
+        asyncio.run(scenario())
+        old.unregister_session.assert_called_once()
+        assert 'ep' not in plugin._child_orphans
+
+    def test_orphans_of_endpoints_that_never_return_are_forgotten(
+            self, tmp_path):
+        from radical.orbit import plugin_task_dispatcher as ptd
+        _, plugin = _make_plugin(tmp_path, broker_caller=MagicMock())
+        plugin._child_orphans['gone'] = (
+            time.time() - ptd.CHILD_ORPHAN_KEEP - 1, [MagicMock()])
+        plugin._child_clients[('ep', 'psij', None)] = MagicMock()
+        asyncio.run(plugin.on_topology_change(
+            {'ep': {'role': 'endpoint', 'plugins': {}, 'liveness': 'lost'}}))
+        assert 'gone' not in plugin._child_orphans
+        assert 'ep' in plugin._child_orphans
+
     def test_child_sessions_never_idle_expire(self, tmp_path):
         """Child sessions are cached across arbitrarily long pool idle
         phases, so they are registered with ttl=0."""

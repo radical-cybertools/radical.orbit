@@ -10,6 +10,7 @@ No test sleeps for more than ~2.5 s; liveness/backoff knobs are injected tiny.
 """
 
 import asyncio
+import logging
 import subprocess
 import threading
 from collections import Counter
@@ -151,7 +152,8 @@ class _RunningBroker:
         config = uvicorn.Config(
             broker.app, host='127.0.0.1', port=0, log_level='error',
             ws_ping_interval=ws_ping_interval,
-            ws_ping_timeout=ws_ping_timeout)
+            ws_ping_timeout=ws_ping_timeout,
+            ws_per_message_deflate=broker._ws_compression)
         self._server = uvicorn.Server(config)
         self._thread = threading.Thread(target=self._server.run, daemon=True)
 
@@ -336,6 +338,35 @@ def test_serve_and_call_plugin_end_to_end(harness):
     assert body['error']       is True
     assert body['status_code'] == 404
     assert 'No route' in body['detail']
+
+
+# ---------------------------------------------------------------------------
+# permessage-deflate is negotiated per connection: mixed settings interoperate
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize('broker_mode, client_mode, expect', [
+    ('off', 'off',  False), ('on', 'off',  False), ('off', 'on', False),
+    ('on',  'on',   True),  ('on', 'auto', False),       # auto on localhost
+    ('off', 'auto', False)])
+def test_ws_compression_interop(harness, monkeypatch,
+                                broker_mode, client_mode, expect):
+    monkeypatch.delenv('RADICAL_ORBIT_WS_COMPRESSION',        raising=False)
+    monkeypatch.delenv('RADICAL_ORBIT_WS_COMPRESSION_RTT_MS', raising=False)
+    make_broker, make_runtime = harness
+    srv = make_broker(ws_compression=broker_mode)
+
+    a = make_runtime(srv.url, name='epA', plugins=['echo_rt'],
+                     ws_compression=client_mode)
+    b = make_runtime(srv.url, name='epB', ws_compression=client_mode)
+    assert a.wait_registered(timeout=5.0)
+    assert _wait_topology(b, 'epA', 'echo_rt', timeout=5.0)
+    assert b.get_plugin('epA', 'echo_rt').echo('x' * 4096) == \
+        {'echo': 'x' * 4096}
+
+    # Deflate is in effect only when the runtime offers it and the broker
+    # accepts it.
+    negotiated = [e.name for e in b._ws.protocol.extensions]
+    assert negotiated == (['permessage-deflate'] if expect else [])
 
 
 # ---------------------------------------------------------------------------
@@ -1498,3 +1529,17 @@ def test_control_terminate_marks_terminated():
     assert not rt.terminated
     rt._on_control(protocol.Control(src='broker', op='terminate'))
     assert rt.terminated
+
+
+def test_work_teardown_skips_objects_without_hook(caplog):
+    """A served object that does not subclass Plugin has no on_host_stop:
+    skipped, not logged as a failure."""
+    class _Bare:
+        instance_name = 'bare'
+        _cleanup_task = None
+
+    rt = _unstarted_runtime()
+    rt._plugins = {'bare': _Bare()}
+    with caplog.at_level(logging.WARNING, logger='radical.orbit'):
+        asyncio.run(rt._work_teardown())
+    assert 'on_host_stop' not in caplog.text
