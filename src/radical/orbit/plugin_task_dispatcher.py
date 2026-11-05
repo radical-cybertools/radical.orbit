@@ -1119,6 +1119,8 @@ class PluginTaskDispatcher(Plugin):
         self._child_clients: dict[tuple, Any] = {}
         # dst -> whether it has the touch route (probed once; reset on lost)
         self._child_touchable: dict[str, bool] = {}
+        # keys of cached clients with a persistent (never touched) session
+        self._child_persistent: set[tuple] = set()
 
         # endpoint_name → set of loaded plugin names, refreshed on every
         # topology change.  Used to auto-resolve a pool's endpoint_name and to
@@ -1405,6 +1407,7 @@ class PluginTaskDispatcher(Plugin):
                         and (touching is None or touching.done()):
                     touching   = asyncio.get_running_loop().create_task(
                         self._touch_child_sessions())
+                    touching.add_done_callback(self._log_touch_failure)
                     last_touch = now
                 if now - last_prune >= _PRUNE_INTERVAL_SEC:
                     self._prune_stale_state_dirs()
@@ -1542,8 +1545,10 @@ class PluginTaskDispatcher(Plugin):
             await asyncio.to_thread(
                 client.register_session,
                 ttl=_CHILD_SESSION_TTL if touchable else 0, **register_kwargs)
-            if not touchable:
-                client._orbit_persistent = True
+            if touchable:
+                self._child_persistent.discard(key)
+            else:
+                self._child_persistent.add(key)
             # cache the probe only once *plugin* proved present on dst: a
             # missing plugin also answers "No route"
             if probed and touchable is not None:
@@ -1571,6 +1576,12 @@ class PluginTaskDispatcher(Plugin):
             if _no_route(e):
                 return False
             return None
+
+    def _log_touch_failure(self, task: asyncio.Task) -> None:
+        '''Done-callback of a touch pass: log an exception that escaped it.'''
+        if not task.cancelled() and task.exception() is not None:
+            log.error('[%s] child session touch pass failed: %r',
+                      self.instance_name, task.exception())
 
     async def _touch_child_sessions(self) -> None:
         '''Touch every cached child session (a few in parallel, so a pass
@@ -1601,7 +1612,7 @@ class PluginTaskDispatcher(Plugin):
 
         await asyncio.gather(*(_one(k, c) for k, c
                                in list(self._child_clients.items())
-                               if getattr(c, '_orbit_persistent', False) is not True))
+                               if k not in self._child_persistent))
 
     async def _get_psij_client(self, endpoint_name: str):
         '''Return a caller-backed :class:`PSIJClient` for *endpoint_name*.'''
@@ -2608,6 +2619,7 @@ class PluginTaskDispatcher(Plugin):
                 # reconnecting one re-registers fresh.
                 for key in [k for k in self._child_clients if k[0] == name]:
                     self._child_clients.pop(key, None)
+                    self._child_persistent.discard(key)
                 self._child_touchable.pop(name, None)  # may come back upgraded
                 continue
             plugins = (info or {}).get('plugins', {})

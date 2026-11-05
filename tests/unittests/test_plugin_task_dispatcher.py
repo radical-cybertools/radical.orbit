@@ -817,12 +817,12 @@ class TestPilotSubmitTransport:
         ended.touch.side_effect = _err(410, 'session expired')
         gone.touch.side_effect  = _err(404, 'unknown session id: s')
         flaky.touch.side_effect = _err(504, 'timeout')
-        old._orbit_persistent   = True
         plugin._child_clients.update({('a', 'psij', None): live,
                                       ('b', 'psij', None): ended,
                                       ('c', 'psij', None): gone,
                                       ('d', 'psij', None): flaky,
                                       ('e', 'psij', None): old})
+        plugin._child_persistent.add(('e', 'psij', None))
         asyncio.run(plugin._touch_child_sessions())
         live.touch.assert_called_once()
         old.touch.assert_not_called()                  # persistent: skipped
@@ -845,7 +845,6 @@ class TestPilotSubmitTransport:
 
         def _run(probe_error):
             client = MagicMock()
-            client._orbit_persistent = False
             with patch.object(plugin, '_make_child_client',
                               return_value=client):
                 client.touch.side_effect = probe_error
@@ -854,18 +853,19 @@ class TestPilotSubmitTransport:
             return client.register_session.call_args.kwargs['ttl'], client
 
         ttl, c = _run(_err(404, 'unknown session id: x'))
-        assert ttl == ptd._CHILD_SESSION_TTL and c._orbit_persistent is False
+        assert ttl == ptd._CHILD_SESSION_TTL
+        assert ('ep', 'psij', None) not in plugin._child_persistent
         assert plugin._child_touchable['ep'] is True
         asyncio.run(plugin.on_topology_change(
             {'ep': {'role': 'endpoint', 'plugins': {}, 'liveness': 'lost'}}))
         assert 'ep' not in plugin._child_touchable
 
         ttl, c = _run(_err(404, 'No route: POST /psij/touch/x'))
-        assert ttl == 0 and c._orbit_persistent is True
+        assert ttl == 0 and ('ep', 'psij', None) in plugin._child_persistent
         plugin._child_touchable.clear()
 
         ttl, c = _run(_err(504, 'timeout'))                # inconclusive
-        assert ttl == 0 and c._orbit_persistent is True
+        assert ttl == 0 and ('ep', 'psij', None) in plugin._child_persistent
         assert 'ep' not in plugin._child_touchable          # probe again
 
         # a missing plugin answers "No route" too: its failed registration
