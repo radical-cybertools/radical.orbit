@@ -343,25 +343,29 @@ def test_serve_and_call_plugin_end_to_end(harness):
 # permessage-deflate is negotiated per connection: mixed settings interoperate
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize('broker_on, client_on', [
-    (False, False), (True, False), (False, True), (True, True)])
-def test_ws_compression_interop(harness, monkeypatch, broker_on, client_on):
-    monkeypatch.delenv('RADICAL_ORBIT_WS_COMPRESSION', raising=False)
+@pytest.mark.parametrize('broker_mode, client_mode, expect', [
+    ('off', 'off',  False), ('on', 'off',  False), ('off', 'on', False),
+    ('on',  'on',   True),  ('on', 'auto', False),       # auto on localhost
+    ('off', 'auto', False)])
+def test_ws_compression_interop(harness, monkeypatch,
+                                broker_mode, client_mode, expect):
+    monkeypatch.delenv('RADICAL_ORBIT_WS_COMPRESSION',        raising=False)
+    monkeypatch.delenv('RADICAL_ORBIT_WS_COMPRESSION_RTT_MS', raising=False)
     make_broker, make_runtime = harness
-    srv = make_broker(ws_compression=broker_on)
+    srv = make_broker(ws_compression=broker_mode)
 
     a = make_runtime(srv.url, name='epA', plugins=['echo_rt'],
-                     ws_compression=client_on)
-    b = make_runtime(srv.url, name='epB', ws_compression=client_on)
+                     ws_compression=client_mode)
+    b = make_runtime(srv.url, name='epB', ws_compression=client_mode)
     assert a.wait_registered(timeout=5.0)
     assert _wait_topology(b, 'epA', 'echo_rt', timeout=5.0)
     assert b.get_plugin('epA', 'echo_rt').echo('x' * 4096) == \
         {'echo': 'x' * 4096}
 
-    # Deflate is in effect only when both sides offer / accept it.
+    # Deflate is in effect only when the runtime offers it and the broker
+    # accepts it.
     negotiated = [e.name for e in b._ws.protocol.extensions]
-    expected   = ['permessage-deflate'] if broker_on and client_on else []
-    assert negotiated == expected
+    assert negotiated == (['permessage-deflate'] if expect else [])
 
 
 # ---------------------------------------------------------------------------

@@ -52,7 +52,7 @@ import threading
 from contextlib   import asynccontextmanager
 from dataclasses  import dataclass
 from pathlib      import Path
-from typing       import Any, Callable, Dict, List, Optional, Tuple
+from typing       import Any, Callable, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import msgpack
@@ -100,9 +100,10 @@ class BrokerTuning:
     * ``reap_interval`` — how often the reaper sweeps for expired calls.
     * ``event_queue`` — per-subscriber delivery-queue depth.
     * ``frame_cap`` — uvicorn ``ws_max_size`` / the protocol frame cap.
-    * ``ws_compression`` — offer WS permessage-deflate (uvicorn
-      ``ws_per_message_deflate``); ``None`` defers to
-      ``$RADICAL_ORBIT_WS_COMPRESSION``, unset means off.
+    * ``ws_compression`` — accept WS permessage-deflate when a client offers
+      it (uvicorn ``ws_per_message_deflate``); ``None`` defers to
+      ``$RADICAL_ORBIT_WS_COMPRESSION``, unset means accept.  Only ``off``
+      (or ``False``) disables it; accepting costs nothing unless offered.
     """
 
     ping_interval: float = 1.0
@@ -114,7 +115,7 @@ class BrokerTuning:
     reap_interval: float = 5.0
     event_queue:   int   = 1024
     frame_cap:     int   = protocol.FRAME_CAP
-    ws_compression: Optional[bool] = None
+    ws_compression: Optional[Union[bool, str]] = None
 
 
 class _Call:
@@ -273,7 +274,7 @@ class Broker:
         self._event_queue   = tuning.event_queue
         self._frame_cap     = tuning.frame_cap
         self._ws_compression = utils.resolve_ws_compression(
-            tuning.ws_compression)
+            tuning.ws_compression, default='on') != 'off'
         self._plugins_spec: str = plugins or ''
         self._gateway_enabled   = gateway
 

@@ -57,30 +57,52 @@ def _env(name: str) -> str:
 
 
 # WebSocket permessage-deflate (RFC 7692), negotiated per connection: frames
-# are compressed only when both sides offer / accept it, so a mixed setup
-# interoperates.  Off by default — deflate dominates large payloads (1 MiB
-# put/get p50 ~100 ms with, 16-19 ms without, on Perlmutter).
-ENV_WS_COMPRESSION = 'RADICAL_ORBIT_WS_COMPRESSION'
+# are compressed only when the dialling side offers it and the accepting side
+# accepts it, so mixed settings interoperate.  Deflate dominates large
+# payloads on fast links (1 MiB put/get p50 ~100 ms with, 16-19 ms without,
+# on Perlmutter), so a runtime offers it in ``auto`` mode only when the
+# broker looks remote (TCP connect time >= a threshold).
+ENV_WS_COMPRESSION        = 'RADICAL_ORBIT_WS_COMPRESSION'
+ENV_WS_COMPRESSION_RTT_MS = 'RADICAL_ORBIT_WS_COMPRESSION_RTT_MS'
+WS_COMPRESSION_RTT_MS     = 10.0
 
-_TRUE  = ('1', 'true',  'on',  'yes')
-_FALSE = ('0', 'false', 'off', 'no')
+_WS_MODES = {'1': 'on',  'true':  'on',  'on':  'on',  'yes': 'on',
+             '0': 'off', 'false': 'off', 'off': 'off', 'no':  'off',
+             'auto': 'auto'}
 
 
-def resolve_ws_compression(value: Optional[bool] = None) -> bool:
-    """Explicit setting > ``$RADICAL_ORBIT_WS_COMPRESSION`` > off.
+def resolve_ws_compression(value: Any = None, default: str = 'auto') -> str:
+    """Return ``'on'`` / ``'off'`` / ``'auto'`` for the deflate switch.
 
-    ``value=None`` means "not set": the env var decides, and an unset (or
-    empty) env var means off.  An unrecognised env value raises.
+    Explicit *value* > ``$RADICAL_ORBIT_WS_COMPRESSION`` > *default*.
+    *value* may be a bool (``True`` = on, ``False`` = off), a mode string, or
+    ``None`` (not set).  An unrecognised value raises ``ValueError``.
     """
+    if isinstance(value, bool):
+        return 'on' if value else 'off'
+    src, raw = ('setting', value) if value is not None \
+        else (f'${ENV_WS_COMPRESSION}', _env(ENV_WS_COMPRESSION))
+    raw = str(raw).strip().lower()
+    if not raw:
+        return default
+    if raw not in _WS_MODES:
+        raise ValueError(f"ws_compression {src}={raw!r}: expected on/off/auto "
+                         f"(or 1/true/yes, 0/false/no)")
+    return _WS_MODES[raw]
+
+
+def resolve_ws_compression_rtt_ms(value: Optional[float] = None) -> float:
+    """``auto`` threshold (ms): explicit > env > ``WS_COMPRESSION_RTT_MS``."""
     if value is not None:
-        return bool(value)
-    raw = _env(ENV_WS_COMPRESSION).lower()
-    if raw in _TRUE:
-        return True
-    if raw in _FALSE or not raw:
-        return False
-    raise ValueError(f"${ENV_WS_COMPRESSION}={raw!r}: expected one of "
-                     f"{'/'.join(_TRUE)} or {'/'.join(_FALSE)}")
+        return float(value)
+    raw = _env(ENV_WS_COMPRESSION_RTT_MS)
+    if not raw:
+        return WS_COMPRESSION_RTT_MS
+    try:
+        return float(raw)
+    except ValueError:
+        raise ValueError(f"${ENV_WS_COMPRESSION_RTT_MS}={raw!r}: expected a "
+                         f"number of milliseconds") from None
 
 
 # Cookie the browser/SSE path carries (set by the broker's POST /auth).  The

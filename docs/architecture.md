@@ -49,13 +49,22 @@ payload:
 Liveness is transport-level only (WebSocket keepalive); there is no app-level
 heartbeat kind. A frame-size cap bounds each frame.
 
-WebSocket permessage-deflate is off by default (it dominated large payloads:
-1 MiB round trips went from ~100 ms to 16–19 ms without it; small frames are
-unaffected).  Enable it with `BrokerTuning(ws_compression=True)` on the
-broker, the `ws_compression=True` keyword on an `EndpointRuntime`, or
-`RADICAL_ORBIT_WS_COMPRESSION=1` on either side (an explicit setting wins
-over the env var).  The extension is negotiated per connection, so mixed
-settings interoperate: frames are compressed only when both sides enable it.
+WebSocket permessage-deflate is decided per hop by the side that dials.  It
+dominated large payloads on fast links (1 MiB round trips went from ~100 ms
+to 16–19 ms without it; small frames are unaffected), so:
+
+- the broker *accepts* it by default (costs nothing unless a client offers
+  it); `BrokerTuning(ws_compression=False)` or
+  `RADICAL_ORBIT_WS_COMPRESSION=off` turns acceptance off;
+- an `EndpointRuntime` *offers* it per mode `off`, `on` or `auto`
+  (`ws_compression=` keyword > `RADICAL_ORBIT_WS_COMPRESSION` > `auto`).
+  `auto` times a plain TCP connect to the broker before each (re)connect
+  and offers deflate when it takes at least 10 ms
+  (`ws_compression_rtt_ms` / `RADICAL_ORBIT_WS_COMPRESSION_RTT_MS`) —
+  i.e. on WAN links, not inside a site.  The runtime asks for zlib level 1.
+
+The extension is negotiated per connection, so mixed settings interoperate:
+frames are compressed only when offered and accepted.
 
 ## Session lifecycle
 
