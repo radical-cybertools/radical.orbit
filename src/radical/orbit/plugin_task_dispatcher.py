@@ -101,6 +101,7 @@ _TICK_INTERVAL_SEC = 5.0
 _CHILD_SESSION_TTL     = 3600.0
 _CHILD_TOUCH_INTERVAL  = 300.0
 _CHILD_TOUCH_TIMEOUT   = 60.0
+_CHILD_TOUCH_PARALLEL  = 8        # executor threads one touch pass may hold
 
 # Handshake timeout — a pilot that hasn't handshaken in this long is
 # reconciled against psij job state.
@@ -1523,22 +1524,44 @@ class PluginTaskDispatcher(Plugin):
         return client
 
     async def _touch_child_sessions(self) -> None:
-        '''Touch every cached child session, in parallel, so it does not
-        idle-expire.  A session found ended (410, or 404 "unknown session")
-        -- e.g. its endpoint restarted -- is dropped from the cache, so the
-        next use registers a fresh one.  Other failures keep it.'''
-        async def _one(key, client):
+        '''Touch every cached child session (a few in parallel, so a pass
+        cannot hold the shared executor), so it does not idle-expire.
+
+        A session found ended (410, or 404 "unknown session") -- e.g. its
+        endpoint restarted -- is dropped from the cache, so the next use
+        registers a fresh one.  An endpoint without the ``touch`` route
+        (older release: 404 "No route") is kept alive by a reconnect
+        instead, an access there too.  Other failures keep the entry.
+        '''
+        limit = asyncio.Semaphore(_CHILD_TOUCH_PARALLEL)
+
+        def _keep(client):
             try:
-                await asyncio.wait_for(asyncio.to_thread(client.touch),
-                                       _CHILD_TOUCH_TIMEOUT)
+                client.touch()
             except Exception as e:
-                status = getattr(e, 'status_code', None)
-                if status == 410 or (status == 404
-                                     and 'unknown session' in str(e)):
-                    if self._child_clients.get(key) is client:
-                        self._child_clients.pop(key, None)
-                    log.info('[%s] child session %s ended: %s',
-                             self.instance_name, key, e)
+                if getattr(e, 'status_code', None) == 404 \
+                        and 'No route' in str(e):
+                    client.register_session(sid=client.sid,
+                                            ttl=_CHILD_SESSION_TTL)
+                else:
+                    raise
+
+        async def _one(key, client):
+            async with limit:
+                try:
+                    await asyncio.wait_for(asyncio.to_thread(_keep, client),
+                                           _CHILD_TOUCH_TIMEOUT)
+                except Exception as e:
+                    status = getattr(e, 'status_code', None)
+                    if status == 410 or (status == 404
+                                         and 'unknown session' in str(e)):
+                        if self._child_clients.get(key) is client:
+                            self._child_clients.pop(key, None)
+                        log.info('[%s] child session %s ended: %s',
+                                 self.instance_name, key, e)
+                    else:
+                        log.info('[%s] cannot touch child session %s '
+                                 '(kept): %s', self.instance_name, key, e)
 
         await asyncio.gather(*(_one(k, c) for k, c
                                in list(self._child_clients.items())))

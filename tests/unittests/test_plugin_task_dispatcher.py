@@ -812,18 +812,24 @@ class TestPilotSubmitTransport:
             e.status_code = status
             return e
 
-        live, ended, gone, flaky = (MagicMock() for _ in range(4))
+        live, ended, gone, flaky, old = (MagicMock() for _ in range(5))
         ended.touch.side_effect = _err(410, 'session expired')
         gone.touch.side_effect  = _err(404, 'unknown session id: s')
         flaky.touch.side_effect = _err(504, 'timeout')
+        old.touch.side_effect   = _err(404, 'No route: POST /psij/touch/s')
+        old.sid = 's.old'
         plugin._child_clients.update({('a', 'psij', None): live,
                                       ('b', 'psij', None): ended,
                                       ('c', 'psij', None): gone,
-                                      ('d', 'psij', None): flaky})
+                                      ('d', 'psij', None): flaky,
+                                      ('e', 'psij', None): old})
         asyncio.run(plugin._touch_child_sessions())
         live.touch.assert_called_once()
         assert set(plugin._child_clients) == {('a', 'psij', None),
-                                              ('d', 'psij', None)}
+                                              ('d', 'psij', None),
+                                              ('e', 'psij', None)}
+        # an endpoint without the touch route: kept alive by a reconnect
+        assert old.register_session.call_args.kwargs['sid'] == 's.old'
 
 
 # ---------------------------------------------------------------------------

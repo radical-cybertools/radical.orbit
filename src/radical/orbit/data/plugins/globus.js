@@ -228,7 +228,10 @@ async function connect(page, api, silent = false, creds = null, ended = '') {
     label.textContent = text;
     label.style.color = color;
   };
-  const payload = creds || authPayload(page);
+  const payload  = creds || authPayload(page);
+  // remember what the user asked for when connecting (manual Connect only;
+  // an auto-connect or silent reconnect never rewrites the stored token)
+  const remember = !silent && page.querySelector('.globus-remember').checked;
 
   if (!hasCredential(payload)) {
     if (!silent) {
@@ -265,8 +268,7 @@ async function connect(page, api, silent = false, creds = null, ended = '') {
     const sid = data.sid;
     api.keepSession?.(sid, undefined, (detail) => sessionLost(page, api, sid, detail));
 
-    // a silent reconnect reuses a credential: it never rewrites the stored one
-    if (!creds && shown().querySelector('.globus-remember').checked) saveTokens(endpoint, payload);
+    if (remember) saveTokens(endpoint, payload);
 
     setStatus('<span style="color:var(--success);">Connected.</span>'
               + (note ? ` <span style="color:var(--muted);">${escHtml(note)}</span>` : ''));
@@ -308,11 +310,16 @@ function sessionLost(page, api, sid, detail) {
     connect(page, api, /*silent=*/true, creds, why);
 }
 
-// A request failed: if its session is dead, handle it as lost.
+// A request failed: if its session is dead, handle it as lost.  Returns
+// whether it was.
 async function checkLost(page, api, sid, e) {
   try {
-    if (sid && await api.isStaleSession?.(e)) sessionLost(page, api, sid, e.detail);
+    if (sid && await api.isStaleSession?.(e)) {
+      sessionLost(page, api, sid, e.detail);
+      return true;
+    }
   } catch (err) { console.log('globus: session check failed', err); }
+  return false;
 }
 
 function sidOrThrow(page, api) {
@@ -431,8 +438,7 @@ async function refreshTasks(page, api) {
       st.tasks[tid].status = data.status || st.tasks[tid].status;
       st.tasks[tid].nice   = data.nice_status || '';
     } catch (e) {                                    // leave the task as-is
-      if (!(await api.isStaleSession?.(e).catch(() => false))) failed = e;
-      checkLost(page, api, held, e);
+      if (!(await checkLost(page, api, held, e))) failed = e;
     }
   }));
   renderTasks(page, api);
