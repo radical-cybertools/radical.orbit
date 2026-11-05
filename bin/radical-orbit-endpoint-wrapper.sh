@@ -12,6 +12,25 @@
 # Log level is controlled by RADICAL_ORBIT_LOG_LVL (default: INFO).
 # Set to DEBUG before submitting to get verbose output in the job log:
 #   export RADICAL_ORBIT_LOG_LVL=DEBUG
+#
+# Stop signals: under dragon the wrapper does not ``exec`` but stays the
+# parent of the launcher, traps TERM/INT/HUP and forwards them (HUP as
+# TERM) to the endpoint python process alone -- never to ``dragon`` or its
+# process group: ``dragon -s`` has no SIGTERM handler (the runtime dies
+# under the endpoint, DDict managers orphan, /dev/shm leaks) and killing
+# an srun step under ``dragon -m`` orphans its backend step.  The endpoint
+# writes its PID to $RADICAL_ORBIT_ENDPOINT_PIDFILE (set here); on the
+# signal it releases its resources (on_host_stop) and exits, then dragon
+# tears down and the wrapper exits with dragon's exit code.  A signal
+# before the endpoint wrote its PID is retried until it has, or dragon
+# exits.  Without dragon the wrapper ``exec``s python as before.
+#
+# Batch jobs: let Slurm signal the batch shell only, with lead time
+# before it kills everything at the walltime, and run the wrapper as the
+# job's process (``exec`` it, or forward the signal to it):
+#   #SBATCH --signal=B:TERM@120
+# (without ``B:`` Slurm signals every job step -- dragon's sruns -- and
+# not the batch shell; to stop early: ``scancel --batch --signal=TERM``).
 
 # The venv bin dir is wherever this script really lives, symlinks resolved.
 SELF="$0"
@@ -119,7 +138,54 @@ fi
 
 if [ "$USE_DRAGON" = "yes" ]; then
     echo "[orbit] starting with dragon ($DRAGON_PATH)" >&2
-    exec "$DRAGON_PATH" $ARGS "$BINDIR/radical-orbit-endpoint.py" "$@"
+    # stay dragon's parent and forward stop signals to the endpoint (see
+    # the header)
+    RADICAL_ORBIT_ENDPOINT_PIDFILE="$(mktemp \
+        "${TMPDIR:-/tmp}/radical-orbit-endpoint.pid.XXXXXX")" || {
+        echo "[orbit] FATAL: cannot create the endpoint pid file" >&2
+        exit 1
+    }
+    export RADICAL_ORBIT_ENDPOINT_PIDFILE
+    trap 'rm -f "$RADICAL_ORBIT_ENDPOINT_PIDFILE"' EXIT
+
+    PENDING=""
+    forward() {
+        TRAPPED=1
+        EP_PID="$(cat "$RADICAL_ORBIT_ENDPOINT_PIDFILE" 2>/dev/null)"
+        if [ -n "$EP_PID" ] && kill -"$1" "$EP_PID" 2>/dev/null; then
+            echo "[orbit] forwarded SIG$1 to the endpoint (pid $EP_PID)" >&2
+            PENDING=""
+        else
+            PENDING="$1"        # endpoint not up (yet): retry below
+        fi
+    }
+    trap 'forward TERM' TERM HUP
+    trap 'forward INT'  INT
+
+    # explicit stdin: an async list would otherwise get /dev/null.  An async
+    # list also starts with INT/QUIT ignored (no job control), which dragon's
+    # local children would inherit; ``trap -`` cannot undo that in every sh
+    # (dash), so python restores the defaults right before the exec.
+    "$PYTHON_PATH" -c 'import os, signal, sys
+for s in (signal.SIGINT, signal.SIGQUIT):
+    signal.signal(s, signal.SIG_DFL)
+os.execv(sys.argv[1], sys.argv[1:])' \
+        "$DRAGON_PATH" $ARGS "$BINDIR/radical-orbit-endpoint.py" "$@" <&0 &
+    CHILD=$!
+    while :; do
+        TRAPPED=""
+        wait "$CHILD"; RC=$?
+        [ -n "$TRAPPED" ] || break              # dragon exited
+        if ! kill -0 "$CHILD" 2>/dev/null; then
+            wait "$CHILD"; RC=$?                # exited while trapped
+            break
+        fi
+        while [ -n "$PENDING" ] && kill -0 "$CHILD" 2>/dev/null; do
+            sleep 1
+            forward "$PENDING"
+        done
+    done
+    exit "$RC"
 else
     echo "[orbit] starting with python ($PYTHON_PATH) — $REASON" >&2
     exec "$PYTHON_PATH" "$BINDIR/radical-orbit-endpoint.py" "$@"

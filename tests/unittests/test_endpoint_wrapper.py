@@ -7,8 +7,11 @@ and dragon-backed plugins died at runtime.
 """
 
 import os
+import signal
 import stat
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -128,3 +131,74 @@ def test_a_wrapper_without_a_python_fails_loudly(fake_venv):
     assert out.returncode == 1
     assert "FATAL: no usable python3" in out.stderr
     assert "EXEC_PYTHON" not in out.stdout
+
+
+# a launcher that, like ``dragon``, runs the endpoint as its child; it
+# records any signal it gets itself -- the wrapper must not send it one
+DRAGON_STUB = """#!/bin/sh
+trap 'echo TERM >> "$MARKS/launcher"' TERM
+trap 'echo INT  >> "$MARKS/launcher"' INT
+"$(dirname "$0")/python3" "$@"
+exit $?
+"""
+
+# the endpoint: writes its PID where the wrapper says (after a delay, to
+# cover a signal that arrives before the endpoint is up), exits 7 on TERM
+ENDPOINT_STUB = """import os, signal, sys, time
+marks = os.environ['MARKS']
+def on_term(signum, frame):
+    with open(os.path.join(marks, 'endpoint'), 'w') as f:
+        f.write(signal.Signals(signum).name)
+    sys.exit(7)
+signal.signal(signal.SIGTERM, on_term)
+with open(os.path.join(marks, 'sigint'), 'w') as f:  # not inherited SIG_IGN
+    f.write(str(signal.getsignal(signal.SIGINT) is signal.default_int_handler))
+open(os.path.join(marks, 'started'), 'w').close()
+time.sleep(float(os.environ['PID_DELAY']))
+pidfile = os.environ['RADICAL_ORBIT_ENDPOINT_PIDFILE']
+with open(pidfile, 'w') as f:
+    f.write(f'{os.getpid()}\\n')
+with open(os.path.join(marks, 'pidfile'), 'w') as f:
+    f.write(pidfile)
+time.sleep(60)
+"""
+
+
+@pytest.mark.parametrize("pid_delay", [0.0, 1.5])
+def test_dragon_path_forwards_term_to_the_endpoint(fake_venv, tmp_path,
+                                                   pid_delay):
+    """Under a launcher, SIGTERM to the wrapper reaches the endpoint
+    process alone, and the endpoint's exit code comes back out."""
+
+    (fake_venv / "python3").write_text(
+        f'#!/bin/sh\nexec {sys.executable} "$@"\n')
+    (fake_venv / "dragon").write_text(DRAGON_STUB)
+    (fake_venv / "dragon").chmod(0o755)
+    (fake_venv / "radical-orbit-endpoint.py").write_text(ENDPOINT_STUB)
+    marks = tmp_path / "marks"
+    marks.mkdir()
+
+    # an allocation, so the wrapper picks the launcher
+    proc = subprocess.Popen(
+        [str(fake_venv / WRAPPER.name)], stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True,
+        env={**os.environ, "MARKS": str(marks), "PID_DELAY": str(pid_delay),
+             "SLURM_JOB_ID": "1", "PBS_JOBID": "1", "TMPDIR": str(tmp_path)})
+    try:
+        deadline = time.time() + 20
+        while not (marks / "started").exists():
+            assert time.time() < deadline and proc.poll() is None
+            time.sleep(0.05)
+        proc.send_signal(signal.SIGTERM)
+        rc = proc.wait(timeout=20)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    err = proc.stderr.read()
+
+    assert rc == 7, err
+    assert (marks / "endpoint").read_text() == "SIGTERM"
+    assert not (marks / "launcher").exists()
+    assert "forwarded SIGTERM to the endpoint" in err
+    assert not Path((marks / "pidfile").read_text()).exists()   # cleaned
+    assert (marks / "sigint").read_text() == "True"   # INT not ignored
