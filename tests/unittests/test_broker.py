@@ -1079,7 +1079,7 @@ async def test_runtime_disconnect_endpoint_frame(make_broker):
     # EndpointRuntime.disconnect_endpoint (plugin_psij's graceful cancel)
     # sends the very control the broker acts on: target removed + terminated
     from radical.orbit.runtime import EndpointRuntime
-    rt   = EndpointRuntime(broker_url='https://localhost:1', token=None)
+    rt   = EndpointRuntime(broker_url='http://localhost:1', token=None)
     sent = []
     rt._enqueue = lambda data, kind: sent.append((data, kind)) or True
     assert rt.disconnect_endpoint('e1') is True

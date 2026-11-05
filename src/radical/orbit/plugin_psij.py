@@ -464,11 +464,15 @@ class PSIJSession(PluginSession):
         '''
         Cancel a job.
 
-        For a job that runs an endpoint this plugin launched, *stop_endpoint*
-        (``name -> bool``, True when the stop request was sent) asks ORBIT to
-        stop that endpoint first; the job then gets ``_cancel_grace()``
-        seconds to end on its own before ``job.cancel()``.  Other jobs (and
-        calls without *stop_endpoint*) are cancelled at once, as before.
+        For an *active* job that runs an endpoint this plugin launched,
+        *stop_endpoint* (``name -> bool``, True when the stop request was
+        sent) asks ORBIT to stop that endpoint first; the job then gets
+        ``_cancel_grace()`` seconds to end on its own.  Only a confirmed end
+        (a terminal state from psij or the batch system) skips
+        ``job.cancel()`` and reports ``graceful: True``; otherwise the job is
+        cancelled as well and the reply carries ``graceful: False``,
+        ``endpoint_stopped: True``.  Other jobs (and calls without
+        *stop_endpoint*) are cancelled at once, as before.
         '''
         job = self._jobs.get(job_id)
         if not job:
@@ -477,6 +481,8 @@ class PSIJSession(PluginSession):
         # Record intent *before* calling cancel() so any status update
         # that races with qdel gets mapped through _effective_state -- but
         # not for a job already finished: its final state stands
+        sent    = False
+        outcome = None
         if self._job_states.get(job_id) not in TERMINAL_STATES:
             self._cancelled_jobs.add(job_id)
 
@@ -484,7 +490,12 @@ class PSIJSession(PluginSession):
             name  = meta.get('endpoint_name') if meta.get('endpoint_owned') \
                     else None
             grace = _cancel_grace() if name and stop_endpoint else 0
-            sent  = False
+            # A job that is not running cannot have registered the endpoint
+            # under that name: whatever holds the name is not ours.
+            if grace > 0 and not await self._job_active(job_id):
+                log.info("[psij] cancel job %s: not running, endpoint %s not "
+                         "stopped through ORBIT", job_id, name)
+                grace = 0
             if grace > 0:
                 try:
                     sent = bool(stop_endpoint(name))
@@ -494,57 +505,87 @@ class PSIJSession(PluginSession):
             if sent:
                 log.info("[psij] cancel job %s: asked ORBIT to stop endpoint "
                          "%s, waiting up to %.0f s", job_id, name, grace)
-                if await self._wait_final(job_id, grace):
+                outcome = await self._wait_final(job_id, grace)
+                if outcome == 'ended':
                     log.info("[psij] cancel job %s: endpoint %s stopped, job "
                              "ended without a batch cancel", job_id, name)
                     return {"job_id": job_id, "status": "canceled",
                             "graceful": True}
-                log.warning("[psij] cancel job %s: still running %.0f s after "
-                            "stopping endpoint %s -- cancelling the job",
-                            job_id, grace, name)
+                if outcome == 'gone':
+                    log.info("[psij] cancel job %s: left the queue after "
+                             "stopping endpoint %s (end not confirmed) -- "
+                             "cancelling it anyway", job_id, name)
+                else:
+                    log.warning("[psij] cancel job %s: still running %.0f s "
+                                "after stopping endpoint %s -- cancelling the "
+                                "job", job_id, grace, name)
         try:
             job.cancel()
-            return {"job_id": job_id, "status": "canceled"}
         except Exception as e:
-            log.exception("Job cancellation failed: %s", e)
-            raise HTTPException(status_code=500, detail=str(e)) from e
+            if outcome != 'gone':
+                log.exception("Job cancellation failed: %s", e)
+                raise HTTPException(status_code=500, detail=str(e)) from e
+            log.info("[psij] cancel job %s: batch cancel failed, job likely "
+                     "gone already: %s", job_id, e)
+        ret = {"job_id": job_id, "status": "canceled"}
+        if sent:
+            ret.update(graceful=False, endpoint_stopped=True)
+        return ret
 
-    async def _wait_final(self, job_id: str, grace: float) -> bool:
-        """Wait up to *grace* seconds for *job_id* to end; True if it did.
-
-        psij notices a batch job's end only at its queue poll (30 s by
-        default), so the batch system is asked directly as well -- but only
-        when the job went through the detected backend's executor (the
-        native id of a ``local`` job is a pid, not a batch job id)."""
-        job     = self._jobs[job_id]
+    def _batch_backend(self, job_id: str):
+        """The detected batch backend if *job_id* went through its executor
+        (the native id of a ``local`` job is a pid, not a batch job id),
+        else None."""
         meta    = self._job_meta.get(job_id, {})
         backend = batch_system.detect_batch_system()
-        native  = job.native_id
-        batch   = native is not None \
-                  and backend.psij_executor == meta.get('executor') \
-                  and backend.psij_executor != 'local'
+        if self._jobs[job_id].native_id is not None \
+                and backend.psij_executor == meta.get('executor') \
+                and backend.psij_executor != 'local':
+            return backend
+        return None
+
+    async def _job_active(self, job_id: str) -> bool:
+        """Running now: psij says ACTIVE, or (psij polls the queue only every
+        30 s) the batch system says RUNNING."""
+        job = self._jobs[job_id]
+        if _normalize_state(job.status.state) == 'ACTIVE':
+            return True
+        backend = self._batch_backend(job_id)
+        return backend is not None and await asyncio.to_thread(
+            backend.job_state, job.native_id) == batch_system.STATE_RUNNING
+
+    async def _wait_final(self, job_id: str, grace: float) -> 'str | None':
+        """Wait up to *grace* seconds for *job_id* to end.
+
+        Returns ``'ended'`` for a terminal state from psij or the batch
+        system, ``'gone'`` when the batch system lost the job after having
+        seen it (``UNKNOWN`` ``UNKNOWN_TOLERANCE`` times in a row: squeue
+        drops a finished job from its default listing at once on Perlmutter,
+        but also answers UNKNOWN when it fails -- so not a confirmed end),
+        and None on timeout.  psij notices a batch job's end only at its
+        queue poll (30 s by default), hence the batch system is asked too."""
+        job      = self._jobs[job_id]
+        backend  = self._batch_backend(job_id)
         deadline = time.monotonic() + grace
         seen     = False      # batch state other than UNKNOWN seen
         unknown  = 0          # consecutive UNKNOWN polls after that
         while True:
             if _normalize_state(job.status.state) in TERMINAL_STATES:
-                return True
-            if batch:
-                state = await asyncio.to_thread(backend.job_state, native)
+                return 'ended'
+            if backend is not None:
+                state = await asyncio.to_thread(backend.job_state,
+                                                job.native_id)
                 if state in batch_system.TERMINAL_STATES:
-                    return True
-                # squeue drops a finished job from its default listing at
-                # once (Perlmutter): gone from the queue counts as ended,
-                # as in the tunnel watchers
+                    return 'ended'
                 if state != batch_system.STATE_UNKNOWN:
                     seen, unknown = True, 0
                 elif seen:
                     unknown += 1
                     if unknown >= UNKNOWN_TOLERANCE:
-                        return True
+                        return 'gone'
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return False
+                return None
             await asyncio.sleep(min(CANCEL_POLL, remaining))
 
     async def close(self) -> dict:

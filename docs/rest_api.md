@@ -107,7 +107,7 @@ Namespace: `psij`
 | `POST` | `submit/{sid}` | Submit a job. Body: `{"job_spec": {...}, "executor": "slurm"}` |
 | `GET` | `status/{sid}/{job_id}` | Job status and output. Query params: `stdout_offset`, `stderr_offset` for streaming |
 | `GET` | `list_jobs/{sid}` | All jobs in the session. Returns `{"jobs": [...]}` |
-| `POST` | `cancel/{sid}/{job_id}` | Cancel a job. Returns `{"job_id": ..., "status": "canceled"}` (plus `"graceful": true` for an endpoint job that ended without a batch cancel, see below) |
+| `POST` | `cancel/{sid}/{job_id}` | Cancel a job. Returns `{"job_id": ..., "status": "canceled"}` (plus `graceful` / `endpoint_stopped` for an endpoint job stopped through ORBIT, see below) |
 | `POST` | `submit_tunneled/{sid}` | Submit a job that starts a child ORBIT endpoint. Body as `submit`, plus `"tunnel": "none"\|"forward"\|"reverse"`; `job_spec.arguments` must hold `-n <endpoint_name>`. Returns `job_id`, `native_id`, `endpoint_name` |
 
 **Endpoint jobs** (submitted through `submit_tunneled`):
@@ -117,14 +117,23 @@ Namespace: `psij`
   `/endpoint/disconnect/{name}` uses: the broker removes the endpoint and sends
   it `terminate`; the endpoint runs `on_host_stop` and exits), then waits up
   to `$RADICAL_ORBIT_PSIJ_CANCEL_GRACE` seconds (default 30, `0` disables the
-  step; read by the psij host at each cancel) for the job to end, and only
-  then cancels the job (`scancel`/`qdel`). A plain batch cancel signals every
+  step; read by the psij host at each cancel) for the job to end. Only a
+  confirmed end (a terminal state from psij or the batch system) skips the
+  batch cancel (`"graceful": true`); on timeout, or when the job merely left
+  the queue listing (which a failing `squeue` looks like too), the job is
+  cancelled (`scancel`/`qdel`) anyway (`"graceful": false,
+  "endpoint_stopped": true`). A plain batch cancel signals every
   process of the job at once, so the endpoint never unregistered (the broker
   dropped it only by heartbeat timeout) and Dragon tore down uncleanly. The
   step is skipped -- immediate batch cancel, as for any other job -- when the
-  endpoint is not connected (job still pending, or already gone), when an
+  job is not running (psij `ACTIVE` or batch `RUNNING`; a queued job cannot
+  have registered the endpoint, so whatever holds the name is not ours), when
+  the endpoint is not connected (job still pending, or already gone), when an
   endpoint of that name was already connected at submit time (not this
-  job's), or for the host's own name. psij on an endpoint sends the control
+  job's), or for the host's own name. Ownership is by name only: endpoints
+  do not advertise their batch job id, so two running jobs with the same
+  `-n` are not told apart (binding the endpoint to the job id is a
+  follow-up). psij on an endpoint sends the control
   over its broker connection; psij hosted on a broker calls the broker
   directly.
 - *Output kept.* Job stdout/stderr live under
