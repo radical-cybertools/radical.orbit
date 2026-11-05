@@ -745,9 +745,9 @@ def test_cancel_endpoint_job_left_the_queue(mock_psij, monkeypatch,
                                             cancel_fails):
     '''UNKNOWN after RUNNING, UNKNOWN_TOLERANCE times in a row: the job left
     the queue -- or squeue failed (it answers UNKNOWN then, too).  Not a
-    confirmed end: job.cancel() still runs (its error swallowed, the job is
-    likely gone), and the reply says graceful False.  The trailing RUNNING
-    is the squeue-outage case: the job was alive all along.'''
+    confirmed end: job.cancel() still runs, and the reply says graceful
+    False.  The trailing RUNNING is the squeue-outage case: the job was alive
+    all along -- so a failing cancel is reported (500), not swallowed.'''
     from radical.orbit import plugin_psij as m
     monkeypatch.setattr(m, 'CANCEL_POLL', 0.01)
     backend = MagicMock()
@@ -761,12 +761,15 @@ def test_cancel_endpoint_job_left_the_queue(mock_psij, monkeypatch,
                                                 executor='slurm')
     rt.connected.add('child-ep')
     if cancel_fails:
-        job.cancel.side_effect = RuntimeError('scancel: invalid job id')
+        job.cancel.side_effect = RuntimeError('scancel: Socket timed out')
 
     resp = client.post(f"{plugin.namespace}/cancel/{sid}/{job.id}")
-    assert resp.status_code == 200
-    assert resp.json() == {'job_id': job.id, 'status': 'canceled',
-                           'graceful': False, 'endpoint_stopped': True}
+    if cancel_fails:
+        assert resp.status_code == 500
+    else:
+        assert resp.status_code == 200
+        assert resp.json() == {'job_id': job.id, 'status': 'canceled',
+                               'graceful': False, 'endpoint_stopped': True}
     assert rt.disconnects == ['child-ep']
     job.cancel.assert_called_once()
     assert backend.job_state.call_count == 5

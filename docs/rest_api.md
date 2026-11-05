@@ -122,7 +122,8 @@ Namespace: `psij`
   batch cancel (`"graceful": true`); on timeout, or when the job merely left
   the queue listing (which a failing `squeue` looks like too), the job is
   cancelled (`scancel`/`qdel`) anyway (`"graceful": false,
-  "endpoint_stopped": true`). A plain batch cancel signals every
+  "endpoint_stopped": true`); if that cancel fails, the call fails (500) as
+  for any job. A plain batch cancel signals every
   process of the job at once, so the endpoint never unregistered (the broker
   dropped it only by heartbeat timeout) and Dragon tore down uncleanly. The
   step is skipped -- immediate batch cancel, as for any other job -- when the

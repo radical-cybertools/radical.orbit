@@ -522,11 +522,11 @@ class PSIJSession(PluginSession):
         try:
             job.cancel()
         except Exception as e:
-            if outcome != 'gone':
-                log.exception("Job cancellation failed: %s", e)
-                raise HTTPException(status_code=500, detail=str(e)) from e
-            log.info("[psij] cancel job %s: batch cancel failed, job likely "
-                     "gone already: %s", job_id, e)
+            # also after 'gone': cancelling an ended job is a no-op for psij
+            # (final state) and scancel -Q, so an error here is a real failure
+            # (e.g. the slurmctld outage that made squeue answer UNKNOWN)
+            log.exception("Job cancellation failed: %s", e)
+            raise HTTPException(status_code=500, detail=str(e)) from e
         ret = {"job_id": job_id, "status": "canceled"}
         if sent:
             ret.update(graceful=False, endpoint_stopped=True)
