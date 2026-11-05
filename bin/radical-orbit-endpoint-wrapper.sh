@@ -164,10 +164,13 @@ if [ "$USE_DRAGON" = "yes" ]; then
 
     # explicit stdin: an async list would otherwise get /dev/null.  An async
     # list also starts with INT/QUIT ignored (no job control), which dragon's
-    # local children would inherit: restore them before the exec.
-    ( trap - INT QUIT
-      exec "$DRAGON_PATH" $ARGS "$BINDIR/radical-orbit-endpoint.py" "$@"
-    ) <&0 &
+    # local children would inherit; ``trap -`` cannot undo that in every sh
+    # (dash), so python restores the defaults right before the exec.
+    "$PYTHON_PATH" -c 'import os, signal, sys
+for s in (signal.SIGINT, signal.SIGQUIT):
+    signal.signal(s, signal.SIG_DFL)
+os.execv(sys.argv[1], sys.argv[1:])' \
+        "$DRAGON_PATH" $ARGS "$BINDIR/radical-orbit-endpoint.py" "$@" <&0 &
     CHILD=$!
     while :; do
         TRAPPED=""
