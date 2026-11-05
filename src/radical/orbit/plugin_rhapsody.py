@@ -23,6 +23,7 @@ from fastapi import FastAPI, HTTPException, Request
 
 from .plugin_session_base import PluginSession, _takes_session
 from .plugin_base import Plugin, DEFAULT_SID
+from .plugin_base import resolve_frame_cap as _resolve_frame_cap
 from .client import PluginClient
 from .protocol import FRAME_CAP
 
@@ -189,30 +190,6 @@ def _payload_size(payload: dict) -> int:
         else:
             size += len(str(k)) + 16
     return size
-
-
-def _resolve_frame_cap(app) -> int:
-    """Resolve the effective transport frame cap for this plugin host.
-
-    ``protocol.FRAME_CAP`` is only the default: the serving runtime packs
-    with its own ``frame_cap`` tunable (``EndpointRuntime._frame_cap``), so a
-    lower configured cap must shrink the plugin's budgets too — otherwise an
-    "allowed" result or batch still overruns the real transport limit and the
-    frame is dropped.  The runtime is reached through the established
-    ``app.state.endpoint_service`` handle (same one ``_create_session`` uses
-    for the profiler); hosts without one (broker plugin host, tests) fall
-    back to the protocol default.
-
-    Known limitation: only the *local* cap is discoverable.  The broker's cap
-    is configurable as well and is not advertised in the handshake
-    (``RegisterAck`` carries no tuning), so a broker configured below its
-    endpoints can still reject a frame this budget allows.
-    """
-    svc = getattr(getattr(app, 'state', None), 'endpoint_service', None)
-    cap = getattr(svc, '_frame_cap', None)
-    if isinstance(cap, int) and cap > 0:
-        return cap
-    return FRAME_CAP
 
 
 def _resolve_notify_window() -> float:

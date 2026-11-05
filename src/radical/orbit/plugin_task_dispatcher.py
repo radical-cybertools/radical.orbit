@@ -53,11 +53,11 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 
 from .client                            import PluginClient
-from .plugin_base                       import Plugin
+from .plugin_base                       import Plugin, resolve_frame_cap
 from .plugin_session_base               import PluginSession
 from .plugin_rhapsody                   import (
     RhapsodyClient, RhapsodySession, WS_PAYLOAD_LIMIT, NOTIFY_BATCH_SIZE,
-    _payload_size, _resolve_notify_window, _resolve_frame_cap, BUDGET_RATIO,
+    _payload_size, _resolve_notify_window, BUDGET_RATIO,
 )
 from .task_dispatcher_config            import (
     PoolConfig, PoolMember, PilotSize, PoolConfigError,
@@ -1126,7 +1126,7 @@ class PluginTaskDispatcher(Plugin):
         # write per dirty pool per flush -- the per-task fsync is the
         # dominant latency cost of pool mode.
         self._notify_window       = _resolve_notify_window()
-        self._notify_batch_bytes  = _resolve_frame_cap(app) // BUDGET_RATIO
+        self._notify_batch_bytes  = resolve_frame_cap(app) // BUDGET_RATIO
         self._rh_notify_buf: list[dict]           = []
         self._rh_notify_bytes                     = 0
         self._rh_notify_lock                      = threading.Lock()

@@ -97,6 +97,14 @@ def main():
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, signal_handler)
 
+    # the endpoint wrapper forwards stop signals to this PID (not to a
+    # launcher such as dragon); written once the handlers are in place
+    pidfile = os.environ.get('RADICAL_ORBIT_ENDPOINT_PIDFILE')
+    if pidfile:
+        with open(pidfile + '.tmp', 'w') as f:
+            f.write(f'{os.getpid()}\n')
+        os.replace(pidfile + '.tmp', pidfile)
+
     log.info("Starting ORBIT endpoint (%s)", runtime.broker_url)
 
     try:
@@ -105,6 +113,9 @@ def main():
         # e.g. the broker restarted with a new token and the reconnect is
         # rejected.  Sitting silently would burn the job's walltime.
         while not stop.wait(timeout=5):
+            if runtime.terminated:
+                log.info("Terminated by the broker")
+                break
             if runtime.fatal:
                 reason = runtime.fatal_reason or 'transport failed fatally'
                 log.error("Endpoint giving up: %s", reason)
@@ -120,6 +131,10 @@ def main():
         log.info("Endpoint stopping")
         runtime.stop()
         log.info("Endpoint stopped")
+        if pidfile:
+            try:    os.unlink(pidfile)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
