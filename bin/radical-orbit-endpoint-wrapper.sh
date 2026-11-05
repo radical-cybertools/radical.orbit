@@ -162,8 +162,12 @@ if [ "$USE_DRAGON" = "yes" ]; then
     trap 'forward TERM' TERM HUP
     trap 'forward INT'  INT
 
-    # explicit stdin: an async list would otherwise get /dev/null
-    "$DRAGON_PATH" $ARGS "$BINDIR/radical-orbit-endpoint.py" "$@" <&0 &
+    # explicit stdin: an async list would otherwise get /dev/null.  An async
+    # list also starts with INT/QUIT ignored (no job control), which dragon's
+    # local children would inherit: restore them before the exec.
+    ( trap - INT QUIT
+      exec "$DRAGON_PATH" $ARGS "$BINDIR/radical-orbit-endpoint.py" "$@"
+    ) <&0 &
     CHILD=$!
     while :; do
         TRAPPED=""

@@ -151,6 +151,8 @@ def on_term(signum, frame):
         f.write(signal.Signals(signum).name)
     sys.exit(7)
 signal.signal(signal.SIGTERM, on_term)
+with open(os.path.join(marks, 'sigint'), 'w') as f:  # not inherited SIG_IGN
+    f.write(str(signal.getsignal(signal.SIGINT) is signal.default_int_handler))
 open(os.path.join(marks, 'started'), 'w').close()
 time.sleep(float(os.environ['PID_DELAY']))
 pidfile = os.environ['RADICAL_ORBIT_ENDPOINT_PIDFILE']
@@ -199,3 +201,4 @@ def test_dragon_path_forwards_term_to_the_endpoint(fake_venv, tmp_path,
     assert not (marks / "launcher").exists()
     assert "forwarded SIGTERM to the endpoint" in err
     assert not Path((marks / "pidfile").read_text()).exists()   # cleaned
+    assert (marks / "sigint").read_text() == "True"   # INT not ignored
