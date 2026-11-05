@@ -36,6 +36,20 @@ Default: `attach` when `$DRAGON_ATTACH_TOKEN` is set, else `start`.  The
 All Dragon calls run on one dedicated thread: concurrent DDict calls from
 several threads hang in dragonhpc 0.15.0.
 
+**Multi-node runtimes under Slurm.** Start the endpoint under `dragon -m`
+from the batch script or an interactive `salloc` shell, not from inside an
+`srun` step. Inside a step, Slurm narrows `SLURM_JOB_NODELIST` to the step's
+nodes, so the launcher's own `srun` only sees those nodes. If you must
+launch from a step, first re-export the job's node list and drop the step
+variables (see `benchmarks/2026-11-dragon-ddict/step_env.sh`).
+
+**Stopping.** Send SIGTERM to the endpoint process only. The endpoint then
+destroys its DDicts and exits, and the launcher tears the runtime down. A
+signal to the `dragon` launcher itself (e.g. `pkill -f` on the endpoint
+script name, which also matches the launcher's command line) kills the
+runtime under the endpoint. That leaves DDict processes and `/dev/shm`
+pools behind (see the benchmark README, "Teardown").
+
 ## DDicts
 
 DDicts belong to the plugin, not to the session that created them: like

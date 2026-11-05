@@ -73,6 +73,53 @@ client (plain python, EndpointRuntime)        broker (compute node 0, or login n
 The no-op round trips (p50): `ddict/list` takes 1.05 ms, and `keys` takes
 3.57 ms. The figures use 200 samples per point.
 
+### F1b: latency vs WebSocket compression (PR #159, 2026-11-05)
+
+![F1b](figs/F1b_latency_compression.png)
+
+This rerun of F1 uses the compression switch from PR #159
+(`feature/ws-compression-switch` at `0150898`), trial-merged locally onto
+this branch; the merge is not pushed. Each configuration sets
+`RADICAL_ORBIT_WS_COMPRESSION` for both the endpoint and the client. The
+broker accepts deflate by default.
+
+| | |
+|---|---|
+| Allocation | 3 CPU nodes (job 60867609): broker on node 0, latency client on node 1, endpoint on node 2 under `dragon -s` |
+| Hops | client → broker → endpoint, each on its own node, as in F1 |
+| Endpoint | a fresh endpoint and DDict per configuration |
+| Samples | 200 per size, as in F1 |
+| Script | `wscomp_bench.sh` |
+
+p50 per call, put / get (ms):
+
+| value | off | on (deflate level 1) | auto |
+|---|---|---|---|
+| 64 B    | 1.47 / 1.37   | 1.55 / 1.45   | 1.35 / 1.28   |
+| 1 KiB   | 1.46 / 1.37   | 1.53 / 1.46   | 1.37 / 1.29   |
+| 16 KiB  | 1.70 / 1.64   | 3.81 / 3.69   | 1.55 / 1.53   |
+| 256 KiB | 6.07 / 6.86   | 25.2 / 26.1   | 6.01 / 6.59   |
+| 1 MiB   | 16.2 / 18.7   | 89.2 / 91.2   | 16.0 / 17.9   |
+
+- **`auto` resolved to off on both hops.** The client measured a 1.0 ms
+  TCP connect time and the endpoint 1.1 ms, against the 10 ms threshold
+  (`data/wscomp/decision-log.txt`):
+  `[Runtime] ws_compression=auto: connect 1.1 ms (threshold 10.0 ms) -> deflate off`.
+  Its numbers match `off`.
+- **`off` matches the first run's nodeflate diagnostic** (1 MiB 16.3 /
+  18.7 ms). Large values are 5–6× faster than with deflate, and values up
+  to 1 KiB are unchanged.
+- **`on` (level 1) is only slightly faster than the old hard-wired
+  default** (1 MiB 89 vs 100 ms). On an in-allocation hop, deflate stays
+  expensive for base64 payloads at any level.
+- **The old `nodeflate/sitecustomize.py` patch has no effect on #159.**
+  With deflate on, #159 offers it through `extensions=[...]`, and the patch
+  only forces `compression=None`. A run with `on` plus the patch was
+  therefore identical to `on` (`data/lat-wscomp-nodeflate.json`, not
+  plotted). The first-run curves in F1b stand in as the cross-check.
+- All four endpoint stops (SIGTERM to the endpoint only) finished in 0–1 s.
+  The run took 4:47 on 3 nodes, about 0.24 node-hours.
+
 ### F2: throughput vs batch size (1 client, 1 KiB values)
 
 ![F2](figs/F2_batch.png)
@@ -150,7 +197,7 @@ Other ports were not tested.
    ORBIT change), 1 MiB took 16–19 ms (5.9×) and 256 KiB took 6 ms
    instead of 28 ms. Small-value latency and throughput did not change.
    Recommendation: make compression configurable, or default it off for
-   this traffic. Base64 inside JSON inside msgpack adds a further 4/3 on
+   this traffic. PR #159 does that; see F1b. Base64 inside JSON inside msgpack adds a further 4/3 on
    bytes values.
 3. **Throughput ceiling: the single Dragon thread.** Batching helps up to
    about 256 keys per call. Beyond that, `get_many` levels off at about
@@ -428,7 +475,8 @@ matches the launcher).
 | `step_env.sh` | lets `dragon -m` run from a one-node step (finding 8) |
 | `bench_client.py` | ORBIT client: modes `setup destroy lat batch conc` (`--shared`, `--mpn`) |
 | `native_bench.py` | native DDict baseline (a Dragon program): modes `lat conc replay trend` |
-| `nodeflate/sitecustomize.py` | diagnostic for `k1nd`: no permessage-deflate on ORBIT's `websockets.connect` |
+| `nodeflate/sitecustomize.py` | diagnostic for `k1nd`: no permessage-deflate on ORBIT's `websockets.connect` (no effect with PR #159, see F1b) |
+| `wscomp_bench.sh` | F1b: latency with `RADICAL_ORBIT_WS_COMPRESSION=off/on/auto` (needs the #159 tree on `$TREE`) |
 | `analyze.py` | reduces `data/` to `data/summary.json` and plots F1–F5 into `figs/` |
 | `inv_bench.sh`, `inv2_bench.sh` | put-collapse and teardown investigation (they source `run_bench.sh` for its functions) |
 | `diag/sitecustomize.py` | diagnostic import hook: per Dragon-thread call queue wait, exec time and time in DDict set/get, plus handler time |
@@ -453,6 +501,13 @@ export JOB=<jobid>
 scancel $JOB
 
 python analyze.py $RUNS/data figs
+```
+
+F1b (3 nodes, the #159 switch trial-merged, its `src/` as `$TREE`):
+
+```sh
+export JOB=<jobid> TREE=<trial merge>/src
+./wscomp_bench.sh broker-compute off on auto nodeflate stop
 ```
 
 Investigation (allocation of up to 90 min, the broker on node 0):

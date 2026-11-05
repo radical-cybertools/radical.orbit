@@ -1,0 +1,11 @@
+{
+ "id": "ddict.d043e069",
+ "n_nodes": 1,
+ "mpn": 1,
+ "mem": "8G",
+ "create_s": 2.254223932977766,
+ "mode": "setup",
+ "ep": "ep-wc-auto",
+ "client_host": "nid200178",
+ "broker": "https://nid200177:18432"
+}

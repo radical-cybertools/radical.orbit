@@ -29,6 +29,7 @@ Values are ``bytes`` (base64 on the wire, ~4/3 of the raw size).
 
 import argparse
 import json
+import logging
 import os
 import socket
 import sys
@@ -163,6 +164,9 @@ def main():
     eps  = a.ep.split(',')
     a.ep = eps[rank % len(eps)]
 
+    # $BENCH_CLIENT_LOG=INFO shows e.g. the runtime's ws_compression decision
+    logging.basicConfig(level=os.environ.get('BENCH_CLIENT_LOG', 'WARNING'),
+                        format='%(asctime)s %(levelname)s %(message)s')
     rt = EndpointRuntime()
     rt.start(wait=True)
     try:

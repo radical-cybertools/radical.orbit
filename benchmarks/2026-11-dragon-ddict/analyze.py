@@ -116,6 +116,64 @@ def f1():
     save(fig, 'F1_latency')
 
 
+# -- F1b: latency vs value size, WebSocket compression off / on / auto --------
+def f1b():
+    cfgs = [('off', 'off', BLUE, 'o-'),
+            ('on', 'on (deflate level 1)', VIOLET, 's-'),
+            ('auto', 'auto (resolved: off)', AQUA, 'D--')]
+    runs = {c: load(f'lat-wscomp-{c}.json') for c, *_ in cfgs}
+    # first run (2026-11-04): hard-wired default deflate, and the nodeflate
+    # diagnostic patch; thin reference lines
+    refs = [(load('lat-compute.json'), 'first run: old default deflate',
+             '-.'), (load('lat-nodeflate.json'), 'first run: nodeflate patch',
+                     ':')]
+    nat = load('native-lat.json')
+    if not runs['off']:
+        return
+    sizes = sorted(int(x) for x in runs['off']['sizes'])
+    S['latency_wscomp'] = {c: (r['sizes'] if r else None)
+                           for c, r in runs.items()}
+    fig, axs = plt.subplots(1, 2, figsize=(13, 5.4), sharey=True)
+    for ax, op in zip(axs, ('put', 'get')):
+        for c, lbl, col, st in cfgs:
+            r = runs[c]
+            if r:
+                ax.plot(sizes, [r['sizes'][str(x)][op]['p50_us'] / 1e3
+                                for x in sizes], st, color=col, label=lbl,
+                        lw=1.5 if c == 'nodeflate' else 2)
+        for r, lbl, st in refs:
+            if r:
+                ax.plot(sizes, [r['sizes'][str(x)][op]['p50_us'] / 1e3
+                                for x in sizes], st, color=GRAY, lw=1.3,
+                        label=lbl)
+        if nat:
+            ax.plot(sizes, [nat['sizes'][str(x)][op]['p50_us'] / 1e3
+                            for x in sizes], 'o-', color=ORANGE,
+                    label='native DDict (first run)')
+        ax.set_xscale('log', base=2)
+        ax.set_yscale('log')
+        ax.set_xticks(sizes, ['64 B', '1 KiB', '16 KiB', '256 KiB', '1 MiB'])
+        ax.set_xlabel('value size (bytes, one key per call)')
+        ax.set_title(f"sequential {'update({k: v})' if op == 'put' else 'get(k)'}")
+    axs[0].set_ylabel('p50 latency per call (ms, log)')
+    axs[0].legend(loc='upper left', frameon=False, fontsize=10)
+    fig.suptitle('F1b  ORBIT DDict p50 latency vs WebSocket compression '
+                 '(RADICAL_ORBIT_WS_COMPRESSION, PR #159)', fontsize=15)
+    save(fig, 'F1b_latency_compression')
+    print('| value | ' + ' | '.join(f'{c} put / get (ms)' for c, *_ in cfgs)
+          + ' |')
+    print('|---' * (len(cfgs) + 1) + '|')
+    for x in sizes:
+        cells = []
+        for c, *_ in cfgs:
+            r = runs[c]
+            cells.append('-' if not r else
+                         f"{r['sizes'][str(x)]['put']['p50_us']/1e3:.2f} / "
+                         f"{r['sizes'][str(x)]['get']['p50_us']/1e3:.2f}")
+        print(f'| {x:,} B | ' + ' | '.join(cells) + ' |')
+    print()
+
+
 # -- F2: throughput vs batch size --------------------------------------------
 def f2():
     d = load('batch-compute.json')
@@ -287,7 +345,7 @@ def tables():
 
 
 if __name__ == '__main__':
-    for f in (f1, f2, f3, f4, f5):
+    for f in (f1, f1b, f2, f3, f4, f5):
         try:
             f()
         except Exception as e:                      # keep going: partial data
