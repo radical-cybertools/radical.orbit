@@ -730,6 +730,11 @@ class PoolState:
 QUEUE_WAIT_MAX = 7 * 86400
 
 
+# How long the sessions of a lost endpoint's dropped child clients are
+# remembered for release when it returns (s).
+CHILD_ORPHAN_KEEP = 86400
+
+
 class TaskDispatcherSession(PluginSession):
     '''Session handle — owns this session's pools by lifetime.
 
@@ -1096,6 +1101,12 @@ class PluginTaskDispatcher(Plugin):
         # over the caller), keyed (dst, plugin, backend).  Invalidated for a
         # dst when it goes ``lost``.
         self._child_clients: dict[tuple, Any] = {}
+        # Clients dropped when their endpoint went lost: name -> (time,
+        # [clients]).  Their (ttl=0) sessions are unregistered when the
+        # endpoint is present again; entries older than CHILD_ORPHAN_KEEP
+        # are forgotten (e.g. a pilot child that ended with its job).
+        self._child_orphans: dict[str, tuple[float, list]] = {}
+        self._release_tasks: set[asyncio.Task] = set()
 
         # endpoint_name → set of loaded plugin names, refreshed on every
         # topology change.  Used to auto-resolve a pool's endpoint_name and to
@@ -1402,6 +1413,8 @@ class PluginTaskDispatcher(Plugin):
             except Exception:
                 pass
             self._untap = None
+        if self._release_tasks:     # threads: wait briefly, not cancellable
+            await asyncio.wait(set(self._release_tasks), timeout=5)
         await super().shutdown()
 
     async def _reconcile_overdue_pilots(self, now: float) -> None:
@@ -1503,6 +1516,24 @@ class PluginTaskDispatcher(Plugin):
             return None
         self._child_clients[key] = client
         return client
+
+    def _release_child_sessions(self, dst: str, clients: list) -> None:
+        '''Unregister the sessions of *clients* (dropped when *dst* went
+        lost) in the background, best effort: *dst* is back, and those
+        ``ttl=0`` sessions would otherwise stay until its process exits.'''
+        def _release():
+            for client in clients:
+                try:
+                    client.unregister_session()
+                except Exception as e:
+                    log.debug('[%s] cannot release %s session on %s: %s',
+                              self.instance_name,
+                              getattr(client, '_plugin_name', '?'), dst, e)
+
+        task = asyncio.get_running_loop().create_task(
+            asyncio.to_thread(_release))
+        self._release_tasks.add(task)
+        task.add_done_callback(self._release_tasks.discard)
 
     async def _get_psij_client(self, endpoint_name: str):
         '''Return a caller-backed :class:`PSIJClient` for *endpoint_name*.'''
@@ -2506,10 +2537,22 @@ class PluginTaskDispatcher(Plugin):
                 continue
             if (info or {}).get('liveness') == 'lost':
                 # Drop cached plugin-clients on a lost endpoint so a
-                # reconnecting one re-registers fresh.
-                for key in [k for k in self._child_clients if k[0] == name]:
-                    self._child_clients.pop(key, None)
+                # reconnecting one re-registers fresh; their sessions are
+                # released once it is back (they never idle-expire).
+                cutoff = time.time() - CHILD_ORPHAN_KEEP
+                for n in [n for n, (t, _) in self._child_orphans.items()
+                          if t < cutoff]:
+                    self._child_orphans.pop(n, None)
+                dropped = [self._child_clients.pop(k)
+                           for k in [k for k in self._child_clients
+                                     if k[0] == name]]
+                if dropped:
+                    _, prev = self._child_orphans.get(name, (0, []))
+                    self._child_orphans[name] = (time.time(), prev + dropped)
                 continue
+            if name in self._child_orphans:
+                _, orphans = self._child_orphans.pop(name)
+                self._release_child_sessions(name, orphans)
             plugins = (info or {}).get('plugins', {})
             if isinstance(plugins, dict):
                 plugins = list(plugins.keys())
