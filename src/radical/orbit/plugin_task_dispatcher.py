@@ -100,7 +100,6 @@ _TICK_INTERVAL_SEC = 5.0
 # and idle-expires on its endpoint once its work is done (is_busy).
 _CHILD_SESSION_TTL     = 3600.0
 _CHILD_TOUCH_INTERVAL  = 300.0
-_CHILD_TOUCH_TIMEOUT   = 60.0
 _CHILD_TOUCH_PARALLEL  = 8        # executor threads one touch pass may hold
 
 # Handshake timeout — a pilot that hasn't handshaken in this long is
@@ -737,6 +736,12 @@ class PoolState:
 # without any task running (s): bounds an abandoned pool that keeps
 # resubmitting failing pilots.
 QUEUE_WAIT_MAX = 7 * 86400
+
+
+def _no_route(e: Exception) -> bool:
+    """Whether a child-client call failed for lack of the route (an endpoint
+    of an older release)."""
+    return getattr(e, 'status_code', None) == 404 and 'No route' in str(e)
 
 
 class TaskDispatcherSession(PluginSession):
@@ -1506,6 +1511,10 @@ class PluginTaskDispatcher(Plugin):
         one lives across arbitrarily long idle phases of its pools, and a
         dropped one (*dst* lost, broker restarted) expires on its endpoint
         once its work is done -- never while tasks or jobs still run.
+
+        An endpoint of an older release has no ``touch`` route and expires
+        sessions on idle time alone (no busy check), so there the session
+        is recreated persistent (``ttl=0``), as before, and never touched.
         '''
         if self._broker_caller is None:
             return None
@@ -1514,8 +1523,8 @@ class PluginTaskDispatcher(Plugin):
             return client
         client = self._make_child_client(cls, plugin, dst)
         try:
-            await asyncio.to_thread(client.register_session,
-                                    ttl=_CHILD_SESSION_TTL, **register_kwargs)
+            await asyncio.to_thread(self._register_child, client,
+                                    register_kwargs)
         except Exception as e:
             log.warning('[%s] %s session unavailable on %s: %s',
                         self.instance_name, plugin, dst, e)
@@ -1523,34 +1532,37 @@ class PluginTaskDispatcher(Plugin):
         self._child_clients[key] = client
         return client
 
+    @staticmethod
+    def _register_child(client, register_kwargs: dict) -> None:
+        '''Register *client*'s session with the child idle timeout; on an
+        endpoint without the ``touch`` route (older release) recreate it
+        persistent instead and mark the client untouchable.  Blocking.'''
+        client.register_session(ttl=_CHILD_SESSION_TTL, **register_kwargs)
+        try:
+            client.touch()
+        except Exception as e:
+            if not _no_route(e):
+                return          # a transient failure: the next pass retries
+            client.unregister_session()        # just created, still empty
+            client.register_session(ttl=0, **register_kwargs)
+            client._orbit_persistent = True
+
     async def _touch_child_sessions(self) -> None:
         '''Touch every cached child session (a few in parallel, so a pass
         cannot hold the shared executor), so it does not idle-expire.
 
         A session found ended (410, or 404 "unknown session") -- e.g. its
         endpoint restarted -- is dropped from the cache, so the next use
-        registers a fresh one.  An endpoint without the ``touch`` route
-        (older release: 404 "No route") is kept alive by a reconnect
-        instead, an access there too.  Other failures keep the entry.
+        registers a fresh one.  Other failures keep the entry.  Persistent
+        sessions (older endpoints, see :meth:`_register_child`) are skipped.
+        Each touch is bounded by the broker caller's call timeout.
         '''
         limit = asyncio.Semaphore(_CHILD_TOUCH_PARALLEL)
-
-        def _keep(client):
-            try:
-                client.touch()
-            except Exception as e:
-                if getattr(e, 'status_code', None) == 404 \
-                        and 'No route' in str(e):
-                    client.register_session(sid=client.sid,
-                                            ttl=_CHILD_SESSION_TTL)
-                else:
-                    raise
 
         async def _one(key, client):
             async with limit:
                 try:
-                    await asyncio.wait_for(asyncio.to_thread(_keep, client),
-                                           _CHILD_TOUCH_TIMEOUT)
+                    await asyncio.to_thread(client.touch)
                 except Exception as e:
                     status = getattr(e, 'status_code', None)
                     if status == 410 or (status == 404
@@ -1564,7 +1576,8 @@ class PluginTaskDispatcher(Plugin):
                                  '(kept): %s', self.instance_name, key, e)
 
         await asyncio.gather(*(_one(k, c) for k, c
-                               in list(self._child_clients.items())))
+                               in list(self._child_clients.items())
+                               if getattr(c, '_orbit_persistent', False) is not True))
 
     async def _get_psij_client(self, endpoint_name: str):
         '''Return a caller-backed :class:`PSIJClient` for *endpoint_name*.'''

@@ -816,8 +816,7 @@ class TestPilotSubmitTransport:
         ended.touch.side_effect = _err(410, 'session expired')
         gone.touch.side_effect  = _err(404, 'unknown session id: s')
         flaky.touch.side_effect = _err(504, 'timeout')
-        old.touch.side_effect   = _err(404, 'No route: POST /psij/touch/s')
-        old.sid = 's.old'
+        old._orbit_persistent   = True
         plugin._child_clients.update({('a', 'psij', None): live,
                                       ('b', 'psij', None): ended,
                                       ('c', 'psij', None): gone,
@@ -825,11 +824,34 @@ class TestPilotSubmitTransport:
                                       ('e', 'psij', None): old})
         asyncio.run(plugin._touch_child_sessions())
         live.touch.assert_called_once()
+        old.touch.assert_not_called()                  # persistent: skipped
         assert set(plugin._child_clients) == {('a', 'psij', None),
                                               ('d', 'psij', None),
                                               ('e', 'psij', None)}
-        # an endpoint without the touch route: kept alive by a reconnect
-        assert old.register_session.call_args.kwargs['sid'] == 's.old'
+
+    def test_older_endpoints_get_persistent_child_sessions(self, tmp_path):
+        """An endpoint without the touch route expires sessions on idle
+        time alone: its child session is recreated persistent (ttl=0), as
+        before, and marked so it is never touched."""
+        _, plugin = _make_plugin(tmp_path, broker_caller=MagicMock())
+        client = MagicMock()
+        e = RuntimeError('HTTP 404 — No route: POST /psij/touch/s')
+        e.status_code = 404
+        client.touch.side_effect = e
+        with patch.object(plugin, '_make_child_client', return_value=client):
+            assert asyncio.run(plugin._get_psij_client('ep')) is client
+        ttls = [c.kwargs['ttl'] for c in client.register_session.call_args_list]
+        assert ttls[0] > 0 and ttls[-1] == 0
+        client.unregister_session.assert_called_once()
+        assert client._orbit_persistent is True
+
+    def test_lost_endpoint_drops_its_cached_child_clients(self, tmp_path):
+        _, plugin = _make_plugin(tmp_path, broker_caller=MagicMock())
+        plugin._child_clients[('ep', 'psij', None)]    = MagicMock()
+        plugin._child_clients[('other', 'psij', None)] = MagicMock()
+        asyncio.run(plugin.on_topology_change(
+            {'ep': {'role': 'endpoint', 'plugins': {}, 'liveness': 'lost'}}))
+        assert set(plugin._child_clients) == {('other', 'psij', None)}
 
 
 # ---------------------------------------------------------------------------
