@@ -205,6 +205,20 @@ class BrokerCaller:
                       timeout=timeout),
             self._broker._loop)
 
+    def connected(self, name: str) -> bool:
+        """Whether *name* is a registered participant not marked ``lost``
+        (dict membership reads: safe from the plugin-host thread)."""
+        return name in self._broker.registry \
+               and self._broker._liveness.get(name) != 'lost'
+
+    def disconnect_threadsafe(self, name: str) -> 'concurrent.futures.Future':
+        """Schedule the operator ``disconnect`` of endpoint *name* (remove +
+        ``terminate`` control, as ``/endpoint/disconnect``) on the routing
+        loop.  For broker-hosted plugins; ``plugin_psij`` uses it to stop an
+        endpoint job it launched before cancelling the job."""
+        return asyncio.run_coroutine_threadsafe(
+            self._broker._disconnect(name), self._broker._loop)
+
 
 # ---------------------------------------------------------------------------
 # Broker

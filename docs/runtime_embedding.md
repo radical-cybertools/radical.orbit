@@ -275,5 +275,11 @@ print(psij.get_job_status(result["job_id"]))
 rt.stop()
 ```
 
+A job that starts a child endpoint (`psij.submit_tunneled(...)`) is cancelled
+gracefully: `cancel_job` stops the endpoint through ORBIT first and falls back
+to the batch cancel after `$RADICAL_ORBIT_PSIJ_CANCEL_GRACE` seconds (default
+30); its stdout/stderr survive the session's `close()`. See
+[REST API](rest_api.md#psij-plugin) for the details.
+
 See [REST API](rest_api.md) for the underlying request/response shapes and
 [Plugin Development](plugin_development.md) for the full plugin authoring model.

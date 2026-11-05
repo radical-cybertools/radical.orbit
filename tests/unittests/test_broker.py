@@ -1055,6 +1055,52 @@ async def test_control_disconnect_removes_target(make_broker):
         await broker.shutdown()
 
 
+@pytest.mark.asyncio
+async def test_broker_caller_connected_and_disconnect(make_broker):
+    # the broker seam broker-hosted psij uses to stop an endpoint it launched
+    broker = make_broker()
+    await broker.startup()
+    try:
+        ws1 = FakeWS()
+        await _register(broker, 'e1', ws1)
+        assert broker.caller.connected('e1') is True
+        assert broker.caller.connected('nope') is False
+        await asyncio.wrap_future(broker.caller.disconnect_threadsafe('e1'))
+        assert 'e1' not in broker.registry
+        assert broker.caller.connected('e1') is False
+        assert any(protocol.parse_message(f).kind == 'control'
+                   for f in ws1.sent)
+    finally:
+        await broker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_runtime_disconnect_endpoint_frame(make_broker):
+    # EndpointRuntime.disconnect_endpoint (plugin_psij's graceful cancel)
+    # sends the very control the broker acts on: target removed + terminated
+    from radical.orbit.runtime import EndpointRuntime
+    rt   = EndpointRuntime(broker_url='https://localhost:1', token=None)
+    sent = []
+    rt._enqueue = lambda data, kind: sent.append((data, kind)) or True
+    assert rt.disconnect_endpoint('e1') is True
+    assert sent[0][1] == 'control'
+
+    broker = make_broker()
+    await broker.startup()
+    try:
+        ws1, ws2 = FakeWS(), FakeWS()
+        await _register(broker, 'e1', ws1)
+        await _register(broker, 'e2', ws2)
+        await broker._route_frame('e2', sent[0][0])
+        await asyncio.sleep(0)
+        assert 'e1' not in broker.registry
+        assert any(protocol.parse_message(f).kind == 'control'
+                   for f in ws1.sent)
+        assert ws1.closed == 1000
+    finally:
+        await broker.shutdown()
+
+
 # ---------------------------------------------------------------------------
 # dst=='broker' host round-trip + config wiring
 # ---------------------------------------------------------------------------

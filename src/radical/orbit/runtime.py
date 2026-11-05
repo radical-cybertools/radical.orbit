@@ -1459,6 +1459,25 @@ class EndpointRuntime(PluginHostBase):
                             session=session, ts=0.0, seq=0, data=data)
         self._emit(ev)
 
+    def disconnect_endpoint(self, name: str) -> bool:
+        """Send the broker a ``disconnect`` control for endpoint *name*.
+
+        The broker removes the participant and sends it ``terminate``; its
+        runtime stops (``on_host_stop``) and the endpoint exits.  Same
+        control the gateway's ``/endpoint/disconnect`` drives.  Returns True
+        when the frame was queued for sending (not that the endpoint is
+        gone).  Used by ``plugin_psij`` to stop an endpoint job it launched
+        before cancelling the job.
+        """
+        msg = protocol.Control(src=self._name, dst=protocol.BROKER_NAME,
+                               op='disconnect', data={'name': name})
+        try:
+            data = protocol.pack_message(msg, cap=self._frame_cap)
+        except protocol.ProtocolError as e:
+            log.error("[Runtime] failed to pack disconnect control: %s", e)
+            return False
+        return self._enqueue(data, msg.kind)
+
     # ── topology snapshot access ───────────────────────────────────────
 
     def topology(self) -> Dict[str, Dict[str, Any]]:
