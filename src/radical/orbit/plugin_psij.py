@@ -17,6 +17,7 @@ PluginPSIJ    Registers the plugin with the endpoint, adds URL routes, and wires
 
 import asyncio
 import logging
+import math
 import os
 import pathlib
 import shutil
@@ -94,6 +95,31 @@ _KEEP_PSIJ_FILES = os.environ.get('RADICAL_ORBIT_PSIJ_KEEP_FILES', '').lower() \
 
 # Terminal states that don't need further polling
 TERMINAL_STATES = {'COMPLETED', 'FAILED', 'CANCELED'}
+
+# Graceful cancel of endpoint jobs (``submit_tunneled``): ``cancel_job`` first
+# asks the broker to disconnect the child endpoint (which then unregisters,
+# runs ``on_host_stop`` and exits) and waits up to this many seconds for the
+# job to end before falling back to ``job.cancel()`` (``scancel`` / ``qdel``,
+# which signals every process of the job at once).  ``0`` disables the
+# graceful step.  Resolved per call, like ``$RADICAL_ORBIT_PSIJ_DIR``.
+_CANCEL_GRACE_ENV = 'RADICAL_ORBIT_PSIJ_CANCEL_GRACE'
+CANCEL_GRACE      = 30.0
+CANCEL_POLL       = 1.0     # job-state poll interval within the grace period
+
+
+def _cancel_grace() -> float:
+    raw = os.environ.get(_CANCEL_GRACE_ENV, '').strip()
+    if not raw:
+        return CANCEL_GRACE
+    try:
+        grace = float(raw)
+        if grace < 0 or not math.isfinite(grace):
+            raise ValueError(raw)
+        return grace
+    except ValueError:
+        log.warning("[psij] ignoring invalid $%s=%r, using %.0f s",
+                    _CANCEL_GRACE_ENV, raw, CANCEL_GRACE)
+        return CANCEL_GRACE
 
 
 def _normalize_state(state) -> str:
@@ -225,9 +251,17 @@ class PSIJSession(PluginSession):
             "stderr":    _read_output_file(job, 'stderr_path') if is_terminal else "",
         })
 
-    async def submit_job(self, job_spec_dict: Dict[str, Any], executor_name: str = 'local') -> Dict[str, Any]:
+    async def submit_job(self, job_spec_dict: Dict[str, Any],
+                         executor_name: str = 'local',
+                         endpoint_name: 'str | None' = None,
+                         endpoint_owned: bool = False) -> Dict[str, Any]:
         '''
         Submit a job via PSIJ.
+
+        *endpoint_name* marks a job that runs an ORBIT endpoint
+        (``submit_tunneled``): its output survives :meth:`close`, and with
+        *endpoint_owned* (the name was not connected at submit time)
+        :meth:`cancel_job` may stop that endpoint through ORBIT first.
         '''
         try:
 
@@ -325,6 +359,9 @@ class PSIJSession(PluginSession):
                 'node_count':  attribs.get('node_count'),
                 'duration':    attribs.get('duration'),
             }
+            if endpoint_name:
+                self._job_meta[job.id]['endpoint_name']  = endpoint_name
+                self._job_meta[job.id]['endpoint_owned'] = endpoint_owned
 
             # Register status callback BEFORE submit so no transitions are
             # missed; it shares the dedupe/payload path with the poll loop.
@@ -422,9 +459,20 @@ class PSIJSession(PluginSession):
             })
         return {"jobs": jobs}
 
-    async def cancel_job(self, job_id: str) -> Dict[str, Any]:
+    async def cancel_job(self, job_id: str,
+                         stop_endpoint=None) -> Dict[str, Any]:
         '''
         Cancel a job.
+
+        For an *active* job that runs an endpoint this plugin launched,
+        *stop_endpoint* (``name -> bool``, True when the stop request was
+        sent) asks ORBIT to stop that endpoint first; the job then gets
+        ``_cancel_grace()`` seconds to end on its own.  Only a confirmed end
+        (a terminal state from psij or the batch system) skips
+        ``job.cancel()`` and reports ``graceful: True``; otherwise the job is
+        cancelled as well and the reply carries ``graceful: False``,
+        ``endpoint_stopped: True``.  Other jobs (and calls without
+        *stop_endpoint*) are cancelled at once, as before.
         '''
         job = self._jobs.get(job_id)
         if not job:
@@ -433,18 +481,120 @@ class PSIJSession(PluginSession):
         # Record intent *before* calling cancel() so any status update
         # that races with qdel gets mapped through _effective_state -- but
         # not for a job already finished: its final state stands
+        sent    = False
+        outcome = None
         if self._job_states.get(job_id) not in TERMINAL_STATES:
             self._cancelled_jobs.add(job_id)
+
+            meta  = self._job_meta.get(job_id, {})
+            name  = meta.get('endpoint_name') if meta.get('endpoint_owned') \
+                    else None
+            grace = _cancel_grace() if name and stop_endpoint else 0
+            # A job that is not running cannot have registered the endpoint
+            # under that name: whatever holds the name is not ours.
+            if grace > 0 and not await self._job_active(job_id):
+                log.info("[psij] cancel job %s: not running, endpoint %s not "
+                         "stopped through ORBIT", job_id, name)
+                grace = 0
+            if grace > 0:
+                try:
+                    sent = bool(stop_endpoint(name))
+                except Exception as e:
+                    log.warning("[psij] stopping endpoint %s failed: %s",
+                                name, e)
+            if sent:
+                log.info("[psij] cancel job %s: asked ORBIT to stop endpoint "
+                         "%s, waiting up to %.0f s", job_id, name, grace)
+                outcome = await self._wait_final(job_id, grace)
+                if outcome == 'ended':
+                    log.info("[psij] cancel job %s: endpoint %s stopped, job "
+                             "ended without a batch cancel", job_id, name)
+                    return {"job_id": job_id, "status": "canceled",
+                            "graceful": True}
+                if outcome == 'gone':
+                    log.info("[psij] cancel job %s: left the queue after "
+                             "stopping endpoint %s (end not confirmed) -- "
+                             "cancelling it anyway", job_id, name)
+                else:
+                    log.warning("[psij] cancel job %s: still running %.0f s "
+                                "after stopping endpoint %s -- cancelling the "
+                                "job", job_id, grace, name)
         try:
             job.cancel()
-            return {"job_id": job_id, "status": "canceled"}
         except Exception as e:
+            # also after 'gone': cancelling an ended job is a no-op for psij
+            # (final state) and scancel -Q, so an error here is a real failure
+            # (e.g. the slurmctld outage that made squeue answer UNKNOWN)
             log.exception("Job cancellation failed: %s", e)
             raise HTTPException(status_code=500, detail=str(e)) from e
+        ret = {"job_id": job_id, "status": "canceled"}
+        if sent:
+            ret.update(graceful=False, endpoint_stopped=True)
+        return ret
+
+    def _batch_backend(self, job_id: str):
+        """The detected batch backend if *job_id* went through its executor
+        (the native id of a ``local`` job is a pid, not a batch job id),
+        else None."""
+        meta    = self._job_meta.get(job_id, {})
+        backend = batch_system.detect_batch_system()
+        if self._jobs[job_id].native_id is not None \
+                and backend.psij_executor == meta.get('executor') \
+                and backend.psij_executor != 'local':
+            return backend
+        return None
+
+    async def _job_active(self, job_id: str) -> bool:
+        """Running now: psij says ACTIVE, or (psij polls the queue only every
+        30 s) the batch system says RUNNING."""
+        job = self._jobs[job_id]
+        if _normalize_state(job.status.state) == 'ACTIVE':
+            return True
+        backend = self._batch_backend(job_id)
+        return backend is not None and await asyncio.to_thread(
+            backend.job_state, job.native_id) == batch_system.STATE_RUNNING
+
+    async def _wait_final(self, job_id: str, grace: float) -> 'str | None':
+        """Wait up to *grace* seconds for *job_id* to end.
+
+        Returns ``'ended'`` for a terminal state from psij or the batch
+        system, ``'gone'`` when the batch system lost the job after having
+        seen it (``UNKNOWN`` ``UNKNOWN_TOLERANCE`` times in a row: squeue
+        drops a finished job from its default listing at once on Perlmutter,
+        but also answers UNKNOWN when it fails -- so not a confirmed end),
+        and None on timeout.  psij notices a batch job's end only at its
+        queue poll (30 s by default), hence the batch system is asked too."""
+        job      = self._jobs[job_id]
+        backend  = self._batch_backend(job_id)
+        deadline = time.monotonic() + grace
+        seen     = False      # batch state other than UNKNOWN seen
+        unknown  = 0          # consecutive UNKNOWN polls after that
+        while True:
+            if _normalize_state(job.status.state) in TERMINAL_STATES:
+                return 'ended'
+            if backend is not None:
+                state = await asyncio.to_thread(backend.job_state,
+                                                job.native_id)
+                if state in batch_system.TERMINAL_STATES:
+                    return 'ended'
+                if state != batch_system.STATE_UNKNOWN:
+                    seen, unknown = True, 0
+                elif seen:
+                    unknown += 1
+                    if unknown >= UNKNOWN_TOLERANCE:
+                        return 'gone'
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            await asyncio.sleep(min(CANCEL_POLL, remaining))
 
     async def close(self) -> dict:
         '''
         Close the session and stop polling.
+
+        The output directory is removed -- except the stdout/stderr of
+        endpoint jobs (``submit_tunneled``), which are kept for post-mortem
+        (their paths are logged) and age out with the stale-output cleanup.
         '''
         if self._poll_task:
             self._poll_task.cancel()
@@ -454,8 +604,26 @@ class PSIJSession(PluginSession):
                 pass
             self._poll_task = None
 
+        keep = [jid for jid, meta in self._job_meta.items()
+                if meta.get('endpoint_name')]
+        if keep and self._output_dir.exists():
+            for jid in list(self._jobs):
+                if jid in keep:
+                    continue
+                for ext in ('out', 'err'):
+                    try:
+                        (self._output_dir / f"{jid}.{ext}").unlink(
+                            missing_ok=True)
+                    except Exception as e:
+                        log.debug("Failed to remove output of %s: %s", jid, e)
+            for jid in keep:
+                log.info("[psij] session %s closed: kept output of endpoint "
+                         "job %s (endpoint %s): %s.{out,err}", self.sid, jid,
+                         self._job_meta[jid]['endpoint_name'],
+                         self._output_dir / jid)
+
         # Clean up this session's output directory
-        if self._output_dir.exists():
+        elif self._output_dir.exists():
             try:
                 shutil.rmtree(self._output_dir)
             except Exception as e:
@@ -799,7 +967,44 @@ class PluginPSIJ(Plugin):
     async def cancel_job(self, request: Request) -> dict:
         sid = request.path_params['sid']
         job_id = request.path_params['job_id']
-        return await self._forward(sid, PSIJSession.cancel_job, job_id=job_id)
+        return await self._forward(sid, PSIJSession.cancel_job, job_id=job_id,
+                                   stop_endpoint=self._stop_endpoint)
+
+    def _endpoint_connected(self, name: str) -> bool:
+        """True if *name* is a live participant: asked of the broker when
+        psij is broker-hosted, else of the host runtime's topology."""
+        caller = getattr(self._app.state, 'broker_caller', None)
+        if caller is not None:
+            return caller.connected(name)
+        svc  = getattr(self._app.state, 'endpoint_service', None)
+        topo = getattr(svc, 'topology', None)
+        if not callable(topo):
+            return False
+        info = topo().get(name)
+        return bool(info) and info.get('liveness') != 'lost'
+
+    def _stop_endpoint(self, name: str) -> bool:
+        """Ask the broker to disconnect (and so terminate) endpoint *name*.
+
+        Only called for an endpoint this plugin launched (``submit_tunneled``,
+        name not connected at submit time).  Broker-hosted psij schedules the
+        broker's own disconnect; on an endpoint it sends the broker the
+        ``disconnect`` control.  Returns False -- the caller then cancels the
+        job right away -- when the host has no control path, *name* is the
+        host itself, or *name* is not connected (a pending job, or the
+        endpoint already gone)."""
+        caller = getattr(self._app.state, 'broker_caller', None)
+        svc    = getattr(self._app.state, 'endpoint_service', None)
+        own    = getattr(self._app.state, 'endpoint_name', None)
+        if name == own or not self._endpoint_connected(name):
+            return False
+        if caller is not None:
+            caller.disconnect_threadsafe(name)
+            return True
+        disconnect = getattr(svc, 'disconnect_endpoint', None)
+        if disconnect is None:
+            return False
+        return disconnect(name)
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Endpoint-job submission with optional reverse SSH tunnel
@@ -890,9 +1095,18 @@ class PluginPSIJ(Plugin):
             job_spec = dict(job_spec)
             job_spec['arguments'] = args
 
+        # An endpoint already connected under this name is not ours: cancel
+        # must never stop it (see ``_stop_endpoint``).
+        owned = not self._endpoint_connected(endpoint_name)
+        if not owned:
+            log.warning("[psij] submit_tunneled: endpoint %s is already "
+                        "connected -- cancelling this job will not stop it "
+                        "through ORBIT", endpoint_name)
         resp = await self._forward(sid, PSIJSession.submit_job,
                                    job_spec_dict=job_spec,
-                                   executor_name=executor)
+                                   executor_name=executor,
+                                   endpoint_name=endpoint_name,
+                                   endpoint_owned=owned)
 
         if mode != 'none':
             native_id = resp.get('native_id')
