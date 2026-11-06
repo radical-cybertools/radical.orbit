@@ -1132,3 +1132,21 @@ async def test_shutdown_does_not_drain():
     await asyncio.wait_for(plugin.shutdown(), 1)       # no 30 s drain
     assert not plugin._sessions
     req.cancel()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cuts_a_close_already_draining():
+    plugin  = await _plugin_with("s1")
+    entered = asyncio.Event()
+
+    async def _stuck(request):
+        entered.set()
+        await asyncio.sleep(10)
+
+    req = asyncio.ensure_future(plugin._accessing(_stuck)(_sid_request("s1")))
+    await entered.wait()
+    unreg = asyncio.ensure_future(plugin._drop_session("s1"))   # draining
+    await asyncio.sleep(0.01)
+    await asyncio.wait_for(plugin.shutdown(), 1)               # cuts it
+    assert unreg.done() and not plugin._sessions
+    req.cancel()

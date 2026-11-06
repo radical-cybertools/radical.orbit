@@ -80,6 +80,7 @@ class SessionRecord:
     draining:       int             = 0       # in-flight requests a close awaits
     drained:        Optional[asyncio.Event] = None   # set when draining is 0
     close_task:     Optional[asyncio.Future] = None  # the one close
+    skip_drain:     bool            = False   # host shutdown: close now
 
 
 class _LastAccessView:
@@ -428,7 +429,8 @@ class Plugin(object):
             rec = self._records.get(sid) if sid else None
             if sid == DEFAULT_SID and rec is not None and rec.closing:
                 await self._drop_session(sid)   # 'default' is recreated
-                rec = None
+                await self._ensure_default_session()
+                rec = self._records.get(sid)
             if sid and rec is None:
                 text = self._ended_detail(sid)
                 if text:
@@ -930,11 +932,7 @@ class Plugin(object):
                 the detail says why and what to change.
             HTTPException 500: Unexpected error inside the session method.
         """
-        # On-demand creation of the reserved persistent 'default' session
-        # (after a close of it has finished: it is never 'ended').
-        record = self._records.get(sid)
-        if sid == DEFAULT_SID and record is not None and record.closing:
-            await self._drop_session(sid)
+        # On-demand creation of the reserved persistent 'default' session.
         if sid == DEFAULT_SID and sid not in self._sessions:
             await self._ensure_default_session()
 
@@ -970,7 +968,7 @@ class Plugin(object):
                     or self._sessions.get(sid) is not session:
                 log.warning("[%s] %s on session %s failed during its close "
                             "(answered 410): %r", self.instance_name,
-                            func.__name__, sid, e)
+                            func.__name__, sid, e, exc_info=True)
                 raise HTTPException(
                     status_code=410,
                     detail=self._ended_detail(sid)
@@ -1111,30 +1109,35 @@ class Plugin(object):
                 log.warning("[%s] Error closing session %s: %s",
                             self.instance_name, sid, e)
             return True
+        if not drain:                   # also cuts a close already draining
+            rec.skip_drain = True
+            if rec.drained is not None:
+                rec.drained.set()
         if rec.close_task is None:
             rec.closing    = True
             rec.close_task = asyncio.ensure_future(
-                self._close_session(sid, rec, drain))
+                self._close_session(sid, rec))
             # retrieved even if every caller was cancelled
             rec.close_task.add_done_callback(
                 lambda t: t.cancelled() or t.exception())
         return await asyncio.shield(rec.close_task)
 
-    async def _close_session(self, sid: str, rec: SessionRecord,
-                             drain: bool = True) -> bool:
+    async def _close_session(self, sid: str, rec: SessionRecord) -> bool:
         """Drain, close and forget one session (see :meth:`_drop_session`)."""
         session = self._sessions.get(sid)
         try:
-            if drain and rec.draining:
+            if rec.draining and not rec.skip_drain:
                 rec.drained = asyncio.Event()
-                if rec.draining:            # still: none finished meanwhile
+                if rec.draining and not rec.skip_drain:
                     try:
                         await asyncio.wait_for(rec.drained.wait(),
                                                CLOSE_DRAIN_TIMEOUT)
                     except asyncio.TimeoutError:
-                        log.warning("[%s] closing session %s with %d "
-                                    "request(s) still in flight",
-                                    self.instance_name, sid, rec.draining)
+                        pass
+                if rec.draining:
+                    log.warning("[%s] closing session %s with %d "
+                                "request(s) still in flight",
+                                self.instance_name, sid, rec.draining)
             if session is not None:
                 try:
                     await session.close()
@@ -1213,10 +1216,14 @@ class Plugin(object):
                 pass
             except Exception:
                 pass
-        await asyncio.gather(*(self._drop_session(sid, drain=False)
-                               for sid in set(self._sessions)
-                               | set(self._records)),
-                             return_exceptions=True)
+        sids    = list(set(self._sessions) | set(self._records))
+        results = await asyncio.gather(*(self._drop_session(sid, drain=False)
+                                         for sid in sids),
+                                       return_exceptions=True)
+        for sid, res in zip(sids, results):
+            if isinstance(res, BaseException):
+                log.warning("[%s] closing session %s at shutdown failed: %r",
+                            self.instance_name, sid, res)
 
     def _log_routes(self) -> None:
         """Log all registered routes for debugging."""
