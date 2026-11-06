@@ -1,51 +1,63 @@
 import os
 import pathlib
-import shutil
-import tempfile
 
 import pytest
 
 
 # The real ORBIT config/state dir of the invoking user.  It may serve a live
-# deployment, so the suite must never write there (issue #162).  Resolved
-# before HOME is replaced below.
+# deployment, so the unit tests must never write there (issue #162).
 _REAL_ORBIT_DIR = pathlib.Path.home() / '.radical' / 'orbit'
 
-# The whole run sees an empty HOME (set before any radical.orbit module is
-# imported, so home-derived module defaults land there too): no test can
-# write into, or pass only because of files in, the real home directory.
-_REAL_HOME = os.environ.get('HOME')
-_TEST_HOME = tempfile.mkdtemp(prefix='orbit-test-home-')
-os.environ['HOME'] = _TEST_HOME
+# How deep the leak check looks (psij/output/session.* is at depth 3): a
+# live deployment's tree can be large, on a slow shared filesystem.
+_SNAPSHOT_DEPTH = 3
+
+# The empty HOME the unit tests run with (set by _isolate_orbit_dirs).
+_test_home = None
 
 
-def _snapshot(root: pathlib.Path) -> set:
-    """All paths below *root* (relative), or an empty set if it is absent."""
-    if not root.exists():
-        return set()
-    return {str(p.relative_to(root)) for p in root.rglob('*')} | {'.'}
+def _snapshot(root: pathlib.Path, depth: int = _SNAPSHOT_DEPTH) -> set:
+    """Paths below *root* (relative, at most *depth* levels), or an empty
+    set if it is absent."""
+    found = set()
+
+    def _walk(path, rel, level):
+        try:
+            entries = list(os.scandir(path))
+        except OSError:
+            return
+        for e in entries:
+            sub = f'{rel}{e.name}'
+            found.add(sub)
+            if level < depth and e.is_dir(follow_symlinks=False):
+                _walk(e.path, sub + '/', level + 1)
+
+    if root.is_dir():
+        found.add('.')
+        _walk(root, '', 1)
+    return found
 
 
 def pytest_sessionstart(session):
     session.config._orbit_dir_before = _snapshot(_REAL_ORBIT_DIR)
 
 
+@pytest.hookimpl(trylast=True)
 def pytest_sessionfinish(session, exitstatus):
     """Report writes under ``.radical/orbit`` that the redirects missed.
 
-    Two places are checked: the real ``~/.radical/orbit`` (paths the run
+    Runs after the fixture teardown (``trylast``: after pytest's own
+    ``sessionfinish``).  Checks the real ``~/.radical/orbit`` (paths the run
     added) and the test HOME's ``.radical/orbit`` (anything there is a
-    home-derived default no fixture redirects yet).  Fails the run in CI
-    (``$CI`` set); locally it only warns, since a live deployment on the
+    home-derived default no fixture redirects yet).  Fails a passing run in
+    CI (``$CI`` set); locally it only warns, since a live deployment on the
     same host may legitimately add files to the real directory meanwhile.
     """
-    leaked = sorted(_snapshot(pathlib.Path(_TEST_HOME) / '.radical' / 'orbit'))
-    if _REAL_HOME is not None:
-        os.environ['HOME'] = _REAL_HOME
-    shutil.rmtree(_TEST_HOME, ignore_errors=True)
     before = getattr(session.config, '_orbit_dir_before', None)
     added  = sorted(_snapshot(_REAL_ORBIT_DIR) - before) \
              if before is not None else []
+    leaked = sorted(_snapshot(_test_home / '.radical' / 'orbit')) \
+             if _test_home is not None else []
     lines  = [f'{_REAL_ORBIT_DIR}/{p}' for p in added] \
            + [f'<test HOME>/.radical/orbit/{p}' for p in leaked]
     if not lines:
@@ -56,24 +68,31 @@ def pytest_sessionfinish(session, exitstatus):
     reporter = session.config.pluginmanager.get_plugin('terminalreporter')
     if reporter is not None:
         reporter.write_line(msg, red=True)
-    if os.environ.get('CI'):
+    if os.environ.get('CI') and session.exitstatus == pytest.ExitCode.OK:
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 @pytest.fixture(autouse=True, scope='session')
 def _isolate_orbit_dirs(tmp_path_factory):
-    """Point every default under ``~/.radical/orbit`` that the code writes
-    to at a temporary directory (psij output/work dirs, tunnel rendezvous
-    files, dispatcher/federation state and scratch roots).
-
-    Session-scoped, so it is in place before module- and session-scoped
-    fixtures build plugins; tests that need their own directory still patch
-    these per test.
+    """Point the home-derived module defaults under ``~/.radical/orbit`` at
+    an empty test HOME: psij output/work dirs, tunnel rendezvous files,
+    dispatcher/federation state and scratch roots, and the broker cert / key
+    / token files.  Session-scoped, so it is in place before module-scoped
+    fixtures build plugins; tests that need their own files still patch per
+    test.
     """
-    from radical.orbit import tunnel, plugin_task_dispatcher, plugin_federation
-    base = tmp_path_factory.mktemp('orbit-home')
+    global _test_home
+    from radical.orbit import (utils, tunnel, plugin_task_dispatcher,
+                               plugin_federation)
+    _test_home = tmp_path_factory.mktemp('home')
+    base       = tmp_path_factory.mktemp('orbit-state')
+    conf       = _test_home / '.radical' / 'orbit'      # never created
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv('RADICAL_ORBIT_PSIJ_DIR', str(base / 'psij'))
+        mp.setattr(utils, 'DEFAULT_DIR', conf)
+        mp.setattr(utils, 'CERT_FILE',   conf / 'broker_cert.pem')
+        mp.setattr(utils, 'KEY_FILE',    conf / 'broker_key.pem')
+        mp.setattr(utils, 'TOKEN_FILE',  conf / 'broker.token')
         mp.setattr(tunnel, 'RELAY_BASE', base / 'tunnels')
         mp.setattr(plugin_task_dispatcher, '_DEFAULT_STATE_ROOT',
                    base / 'task_dispatcher' / 'state')
@@ -82,6 +101,15 @@ def _isolate_orbit_dirs(tmp_path_factory):
         mp.setattr(plugin_federation, '_DEFAULT_STATE_ROOT',
                    base / 'federation')
         yield
+
+
+@pytest.fixture(autouse=True)
+def _empty_home(monkeypatch):
+    """Each unit test sees the empty test HOME, so none can write into -- or
+    pass only because of files in -- the real home.  Per test, so tests
+    outside this directory (e.g. integration tests in the same run) keep
+    the real HOME."""
+    monkeypatch.setenv('HOME', str(_test_home))
 
 
 @pytest.fixture(autouse=True)
