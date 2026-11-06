@@ -22,7 +22,7 @@ import uuid
 from fastapi import FastAPI, HTTPException, Request
 
 from .plugin_session_base import PluginSession, _takes_session
-from .plugin_base import Plugin, DEFAULT_SID
+from .plugin_base import Plugin, DEFAULT_SID, no_drain
 from .plugin_base import resolve_frame_cap as _resolve_frame_cap
 from .client import PluginClient
 from .protocol import FRAME_CAP
@@ -52,7 +52,6 @@ DATA_NAME_RE = re.compile(r'[A-Za-z0-9_.-]+')
 TERMINAL_STATES     = {'DONE', 'FAILED', 'CANCELED', 'COMPLETED'}
 NOTIFY_BATCH_SIZE   = 1024             # max tasks per bulk notification
 NOTIFY_BATCH_WINDOW = 0.25             # seconds to accumulate before flush
-CLOSE_DRAIN_TIMEOUT = 30.0             # close waits this long for ops in flight
 
 # Both budgets below are halves of the transport frame cap.  The *effective*
 # cap is resolved per plugin from the hosting runtime (see
@@ -235,25 +234,18 @@ class _DataEntry:
         self.stop: asyncio.Future | None = None
 
 
-def _tracked(func):
-    """Count a state-changing session route as in flight while it runs.
+def _requires_init(func):
+    """Run a state-changing session method only on an initialized, open
+    session (409 still initializing, 500 init failed, 410 closing).
 
-    ``close()`` waits (bounded) until no tracked route is in flight before
-    it tears the rhapsody session down, so such a route never sees a half
-    torn-down session.  Read and wait routes stay untracked: a long
-    ``wait_tasks`` must not hold up a close.
+    Requests in flight are drained by the base plugin before a close
+    (``Plugin._drop_session``); the rhapsody wait route is exempt there
+    (``@no_drain``).
     """
     @functools.wraps(func)
     async def wrapper(self, *args, **kwargs):
         self._check_initialized()
-        self._ops += 1
-        self._ops_idle.clear()
-        try:
-            return await func(self, *args, **kwargs)
-        finally:
-            self._ops -= 1
-            if not self._ops:
-                self._ops_idle.set()
+        return await func(self, *args, **kwargs)
     return wrapper
 
 
@@ -299,13 +291,11 @@ class RhapsodySession(PluginSession):
         self._torn_down = False                # teardown took the leftovers
         self._bg: set[asyncio.Future] = set()  # strong refs to shutdown tasks
 
-        # Close coordination: ``_closing`` turns new requests away (410),
-        # tracked routes (``_tracked``) are drained before teardown, and
-        # the teardown itself runs as one shielded task.
+        # Close coordination: ``_closing`` turns new requests and the
+        # background init steps away (410); the teardown runs as one
+        # shielded task.  The base plugin drains requests in flight before
+        # it calls close().
         self._closing    = False
-        self._ops        = 0
-        self._ops_idle   = asyncio.Event()
-        self._ops_idle.set()
         self._close_task: asyncio.Future | None = None
 
         # Async init tracking
@@ -576,7 +566,7 @@ class RhapsodySession(PluginSession):
         deserialized = [self._deserialize_task(td) for td in task_dicts]
         return [rh.BaseTask.from_dict(td) for td in deserialized]
 
-    @_tracked
+    @_requires_init
     async def submit_tasks(self, task_dicts: list[dict]) -> list[dict]:
         """
         Submit a list of tasks.
@@ -1027,7 +1017,7 @@ class RhapsodySession(PluginSession):
                                 detail=f"task {uid} not found")
         return self._sanitize_task(task)
 
-    @_tracked
+    @_requires_init
     async def cancel_task(self, uid: str) -> dict:
         """
         Cancel a running task.
@@ -1051,7 +1041,7 @@ class RhapsodySession(PluginSession):
 
         return {"uid": uid, "status": "canceled"}
 
-    @_tracked
+    @_requires_init
     async def cancel_all_tasks(self) -> dict:
         """
         Cancel all non-terminal tasks in this session.
@@ -1081,7 +1071,7 @@ class RhapsodySession(PluginSession):
 
     # -- data backends -------------------------------------------------------
 
-    @_tracked
+    @_requires_init
     async def data_start(self, kind: str, name: str | None = None,
                          kwargs: dict | None = None) -> dict:
         """
@@ -1238,7 +1228,7 @@ class RhapsodySession(PluginSession):
         self._check_initialized()
         return {"backends": {n: self._data_info(n) for n in list(self._data)}}
 
-    @_tracked
+    @_requires_init
     async def data_shutdown(self, name: str) -> dict:
         """Shut down one data backend of this session."""
         entry = self._data.get(name)
@@ -1269,16 +1259,6 @@ class RhapsodySession(PluginSession):
         return {}
 
     async def _teardown(self) -> None:
-        # let tracked routes in flight finish (bounded), so none of them
-        # sees a half torn-down session
-        if self._ops:
-            try:
-                await asyncio.wait_for(self._ops_idle.wait(),
-                                       CLOSE_DRAIN_TIMEOUT)
-            except asyncio.TimeoutError:
-                log.warning("[%s] closing with %d request(s) still in "
-                            "flight", self._sid, self._ops)
-
         data, self._data = self._data, {}
         leftovers, self._leftovers = self._leftovers, []
         self._torn_down = True
@@ -2346,6 +2326,7 @@ class PluginRhapsody(Plugin):
         return await self._forward(sid, RhapsodySession.submit_tasks,
                                    task_dicts=task_dicts)
 
+    @no_drain                       # a long wait must not hold a close
     async def wait_tasks(self, request: Request) -> dict:
         sid = request.path_params['sid']
         data = await request.json()

@@ -1440,3 +1440,26 @@ async def test_globus_stale_status_does_not_keep_the_session_busy(monkeypatch):
         assert session.is_busy() is False
     finally:
         await session.close()
+
+
+@pytest.mark.asyncio
+async def test_rotation_waits_for_a_closing_session():
+    '''A rotation (register_session on a live sid) that meets a session
+    being closed waits for the close, then sees it gone (the ended path),
+    instead of adopting a credential into it.'''
+    import time as _t
+    from radical.orbit.plugin_base import SessionRecord
+    from radical.orbit.plugin_session_base import PluginSession
+
+    class _Slow(PluginSession):
+        async def close(self):
+            await asyncio.sleep(0.02)
+            return await super().close()
+
+    plugin = PluginGlobus(FastAPI())
+    plugin._sessions['s1'] = _Slow('s1')
+    plugin._records['s1']  = SessionRecord('ttl', 60.0, None, _t.time())
+    close = asyncio.ensure_future(plugin._drop_session('s1'))
+    await asyncio.sleep(0)
+    assert await plugin._live_session('s1') is None
+    assert close.done()

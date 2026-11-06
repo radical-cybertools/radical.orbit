@@ -260,6 +260,18 @@ When `close()` is called on a `PluginSession`:
   handles) and cancels any background polling/watchers
 - The base `super().close()` marks the session inactive
 
+The plugin calls `close()` through one path (unregister, idle expiry,
+shutdown) that coordinates it with requests on the session:
+
+- from the moment the close starts, requests on the session answer **410**
+  "session is closing" (the session stays known until the close finished);
+- `{sid}` requests already running are drained first, bounded by
+  `CLOSE_DRAIN_TIMEOUT` (30 s).  Mark long-blocking route handlers (waits)
+  with `@no_drain` (`from radical.orbit.plugin_base import no_drain`) so
+  they do not hold a close; a call the close then overtakes answers 410;
+- `close()` runs once, in a task a cancelled caller does not interrupt;
+- the expiry sweep and plugin shutdown close sessions concurrently.
+
 ## Notifications
 
 Plugins push real-time notifications that become broker `event` frames.
