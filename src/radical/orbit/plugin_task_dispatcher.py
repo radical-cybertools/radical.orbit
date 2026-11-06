@@ -1106,9 +1106,9 @@ class PluginTaskDispatcher(Plugin):
 
         base               = utils.orbit_dir() / 'task_dispatcher'
         self._state_root   = Path(state_root   or _DEFAULT_STATE_ROOT
-                                  or base / 'state')
+                                  or base / 'state').expanduser()
         self._scratch_root = Path(scratch_root or _DEFAULT_SCRATCH_ROOT
-                                  or base / 'scratch')
+                                  or base / 'scratch').expanduser()
 
         # Broker seam (broker-hosted only): the in-process caller handle and
         # the raw event tap, injected by BrokerPluginHost.  When absent the

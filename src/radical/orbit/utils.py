@@ -57,6 +57,15 @@ def orbit_dir() -> Path:
     return Path.home() / '.radical' / 'orbit'
 
 
+def allowed_bases() -> list:
+    """The roots a user-supplied file path may live under (staging,
+    federation scratch): ``~`` and ``/tmp``, both through ``realpath`` (a
+    platform where ``/tmp`` is a symlink, ``/private/tmp``, must not reject
+    every path).  Per call."""
+    return [os.path.realpath(os.path.expanduser('~')),
+            os.path.realpath('/tmp')]
+
+
 def cert_file() -> Path:
     """Default broker TLS cert file."""
     return Path(CERT_FILE) if CERT_FILE is not None \

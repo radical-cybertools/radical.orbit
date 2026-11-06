@@ -613,16 +613,24 @@ class Broker:
         if Path(cert_path) == utils.cert_file():
             cp_cert = (f'    {mkdir} && scp {host}:'
                        f'{Broker._scp_src(cert_path)} ~/.radical/orbit/')
-            cp_both = (f'    {mkdir} && scp {host}:'
-                       f'{Broker._scp_src(utils.orbit_dir())}'
-                       f'/{{broker_cert.pem,broker.token}} ~/.radical/orbit/')
+            conf = Path(cert_path).parent
+            if utils.token_file() == conf / 'broker.token' \
+                    and Path(cert_path).name == 'broker_cert.pem':
+                cp_both = (f'    {mkdir} && scp {host}:'
+                           f'{Broker._scp_src(conf)}'
+                           f'/{{broker_cert.pem,broker.token}} '
+                           f'~/.radical/orbit/')
+            else:                   # an overridden file: copy each one
+                cp_both = (cp_cert + f' && scp {host}:'
+                           f'{Broker._scp_src(utils.token_file())}'
+                           f' ~/.radical/orbit/broker.token')
         else:
             cp_cert = (f'    {mkdir} && scp {host}:'
                        f'{Broker._scp_src(cert_path)} '
                        f'~/.radical/orbit/broker_cert.pem')
             cp_both = (cp_cert + f' && scp {host}:'
                        f'{Broker._scp_src(utils.token_file())}'
-                       f' ~/.radical/orbit/')
+                       f' ~/.radical/orbit/broker.token')
 
         if not auth_enabled:
             lines += ['', '  On Client and Endpoint:', export_url, cp_cert]

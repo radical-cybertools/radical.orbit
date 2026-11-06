@@ -127,6 +127,15 @@ def _isolate_orbit_dirs(tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _fresh_home(tmp_path_factory, monkeypatch):
+    """Each test gets its own empty HOME (outside its ``tmp_path``), so a
+    file one test leaves under ``~/.radical/orbit`` (a token, a cert)
+    cannot change another's lookups.  Module- and session-scoped fixtures
+    use the session one."""
+    monkeypatch.setenv('HOME', str(tmp_path_factory.mktemp('home')))
+
+
+@pytest.fixture(autouse=True)
 def _reset_batch_system_detection():
     """Every test starts and ends with a clear batch-system detection cache.
 

@@ -17,7 +17,7 @@ from .plugin_base import Plugin
 from .plugin_session_base import PluginSession
 from .client import PluginClient
 from .errors import http_exception
-from .federation_state import allowed_bases
+from .utils import allowed_bases
 
 log = logging.getLogger("radical.orbit")
 
@@ -32,7 +32,7 @@ class StagingSession(PluginSession):
     # Allowed base directories for file operations (resolved via realpath).
     # All requested paths must reside under one of these.
     # Override hook (``None``: ``~`` and ``/tmp``, resolved per session --
-    # :func:`federation_state.allowed_bases`).
+    # :func:`utils.allowed_bases`).
     _ALLOWED_BASES = None
 
     # Env var naming this endpoint's scratch tree.  A task-dispatcher pilot

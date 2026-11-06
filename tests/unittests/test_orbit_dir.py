@@ -28,12 +28,32 @@ def test_overrides_take_precedence(tmp_path, monkeypatch):
 
 
 def test_plugin_defaults_follow_home(tmp_path, monkeypatch):
+    """Every home-derived plugin default resolves from the HOME at the time
+    of use (not at import)."""
+    import asyncio
+    import os
     from radical.orbit.plugin_staging import StagingSession
     from radical.orbit.plugin_task_dispatcher import PluginTaskDispatcher
-    import os
+    from radical.orbit.plugin_federation import PluginFederation
+    from radical.orbit import plugin_psij, plugin_globus
     monkeypatch.setenv('HOME', str(tmp_path))
-    session = StagingSession('s1')
-    assert os.path.realpath(tmp_path) in session._allowed_bases
-    plugin = PluginTaskDispatcher(FastAPI())
-    assert plugin._state_root == \
-        tmp_path / '.radical' / 'orbit' / 'task_dispatcher' / 'state'
+    monkeypatch.delenv('RADICAL_ORBIT_PSIJ_DIR', raising=False)
+    base = tmp_path / '.radical' / 'orbit'
+
+    assert os.path.realpath(tmp_path) in StagingSession('s1')._allowed_bases
+    assert plugin_psij._psij_dir() == base / 'psij'
+
+    td = PluginTaskDispatcher(FastAPI())
+    assert td._state_root   == base / 'task_dispatcher' / 'state'
+    assert td._scratch_root == base / 'task_dispatcher' / 'scratch'
+    asyncio.run(td.shutdown())
+
+    monkeypatch.delenv('RADICAL_ORBIT_FEDERATION_STATE', raising=False)
+    fed = PluginFederation(FastAPI())
+    assert fed._root == base / 'federation'
+
+    (base / 'globus.json').parent.mkdir(parents=True, exist_ok=True)
+    (base / 'globus.json').write_text('{"local_collection": "lc-uuid"}')
+    monkeypatch.setattr(plugin_globus, 'globus_sdk', None)   # no GCP probe
+    monkeypatch.delenv('RADICAL_ORBIT_GLOBUS_COLLECTION', raising=False)
+    assert plugin_globus.detect_local_collection() == 'lc-uuid'
