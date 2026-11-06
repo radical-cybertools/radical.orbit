@@ -1,0 +1,38 @@
+{
+ "procs": 2,
+ "runtime_nodes": 1,
+ "shared": false,
+ "vsize": 1024,
+ "mpn": 1,
+ "ranks": [
+  {
+   "rank": 1,
+   "host": "login20",
+   "put": {
+    "ops": 5991,
+    "elapsed": 3.0003826649626717
+   },
+   "get": {
+    "ops": 8344,
+    "elapsed": 3.0000925039639696
+   }
+  },
+  {
+   "rank": 0,
+   "host": "login20",
+   "put": {
+    "ops": 5993,
+    "elapsed": 3.000022502965294
+   },
+   "get": {
+    "ops": 8350,
+    "elapsed": 3.0002472429769114
+   }
+  }
+ ],
+ "put_ops_s": 3994.3969874819513,
+ "get_ops_s": 5564.351540221681,
+ "mode": "conc",
+ "n_nodes": 1,
+ "host": "login20"
+}

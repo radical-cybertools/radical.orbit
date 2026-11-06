@@ -1,0 +1,4 @@
+nid200056 shm=0 dragon_procs=2
+nid200058 shm=0 dragon_procs=2
+nid200059 shm=0 dragon_procs=2
+nid200057 shm=0 dragon_procs=2

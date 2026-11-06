@@ -35,6 +35,7 @@ from .plugin_task_dispatcher import PluginTaskDispatcher  # noqa: F401
 from .plugin_federation      import PluginFederation      # noqa: F401
 from .plugin_replay      import PluginReplay  # noqa: F401
 from .plugin_lucid       import PluginLucid   # noqa: F401
+from .plugin_dragon      import PluginDragon  # noqa: F401
 
 # Optional plugins with external dependencies.
 try:
