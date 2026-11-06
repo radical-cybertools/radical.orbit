@@ -42,6 +42,7 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
 
+from .                       import utils
 from .task_dispatcher_config import PilotSize, PILOT_SUBMIT, PILOT_ENDPOINT
 from .task_dispatcher_state  import write_json_atomic, read_json
 
@@ -776,15 +777,9 @@ class FederationState:
 # ---------------------------------------------------------------------------
 
 def allowed_bases() -> list[str]:
-    '''Return the roots a federation-written path may live under.
-
-    ``~`` and ``/tmp``, both through ``realpath`` — exactly the
-    ``PluginStaging._ALLOWED_BASES`` rule, resolved the same way so a
-    platform where ``/tmp`` is itself a symlink (``/private/tmp``) does not
-    reject every legitimate path.
-    '''
-    return [os.path.realpath(os.path.expanduser('~')),
-            os.path.realpath('/tmp')]
+    '''The roots a federation-written path may live under: the staging
+    rule, :func:`utils.allowed_bases` (looked up per call).'''
+    return utils.allowed_bases()
 
 
 def validate_scratch_base(path: str, *, field: str = 'scratch_base') -> str:

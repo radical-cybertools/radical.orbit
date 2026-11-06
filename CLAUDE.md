@@ -261,7 +261,7 @@ def on_topology(endpoints):
 rt.register_topology_callback(on_topology)
 
 # Cleanup
-rt.close()
+rt.stop()
 ```
 
 #### Subscribing to notifications (raw SSE)

@@ -55,6 +55,7 @@ import httpx
 
 from fastapi import FastAPI, HTTPException, Request
 
+from .                    import utils
 from .plugin_base         import Plugin, DEFAULT_SID
 from .plugin_session_base import PluginSession
 from .client              import PluginClient
@@ -87,7 +88,8 @@ GLOBUS_WAIT_DONE = GLOBUS_TERMINAL | {'INACTIVE'}
 GLOBUS_STALE_STATUS = 1800
 
 # Local-collection config file (lowest-priority auto-detection source).
-GLOBUS_CONFIG_FILE = '~/.radical/orbit/globus.json'
+# Override hook (``None``: ``~/.radical/orbit/globus.json``, per call).
+GLOBUS_CONFIG_FILE = None
 
 # Upper bound for one call of the server-side ``wait`` route (seconds), kept
 # for direct HTTP callers.  The broker reaps a routed call after
@@ -147,7 +149,8 @@ def detect_local_collection() -> Optional[str]:
             log.debug('[globus] GCP detection failed: %s', exc)
 
     try:
-        path = os.path.expanduser(GLOBUS_CONFIG_FILE)
+        path = os.path.expanduser(GLOBUS_CONFIG_FILE
+                                  or utils.orbit_dir() / 'globus.json')
         if os.path.exists(path):
             with open(path, encoding='utf-8') as f:
                 data = json.load(f)

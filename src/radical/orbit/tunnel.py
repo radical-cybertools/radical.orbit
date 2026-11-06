@@ -35,20 +35,32 @@ import subprocess
 import threading
 import time
 
+from . import utils
+
 log = logging.getLogger('radical.orbit')
 
 
-RELAY_BASE = pathlib.Path.home() / '.radical' / 'orbit' / 'tunnels'
+# Override hook for the rendezvous dir (``None``: ``~/.radical/orbit/tunnels``,
+# resolved per call -- see :func:`relay_base`).
+RELAY_BASE = None
 
 # Matches sshd's "Allocated port N for remote forward to ..." line that
 # OpenSSH 7.6+ prints on stderr when ``-R 0:host:port`` is used.
 _ALLOCATED_PORT_RE = re.compile(r'Allocated port (\d+) for remote forward')
 
 
+def relay_base() -> pathlib.Path:
+    """The rendezvous directory on the shared fs (not created)."""
+    if RELAY_BASE is not None:
+        return pathlib.Path(RELAY_BASE).expanduser()
+    return utils.orbit_dir() / 'tunnels'
+
+
 def relay_dir() -> pathlib.Path:
     """Return (and create) the rendezvous directory on the shared fs."""
-    RELAY_BASE.mkdir(parents=True, exist_ok=True)
-    return RELAY_BASE
+    base = relay_base()
+    base.mkdir(parents=True, exist_ok=True)
+    return base
 
 
 def _rendezvous_path(endpoint_name: str, suffix: str) -> pathlib.Path:

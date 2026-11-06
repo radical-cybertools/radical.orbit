@@ -192,7 +192,7 @@ def test_cert_missing_error_names_broker_file(isolated_dir):
     """The TLS-cert error names the broker cert file."""
     with pytest.raises(ValueError) as ei:
         utils.resolve_broker_cert()
-    assert str(utils.CERT_FILE) in str(ei.value)
+    assert str(utils.cert_file()) in str(ei.value)
 
 
 def test_cert_path_set_but_file_missing(isolated_dir, monkeypatch):
@@ -236,7 +236,7 @@ def test_key_missing_error_names_broker_file(isolated_dir):
     """The TLS-key error names the broker key file."""
     with pytest.raises(ValueError) as ei:
         utils.resolve_broker_key()
-    assert str(utils.KEY_FILE) in str(ei.value)
+    assert str(utils.key_file()) in str(ei.value)
 
 
 def test_key_refuses_world_readable(isolated_dir, self_signed, monkeypatch):

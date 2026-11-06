@@ -17,6 +17,7 @@ from .plugin_base import Plugin
 from .plugin_session_base import PluginSession
 from .client import PluginClient
 from .errors import http_exception
+from . import utils
 
 log = logging.getLogger("radical.orbit")
 
@@ -30,10 +31,9 @@ class StagingSession(PluginSession):
 
     # Allowed base directories for file operations (resolved via realpath).
     # All requested paths must reside under one of these.
-    _ALLOWED_BASES = [
-        os.path.realpath(os.path.expanduser('~')),
-        os.path.realpath('/tmp'),
-    ]
+    # Override hook (``None``: ``~`` and ``/tmp``, resolved per session --
+    # :func:`utils.allowed_bases`).
+    _ALLOWED_BASES = None
 
     # Env var naming this endpoint's scratch tree.  A task-dispatcher pilot
     # is started with it set to its pool member's ``scratch_base``
@@ -47,7 +47,9 @@ class StagingSession(PluginSession):
 
     def __init__(self, sid: str):
         super().__init__(sid)
-        self._allowed_bases = list(self._ALLOWED_BASES)
+        self._allowed_bases = list(self._ALLOWED_BASES
+                                   if self._ALLOWED_BASES is not None
+                                   else utils.allowed_bases())
         scratch = os.environ.get(self._SCRATCH_ENV)
         if scratch:
             base = os.path.realpath(os.path.expanduser(scratch))
