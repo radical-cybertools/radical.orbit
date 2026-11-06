@@ -40,10 +40,40 @@ from typing  import Any, Dict, List, Optional, Tuple
 #  advertised URL from its own (host, port).
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEFAULT_DIR  = Path.home() / '.radical' / 'orbit'
-CERT_FILE    = DEFAULT_DIR / 'broker_cert.pem'
-KEY_FILE     = DEFAULT_DIR / 'broker_key.pem'
-TOKEN_FILE   = DEFAULT_DIR / 'broker.token'
+# The defaults under ``~/.radical/orbit`` are resolved per call, from the
+# current home directory: use the accessors below.  These module attributes
+# are override hooks (``None``: derived); a per-file override wins over a
+# ``DEFAULT_DIR`` override, which wins over the home directory.
+DEFAULT_DIR  = None
+CERT_FILE    = None
+KEY_FILE     = None
+TOKEN_FILE   = None
+
+
+def orbit_dir() -> Path:
+    """The ORBIT config/state root, ``~/.radical/orbit`` (per call)."""
+    if DEFAULT_DIR is not None:
+        return Path(DEFAULT_DIR)
+    return Path.home() / '.radical' / 'orbit'
+
+
+def cert_file() -> Path:
+    """Default broker TLS cert file."""
+    return Path(CERT_FILE) if CERT_FILE is not None \
+        else orbit_dir() / 'broker_cert.pem'
+
+
+def key_file() -> Path:
+    """Default broker TLS key file."""
+    return Path(KEY_FILE) if KEY_FILE is not None \
+        else orbit_dir() / 'broker_key.pem'
+
+
+def token_file() -> Path:
+    """Default broker ingress token file."""
+    return Path(TOKEN_FILE) if TOKEN_FILE is not None \
+        else orbit_dir() / 'broker.token'
+
 
 ENV_URL      = 'RADICAL_ORBIT_BROKER_URL'
 ENV_CERT     = 'RADICAL_ORBIT_BROKER_CERT'
@@ -236,10 +266,10 @@ def resolve_broker_cert(cli: Optional[str] = None) -> Tuple[Path, str]:
     yields a path, ``FileNotFoundError`` if the path does not exist,
     ``ssl.SSLError`` if the file is not a valid cert.
     """
-    path, source = _resolve_path_value(cli, ENV_CERT, CERT_FILE)
+    path, source = _resolve_path_value(cli, ENV_CERT, cert_file())
     if path is None:
         raise ValueError(f"TLS cert required (no CLI arg, ${ENV_CERT} unset, "
-                         f"no file at {CERT_FILE})")
+                         f"no file at {cert_file()})")
     if not path.exists():
         raise FileNotFoundError(f"TLS cert not found: {path}")
     ctx = ssl.create_default_context()
@@ -260,11 +290,11 @@ def resolve_broker_key(cli: Optional[str] = None, *,
 
     Returns ``(path, source)``.
     """
-    path, source = _resolve_path_value(cli, ENV_KEY, KEY_FILE)
+    path, source = _resolve_path_value(cli, ENV_KEY, key_file())
     if path is None:
         raise ValueError(
             f"TLS key required for role='broker' (no CLI arg, "
-            f"${ENV_KEY} unset, no file at {KEY_FILE})")
+            f"${ENV_KEY} unset, no file at {key_file()})")
     if not path.exists():
         raise FileNotFoundError(f"TLS key not found: {path}")
 
@@ -319,7 +349,7 @@ def _read_token_file(path: Optional[Path] = None) -> Optional[str]:
     surface loudly rather than be masked as "no token".
     """
     if path is None:
-        path = TOKEN_FILE
+        path = token_file()
     try:
         text = path.read_text().strip()
     except FileNotFoundError:

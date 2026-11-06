@@ -1334,7 +1334,7 @@ def test_broker_startup_banner_token_file():
     from radical.orbit        import utils
     from radical.orbit.broker import Broker
     forms = ['https://host.example.org:8000', 'https://10.0.0.5:8000']
-    text  = Broker._startup_banner(forms, str(utils.CERT_FILE), 'file', True)
+    text  = Broker._startup_banner(forms, str(utils.cert_file()), 'file', True)
     # copy-paste help exports the env var with the canonical (first) form
     assert 'export RADICAL_ORBIT_BROKER_URL=https://host.example.org:8000' \
            in text
@@ -1360,13 +1360,13 @@ def test_broker_ctor_requires_token_when_auth_on(make_broker, monkeypatch):
     with pytest.raises(ValueError, match='ingress auth token required') as ei:
         make_broker(auth=True)
     assert 'token_urlsafe' in str(ei.value)          # carries TOKEN_RECIPE
-    assert not utils.TOKEN_FILE.exists()             # no write-on-start
+    assert not utils.token_file().exists()             # no write-on-start
 
 
 def test_broker_startup_banner_no_auth():
     from radical.orbit        import utils
     from radical.orbit.broker import Broker
-    text = Broker._startup_banner(['https://h:8000'], str(utils.CERT_FILE),
+    text = Broker._startup_banner(['https://h:8000'], str(utils.cert_file()),
                                   'disabled', False)
     assert 'DISABLED' in text
     # client and endpoint collapse to one cert-only section
@@ -1380,7 +1380,7 @@ def test_broker_startup_banner_env_token():
     # carries an export placeholder, and no scp line mentions the token.
     from radical.orbit        import utils
     from radical.orbit.broker import Broker
-    text = Broker._startup_banner(['https://h:8000'], str(utils.CERT_FILE),
+    text = Broker._startup_banner(['https://h:8000'], str(utils.cert_file()),
                                   'env', True)
     assert 'export RADICAL_ORBIT_BROKER_TOKEN=' in text
     assert '{broker_cert.pem,broker.token}' not in text
@@ -1402,7 +1402,7 @@ def test_broker_startup_banner_empty_forms_no_crash():
     # bootstrap against — status lines only.
     from radical.orbit        import utils
     from radical.orbit.broker import Broker
-    text = Broker._startup_banner([], str(utils.CERT_FILE), 'file', True)
+    text = Broker._startup_banner([], str(utils.cert_file()), 'file', True)
     assert 'On Client' not in text
     assert 'listening' not in text
 

@@ -52,6 +52,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 
+from .                                  import utils
 from .client                            import PluginClient
 from .plugin_base                       import Plugin, resolve_frame_cap
 from .plugin_session_base               import PluginSession
@@ -81,10 +82,10 @@ log = logging.getLogger('radical.orbit')
 # Defaults
 # ---------------------------------------------------------------------------
 
-_DEFAULT_STATE_ROOT  = Path('~/.radical/orbit/task_dispatcher/state'
-                            ).expanduser()
-_DEFAULT_SCRATCH_ROOT = Path('~/.radical/orbit/task_dispatcher/scratch'
-                             ).expanduser()
+# Override hooks (``None``: ``~/.radical/orbit/task_dispatcher/{state,
+# scratch}``, resolved when the plugin is built).
+_DEFAULT_STATE_ROOT   = None
+_DEFAULT_SCRATCH_ROOT = None
 
 # State-directory pruning: a pool directory not backing an active pool AND
 # older than this threshold is removed by the housekeeping tick.
@@ -1103,8 +1104,11 @@ class PluginTaskDispatcher(Plugin):
                  scratch_root: str | os.PathLike | None = None) -> None:
         super().__init__(app, instance_name)
 
-        self._state_root   = Path(state_root   or _DEFAULT_STATE_ROOT)
-        self._scratch_root = Path(scratch_root or _DEFAULT_SCRATCH_ROOT)
+        base               = utils.orbit_dir() / 'task_dispatcher'
+        self._state_root   = Path(state_root   or _DEFAULT_STATE_ROOT
+                                  or base / 'state')
+        self._scratch_root = Path(scratch_root or _DEFAULT_SCRATCH_ROOT
+                                  or base / 'scratch')
 
         # Broker seam (broker-hosted only): the in-process caller handle and
         # the raw event tap, injected by BrokerPluginHost.  When absent the

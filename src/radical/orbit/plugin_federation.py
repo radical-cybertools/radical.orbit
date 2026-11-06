@@ -102,6 +102,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from starlette.responses import JSONResponse
 
+from .                      import utils
 from .client                import PluginClient
 from .plugin_base           import Plugin
 from .plugin_session_base   import PluginSession
@@ -132,7 +133,8 @@ log = logging.getLogger('radical.orbit')
 # only), so a test or a demo isolates the federation the same way it would
 # isolate any other durable store.
 _ENV_STATE_ROOT      = 'RADICAL_ORBIT_FEDERATION_STATE'
-_DEFAULT_STATE_ROOT  = Path('~/.radical/orbit/federation').expanduser()
+# Override hook (``None``: ``~/.radical/orbit/federation``, per plugin).
+_DEFAULT_STATE_ROOT  = None
 
 # The dispatcher instance the federation drives.
 _DISPATCHER_INSTANCE = 'task_dispatcher'
@@ -459,7 +461,8 @@ class PluginFederation(Plugin):
         super().__init__(app, instance_name)
 
         root = Path(state_root or os.environ.get(_ENV_STATE_ROOT)
-                    or _DEFAULT_STATE_ROOT).expanduser()
+                    or _DEFAULT_STATE_ROOT
+                    or utils.orbit_dir() / 'federation').expanduser()
         self._root         = root
         self._state_dir    = root / instance_name
         self._scratch_root = root / 'scratch'
