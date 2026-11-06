@@ -17,7 +17,7 @@ from .plugin_base import Plugin
 from .plugin_session_base import PluginSession
 from .client import PluginClient
 from .errors import http_exception
-from .utils import allowed_bases
+from . import utils
 
 log = logging.getLogger("radical.orbit")
 
@@ -49,7 +49,7 @@ class StagingSession(PluginSession):
         super().__init__(sid)
         self._allowed_bases = list(self._ALLOWED_BASES
                                    if self._ALLOWED_BASES is not None
-                                   else allowed_bases())
+                                   else utils.allowed_bases())
         scratch = os.environ.get(self._SCRATCH_ENV)
         if scratch:
             base = os.path.realpath(os.path.expanduser(scratch))

@@ -776,8 +776,10 @@ class FederationState:
 # Validation
 # ---------------------------------------------------------------------------
 
-# The roots a federation-written path may live under: the staging rule.
-allowed_bases = utils.allowed_bases
+def allowed_bases() -> list[str]:
+    '''The roots a federation-written path may live under: the staging
+    rule, :func:`utils.allowed_bases` (looked up per call).'''
+    return utils.allowed_bases()
 
 
 def validate_scratch_base(path: str, *, field: str = 'scratch_base') -> str:

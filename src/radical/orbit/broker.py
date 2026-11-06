@@ -615,8 +615,7 @@ class Broker:
             cp_cert = (f'    {mkdir} && scp {host}:'
                        f'{Broker._scp_src(cert_path)} ~/.radical/orbit/')
             conf = Path(cert_path).parent
-            if utils.token_file() == conf / 'broker.token' \
-                    and Path(cert_path).name == 'broker_cert.pem':
+            if utils.token_file() == conf / 'broker.token':
                 cp_both = (f'    {mkdir} && scp {host}:'
                            f'{Broker._scp_src(conf)}'
                            f'/{{broker_cert.pem,broker.token}} '
