@@ -59,6 +59,9 @@ _ORBIT_DIR_BEFORE = _snapshot(_REAL_ORBIT_DIR)
 
 _leak_report: 'str | None' = None
 
+_CREDENTIAL_FILES = ('broker.token', 'broker_cert.pem', 'broker_key.pem',
+                     'globus.json')
+
 
 def _ci() -> bool:
     return os.environ.get('CI', '').strip().lower() not in ('', '0', 'false',
@@ -127,12 +130,18 @@ def _isolate_orbit_dirs(tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
-def _fresh_home(tmp_path_factory, monkeypatch):
-    """Each test gets its own empty HOME (outside its ``tmp_path``), so a
-    file one test leaves under ``~/.radical/orbit`` (a token, a cert)
-    cannot change another's lookups.  Module- and session-scoped fixtures
-    use the session one."""
-    monkeypatch.setenv('HOME', str(tmp_path_factory.mktemp('home')))
+def _no_leftover_credentials():
+    """Remove the credential files a test left in the test HOME's
+    ``.radical/orbit`` (a token, cert, key, globus config), so they cannot
+    change a later test's lookups.  Other state there stays: module-scoped
+    fixtures may share it."""
+    yield
+    conf = pathlib.Path(os.environ['HOME']) / '.radical' / 'orbit'
+    for name in _CREDENTIAL_FILES:
+        try:
+            (conf / name).unlink()
+        except (FileNotFoundError, IsADirectoryError):
+            pass
 
 
 @pytest.fixture(autouse=True)

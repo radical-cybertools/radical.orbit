@@ -133,8 +133,6 @@ log = logging.getLogger('radical.orbit')
 # only), so a test or a demo isolates the federation the same way it would
 # isolate any other durable store.
 _ENV_STATE_ROOT      = 'RADICAL_ORBIT_FEDERATION_STATE'
-# Override hook (``None``: ``~/.radical/orbit/federation``, per plugin).
-_DEFAULT_STATE_ROOT  = None
 
 # The dispatcher instance the federation drives.
 _DISPATCHER_INSTANCE = 'task_dispatcher'
@@ -461,7 +459,6 @@ class PluginFederation(Plugin):
         super().__init__(app, instance_name)
 
         root = Path(state_root or os.environ.get(_ENV_STATE_ROOT)
-                    or _DEFAULT_STATE_ROOT
                     or utils.orbit_dir() / 'federation').expanduser()
         self._root         = root
         self._state_dir    = root / instance_name

@@ -53,7 +53,7 @@ TOKEN_FILE   = None
 def orbit_dir() -> Path:
     """The ORBIT config/state root, ``~/.radical/orbit`` (per call)."""
     if DEFAULT_DIR is not None:
-        return Path(DEFAULT_DIR)
+        return Path(DEFAULT_DIR).expanduser()
     return Path.home() / '.radical' / 'orbit'
 
 
@@ -68,19 +68,19 @@ def allowed_bases() -> list:
 
 def cert_file() -> Path:
     """Default broker TLS cert file."""
-    return Path(CERT_FILE) if CERT_FILE is not None \
+    return Path(CERT_FILE).expanduser() if CERT_FILE is not None \
         else orbit_dir() / 'broker_cert.pem'
 
 
 def key_file() -> Path:
     """Default broker TLS key file."""
-    return Path(KEY_FILE) if KEY_FILE is not None \
+    return Path(KEY_FILE).expanduser() if KEY_FILE is not None \
         else orbit_dir() / 'broker_key.pem'
 
 
 def token_file() -> Path:
     """Default broker ingress token file."""
-    return Path(TOKEN_FILE) if TOKEN_FILE is not None \
+    return Path(TOKEN_FILE).expanduser() if TOKEN_FILE is not None \
         else orbit_dir() / 'broker.token'
 
 

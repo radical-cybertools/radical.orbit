@@ -52,7 +52,7 @@ _ALLOCATED_PORT_RE = re.compile(r'Allocated port (\d+) for remote forward')
 def relay_base() -> pathlib.Path:
     """The rendezvous directory on the shared fs (not created)."""
     if RELAY_BASE is not None:
-        return pathlib.Path(RELAY_BASE)
+        return pathlib.Path(RELAY_BASE).expanduser()
     return utils.orbit_dir() / 'tunnels'
 
 

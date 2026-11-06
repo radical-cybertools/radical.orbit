@@ -610,7 +610,8 @@ class Broker:
         # Cert copy: when the cert sits at its default path it keeps its
         # basename; a custom path gets an explicit destination, because
         # connecting hosts resolve ~/.radical/orbit/broker_cert.pem.
-        if Path(cert_path) == utils.cert_file():
+        if Path(cert_path) == utils.cert_file() \
+                and Path(cert_path).name == 'broker_cert.pem':
             cp_cert = (f'    {mkdir} && scp {host}:'
                        f'{Broker._scp_src(cert_path)} ~/.radical/orbit/')
             conf = Path(cert_path).parent
