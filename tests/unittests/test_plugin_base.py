@@ -1150,3 +1150,39 @@ async def test_shutdown_cuts_a_close_already_draining():
     await asyncio.wait_for(plugin.shutdown(), 1)               # cuts it
     assert unreg.done() and not plugin._sessions
     req.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_drained_request_reaches_its_session_during_the_close():
+    '''A request counted before the close started is drained: its own
+    _forward goes through instead of answering 410.'''
+    plugin  = await _plugin_with("s1")
+    release = asyncio.Event()
+
+    async def _late_forward(request):
+        await release.wait()            # e.g. reading the request body
+        return await plugin._forward("s1", PluginSession.ping)
+
+    req   = asyncio.ensure_future(
+        plugin._accessing(_late_forward)(_sid_request("s1")))
+    await asyncio.sleep(0)
+    close = asyncio.ensure_future(plugin._drop_session("s1"))
+    await asyncio.sleep(0)
+    with pytest.raises(HTTPException) as exc:     # a new request: 410
+        await plugin._forward("s1", PluginSession.ping)
+    assert exc.value.status_code == 410
+    release.set()
+    assert (await req) == {}
+    await close
+
+
+@pytest.mark.asyncio
+async def test_no_default_session_is_recreated_during_shutdown():
+    from radical.orbit.plugin_base import DEFAULT_SID
+    plugin = _fresh_plugin()
+    await plugin.register_session(_owned_request({"sid": DEFAULT_SID}))
+    await plugin.shutdown()
+    with pytest.raises(HTTPException) as exc:
+        await plugin.register_session(_owned_request({"sid": DEFAULT_SID}))
+    assert exc.value.status_code == 410
+    assert DEFAULT_SID not in plugin._sessions
