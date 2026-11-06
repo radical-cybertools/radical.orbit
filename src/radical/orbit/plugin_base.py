@@ -426,6 +426,9 @@ class Plugin(object):
         async def _accessed(request):
             sid = (getattr(request, 'path_params', None) or {}).get('sid')
             rec = self._records.get(sid) if sid else None
+            if sid == DEFAULT_SID and rec is not None and rec.closing:
+                await self._drop_session(sid)   # 'default' is recreated
+                rec = None
             if sid and rec is None:
                 text = self._ended_detail(sid)
                 if text:
@@ -654,8 +657,11 @@ class Plugin(object):
         sid    = policy[0]
         rec    = self._records.get(sid) if sid is not None else None
         if rec is not None and rec.closing:
-            raise HTTPException(status_code=410,
-                                detail=self._closing_detail(sid))
+            if sid != DEFAULT_SID:
+                raise HTTPException(status_code=410,
+                                    detail=self._closing_detail(sid))
+            await self._drop_session(sid)       # 'default' is recreated
+            rec = None
         if rec is not None:
             await self._expire_if_due(sid, rec, time.time())
         if sid is not None and sid not in self._records:
@@ -924,7 +930,11 @@ class Plugin(object):
                 the detail says why and what to change.
             HTTPException 500: Unexpected error inside the session method.
         """
-        # On-demand creation of the reserved persistent 'default' session.
+        # On-demand creation of the reserved persistent 'default' session
+        # (after a close of it has finished: it is never 'ended').
+        record = self._records.get(sid)
+        if sid == DEFAULT_SID and record is not None and record.closing:
+            await self._drop_session(sid)
         if sid == DEFAULT_SID and sid not in self._sessions:
             await self._ensure_default_session()
 
@@ -958,6 +968,9 @@ class Plugin(object):
             rec = self._records.get(sid)
             if (rec is not None and rec.closing) \
                     or self._sessions.get(sid) is not session:
+                log.warning("[%s] %s on session %s failed during its close "
+                            "(answered 410): %r", self.instance_name,
+                            func.__name__, sid, e)
                 raise HTTPException(
                     status_code=410,
                     detail=self._ended_detail(sid)
@@ -1074,7 +1087,7 @@ class Plugin(object):
                 f"this is a legitimate use case, please open an issue: "
                 f"{ISSUES_URL}")
 
-    async def _drop_session(self, sid: str) -> bool:
+    async def _drop_session(self, sid: str, drain: bool = True) -> bool:
         """Close and forget one session (record + object).  Idempotent.
 
         The single teardown path shared by unregister / expiry sweep /
@@ -1083,26 +1096,36 @@ class Plugin(object):
         ``CLOSE_DRAIN_TIMEOUT``; ``@no_drain`` routes excepted), then the
         session is closed and forgotten -- all in one task that a cancelled
         caller does not interrupt, and that concurrent callers share.
-        Returns True if a session object was closed.
+        ``drain=False`` (host shutdown: requests are being cancelled, and the
+        host bounds the shutdown) closes without waiting.  Returns True if
+        a session object was closed.
         """
         rec = self._records.get(sid)
-        if rec is None:                             # no record: just close
-            return await self._close_session(sid, None)
+        if rec is None:                 # no record: forget first, then close
+            session = self._sessions.pop(sid, None)
+            if session is None:
+                return False
+            try:
+                await session.close()
+            except Exception as e:
+                log.warning("[%s] Error closing session %s: %s",
+                            self.instance_name, sid, e)
+            return True
         if rec.close_task is None:
             rec.closing    = True
             rec.close_task = asyncio.ensure_future(
-                self._close_session(sid, rec))
+                self._close_session(sid, rec, drain))
             # retrieved even if every caller was cancelled
             rec.close_task.add_done_callback(
                 lambda t: t.cancelled() or t.exception())
         return await asyncio.shield(rec.close_task)
 
-    async def _close_session(self, sid: str,
-                             rec: Optional[SessionRecord]) -> bool:
+    async def _close_session(self, sid: str, rec: SessionRecord,
+                             drain: bool = True) -> bool:
         """Drain, close and forget one session (see :meth:`_drop_session`)."""
         session = self._sessions.get(sid)
         try:
-            if rec is not None and rec.draining:
+            if drain and rec.draining:
                 rec.drained = asyncio.Event()
                 if rec.draining:            # still: none finished meanwhile
                     try:
@@ -1119,7 +1142,7 @@ class Plugin(object):
                     log.warning("[%s] Error closing session %s: %s",
                                 self.instance_name, sid, e)
         finally:
-            if rec is not None and self._records.get(sid) is rec:
+            if self._records.get(sid) is rec:
                 self._records.pop(sid, None)
             if session is not None and self._sessions.get(sid) is session:
                 self._sessions.pop(sid, None)
@@ -1190,8 +1213,9 @@ class Plugin(object):
                 pass
             except Exception:
                 pass
-        await asyncio.gather(*(self._drop_session(sid) for sid in
-                               set(self._sessions) | set(self._records)),
+        await asyncio.gather(*(self._drop_session(sid, drain=False)
+                               for sid in set(self._sessions)
+                               | set(self._records)),
                              return_exceptions=True)
 
     def _log_routes(self) -> None:

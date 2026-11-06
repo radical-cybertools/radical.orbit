@@ -22,7 +22,7 @@ import uuid
 from fastapi import FastAPI, HTTPException, Request
 
 from .plugin_session_base import PluginSession, _takes_session
-from .plugin_base import Plugin, DEFAULT_SID, no_drain
+from .plugin_base import Plugin, DEFAULT_SID
 from .plugin_base import resolve_frame_cap as _resolve_frame_cap
 from .client import PluginClient
 from .protocol import FRAME_CAP
@@ -239,8 +239,7 @@ def _requires_init(func):
     session (409 still initializing, 500 init failed, 410 closing).
 
     Requests in flight are drained by the base plugin before a close
-    (``Plugin._drop_session``); the rhapsody wait route is exempt there
-    (``@no_drain``).
+    (``Plugin._drop_session``).
     """
     @functools.wraps(func)
     async def wrapper(self, *args, **kwargs):
@@ -2326,7 +2325,6 @@ class PluginRhapsody(Plugin):
         return await self._forward(sid, RhapsodySession.submit_tasks,
                                    task_dicts=task_dicts)
 
-    @no_drain                       # a long wait must not hold a close
     async def wait_tasks(self, request: Request) -> dict:
         sid = request.path_params['sid']
         data = await request.json()

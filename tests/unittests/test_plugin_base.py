@@ -1101,3 +1101,34 @@ async def test_sweep_and_shutdown_close_concurrently():
     t2 = time.monotonic()
     assert t1 - t0 < 0.09 and t2 - t1 < 0.09      # 50 ms each, in parallel
     assert not plugin._sessions and not plugin._records
+
+
+@pytest.mark.asyncio
+async def test_default_session_closing_is_recreated_not_410():
+    from radical.orbit.plugin_base import DEFAULT_SID
+    _SlowCloseSession.closes = 0
+    plugin = _fresh_plugin()
+    plugin.session_class = _SlowCloseSession
+    await plugin.register_session(_owned_request({"sid": DEFAULT_SID}))
+    old   = plugin._sessions[DEFAULT_SID]
+    close = asyncio.ensure_future(plugin._drop_session(DEFAULT_SID))
+    await asyncio.sleep(0)
+    data  = await plugin.register_session(_owned_request({"sid": DEFAULT_SID}))
+    assert data["sid"] == DEFAULT_SID
+    assert close.done() and plugin._sessions[DEFAULT_SID] is not old
+
+
+@pytest.mark.asyncio
+async def test_shutdown_does_not_drain():
+    plugin  = await _plugin_with("s1")
+    entered = asyncio.Event()
+
+    async def _stuck(request):
+        entered.set()
+        await asyncio.sleep(10)
+
+    req = asyncio.ensure_future(plugin._accessing(_stuck)(_sid_request("s1")))
+    await entered.wait()
+    await asyncio.wait_for(plugin.shutdown(), 1)       # no 30 s drain
+    assert not plugin._sessions
+    req.cancel()
