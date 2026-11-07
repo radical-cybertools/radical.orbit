@@ -804,12 +804,13 @@ class Broker:
                     self._plugins_list_to_dict(msg.plugins)
                 self._events.restart_sender(name)
                 await self._send(ws, self._ack(True, self._resume_keys[name]))
-                await self._fail_held_for(name)
                 # Close the old socket; its teardown no-ops via the guard.
                 if old is not ws:
                     spawn(self._close_quiet(old), 'broker_close_old')
                 # Broadcast reaches the resumed endpoint too (full topology).
                 await self._broadcast_topology()
+                # Calls that arrived while it was suspect were never sent.
+                await self._fail_held_for(name)
                 return True, name
 
             log.warning("[Broker] name-in-use (no/invalid resume_key): %s", name)
@@ -887,12 +888,7 @@ class Broker:
         call = _Call(src_name, dst, None,
                      self._loop.time() + self._call_timeout)
         self._calls[corr_id] = call
-        if self._liveness.get(dst) == 'suspect':
-            # The socket is gone: writing to it would drop the frame silently.
-            # Hold the call until resume (fails it, retryable) or lost (504).
-            call.held = True
-            return
-        await self._send(target, msgpack.packb(raw, use_bin_type=True))
+        await self._deliver(call, target, msgpack.packb(raw, use_bin_type=True))
 
     async def _route_response(self, src_name: str, raw: dict) -> None:
         corr_id = raw.get('corr_id')
@@ -941,10 +937,7 @@ class Broker:
                      self._loop.time() + self._call_timeout)
         self._calls[corr_id] = call
         try:
-            if self._liveness.get(dst) == 'suspect':
-                call.held = True        # see _route_request
-            else:
-                await self._send(target, data)
+            await self._deliver(call, target, data)
             return await asyncio.wait_for(fut, timeout=timeout)
         except Exception:
             self._calls.pop(corr_id, None)
@@ -1153,6 +1146,17 @@ class Broker:
                 # Requester gone — the response would go nowhere; drop it.
                 self._calls.pop(corr_id, None)
 
+    async def _deliver(self, call: '_Call', target, data: bytes) -> None:
+        """Send a request frame for *call*, or hold the call.
+
+        A frame for a ``suspect`` endpoint, or one whose write fails, would be
+        lost silently: such a call is held instead, and failed on resume
+        (retryable 503) or on lost (504).
+        """
+        if self._liveness.get(call.dst) == 'suspect' \
+                or not await self._send(target, data):
+            call.held = True
+
     async def _fail_held_for(self, name: str) -> None:
         """Fail the calls that arrived while *name* was suspect (never sent).
 
@@ -1174,13 +1178,15 @@ class Broker:
             self._settle_call(call, {
                 'kind': 'response', 'status': status,
                 'src': call.dst, 'dst': BROKER_NAME, 'corr_id': corr_id,
-                'headers': {}, 'body': b'', 'reason': reason})
+                'headers': {'content-type': 'application/json'},
+                'body': error_body(status, reason), 'reason': reason})
         else:
             target = self.registry.get(call.src)
             if target is not None:
                 out = protocol.Response(
                     src=call.dst, dst=call.src, status=status,
-                    body=reason.encode(), corr_id=corr_id)
+                    headers={'content-type': 'application/json'},
+                    body=error_body(status, reason), corr_id=corr_id)
                 await self._send(target, protocol.pack_message(
                     out, cap=self._frame_cap))
 
@@ -1295,13 +1301,16 @@ class Broker:
 
     # ── low-level helpers ─────────────────────────────────────────────
 
-    async def _send(self, ws, data: bytes) -> None:
+    async def _send(self, ws, data: bytes) -> bool:
+        """Write *data* to *ws*; ``False`` if there is no socket or it failed."""
         if ws is None:
-            return
+            return False
         try:
             await ws.send_bytes(data)
+            return True
         except Exception as e:
             log.debug("[Broker] send failed: %s", e)
+            return False
 
     @staticmethod
     async def _close_quiet(ws) -> None:
