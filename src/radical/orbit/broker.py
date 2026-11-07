@@ -804,6 +804,10 @@ class Broker:
                 # endpoint reconnected.
                 held = [cid for cid, c in self._calls.items()
                         if c.dst == name and c.held]
+                # In the background: neither delays the resume nor waits for
+                # its awaits (a drop during them must not see these 503s).
+                if held:
+                    spawn(self._fail_held(held), 'broker_fail_held')
                 self._participants[name]['role'] = msg.role
                 self._participants[name]['plugins'] = \
                     self._plugins_list_to_dict(msg.plugins)
@@ -814,8 +818,6 @@ class Broker:
                     spawn(self._close_quiet(old), 'broker_close_old')
                 # Broadcast reaches the resumed endpoint too (full topology).
                 await self._broadcast_topology()
-                # Calls that arrived while it was suspect were never sent.
-                await self._fail_held(held)
                 return True, name
 
             log.warning("[Broker] name-in-use (no/invalid resume_key): %s", name)
@@ -1175,33 +1177,41 @@ class Broker:
                 await self._fail_call(
                     corr_id, call,
                     'endpoint reconnected; a request sent while it was '
-                    'disconnected was not delivered, retry it', status=503)
+                    'disconnected was not delivered, retry it',
+                    status=503, retryable=True)
 
     async def _fail_call(self, corr_id: str, call: '_Call', reason: str,
-                         status: int = 504) -> None:
+                         status: int = 504, retryable: bool = False) -> None:
         """Synthesize a 504 (or *status*) for *call*: resolve its future, or
-        send it upstream."""
+        send it upstream.
+
+        A *retryable* answer carries the JSON error envelope and a
+        ``retry-after`` header; the 504s keep their established shape.
+        """
         if call.future is not None:
-            # 504s keep their established shape; the retryable 503 carries
-            # the canonical JSON envelope so HTTP clients see its detail
-            json_err = status != 504
+            headers, body = {}, b''
+            if retryable:
+                headers = {'content-type': 'application/json',
+                           'retry-after': '1'}
+                body = error_body(status, reason)
             self._settle_call(call, {
                 'kind': 'response', 'status': status,
                 'src': call.dst, 'dst': BROKER_NAME, 'corr_id': corr_id,
-                'headers': {'content-type': 'application/json'} if json_err else {},
-                'body': error_body(status, reason) if json_err else b'',
-                'reason': reason})
+                'headers': headers, 'body': body, 'reason': reason})
         else:
             target = self.registry.get(call.src)
-            if target is not None:
-                json_err = status != 504
-                out = protocol.Response(
+            if target is None:
+                return
+            if retryable:
+                frame = self._error_response(
+                    {'src': call.src, 'corr_id': corr_id}, status, reason,
+                    src=call.dst, headers={'retry-after': '1'})
+            else:
+                frame = protocol.pack_message(protocol.Response(
                     src=call.dst, dst=call.src, status=status,
-                    headers={'content-type': 'application/json'} if json_err else {},
-                    body=error_body(status, reason) if json_err else reason.encode(),
-                    corr_id=corr_id)
-                await self._send(target, protocol.pack_message(
-                    out, cap=self._frame_cap))
+                    body=reason.encode(), corr_id=corr_id),
+                    cap=self._frame_cap)
+            await self._send(target, frame)
 
     def _remove_participant(self, name: str) -> None:
         """Free name + resume_key + meta + delivery machinery (no broadcast)."""
@@ -1328,10 +1338,12 @@ class Broker:
         except Exception:
             pass
 
-    def _error_response(self, req_raw: dict, status: int, detail: str) -> bytes:
+    def _error_response(self, req_raw: dict, status: int, detail: str,
+                        src: str = BROKER_NAME,
+                        headers: Optional[Dict[str, str]] = None) -> bytes:
         out = protocol.Response(
-            src=BROKER_NAME, dst=req_raw.get('src'), status=status,
-            headers={'content-type': 'application/json'},
+            src=src, dst=req_raw.get('src'), status=status,
+            headers={'content-type': 'application/json', **(headers or {})},
             body=error_body(status, detail),
             corr_id=req_raw.get('corr_id'))
         return protocol.pack_message(out, cap=self._frame_cap)

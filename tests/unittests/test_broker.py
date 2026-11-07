@@ -1018,7 +1018,12 @@ async def test_forwarded_call_to_suspect_fails_503_on_resume(make_broker):
         ok, _ = await _register(broker, 'e2', ws3, resume_key=key)
         assert ok is True
 
+        for _ in range(100):                        # the 503s go out in the background
+            if [m for m in ws1.msgs() if m.kind == 'response']:
+                break
+            await asyncio.sleep(0.01)
         got = [m for m in ws1.msgs() if m.kind == 'response'][-1]
+        assert dict(got.headers).get('retry-after') == '1'
         assert got.kind == 'response' and got.status == 503
         assert got.corr_id == req.corr_id
         assert 'retry' in json.loads(got.body)['detail']
