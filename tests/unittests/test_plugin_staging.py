@@ -418,19 +418,15 @@ def test_validate_path_relative_raises():
         session._validate_path("relative/path/file.txt")
 
 
-def test_validate_path_outside_allowed_raises(tmp_path):
+def test_validate_path_outside_allowed_raises(tmp_path, monkeypatch):
     """Path not under $HOME or /tmp must be rejected."""
     # The allow-list is snapshotted per session (a session also picks up
     # $RADICAL_ORBIT_SCRATCH_BASE), so patch the class default BEFORE
     # constructing the session under test.
-    original = StagingSession._ALLOWED_BASES[:]
-    StagingSession._ALLOWED_BASES = ["/nonexistent/base"]
-    try:
-        session = StagingSession("sid-val-2")
-        with pytest.raises(ValueError, match="escapes"):
-            session._validate_path(str(tmp_path / "file.txt"))
-    finally:
-        StagingSession._ALLOWED_BASES = original
+    monkeypatch.setattr(StagingSession, "_ALLOWED_BASES", ["/nonexistent/base"])
+    session = StagingSession("sid-val-2")
+    with pytest.raises(ValueError, match="escapes"):
+        session._validate_path(str(tmp_path / "file.txt"))
 
 
 def test_scratch_base_env_extends_the_allow_list(tmp_path, monkeypatch):
@@ -457,25 +453,17 @@ def test_scratch_base_env_extends_the_allow_list(tmp_path, monkeypatch):
         allowed._validate_path(str(tmp_path / "elsewhere" / "in.txt"))
 
 
-def test_validate_path_valid_tmp(tmp_path):
+def test_validate_path_valid_tmp(tmp_path, monkeypatch):
     """Path within /tmp must be accepted."""
-    import tempfile
-    session = StagingSession("sid-val-3")
-    # tmp_path is under /tmp on most systems; if not, patch _ALLOWED_BASES
+    # tmp_path is under /tmp on most systems; if not, allow its parent
     real_tmp = os.path.realpath('/tmp')
     real_path = os.path.realpath(str(tmp_path))
     if not real_path.startswith(real_tmp + os.sep) and real_path != real_tmp:
-        # Patch to allow this path
-        original = StagingSession._ALLOWED_BASES[:]
-        StagingSession._ALLOWED_BASES = [os.path.dirname(real_path)]
-        try:
-            result = session._validate_path(str(tmp_path / "file.txt"))
-            assert os.path.isabs(result)
-        finally:
-            StagingSession._ALLOWED_BASES = original
-    else:
-        result = session._validate_path(str(tmp_path / "file.txt"))
-        assert os.path.isabs(result)
+        monkeypatch.setattr(StagingSession, "_ALLOWED_BASES",
+                            [os.path.dirname(real_path)])
+    session = StagingSession("sid-val-3")
+    result = session._validate_path(str(tmp_path / "file.txt"))
+    assert os.path.isabs(result)
 
 
 def test_check_target_not_exists_raises(tmp_path):

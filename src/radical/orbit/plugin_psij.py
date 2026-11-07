@@ -34,6 +34,7 @@ import psij
 
 from . import batch_system
 from . import tunnel
+from . import utils
 from .plugin_base import Plugin
 from .plugin_session_base import PluginSession
 from .client import PluginClient
@@ -75,7 +76,7 @@ def _psij_dir() -> pathlib.Path:
     raw = os.environ.get(_PSIJ_DIR_ENV)
     if raw:
         return pathlib.Path(raw).expanduser()
-    return pathlib.Path.home() / '.radical' / 'orbit' / 'psij'
+    return utils.orbit_dir() / 'psij'
 
 
 def _output_base() -> pathlib.Path:

@@ -57,9 +57,10 @@ def _snapshot(root: pathlib.Path, depth: int = _SNAPSHOT_DEPTH) -> dict:
 # during collection (``pytest`` / ``pytest tests/``).
 _ORBIT_DIR_BEFORE = _snapshot(_REAL_ORBIT_DIR)
 
-# The empty HOME the unit tests run with (set by _isolate_orbit_dirs).
-_test_home: 'pathlib.Path | None' = None
 _leak_report: 'str | None' = None
+
+_CREDENTIAL_FILES = ('broker.token', 'broker_cert.pem', 'broker_key.pem',
+                     'globus.json')
 
 
 def _ci() -> bool:
@@ -69,16 +70,15 @@ def _ci() -> bool:
 
 @pytest.hookimpl(trylast=True)
 def pytest_sessionfinish(session):
-    """Check for writes under ``.radical/orbit`` that the redirects missed.
+    """Check the real ``~/.radical/orbit`` for changes during the run.
 
     Runs after the fixture teardown (``trylast``: after pytest's own
-    ``sessionfinish``).  Checks the real ``~/.radical/orbit`` (paths the run
-    added, credential files it changed) and the test HOME's
-    ``.radical/orbit`` (anything there is a home-derived default no fixture
-    redirects yet).  Fails a passing run in CI (``$CI`` set); locally it
-    only warns, since a live deployment on the same host may legitimately
-    change the real directory meanwhile.  Reported at the end of the
-    terminal summary.
+    ``sessionfinish``): paths added or removed, credential files changed.
+    Such a change means some code resolved the home directory before the
+    test HOME was set, or bypassed it.  Fails a passing run in CI (``$CI``
+    set); locally it only warns, since a live deployment on the same host
+    may legitimately change the real directory meanwhile.  Reported at the
+    end of the terminal summary.
     """
     global _leak_report
     after   = _snapshot(_REAL_ORBIT_DIR)
@@ -87,18 +87,15 @@ def pytest_sessionfinish(session):
                      or (stamp is not None and stamp != _ORBIT_DIR_BEFORE[p]))
     changed += sorted(f'{p} (removed)' for p in _ORBIT_DIR_BEFORE
                       if p not in after)
-    leaked  = sorted(_snapshot(_test_home / '.radical' / 'orbit')) \
-              if _test_home is not None else []
-    lines   = [f'{_REAL_ORBIT_DIR}/{p}' for p in changed] \
-            + [f'<test HOME>/.radical/orbit/{p}' for p in leaked]
+    lines   = [f'{_REAL_ORBIT_DIR}/{p}' for p in changed]
     if not lines:
         return
     shown = '\n  '.join(lines[:20]) + ('\n  ...' if len(lines) > 20 else '')
-    _leak_report = (f"{len(lines)} path(s) under .radical/orbit changed "
+    _leak_report = (f"{len(lines)} path(s) under {_REAL_ORBIT_DIR} changed "
                     f"during the run.  Unit tests must not write there "
-                    f"(redirect the default in tests/unittests/conftest.py, "
-                    f"see issue #162); paths in the real directory may also "
-                    f"come from a live deployment on this host:\n  {shown}")
+                    f"(resolve home-derived defaults per call, see "
+                    f"utils.orbit_dir and issue #162); a live deployment on "
+                    f"this host may also change it:\n  {shown}")
     if _ci() and session.exitstatus == pytest.ExitCode.OK:
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
@@ -111,46 +108,40 @@ def pytest_terminal_summary(terminalreporter):
 
 @pytest.fixture(autouse=True, scope='session')
 def _isolate_orbit_dirs(tmp_path_factory):
-    """Run the unit tests with an empty HOME, and point the home-derived
-    module defaults (bound at import, from the real home) at a separate
-    temp tree: psij output/work dirs, tunnel rendezvous files,
-    dispatcher/federation state and scratch roots; the broker cert / key /
-    token files resolve into the (empty) test HOME, and staging allows the
-    test HOME instead of the real one.  Ambient ``RADICAL_ORBIT_*``
-    settings of a live deployment are cleared.
+    """Run the unit tests with an empty HOME: every default under
+    ``~/.radical/orbit`` resolves from the current HOME per call (see
+    ``utils.orbit_dir``), so this alone keeps them out of the real home.
+    The psij dir goes to a separate temp tree (its output is not a leak);
+    ambient ``RADICAL_ORBIT_*`` settings of a live deployment are cleared.
 
     Session-scoped, so it is in place before module-scoped fixtures build
     plugins; tests that need their own files still patch per test.  Run
     integration tests separately: they need the real HOME.
     """
-    global _test_home
-    from radical.orbit import (utils, tunnel, plugin_task_dispatcher,
-                               plugin_federation, plugin_staging)
-    home       = tmp_path_factory.mktemp('home')
-    state      = tmp_path_factory.mktemp('orbit-state')
-    conf       = home / '.radical' / 'orbit'            # never created
-    _test_home = home
+    home  = tmp_path_factory.mktemp('home')
+    state = tmp_path_factory.mktemp('orbit-state')
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv('HOME', str(home))
         for name in [n for n in os.environ if n.startswith('RADICAL_ORBIT_')
                      and n not in _KEEP_ENV]:
             mp.delenv(name)
         mp.setenv('RADICAL_ORBIT_PSIJ_DIR', str(state / 'psij'))
-        mp.setattr(utils, 'DEFAULT_DIR', conf)
-        mp.setattr(utils, 'CERT_FILE',   conf / 'broker_cert.pem')
-        mp.setattr(utils, 'KEY_FILE',    conf / 'broker_key.pem')
-        mp.setattr(utils, 'TOKEN_FILE',  conf / 'broker.token')
-        mp.setattr(tunnel, 'RELAY_BASE', state / 'tunnels')
-        mp.setattr(plugin_task_dispatcher, '_DEFAULT_STATE_ROOT',
-                   state / 'task_dispatcher' / 'state')
-        mp.setattr(plugin_task_dispatcher, '_DEFAULT_SCRATCH_ROOT',
-                   state / 'task_dispatcher' / 'scratch')
-        mp.setattr(plugin_federation, '_DEFAULT_STATE_ROOT',
-                   state / 'federation')
-        # bound at import to the real home: allow the test HOME instead
-        mp.setattr(plugin_staging.StagingSession, '_ALLOWED_BASES',
-                   [os.path.realpath(home), os.path.realpath('/tmp')])
         yield
+
+
+@pytest.fixture(autouse=True)
+def _no_leftover_credentials():
+    """Remove the credential files a test left in the test HOME's
+    ``.radical/orbit`` (a token, cert, key, globus config), so they cannot
+    change a later test's lookups.  Other state there stays: module-scoped
+    fixtures may share it."""
+    yield
+    conf = pathlib.Path(os.environ['HOME']) / '.radical' / 'orbit'
+    for name in _CREDENTIAL_FILES:
+        try:
+            (conf / name).unlink()
+        except (FileNotFoundError, IsADirectoryError):
+            pass
 
 
 @pytest.fixture(autouse=True)

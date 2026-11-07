@@ -812,7 +812,7 @@ class EndpointRuntime(PluginHostBase):
                 src = {
                     'cli':  'passed explicitly (--token / token=)',
                     'env':  'from $RADICAL_ORBIT_BROKER_TOKEN',
-                    'file': f'from {utils.TOKEN_FILE}',
+                    'file': f'from {utils.token_file()}',
                 }.get(self._token_source, 'not configured at all')
                 self._set_fatal(
                     f"registration rejected by broker at {self._broker_url}: "
