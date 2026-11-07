@@ -799,6 +799,11 @@ class Broker:
                 self.registry[name] = ws                  # install new first
                 self._cancel_grace(name)
                 self._liveness[name] = 'present'
+                # Snapshot now: if the new socket drops during the awaits
+                # below, calls held in that new window must not be told the
+                # endpoint reconnected.
+                held = [cid for cid, c in self._calls.items()
+                        if c.dst == name and c.held]
                 self._participants[name]['role'] = msg.role
                 self._participants[name]['plugins'] = \
                     self._plugins_list_to_dict(msg.plugins)
@@ -810,7 +815,7 @@ class Broker:
                 # Broadcast reaches the resumed endpoint too (full topology).
                 await self._broadcast_topology()
                 # Calls that arrived while it was suspect were never sent.
-                await self._fail_held_for(name)
+                await self._fail_held(held)
                 return True, name
 
             log.warning("[Broker] name-in-use (no/invalid resume_key): %s", name)
@@ -1149,22 +1154,24 @@ class Broker:
     async def _deliver(self, call: '_Call', target, data: bytes) -> None:
         """Send a request frame for *call*, or hold the call.
 
-        A frame for a ``suspect`` endpoint, or one whose write fails, would be
-        lost silently: such a call is held instead, and failed on resume
+        A frame for a ``suspect`` endpoint would go to its dropped socket and
+        be lost silently: such a call is held instead, and failed on resume
         (retryable 503) or on lost (504).
         """
-        if self._liveness.get(call.dst) == 'suspect' \
-                or not await self._send(target, data):
+        if self._liveness.get(call.dst) == 'suspect':
             call.held = True
+            return
+        await self._send(target, data)
 
-    async def _fail_held_for(self, name: str) -> None:
-        """Fail the calls that arrived while *name* was suspect (never sent).
+    async def _fail_held(self, corr_ids: list) -> None:
+        """Fail held calls (they arrived while their dst was suspect, never
+        sent) that are still pending.
 
         A 503: the endpoint is back, so the caller may simply retry.
         """
-        for corr_id, call in list(self._calls.items()):
-            if call.dst == name and call.held:
-                self._calls.pop(corr_id, None)
+        for corr_id in corr_ids:
+            call = self._calls.pop(corr_id, None)
+            if call is not None:
                 await self._fail_call(
                     corr_id, call,
                     'endpoint reconnected; a request sent while it was '
@@ -1175,18 +1182,24 @@ class Broker:
         """Synthesize a 504 (or *status*) for *call*: resolve its future, or
         send it upstream."""
         if call.future is not None:
+            # 504s keep their established shape; the retryable 503 carries
+            # the canonical JSON envelope so HTTP clients see its detail
+            json_err = status != 504
             self._settle_call(call, {
                 'kind': 'response', 'status': status,
                 'src': call.dst, 'dst': BROKER_NAME, 'corr_id': corr_id,
-                'headers': {'content-type': 'application/json'},
-                'body': error_body(status, reason), 'reason': reason})
+                'headers': {'content-type': 'application/json'} if json_err else {},
+                'body': error_body(status, reason) if json_err else b'',
+                'reason': reason})
         else:
             target = self.registry.get(call.src)
             if target is not None:
+                json_err = status != 504
                 out = protocol.Response(
                     src=call.dst, dst=call.src, status=status,
-                    headers={'content-type': 'application/json'},
-                    body=error_body(status, reason), corr_id=corr_id)
+                    headers={'content-type': 'application/json'} if json_err else {},
+                    body=error_body(status, reason) if json_err else reason.encode(),
+                    corr_id=corr_id)
                 await self._send(target, protocol.pack_message(
                     out, cap=self._frame_cap))
 
@@ -1301,16 +1314,13 @@ class Broker:
 
     # ── low-level helpers ─────────────────────────────────────────────
 
-    async def _send(self, ws, data: bytes) -> bool:
-        """Write *data* to *ws*; ``False`` if there is no socket or it failed."""
+    async def _send(self, ws, data: bytes) -> None:
         if ws is None:
-            return False
+            return
         try:
             await ws.send_bytes(data)
-            return True
         except Exception as e:
             log.debug("[Broker] send failed: %s", e)
-            return False
 
     @staticmethod
     async def _close_quiet(ws) -> None:

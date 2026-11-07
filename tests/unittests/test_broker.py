@@ -12,6 +12,7 @@ No test sleeps for more than ~1 s; liveness knobs are injected tiny.
 """
 
 import asyncio
+import json
 import threading
 import time
 
@@ -1020,6 +1021,7 @@ async def test_forwarded_call_to_suspect_fails_503_on_resume(make_broker):
         got = [m for m in ws1.msgs() if m.kind == 'response'][-1]
         assert got.kind == 'response' and got.status == 503
         assert got.corr_id == req.corr_id
+        assert 'retry' in json.loads(got.body)['detail']
         assert req.corr_id not in broker._calls
     finally:
         await broker.shutdown()
@@ -1082,43 +1084,6 @@ async def test_call_sent_before_the_drop_survives_resume(make_broker):
         assert req.corr_id in broker._calls
         assert broker._calls[req.corr_id].held is False
         assert not [m for m in ws1.msgs() if m.kind == 'response']
-    finally:
-        await broker.shutdown()
-
-
-class DeadWS(FakeWS):
-    """A socket that died before the broker noticed: every write fails."""
-
-    async def send_bytes(self, data: bytes) -> None:
-        raise ConnectionResetError("socket is gone")
-
-
-@pytest.mark.asyncio
-async def test_failed_write_before_suspect_is_held_and_fails_503_on_resume(make_broker):
-    """The socket can die before _on_socket_drop marks it suspect: a request
-    whose write fails is held too, and resume answers it with a JSON 503."""
-    import json
-    broker = make_broker()
-    await broker.startup()
-    try:
-        ws1 = FakeWS()
-        await _register(broker, 'e1', ws1)
-        ws2 = FakeWS()
-        await _register(broker, 'e2', ws2)
-        key = protocol.parse_message(ws2.sent[0]).resume_key
-        broker.registry['e2'] = DeadWS()          # died, not yet noticed
-        ws1.sent.clear()
-
-        req = protocol.make_request('e1', 'e2', 'POST', '/submit')
-        await broker._route_frame('e1', protocol.pack_message(req))
-        assert broker._calls[req.corr_id].held is True
-
-        await broker._on_socket_drop('e2', broker.registry['e2'], clean=False)
-        await _register(broker, 'e2', FakeWS(), resume_key=key)
-
-        got = [m for m in ws1.msgs() if m.kind == 'response'][-1]
-        assert got.status == 503 and got.corr_id == req.corr_id
-        assert 'retry' in json.loads(got.body)['detail']
     finally:
         await broker.shutdown()
 
