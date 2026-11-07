@@ -2228,17 +2228,17 @@ async def test_close_stops_data_backend_still_starting():
 
 
 @pytest.mark.asyncio
-async def test_close_drain_is_bounded():
-    from radical.orbit import plugin_rhapsody as prh
+async def test_close_under_a_running_start_leaves_it_to_data_start():
+    # the base plugin drains requests before close(), bounded: past that
+    # bound close() runs under a start still in progress
     session = _ready_session()
     backend = _FakeDataBackend('redis_data')
     backend.gate = asyncio.Event()          # start never finishes by itself
 
-    with patch.object(_mock_rh, 'get_data_backend', return_value=backend), \
-         patch.object(prh, 'CLOSE_DRAIN_TIMEOUT', 0.05):
+    with patch.object(_mock_rh, 'get_data_backend', return_value=backend):
         task = asyncio.ensure_future(session.data_start('redis'))
         await asyncio.sleep(0)
-        await session.close()               # returns after the drain timeout
+        await session.close()
         assert not session.is_active
         backend.shutdown.assert_not_awaited()   # start still runs ...
         backend.gate.set()
@@ -2528,12 +2528,12 @@ async def test_concurrent_stoppers_share_one_shutdown():
 
 
 @pytest.mark.asyncio
-async def test_cancel_all_is_one_tracked_op():
+async def test_cancel_all_cancels_every_running_task():
     session = _ready_session()
     seen    = []
 
     async def _cancel(uid):
-        seen.append(session._ops)
+        seen.append(uid)
     backend = MagicMock()
     backend.cancel_task = AsyncMock(side_effect=_cancel)
     session._rh_session.backends = {'concurrent': backend}
@@ -2541,8 +2541,7 @@ async def test_cancel_all_is_one_tracked_op():
                                 'backend': 'concurrent'} for i in range(3)}
     res = await session.cancel_all_tasks()
     assert res == {'canceled': 3}
-    assert seen == [1, 1, 1]
-    assert session._ops == 0
+    assert len(seen) == 3
 
 
 @pytest.mark.asyncio
@@ -2638,7 +2637,9 @@ async def test_close_during_initialize_closes_new_rh_session(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_failed_start_cleanup_during_drain_is_retried_by_close():
+async def test_failed_start_cleanup_is_retried_by_close():
+    # the base plugin drains the start request before close(): the start
+    # fails first, its cleanup fails, and close() tries that store again
     session = _ready_session()
     backend = _FakeDataBackend('redis_data')
     backend.gate = asyncio.Event()
@@ -2652,12 +2653,10 @@ async def test_failed_start_cleanup_during_drain_is_retried_by_close():
     with patch.object(_mock_rh, 'get_data_backend', return_value=backend):
         start = asyncio.ensure_future(session.data_start('redis'))
         await asyncio.sleep(0)
-        close = asyncio.ensure_future(session.close())   # drains the start
-        await asyncio.sleep(0)
         backend.gate.set()
         with pytest.raises(RuntimeError, match='port in use'):
             await start
-        await close
+        await session.close()
     assert backend.shutdown.await_count == 2    # close tried once more
 
 

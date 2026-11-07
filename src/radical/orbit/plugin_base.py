@@ -4,6 +4,7 @@ import uuid
 import asyncio
 import inspect
 import functools
+import contextvars
 import logging
 import time
 
@@ -52,6 +53,24 @@ def resolve_frame_cap(app) -> int:
 
 ISSUES_URL  = 'https://github.com/radical-cybertools/radical.orbit/issues'
 ENDED_KEEP  = 100_000     # ended sids remembered (for the 410), oldest dropped
+CLOSE_DRAIN_TIMEOUT = 30.0   # a close waits this long for requests in flight
+
+
+# The sid whose {sid} request the current task is serving (set by
+# Plugin._accessing): such a request is drained by a close, so _forward must
+# let it through instead of answering 410 "is closing".
+_serving_sid: contextvars.ContextVar = contextvars.ContextVar(
+    'orbit_serving_sid', default=None)
+
+# How many sessions the expiry sweep closes at once.
+SWEEP_CLOSE_PARALLEL = 16
+
+
+def no_drain(handler: Callable) -> Callable:
+    """Mark a ``{sid}`` route handler as long-blocking (e.g. a wait): a
+    session close does not wait for it to return."""
+    handler._orbit_no_drain = True
+    return handler
 
 
 @dataclass
@@ -67,6 +86,12 @@ class SessionRecord:
     last_access:    float
     client:         Optional[str]   = None    # X-Orbit-Client (e.g. explorer)
     inflight:       int             = 0       # {sid} requests still running
+    # close coordination (see Plugin._drop_session)
+    closing:        bool            = False   # close started: requests 410
+    draining:       int             = 0       # in-flight requests a close awaits
+    drained:        Optional[asyncio.Event] = None   # set when draining is 0
+    close_task:     Optional[asyncio.Future] = None  # the one close
+    skip_drain:     bool            = False   # host shutdown: close now
 
 
 class _LastAccessView:
@@ -296,6 +321,7 @@ class Plugin(object):
         # Guards on-demand creation of the reserved 'default' session so two
         # concurrent first requests cannot double-create it.
         self._default_lock = asyncio.Lock()
+        self._shutting_down = False     # no 'default' is recreated then
         # Loop used to schedule thread-origin notifications.  Captured at
         # construction (the host builds plugins on its loop); refreshed on the
         # first async notify if construction happened outside a loop.
@@ -407,26 +433,43 @@ class Plugin(object):
         with its reason; otherwise the request is an access of the session,
         for as long as it runs (also for plugins that look sessions up
         directly instead of through :meth:`_forward`)."""
+        drain = not getattr(handler, '_orbit_no_drain', False)
+
         @functools.wraps(handler)
         async def _accessed(request):
             sid = (getattr(request, 'path_params', None) or {}).get('sid')
             rec = self._records.get(sid) if sid else None
+            if sid == DEFAULT_SID and rec is not None and rec.closing:
+                await self._drop_session(sid)   # 'default' is recreated
+                await self._ensure_default_session()
+                rec = self._records.get(sid)
             if sid and rec is None:
                 text = self._ended_detail(sid)
                 if text:
                     raise HTTPException(status_code=410, detail=text)
             if rec is None:
                 return await handler(request)
+            if rec.closing:
+                raise HTTPException(status_code=410,
+                                    detail=self._closing_detail(sid))
             text = await self._expire_if_due(sid, rec, time.time())
             if text:
                 raise HTTPException(status_code=410, detail=text)
             self._tag_client(rec, request)
             rec.inflight += 1
+            if drain:
+                rec.draining += 1
+            token = _serving_sid.set(sid)
             try:
                 return await handler(request)
             finally:
+                _serving_sid.reset(token)
                 rec.inflight   -= 1
                 rec.last_access = time.time()
+                if drain:
+                    rec.draining -= 1
+                    if not rec.draining and rec.drained is not None:
+                        rec.drained.set()
         return _accessed
 
     def _tagging_client(self, handler: Callable) -> Callable:
@@ -629,6 +672,12 @@ class Plugin(object):
         policy = self._validate_session_policy(data)     # 409 first
         sid    = policy[0]
         rec    = self._records.get(sid) if sid is not None else None
+        if rec is not None and rec.closing:
+            if sid != DEFAULT_SID:
+                raise HTTPException(status_code=410,
+                                    detail=self._closing_detail(sid))
+            await self._drop_session(sid)       # 'default' is recreated
+            rec = None
         if rec is not None:
             await self._expire_if_due(sid, rec, time.time())
         if sid is not None and sid not in self._records:
@@ -735,6 +784,9 @@ class Plugin(object):
         session = self._sessions.get(DEFAULT_SID)
         if session is not None:
             return session
+        if self._shutting_down:
+            raise HTTPException(status_code=410,
+                                detail=f"[{self.instance_name}] shutting down")
         async with self._default_lock:
             session = self._sessions.get(DEFAULT_SID)
             if session is None:
@@ -903,6 +955,10 @@ class Plugin(object):
 
         # Detect expiry of THIS session before the background cleanup removes it
         record = self._records.get(sid)
+        if record is not None and record.closing \
+                and _serving_sid.get() != sid:  # a drained request goes on
+            raise HTTPException(status_code=410,
+                                detail=self._closing_detail(sid))
         text   = record and await self._expire_if_due(sid, record, time.time())
         if text:
             raise HTTPException(status_code=410, detail=text)
@@ -923,6 +979,18 @@ class Plugin(object):
         except HTTPException:
             raise  # Re-raise HTTP exceptions as-is
         except Exception as e:
+            # the session was closed underneath the call (a @no_drain wait,
+            # or a drain that timed out): that is a 410, not a server error
+            rec = self._records.get(sid)
+            if (rec is not None and rec.closing) \
+                    or self._sessions.get(sid) is not session:
+                log.warning("[%s] %s on session %s failed during its close "
+                            "(answered 410): %r", self.instance_name,
+                            func.__name__, sid, e, exc_info=True)
+                raise HTTPException(
+                    status_code=410,
+                    detail=self._ended_detail(sid)
+                    or self._closing_detail(sid)) from e
             log.exception("[%s] Error in session %s calling %s: %s",
                           self.instance_name, sid, func.__name__, e)
             raise HTTPException(
@@ -975,6 +1043,8 @@ class Plugin(object):
         idle one ends: it is dropped, its reason logged and remembered, and
         that reason returned (the 410 detail).  ``None`` if it lives on.
         """
+        if rec.closing:
+            return None             # being closed already (see _drop_session)
         if not self._is_expired(rec, now):
             return None
         if self._is_busy(sid, rec):
@@ -985,8 +1055,16 @@ class Plugin(object):
     async def _end_session(self, sid: str, reason: str, now: float) -> str:
         """End a session (``reason``: ``'expired'`` or ``'closed'``): log,
         remember (unless persistent -- e.g. ``default`` is recreated on
-        demand) and drop it.  Returns the explanation."""
+        demand) and drop it.  Returns the explanation.  A session already
+        closing keeps the reason it ended with; this waits for that close."""
         rec = self._records.get(sid)
+        if rec is not None and rec.closing:
+            entry = self._ended.get(sid)
+            if reason == 'closed' and entry is not None:   # explicit wins
+                self._ended[sid] = (entry[0], 'closed') + entry[2:]
+            await self._drop_session(sid)
+            return self._ended_detail(sid) \
+                or f"[{self.instance_name}] session {sid} has ended"
         if rec is not None and self._timeout(rec) > 0:
             self._ended[sid] = (now, reason, self._timeout(rec),
                                 now - rec.last_access, rec.client)
@@ -1001,6 +1079,10 @@ class Plugin(object):
             text = f"[{self.instance_name}] session {sid} has ended"
         await self._drop_session(sid)
         return text
+
+    def _closing_detail(self, sid: str) -> str:
+        """The 410 detail for a request on a session that is being closed."""
+        return f"[{self.instance_name}] session {sid} is closing"
 
     def _ended_detail(self, sid: str) -> Optional[str]:
         """Why *sid* ended (the 410 detail), or ``None`` if it did not."""
@@ -1024,40 +1106,97 @@ class Plugin(object):
                 f"this is a legitimate use case, please open an issue: "
                 f"{ISSUES_URL}")
 
-    async def _drop_session(self, sid: str) -> bool:
+    async def _drop_session(self, sid: str, drain: bool = True) -> bool:
         """Close and forget one session (record + object).  Idempotent.
 
         The single teardown path shared by unregister / expiry sweep /
-        shutdown.  Returns True if a session object was closed.
+        shutdown.  The record is marked closing at once (requests answer
+        410 "is closing"), requests in flight are drained (bounded by
+        ``CLOSE_DRAIN_TIMEOUT``; ``@no_drain`` routes excepted), then the
+        session is closed and forgotten -- all in one task that a cancelled
+        caller does not interrupt, and that concurrent callers share.
+        ``drain=False`` (host shutdown: requests are being cancelled, and the
+        host bounds the shutdown) closes without waiting.  Returns True if
+        a session object was closed.
         """
-        self._records.pop(sid, None)
-        session = self._sessions.pop(sid, None)
-        if session is None:
-            return False
+        rec = self._records.get(sid)
+        if rec is None:                 # no record: forget first, then close
+            session = self._sessions.pop(sid, None)
+            if session is None:
+                return False
+            try:
+                await session.close()
+            except Exception as e:
+                log.warning("[%s] Error closing session %s: %s",
+                            self.instance_name, sid, e)
+            return True
+        if not drain:                   # also cuts a close already draining
+            rec.skip_drain = True
+            if rec.drained is not None:
+                rec.drained.set()
+        if rec.close_task is None:
+            rec.closing    = True
+            rec.close_task = asyncio.ensure_future(
+                self._close_session(sid, rec))
+            # retrieved even if every caller was cancelled
+            rec.close_task.add_done_callback(
+                lambda t: t.cancelled() or t.exception())
+        return await asyncio.shield(rec.close_task)
+
+    async def _close_session(self, sid: str, rec: SessionRecord) -> bool:
+        """Drain, close and forget one session (see :meth:`_drop_session`)."""
+        session = self._sessions.get(sid)
         try:
-            await session.close()
-        except Exception as e:
-            log.warning("[%s] Error closing session %s: %s",
-                        self.instance_name, sid, e)
-        return True
+            if rec.draining and not rec.skip_drain:
+                rec.drained = asyncio.Event()
+                try:
+                    await asyncio.wait_for(rec.drained.wait(),
+                                           CLOSE_DRAIN_TIMEOUT)
+                except asyncio.TimeoutError:
+                    pass
+                if rec.draining:
+                    log.warning("[%s] closing session %s with %d "
+                                "request(s) still in flight",
+                                self.instance_name, sid, rec.draining)
+            if session is not None:
+                try:
+                    await session.close()
+                except Exception as e:
+                    log.warning("[%s] Error closing session %s: %s",
+                                self.instance_name, sid, e)
+        finally:
+            if self._records.get(sid) is rec:
+                self._records.pop(sid, None)
+            if session is not None and self._sessions.get(sid) is session:
+                self._sessions.pop(sid, None)
+        return session is not None
 
     async def _cleanup_expired_sessions(self) -> int:
         """End every session idle past its timeout (see
-        :meth:`_expire_if_due`).  Each candidate is decided afresh: an
-        earlier close may have yielded long enough for it to be used.
+        :meth:`_expire_if_due`), concurrently: one slow close (a drain)
+        does not delay the others.  Each candidate is decided afresh.
 
         Returns:
             Number of sessions ended.
         """
         now = time.time()
         due = [(sid, rec) for sid, rec in list(self._records.items())
-               if self._is_expired(rec, now)]
-        ended = 0
-        for sid, rec in due:
-            if self._records.get(sid) is rec \
-                    and await self._expire_if_due(sid, rec, time.time()):
-                ended += 1
-        return ended
+               if not rec.closing and self._is_expired(rec, now)]
+
+        limit = asyncio.Semaphore(SWEEP_CLOSE_PARALLEL)
+
+        async def _one(sid, rec):
+            async with limit:
+                return self._records.get(sid) is rec and bool(
+                    await self._expire_if_due(sid, rec, time.time()))
+
+        results = await asyncio.gather(*(_one(s, r) for s, r in due),
+                                       return_exceptions=True)
+        for (sid, _), res in zip(due, results):
+            if isinstance(res, BaseException):
+                log.warning("[%s] expiring session %s failed: %r",
+                            self.instance_name, sid, res)
+        return sum(1 for res in results if res is True)
 
     def _ensure_cleanup_task(self) -> None:
         """Start the background session-cleanup task if not already running."""
@@ -1093,6 +1232,7 @@ class Plugin(object):
         session.  Subclasses that spawn additional background tasks override
         this and call ``super().shutdown()``.
         """
+        self._shutting_down = True
         if self._cleanup_task is not None and not self._cleanup_task.done():
             self._cleanup_task.cancel()
             try:    await self._cleanup_task
@@ -1100,8 +1240,14 @@ class Plugin(object):
                 pass
             except Exception:
                 pass
-        for sid in set(self._sessions) | set(self._records):
-            await self._drop_session(sid)
+        sids    = list(set(self._sessions) | set(self._records))
+        results = await asyncio.gather(*(self._drop_session(sid, drain=False)
+                                         for sid in sids),
+                                       return_exceptions=True)
+        for sid, res in zip(sids, results):
+            if isinstance(res, BaseException):
+                log.warning("[%s] closing session %s at shutdown failed: %r",
+                            self.instance_name, sid, res)
 
     def _log_routes(self) -> None:
         """Log all registered routes for debugging."""
