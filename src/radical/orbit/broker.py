@@ -124,10 +124,12 @@ class _Call:
     ``future`` is set only for broker-originated calls (``src='broker'``, the
     :class:`BrokerCaller` path); a forwarded endpoint↔endpoint call leaves it
     ``None``.  ``deadline`` (loop time) bounds every entry so a responder that
-    never answers cannot leak the table.
+    never answers cannot leak the table.  ``held`` marks a request that arrived
+    while ``dst`` was ``suspect``: it was never delivered, so a resume fails it
+    (the endpoint cannot answer it) instead of leaving it to the deadline.
     """
 
-    __slots__ = ('src', 'dst', 'future', 'deadline')
+    __slots__ = ('src', 'dst', 'future', 'deadline', 'held')
 
     def __init__(self, src: str, dst: str,
                  future: Optional[asyncio.Future], deadline: float):
@@ -135,6 +137,7 @@ class _Call:
         self.dst      = dst
         self.future   = future
         self.deadline = deadline
+        self.held     = False
 
 
 # ---------------------------------------------------------------------------
@@ -801,6 +804,7 @@ class Broker:
                     self._plugins_list_to_dict(msg.plugins)
                 self._events.restart_sender(name)
                 await self._send(ws, self._ack(True, self._resume_keys[name]))
+                await self._fail_held_for(name)
                 # Close the old socket; its teardown no-ops via the guard.
                 if old is not ws:
                     spawn(self._close_quiet(old), 'broker_close_old')
@@ -880,8 +884,14 @@ class Broker:
                                                   "at cap"))
             return
 
-        self._calls[corr_id] = _Call(src_name, dst, None,
-                                     self._loop.time() + self._call_timeout)
+        call = _Call(src_name, dst, None,
+                     self._loop.time() + self._call_timeout)
+        self._calls[corr_id] = call
+        if self._liveness.get(dst) == 'suspect':
+            # The socket is gone: writing to it would drop the frame silently.
+            # Hold the call until resume (fails it, retryable) or lost (504).
+            call.held = True
+            return
         await self._send(target, msgpack.packb(raw, use_bin_type=True))
 
     async def _route_response(self, src_name: str, raw: dict) -> None:
@@ -926,11 +936,15 @@ class Broker:
                     'headers': {'content-type': 'application/json'},
                     'body':    error_body(413, f"request body too large: {e}")}
 
-        fut = self._loop.create_future()
-        self._calls[corr_id] = _Call(BROKER_NAME, dst, fut,
-                                     self._loop.time() + self._call_timeout)
+        fut  = self._loop.create_future()
+        call = _Call(BROKER_NAME, dst, fut,
+                     self._loop.time() + self._call_timeout)
+        self._calls[corr_id] = call
         try:
-            await self._send(target, data)
+            if self._liveness.get(dst) == 'suspect':
+                call.held = True        # see _route_request
+            else:
+                await self._send(target, data)
             return await asyncio.wait_for(fut, timeout=timeout)
         except Exception:
             self._calls.pop(corr_id, None)
@@ -1139,18 +1153,33 @@ class Broker:
                 # Requester gone — the response would go nowhere; drop it.
                 self._calls.pop(corr_id, None)
 
-    async def _fail_call(self, corr_id: str, call: '_Call', reason: str) -> None:
-        """Synthesize a 504 for *call*: resolve its future, or send it upstream."""
+    async def _fail_held_for(self, name: str) -> None:
+        """Fail the calls that arrived while *name* was suspect (never sent).
+
+        A 503: the endpoint is back, so the caller may simply retry.
+        """
+        for corr_id, call in list(self._calls.items()):
+            if call.dst == name and call.held:
+                self._calls.pop(corr_id, None)
+                await self._fail_call(
+                    corr_id, call,
+                    'endpoint reconnected; a request sent while it was '
+                    'disconnected was not delivered, retry it', status=503)
+
+    async def _fail_call(self, corr_id: str, call: '_Call', reason: str,
+                         status: int = 504) -> None:
+        """Synthesize a 504 (or *status*) for *call*: resolve its future, or
+        send it upstream."""
         if call.future is not None:
             self._settle_call(call, {
-                'kind': 'response', 'status': 504,
+                'kind': 'response', 'status': status,
                 'src': call.dst, 'dst': BROKER_NAME, 'corr_id': corr_id,
                 'headers': {}, 'body': b'', 'reason': reason})
         else:
             target = self.registry.get(call.src)
             if target is not None:
                 out = protocol.Response(
-                    src=call.dst, dst=call.src, status=504,
+                    src=call.dst, dst=call.src, status=status,
                     body=reason.encode(), corr_id=corr_id)
                 await self._send(target, protocol.pack_message(
                     out, cap=self._frame_cap))
