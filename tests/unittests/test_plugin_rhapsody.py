@@ -3544,26 +3544,25 @@ async def test_finished_tasks_are_released_after_the_retention(monkeypatch):
         await session.get_task('task.r0000')
     assert e.value.status_code == 404 and 'kept for' in e.value.detail
 
-    # a polling waiter gets one result per uid, a released one as FAILED
-    got = await session.wait_tasks(['task.r0000', 'task.run'])
-    assert [t['uid'] for t in got] == ['task.r0000', 'task.run']
-    assert got[0]['state'] == 'FAILED' and 'kept for' in got[0]['error']
 
 
-def test_pickle_cache_stays_bounded():
-    '''Per-task arguments differ, so the cache must not grow with tasks.'''
+def test_pickle_cache_keeps_functions_only():
+    '''Per-task arguments differ, so caching them grows with every task.'''
     import base64
     import cloudpickle
-    from radical.orbit.plugin_rhapsody import PICKLE_CACHE_SIZE
+
+    def enc(obj):
+        return 'cloudpickle::' + base64.b64encode(
+            cloudpickle.dumps(obj)).decode('ascii')
 
     session = RhapsodySession('test.pickle')
-    for i in range(3 * PICKLE_CACHE_SIZE):
-        blob = 'cloudpickle::' + base64.b64encode(
-            cloudpickle.dumps((i,))).decode('ascii')
+    fn = enc(len)
+    for i in range(100):
         td = session._deserialize_task(
-            {'args': blob, '_pickled_fields': ['args']})
-        assert td['args'] == (i,)
-    assert len(session._pickle_cache) <= PICKLE_CACHE_SIZE
+            {'function': fn, 'args': enc((i,)),
+             '_pickled_fields': ['function', 'args']})
+        assert td['args'] == (i,) and td['function'] is len
+    assert list(session._pickle_cache) == [fn[len('cloudpickle::'):]]
 
 
 def test_client_completions_expire_unless_waited(monkeypatch):

@@ -100,10 +100,6 @@ OUTPUT_NOTIFY_LIMIT = FRAME_CAP // OUTPUT_RATIO
 # waiting for.
 FINISHED_RETAIN_S   = 3600.0
 
-# Deserialized cloudpickle payloads kept per session; the cache is emptied
-# when full (per-task arguments differ, so it would grow with every task).
-PICKLE_CACHE_SIZE   = 256
-
 # Endpoint-level override for the coalescing window above (seconds).  The
 # default trades ~250 ms of completion latency for fewer WS frames; a
 # latency-sensitive endpoint (co-located service, sequential task round
@@ -565,9 +561,10 @@ class RhapsodySession(PluginSession):
                         td[field] = cached
                     else:
                         obj = _cp.loads(base64.b64decode(encoded))
-                        if len(self._pickle_cache) >= PICKLE_CACHE_SIZE:
-                            self._pickle_cache.clear()
-                        self._pickle_cache[encoded] = obj
+                        # only functions repeat; per-task arguments would
+                        # grow the cache with every task
+                        if field == 'function':
+                            self._pickle_cache[encoded] = obj
                         td[field] = obj
             return td
 
@@ -864,17 +861,12 @@ class RhapsodySession(PluginSession):
         """
         self._check_initialized()
 
-        tasks = [self._lookup(uid) for uid in uids]
-        if not any(tasks):
+        tasks = [t for t in map(self._lookup, uids) if t is not None]
+        if not tasks:
             raise HTTPException(status_code=404,
                                 detail="none of the requested tasks found")
 
-        # one entry per uid, so a polling waiter never mistakes a released
-        # task for a missing one: it gets a FAILED result naming the cause
-        return [self._sanitize_task(t) if t else
-                {"uid": uid, "state": "FAILED",
-                 "error": self._not_found(uid).detail}
-                for uid, t in zip(uids, tasks)]
+        return [self._sanitize_task(t) for t in tasks]
 
     def _get_attr(self, obj, attr, default=None):
         """Helper to get attribute from object or dict."""
@@ -1064,7 +1056,9 @@ class RhapsodySession(PluginSession):
     async def list_tasks(self) -> dict:
         """Return all tasks in this session with current state."""
         self._check_initialized()
-        tasks = [self._sanitize_task(task) for task, _ in self._finished.values()]
+        tasks = [self._sanitize_task(task)
+                 for uid, (task, _) in self._finished.items()
+                 if uid not in self._tasks]          # a reused uid: once
         tasks += [self._sanitize_task(task) for task in self._tasks.values()]
         return {"tasks": tasks}
 
