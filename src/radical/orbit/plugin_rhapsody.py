@@ -822,6 +822,7 @@ class RhapsodySession(PluginSession):
         task = self._tasks.pop(uid, None)
         if task is not None:
             self._finished[uid] = (task, time.monotonic())
+            self._finished.move_to_end(uid)
         with self._notified_lock:
             self._notified_states.pop(uid, None)
         cutoff = time.monotonic() - FINISHED_RETAIN_S
@@ -863,12 +864,17 @@ class RhapsodySession(PluginSession):
         """
         self._check_initialized()
 
-        tasks = [t for t in map(self._lookup, uids) if t is not None]
-        if not tasks:
+        tasks = [self._lookup(uid) for uid in uids]
+        if not any(tasks):
             raise HTTPException(status_code=404,
                                 detail="none of the requested tasks found")
 
-        return [self._sanitize_task(t) for t in tasks]
+        # one entry per uid, so a polling waiter never mistakes a released
+        # task for a missing one: it gets a FAILED result naming the cause
+        return [self._sanitize_task(t) if t else
+                {"uid": uid, "state": "FAILED",
+                 "error": self._not_found(uid).detail}
+                for uid, t in zip(uids, tasks)]
 
     def _get_attr(self, obj, attr, default=None):
         """Helper to get attribute from object or dict."""
@@ -1090,7 +1096,8 @@ class RhapsodySession(PluginSession):
             raise self._not_found(uid)
 
         backend_name = task.get("backend")
-        if backend_name and backend_name in self._rh_session.backends:
+        if uid in self._tasks and backend_name and \
+                backend_name in self._rh_session.backends:
             backend = self._rh_session.backends[backend_name]
             await backend.cancel_task(uid)
 
@@ -1350,6 +1357,8 @@ class RhapsodySession(PluginSession):
         finally:
             self._tasks = {}
             self._finished.clear()
+            with self._notified_lock:
+                self._notified_states.clear()
             starting = [(n, e) for n, e in data.items()
                         if n not in owned and e.starting]
             for name, entry in starting:
@@ -1587,7 +1596,7 @@ class RhapsodyClient(PluginClient):
             uid, arrived = next(iter(self._arrived.items()))
             if arrived >= cutoff:
                 break
-            if self._waiting.get(uid):          # renewed: ends the sweep
+            if self._waiting.get(uid):   # renewed: moves behind the cutoff
                 self._arrived[uid] = now
                 self._arrived.move_to_end(uid)
                 continue
@@ -2026,13 +2035,15 @@ class RhapsodyClient(PluginClient):
                         deadline: float | None) -> list[dict]:
         """Block on ``_cond`` (held) until every uid completed or the
         deadline passed."""
-        while not all(uid in self._completed for uid in uids):
+        while True:
+            missing = [u for u in uids if u not in self._completed]
+            if not missing:
+                break
             if self._sid != sid:
                 raise RuntimeError(
                     f"wait_tasks: session changed from {sid} to "
                     f"{self._sid}; its tasks are not tracked any more")
-            gone = [u for u in uids
-                    if u not in self._completed and u not in self._submitted]
+            gone = [u for u in missing if u not in self._submitted]
             if gone:                     # dropped before this wait pinned it
                 raise ValueError(
                     "wait_tasks: completion(s) older than "

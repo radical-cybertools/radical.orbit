@@ -3524,12 +3524,30 @@ async def test_finished_tasks_are_released_after_the_retention(monkeypatch):
     session._check_initialized = lambda: None
     assert (await session.get_task('task.r0000'))['uid'] == 'task.r0000'
 
+    # a finished task is not cancelled on the backend again
+    backend = MagicMock(cancel_task=AsyncMock())
+    session._rh_session.backends = {'b': backend}
+    tasks[0].get = lambda key, default=None: 'b' if key == 'backend' else default
+    await session._cancel_one('task.r0000')
+    backend.cancel_task.assert_not_called()
+
+    # a reused uid moves to the back: it does not shield older entries
+    session._tasks['task.r0000'] = tasks[0]
+    session._release('task.r0000')
+    assert next(reversed(session._finished)) == 'task.r0000'
+
     monkeypatch.setattr(pr, 'FINISHED_RETAIN_S', 0.0)
+    session._tasks['task.run'] = _done_task('task.run', 0)
     session._release('task.none')                   # any release expires
     assert len(session._finished) == 0
     with pytest.raises(HTTPException) as e:
         await session.get_task('task.r0000')
     assert e.value.status_code == 404 and 'kept for' in e.value.detail
+
+    # a polling waiter gets one result per uid, a released one as FAILED
+    got = await session.wait_tasks(['task.r0000', 'task.run'])
+    assert [t['uid'] for t in got] == ['task.r0000', 'task.run']
+    assert got[0]['state'] == 'FAILED' and 'kept for' in got[0]['error']
 
 
 def test_pickle_cache_stays_bounded():
