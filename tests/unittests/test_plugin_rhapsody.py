@@ -3492,3 +3492,89 @@ def test_same_sid_reconnect_keeps_own_callbacks_a_switch_moves_them():
     assert _scopes(rt, client._on_task_done) == {
         'task_status': ['sid-c'], 'task_status_batch': ['sid-c'],
         'session_status': []}
+
+
+# ---------------------------------------------------------------------------
+# Finished tasks are released: a long-lived session stays bounded
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_finished_tasks_are_released_after_the_retention(monkeypatch):
+    '''Notified terminal tasks leave the running map at once and the finished
+    map after FINISHED_RETAIN_S; state dedup entries go with them.'''
+    import radical.orbit.plugin_rhapsody as pr
+
+    session, futs = _watched_session('test.release')
+    tasks = [_done_task(f'task.r{i:04d}', i) for i in range(500)]
+    for t in tasks:
+        session._tasks[t.uid] = t
+        session._on_task_state_change(t, 'RUNNING')
+    assert len(session._notified_states) == 500
+
+    watcher = asyncio.ensure_future(session._watch_batch(tasks))
+    await _ticks(1)
+    for fut in futs.values():
+        fut.set_result(None)
+    await asyncio.wait_for(watcher, 5)
+
+    assert session._tasks == {}
+    assert session._notified_states == {}
+    assert len(session._finished) == 500
+    assert session.is_busy() is False
+    session._check_initialized = lambda: None
+    assert (await session.get_task('task.r0000'))['uid'] == 'task.r0000'
+
+    monkeypatch.setattr(pr, 'FINISHED_RETAIN_S', 0.0)
+    session._release('task.none')                   # any release expires
+    assert len(session._finished) == 0
+    with pytest.raises(HTTPException) as e:
+        await session.get_task('task.r0000')
+    assert e.value.status_code == 404 and 'kept for' in e.value.detail
+
+
+def test_pickle_cache_stays_bounded():
+    '''Per-task arguments differ, so the cache must not grow with tasks.'''
+    import base64
+    import cloudpickle
+    from radical.orbit.plugin_rhapsody import PICKLE_CACHE_SIZE
+
+    session = RhapsodySession('test.pickle')
+    for i in range(3 * PICKLE_CACHE_SIZE):
+        blob = 'cloudpickle::' + base64.b64encode(
+            cloudpickle.dumps((i,))).decode('ascii')
+        td = session._deserialize_task(
+            {'args': blob, '_pickled_fields': ['args']})
+        assert td['args'] == (i,)
+    assert len(session._pickle_cache) <= PICKLE_CACHE_SIZE
+
+
+def test_client_completions_expire_unless_waited(monkeypatch):
+    '''The completion accumulator keeps FINISHED_RETAIN_S worth of results;
+    a completion a wait is pending on is never dropped.'''
+    import radical.orbit.plugin_rhapsody as pr
+
+    client = _make_rhapsody_client()
+    monkeypatch.setattr(pr, 'FINISHED_RETAIN_S', 0.0)
+    client._waiting['task.pinned'] = 1
+    client._submitted.update(['task.pinned', 'task.old'])
+    for uid in ['task.pinned', 'task.old'] + [f'task.{i}' for i in range(500)]:
+        client._on_task_done(None, None, 'task_status',
+                             {'uid': uid, 'state': 'DONE', 'sid': 'sid-rh'})
+
+    assert set(client._completed) == {'task.pinned'}   # the rest expired
+    assert set(client._arrived) == {'task.pinned'}
+    assert client._submitted == set()                  # completed uids leave
+
+    with pytest.raises(ValueError, match='completed more than'):
+        client.wait_tasks(['task.old'])
+
+
+def test_client_wait_fails_when_its_completion_was_dropped_before_the_pin():
+    '''A completion dropped between the uid check and the pin fails the
+    wait instead of blocking it forever.'''
+    client = _make_rhapsody_client()
+    client._bc, client._endpoint_id, client._plugin_name = \
+        MagicMock(), 'ep', 'rhapsody'
+    with client._cond:
+        with pytest.raises(ValueError, match='were dropped'):
+            client._wait_completed(['task.gone'], client._sid, None)
