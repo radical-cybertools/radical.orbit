@@ -807,17 +807,18 @@ class RhapsodySession(PluginSession):
                 if state_str.upper() in TERMINAL_STATES:
                     d = self._notification_payload(t)
                     self._queue_notification(d)
-                    self._release(uid_str)
+                    self._release(uid_str, t)
                 else:
                     self._queue_notification({
                         "uid": uid_str, "state": state_str,
                         "error": f"unexpected state: {state_str}"})
 
-    def _release(self, uid: str) -> None:
-        """Move a task that was notified as terminal to the finished map,
-        and drop finished tasks older than ``FINISHED_RETAIN_S``."""
-        task = self._tasks.pop(uid, None)
-        if task is not None:
+    def _release(self, uid: str, task=None) -> None:
+        """Move *task*, notified as terminal, to the finished map, and drop
+        finished tasks older than ``FINISHED_RETAIN_S``.  A uid that was
+        resubmitted meanwhile keeps its new, running task."""
+        if task is not None and self._tasks.get(uid) is task:
+            del self._tasks[uid]
             self._finished[uid] = (task, time.monotonic())
             self._finished.move_to_end(uid)
         with self._notified_lock:
@@ -2030,18 +2031,18 @@ class RhapsodyClient(PluginClient):
         """Block on ``_cond`` (held) until every uid completed or the
         deadline passed."""
         while True:
-            missing = [u for u in uids if u not in self._completed]
-            if not missing:
+            missing = next((u for u in uids if u not in self._completed),
+                           None)
+            if missing is None:
                 break
             if self._sid != sid:
                 raise RuntimeError(
                     f"wait_tasks: session changed from {sid} to "
                     f"{self._sid}; its tasks are not tracked any more")
-            gone = [u for u in missing if u not in self._submitted]
-            if gone:                     # dropped before this wait pinned it
+            if missing not in self._submitted:   # dropped before the pin
                 raise ValueError(
-                    "wait_tasks: completion(s) older than "
-                    f"{FINISHED_RETAIN_S:g} s were dropped: {gone}")
+                    "wait_tasks: completion older than "
+                    f"{FINISHED_RETAIN_S:g} s was dropped: {missing}")
             remaining = None
             if deadline is not None:
                 remaining = deadline - time.time()

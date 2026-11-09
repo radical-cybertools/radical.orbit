@@ -3533,8 +3533,14 @@ async def test_finished_tasks_are_released_after_the_retention(monkeypatch):
 
     # a reused uid moves to the back: it does not shield older entries
     session._tasks['task.r0000'] = tasks[0]
-    session._release('task.r0000')
+    session._release('task.r0000', tasks[0])
     assert next(reversed(session._finished)) == 'task.r0000'
+
+    # the first run of a resubmitted uid does not release the second
+    again = _done_task('task.r0001', 0)
+    session._tasks['task.r0001'] = again
+    session._release('task.r0001', tasks[1])
+    assert session._tasks['task.r0001'] is again
 
     monkeypatch.setattr(pr, 'FINISHED_RETAIN_S', 0.0)
     session._tasks['task.run'] = _done_task('task.run', 0)
@@ -3593,5 +3599,5 @@ def test_client_wait_fails_when_its_completion_was_dropped_before_the_pin():
     client._bc, client._endpoint_id, client._plugin_name = \
         MagicMock(), 'ep', 'rhapsody'
     with client._cond:
-        with pytest.raises(ValueError, match='were dropped'):
+        with pytest.raises(ValueError, match='was dropped'):
             client._wait_completed(['task.gone'], client._sid, None)
