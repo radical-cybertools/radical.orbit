@@ -1540,6 +1540,39 @@ async def test_initialize_without_telemetry(monkeypatch, has_method, otel):
     assert sess._init_ready.is_set()
 
 
+@pytest.mark.parametrize('accepts', [True, False])
+@pytest.mark.asyncio
+async def test_initialize_bounds_telemetry_when_rhapsody_can(monkeypatch,
+                                                              accepts):
+    '''retained= goes to start_telemetry only if rhapsody takes it.'''
+    from radical.orbit import plugin_rhapsody as prh
+
+    seen = {}
+    if accepts:
+        async def start_telemetry(resource_poll_interval, checkpoint_path,
+                                  retained=None):
+            seen['retained'] = retained
+    else:
+        async def start_telemetry(resource_poll_interval, checkpoint_path):
+            seen['retained'] = 'not passed'
+
+    fake_session = MagicMock(spec=['start_telemetry'])
+    fake_session.start_telemetry = start_telemetry
+    monkeypatch.setattr(prh.rh, 'get_backend',
+                        MagicMock(return_value=MagicMock(spec=[])))
+    monkeypatch.setattr(prh.rh, 'Session',
+                        MagicMock(return_value=fake_session))
+    monkeypatch.setattr(prh, '_telemetry_available', lambda: True)
+    monkeypatch.setattr(prh, '_resolve_telemetry', lambda: True)
+
+    sess = RhapsodySession('sess.telem_bound', backend_names=['fake'])
+    await _REAL_INITIALIZE(sess)
+
+    assert sess._init_error is None
+    assert seen['retained'] == (prh.TELEMETRY_RETAINED if accepts
+                                else 'not passed')
+
+
 @pytest.fixture
 def orbit_caplog(caplog):
     '''``caplog`` capturing WARNING+ from the ``radical.orbit`` logger,

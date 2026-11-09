@@ -10,6 +10,7 @@ import base64
 import functools
 import importlib
 import importlib.util
+import inspect
 import json
 import logging
 import math
@@ -99,6 +100,12 @@ OUTPUT_NOTIFY_LIMIT = FRAME_CAP // OUTPUT_RATIO
 # ever ran.  The client never drops a completion a wait_tasks call is
 # waiting for.
 FINISHED_RETAIN_S   = 3600.0
+
+# Telemetry events and spans rhapsody keeps per session (rhapsody#134; an
+# older rhapsody keeps all).  A task yields about four events, so 20k covers
+# the retention window at the E5 long run's ~5000 tasks/h (~2 KB per task,
+# ~10 MB per session).
+TELEMETRY_RETAINED  = 20_000
 
 # Endpoint-level override for the coalescing window above (seconds).  The
 # default trades ~250 ms of completion latency for fewer WS frames; a
@@ -403,10 +410,17 @@ class RhapsodySession(PluginSession):
             start_telemetry = getattr(self._rh_session, 'start_telemetry', None)
             if start_telemetry is not None and _resolve_telemetry() \
                     and _telemetry_available():
+                bound = {}
+                try:
+                    if 'retained' in inspect.signature(
+                            start_telemetry).parameters:
+                        bound['retained'] = TELEMETRY_RETAINED
+                except (TypeError, ValueError):   # no signature: unbounded
+                    pass
                 try:
                     self._telemetry = await start_telemetry(
                         resource_poll_interval=0.1,
-                        checkpoint_path="telemetry-output")
+                        checkpoint_path="telemetry-output", **bound)
                 except Exception as e:
                     log.warning("[%s] telemetry start failed: %r; not "
                                 "reporting telemetry for this session",
