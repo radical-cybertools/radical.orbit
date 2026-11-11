@@ -205,6 +205,20 @@ class BrokerCaller:
                       timeout=timeout),
             self._broker._loop)
 
+    def connected(self, name: str) -> bool:
+        """Whether *name* is a registered participant not marked ``lost``
+        (dict membership reads: safe from the plugin-host thread)."""
+        return name in self._broker.registry \
+               and self._broker._liveness.get(name) != 'lost'
+
+    def disconnect_threadsafe(self, name: str) -> 'concurrent.futures.Future':
+        """Schedule the operator ``disconnect`` of endpoint *name* (remove +
+        ``terminate`` control, as ``/endpoint/disconnect``) on the routing
+        loop.  For broker-hosted plugins; ``plugin_psij`` uses it to stop an
+        endpoint job it launched before cancelling the job."""
+        return asyncio.run_coroutine_threadsafe(
+            self._broker._disconnect(name), self._broker._loop)
+
 
 # ---------------------------------------------------------------------------
 # Broker
@@ -253,7 +267,7 @@ class Broker:
                 raise ValueError(
                     f'ingress auth token required (no --token, '
                     f'${utils.ENV_TOKEN} unset, no file at '
-                    f'{utils.TOKEN_FILE}).  Pass auth=False (--no-auth) '
+                    f'{utils.token_file()}).  Pass auth=False (--no-auth) '
                     f'for local dev, or create one:\n\n{utils.TOKEN_RECIPE}')
 
         # ── Advertised URL ───────────────────────────────────────────
@@ -579,7 +593,7 @@ class Broker:
                          '(--no-auth)')
         elif token_source == 'file':
             lines.append(f'[Broker] {"using":<10}{"token":<6}at '
-                         f'{Broker._tilde(utils.TOKEN_FILE)}')
+                         f'{Broker._tilde(utils.token_file())}')
         else:  # 'cli' / 'env' — configured, but not at the default file path
             src = '--token' if token_source == 'cli' else f'${utils.ENV_TOKEN}'
             lines.append(f'[Broker] {"using":<10}{"token":<6}from {src}')
@@ -596,19 +610,27 @@ class Broker:
         # Cert copy: when the cert sits at its default path it keeps its
         # basename; a custom path gets an explicit destination, because
         # connecting hosts resolve ~/.radical/orbit/broker_cert.pem.
-        if Path(cert_path) == utils.CERT_FILE:
+        if Path(cert_path) == utils.cert_file() \
+                and Path(cert_path).name == 'broker_cert.pem':
             cp_cert = (f'    {mkdir} && scp {host}:'
                        f'{Broker._scp_src(cert_path)} ~/.radical/orbit/')
-            cp_both = (f'    {mkdir} && scp {host}:'
-                       f'{Broker._scp_src(utils.DEFAULT_DIR)}'
-                       f'/{{broker_cert.pem,broker.token}} ~/.radical/orbit/')
+            conf = Path(cert_path).parent
+            if utils.token_file() == conf / 'broker.token':
+                cp_both = (f'    {mkdir} && scp {host}:'
+                           f'{Broker._scp_src(conf)}'
+                           f'/{{broker_cert.pem,broker.token}} '
+                           f'~/.radical/orbit/')
+            else:                   # an overridden file: copy each one
+                cp_both = (cp_cert + f' && scp {host}:'
+                           f'{Broker._scp_src(utils.token_file())}'
+                           f' ~/.radical/orbit/broker.token')
         else:
             cp_cert = (f'    {mkdir} && scp {host}:'
                        f'{Broker._scp_src(cert_path)} '
                        f'~/.radical/orbit/broker_cert.pem')
             cp_both = (cp_cert + f' && scp {host}:'
-                       f'{Broker._scp_src(utils.TOKEN_FILE)}'
-                       f' ~/.radical/orbit/')
+                       f'{Broker._scp_src(utils.token_file())}'
+                       f' ~/.radical/orbit/broker.token')
 
         if not auth_enabled:
             lines += ['', '  On Client and Endpoint:', export_url, cp_cert]

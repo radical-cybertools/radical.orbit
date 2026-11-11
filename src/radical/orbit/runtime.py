@@ -812,7 +812,7 @@ class EndpointRuntime(PluginHostBase):
                 src = {
                     'cli':  'passed explicitly (--token / token=)',
                     'env':  'from $RADICAL_ORBIT_BROKER_TOKEN',
-                    'file': f'from {utils.TOKEN_FILE}',
+                    'file': f'from {utils.token_file()}',
                 }.get(self._token_source, 'not configured at all')
                 self._set_fatal(
                     f"registration rejected by broker at {self._broker_url}: "
@@ -844,6 +844,9 @@ class EndpointRuntime(PluginHostBase):
                 'enabled':   True,
                 'ui_config': ui_config_to_dict(
                     getattr(plugin, 'ui_config', None)),
+                # tells the gateway this endpoint can serve the plugin's
+                # Explorer JS (GET <namespace>/ui_module)
+                'ui_module': bool(getattr(plugin, 'ui_module', None)),
             })
         return out
 
@@ -1458,6 +1461,25 @@ class EndpointRuntime(PluginHostBase):
         ev = protocol.Event(src=self._name, plugin=plugin_name, topic=topic,
                             session=session, ts=0.0, seq=0, data=data)
         self._emit(ev)
+
+    def disconnect_endpoint(self, name: str) -> bool:
+        """Send the broker a ``disconnect`` control for endpoint *name*.
+
+        The broker removes the participant and sends it ``terminate``; its
+        runtime stops (``on_host_stop``) and the endpoint exits.  Same
+        control the gateway's ``/endpoint/disconnect`` drives.  Returns True
+        when the frame was queued for sending (not that the endpoint is
+        gone).  Used by ``plugin_psij`` to stop an endpoint job it launched
+        before cancelling the job.
+        """
+        msg = protocol.Control(src=self._name, dst=protocol.BROKER_NAME,
+                               op='disconnect', data={'name': name})
+        try:
+            data = protocol.pack_message(msg, cap=self._frame_cap)
+        except protocol.ProtocolError as e:
+            log.error("[Runtime] failed to pack disconnect control: %s", e)
+            return False
+        return self._enqueue(data, msg.kind)
 
     # ── topology snapshot access ───────────────────────────────────────
 

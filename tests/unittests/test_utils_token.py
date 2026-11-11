@@ -18,7 +18,7 @@ def test_resolve_precedence(monkeypatch):
     assert utils.resolve_broker_token() == (None, '')
 
     # file (operator-placed — code never writes it)
-    utils.TOKEN_FILE.write_text('filetok\n')
+    utils.token_file().write_text('filetok\n')
     assert utils.resolve_broker_token() == ('filetok', 'file')
 
     # env beats file

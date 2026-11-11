@@ -528,7 +528,13 @@ const api = {
   endpointName: 'ep', escHtml: s => String(s), flash: () => {},
   async fetch(path) {
     log.push(path);
-    if (path === 'register_session') return { sid: 's' + (++n) };
+    if (path === 'register_session') {
+      const sid = 's' + (++n);
+      if (mode === 'race')                 // the first register is slower
+        await new Promise(r => setTimeout(r, sid === 's1' ? 30 : 5));
+      return { sid };
+    }
+    if (path.startsWith('unregister_session/')) return { ok: true };
     const e = new Error('HTTP 410'); e.status = 410;
     e.detail = '{"detail": "session s2 expired"}';
     throw e;
@@ -544,7 +550,14 @@ vm.runInContext(src, ctx);
 
 (async () => {
   ctx.init(page, api);
+  if (mode === 'race') {                   // two Connects: the last one wins
+    await Promise.all([ctx.connect(page, api), ctx.connect(page, api)]);
+    process.stdout.write(JSON.stringify({ log, sid: ctx.state.ep.sid }));
+    return;
+  }
+  page.querySelector('.globus-remember').checked = true;
   await ctx.connect(page, api);
+  store.globus_tokens = 'saved-by-the-user';
   await new Promise(r => setTimeout(r, 10));
   if (busy) ctx.state.ep.connecting = true;
   onLost('{"detail": "session s1 expired after 900 s"}');
@@ -555,7 +568,8 @@ vm.runInContext(src, ctx);
   ctx.state.ep.sid = ctx.state.ep.sid || 's2';
   await ctx.cancelTask(page, api, 't1');
   await new Promise(r => setTimeout(r, 10));
-  process.stdout.write(JSON.stringify({ log, afterLost, sid: ctx.state.ep.sid }));
+  process.stdout.write(JSON.stringify({ log, afterLost, sid: ctx.state.ep.sid,
+                                       stored: store.globus_tokens }));
 })();
 """
 
@@ -577,6 +591,7 @@ def test_globus_lost_session_reconnects_with_its_refresh_token(tmp_path):
     assert res['log'][:3] == ['register_session', 'keep s1', 'release s1']
     assert res['afterLost']['sid'] == 's2'               # reconnected
     assert 's1 expired after 900 s' in res['afterLost']['status']
+    assert res['stored'] == 'saved-by-the-user'          # not rewritten
 
 
 def test_globus_lost_session_with_an_access_token_resets_the_panel(tmp_path):
@@ -597,3 +612,11 @@ def test_globus_lost_session_does_not_race_a_running_connect(tmp_path):
     res = _globus_run(tmp_path, 'refresh', 'busy')
     assert res['afterLost']['sid'] is None
     assert res['log'].count('register_session') == 1
+
+
+def test_globus_superseded_connect_releases_its_session(tmp_path):
+    """Of two overlapping Connects the last one wins; the earlier one,
+    finishing later, unregisters the session it created."""
+    res = _globus_run(tmp_path, 'race')
+    assert res['sid'] == 's2'
+    assert 'unregister_session/s1' in res['log']

@@ -639,3 +639,293 @@ def test_psij_cancel_racing_a_recorded_completion_keeps_it(mock_psij):
     sess._notify_state('job.1', _status('COMPLETED'))
     assert sess._job_states['job.1'] == 'COMPLETED'
     assert [d['state'] for d in sent] == ['COMPLETED']
+
+
+# --- graceful cancel of endpoint jobs ------------------------------------------
+
+class _FakeRuntime:
+    '''The host runtime as plugin_psij sees it: name, topology, and the
+    broker ``disconnect`` control.  ``on_disconnect`` runs when the control
+    is "sent" (e.g. to let the fake job end).'''
+
+    def __init__(self, connected=(), on_disconnect=None):
+        self.name          = 'login'
+        self.connected     = set(connected)
+        self.disconnects   = []
+        self.on_disconnect = on_disconnect
+
+    def topology(self):
+        return {n: {'role': 'endpoint', 'plugins': {}, 'liveness': 'alive'}
+                for n in self.connected}
+
+    def disconnect_endpoint(self, name):
+        self.disconnects.append(name)
+        if self.on_disconnect:
+            self.on_disconnect(name)
+        return True
+
+    def send_notification(self, *a, **kw):
+        pass
+
+
+def _endpoint_plugin(mock_psij, rt, executor='local', name='child-ep',
+                     caller=None):
+    '''A psij plugin on a fake runtime, with one endpoint job submitted
+    through ``submit_tunneled`` (tunnel 'none') and currently ACTIVE.'''
+    app = FastAPI()
+    app.state.endpoint_service = rt
+    app.state.endpoint_name    = rt.name
+    if caller is not None:
+        app.state.broker_caller = caller
+    plugin = PluginPSIJ(app)
+    client = TestClient(app)
+
+    job = MagicMock()
+    job.id        = 'endpoint-job.g'
+    job.native_id = '4242'
+    job.status.state = psij.JobState.ACTIVE
+    mock_psij.Job.return_value = job
+
+    sid  = client.post(f"{plugin.namespace}/register_session").json()['sid']
+    resp = client.post(f"{plugin.namespace}/submit_tunneled/{sid}", json={
+        "job_spec": {"executable": "radical-orbit-endpoint-wrapper.sh",
+                     "arguments": ["-n", name, "-p", "default"]},
+        "executor": executor, "tunnel": "none"})
+    assert resp.status_code == 200
+    return plugin, client, sid, job
+
+
+def test_cancel_endpoint_job_stops_endpoint_gracefully(mock_psij, monkeypatch):
+    '''Endpoint connected: cancel sends the broker disconnect, the job ends
+    on its own within the grace period, and no batch cancel is issued.'''
+    from radical.orbit import plugin_psij as m
+    monkeypatch.setattr(m, 'CANCEL_POLL', 0.01)
+    rt = _FakeRuntime()
+    plugin, client, sid, job = _endpoint_plugin(mock_psij, rt)
+    rt.connected.add('child-ep')            # the child registered after submit
+
+    def _ends(name):
+        job.status.state = psij.JobState.COMPLETED
+    rt.on_disconnect = _ends
+
+    resp = client.post(f"{plugin.namespace}/cancel/{sid}/{job.id}")
+    assert resp.status_code == 200
+    assert resp.json() == {'job_id': job.id, 'status': 'canceled',
+                           'graceful': True}
+    assert rt.disconnects == ['child-ep']
+    job.cancel.assert_not_called()
+    # still reported as the requested cancel
+    assert plugin._sessions[sid]._effective_state(job.id, 'COMPLETED') \
+        == 'CANCELED'
+
+
+def test_cancel_endpoint_job_sees_batch_end_before_psij(mock_psij, monkeypatch):
+    '''psij polls the queue only every 30 s: the batch system's own view of
+    the job ending counts too (when the job used the detected backend).'''
+    from radical.orbit import plugin_psij as m
+    monkeypatch.setattr(m, 'CANCEL_POLL', 0.01)
+    backend = MagicMock()
+    backend.psij_executor = 'slurm'
+    backend.job_state.side_effect = ['RUNNING', 'DONE']
+    monkeypatch.setattr(m.batch_system, 'detect_batch_system',
+                        lambda: backend)
+    rt = _FakeRuntime()
+    plugin, client, sid, job = _endpoint_plugin(mock_psij, rt,
+                                                executor='slurm')
+    rt.connected.add('child-ep')
+
+    resp = client.post(f"{plugin.namespace}/cancel/{sid}/{job.id}")
+    assert resp.json()['graceful'] is True
+    job.cancel.assert_not_called()
+    assert backend.job_state.call_args[0] == ('4242',)
+
+
+@pytest.mark.parametrize('cancel_fails', [False, True])
+def test_cancel_endpoint_job_left_the_queue(mock_psij, monkeypatch,
+                                            cancel_fails):
+    '''UNKNOWN after RUNNING, UNKNOWN_TOLERANCE times in a row: the job left
+    the queue -- or squeue failed (it answers UNKNOWN then, too).  Not a
+    confirmed end: job.cancel() still runs, and the reply says graceful
+    False.  The trailing RUNNING is the squeue-outage case: the job was alive
+    all along -- so a failing cancel is reported (500), not swallowed.'''
+    from radical.orbit import plugin_psij as m
+    monkeypatch.setattr(m, 'CANCEL_POLL', 0.01)
+    backend = MagicMock()
+    backend.psij_executor = 'slurm'
+    backend.job_state.side_effect = ['UNKNOWN', 'RUNNING'] + \
+                                    ['UNKNOWN'] * 3 + ['RUNNING']
+    monkeypatch.setattr(m.batch_system, 'detect_batch_system',
+                        lambda: backend)
+    rt = _FakeRuntime()
+    plugin, client, sid, job = _endpoint_plugin(mock_psij, rt,
+                                                executor='slurm')
+    rt.connected.add('child-ep')
+    if cancel_fails:
+        job.cancel.side_effect = RuntimeError('scancel: Socket timed out')
+
+    resp = client.post(f"{plugin.namespace}/cancel/{sid}/{job.id}")
+    if cancel_fails:
+        assert resp.status_code == 500
+    else:
+        assert resp.status_code == 200
+        assert resp.json() == {'job_id': job.id, 'status': 'canceled',
+                               'graceful': False, 'endpoint_stopped': True}
+    assert rt.disconnects == ['child-ep']
+    job.cancel.assert_called_once()
+    assert backend.job_state.call_count == 5
+
+
+@pytest.mark.parametrize('batch_state, stopped', [('PENDING', False),
+                                                  ('UNKNOWN', False),
+                                                  ('RUNNING', True)])
+def test_cancel_endpoint_job_only_when_running(mock_psij, monkeypatch,
+                                               batch_state, stopped):
+    '''A queued job cannot have registered the endpoint: the endpoint that
+    holds the name (an earlier job with the same -n, another user's) is not
+    ours and must not be stopped.  psij lags behind the batch system, so
+    batch RUNNING counts as active even while psij still says QUEUED.'''
+    from radical.orbit import plugin_psij as m
+    monkeypatch.setattr(m, 'CANCEL_POLL', 0.01)
+    backend = MagicMock()
+    backend.psij_executor = 'slurm'
+    backend.job_state.side_effect = [batch_state, 'DONE']
+    monkeypatch.setattr(m.batch_system, 'detect_batch_system',
+                        lambda: backend)
+    rt = _FakeRuntime()
+    plugin, client, sid, job = _endpoint_plugin(mock_psij, rt,
+                                                executor='slurm')
+    job.status.state = psij.JobState.QUEUED
+    rt.connected.add('child-ep')          # someone holds the name
+
+    resp = client.post(f"{plugin.namespace}/cancel/{sid}/{job.id}")
+    if stopped:
+        assert rt.disconnects == ['child-ep']
+        assert resp.json()['graceful'] is True
+        job.cancel.assert_not_called()
+    else:
+        assert rt.disconnects == []
+        assert resp.json() == {'job_id': job.id, 'status': 'canceled'}
+        job.cancel.assert_called_once()
+
+
+def test_cancel_queued_local_job_skips_graceful_step(mock_psij):
+    '''No batch backend to ask: psij's own state decides.'''
+    rt = _FakeRuntime()
+    plugin, client, sid, job = _endpoint_plugin(mock_psij, rt)
+    job.status.state = psij.JobState.QUEUED
+    rt.connected.add('child-ep')
+    client.post(f"{plugin.namespace}/cancel/{sid}/{job.id}")
+    assert rt.disconnects == []
+    job.cancel.assert_called_once()
+
+
+def test_cancel_endpoint_job_falls_back_after_grace(mock_psij, monkeypatch):
+    '''The job does not end within the grace period: job.cancel() follows.'''
+    from radical.orbit import plugin_psij as m
+    monkeypatch.setattr(m, 'CANCEL_POLL', 0.01)
+    monkeypatch.setenv('RADICAL_ORBIT_PSIJ_CANCEL_GRACE', '0.1')
+    rt = _FakeRuntime()
+    plugin, client, sid, job = _endpoint_plugin(mock_psij, rt)
+    rt.connected.add('child-ep')
+
+    resp = client.post(f"{plugin.namespace}/cancel/{sid}/{job.id}")
+    assert resp.json() == {'job_id': job.id, 'status': 'canceled',
+                           'graceful': False, 'endpoint_stopped': True}
+    assert rt.disconnects == ['child-ep']
+    job.cancel.assert_called_once()
+
+
+@pytest.mark.parametrize('case', ['not_connected', 'not_owned', 'grace_0',
+                                  'plain_job'])
+def test_cancel_without_graceful_step(mock_psij, monkeypatch, case):
+    '''No disconnect, immediate job.cancel(): a pending endpoint job (not
+    connected yet), a name that was already connected at submit (not ours),
+    a grace of 0, and an ordinary psij job.'''
+    rt = _FakeRuntime(connected=['child-ep'] if case == 'not_owned' else [])
+    if case == 'grace_0':
+        monkeypatch.setenv('RADICAL_ORBIT_PSIJ_CANCEL_GRACE', '0')
+    plugin, client, sid, job = _endpoint_plugin(mock_psij, rt)
+    if case in ('grace_0',):
+        rt.connected.add('child-ep')
+    if case == 'plain_job':
+        rt.connected.add('child-ep')
+        plugin._sessions[sid]._job_meta[job.id].pop('endpoint_name')
+
+    resp = client.post(f"{plugin.namespace}/cancel/{sid}/{job.id}")
+    assert resp.json() == {'job_id': job.id, 'status': 'canceled'}
+    assert rt.disconnects == []
+    job.cancel.assert_called_once()
+
+
+def test_cancel_never_stops_the_host_endpoint(mock_psij):
+    rt = _FakeRuntime()
+    plugin, client, sid, job = _endpoint_plugin(mock_psij, rt, name='login')
+    rt.connected.add('login')
+    client.post(f"{plugin.namespace}/cancel/{sid}/{job.id}")
+    assert rt.disconnects == []
+    job.cancel.assert_called_once()
+
+
+def test_cancel_endpoint_job_from_broker_hosted_psij(mock_psij, monkeypatch):
+    '''psij hosted on the (embedded) broker -- the HPPSS demo setup: the
+    disconnect goes through the broker seam, not a runtime control frame.'''
+    from radical.orbit import plugin_psij as m
+    monkeypatch.setattr(m, 'CANCEL_POLL', 0.01)
+    rt      = _FakeRuntime()
+    rt.name = 'broker'
+    caller  = MagicMock()
+    caller.connected.return_value = False          # at submit: not connected
+    plugin, client, sid, job = _endpoint_plugin(mock_psij, rt, caller=caller)
+    caller.connected.return_value = True
+
+    def _ends(name):
+        job.status.state = psij.JobState.COMPLETED
+    caller.disconnect_threadsafe.side_effect = _ends
+
+    resp = client.post(f"{plugin.namespace}/cancel/{sid}/{job.id}")
+    assert resp.json()['graceful'] is True
+    caller.disconnect_threadsafe.assert_called_once_with('child-ep')
+    assert rt.disconnects == []
+    job.cancel.assert_not_called()
+
+
+def test_cancel_grace_from_environment(monkeypatch):
+    from radical.orbit import plugin_psij as m
+    monkeypatch.delenv('RADICAL_ORBIT_PSIJ_CANCEL_GRACE', raising=False)
+    assert m._cancel_grace() == 30.0
+    monkeypatch.setenv('RADICAL_ORBIT_PSIJ_CANCEL_GRACE', '5')
+    assert m._cancel_grace() == 5.0
+    for bad in ('-1', 'nan', 'inf', 'soon'):
+        monkeypatch.setenv('RADICAL_ORBIT_PSIJ_CANCEL_GRACE', bad)
+        assert m._cancel_grace() == 30.0
+
+
+# --- endpoint job output survives session close --------------------------------
+
+def test_endpoint_job_output_survives_session_close(mock_psij, monkeypatch,
+                                                    tmp_path):
+    monkeypatch.setenv('RADICAL_ORBIT_PSIJ_DIR', str(tmp_path / 'psij'))
+    plugin, client, sid, job = _endpoint_plugin(mock_psij, _FakeRuntime())
+    sess = plugin._sessions[sid]
+    sess._jobs['plain.1'] = MagicMock()
+    out_dir = sess._output_dir
+    for jid in (job.id, 'plain.1'):
+        for ext in ('out', 'err'):
+            (out_dir / f'{jid}.{ext}').write_text(f'{jid} {ext}\n')
+
+    asyncio.run(sess.close())
+
+    assert (out_dir / f'{job.id}.out').read_text() == f'{job.id} out\n'
+    assert (out_dir / f'{job.id}.err').exists()
+    assert not (out_dir / 'plain.1.out').exists()
+    assert not (out_dir / 'plain.1.err').exists()
+
+
+def test_plain_session_output_removed_on_close(mock_psij, monkeypatch,
+                                               tmp_path):
+    monkeypatch.setenv('RADICAL_ORBIT_PSIJ_DIR', str(tmp_path / 'psij'))
+    sess, _ = _psij_session(mock_psij)
+    sess._jobs['plain.1'] = MagicMock()
+    (sess._output_dir / 'plain.1.out').write_text('x')
+    asyncio.run(sess.close())
+    assert not sess._output_dir.exists()
