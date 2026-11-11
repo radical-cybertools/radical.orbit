@@ -1463,3 +1463,38 @@ async def test_rotation_waits_for_a_closing_session():
     await asyncio.sleep(0)
     assert await plugin._live_session('s1') is None
     assert close.done()
+
+
+@pytest.mark.asyncio
+async def test_register_during_shutdown_closes_the_built_session(
+        endpoint_app, monkeypatch):
+    '''A refresh-token register whose offloaded build outlives the start
+    of shutdown answers 410 and closes the built session instead of
+    recording one that nobody closes.'''
+    import threading
+    plugin  = PluginGlobus(endpoint_app)
+    release = threading.Event()
+    built   = []
+    orig    = plugin._create_session
+
+    def _create(sid, **kw):
+        release.wait(5)
+        session = orig(sid, **kw)
+        session._close_clients = MagicMock(
+            side_effect=session._close_clients)
+        built.append(session)
+        return session
+
+    monkeypatch.setattr(plugin, '_create_session', _create)
+    with patch('radical.orbit.plugin_globus.globus_sdk'):
+        reg = asyncio.ensure_future(plugin.register_session(
+            _register_request({'refresh_token': 'rt', 'client_id': 'c'})))
+        await asyncio.sleep(0.05)               # the build is running
+        await plugin.shutdown()
+        release.set()
+        with pytest.raises(HTTPException) as exc:
+            await reg
+    assert exc.value.status_code == 410
+    assert 'shutting down' in exc.value.detail
+    assert not plugin._sessions and not plugin._records
+    built[0]._close_clients.assert_called_once()

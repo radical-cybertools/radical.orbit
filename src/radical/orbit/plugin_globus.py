@@ -970,6 +970,11 @@ class PluginGlobus(Plugin):
         except BaseException:         # incl. cancellation: nothing holds it
             session._close_clients()
             raise
+        if self._shutting_down:
+            # shutdown began during the build: nobody would close it
+            session._close_clients()
+            raise HTTPException(status_code=410,
+                                detail=self._shutdown_detail())
         if existing is not None:
             existing.adopt_credential(
                 session, keep_collection=not data.get('local_collection'))

@@ -327,6 +327,7 @@ class PluginLucid(Plugin):
         return {'name': name, 'mime': 'image/png', 'data': data}
 
     async def shutdown(self) -> None:
+        self._shutting_down = True     # requests answer 410 from here on
         # stop the run first: it may still use the runtime stopped below
         run, thread = self._run, self._thread
         if run and thread and thread.is_alive():

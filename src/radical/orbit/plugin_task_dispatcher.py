@@ -1426,6 +1426,7 @@ class PluginTaskDispatcher(Plugin):
 
     async def shutdown(self) -> None:
         '''Cancel the housekeeping loop and drop the event tap, then base close.'''
+        self._shutting_down = True     # requests answer 410 from here on
         # anything still coalescing gets its persist and its notification now
         self._flush_rh()
         if self._housekeeping_task is not None \
