@@ -378,6 +378,24 @@ def test_proxy_unknown_endpoint_is_404(harness):
     assert r.status_code == 404
 
 
+
+def test_proxy_to_suspect_endpoint_is_503_with_retry_after(harness):
+    """The client-visible contract: a suspect endpoint answers 503 with
+    Retry-After (retry is safe, nothing was sent), not 404 / 504.  The
+    endpoint is marked suspect directly: a real unclean drop is followed by
+    the runtime's reconnect within milliseconds."""
+    make_broker, make_runtime = harness
+    srv = make_broker()
+    make_runtime(srv.url, name='epA', plugins=['gw_test'])
+    assert _wait(lambda: 'epA' in srv.broker.registry)
+
+    srv.broker._liveness['epA'] = 'suspect'
+    r = httpx.get(srv.url + '/epA/gw_test/ping', timeout=5.0)
+    assert r.status_code == 503
+    assert r.headers['retry-after'] == '1'
+    assert 'retry' in r.json()['detail']
+
+
 def test_gateway_raised_httpexception_uses_rich_envelope(harness):
     # A gateway-raised HTTPException (disconnecting the broker host is a 400)
     # renders the canonical envelope, not FastAPI's bare {"detail": ...}.
