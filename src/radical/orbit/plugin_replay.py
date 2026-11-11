@@ -467,6 +467,7 @@ class PluginReplay(Plugin):
         '''Cancel the background sweeper and drop the raw-event tap, then run
         the base teardown (cleanup task + sessions).  Keeps the host loop free
         of pending plugin tasks on broker shutdown.'''
+        self._shutting_down = True     # requests answer 410 from here on
         if self._sweeper is not None and not self._sweeper.done():
             self._sweeper.cancel()
             try:    await self._sweeper

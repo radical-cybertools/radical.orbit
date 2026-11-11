@@ -56,7 +56,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 
 from .                    import utils
-from .plugin_base         import Plugin, DEFAULT_SID
+from .plugin_base         import Plugin, DEFAULT_SID, no_drain
 from .plugin_session_base import PluginSession
 from .client              import PluginClient
 
@@ -970,6 +970,11 @@ class PluginGlobus(Plugin):
         except BaseException:         # incl. cancellation: nothing holds it
             session._close_clients()
             raise
+        if self._shutting_down:
+            # shutdown began during the build: nobody would close it
+            session._close_clients()
+            raise HTTPException(status_code=410,
+                                detail=self._shutdown_detail())
         if existing is not None:
             existing.adopt_credential(
                 session, keep_collection=not data.get('local_collection'))
@@ -994,7 +999,9 @@ class PluginGlobus(Plugin):
         '''Return the session under ``sid``, ending it first if it has
         expired but was not swept yet — a rotation must not revive it.'''
         record = self._records.get(sid)
-        if record is not None:
+        if record is not None and record.closing:
+            await self._drop_session(sid)       # let that close finish
+        elif record is not None:
             await self._expire_if_due(sid, record, time.time())
         return self._sessions.get(sid)
 
@@ -1021,6 +1028,7 @@ class PluginGlobus(Plugin):
         task_id = request.path_params['task_id']
         return await self._forward(sid, GlobusSession.get_task, task_id)
 
+    @no_drain                       # a long wait must not hold a close
     async def task_wait(self, request: Request) -> dict:
         sid     = request.path_params['sid']
         task_id = request.path_params['task_id']

@@ -308,6 +308,86 @@ async def test_default_session_via_forward():
         DEFAULT_SID, plugin._sessions[DEFAULT_SID])
 
 
+def _default_request():
+    request = MagicMock(spec=Request)
+    request.json    = AsyncMock(return_value={"sid": DEFAULT_SID})
+    request.headers = {}
+    return request
+
+
+@pytest.mark.asyncio
+async def test_closing_default_answers_410_then_is_recreated():
+    '''register('default') on a closing 'default' answers 410; after the
+    close it is recreated through rhapsody's override, with its init.'''
+    _, plugin, _ = _make_plugin()
+    with patch.object(PluginRhapsody, '_init_session', new_callable=AsyncMock):
+        await plugin.register_session(_default_request())
+    old     = plugin._sessions[DEFAULT_SID]
+    release = asyncio.Event()
+
+    async def _held(request):
+        await release.wait()
+
+    req   = asyncio.ensure_future(plugin._accessing(_held)(
+        MagicMock(path_params={'sid': DEFAULT_SID}, headers={})))
+    await asyncio.sleep(0)
+    close = asyncio.ensure_future(plugin._drop_session(DEFAULT_SID))
+    await asyncio.sleep(0)
+    with pytest.raises(HTTPException) as exc:
+        await plugin.register_session(_default_request())
+    assert exc.value.status_code == 410 and "closing" in exc.value.detail
+    release.set()
+    await req
+    await close
+    assert DEFAULT_SID not in plugin._sessions
+    with patch.object(PluginRhapsody, '_init_session',
+                      new_callable=AsyncMock) as init_mock:
+        resp = await plugin.register_session(_default_request())
+        await asyncio.sleep(0)
+    new = plugin._sessions[DEFAULT_SID]
+    assert resp['sid'] == DEFAULT_SID and new is not old
+    init_mock.assert_called_once_with(DEFAULT_SID, new)
+
+
+@pytest.mark.asyncio
+async def test_no_default_recreated_during_shutdown():
+    '''Routes stay live during shutdown: once 'default' was closed, a
+    register or _forward on it answers 410 and starts no init.'''
+    _, plugin, _ = _make_plugin()
+    with patch.object(PluginRhapsody, '_init_session', new_callable=AsyncMock):
+        await plugin.register_session(_default_request())
+        other = MagicMock(spec=Request)
+        other.json    = AsyncMock(return_value={})
+        other.headers = {}
+        sid  = (await plugin.register_session(other))['sid']
+    hold = asyncio.Event()
+
+    async def _slow_close():
+        await hold.wait()
+
+    plugin._sessions[sid].close = _slow_close       # keeps shutdown running
+    down = asyncio.ensure_future(plugin.shutdown())
+    for _ in range(1000):
+        if DEFAULT_SID not in plugin._sessions:
+            break
+        await asyncio.sleep(0)
+    assert DEFAULT_SID not in plugin._sessions and not down.done()
+    with patch.object(PluginRhapsody, '_init_session',
+                      new_callable=AsyncMock) as init_mock:
+        with pytest.raises(HTTPException) as exc:
+            await plugin.register_session(_default_request())
+        assert exc.value.status_code == 410
+        with pytest.raises(HTTPException) as exc:
+            await plugin._forward(DEFAULT_SID, RhapsodySession.list_tasks)
+        assert exc.value.status_code == 410
+        await asyncio.sleep(0)
+    init_mock.assert_not_called()
+    assert DEFAULT_SID not in plugin._sessions
+    hold.set()
+    await down
+    assert not plugin._sessions
+
+
 def test_unregister_session():
     _, plugin, client = _make_plugin()
     sid = _register(client, plugin)
@@ -2228,17 +2308,17 @@ async def test_close_stops_data_backend_still_starting():
 
 
 @pytest.mark.asyncio
-async def test_close_drain_is_bounded():
-    from radical.orbit import plugin_rhapsody as prh
+async def test_close_under_a_running_start_leaves_it_to_data_start():
+    # the base plugin drains requests before close(), bounded: past that
+    # bound close() runs under a start still in progress
     session = _ready_session()
     backend = _FakeDataBackend('redis_data')
     backend.gate = asyncio.Event()          # start never finishes by itself
 
-    with patch.object(_mock_rh, 'get_data_backend', return_value=backend), \
-         patch.object(prh, 'CLOSE_DRAIN_TIMEOUT', 0.05):
+    with patch.object(_mock_rh, 'get_data_backend', return_value=backend):
         task = asyncio.ensure_future(session.data_start('redis'))
         await asyncio.sleep(0)
-        await session.close()               # returns after the drain timeout
+        await session.close()
         assert not session.is_active
         backend.shutdown.assert_not_awaited()   # start still runs ...
         backend.gate.set()
@@ -2528,12 +2608,12 @@ async def test_concurrent_stoppers_share_one_shutdown():
 
 
 @pytest.mark.asyncio
-async def test_cancel_all_is_one_tracked_op():
+async def test_cancel_all_cancels_every_running_task():
     session = _ready_session()
     seen    = []
 
     async def _cancel(uid):
-        seen.append(session._ops)
+        seen.append(uid)
     backend = MagicMock()
     backend.cancel_task = AsyncMock(side_effect=_cancel)
     session._rh_session.backends = {'concurrent': backend}
@@ -2541,8 +2621,7 @@ async def test_cancel_all_is_one_tracked_op():
                                 'backend': 'concurrent'} for i in range(3)}
     res = await session.cancel_all_tasks()
     assert res == {'canceled': 3}
-    assert seen == [1, 1, 1]
-    assert session._ops == 0
+    assert len(seen) == 3
 
 
 @pytest.mark.asyncio
@@ -2638,7 +2717,9 @@ async def test_close_during_initialize_closes_new_rh_session(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_failed_start_cleanup_during_drain_is_retried_by_close():
+async def test_failed_start_cleanup_is_retried_by_close():
+    # the base plugin drains the start request before close(): the start
+    # fails first, its cleanup fails, and close() tries that store again
     session = _ready_session()
     backend = _FakeDataBackend('redis_data')
     backend.gate = asyncio.Event()
@@ -2652,12 +2733,10 @@ async def test_failed_start_cleanup_during_drain_is_retried_by_close():
     with patch.object(_mock_rh, 'get_data_backend', return_value=backend):
         start = asyncio.ensure_future(session.data_start('redis'))
         await asyncio.sleep(0)
-        close = asyncio.ensure_future(session.close())   # drains the start
-        await asyncio.sleep(0)
         backend.gate.set()
         with pytest.raises(RuntimeError, match='port in use'):
             await start
-        await close
+        await session.close()
     assert backend.shutdown.await_count == 2    # close tried once more
 
 

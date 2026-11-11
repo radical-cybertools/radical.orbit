@@ -187,6 +187,9 @@ class PluginLucid(Plugin):
         if url:
             with self._rt_lock:
                 if self._rt_own is None:
+                    if self._shutting_down:     # shutdown would not stop it
+                        raise HTTPException(status_code=410,
+                                            detail=self._shutdown_detail())
                     from .runtime import EndpointRuntime
                     rt = EndpointRuntime(broker_url=url)
                     try:
@@ -200,6 +203,10 @@ class PluginLucid(Plugin):
                             status_code=503,
                             detail=f'cannot reach {_BROKER_ENV}={url}: '
                                    f'{e}') from e
+                    if self._shutting_down:     # began during the start
+                        rt.stop()
+                        raise HTTPException(status_code=410,
+                                            detail=self._shutdown_detail())
                     self._rt_own = rt
                 return self._rt_own
         rt = getattr(self._app.state, 'endpoint_service', None)
@@ -267,6 +274,9 @@ class PluginLucid(Plugin):
             raise HTTPException(status_code=400, detail=str(e)) from e
 
         with self._lock:
+            if self._shutting_down:         # shutdown would not join it
+                raise HTTPException(status_code=410,
+                                    detail=self._shutdown_detail())
             prev         = self._run
             self._run    = run
             self._state  = run.snapshot()
@@ -326,16 +336,27 @@ class PluginLucid(Plugin):
                                 detail=f'image {name} is gone: {e}') from e
         return {'name': name, 'mime': 'image/png', 'data': data}
 
+    def _take_rt_own(self):
+        '''The runtime this plugin created (if any), waiting for a
+        creation in progress.'''
+        with self._rt_lock:
+            return self._rt_own
+
     async def shutdown(self) -> None:
-        # stop the run first: it may still use the runtime stopped below
-        run, thread = self._run, self._thread
+        self._shutting_down = True     # requests answer 410 from here on
+        # stop the run first: it may still use the runtime stopped below.
+        # Read under the locks: a submit past its 410 check either started
+        # its thread / runtime before (stopped here) or sees the flag.
+        with self._lock:
+            run, thread = self._run, self._thread
         if run and thread and thread.is_alive():
             run.cancel()
             await asyncio.to_thread(thread.join, 60)
         shutil.rmtree(self._imgdir, ignore_errors=True)
-        if self._rt_own is not None:
+        rt_own = await asyncio.to_thread(self._take_rt_own)
+        if rt_own is not None:
             try:
-                await asyncio.to_thread(self._rt_own.stop)
+                await asyncio.to_thread(rt_own.stop)
             except Exception as e:
                 log.warning('[lucid] runtime stop failed: %s', e)
         await super().shutdown()

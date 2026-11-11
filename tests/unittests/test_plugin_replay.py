@@ -662,3 +662,22 @@ def test_e2e_late_consumer_replays_with_splice(harness):
     deduped = set(all_deliveries)
     assert deduped == set(range(7))                  # exactly-once after dedup
     assert len(all_deliveries) > len(deduped)        # overlap actually occurred
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['replay', 'task_dispatcher'])
+async def test_shutdown_flag_set_before_own_teardown(kind, tmp_path):
+    '''Plugins with their own teardown set _shutting_down first, so a
+    request during that teardown answers 410.'''
+    if kind == 'replay':
+        p = _make_plugin()
+    else:
+        from radical.orbit.plugin_task_dispatcher import PluginTaskDispatcher
+        app = FastAPI()
+        app.state.broker_tap = None
+        p = PluginTaskDispatcher(app, state_root=tmp_path / 'state',
+                                 scratch_root=tmp_path / 'scratch')
+    seen = []
+    p._untap = lambda: seen.append(p._shutting_down)
+    await p.shutdown()
+    assert seen == [True]

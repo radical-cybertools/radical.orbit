@@ -15,7 +15,7 @@ from radical.orbit.plugin_session_base import PluginSession
 from fastapi import FastAPI, HTTPException
 from starlette.routing import Route
 from starlette.requests import Request
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 import asyncio
 import uuid
 import logging
@@ -956,3 +956,428 @@ async def test_touching_default_does_not_create_it():
     plugin = _fresh_plugin()
     assert await plugin.touch_session(_sid_request(DEFAULT_SID)) == {}
     assert DEFAULT_SID not in plugin._sessions
+
+
+# ---------------------------------------------------------------------------
+# Close coordination: a closing session answers 410 "is closing", requests
+# in flight are drained (bounded; @no_drain routes excepted), the close runs
+# once, shielded, and the sweep / shutdown close sessions concurrently.
+# ---------------------------------------------------------------------------
+
+class _SlowCloseSession(PluginSession):
+    closes = 0
+
+    async def close(self):
+        type(self).closes += 1
+        await asyncio.sleep(0.05)
+        return await super().close()
+
+
+async def _plugin_with(sid, session_class=PluginSession):
+    plugin = _fresh_plugin()
+    plugin.session_class = session_class
+    await plugin.register_session(_owned_request({"sid": sid}))
+    return plugin
+
+
+@pytest.mark.asyncio
+async def test_close_waits_for_a_request_in_flight_then_answers_410():
+    plugin  = await _plugin_with("s1")
+    release = asyncio.Event()
+    entered = asyncio.Event()
+
+    async def _slow(request):
+        entered.set()
+        await release.wait()
+        return {"done": True}
+
+    handler = plugin._accessing(_slow)
+    req     = asyncio.ensure_future(handler(_sid_request("s1")))
+    await entered.wait()
+    close   = asyncio.ensure_future(plugin._drop_session("s1"))
+    await asyncio.sleep(0.01)
+    assert not close.done()                       # draining
+    assert "s1" in plugin._sessions               # kept during the close
+    with pytest.raises(HTTPException) as exc:     # no 404 meanwhile
+        await handler(_sid_request("s1"))
+    assert exc.value.status_code == 410 and "closing" in exc.value.detail
+    release.set()
+    assert (await req) == {"done": True}
+    assert await close is True
+    assert "s1" not in plugin._sessions and "s1" not in plugin._records
+
+
+@pytest.mark.asyncio
+async def test_close_drain_is_bounded(caplog):
+    from radical.orbit import plugin_base as pb
+    plugin  = await _plugin_with("s1")
+    entered = asyncio.Event()
+
+    async def _stuck(request):
+        entered.set()
+        await asyncio.sleep(10)
+
+    req = asyncio.ensure_future(plugin._accessing(_stuck)(_sid_request("s1")))
+    await entered.wait()
+    with patch.object(pb, 'CLOSE_DRAIN_TIMEOUT', 0.05), \
+            caplog.at_level(logging.WARNING, logger="radical.orbit"):
+        assert await plugin._drop_session("s1") is True
+    assert "still in flight" in caplog.text
+    req.cancel()
+
+
+@pytest.mark.asyncio
+async def test_no_drain_route_does_not_hold_a_close():
+    from radical.orbit.plugin_base import no_drain
+    plugin  = await _plugin_with("s1")
+    entered = asyncio.Event()
+
+    @no_drain
+    async def _wait(request):
+        entered.set()
+        await asyncio.sleep(10)
+
+    req = asyncio.ensure_future(plugin._accessing(_wait)(_sid_request("s1")))
+    await entered.wait()
+    await asyncio.wait_for(plugin._drop_session("s1"), 1)    # no drain
+    assert "s1" not in plugin._sessions
+    req.cancel()
+
+
+@pytest.mark.asyncio
+async def test_close_runs_once_and_survives_a_cancelled_caller():
+    _SlowCloseSession.closes = 0
+    plugin = await _plugin_with("s1", _SlowCloseSession)
+    first  = asyncio.ensure_future(plugin._drop_session("s1"))
+    await asyncio.sleep(0)
+    second = asyncio.ensure_future(plugin._drop_session("s1"))
+    await asyncio.sleep(0)
+    first.cancel()                                # the caller gives up
+    assert await second is True
+    assert _SlowCloseSession.closes == 1
+    assert "s1" not in plugin._sessions and "s1" not in plugin._records
+
+
+@pytest.mark.asyncio
+async def test_expiry_during_unregister_keeps_reason_closed():
+    plugin = await _plugin_with("s1", _SlowCloseSession)
+    plugin.session_ttl = 60
+    unreg  = asyncio.ensure_future(
+        plugin.unregister_session(_sid_request("s1")))
+    await asyncio.sleep(0)
+    rec = plugin._records["s1"]
+    rec.last_access = time.time() - 100           # also past its deadline
+    assert await plugin._expire_if_due("s1", rec, time.time()) is None
+    await unreg
+    with pytest.raises(HTTPException) as exc:
+        await plugin.register_session(_owned_request({"sid": "s1"}))
+    assert exc.value.status_code == 410 and "closed" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_reconnect_during_close_answers_410_closing():
+    plugin = await _plugin_with("s1", _SlowCloseSession)
+    close  = asyncio.ensure_future(plugin._drop_session("s1"))
+    await asyncio.sleep(0)
+    with pytest.raises(HTTPException) as exc:
+        await plugin.register_session(_owned_request({"sid": "s1"}))
+    assert exc.value.status_code == 410 and "closing" in exc.value.detail
+    await close
+
+
+class _BarrierCloseSession(PluginSession):
+    '''close() waits until ``need`` closes have entered: it can only see
+    the barrier set if those closes run at the same time.'''
+    need    = 0
+    entered = 0
+    barrier = None
+    saw     = []
+
+    async def close(self):
+        cls = type(self)
+        cls.entered += 1
+        if cls.entered >= cls.need:
+            cls.barrier.set()
+        try:
+            await asyncio.wait_for(cls.barrier.wait(), 2)
+            cls.saw.append(True)
+        except asyncio.TimeoutError:
+            cls.saw.append(False)
+        return await super().close()
+
+    @classmethod
+    def arm(cls, need):
+        cls.need, cls.entered, cls.barrier, cls.saw = \
+            need, 0, asyncio.Event(), []
+
+
+@pytest.mark.asyncio
+async def test_sweep_and_shutdown_close_concurrently():
+    plugin = _fresh_plugin()
+    plugin.session_class = _BarrierCloseSession
+    plugin.session_ttl   = 60
+    for sid in ("a", "b", "c", "d"):
+        await plugin.register_session(_owned_request({"sid": sid}))
+    for sid in ("a", "b"):
+        plugin._records[sid].last_access = time.time() - 100
+    _BarrierCloseSession.arm(2)
+    assert await plugin._cleanup_expired_sessions() == 2
+    assert _BarrierCloseSession.saw == [True, True]     # both at once
+    _BarrierCloseSession.arm(2)
+    await plugin.shutdown()
+    assert _BarrierCloseSession.saw == [True, True]
+    assert not plugin._sessions and not plugin._records
+
+
+@pytest.mark.asyncio
+async def test_default_session_closing_answers_410_then_recreates():
+    ''''default' is closed like any session (an explicit unregister): it
+    answers 410 during its close and is recreated on the next request.'''
+    from radical.orbit.plugin_base import DEFAULT_SID
+    plugin = _fresh_plugin()
+    plugin.session_class = _SlowCloseSession
+    await plugin.register_session(_owned_request({"sid": DEFAULT_SID}))
+    old   = plugin._sessions[DEFAULT_SID]
+    close = asyncio.ensure_future(plugin._drop_session(DEFAULT_SID))
+    await asyncio.sleep(0)
+    with pytest.raises(HTTPException) as exc:
+        await plugin.register_session(_owned_request({"sid": DEFAULT_SID}))
+    assert exc.value.status_code == 410 and "closing" in exc.value.detail
+    with pytest.raises(HTTPException) as exc:
+        await plugin._accessing(lambda r: None)(_sid_request(DEFAULT_SID))
+    assert exc.value.status_code == 410 and "closing" in exc.value.detail
+    await close
+    assert (await plugin._forward(DEFAULT_SID, PluginSession.ping)) == {}
+    assert plugin._sessions[DEFAULT_SID] is not old
+
+
+@pytest.mark.asyncio
+async def test_shutdown_does_not_drain():
+    plugin  = await _plugin_with("s1")
+    entered = asyncio.Event()
+
+    async def _stuck(request):
+        entered.set()
+        await asyncio.sleep(10)
+
+    req = asyncio.ensure_future(plugin._accessing(_stuck)(_sid_request("s1")))
+    await entered.wait()
+    await asyncio.wait_for(plugin.shutdown(), 1)       # no 30 s drain
+    assert not plugin._sessions
+    req.cancel()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cuts_a_close_already_draining():
+    plugin  = await _plugin_with("s1")
+    entered = asyncio.Event()
+
+    async def _stuck(request):
+        entered.set()
+        await asyncio.sleep(10)
+
+    req = asyncio.ensure_future(plugin._accessing(_stuck)(_sid_request("s1")))
+    await entered.wait()
+    unreg = asyncio.ensure_future(plugin._drop_session("s1"))   # draining
+    await asyncio.sleep(0.01)
+    await asyncio.wait_for(plugin.shutdown(), 1)               # cuts it
+    assert unreg.done() and not plugin._sessions
+    req.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_drained_request_reaches_its_session_during_the_close():
+    '''A request counted before the close started is drained: its own
+    _forward goes through instead of answering 410.'''
+    plugin  = await _plugin_with("s1")
+    release = asyncio.Event()
+
+    async def _late_forward(request):
+        await release.wait()            # e.g. reading the request body
+        return await plugin._forward("s1", PluginSession.ping)
+
+    req   = asyncio.ensure_future(
+        plugin._accessing(_late_forward)(_sid_request("s1")))
+    await asyncio.sleep(0)
+    close = asyncio.ensure_future(plugin._drop_session("s1"))
+    await asyncio.sleep(0)
+    with pytest.raises(HTTPException) as exc:     # a new request: 410
+        await plugin._accessing(_late_forward)(_sid_request("s1"))
+    assert exc.value.status_code == 410
+    release.set()
+    assert (await req) == {}
+    await close
+
+
+@pytest.mark.asyncio
+async def test_no_default_session_is_recreated_during_shutdown():
+    from radical.orbit.plugin_base import DEFAULT_SID
+    plugin = _fresh_plugin()
+    await plugin.register_session(_owned_request({"sid": DEFAULT_SID}))
+    await plugin.shutdown()
+    with pytest.raises(HTTPException) as exc:
+        await plugin.register_session(_owned_request({"sid": DEFAULT_SID}))
+    assert exc.value.status_code == 410
+    assert DEFAULT_SID not in plugin._sessions
+
+
+class _HookSession(PluginSession):
+    '''``boom`` fails once ``fail_on`` is set; ``in_close`` is set when
+    close() starts, which then takes a while.'''
+    fail_on  = None
+    in_close = None
+
+    async def boom(self):
+        await type(self).fail_on.wait()
+        raise RuntimeError("boom")
+
+    async def close(self):
+        type(self).in_close.set()
+        await asyncio.sleep(0.05)
+        return await super().close()
+
+    @classmethod
+    def arm(cls, fail_on_close=False):
+        cls.in_close = asyncio.Event()
+        cls.fail_on  = cls.in_close if fail_on_close else asyncio.Event()
+
+
+@pytest.mark.asyncio
+async def test_drained_request_error_is_500_not_410():
+    '''A real error in a request drained before close() stays a 500.'''
+    _HookSession.arm()
+    plugin = await _plugin_with("s1", _HookSession)
+
+    async def _call(request):
+        return await plugin._forward("s1", _HookSession.boom)
+
+    req   = asyncio.ensure_future(plugin._accessing(_call)(_sid_request("s1")))
+    await asyncio.sleep(0)
+    close = asyncio.ensure_future(plugin._drop_session("s1"))
+    await asyncio.sleep(0)
+    assert not _HookSession.in_close.is_set()          # still draining
+    _HookSession.fail_on.set()
+    with pytest.raises(HTTPException) as exc:
+        await req
+    assert exc.value.status_code == 500
+    await close
+
+
+@pytest.mark.asyncio
+async def test_error_once_close_began_is_410():
+    '''A drained request still running when the drain times out, and
+    failing while close() runs, answers 410 "is closing", not 500.'''
+    from radical.orbit import plugin_base as pb
+    _HookSession.arm(fail_on_close=True)
+    plugin = await _plugin_with("s1", _HookSession)
+
+    async def _call(request):
+        return await plugin._forward("s1", _HookSession.boom)
+
+    req = asyncio.ensure_future(plugin._accessing(_call)(_sid_request("s1")))
+    await asyncio.sleep(0)
+    with patch.object(pb, 'CLOSE_DRAIN_TIMEOUT', 0.05):
+        close = asyncio.ensure_future(plugin._drop_session("s1"))
+        with pytest.raises(HTTPException) as exc:
+            await req                   # fails while close() still runs
+        assert "s1" in plugin._sessions
+        await close
+    assert exc.value.status_code == 410 and "closing" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_forward_passes_during_drain_and_answers_410_in_close():
+    '''An uncounted _forward goes through during the drain (like any
+    request in flight) and answers 410 once close() runs.'''
+    _HookSession.arm()
+    plugin  = await _plugin_with("s1", _HookSession)
+    release = asyncio.Event()
+
+    async def _held(request):
+        await release.wait()
+
+    req   = asyncio.ensure_future(plugin._accessing(_held)(_sid_request("s1")))
+    await asyncio.sleep(0)
+    close = asyncio.ensure_future(plugin._drop_session("s1"))
+    await asyncio.sleep(0)
+    assert (await plugin._forward("s1", PluginSession.ping)) == {}
+    release.set()
+    await req
+    await _HookSession.in_close.wait()
+    with pytest.raises(HTTPException) as exc:
+        await plugin._forward("s1", PluginSession.ping)
+    assert exc.value.status_code == 410 and "closing" in exc.value.detail
+    await close
+
+
+@pytest.mark.asyncio
+async def test_spawned_task_does_not_bypass_close():
+    '''A task spawned from a {sid} handler is not the drained request:
+    its _forward answers 410 once close() runs.'''
+    _HookSession.arm()
+    plugin = await _plugin_with("s1", _HookSession)
+    spawned = []
+
+    async def _late():
+        await _HookSession.in_close.wait()
+        return await plugin._forward("s1", PluginSession.ping)
+
+    async def _spawn(request):
+        spawned.append(asyncio.ensure_future(_late()))
+
+    await plugin._accessing(_spawn)(_sid_request("s1"))
+    close = asyncio.ensure_future(plugin._drop_session("s1"))
+    with pytest.raises(HTTPException) as exc:
+        await spawned[0]
+    assert exc.value.status_code == 410
+    await close
+
+
+@pytest.mark.asyncio
+async def test_unregister_during_expiry_keeps_reason_expired():
+    '''The first reason wins: an unregister during an expiry close
+    succeeds, and the sid stays "expired".'''
+    plugin = await _plugin_with("s1", _SlowCloseSession)
+    plugin.session_ttl = 60
+    rec = plugin._records["s1"]
+    rec.last_access = time.time() - 100
+    expiry = asyncio.ensure_future(
+        plugin._expire_if_due("s1", rec, time.time()))
+    await asyncio.sleep(0)
+    assert rec.closing
+    assert (await plugin.unregister_session(_sid_request("s1"))) == \
+        {"ok": True}
+    await expiry
+    with pytest.raises(HTTPException) as exc:
+        await plugin.register_session(_owned_request({"sid": "s1"}))
+    assert exc.value.status_code == 410 and "expired" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_request_during_shutdown_does_not_recreate_default():
+    '''Routes stay live during shutdown: once 'default' was closed, a
+    {sid} request, a register or a _forward on it answers 410 instead of
+    recreating it.'''
+    from radical.orbit.plugin_base import DEFAULT_SID
+    plugin = _fresh_plugin()
+    await plugin.register_session(_owned_request({"sid": DEFAULT_SID}))
+    plugin.session_class = _SlowCloseSession
+    await plugin.register_session(_owned_request({"sid": "s1"}))
+    down = asyncio.ensure_future(plugin.shutdown())
+    while DEFAULT_SID in plugin._sessions:          # 'default' closes first
+        await asyncio.sleep(0)
+    assert not down.done()
+
+    async def _call(request):
+        return await plugin._forward(DEFAULT_SID, PluginSession.ping)
+
+    for probe in (lambda: plugin._accessing(_call)(_sid_request(DEFAULT_SID)),
+                  lambda: plugin.register_session(
+                      _owned_request({"sid": DEFAULT_SID})),
+                  lambda: plugin._forward(DEFAULT_SID, PluginSession.ping)):
+        with pytest.raises(HTTPException) as exc:
+            await probe()
+        assert exc.value.status_code == 410
+        assert DEFAULT_SID not in plugin._sessions
+    await down
+    assert not plugin._sessions

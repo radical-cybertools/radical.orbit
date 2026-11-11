@@ -507,3 +507,86 @@ async def test_plugin_shutdown_cancels_run_and_removes_images(monkeypatch):
     assert not p._thread.is_alive()
     assert p._status()['status'] == 'failed'
     assert not os.path.exists(imgdir)
+
+
+# ------------------------------------------------------------------------------
+# shutdown races: a submit / config past the 410 check that resumes after
+# shutdown must not leave a run thread or a runtime nobody stops
+#
+@pytest.mark.asyncio
+async def test_submit_racing_shutdown_starts_no_run(monkeypatch):
+    release = threading.Event()
+    entered = threading.Event()
+
+    def _refresh(*a, **k):
+        entered.set()
+        release.wait(5)
+        return 'rt'
+
+    monkeypatch.setattr(lf, 'transfer_refresh_token', _refresh)
+    p   = _plugin(FakeRuntime())
+    sub = asyncio.ensure_future(p._submit({'endpoint': 'hpc1',
+                                           'wells': ['r01c01']}))
+    await asyncio.to_thread(entered.wait, 5)
+    await p.shutdown()
+    release.set()
+    with pytest.raises(HTTPException) as e:
+        await sub
+    assert e.value.status_code == 410
+    assert p._thread is None and not p._busy
+
+
+class _BlockingRuntime(FakeRuntime):
+    instances = []
+    entered   = None
+    release   = None
+
+    def __init__(self, broker_url=None):
+        super().__init__()
+        self.stopped = False
+        type(self).instances.append(self)
+
+    def start(self, wait=True):
+        type(self).entered.set()
+        type(self).release.wait(5)
+
+    def stop(self):
+        self.stopped = True
+
+
+@pytest.mark.asyncio
+async def test_runtime_created_during_shutdown_is_stopped(monkeypatch):
+    from radical.orbit import runtime as rt_mod
+    from radical.orbit import plugin_lucid as pl
+    _BlockingRuntime.instances = []
+    _BlockingRuntime.entered   = threading.Event()
+    _BlockingRuntime.release   = threading.Event()
+    monkeypatch.setenv(pl._BROKER_ENV, 'wss://localhost:1')
+    monkeypatch.setattr(rt_mod, 'EndpointRuntime', _BlockingRuntime)
+    p    = _plugin(None)
+    cfg  = asyncio.ensure_future(p._config())
+    await asyncio.to_thread(_BlockingRuntime.entered.wait, 5)
+    down = asyncio.ensure_future(p.shutdown())
+    await asyncio.sleep(0.05)
+    _BlockingRuntime.release.set()
+    with pytest.raises(HTTPException) as e:
+        await cfg
+    await down
+    assert e.value.status_code == 410
+    assert [r.stopped for r in _BlockingRuntime.instances] == [True]
+    assert p._rt_own is None
+
+
+@pytest.mark.asyncio
+async def test_request_during_lucid_teardown_answers_410(monkeypatch):
+    '''The flag is set before lucid's own teardown (a run-thread join of
+    up to 60 s), so requests meanwhile answer 410, not a stopped runtime.'''
+    monkeypatch.setattr(lf, 'transfer_refresh_token', lambda *a, **k: 'rt')
+    p    = _plugin(FakeRuntime(globus=FakeGlobus(status='ACTIVE')))
+    await p._submit({'endpoint': 'hpc1', 'wells': ['r01c01']})
+    down = asyncio.ensure_future(p.shutdown())
+    await asyncio.sleep(0)                      # inside the join
+    with pytest.raises(HTTPException) as e:
+        await p._forward('default', type(p).session_class.get_status)
+    assert e.value.status_code == 410
+    await down
