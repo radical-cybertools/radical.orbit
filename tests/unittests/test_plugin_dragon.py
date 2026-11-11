@@ -808,6 +808,23 @@ def test_guard_released_by_close_outliving_its_timeout(monkeypatch):
     asyncio.run(second.shutdown())
 
 
+def test_guard_released_when_close_was_queued_at_timeout(monkeypatch):
+    import time
+    import radical.orbit.plugin_dragon as pd
+    monkeypatch.setattr(pd, '_default_owner', None)
+    first = PluginDragon(FastAPI())
+    first.backend._pool.submit(time.sleep, 0.3)     # a long Dragon call
+
+    async def _run():                       # the close queues behind it
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(first.on_host_stop(), 0.1)
+    asyncio.run(_run())
+    assert first.backend._pool.join(2)
+    assert first.backend.closed             # the queued close still ran
+    second = PluginDragon(FastAPI())        # not refused
+    asyncio.run(second.shutdown())
+
+
 def test_failed_runtime_release_closes_once(env, monkeypatch):
     import atexit
     plugin, backend, tc, sid = env

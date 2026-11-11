@@ -89,6 +89,7 @@ B64_KEY          = '$b64'
 # a module-wide guard: one PluginDragon with the default backend (and so one
 # Dragon thread) per process, see PluginDragon.__init__
 _default_owner   = None
+_owner_lock      = threading.Lock()
 
 
 # ------------------------------------------------------------------------
@@ -483,15 +484,18 @@ class DDictBackend:
             self._closed = True
 
     async def close(self) -> None:
-        """Destroy every DDict, then stop or detach the runtime.  When the
-        await is cancelled before the close ran, :meth:`close_sync` still
-        does it at exit."""
+        """Destroy every DDict, then stop or detach the runtime.  A
+        cancelled await does not cancel the close: it still runs on the
+        Dragon thread (after a call that blocks it), and :meth:`close_sync`
+        completes it at exit if it did not get to run."""
         if self._closed or self._pool.down:
             return                      # a cancelled close: close_sync
         # the close is the last job: no create can queue behind it
         fut = self._pool.submit(self._close)
         self._pool.shutdown(wait=False)
-        await asyncio.wrap_future(fut)
+        # shielded: cancelling the await would drop the queued close, and
+        # the backend would stay open with no thread left to close it
+        await asyncio.shield(asyncio.wrap_future(fut))
 
     def close_sync(self) -> None:
         """:meth:`close` for process exit (no event loop), for hosts that
@@ -810,17 +814,25 @@ class PluginDragon(Plugin):
                  backend: Optional[DDictBackend] = None):
         global _default_owner               # pylint: disable=global-statement
         # one default backend per process: each has its own Dragon thread,
-        # and concurrent Dragon calls from several threads hang (0.15.0)
-        # a close that outlived its caller's timeout still releases it
-        if backend is None and _default_owner is not None \
-                and not _default_owner.backend.closed:
-            raise RuntimeError("a dragon plugin instance already runs in "
-                               "this process")
-        super().__init__(app, instance_name)
-
+        # and concurrent Dragon calls from several threads hang (0.15.0).
+        # A close that outlived its caller's timeout still releases it.
         if backend is None:
-            backend        = DDictBackend(runtime_mode())
-            _default_owner = self
+            with _owner_lock:
+                if _default_owner is not None and \
+                        not _default_owner.backend.closed:
+                    raise RuntimeError("a dragon plugin instance already "
+                                       "runs in this process")
+                backend        = DDictBackend(runtime_mode())
+                self.backend   = backend
+                _default_owner = self
+        try:
+            super().__init__(app, instance_name)
+        except BaseException:
+            with _owner_lock:
+                if _default_owner is self:
+                    _default_owner = None
+            raise
+
         self.backend     = backend
         self.entries: Dict[str, dict] = {}
         self.reply_limit = resolve_frame_cap(app) // 2
@@ -1063,8 +1075,9 @@ class PluginDragon(Plugin):
             # a cancelled close is not closed: keep the exit fallback
             if self.backend.closed:
                 atexit.unregister(self.backend.close_sync)
-                if _default_owner is self:
-                    _default_owner = None
+                with _owner_lock:
+                    if _default_owner is self:
+                        _default_owner = None
 
     async def on_host_stop(self) -> None:
         """The hosting runtime stops: destroy the DDicts, release the
