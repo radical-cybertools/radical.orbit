@@ -96,8 +96,7 @@ OUTPUT_NOTIFY_LIMIT = FRAME_CAP // OUTPUT_RATIO
 # How long a finished task stays queryable (seconds), on the endpoint
 # (get_task / wait_tasks / list_tasks) and in the client's completion
 # accumulator.  Without a bound, a long-lived session keeps every task it
-# ever ran.  The client never drops a completion a wait_tasks call is
-# waiting for.
+# ever ran.  A pending wait_tasks call keeps the results it has seen.
 FINISHED_RETAIN_S   = 3600.0
 
 # Endpoint-level override for the coalescing window above (seconds).  The
@@ -494,6 +493,14 @@ class RhapsodySession(PluginSession):
         if state_str.upper() in TERMINAL_STATES:
             return
 
+        # A late callback for a task already released would re-add an entry
+        # nothing removes.  Identity check, so a resubmitted uid still
+        # notifies; it only works when the backend passes the task object
+        # it was given (a backend that hands out copies makes it a no-op).
+        done = self._finished.get(uid_str)
+        if done is not None and done[0] is task:
+            return
+
         with self._notified_lock:
             # Skip if we already notified this state
             if self._notified_states.get(uid_str) == state_str:
@@ -632,9 +639,9 @@ class RhapsodySession(PluginSession):
                                 "state": str(t.get("state"))})
             all_tasks.extend(tasks)
 
-        # Start a single batch watcher instead of per-task watchers
+        # Watch the whole batch: one done-callback per task
         if self._plugin and all_tasks:
-            asyncio.ensure_future(self._watch_batch(all_tasks))
+            self._watch_batch(all_tasks)
 
         if self._prof:
             self._prof.prof('rh_submit_done', uid=bid, msg=str(batch_n))
@@ -758,23 +765,21 @@ class RhapsodySession(PluginSession):
         """
         return self._rh_session._state_manager.get_wait_future(uid_str, task)
 
-    async def _watch_batch(self, tasks):
+    def _watch_batch(self, tasks) -> None:
         """Watch a batch of tasks, notifying as each completes.
 
-        Uses ``asyncio.wait(FIRST_COMPLETED)`` to drain completions
-        incrementally.  Notifications are queued per-task as soon as
-        each finishes — the notification buffer (``_queue_notification``)
-        batches them opportunistically so fast-completing tasks are grouped
-        into single SSE messages while slow tasks don't block others.
+        One done-callback per task future: a task is notified (and
+        released) as soon as it finishes, and nothing here keeps it alive
+        afterwards — rhapsody resolves the future with the task itself, so
+        a watcher holding finished futures would pin the whole batch until
+        its last task ends.  Notifications are queued per task; the
+        notification buffer (``_queue_notification``) batches them, so
+        completions of one loop pass share a frame while slow tasks don't
+        block others.
         """
-        # Build uid map and per-task futures
-        fut_to_uid: dict[asyncio.Future, str] = {}
-        uid_to_task: dict[str, object]         = {}
-
-        for t in tasks:
-            uid     = self._get_attr(t, 'uid')
-            uid_str = str(uid) if uid else '?'
-            uid_to_task[uid_str] = t
+        # one entry per uid (a duplicate uid shares rhapsody's future)
+        uid_to_task = {self._uid_str(t): t for t in tasks}
+        del tasks
 
         if not self._rh_session:
             for uid_str in uid_to_task:
@@ -784,45 +789,42 @@ class RhapsodySession(PluginSession):
             return
 
         for uid_str, t in uid_to_task.items():
-            fut_to_uid[self._task_future(uid_str, t)] = uid_str
+            self._task_future(uid_str, t).add_done_callback(
+                functools.partial(self._task_done, uid_str, t))
 
-        # Drain completions incrementally
-        pending = set(fut_to_uid.keys())
+    def _uid_str(self, t) -> str:
+        uid = self._get_attr(t, 'uid')
+        return str(uid) if uid else '?'
 
-        while pending:
-            try:
-                done, pending = await asyncio.wait(
-                    pending, return_when=asyncio.FIRST_COMPLETED)
-            except Exception as e:
-                log.warning("[%s] Batch watch error: %s", self._sid, e)
-                break
+    def _task_done(self, uid_str: str, t, _fut=None) -> None:
+        """Notify one finished task (a future done-callback)."""
+        state     = self._get_attr(t, 'state')
+        state_str = str(state) if state else 'UNKNOWN'
 
-            # Notify for every task that just completed
-            for fut in done:
-                uid_str = fut_to_uid[fut]
-                t       = uid_to_task[uid_str]
-                state     = self._get_attr(t, 'state')
-                state_str = str(state) if state else 'UNKNOWN'
+        if state_str.upper() in TERMINAL_STATES:
+            self._queue_notification(self._notification_payload(t))
+            self._release(uid_str, t)
+        else:
+            self._queue_notification({
+                "uid": uid_str, "state": state_str,
+                "error": f"unexpected state: {state_str}"})
 
-                if state_str.upper() in TERMINAL_STATES:
-                    d = self._notification_payload(t)
-                    self._queue_notification(d)
-                    self._release(uid_str, t)
-                else:
-                    self._queue_notification({
-                        "uid": uid_str, "state": state_str,
-                        "error": f"unexpected state: {state_str}"})
-
-    def _release(self, uid: str, task=None) -> None:
+    def _release(self, uid: str, task) -> None:
         """Move *task*, notified as terminal, to the finished map, and drop
         finished tasks older than ``FINISHED_RETAIN_S``.  A uid that was
         resubmitted meanwhile keeps its new, running task."""
-        if task is not None and self._tasks.get(uid) is task:
+        if self._tasks.get(uid) is task:
             del self._tasks[uid]
             self._finished[uid] = (task, time.monotonic())
             self._finished.move_to_end(uid)
         with self._notified_lock:
             self._notified_states.pop(uid, None)
+        self._expire()
+
+    def _expire(self) -> None:
+        """Drop finished tasks older than ``FINISHED_RETAIN_S``, oldest
+        first.  Runs on every request that reads them too, so an idle
+        session keeps the window as well."""
         cutoff = time.monotonic() - FINISHED_RETAIN_S
         while self._finished:
             oldest = next(iter(self._finished.values()))
@@ -831,7 +833,8 @@ class RhapsodySession(PluginSession):
             self._finished.popitem(last=False)
 
     def _lookup(self, uid: str):
-        """A task by uid: running, or finished within the retention."""
+        """A task by uid: running, or finished within the retention.  The
+        caller runs ``_expire()`` once per request."""
         task = self._tasks.get(uid)
         if task is None and uid in self._finished:
             task = self._finished[uid][0]
@@ -862,6 +865,7 @@ class RhapsodySession(PluginSession):
         """
         self._check_initialized()
 
+        self._expire()
         tasks = [t for t in map(self._lookup, uids) if t is not None]
         if not tasks:
             raise HTTPException(status_code=404,
@@ -1057,6 +1061,7 @@ class RhapsodySession(PluginSession):
     async def list_tasks(self) -> dict:
         """Return all tasks in this session with current state."""
         self._check_initialized()
+        self._expire()
         tasks = [self._sanitize_task(task)
                  for uid, (task, _) in self._finished.items()
                  if uid not in self._tasks]          # a reused uid: once
@@ -1069,6 +1074,7 @@ class RhapsodySession(PluginSession):
         """
         self._check_initialized()
 
+        self._expire()
         task = self._lookup(uid)
         if not task:
             raise self._not_found(uid)
@@ -1086,6 +1092,7 @@ class RhapsodySession(PluginSession):
             # cancel_all's gathered cancels can resume after a teardown that
             # followed a drain timeout
             raise HTTPException(status_code=410, detail="session is closing")
+        self._expire()
         task = self._lookup(uid)
         if not task:
             raise self._not_found(uid)
@@ -1386,9 +1393,8 @@ class RhapsodyClient(PluginClient):
         self._cond = threading.Condition()
         self._completed: dict[str, dict] = {}
         # arrival time per completion, oldest first: completions older than
-        # FINISHED_RETAIN_S are dropped unless a wait is waiting for them
+        # FINISHED_RETAIN_S are dropped (a pending wait keeps its own copy)
         self._arrived: OrderedDict[str, float] = OrderedDict()
-        self._waiting: dict[str, int] = {}       # uid -> waits pending on it
         # UIDs submitted via this client and not completed yet — lets
         # wait_tasks() reject UIDs that were never submitted (or whose
         # completion was dropped) instead of blocking on them forever.
@@ -1582,19 +1588,13 @@ class RhapsodyClient(PluginClient):
                 self._cond.notify_all()
 
     def _expire_completed(self) -> None:
-        """Drop completions older than ``FINISHED_RETAIN_S`` that no wait is
-        waiting for (a waited one is kept and checked again later).  Called
-        with ``_cond`` held."""
-        now    = time.monotonic()
-        cutoff = now - FINISHED_RETAIN_S
+        """Drop completions older than ``FINISHED_RETAIN_S``, oldest first
+        (a pending wait has its own copy).  Called with ``_cond`` held."""
+        cutoff = time.monotonic() - FINISHED_RETAIN_S
         while self._arrived:
             uid, arrived = next(iter(self._arrived.items()))
             if arrived >= cutoff:
                 break
-            if self._waiting.get(uid):   # renewed: moves behind the cutoff
-                self._arrived[uid] = now
-                self._arrived.move_to_end(uid)
-                continue
             del self._arrived[uid]
             self._completed.pop(uid, None)
 
@@ -1907,8 +1907,14 @@ class RhapsodyClient(PluginClient):
                 td['uid'] = f"task.{uuid.uuid4().hex[:8]}"
 
         # Remember what we submitted so wait_tasks() can validate UIDs.
+        # A resubmitted uid forgets its previous result, so a wait on it
+        # waits for the new run.
         with self._cond:
-            self._submitted.update(str(td['uid']) for td in task_dicts)
+            for td in task_dicts:
+                uid = str(td['uid'])
+                self._submitted.add(uid)
+                self._completed.pop(uid, None)
+                self._arrived.pop(uid, None)
 
         # --- split into frame-size-bounded batches ---
         url = self._url(ROUTE_SUBMIT.format(sid=self.sid))
@@ -1986,17 +1992,6 @@ class RhapsodyClient(PluginClient):
             norm.append(str(uid))
         uids = norm
 
-        with self._cond:
-            sid     = self._sid
-            unknown = [u for u in uids
-                       if u not in self._submitted
-                       and u not in self._completed]
-        if unknown:
-            raise ValueError(
-                "wait_tasks: unknown task UID(s), not submitted via this "
-                "session or completed more than "
-                f"{FINISHED_RETAIN_S:g} s ago: {unknown}")
-
         # ------------------------------------------------------------------
         # Check if SSE notifications are available
         # ------------------------------------------------------------------
@@ -2004,87 +1999,102 @@ class RhapsodyClient(PluginClient):
                    self._endpoint_id is not None and
                    self._plugin_name is not None)
 
+        # ------------------------------------------------------------------
+        # SSE-based wait (preferred path); the poll fallback shares the uid
+        # check (first pass only), then polls
+        # ------------------------------------------------------------------
+        # The persistent `_on_task_done` callback fills `_completed` and
+        # notifies the Condition on every completion.  Each requested result
+        # is copied into `got` as it appears — the first copy in the same
+        # critical section as the uid check — so expiry may drop anything
+        # from `_completed` without a pending wait losing its result.
+        deadline = (time.time() + timeout) if timeout is not None else None
+        got: dict[str, dict] = {}
+        with self._cond:
+            sid = self._sid
+            self._expire_completed()
+            while True:
+                for u in uids:
+                    if u not in got and u in self._completed:
+                        got[u] = self._completed[u]
+                if len(got) == len(set(uids)):
+                    break
+                if self._sid != sid:            # also clears _submitted
+                    raise RuntimeError(
+                        f"wait_tasks: session changed from {sid} to "
+                        f"{self._sid}; its tasks are not tracked any more")
+                unknown = [u for u in uids
+                           if u not in got and u not in self._submitted]
+                if unknown:
+                    raise ValueError(
+                        "wait_tasks: unknown task UID(s), not submitted via "
+                        "this session or completed more than "
+                        f"{FINISHED_RETAIN_S:g} s ago: {unknown}")
+                if not has_sse:
+                    break
+                remaining = None
+                if deadline is not None:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        break
+                self._cond.wait(remaining)
+
         if not has_sse:
             return self._wait_tasks_poll(uids, timeout)
 
-        # ------------------------------------------------------------------
-        # SSE-based wait (preferred path)
-        # ------------------------------------------------------------------
-        # The persistent `_on_task_done` callback fills `_completed` and
-        # notifies the Condition on every completion; block on it until every
-        # requested UID has landed (or the deadline passes).
-        deadline = (time.time() + timeout) if timeout is not None else None
-        with self._cond:
-            for uid in uids:                   # pinned: never expired
-                self._waiting[uid] = self._waiting.get(uid, 0) + 1
-            try:
-                return self._wait_completed(uids, sid, deadline)
-            finally:
-                for uid in uids:
-                    if self._waiting[uid] > 1:
-                        self._waiting[uid] -= 1
-                    else:
-                        del self._waiting[uid]
-
-    def _wait_completed(self, uids: list[str], sid: str,
-                        deadline: float | None) -> list[dict]:
-        """Block on ``_cond`` (held) until every uid completed or the
-        deadline passed."""
-        while True:
-            missing = next((u for u in uids if u not in self._completed),
-                           None)
-            if missing is None:
-                break
-            if self._sid != sid:
-                raise RuntimeError(
-                    f"wait_tasks: session changed from {sid} to "
-                    f"{self._sid}; its tasks are not tracked any more")
-            if missing not in self._submitted:   # dropped before the pin
-                raise ValueError(
-                    "wait_tasks: completion older than "
-                    f"{FINISHED_RETAIN_S:g} s was dropped: {missing}")
-            remaining = None
-            if deadline is not None:
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    break
-            self._cond.wait(remaining)
-
-        return [self._completed.get(uid, {"uid": uid, "state": "UNKNOWN"})
+        return [got.get(uid, {"uid": uid, "state": "UNKNOWN"})
                 for uid in uids]
 
     def _wait_tasks_poll(self, uids: list[str],
                          timeout: float | None = None) -> list[dict]:
         """Fallback wait via periodic polling (no SSE available).
 
+        Like the SSE path, a terminal result is kept for this wait as soon
+        as a poll returns it, and later polls ask only for the uids still
+        outstanding — so a result the endpoint releases meanwhile is not
+        lost.  An outstanding uid the endpoint does not know (released, or
+        never there) raises ``ValueError`` instead of a short answer.
+
         Decodes encoded return values just like the SSE path, so a caller
         sees the same objects no matter which transport served the wait.
         """
-
-        url     = self._url(ROUTE_WAIT.format(sid=self.sid))
-        payload: dict = {"uids": uids}
-        if timeout is not None:
-            payload["timeout"] = timeout
-
+        url      = self._url(ROUTE_WAIT.format(sid=self.sid))
         deadline = (time.time() + timeout) if timeout else None
+        got:  dict[str, dict] = {}              # terminal, kept for the wait
+        last: dict[str, dict] = {}              # latest non-terminal answer
 
         while True:
+            todo = [u for u in dict.fromkeys(uids) if u not in got]
+            payload: dict = {"uids": todo}
+            if timeout is not None:
+                payload["timeout"] = timeout
             resp = self._http.post(url, json=payload)
-            self._raise(resp, f"wait {len(uids)} task(s)")
-            tasks = resp.json()
+            if resp.is_error and resp.status_code == 404 and \
+                    'none of the requested' in resp.text:
+                found = []                      # not an unknown session
+            else:
+                self._raise(resp, f"wait {len(todo)} task(s)")
+                found = resp.json()
 
-            for t in tasks:
+            for t in found:
                 self._decode_return_value(t)
+                uid = str(t.get('uid'))
+                if str(t.get('state', '')).upper() in TERMINAL_STATES:
+                    got[uid] = t
+                else:
+                    last[uid] = t
 
-            # Check if all are terminal
-            all_done = all(
-                str(t.get('state', '')).upper() in TERMINAL_STATES
-                for t in tasks)
-            if all_done:
-                return tasks
+            seen    = {str(t.get('uid')) for t in found}
+            missing = [u for u in todo if u not in seen]
+            if missing:
+                raise ValueError(
+                    "wait_tasks: task UID(s) not found on the endpoint "
+                    "(finished tasks are kept for "
+                    f"{FINISHED_RETAIN_S:g} s): {missing}")
 
-            if deadline and time.time() >= deadline:
-                return tasks  # return whatever we have
+            if all(u in got for u in uids) or \
+                    (deadline and time.time() >= deadline):
+                return [got.get(u) or last[u] for u in uids]
 
             time.sleep(1.0)
 

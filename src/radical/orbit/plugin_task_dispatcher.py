@@ -2322,6 +2322,11 @@ class PluginTaskDispatcher(Plugin):
             try:
                 info = await asyncio.to_thread(rh.get_task, task_id)
             except Exception as e:
+                if getattr(e, 'status_code', None) == 404:
+                    # not upstream trouble: the task is unknown there
+                    # (finished tasks are released after a retention)
+                    raise HTTPException(status_code=404,
+                                        detail=str(e)) from e
                 raise HTTPException(
                     status_code=502,
                     detail=f'rhapsody get_task failed on '
@@ -2353,6 +2358,11 @@ class PluginTaskDispatcher(Plugin):
             try:
                 info = await asyncio.to_thread(rh.cancel_task, task_id)
             except Exception as e:
+                if getattr(e, 'status_code', None) == 404:
+                    # not upstream trouble: the task is unknown there
+                    # (finished tasks are released after a retention)
+                    raise HTTPException(status_code=404,
+                                        detail=str(e)) from e
                 raise HTTPException(
                     status_code=502,
                     detail=f'rhapsody cancel_task failed on '

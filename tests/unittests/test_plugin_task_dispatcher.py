@@ -973,6 +973,32 @@ class TestEndpointMode:
                 'requirements': {'gpu': 1}})
         assert r.status_code == 400
         assert r.json()['detail'] == "requirements: unknown key 'gpu'"
+
+    def test_endpoint_mode_passes_404_through(self, tmp_path):
+        """A task the endpoint no longer knows (released after its
+        retention, its terminal notification missed) answers 404, not 502;
+        any other upstream failure stays 502."""
+        _, plugin = _make_plugin(tmp_path)
+        client = TestClient(plugin._app)
+        sid = _register(client, plugin, body={'sid': 'A',
+                                              'lifetime': 'persistent'})
+        plugin._endpoint_mode_tasks['t.1'] = 'ep'
+        gone = RuntimeError('HTTP 404 — task t.1 not found')
+        gone.status_code = 404
+        rh_mock = MagicMock()
+        rh_mock.get_task    = MagicMock(side_effect=gone)
+        rh_mock.cancel_task = MagicMock(side_effect=gone)
+        with patch.object(plugin, '_get_rhapsody_client',
+                          new=AsyncMock(return_value=rh_mock)):
+            r = client.get(f'{plugin.namespace}/task/{sid}/t.1')
+            assert r.status_code == 404
+            assert 'not found' in r.json()['detail']
+            r = client.post(f'{plugin.namespace}/cancel/{sid}/t.1')
+            assert r.status_code == 404
+
+            rh_mock.get_task.side_effect = RuntimeError('HTTP 500 — boom')
+            r = client.get(f'{plugin.namespace}/task/{sid}/t.1')
+            assert r.status_code == 502
         rh_mock.submit_tasks.assert_not_called()
 
     def test_endpoint_mode_skips_the_pool_gates(self, tmp_path):
