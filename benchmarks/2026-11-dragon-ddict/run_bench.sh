@@ -43,12 +43,12 @@ start_broker() {            # $1: compute | login
     mkdir -p $RUNS/broker-$1
     if [ "$1" = compute ]; then
         RADICAL_ORBIT_LOG_FILE=$RUNS/broker-$1/broker.log \
-        $SRUN -N1 -n1 -w $N0 python $OV/wt-156/bin/radical-orbit-broker.py \
+        $SRUN -N1 -n1 -w $N0 python $ORBIT_SRC/bin/radical-orbit-broker.py \
             --port $PORT -p '' > $RUNS/broker-$1/broker.out 2>&1 &
         echo "https://$N0:$PORT" > $RUNS/broker.url
     else
         RADICAL_ORBIT_LOG_FILE=$RUNS/broker-$1/broker.log \
-        python $OV/wt-156/bin/radical-orbit-broker.py \
+        python $ORBIT_SRC/bin/radical-orbit-broker.py \
             --port $PORT -p '' > $RUNS/broker-$1/broker.out 2>&1 &
         echo "https://$(hostname):$PORT" > $RUNS/broker.url
     fi
@@ -85,7 +85,7 @@ start_endpoint() {          # $1: name  $2: K nodes (0: dragon -s on $3)
     RADICAL_ORBIT_BROKER_URL=$(broker_url) SLURM_OVERLAP=1 \
     RADICAL_ORBIT_LOG_FILE=$dir/endpoint.log \
     $SRUN -N1 -n1 -w $node --chdir $dir $launch \
-        $OV/wt-156/bin/radical-orbit-endpoint.py --name $name -p dragon \
+        $ORBIT_SRC/bin/radical-orbit-endpoint.py --name $name -p dragon \
         > $dir/endpoint.out 2>&1 &
     echo $! > $dir/srun.pid
     log "endpoint $name ($launch on $node)"

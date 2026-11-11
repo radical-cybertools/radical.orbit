@@ -492,7 +492,9 @@ matches the launcher).
 
 ```sh
 cd benchmarks/2026-11-dragon-ddict
-# edit env.sh (OV, venv, cert/key paths); then a token, never ~/.radical/orbit:
+# $DRAGON_BENCH_ROOT (default $PSCRATCH/dragon-bench): ve/ (dragonhpc 0.15.0,
+# matplotlib), ve310/ (py-spy), tls/broker_{cert,key}.pem; see env.sh.
+# Then a token, never ~/.radical/orbit:
 export RUNS=/pscratch/sd/$USER/dragon-bench; mkdir -p $RUNS
 (umask 077; python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > $RUNS/token)
 

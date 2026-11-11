@@ -13,7 +13,7 @@
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 source $HERE/run_bench.sh                      # functions only
-export PYTHONPATH=${TREE:?}:$PYTHONPATH        # the switch, ahead of wt-156
+export PYTHONPATH=${TREE:?}:$PYTHONPATH        # the switch, ahead of $ORBIT_SRC
 export RADICAL_ORBIT_LOG_LVL=INFO BENCH_CLIENT_LOG=INFO
 mkdir -p $RUNS/wscomp
 

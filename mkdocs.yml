@@ -117,6 +117,7 @@ nav:
       - REST API: rest_api.md
       - Machine Guide: machine_guide.md
       - Task Dispatcher Strategy: task_dispatcher_strategy.md
+      - "Orbit-Dragon: Scoping": swarmslicer/orbit_dragon_scoping.md
   - API Reference:
       - Modules: api/
 

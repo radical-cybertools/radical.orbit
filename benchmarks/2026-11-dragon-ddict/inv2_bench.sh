@@ -14,7 +14,6 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 source $HERE/run_bench.sh                      # functions only
 DUR=${DUR:-4}
 export DIAG=1
-PYSPY=/pscratch/sd/m/merzky/overnight-2026-10-29/ve310/bin/py-spy
 EPAT='^[^ ]*python3 [^ ]*radical-orbit-endpoint.py'
 ep_node() {
     $SRUN -N ${#NODES[@]} -n ${#NODES[@]} bash -c \
