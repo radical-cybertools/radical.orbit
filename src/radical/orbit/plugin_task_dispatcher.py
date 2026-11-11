@@ -2325,6 +2325,8 @@ class PluginTaskDispatcher(Plugin):
                 if getattr(e, 'status_code', None) == 404:
                     # not upstream trouble: the task is unknown there
                     # (finished tasks are released after a retention)
+                    if self._endpoint_mode_tasks.pop(task_id, None):
+                        self._persist_endpoint_mode()
                     raise HTTPException(status_code=404,
                                         detail=str(e)) from e
                 raise HTTPException(
@@ -2361,6 +2363,8 @@ class PluginTaskDispatcher(Plugin):
                 if getattr(e, 'status_code', None) == 404:
                     # not upstream trouble: the task is unknown there
                     # (finished tasks are released after a retention)
+                    if self._endpoint_mode_tasks.pop(task_id, None):
+                        self._persist_endpoint_mode()
                     raise HTTPException(status_code=404,
                                         detail=str(e)) from e
                 raise HTTPException(

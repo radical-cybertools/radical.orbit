@@ -493,15 +493,15 @@ class RhapsodySession(PluginSession):
         if state_str.upper() in TERMINAL_STATES:
             return
 
-        # A late callback for a task already released would re-add an entry
-        # nothing removes.  Identity check, so a resubmitted uid still
-        # notifies; it only works when the backend passes the task object
-        # it was given (a backend that hands out copies makes it a no-op).
-        done = self._finished.get(uid_str)
-        if done is not None and done[0] is task:
-            return
-
         with self._notified_lock:
+            # A late callback for a task already released would re-add an
+            # entry nothing removes (checked under the lock _release takes).
+            # Identity check, so a resubmitted uid still notifies; it only
+            # works when the backend passes the task object it was given (a
+            # backend that hands out copies makes it a no-op).
+            done = self._finished.get(uid_str)
+            if done is not None and done[0] is task:
+                return
             # Skip if we already notified this state
             if self._notified_states.get(uid_str) == state_str:
                 return
@@ -763,7 +763,21 @@ class RhapsodySession(PluginSession):
         dependency is a single greppable line that a dependency upgrade can
         find.
         """
-        return self._rh_session._state_manager.get_wait_future(uid_str, task)
+        mgr = self._rh_session._state_manager
+        fut = mgr.get_wait_future(uid_str, task)
+        if fut.done() and (fut.cancelled() or fut.exception() is not None
+                           or fut.result() is not task):
+            # A stale future of an earlier run of this uid: rhapsody never
+            # pops a future it created already resolved (a task that
+            # finished before its watch attached), and hands it out again
+            # on resubmit — the new run would never be notified terminal.
+            # Drop it and ask again (private ``_task_futures``, like the
+            # line above; remove with the companion rhapsody fix).  A
+            # failed run cannot be told apart by its exception, so it is
+            # renewed too: for a task already terminal that is harmless.
+            mgr._task_futures.pop(uid_str, None)
+            fut = mgr.get_wait_future(uid_str, task)
+        return fut
 
     def _watch_batch(self, tasks) -> None:
         """Watch a batch of tasks, notifying as each completes.
@@ -813,11 +827,11 @@ class RhapsodySession(PluginSession):
         """Move *task*, notified as terminal, to the finished map, and drop
         finished tasks older than ``FINISHED_RETAIN_S``.  A uid that was
         resubmitted meanwhile keeps its new, running task."""
-        if self._tasks.get(uid) is task:
-            del self._tasks[uid]
-            self._finished[uid] = (task, time.monotonic())
-            self._finished.move_to_end(uid)
         with self._notified_lock:
+            if self._tasks.get(uid) is task:
+                del self._tasks[uid]
+                self._finished[uid] = (task, time.monotonic())
+                self._finished.move_to_end(uid)
             self._notified_states.pop(uid, None)
         self._expire()
 
@@ -2040,19 +2054,21 @@ class RhapsodyClient(PluginClient):
                 self._cond.wait(remaining)
 
         if not has_sse:
-            return self._wait_tasks_poll(uids, timeout)
+            return self._wait_tasks_poll(uids, timeout, got)
 
         return [got.get(uid, {"uid": uid, "state": "UNKNOWN"})
                 for uid in uids]
 
     def _wait_tasks_poll(self, uids: list[str],
-                         timeout: float | None = None) -> list[dict]:
+                         timeout: float | None = None,
+                         got: dict | None = None) -> list[dict]:
         """Fallback wait via periodic polling (no SSE available).
 
-        Like the SSE path, a terminal result is kept for this wait as soon
-        as a poll returns it, and later polls ask only for the uids still
-        outstanding — so a result the endpoint releases meanwhile is not
-        lost.  An outstanding uid the endpoint does not know (released, or
+        Like the SSE path, a terminal result is kept for this wait (and in
+        the completion accumulator) as soon as a poll returns it, starting
+        from *got* (results the accumulator already had), and polls ask
+        only for the uids still outstanding — so a result the endpoint
+        releases meanwhile is not lost.  An outstanding uid the endpoint does not know (released, or
         never there) raises ``ValueError`` instead of a short answer.
 
         Decodes encoded return values just like the SSE path, so a caller
@@ -2060,11 +2076,13 @@ class RhapsodyClient(PluginClient):
         """
         url      = self._url(ROUTE_WAIT.format(sid=self.sid))
         deadline = (time.time() + timeout) if timeout else None
-        got:  dict[str, dict] = {}              # terminal, kept for the wait
+        got   = dict(got or {})                 # terminal, kept for the wait
         last: dict[str, dict] = {}              # latest non-terminal answer
 
         while True:
             todo = [u for u in dict.fromkeys(uids) if u not in got]
+            if not todo:
+                return [got[u] for u in uids]
             payload: dict = {"uids": todo}
             if timeout is not None:
                 payload["timeout"] = timeout
@@ -2081,6 +2099,12 @@ class RhapsodyClient(PluginClient):
                 uid = str(t.get('uid'))
                 if str(t.get('state', '')).upper() in TERMINAL_STATES:
                     got[uid] = t
+                    with self._cond:            # as _on_task_done does
+                        self._completed[uid] = t
+                        self._arrived[uid]   = time.monotonic()
+                        self._arrived.move_to_end(uid)
+                        self._submitted.discard(uid)
+                        self._expire_completed()
                 else:
                     last[uid] = t
 

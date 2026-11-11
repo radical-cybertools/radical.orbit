@@ -3497,19 +3497,27 @@ def test_same_sid_reconnect_keeps_own_callbacks_a_switch_moves_them():
 # ---------------------------------------------------------------------------
 
 class _RhStateManager:
-    '''rhapsody's wait-future bookkeeping: one future per uid, popped and
-    resolved with the task itself when the task finishes.'''
+    '''rhapsody's (0.7.0) wait-future bookkeeping: one future per uid,
+    popped and resolved with the task itself when the task finishes; a
+    future created for a task already terminal is resolved at once and
+    never popped.'''
 
     def __init__(self):
-        self.futs = {}
+        self._task_futures = {}
 
     def get_wait_future(self, uid, task):
-        if uid not in self.futs:
-            self.futs[uid] = asyncio.get_running_loop().create_future()
-        return self.futs[uid]
+        if uid not in self._task_futures:
+            fut = asyncio.get_running_loop().create_future()
+            self._task_futures[uid] = fut
+            if task.state in ('DONE', 'FAILED', 'CANCELED'):
+                fut.set_result(task)
+        return self._task_futures[uid]
 
     def finish(self, task):
-        self.futs.pop(task.uid).set_result(task)
+        task.state = 'DONE'
+        fut = self._task_futures.pop(task.uid, None)
+        if fut is not None and not fut.done():
+            fut.set_result(task)
 
 
 class _Task:
@@ -3605,9 +3613,39 @@ async def test_watch_batch_frees_finished_tasks_while_a_straggler_runs(
     session._expire()
     gc.collect()
 
-    assert not mgr.futs['task.slow'].done()          # still running
+    assert not mgr._task_futures['task.slow'].done()  # still running
     assert sum(r() is not None for r in refs) == 0
     assert list(session._tasks) == ['task.slow']
+
+
+@pytest.mark.asyncio
+async def test_resubmitted_uid_does_not_reuse_a_stale_future():
+    '''A task that finished before its watch attached leaves a resolved
+    future in rhapsody's state manager; a resubmit of its uid must not
+    attach to it, or the new run is never notified terminal.'''
+    session, _ = _watched_session('test.stale')
+    mgr = _RhStateManager()
+    session._rh_session._state_manager = mgr
+
+    first = _Task('task.x')                         # finished before watch
+    session._tasks['task.x'] = first
+    session._watch_batch([first])
+    await _ticks()
+    assert 'task.x' in session._finished and 'task.x' in mgr._task_futures
+
+    again = _Task('task.x', state='RUNNING')
+    session._tasks['task.x'] = again
+    session._watch_batch([again])
+    await _ticks()
+    assert session._tasks['task.x'] is again        # not released early
+    assert not any('error' in t for f in _sent_frames(session) for t in f)
+
+    mgr.finish(again)
+    await _ticks()
+    assert 'task.x' not in session._tasks
+    assert session._finished['task.x'][0] is again
+    assert [t['state'] for f in _sent_frames(session) for t in f] \
+        == ['DONE', 'DONE']
 
 
 @pytest.mark.asyncio
@@ -3755,20 +3793,26 @@ def test_client_poll_wait_keeps_early_results_and_raises_for_released():
     assert [(t['uid'], t['state']) for t in out] == \
         [('task.a', 'DONE'), ('task.b', 'DONE')]
 
+    # completed uids leave _submitted, and a later wait is served from the
+    # accumulator without a poll
+    assert client._submitted == set()
+    assert client.wait_tasks(['task.a']) == out[:1] and len(asked) == 2
+
+    client._submitted.update(['task.c', 'task.d', 'task.e'])
     client._http.post = lambda url, json=None: \
-        _resp([{'uid': 'task.a', 'state': 'DONE'}])
-    with pytest.raises(ValueError, match=r"not found.*task\.b"):
-        client.wait_tasks(['task.a', 'task.b'])
+        _resp([{'uid': 'task.c', 'state': 'DONE'}])
+    with pytest.raises(ValueError, match=r"not found.*task\.d"):
+        client.wait_tasks(['task.c', 'task.d'])
 
     client._http.post = lambda url, json=None: \
         _resp({'detail': 'none of the requested tasks found'}, 404)
     with pytest.raises(ValueError, match='not found'):
-        client.wait_tasks(['task.a'])
+        client.wait_tasks(['task.d'])
 
     client._http.post = lambda url, json=None: \
         _resp({'detail': 'session gone'}, 404)    # not a task answer
     with pytest.raises(RuntimeError, match='HTTP 404'):
-        client.wait_tasks(['task.a'])
+        client.wait_tasks(['task.e'])
 
 
 def test_pickle_cache_keeps_functions_only():

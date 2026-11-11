@@ -993,12 +993,17 @@ class TestEndpointMode:
             r = client.get(f'{plugin.namespace}/task/{sid}/t.1')
             assert r.status_code == 404
             assert 'not found' in r.json()['detail']
+            assert 't.1' not in plugin._endpoint_mode_tasks   # forgotten
+            plugin._endpoint_mode_tasks['t.1'] = 'ep'
             r = client.post(f'{plugin.namespace}/cancel/{sid}/t.1')
             assert r.status_code == 404
+            assert 't.1' not in plugin._endpoint_mode_tasks
 
+            plugin._endpoint_mode_tasks['t.1'] = 'ep'
             rh_mock.get_task.side_effect = RuntimeError('HTTP 500 — boom')
             r = client.get(f'{plugin.namespace}/task/{sid}/t.1')
             assert r.status_code == 502
+            assert plugin._endpoint_mode_tasks['t.1'] == 'ep'   # kept
         rh_mock.submit_tasks.assert_not_called()
 
     def test_endpoint_mode_skips_the_pool_gates(self, tmp_path):
