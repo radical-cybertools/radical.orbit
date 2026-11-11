@@ -1734,7 +1734,7 @@ class RhapsodyClient(PluginClient):
                 # the next real call reports them
                 raise RuntimeError(f"session {self.sid} is gone (closing "
                                    "or expired)")
-            if status is not None and status != 409:
+            if status is not None and status not in (409, 503):
                 return  # session is ready (or already errored)
             time.sleep(1.0)
         raise RuntimeError(

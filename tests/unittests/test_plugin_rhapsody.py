@@ -2580,6 +2580,20 @@ def test_client_poll_retries_transient_errors():
     assert http.get.call_count == 3
 
 
+
+def test_client_poll_retries_503():
+    """A 503 (e.g. the broker's fast-fail for a suspect endpoint) is not
+    'ready': the poll keeps going."""
+    http = MagicMock()
+    http.get.side_effect = [MagicMock(status_code=503),
+                            MagicMock(status_code=200)]
+    rc = RhapsodyClient(http, '/rhapsody')
+    rc._sid = 'sid.1'
+    with patch('time.sleep'):
+        rc._poll_session_ready(timeout=5)
+    assert http.get.call_count == 2
+
+
 @pytest.mark.asyncio
 async def test_failed_start_and_cleanup_still_release_name():
     session = _ready_session()

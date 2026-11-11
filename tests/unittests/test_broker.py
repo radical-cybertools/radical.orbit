@@ -320,6 +320,7 @@ async def test_forwarded_call_table_cap_fast_fails_503(make_broker):
         resp = ws1.msgs()[0]
         assert resp.kind == 'response' and resp.status == 503
         assert resp.corr_id == req.corr_id
+        assert dict(resp.headers).get('retry-after') == '1'
         assert not ws2.sent                             # not forwarded to dst
         assert len(broker._calls) == cap                # table did not grow
         assert req.corr_id not in broker._calls
@@ -986,7 +987,7 @@ async def test_reregister_cancels_grace(make_broker):
 
 
 # ---------------------------------------------------------------------------
-# Calls to a suspect endpoint: held, failed on resume (503) or on lost (504)
+# Calls to a suspect endpoint: fast-fail 503 (nothing written, retry is safe)
 # ---------------------------------------------------------------------------
 
 async def _suspect_pair(broker):
@@ -1003,75 +1004,99 @@ async def _suspect_pair(broker):
 
 
 @pytest.mark.asyncio
-async def test_forwarded_call_to_suspect_fails_503_on_resume(make_broker):
-    broker = make_broker()
-    await broker.startup()
-    try:
-        ws1, ws2, key = await _suspect_pair(broker)
-
-        req = protocol.make_request('e1', 'e2', 'POST', '/submit')
-        await broker._route_frame('e1', protocol.pack_message(req))
-        assert ws2.sent == []                       # not written to the dead socket
-        assert broker._calls[req.corr_id].held is True
-
-        ws3 = FakeWS()
-        ok, _ = await _register(broker, 'e2', ws3, resume_key=key)
-        assert ok is True
-
-        for _ in range(100):                        # the 503s go out in the background
-            if [m for m in ws1.msgs() if m.kind == 'response']:
-                break
-            await asyncio.sleep(0.01)
-        got = [m for m in ws1.msgs() if m.kind == 'response'][-1]
-        assert dict(got.headers).get('retry-after') == '1'
-        assert got.kind == 'response' and got.status == 503
-        assert got.corr_id == req.corr_id
-        assert 'retry' in json.loads(got.body)['detail']
-        assert req.corr_id not in broker._calls
-    finally:
-        await broker.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_broker_call_to_suspect_fails_503_on_resume(make_broker):
-    broker = make_broker()
-    await broker.startup()
-    try:
-        _ws1, _ws2, key = await _suspect_pair(broker)
-
-        task = asyncio.ensure_future(broker.caller.call('e2', 'GET', '/y'))
-        await asyncio.sleep(0)
-        assert not task.done()
-
-        await _register(broker, 'e2', FakeWS(), resume_key=key)
-        out = await asyncio.wait_for(task, timeout=1.0)
-        assert out['status'] == 503
-    finally:
-        await broker.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_held_call_fails_504_when_suspect_turns_lost(make_broker):
+async def test_forwarded_call_to_suspect_fast_fails_503(make_broker):
     broker = make_broker()
     await broker.startup()
     try:
         ws1, ws2, _key = await _suspect_pair(broker)
 
+        reqs = [protocol.make_request('e1', 'e2', 'POST', '/submit')
+                for _ in range(2)]
+        for req in reqs:
+            await broker._route_frame('e1', protocol.pack_message(req))
+        assert ws2.sent == []                       # nothing to the dead socket
+
+        got = {m.corr_id: m for m in ws1.msgs() if m.kind == 'response'}
+        assert set(got) == {r.corr_id for r in reqs}
+        for req in reqs:
+            resp = got[req.corr_id]
+            hdrs = dict(resp.headers)
+            assert resp.status == 503
+            assert hdrs.get('retry-after') == '1'
+            assert hdrs.get('content-type') == 'application/json'
+            assert 'retry' in json.loads(resp.body)['detail']
+            assert req.corr_id not in broker._calls
+    finally:
+        await broker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_suspect_is_checked_before_the_call_cap(make_broker):
+    from radical.orbit.broker import _Call
+    broker = make_broker()
+    await broker.startup()
+    try:
+        ws1, _ws2, _key = await _suspect_pair(broker)
+        for i in range(broker._forwarded_call_cap):
+            broker._calls['fill-%d' % i] = _Call('e1', 'e2', None, 1e9)
+
         req = protocol.make_request('e1', 'e2', 'GET', '/x')
         await broker._route_frame('e1', protocol.pack_message(req))
 
-        broker._fire_lost('e2', ws2)
-        await asyncio.sleep(0)
-        got = [m for m in ws1.msgs() if m.kind == 'response'][-1]
-        assert got.status == 504 and got.corr_id == req.corr_id
+        resp   = [m for m in ws1.msgs() if m.kind == 'response'][-1]
+        detail = json.loads(resp.body)['detail']
+        assert resp.status == 503 and resp.corr_id == req.corr_id
+        assert 'disconnected' in detail and 'at cap' not in detail
+    finally:
+        await broker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_broker_call_to_suspect_fast_fails_503(make_broker):
+    broker = make_broker()
+    await broker.startup()
+    try:
+        _ws1, ws2, _key = await _suspect_pair(broker)
+
+        out = await asyncio.wait_for(broker.caller.call('e2', 'GET', '/y'),
+                                     timeout=1.0)
+        hdrs = dict(out['headers'])
+        assert out['status'] == 503
+        assert hdrs.get('retry-after') == '1'
+        assert hdrs.get('content-type') == 'application/json'
+        assert 'retry' in json.loads(out['body'])['detail']
+        assert ws2.sent == []
+        assert not broker._calls
+    finally:
+        await broker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_request_after_resume_is_delivered(make_broker):
+    broker = make_broker()
+    await broker.startup()
+    try:
+        ws1, _ws2, key = await _suspect_pair(broker)
+
+        ws3 = FakeWS()
+        ok, _ = await _register(broker, 'e2', ws3, resume_key=key)
+        assert ok is True
+        ws3.sent.clear()
+
+        req = protocol.make_request('e1', 'e2', 'GET', '/x')
+        await broker._route_frame('e1', protocol.pack_message(req))
+        assert [m.corr_id for m in ws3.msgs() if m.kind == 'request'] \
+            == [req.corr_id]
+        assert not [m for m in ws1.msgs() if m.kind == 'response']
+        assert req.corr_id in broker._calls
     finally:
         await broker.shutdown()
 
 
 @pytest.mark.asyncio
 async def test_call_sent_before_the_drop_survives_resume(make_broker):
-    """Only calls that arrived during suspect are failed on resume; one that was
-    delivered before the drop may still be answered by the resumed endpoint."""
+    """A call delivered before the drop may still be answered by the resumed
+    endpoint: the resume leaves it pending under its normal deadline."""
     broker = make_broker()
     await broker.startup()
     try:
@@ -1087,7 +1112,6 @@ async def test_call_sent_before_the_drop_survives_resume(make_broker):
 
         await _register(broker, 'e2', FakeWS(), resume_key=key)
         assert req.corr_id in broker._calls
-        assert broker._calls[req.corr_id].held is False
         assert not [m for m in ws1.msgs() if m.kind == 'response']
     finally:
         await broker.shutdown()
