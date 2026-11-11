@@ -76,6 +76,8 @@ log = logging.getLogger("radical.orbit.broker")
 
 BROKER_NAME = protocol.BROKER_NAME
 
+_RETRY_AFTER = '1'      # Retry-After (seconds) on the broker's fast-fail 503s
+
 
 # ---------------------------------------------------------------------------
 # Tunables
@@ -116,6 +118,11 @@ class BrokerTuning:
     event_queue:   int   = 1024
     frame_cap:     int   = protocol.FRAME_CAP
     ws_compression: Optional[Union[bool, str]] = None
+
+
+def _suspect_detail(dst: str) -> str:
+    return (f"endpoint {dst!r} is disconnected (reconnect pending); the "
+            "request was not delivered, retry it")
 
 
 class _Call:
@@ -873,11 +880,20 @@ class Broker:
                                                   f"endpoint {dst!r} unknown"))
             return
 
+        if self._liveness.get(dst) == 'suspect':
+            # The frame would go to the dropped socket and be lost: fail fast.
+            # Nothing was written, so a retry is safe even if not idempotent.
+            await self._send(self.registry.get(src_name),
+                             self._error_response(raw, 503, _suspect_detail(dst),
+                                                  headers={'retry-after': _RETRY_AFTER}))
+            return
+
         if len(self._calls) >= self._forwarded_call_cap:
             await self._send(self.registry.get(src_name),
                              self._error_response(raw, 503,
                                                   "broker forwarded-call table "
-                                                  "at cap"))
+                                                  "at cap",
+                                                  headers={'retry-after': _RETRY_AFTER}))
             return
 
         self._calls[corr_id] = _Call(src_name, dst, None,
@@ -917,6 +933,13 @@ class Broker:
         target  = self.registry.get(dst)
         if target is None:
             raise RuntimeError(f"endpoint {dst!r} unknown")
+
+        if self._liveness.get(dst) == 'suspect':
+            # as in _route_request: nothing written, retry is safe
+            return {'status':  503,
+                    'headers': {'content-type': 'application/json',
+                                'retry-after':  _RETRY_AFTER},
+                    'body':    error_body(503, _suspect_detail(dst))}
 
         try:
             data = protocol.pack_message(req, cap=self._frame_cap)
@@ -1280,10 +1303,11 @@ class Broker:
         except Exception:
             pass
 
-    def _error_response(self, req_raw: dict, status: int, detail: str) -> bytes:
+    def _error_response(self, req_raw: dict, status: int, detail: str,
+                        headers: Optional[Dict[str, str]] = None) -> bytes:
         out = protocol.Response(
             src=BROKER_NAME, dst=req_raw.get('src'), status=status,
-            headers={'content-type': 'application/json'},
+            headers={'content-type': 'application/json', **(headers or {})},
             body=error_body(status, detail),
             corr_id=req_raw.get('corr_id'))
         return protocol.pack_message(out, cap=self._frame_cap)
