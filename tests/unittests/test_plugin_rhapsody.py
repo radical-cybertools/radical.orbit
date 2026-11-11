@@ -308,6 +308,86 @@ async def test_default_session_via_forward():
         DEFAULT_SID, plugin._sessions[DEFAULT_SID])
 
 
+def _default_request():
+    request = MagicMock(spec=Request)
+    request.json    = AsyncMock(return_value={"sid": DEFAULT_SID})
+    request.headers = {}
+    return request
+
+
+@pytest.mark.asyncio
+async def test_closing_default_answers_410_then_is_recreated():
+    '''register('default') on a closing 'default' answers 410; after the
+    close it is recreated through rhapsody's override, with its init.'''
+    _, plugin, _ = _make_plugin()
+    with patch.object(PluginRhapsody, '_init_session', new_callable=AsyncMock):
+        await plugin.register_session(_default_request())
+    old     = plugin._sessions[DEFAULT_SID]
+    release = asyncio.Event()
+
+    async def _held(request):
+        await release.wait()
+
+    req   = asyncio.ensure_future(plugin._accessing(_held)(
+        MagicMock(path_params={'sid': DEFAULT_SID}, headers={})))
+    await asyncio.sleep(0)
+    close = asyncio.ensure_future(plugin._drop_session(DEFAULT_SID))
+    await asyncio.sleep(0)
+    with pytest.raises(HTTPException) as exc:
+        await plugin.register_session(_default_request())
+    assert exc.value.status_code == 410 and "closing" in exc.value.detail
+    release.set()
+    await req
+    await close
+    assert DEFAULT_SID not in plugin._sessions
+    with patch.object(PluginRhapsody, '_init_session',
+                      new_callable=AsyncMock) as init_mock:
+        resp = await plugin.register_session(_default_request())
+        await asyncio.sleep(0)
+    new = plugin._sessions[DEFAULT_SID]
+    assert resp['sid'] == DEFAULT_SID and new is not old
+    init_mock.assert_called_once_with(DEFAULT_SID, new)
+
+
+@pytest.mark.asyncio
+async def test_no_default_recreated_during_shutdown():
+    '''Routes stay live during shutdown: once 'default' was closed, a
+    register or _forward on it answers 410 and starts no init.'''
+    _, plugin, _ = _make_plugin()
+    with patch.object(PluginRhapsody, '_init_session', new_callable=AsyncMock):
+        await plugin.register_session(_default_request())
+        other = MagicMock(spec=Request)
+        other.json    = AsyncMock(return_value={})
+        other.headers = {}
+        sid  = (await plugin.register_session(other))['sid']
+    hold = asyncio.Event()
+
+    async def _slow_close():
+        await hold.wait()
+
+    plugin._sessions[sid].close = _slow_close       # keeps shutdown running
+    down = asyncio.ensure_future(plugin.shutdown())
+    for _ in range(1000):
+        if DEFAULT_SID not in plugin._sessions:
+            break
+        await asyncio.sleep(0)
+    assert DEFAULT_SID not in plugin._sessions and not down.done()
+    with patch.object(PluginRhapsody, '_init_session',
+                      new_callable=AsyncMock) as init_mock:
+        with pytest.raises(HTTPException) as exc:
+            await plugin.register_session(_default_request())
+        assert exc.value.status_code == 410
+        with pytest.raises(HTTPException) as exc:
+            await plugin._forward(DEFAULT_SID, RhapsodySession.list_tasks)
+        assert exc.value.status_code == 410
+        await asyncio.sleep(0)
+    init_mock.assert_not_called()
+    assert DEFAULT_SID not in plugin._sessions
+    hold.set()
+    await down
+    assert not plugin._sessions
+
+
 def test_unregister_session():
     _, plugin, client = _make_plugin()
     sid = _register(client, plugin)

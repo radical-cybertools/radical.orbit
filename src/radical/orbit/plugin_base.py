@@ -4,7 +4,6 @@ import uuid
 import asyncio
 import inspect
 import functools
-import contextvars
 import logging
 import time
 
@@ -56,16 +55,6 @@ ENDED_KEEP  = 100_000     # ended sids remembered (for the 410), oldest dropped
 CLOSE_DRAIN_TIMEOUT = 30.0   # a close waits this long for requests in flight
 
 
-# The sid whose {sid} request the current task is serving (set by
-# Plugin._accessing): such a request is drained by a close, so _forward must
-# let it through instead of answering 410 "is closing".
-_serving_sid: contextvars.ContextVar = contextvars.ContextVar(
-    'orbit_serving_sid', default=None)
-
-# How many sessions the expiry sweep closes at once.
-SWEEP_CLOSE_PARALLEL = 16
-
-
 def no_drain(handler: Callable) -> Callable:
     """Mark a ``{sid}`` route handler as long-blocking (e.g. a wait): a
     session close does not wait for it to return."""
@@ -87,7 +76,8 @@ class SessionRecord:
     client:         Optional[str]   = None    # X-Orbit-Client (e.g. explorer)
     inflight:       int             = 0       # {sid} requests still running
     # close coordination (see Plugin._drop_session)
-    closing:        bool            = False   # close started: requests 410
+    closing:        bool            = False   # close started: new requests 410
+    closed:         bool            = False   # close() runs: _forward 410
     draining:       int             = 0       # in-flight requests a close awaits
     drained:        Optional[asyncio.Event] = None   # set when draining is 0
     close_task:     Optional[asyncio.Future] = None  # the one close
@@ -321,7 +311,7 @@ class Plugin(object):
         # Guards on-demand creation of the reserved 'default' session so two
         # concurrent first requests cannot double-create it.
         self._default_lock = asyncio.Lock()
-        self._shutting_down = False     # no 'default' is recreated then
+        self._shutting_down = False     # shutdown began: requests 410
         # Loop used to schedule thread-origin notifications.  Captured at
         # construction (the host builds plugins on its loop); refreshed on the
         # first async notify if construction happened outside a loop.
@@ -438,11 +428,10 @@ class Plugin(object):
         @functools.wraps(handler)
         async def _accessed(request):
             sid = (getattr(request, 'path_params', None) or {}).get('sid')
+            if sid and self._shutting_down:
+                raise HTTPException(status_code=410,
+                                    detail=self._shutdown_detail())
             rec = self._records.get(sid) if sid else None
-            if sid == DEFAULT_SID and rec is not None and rec.closing:
-                await self._drop_session(sid)   # 'default' is recreated
-                await self._ensure_default_session()
-                rec = self._records.get(sid)
             if sid and rec is None:
                 text = self._ended_detail(sid)
                 if text:
@@ -459,11 +448,9 @@ class Plugin(object):
             rec.inflight += 1
             if drain:
                 rec.draining += 1
-            token = _serving_sid.set(sid)
             try:
                 return await handler(request)
             finally:
-                _serving_sid.reset(token)
                 rec.inflight   -= 1
                 rec.last_access = time.time()
                 if drain:
@@ -670,14 +657,14 @@ class Plugin(object):
             HTTPException 410: ``sid`` names a session that has ended.
         """
         policy = self._validate_session_policy(data)     # 409 first
+        if self._shutting_down:
+            raise HTTPException(status_code=410,
+                                detail=self._shutdown_detail())
         sid    = policy[0]
         rec    = self._records.get(sid) if sid is not None else None
         if rec is not None and rec.closing:
-            if sid != DEFAULT_SID:
-                raise HTTPException(status_code=410,
-                                    detail=self._closing_detail(sid))
-            await self._drop_session(sid)       # 'default' is recreated
-            rec = None
+            raise HTTPException(status_code=410,
+                                detail=self._closing_detail(sid))
         if rec is not None:
             await self._expire_if_due(sid, rec, time.time())
         if sid is not None and sid not in self._records:
@@ -784,9 +771,6 @@ class Plugin(object):
         session = self._sessions.get(DEFAULT_SID)
         if session is not None:
             return session
-        if self._shutting_down:
-            raise HTTPException(status_code=410,
-                                detail=f"[{self.instance_name}] shutting down")
         async with self._default_lock:
             session = self._sessions.get(DEFAULT_SID)
             if session is None:
@@ -949,16 +933,21 @@ class Plugin(object):
                 the detail says why and what to change.
             HTTPException 500: Unexpected error inside the session method.
         """
+        if self._shutting_down:
+            raise HTTPException(status_code=410,
+                                detail=self._shutdown_detail())
+
         # On-demand creation of the reserved persistent 'default' session.
         if sid == DEFAULT_SID and sid not in self._sessions:
             await self._ensure_default_session()
 
-        # Detect expiry of THIS session before the background cleanup removes it
+        # A session whose close() runs answers 410; during the drain before
+        # it, calls go through (a drained request must reach its session).
         record = self._records.get(sid)
-        if record is not None and record.closing \
-                and _serving_sid.get() != sid:  # a drained request goes on
+        if record is not None and record.closed:
             raise HTTPException(status_code=410,
                                 detail=self._closing_detail(sid))
+        # Detect expiry of THIS session before the background cleanup removes it
         text   = record and await self._expire_if_due(sid, record, time.time())
         if text:
             raise HTTPException(status_code=410, detail=text)
@@ -980,9 +969,9 @@ class Plugin(object):
             raise  # Re-raise HTTP exceptions as-is
         except Exception as e:
             # the session was closed underneath the call (a @no_drain wait,
-            # or a drain that timed out): that is a 410, not a server error
-            rec = self._records.get(sid)
-            if (rec is not None and rec.closing) \
+            # or a drain that timed out): that is a 410, not a server error.
+            # A failure during the drain, before close(), is a real 500.
+            if (record is not None and record.closed) \
                     or self._sessions.get(sid) is not session:
                 log.warning("[%s] %s on session %s failed during its close "
                             "(answered 410): %r", self.instance_name,
@@ -1050,18 +1039,18 @@ class Plugin(object):
         if self._is_busy(sid, rec):
             rec.last_access = now
             return None
+        # not busy, so no request in flight: an expiry never drains (no
+        # await between this check and _drop_session marking it closing)
         return await self._end_session(sid, 'expired', now)
 
     async def _end_session(self, sid: str, reason: str, now: float) -> str:
         """End a session (``reason``: ``'expired'`` or ``'closed'``): log,
         remember (unless persistent -- e.g. ``default`` is recreated on
         demand) and drop it.  Returns the explanation.  A session already
-        closing keeps the reason it ended with; this waits for that close."""
+        closing keeps the reason it ended with (the first one); this waits
+        for that close."""
         rec = self._records.get(sid)
         if rec is not None and rec.closing:
-            entry = self._ended.get(sid)
-            if reason == 'closed' and entry is not None:   # explicit wins
-                self._ended[sid] = (entry[0], 'closed') + entry[2:]
             await self._drop_session(sid)
             return self._ended_detail(sid) \
                 or f"[{self.instance_name}] session {sid} has ended"
@@ -1079,6 +1068,10 @@ class Plugin(object):
             text = f"[{self.instance_name}] session {sid} has ended"
         await self._drop_session(sid)
         return text
+
+    def _shutdown_detail(self) -> str:
+        """The 410 detail for a request once the plugin shuts down."""
+        return f"[{self.instance_name}] shutting down"
 
     def _closing_detail(self, sid: str) -> str:
         """The 410 detail for a request on a session that is being closed."""
@@ -1158,6 +1151,7 @@ class Plugin(object):
                     log.warning("[%s] closing session %s with %d "
                                 "request(s) still in flight",
                                 self.instance_name, sid, rec.draining)
+            rec.closed = True           # from here on, _forward answers 410
             if session is not None:
                 try:
                     await session.close()
@@ -1173,8 +1167,9 @@ class Plugin(object):
 
     async def _cleanup_expired_sessions(self) -> int:
         """End every session idle past its timeout (see
-        :meth:`_expire_if_due`), concurrently: one slow close (a drain)
-        does not delay the others.  Each candidate is decided afresh.
+        :meth:`_expire_if_due`), concurrently: one slow ``close()`` (e.g. a
+        backend teardown) does not delay the others.  Each candidate is
+        decided afresh.
 
         Returns:
             Number of sessions ended.
@@ -1183,12 +1178,9 @@ class Plugin(object):
         due = [(sid, rec) for sid, rec in list(self._records.items())
                if not rec.closing and self._is_expired(rec, now)]
 
-        limit = asyncio.Semaphore(SWEEP_CLOSE_PARALLEL)
-
         async def _one(sid, rec):
-            async with limit:
-                return self._records.get(sid) is rec and bool(
-                    await self._expire_if_due(sid, rec, time.time()))
+            return self._records.get(sid) is rec and bool(
+                await self._expire_if_due(sid, rec, time.time()))
 
         results = await asyncio.gather(*(_one(s, r) for s, r in due),
                                        return_exceptions=True)
