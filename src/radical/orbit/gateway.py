@@ -92,6 +92,13 @@ REQUEST_TIMEOUT = 600
 # The name the broker reserves for its own hosted-plugin participant.
 BROKER_NAME = protocol.BROKER_NAME
 
+# Plugins whose Explorer UI module the gateway may fetch from an endpoint
+# hosting them: comma-separated plugin names, or ``*``; unset = none.
+ENV_ENDPOINT_UI = 'RADICAL_ORBIT_ENDPOINT_UI_MODULES'
+
+# A UI module fetch is a page load, not a proxied job call: fail fast.
+UI_MODULE_TIMEOUT = 10.0
+
 # Allowed CORS origins.  LUCID needs credentials; browsers reject credentials +
 # wildcard origin, so the allow-list is explicit.
 CORS_ORIGINS = [
@@ -155,6 +162,15 @@ class Gateway:
         # the routing loop (``serve_plugin``, refreshed on a miss from
         # ``Broker.get_ui_modules()``); no lock needed.
         self._plugin_ui_module_js: Dict[str, str] = {}
+
+        # Plugins whose UI module may come from an *endpoint* (see
+        # ``_endpoint_ui_module``).  Opt-in: endpoint JS runs in the Explorer
+        # under the broker's origin, so the operator names the plugins it
+        # trusts (``*`` = all); empty (the default) = off.
+        self._endpoint_ui = frozenset(
+            name.strip()
+            for name in os.environ.get(ENV_ENDPOINT_UI, '').split(',')
+            if name.strip())
 
         self._setup_middleware()
         self._register_routes()
@@ -538,11 +554,54 @@ class Gateway:
             self._plugin_ui_module_js.update(
                 await self._broker.get_ui_modules())
             js = self._plugin_ui_module_js.get(plugin_name)
+        if js is None:
+            js = await self._endpoint_ui_module(plugin_name)
         if js is not None:
             return Response(js, media_type="application/javascript",
                             headers=self._no_cache())
         raise HTTPException(status_code=404,
                             detail=f"Plugin '{filename}' not found")
+
+    async def _endpoint_ui_module(self, plugin_name: str) -> Optional[str]:
+        """Fetch *plugin_name*'s UI module from an endpoint that hosts it.
+
+        Last resort after the packaged JS and the broker-hosted modules, so an
+        endpoint can never replace either.  Only for plugins named in
+        ``$RADICAL_ORBIT_ENDPOINT_UI_MODULES`` (or ``*``).  The first endpoint
+        advertising ``ui_module`` for the plugin that answers wins; the result
+        is cached like a broker-hosted module (restart the broker to pick up
+        an edited file).
+        """
+        if '*' not in self._endpoint_ui \
+                and plugin_name not in self._endpoint_ui:
+            return None
+
+        for name, info in self._broker.topology_snapshot().items():
+            if name == BROKER_NAME:
+                continue
+            pinfo = (info.get('plugins') or {}).get(plugin_name) or {}
+            if not pinfo.get('ui_module'):
+                continue
+            path = (pinfo.get('namespace') or '/' + plugin_name).rstrip('/') \
+                 + '/ui_module'
+            try:
+                resp = await self._broker.caller.call(
+                    name, 'GET', path, timeout=UI_MODULE_TIMEOUT)
+            except (asyncio.TimeoutError, RuntimeError) as exc:
+                log.debug("[Gateway] ui_module of %s on %s: %s",
+                          plugin_name, name, exc)
+                continue
+            status, _, rbody = unpack_response_dict(resp)
+            if status != 200:
+                continue
+            try:
+                js = json.loads(rbody).get('js')
+            except (ValueError, AttributeError):
+                continue
+            if isinstance(js, str):
+                self._plugin_ui_module_js[plugin_name] = js
+                return js
+        return None
 
     @staticmethod
     async def _read_body_capped(request: Request, cap: int) -> bytes:

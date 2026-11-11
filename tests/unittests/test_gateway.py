@@ -92,6 +92,16 @@ class _GwPlugin(Plugin):
         return {'sent': True}
 
 
+class _GwUiPlugin(Plugin):
+    """An endpoint-hosted plugin with an Explorer UI module (set per test)."""
+    plugin_name = 'gw_ui_test'
+    version     = '0.0.1'
+    ui_module   = None
+
+    def __init__(self, app):
+        super().__init__(app, 'gw_ui_test')
+
+
 # ---------------------------------------------------------------------------
 # Broker-under-uvicorn harness + runtime factory
 # ---------------------------------------------------------------------------
@@ -672,3 +682,69 @@ def test_read_body_capped_accepts_within_cap():
     req = _make_stream_request({'content-length': '6'}, [b'abc', b'def'])
     body = asyncio.run(Gateway._read_body_capped(req, 4 * 1024 * 1024))
     assert body == b'abcdef'
+
+
+# ---------------------------------------------------------------------------
+# UI modules of endpoint-hosted plugins
+# ---------------------------------------------------------------------------
+
+_UI_JS = 'export function template() { return "<div>gw ui</div>"; }\n'
+
+
+@pytest.fixture
+def ui_plugin(tmp_path, monkeypatch):
+    path = tmp_path / 'gw_ui_test.js'
+    path.write_text(_UI_JS)
+    monkeypatch.setattr(_GwUiPlugin, 'ui_module', str(path))
+    return path
+
+
+def test_endpoint_ui_module_served_when_allowed(harness, ui_plugin,
+                                                monkeypatch):
+    monkeypatch.setenv('RADICAL_ORBIT_ENDPOINT_UI_MODULES', 'gw_ui_test')
+    make_broker, make_runtime = harness
+    srv = make_broker()
+    make_runtime(srv.url, name='epA', plugins=['gw_ui_test'])
+    assert _wait(lambda: 'epA' in srv.broker.registry)
+
+    # the endpoint advertises it, and the gateway fetches it from there
+    topo = srv.broker.topology_snapshot()
+    assert topo['epA']['plugins']['gw_ui_test']['ui_module'] is True
+
+    r = httpx.get(srv.url + '/plugins/gw_ui_test.js')
+    assert r.status_code == 200
+    assert r.text == _UI_JS
+    assert r.headers['content-type'].startswith('application/javascript')
+
+
+def test_endpoint_ui_module_off_by_default(harness, ui_plugin, monkeypatch):
+    monkeypatch.delenv('RADICAL_ORBIT_ENDPOINT_UI_MODULES', raising=False)
+    make_broker, make_runtime = harness
+    srv = make_broker()
+    make_runtime(srv.url, name='epA', plugins=['gw_ui_test'])
+    assert _wait(lambda: 'epA' in srv.broker.registry)
+
+    # endpoint JS runs under the broker's origin: no allowlist, no JS
+    assert httpx.get(srv.url + '/plugins/gw_ui_test.js').status_code == 404
+
+
+def test_endpoint_ui_module_allowlist_is_by_name(harness, ui_plugin,
+                                                 monkeypatch):
+    monkeypatch.setenv('RADICAL_ORBIT_ENDPOINT_UI_MODULES', 'other, gw_test')
+    make_broker, make_runtime = harness
+    srv = make_broker()
+    make_runtime(srv.url, name='epA', plugins=['gw_ui_test'])
+    assert _wait(lambda: 'epA' in srv.broker.registry)
+
+    assert httpx.get(srv.url + '/plugins/gw_ui_test.js').status_code == 404
+
+
+def test_plugin_without_ui_module_answers_404(harness):
+    make_broker, make_runtime = harness
+    srv = make_broker()
+    make_runtime(srv.url, name='epA', plugins=['gw_test'])
+    assert _wait(lambda: 'epA' in srv.broker.registry)
+
+    assert srv.broker.topology_snapshot()['epA']['plugins']['gw_test'][
+        'ui_module'] is False
+    assert httpx.get(srv.url + '/epA/gw_test/ui_module').status_code == 404

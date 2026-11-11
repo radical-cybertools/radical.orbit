@@ -844,6 +844,9 @@ class EndpointRuntime(PluginHostBase):
                 'enabled':   True,
                 'ui_config': ui_config_to_dict(
                     getattr(plugin, 'ui_config', None)),
+                # tells the gateway this endpoint can serve the plugin's
+                # Explorer JS (GET <namespace>/ui_module)
+                'ui_module': bool(getattr(plugin, 'ui_module', None)),
             })
         return out
 

@@ -135,6 +135,7 @@ The gateway preserves these HTTP paths for the Explorer and other HTTP clients:
 - `POST /broker/terminate` – Terminate the broker process
 - `GET /events` – SSE stream for real-time notifications
 - `/{endpoint_name}/{plugin_namespace}/...` – HTTP requests mapped onto `(dst, path)` and routed to the participant's plugins
+- `GET /plugins/{name}.js` – Explorer plugin JS: packaged `data/plugins/*.js` first, then a broker-hosted plugin's `ui_module`, then (opt-in) the `ui_module` of an endpoint-hosted plugin, fetched once through its built-in `GET {namespace}/ui_module` route and cached. Endpoints advertise `ui_module: true` per plugin in topology. The endpoint fallback is off unless the broker's `$RADICAL_ORBIT_ENDPOINT_UI_MODULES` names the plugin (comma list, or `*`): endpoint JS runs in the Explorer under the broker's origin, so the operator decides which endpoints' plugins it trusts.
 
 ### Plugin system
 

@@ -1,3 +1,4 @@
+import os
 import re
 import math
 import uuid
@@ -322,6 +323,7 @@ class Plugin(object):
         self.add_route_get('list_sessions', self.list_sessions)
         self.add_route_get('health', self.health_check)
         self.add_route_get('ui_config', self.get_ui_config)
+        self.add_route_get('ui_module', self.get_ui_module)
         self._log_routes()
 
     # Role classification — one cached lookup (utils.host_role) backs the four
@@ -791,6 +793,23 @@ class Plugin(object):
             "version": self.version,
             "ui": ui_config_to_dict(self.ui_config)
         }
+
+    async def get_ui_module(self, request: Request) -> dict:
+        """Return this plugin's Explorer UI module (``ui_module``) as text.
+
+        The gateway serves the JS of broker-hosted and packaged plugins from
+        the broker's disk; for a plugin hosted on an endpoint the file lives
+        on that endpoint, so the gateway fetches it through this route (only
+        for plugins the broker operator allows -- see ``gateway.py``).  404
+        when the plugin ships no UI module.
+        """
+        path = getattr(self, 'ui_module', None)
+        if not path or not os.path.isfile(path):
+            raise HTTPException(status_code=404,
+                                detail=f"'{self._instance_name}' has no "
+                                       f"ui_module")
+        with open(path, encoding='utf-8') as fh:
+            return {'js': fh.read()}
 
     async def list_sessions(self, request: Request) -> dict:
         """Return a list of active session IDs."""
