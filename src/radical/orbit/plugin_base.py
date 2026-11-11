@@ -657,9 +657,6 @@ class Plugin(object):
             HTTPException 410: ``sid`` names a session that has ended.
         """
         policy = self._validate_session_policy(data)     # 409 first
-        if self._shutting_down:
-            raise HTTPException(status_code=410,
-                                detail=self._shutdown_detail())
         sid    = policy[0]
         rec    = self._records.get(sid) if sid is not None else None
         if rec is not None and rec.closing:
@@ -667,6 +664,9 @@ class Plugin(object):
                                 detail=self._closing_detail(sid))
         if rec is not None:
             await self._expire_if_due(sid, rec, time.time())
+        if self._shutting_down:             # after the last await
+            raise HTTPException(status_code=410,
+                                detail=self._shutdown_detail())
         if sid is not None and sid not in self._records:
             text = self._ended_detail(sid)
             if text:
