@@ -31,11 +31,13 @@ class _FakeDDict(dict):
 
 class _FakeBackend(DDictBackend):
 
-    def __init__(self):
-        super().__init__('start')
-        self.up    = 0
-        self.down  = 0
-        self.fail  = None
+    def __init__(self, mode='start'):
+        super().__init__(mode)
+        self.up     = 0
+        self.down   = 0
+        self.fail   = None
+        self.nodes  = 4                 # runtime size seen by attach mode
+        self.asked  = 0
 
     def _runtime_up(self):
         if self._rt is None:
@@ -47,15 +49,21 @@ class _FakeBackend(DDictBackend):
             self._rt   = None
             self.down += 1
 
+    def _node_count(self):
+        self.asked += 1
+        if isinstance(self.nodes, Exception):
+            raise self.nodes
+        return self.nodes
+
     def _new_ddict(self, managers_per_node, n_nodes, total_mem):
         if self.fail:
             raise self.fail
         return _FakeDDict(managers_per_node, n_nodes, total_mem)
 
 
-def _mk():
+def _mk(mode='start'):
     app     = FastAPI()
-    backend = _FakeBackend()
+    backend = _FakeBackend(mode)
     plugin  = PluginDragon(app, backend=backend)
     tc      = TestClient(app)
     sid     = tc.post('/dragon/register_session').json()['sid']
@@ -351,6 +359,51 @@ def test_ddicts_outlive_sessions(env):
     assert e['id'] in plugin.entries
 
 
+@pytest.mark.parametrize('body', [{'managers_per_node': 65},
+                                  {'n_nodes': 1025},
+                                  {'total_mem': '65G'},
+                                  {'n_nodes': 2, 'total_mem': '129G'},
+                                  {'total_mem': '999999T'}])
+def test_create_oversize_400_before_dragon(env, body):
+    plugin, backend, tc, sid = env
+    r = tc.post(f'/dragon/ddict/create/{sid}', json=body)
+    assert r.status_code == 400, r.text
+    assert backend.up == 0                  # never reached the Dragon thread
+    assert plugin.entries == {}
+
+
+def test_start_mode_rejects_multi_node_without_query(env):
+    plugin, backend, tc, sid = env
+    r = tc.post(f'/dragon/ddict/create/{sid}', json={'n_nodes': 2})
+    assert r.status_code == 400, r.text
+    assert 'node' in r.json()['detail']
+    assert backend.asked == 0               # no Dragon node query
+    assert plugin.entries == {} and backend._ddicts == {}
+
+
+def test_attach_n_nodes_checked_against_runtime_once():
+    _, backend, tc, sid = _mk('attach')
+    _create(tc, sid, n_nodes=4)
+    r = tc.post(f'/dragon/ddict/create/{sid}', json={'n_nodes': 5})
+    assert r.status_code == 400, r.text
+    assert backend.asked == 1               # cached per runtime
+
+
+def test_node_count_failure_skips_runtime_check():
+    _, backend, tc, sid = _mk('attach')
+    backend.nodes = RuntimeError('no machine info')
+    _create(tc, sid, n_nodes=8)             # MAX_NODES still holds
+
+
+def test_destroy_unknown_to_backend_drops_entry(env):
+    plugin, backend, tc, sid = env
+    did = _create(tc, sid)['id']
+    del backend._ddicts[did]                # gone behind the entry
+    r = tc.post(f'/dragon/ddict/destroy/{sid}', json={'id': did})
+    assert r.status_code == 404
+    assert did not in plugin.entries        # not left 'failed'
+
+
 # ── request validation and lookup ───────────────────────────────────────────
 
 def test_unknown_ddict_404(env):
@@ -511,6 +564,17 @@ def test_partial_put_reports_progress():
         await backend.put('d', {'a': 1, 'b': 2, 'c': 3})
     with pytest.raises(RuntimeError, match="after 2 of 3 items"):
         asyncio.run(_run())
+
+
+@pytest.mark.parametrize('raw', ['aGk=', 5])
+def test_get_b64_shaped_native_value_is_error(env, raw):
+    _, backend, tc, sid = env
+    did = _create(tc, sid)['id']
+    backend._ddicts[did]['k'] = {'$b64': raw}       # written in-runtime
+    r = tc.post(f'/dragon/ddict/get/{sid}', json={'id': did, 'keys': ['k']})
+    assert r.status_code == 200
+    assert r.json()['items'] == {}
+    assert 'reserved' in r.json()['errors']['k']
 
 
 # ── reply limits ────────────────────────────────────────────────────────────
@@ -701,6 +765,61 @@ def test_close_sync_unused_backend_starts_no_thread():
     assert not backend._pool.started
 
 
+def test_second_default_instance_refused_until_shutdown(monkeypatch):
+    import radical.orbit.plugin_dragon as pd
+    monkeypatch.setattr(pd, '_default_owner', None)
+    first = PluginDragon(FastAPI())
+    with pytest.raises(RuntimeError, match='already runs'):
+        PluginDragon(FastAPI())
+    PluginDragon(FastAPI(), backend=_FakeBackend())    # injected: allowed
+    asyncio.run(first.shutdown())
+    again = PluginDragon(FastAPI())
+    asyncio.run(again.shutdown())
+
+
+def test_failed_runtime_release_closes_once(env, monkeypatch):
+    import atexit
+    plugin, backend, tc, sid = env
+    gone  = []
+    calls = []
+    monkeypatch.setattr(atexit, 'unregister', gone.append)
+    _create(tc, sid)
+
+    def _boom():
+        calls.append(1)
+        raise RuntimeError('stop failed')
+    backend._runtime_down = _boom
+    with pytest.raises(RuntimeError, match='stop failed'):
+        asyncio.run(plugin.on_host_stop())
+    assert backend.closed
+    assert gone == [backend.close_sync]
+    asyncio.run(plugin.shutdown())          # second release: a no-op
+    backend.close_sync()
+    assert calls == [1]
+
+
+def test_cancelled_on_host_stop_keeps_exit_fallback(env, monkeypatch):
+    import atexit
+    import time
+    plugin, backend, tc, sid = env
+    gone = []
+    monkeypatch.setattr(atexit, 'unregister', gone.append)
+    dd = backend._ddicts[_create(tc, sid)['id']]
+
+    async def _run():
+        block = asyncio.ensure_future(backend._call(time.sleep, 0.2))
+        task  = asyncio.ensure_future(plugin.on_host_stop())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await block
+    asyncio.run(_run())
+    assert gone == []                       # exit fallback still registered
+    backend.close_sync()
+    assert dd.destroyed and backend.down == 1
+
+
 # ── client ──────────────────────────────────────────────────────────────────
 
 class _Http:
@@ -798,3 +917,16 @@ def test_client_rejects_non_str_keys(client):
     with pytest.raises(TypeError, match='str'):
         dd[1] = 'x'
     assert dd.keys() == []
+
+
+def test_client_rejects_b64_shaped_value_whole_batch(client):
+    dd = client.ddict.create()
+    with pytest.raises(ValueError, match='reserved'):
+        dd.update({'ok': 1, 'bad': {'$b64': 'aGk='}})
+    assert dd.keys() == []                  # nothing sent
+
+
+def test_client_nested_b64_shape_roundtrips(client):
+    dd = client.ddict.create()
+    dd['k'] = {'a': {'$b64': 'aGk='}}
+    assert dd['k'] == {'a': {'$b64': 'aGk='}}

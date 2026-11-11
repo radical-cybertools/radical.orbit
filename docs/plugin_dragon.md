@@ -60,7 +60,10 @@ Keys are strings (keys of other types written inside the runtime are
 counted by `len()` and reported as `n_other` by `keys`).  Values are
 JSON-serializable objects or `bytes` (top level only; bytes nested in a
 JSON value are not encoded); bytes travel as `{"$b64": "<base64>"}`,
-and a malformed marker is a 400.  A value written inside the runtime that
+and a malformed marker is a 400.  That shape is reserved: the client
+refuses to write a dict whose only key is `$b64`, and such a value written
+inside the runtime is reported per key in `errors` (nested ones are plain
+dicts).  A value written inside the runtime that
 is neither (e.g. a numpy array) is reported per key in `errors`.  A `get`
 reply above half the transport frame cap fails with 413: get fewer keys per
 call.
@@ -130,3 +133,22 @@ Notification topic `ddict_status` → `{id, name, state}` on create
 
 Single-node runtimes in containers; no per-user ownership (any client can
 destroy any DDict); no streaming, so values are bounded by the frame cap.
+Further known limits:
+
+- **No reclamation.** DDicts live until destroyed or until the endpoint
+  stops: no TTL, quota or per-creator cap.  `creator` is recorded only.
+- **Create bounds.** `managers_per_node <= 64`, `n_nodes <= 1024`,
+  `total_mem <= 64 GiB` per node.  A started runtime is single-node
+  (`n_nodes > 1` is a 400); an attached or enclosing runtime is asked for
+  its node count once.  If that query fails, only the static bounds hold;
+  a hanging one blocks the Dragon thread.
+- **One instance per process.** A second `dragon` plugin instance with the
+  default backend is refused until the first one is shut down.  Other
+  Dragon users in the same process (e.g. rhapsody's `dragon_v3` or its
+  Dragon data backend) run their calls on their own threads; whether they
+  collide with the plugin's thread (concurrent DDict calls hang in 0.15.0)
+  is not verified.
+- **`$PATH`.** When no `dragon` launcher is on `$PATH`, starting a runtime
+  prepends the interpreter's bin directory to `$PATH`, process-wide.
+- **Not exercised in unit tests.** The real runtime start, attach, stop and
+  detach, and the node-count query, need dragonhpc; the tests use fakes.

@@ -74,14 +74,30 @@ ID_PREFIX        = 'ddict.'           # DDict IDs; reserved for names
 MEM_RE           = re.compile(r'(\d+)\s*([KMGT]?)B?', re.IGNORECASE)
 MEM_UNITS        = {'': 1, 'K': 2**10, 'M': 2**20, 'G': 2**30, 'T': 2**40}
 
+# create bounds: a DDict() call blocks the one Dragon thread for everyone
+MAX_MANAGERS_PER_NODE = 64
+MAX_NODES             = 1024
+MAX_MEM_PER_NODE      = 2**36          # bytes (64 GiB), total_mem / n_nodes
+
 NATIVE           = 'native'            # _rt: running inside a runtime
 
-# bytes values travel as ``{B64_KEY: "<base64>"}``; everything else as JSON
+# bytes values travel as ``{B64_KEY: "<base64>"}``; everything else as JSON.
+# A top-level single-key ``{B64_KEY: ...}`` dict is reserved for that: it
+# cannot be stored as a dict through ORBIT (nested ones can).
 B64_KEY          = '$b64'
+
+# a module-wide guard: one PluginDragon with the default backend (and so one
+# Dragon thread) per process, see PluginDragon.__init__
+_default_owner   = None
 
 
 # ------------------------------------------------------------------------
 #
+def is_b64_marker(value: Any) -> bool:
+    """Whether *value* has the reserved bytes-marker shape."""
+    return isinstance(value, dict) and len(value) == 1 and B64_KEY in value
+
+
 def encode_value(value: Any) -> Any:
     """Wire form of a DDict value: bytes as a base64 marker, else as is."""
     if isinstance(value, (bytes, bytearray)):
@@ -92,7 +108,7 @@ def encode_value(value: Any) -> Any:
 def decode_value(value: Any) -> Any:
     """Inverse of :func:`encode_value`.  A malformed marker raises
     ``ValueError``."""
-    if isinstance(value, dict) and len(value) == 1 and B64_KEY in value:
+    if is_b64_marker(value):
         data = value[B64_KEY]
         if not isinstance(data, str):
             raise ValueError(f"{B64_KEY}: expected a base64 string")
@@ -222,16 +238,29 @@ class DDictBackend:
     keeps the endpoint's loops free.  The runtime is started or attached on
     first use, so loading the plugin costs nothing.
 
+    The thread is per backend: :class:`PluginDragon` allows one default
+    backend per process.  Other Dragon users in the same process (e.g.
+    ``plugin_rhapsody``'s Dragon backends) run their calls on their own
+    threads; whether those collide with this one is not verified.
+
     Subclasses (tests, later the Dragon services API server) override
-    :meth:`_runtime_up`, :meth:`_runtime_down` and :meth:`_new_ddict`.
+    :meth:`_runtime_up`, :meth:`_runtime_down`, :meth:`_node_count` and
+    :meth:`_new_ddict`.
     """
 
     def __init__(self, mode: str):
         self._mode    = mode
         self._pool    = DragonThread()
         self._rt      = None
+        self._nodes   = None                # runtime node count, cached
         self._closed  = False
         self._ddicts: Dict[str, Any] = {}
+
+    @property
+    def closed(self) -> bool:
+        """True once a close ran (also when it failed); False after a
+        cancelled close, which :meth:`close_sync` completes at exit."""
+        return self._closed
 
     async def _call(self, fn, *args, **kwargs) -> Any:
         if self._pool.down:
@@ -259,7 +288,9 @@ class DDictBackend:
             return
 
         # the runtime is spawned through the `dragon` launcher, which sits
-        # next to the interpreter when the venv is not activated
+        # next to the interpreter when the venv is not activated.  Dragon
+        # finds it on $PATH only, so this changes $PATH process-wide: only
+        # when no `dragon` is on it, and only by the interpreter's bindir.
         if not shutil.which('dragon'):
             bindir = os.path.dirname(sys.executable)
             if os.path.exists(os.path.join(bindir, 'dragon')):
@@ -281,7 +312,33 @@ class DDictBackend:
         if   self._rt is NATIVE   : pass         # not ours to stop
         elif self._mode == 'start': self._rt.stop()
         else                    : self._rt.detach()
-        self._rt = None
+        self._rt    = None
+        self._nodes = None
+
+    def _node_count(self) -> int:
+        """Nodes of an attached or enclosing (native) runtime."""
+        from dragon.native.machine import System
+        return System().nnodes
+
+    def _check_nodes(self, n_nodes: int) -> None:
+        """400 when *n_nodes* exceeds the runtime: a started runtime is
+        single-node; otherwise ask Dragon once per runtime.  A failing
+        query skips the check (``MAX_NODES`` still holds); a hanging one
+        is bounded only by the caller's timeout."""
+        if self._mode == 'start' and self._rt is not NATIVE:
+            limit = 1
+        else:
+            if self._nodes is None:
+                try:
+                    self._nodes = int(self._node_count())
+                except Exception as e:
+                    log.warning("[dragon] node count unknown: %s", e)
+                    self._nodes = 0
+            limit = self._nodes
+        if limit and n_nodes > limit:
+            raise HTTPException(status_code=400,
+                                detail=f"n_nodes={n_nodes} exceeds the "
+                                       f"runtime's {limit} node(s)")
 
     def _new_ddict(self, managers_per_node: int, n_nodes: int,
                    total_mem: int) -> Any:
@@ -297,13 +354,16 @@ class DDictBackend:
         try:
             return self._ddicts[did]
         except KeyError:
-            raise FileNotFoundError(f"unknown ddict: {did}") from None
+            # e.g. destroyed while the call waited for the Dragon thread
+            raise http_exception(FileNotFoundError(
+                f"unknown ddict: {did}")) from None
 
     async def create(self, did: str, managers_per_node: int, n_nodes: int,
                      total_mem: int) -> str:
         """Create a DDict under *did*; returns its serialized descriptor."""
         def _create():
             self._runtime_up()
+            self._check_nodes(n_nodes)
             dd = self._new_ddict(managers_per_node, n_nodes, total_mem)
             self._ddicts[did] = dd
             return dd.serialize()
@@ -387,14 +447,22 @@ class DDictBackend:
         await self._call(lambda: self._ddict(did).clear())
 
     def _close(self) -> None:
-        for did, dd in list(self._ddicts.items()):
-            try:
-                dd.destroy()
-            except Exception as e:
-                log.warning("[dragon] destroy %s failed: %s", did, e)
-        self._ddicts.clear()
-        self._runtime_down()
-        self._closed = True
+        # closed also when the runtime release fails: a retry would not do
+        # better, and a half-closed state confused every later close
+        try:
+            for did, dd in list(self._ddicts.items()):
+                try:
+                    dd.destroy()
+                except Exception as e:
+                    log.warning("[dragon] destroy %s failed: %s", did, e)
+            self._ddicts.clear()
+            self._runtime_down()
+        except Exception as e:
+            log.warning("[dragon] runtime release failed, it may be left "
+                        "behind: %s", e)
+            raise
+        finally:
+            self._closed = True
 
     async def close(self) -> None:
         """Destroy every DDict, then stop or detach the runtime.  When the
@@ -435,18 +503,6 @@ class DDictBackend:
             self._pool.shutdown(wait=False)
 
 
-def _not_found_404(method):
-    """A DDict destroyed while the call waited for the Dragon thread is a
-    404, not a 500 (``Plugin._forward`` maps unknown exceptions to 500)."""
-    @functools.wraps(method)
-    async def _wrapped(*args, **kwargs):
-        try:
-            return await method(*args, **kwargs)
-        except FileNotFoundError as e:
-            raise http_exception(e) from e
-    return _wrapped
-
-
 # ------------------------------------------------------------------------
 #
 class DragonSession(PluginSession):
@@ -462,7 +518,6 @@ class DragonSession(PluginSession):
     def _p(self) -> "PluginDragon":
         return self._plugin
 
-    @_not_found_404
     async def create(self, name: Optional[str], managers_per_node: int,
                      n_nodes: int, total_mem: int,
                      creator: Optional[str]) -> dict:
@@ -476,18 +531,15 @@ class DragonSession(PluginSession):
         self._p.check_reply(len(json.dumps(ddicts)), 'too many ddicts')
         return {"ddicts": ddicts}
 
-    @_not_found_404
     async def info(self, did: str) -> dict:
         self._check_active()
         entry = self._p.entry(did)
         return dict(entry, n_keys=await self._p.backend.length(did))
 
-    @_not_found_404
     async def destroy(self, did: str) -> dict:
         self._check_active()
         return await self._p.ddict_destroy(did)
 
-    @_not_found_404
     async def put(self, did: str, items: Dict[str, Any]) -> dict:
         self._check_active()
         self._p.entry(did)
@@ -497,7 +549,6 @@ class DragonSession(PluginSession):
             raise http_exception(e) from e
         return {"n": await self._p.backend.put(did, items)}
 
-    @_not_found_404
     async def get(self, did: str, keys: List[str],
                   values: bool = True) -> dict:
         self._check_active()
@@ -512,6 +563,13 @@ class DragonSession(PluginSession):
         # sizes as escaped JSON (ensure_ascii): an upper bound of the reply
         size = len(json.dumps(missing))
         for k, v in found.items():
+            if is_b64_marker(v):
+                # written in-runtime: would read back as bytes
+                errors[k] = f"value has the reserved {{{B64_KEY!r}: ...}} " \
+                            f"shape"
+                size += len(json.dumps(errors[k])) + len(json.dumps(k)) + 4
+                self._p.check_reply(size, hint)
+                continue
             v = encode_value(v)
             try:
                 # strict JSON: the reply renderer rejects NaN / inf
@@ -526,7 +584,6 @@ class DragonSession(PluginSession):
         self._p.check_reply(size, hint)     # also when nothing was found
         return {"items": items, "missing": missing, "errors": errors}
 
-    @_not_found_404
     async def keys(self, did: str) -> dict:
         self._check_active()
         self._p.entry(did)
@@ -537,14 +594,12 @@ class DragonSession(PluginSession):
         # keys written in-runtime may be of any type; the handle uses str
         return {"keys": strs, "n_other": len(keys) - len(strs)}
 
-    @_not_found_404
     async def pop(self, did: str, keys: List[str]) -> dict:
         self._check_active()
         self._p.entry(did)
         missing = await self._p.backend.pop(did, keys)
         return {"n": len(keys) - len(missing), "missing": missing}
 
-    @_not_found_404
     async def clear(self, did: str) -> dict:
         self._check_active()
         self._p.entry(did)
@@ -600,6 +655,11 @@ class DDictHandle:
         if bad:
             # JSON would turn them into str keys the reads cannot match
             raise TypeError(f"ddict keys must be str, got {bad[0]!r}")
+        bad = [k for k, v in items.items() if is_b64_marker(v)]
+        if bad:
+            # the wire form of bytes: it would read back as bytes
+            raise ValueError(f"{bad[0]!r}: a dict with the single key "
+                             f"{B64_KEY!r} is reserved for bytes")
         self._client._call('POST', 'ddict/put/{sid}', id=self.id,
                            items={k: encode_value(v)
                                   for k, v in items.items()})
@@ -734,9 +794,18 @@ class PluginDragon(Plugin):
 
     def __init__(self, app: FastAPI, instance_name: str = 'dragon',
                  backend: Optional[DDictBackend] = None):
+        global _default_owner               # pylint: disable=global-statement
+        # one default backend per process: each has its own Dragon thread,
+        # and concurrent Dragon calls from several threads hang (0.15.0)
+        if backend is None and _default_owner is not None:
+            raise RuntimeError("a dragon plugin instance already runs in "
+                               "this process")
         super().__init__(app, instance_name)
 
-        self.backend     = backend or DDictBackend(runtime_mode())
+        if backend is None:
+            backend        = DDictBackend(runtime_mode())
+            _default_owner = self
+        self.backend     = backend
         self.entries: Dict[str, dict] = {}
         self.reply_limit = resolve_frame_cap(app) // 2
 
@@ -820,26 +889,32 @@ class PluginDragon(Plugin):
             raise http_exception(FileExistsError(
                 f"ddict {did} is {entry['state']}"))
         entry['state'] = 'destroying'
+
+        def _gone():
+            self.entries.pop(did, None)
+            self._dispatch_notify('ddict_status', {"id": did,
+                                                   "name": entry['name'],
+                                                   "state": "destroyed"})
         try:
             await self.backend.destroy(did)
         except asyncio.CancelledError:
             # the destroy may still run on the Dragon thread, or was
             # dropped from its queue: make sure it happens
-            self.entries.pop(did, None)
             self.backend.discard(did)
-            self._dispatch_notify('ddict_status', {"id": did,
-                                                   "name": entry['name'],
-                                                   "state": "destroyed"})
+            _gone()
+            raise
+        except HTTPException as e:
+            if e.status_code != 404:
+                entry['state'] = 'failed'
+                raise
+            _gone()                     # unknown to the backend: nothing left
             raise
         except BaseException:
             # may be partly torn down: not usable, destroy can be retried
             entry['state'] = 'failed'
             raise
-        self.entries.pop(did, None)
         log.info("[dragon] destroyed %s (%s)", did, entry['name'])
-        self._dispatch_notify('ddict_status', {"id": did,
-                                               "name": entry['name'],
-                                               "state": "destroyed"})
+        _gone()
         return {}
 
     # -- route handlers --------------------------------------------------------
@@ -860,11 +935,12 @@ class PluginDragon(Plugin):
         return body
 
     @staticmethod
-    def _pos_int(body: dict, field: str) -> int:
+    def _pos_int(body: dict, field: str, hi: int) -> int:
         val = body.get(field, 1)
-        if isinstance(val, bool) or not isinstance(val, int) or val < 1:
+        if isinstance(val, bool) or not isinstance(val, int) or \
+                not 1 <= val <= hi:
             raise http_exception(ValueError(f"{field!r} must be an integer "
-                                            f">= 1"))
+                                            f"in [1, {hi}]"))
         return val
 
     @staticmethod
@@ -889,12 +965,15 @@ class PluginDragon(Plugin):
             # attach() resolves IDs and names alike
             raise http_exception(ValueError(f"ddict names must not start "
                                             f"with {ID_PREFIX!r}"))
-        mpn = self._pos_int(body, 'managers_per_node')
-        nn  = self._pos_int(body, 'n_nodes')
+        mpn = self._pos_int(body, 'managers_per_node', MAX_MANAGERS_PER_NODE)
+        nn  = self._pos_int(body, 'n_nodes',           MAX_NODES)
         try:
             mem = parse_mem(body.get('total_mem', DEFAULT_MEM))
         except ValueError as e:
             raise http_exception(e) from e
+        if mem > nn * MAX_MEM_PER_NODE:
+            raise http_exception(ValueError(
+                f"'total_mem' exceeds {MAX_MEM_PER_NODE} bytes per node"))
         return await self._forward(sid, DragonSession.create, name=name,
                                    managers_per_node=mpn, n_nodes=nn,
                                    total_mem=mem,
@@ -960,9 +1039,16 @@ class PluginDragon(Plugin):
                                    DragonSession.clear, did=body['id'])
 
     async def _release(self) -> None:
+        global _default_owner               # pylint: disable=global-statement
         self.entries.clear()
-        await self.backend.close()
-        atexit.unregister(self.backend.close_sync)
+        try:
+            await self.backend.close()
+        finally:
+            # a cancelled close is not closed: keep the exit fallback
+            if self.backend.closed:
+                atexit.unregister(self.backend.close_sync)
+                if _default_owner is self:
+                    _default_owner = None
 
     async def on_host_stop(self) -> None:
         """The hosting runtime stops: destroy the DDicts, release the
