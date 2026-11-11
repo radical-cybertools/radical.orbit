@@ -3630,9 +3630,9 @@ async def test_resubmitted_uid_does_not_reuse_a_stale_future():
     first = _Task('task.x')                         # finished before watch
     session._tasks['task.x'] = first
     session._watch_batch([first])
-    await _ticks()
-    assert 'task.x' in session._finished and 'task.x' in mgr._task_futures
+    assert mgr._task_futures['task.x'].result() is first
 
+    # resubmitted before the first run's callback ran
     again = _Task('task.x', state='RUNNING')
     session._tasks['task.x'] = again
     session._watch_batch([again])
@@ -3646,6 +3646,51 @@ async def test_resubmitted_uid_does_not_reuse_a_stale_future():
     assert session._finished['task.x'][0] is again
     assert [t['state'] for f in _sent_frames(session) for t in f] \
         == ['DONE', 'DONE']
+
+
+@pytest.mark.asyncio
+async def test_early_finished_task_is_not_pinned_by_rhapsodys_future(
+        monkeypatch):
+    '''A task that finished before its watch attached leaves a resolved
+    future in rhapsody's state manager; once the task is notified that
+    future is dropped, so the released task is freed.'''
+    import gc
+    import weakref
+    import radical.orbit.plugin_rhapsody as pr
+
+    monkeypatch.setattr(pr, 'FINISHED_RETAIN_S', 0.0)
+    session, _ = _watched_session('test.early')
+    mgr = _RhStateManager()
+    session._rh_session._state_manager = mgr
+
+    early = _Task('task.e')
+    session._tasks['task.e'] = early
+    ref = weakref.ref(early)
+    session._watch_batch([early])
+    del early
+    await _ticks()
+    session._expire()
+    gc.collect()
+
+    assert mgr._task_futures == {}
+    assert ref() is None
+
+
+def test_client_poll_wait_fails_on_a_session_switch():
+    '''A poll wait does not record its old session's results into the
+    session the client switched to meanwhile.'''
+    client = _make_rhapsody_client()
+    client._submitted.add('task.a')
+
+    def _post(url, json=None):
+        assert 'sid-rh' in url
+        client._sid = 'sid-new'                 # another thread switched
+        return _resp([{'uid': 'task.a', 'state': 'DONE'}])
+
+    client._http.post = _post
+    with pytest.raises(RuntimeError, match='session changed'):
+        client.wait_tasks(['task.a'])
+    assert client._completed == {}
 
 
 @pytest.mark.asyncio

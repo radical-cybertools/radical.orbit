@@ -810,8 +810,17 @@ class RhapsodySession(PluginSession):
         uid = self._get_attr(t, 'uid')
         return str(uid) if uid else '?'
 
-    def _task_done(self, uid_str: str, t, _fut=None) -> None:
+    def _task_done(self, uid_str: str, t, fut=None) -> None:
         """Notify one finished task (a future done-callback)."""
+        # rhapsody never pops a future it created already resolved (a task
+        # that finished before its watch attached), and the future pins the
+        # task through its result: drop it here (private ``_task_futures``,
+        # as in _task_future; remove with the companion rhapsody fix).
+        mgr = getattr(self._rh_session, '_state_manager', None)
+        futs = getattr(mgr, '_task_futures', None)
+        if isinstance(futs, dict) and futs.get(uid_str) is fut:
+            futs.pop(uid_str)
+
         state     = self._get_attr(t, 'state')
         state_str = str(state) if state else 'UNKNOWN'
 
@@ -2054,27 +2063,31 @@ class RhapsodyClient(PluginClient):
                 self._cond.wait(remaining)
 
         if not has_sse:
-            return self._wait_tasks_poll(uids, timeout, got)
+            return self._wait_tasks_poll(uids, timeout, got, sid)
 
         return [got.get(uid, {"uid": uid, "state": "UNKNOWN"})
                 for uid in uids]
 
     def _wait_tasks_poll(self, uids: list[str],
                          timeout: float | None = None,
-                         got: dict | None = None) -> list[dict]:
+                         got: dict | None = None,
+                         sid: str | None = None) -> list[dict]:
         """Fallback wait via periodic polling (no SSE available).
 
         Like the SSE path, a terminal result is kept for this wait (and in
         the completion accumulator) as soon as a poll returns it, starting
         from *got* (results the accumulator already had), and polls ask
         only for the uids still outstanding — so a result the endpoint
-        releases meanwhile is not lost.  An outstanding uid the endpoint does not know (released, or
-        never there) raises ``ValueError`` instead of a short answer.
+        releases meanwhile is not lost.  An outstanding uid the endpoint
+        does not know (released, or never there) raises ``ValueError``
+        instead of a short answer.  The wait belongs to session *sid*
+        (default: the current one); a switch to another session fails it.
 
         Decodes encoded return values just like the SSE path, so a caller
         sees the same objects no matter which transport served the wait.
         """
-        url      = self._url(ROUTE_WAIT.format(sid=self.sid))
+        sid      = sid or self._sid
+        url      = self._url(ROUTE_WAIT.format(sid=sid))
         deadline = (time.time() + timeout) if timeout else None
         got   = dict(got or {})                 # terminal, kept for the wait
         last: dict[str, dict] = {}              # latest non-terminal answer
@@ -2100,6 +2113,11 @@ class RhapsodyClient(PluginClient):
                 if str(t.get('state', '')).upper() in TERMINAL_STATES:
                     got[uid] = t
                     with self._cond:            # as _on_task_done does
+                        if self._sid != sid:    # not into another session
+                            raise RuntimeError(
+                                f"wait_tasks: session changed from {sid} "
+                                f"to {self._sid}; its tasks are not "
+                                "tracked any more")
                         self._completed[uid] = t
                         self._arrived[uid]   = time.monotonic()
                         self._arrived.move_to_end(uid)
