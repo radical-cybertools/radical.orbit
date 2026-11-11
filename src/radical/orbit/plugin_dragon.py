@@ -281,8 +281,7 @@ class DDictBackend:
 
         # launched by the `dragon` launcher (the endpoint wrapper does that
         # when dragonhpc is installed): use the runtime we run in
-        import dragon
-        if dragon.in_dragon():
+        if self._in_dragon():
             self._rt = NATIVE
             log.info("[dragon] running inside a Dragon runtime")
             return
@@ -315,26 +314,40 @@ class DDictBackend:
         self._rt    = None
         self._nodes = None
 
+    def _in_dragon(self) -> bool:
+        """Whether this process runs inside a Dragon runtime (launched by
+        the ``dragon`` launcher)."""
+        import dragon
+        return dragon.in_dragon()
+
+    def _starts_single_node(self) -> bool:
+        """Whether DDicts land on a runtime this backend starts, which is
+        single-node; known before the start."""
+        if self._mode != 'start':
+            return False
+        if self._rt is None:
+            return not self._in_dragon()
+        return self._rt is not NATIVE
+
     def _node_count(self) -> int:
         """Nodes of an attached or enclosing (native) runtime."""
         from dragon.native.machine import System
         return System().nnodes
 
     def _check_nodes(self, n_nodes: int) -> None:
-        """400 when *n_nodes* exceeds the runtime: a started runtime is
-        single-node; otherwise ask Dragon once per runtime.  A failing
-        query skips the check (``MAX_NODES`` still holds); a hanging one
-        is bounded only by the caller's timeout."""
-        if self._mode == 'start' and self._rt is not NATIVE:
-            limit = 1
-        else:
-            if self._nodes is None:
-                try:
-                    self._nodes = int(self._node_count())
-                except Exception as e:
-                    log.warning("[dragon] node count unknown: %s", e)
-                    self._nodes = 0
-            limit = self._nodes
+        """400 when *n_nodes* exceeds an attached or enclosing runtime:
+        Dragon is asked once per runtime.  A failing query skips the check
+        (``MAX_NODES`` still holds); a hanging one is bounded only by the
+        caller's timeout."""
+        if self._starts_single_node():
+            return                          # checked before the start
+        if self._nodes is None:
+            try:
+                self._nodes = int(self._node_count())
+            except Exception as e:
+                log.warning("[dragon] node count unknown: %s", e)
+                self._nodes = 0
+        limit = self._nodes
         if limit and n_nodes > limit:
             raise HTTPException(status_code=400,
                                 detail=f"n_nodes={n_nodes} exceeds the "
@@ -362,6 +375,11 @@ class DDictBackend:
                      total_mem: int) -> str:
         """Create a DDict under *did*; returns its serialized descriptor."""
         def _create():
+            if n_nodes > 1 and self._starts_single_node():
+                # before the start: a bad request launches no runtime
+                raise HTTPException(status_code=400,
+                                    detail=f"n_nodes={n_nodes}: a started "
+                                           f"runtime is single-node")
             self._runtime_up()
             self._check_nodes(n_nodes)
             dd = self._new_ddict(managers_per_node, n_nodes, total_mem)
@@ -682,13 +700,9 @@ class DDictHandle:
         """``{items, missing, errors}`` for *keys*, values decoded."""
         r = self._client._call('POST', 'ddict/get/{sid}', id=self.id,
                                keys=list(keys))
-        items = {}
-        for k, v in r['items'].items():
-            try:
-                items[k] = decode_value(v)
-            except ValueError as e:     # malformed marker written in-runtime
-                r['errors'][k] = str(e)
-        r['items'] = items
+        # the server reports marker-shaped native values in 'errors': the
+        # items hold only values it encoded
+        r['items'] = {k: decode_value(v) for k, v in r['items'].items()}
         return r
 
     def __contains__(self, key: str) -> bool:
@@ -797,7 +811,9 @@ class PluginDragon(Plugin):
         global _default_owner               # pylint: disable=global-statement
         # one default backend per process: each has its own Dragon thread,
         # and concurrent Dragon calls from several threads hang (0.15.0)
-        if backend is None and _default_owner is not None:
+        # a close that outlived its caller's timeout still releases it
+        if backend is None and _default_owner is not None \
+                and not _default_owner.backend.closed:
             raise RuntimeError("a dragon plugin instance already runs in "
                                "this process")
         super().__init__(app, instance_name)

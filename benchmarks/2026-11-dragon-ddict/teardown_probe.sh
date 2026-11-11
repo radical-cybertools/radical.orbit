@@ -3,6 +3,7 @@
 # (none: someone else does) and record, for up to 60 s, py-spy dumps (with native frames) of the endpoint
 # at +2/+8/+16/+24/+40 s and the surviving process list every second.
 PS=${PYSPY:-$(command -v py-spy)}
+[ -x "$PS" ] || { echo "teardown_probe.sh: py-spy not found, set PYSPY" >&2; exit 1; }
 pid=$1 out=$2 sig=${3:-TERM}; mkdir -p $out
 t0=$(date +%s.%N); [ $sig = none ] || kill -$sig $pid
 echo "probe start $t0, sent ${sig} to $pid" > $out/events.txt

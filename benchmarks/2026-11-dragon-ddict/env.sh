@@ -4,7 +4,11 @@
 # also ve310/ with py-spy) and the broker cert/key (tls/); radical.orbit
 # comes from the tree this script is in.
 module load cray-python/3.12.12 >/dev/null 2>&1
-OV=${DRAGON_BENCH_ROOT:-${PSCRATCH:?set DRAGON_BENCH_ROOT}/dragon-bench}
+if [ -z "${DRAGON_BENCH_ROOT:-}" ] && [ -z "${PSCRATCH:-}" ]; then
+    echo "env.sh: set DRAGON_BENCH_ROOT" >&2
+    return 1 2>/dev/null || exit 1
+fi
+OV=${DRAGON_BENCH_ROOT:-$PSCRATCH/dragon-bench}
 export BENCH=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 export ORBIT_SRC=$(cd "$BENCH/../.." && pwd)
 source $OV/ve/bin/activate                     # dragonhpc 0.15.0, matplotlib

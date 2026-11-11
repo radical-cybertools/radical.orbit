@@ -6,7 +6,7 @@ import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
-from radical.orbit.plugin_dragon import (PluginDragon, DDictBackend,
+from radical.orbit.plugin_dragon import (NATIVE, PluginDragon, DDictBackend,
                                          DDictHandle, DragonClient,
                                          encode_value, decode_value,
                                          parse_mem, runtime_mode)
@@ -38,10 +38,14 @@ class _FakeBackend(DDictBackend):
         self.fail   = None
         self.nodes  = 4                 # runtime size seen by attach mode
         self.asked  = 0
+        self.native = False             # under the dragon launcher
+
+    def _in_dragon(self):
+        return self.native
 
     def _runtime_up(self):
         if self._rt is None:
-            self._rt  = object()
+            self._rt  = NATIVE if self.native else object()
             self.up  += 1
 
     def _runtime_down(self):
@@ -378,7 +382,17 @@ def test_start_mode_rejects_multi_node_without_query(env):
     assert r.status_code == 400, r.text
     assert 'node' in r.json()['detail']
     assert backend.asked == 0               # no Dragon node query
+    assert backend.up    == 0               # no runtime started for it
     assert plugin.entries == {} and backend._ddicts == {}
+
+
+def test_start_mode_under_launcher_uses_runtime_nodes(env):
+    _, backend, tc, sid = env
+    backend.native = True                   # enclosing multi-node runtime
+    _create(tc, sid, n_nodes=4)
+    r = tc.post(f'/dragon/ddict/create/{sid}', json={'n_nodes': 5})
+    assert r.status_code == 400, r.text
+    assert backend.asked == 1
 
 
 def test_attach_n_nodes_checked_against_runtime_once():
@@ -775,6 +789,23 @@ def test_second_default_instance_refused_until_shutdown(monkeypatch):
     asyncio.run(first.shutdown())
     again = PluginDragon(FastAPI())
     asyncio.run(again.shutdown())
+
+
+def test_guard_released_by_close_outliving_its_timeout(monkeypatch):
+    import time
+    import radical.orbit.plugin_dragon as pd
+    monkeypatch.setattr(pd, '_default_owner', None)
+    first = PluginDragon(FastAPI())
+    first.backend._runtime_down = lambda: time.sleep(0.3)
+
+    async def _run():                       # like Runtime._work_teardown
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(first.on_host_stop(), 0.1)
+    asyncio.run(_run())
+    assert first.backend._pool.join(2)      # the close ran to its end
+    assert first.backend.closed
+    second = PluginDragon(FastAPI())        # not refused
+    asyncio.run(second.shutdown())
 
 
 def test_failed_runtime_release_closes_once(env, monkeypatch):

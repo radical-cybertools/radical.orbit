@@ -495,7 +495,8 @@ cd benchmarks/2026-11-dragon-ddict
 # $DRAGON_BENCH_ROOT (default $PSCRATCH/dragon-bench): ve/ (dragonhpc 0.15.0,
 # matplotlib), ve310/ (py-spy), tls/broker_{cert,key}.pem; see env.sh.
 # Then a token, never ~/.radical/orbit:
-export RUNS=/pscratch/sd/$USER/dragon-bench; mkdir -p $RUNS
+export RUNS=${DRAGON_BENCH_ROOT:-$PSCRATCH/dragon-bench}/runs/dragon-bench   # env.sh default
+mkdir -p $RUNS
 (umask 077; python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > $RUNS/token)
 
 salloc -N 4 -C cpu -q interactive -t 02:00:00 -A <account> --no-shell
