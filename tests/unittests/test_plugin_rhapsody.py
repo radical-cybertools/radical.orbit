@@ -1436,7 +1436,7 @@ def test_rhapsody_client_wait_tasks():
 
 
 def test_rhapsody_client_wait_tasks_with_timeout():
-    client = _make_rhapsody_client([])
+    client = _make_rhapsody_client([{"uid": "t.001", "state": "DONE"}])
     client._submitted.add("t.001")
     client.wait_tasks(["t.001"], timeout=30.0)
     mock_call = client._http.post.call_args
@@ -1949,16 +1949,14 @@ async def _ticks(n=3):
 
 @pytest.mark.asyncio
 async def test_window_zero_coalesces_completions_of_one_tick():
-    '''With window 0, completions drained in one watcher pass go out in one
+    '''With window 0, completions of one loop pass go out in one
     batch frame; a lone completion still flushes without a timer, on the
     next loop iteration.'''
     session, futs = _watched_session('test.nw0.tick')
     tasks   = [_done_task(f'task.c{i:03d}', i) for i in range(20)]
-    watcher = asyncio.ensure_future(session._watch_batch(tasks))
-    await _ticks(1)
+    session._watch_batch(tasks)
     for fut in futs.values():
         fut.set_result(None)
-    await asyncio.wait_for(watcher, 5)
     await _ticks()
 
     frames = _sent_frames(session)
@@ -3585,3 +3583,390 @@ def test_same_sid_reconnect_keeps_own_callbacks_a_switch_moves_them():
     assert _scopes(rt, client._on_task_done) == {
         'task_status': ['sid-c'], 'task_status_batch': ['sid-c'],
         'session_status': []}
+
+
+# ---------------------------------------------------------------------------
+# Finished tasks are released: a long-lived session stays bounded
+# ---------------------------------------------------------------------------
+
+class _RhStateManager:
+    '''rhapsody's (0.7.0) wait-future bookkeeping: one future per uid,
+    popped and resolved with the task itself when the task finishes; a
+    future created for a task already terminal is resolved at once and
+    never popped.'''
+
+    def __init__(self):
+        self._task_futures = {}
+
+    def get_wait_future(self, uid, task):
+        if uid not in self._task_futures:
+            fut = asyncio.get_running_loop().create_future()
+            self._task_futures[uid] = fut
+            if task.state in ('DONE', 'FAILED', 'CANCELED'):
+                fut.set_result(task)
+        return self._task_futures[uid]
+
+    def finish(self, task):
+        task.state = 'DONE'
+        fut = self._task_futures.pop(task.uid, None)
+        if fut is not None and not fut.done():
+            fut.set_result(task)
+
+
+class _Task:
+    '''A weakref-able task.'''
+
+    def __init__(self, uid, state='DONE'):
+        self.uid, self.state = uid, state
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+
+    def to_dict(self):
+        return {'uid': self.uid, 'state': self.state, 'return_value': 1}
+
+
+@pytest.mark.asyncio
+async def test_finished_tasks_are_released_after_the_retention(monkeypatch):
+    '''Notified terminal tasks leave the running map at once and the finished
+    map after FINISHED_RETAIN_S; state dedup entries go with them.'''
+    import radical.orbit.plugin_rhapsody as pr
+
+    session, futs = _watched_session('test.release')
+    tasks = [_done_task(f'task.r{i:04d}', i) for i in range(500)]
+    for t in tasks:
+        session._tasks[t.uid] = t
+        session._on_task_state_change(t, 'RUNNING')
+    assert len(session._notified_states) == 500
+
+    session._watch_batch(tasks)
+    for fut in futs.values():
+        fut.set_result(None)
+    await _ticks()
+
+    assert session._tasks == {}
+    assert session._notified_states == {}
+    assert len(session._finished) == 500
+    assert session.is_busy() is False
+    session._check_initialized = lambda: None
+    assert (await session.get_task('task.r0000'))['uid'] == 'task.r0000'
+
+    # a finished task is not cancelled on the backend again
+    backend = MagicMock(cancel_task=AsyncMock())
+    session._rh_session.backends = {'b': backend}
+    tasks[0].get = lambda key, default=None: 'b' if key == 'backend' else default
+    await session._cancel_one('task.r0000')
+    backend.cancel_task.assert_not_called()
+
+    # a reused uid moves to the back: it does not shield older entries
+    session._tasks['task.r0000'] = tasks[0]
+    session._release('task.r0000', tasks[0])
+    assert next(reversed(session._finished)) == 'task.r0000'
+
+    # the first run of a resubmitted uid does not release the second
+    again = _done_task('task.r0001', 0)
+    session._tasks['task.r0001'] = again
+    session._release('task.r0001', tasks[1])
+    assert session._tasks['task.r0001'] is again
+
+    monkeypatch.setattr(pr, 'FINISHED_RETAIN_S', 0.0)
+    session._expire()
+    assert len(session._finished) == 0
+    with pytest.raises(HTTPException) as e:
+        await session.get_task('task.r0000')
+    assert e.value.status_code == 404 and 'kept for' in e.value.detail
+
+
+@pytest.mark.asyncio
+async def test_watch_batch_frees_finished_tasks_while_a_straggler_runs(
+        monkeypatch):
+    '''100 tasks finishing in one wakeup are freed past the retention while
+    a straggler of the same batch still runs: neither the watcher nor the
+    futures rhapsody resolved with them keep them alive.'''
+    import gc
+    import weakref
+    import radical.orbit.plugin_rhapsody as pr
+
+    monkeypatch.setattr(pr, 'FINISHED_RETAIN_S', 0.0)
+    session, _ = _watched_session('test.straggler')
+    mgr = _RhStateManager()
+    session._rh_session._state_manager = mgr
+
+    tasks     = [_Task(f'task.s{i:03d}') for i in range(100)]
+    straggler = _Task('task.slow', state='RUNNING')
+    for t in tasks + [straggler]:
+        session._tasks[t.uid] = t
+    refs = [weakref.ref(t) for t in tasks]
+
+    session._watch_batch(tasks + [straggler])
+    for t in tasks:                       # all in one wakeup
+        mgr.finish(t)
+    del t, tasks
+    await _ticks()
+    session._expire()
+    gc.collect()
+
+    assert not mgr._task_futures['task.slow'].done()  # still running
+    assert sum(r() is not None for r in refs) == 0
+    assert list(session._tasks) == ['task.slow']
+
+
+@pytest.mark.asyncio
+async def test_resubmitted_uid_does_not_reuse_a_stale_future():
+    '''A task that finished before its watch attached leaves a resolved
+    future in rhapsody's state manager; a resubmit of its uid must not
+    attach to it, or the new run is never notified terminal.'''
+    session, _ = _watched_session('test.stale')
+    mgr = _RhStateManager()
+    session._rh_session._state_manager = mgr
+
+    first = _Task('task.x')                         # finished before watch
+    session._tasks['task.x'] = first
+    session._watch_batch([first])
+    assert mgr._task_futures['task.x'].result() is first
+
+    # resubmitted before the first run's callback ran
+    again = _Task('task.x', state='RUNNING')
+    session._tasks['task.x'] = again
+    session._watch_batch([again])
+    await _ticks()
+    assert session._tasks['task.x'] is again        # not released early
+    assert not any('error' in t for f in _sent_frames(session) for t in f)
+
+    mgr.finish(again)
+    await _ticks()
+    assert 'task.x' not in session._tasks
+    assert session._finished['task.x'][0] is again
+    assert [t['state'] for f in _sent_frames(session) for t in f] \
+        == ['DONE', 'DONE']
+
+
+@pytest.mark.asyncio
+async def test_early_finished_task_is_not_pinned_by_rhapsodys_future(
+        monkeypatch):
+    '''A task that finished before its watch attached leaves a resolved
+    future in rhapsody's state manager; once the task is notified that
+    future is dropped, so the released task is freed.'''
+    import gc
+    import weakref
+    import radical.orbit.plugin_rhapsody as pr
+
+    monkeypatch.setattr(pr, 'FINISHED_RETAIN_S', 0.0)
+    session, _ = _watched_session('test.early')
+    mgr = _RhStateManager()
+    session._rh_session._state_manager = mgr
+
+    early = _Task('task.e')
+    session._tasks['task.e'] = early
+    ref = weakref.ref(early)
+    session._watch_batch([early])
+    del early
+    await _ticks()
+    session._expire()
+    gc.collect()
+
+    assert mgr._task_futures == {}
+    assert ref() is None
+
+
+def test_client_poll_wait_fails_on_a_session_switch():
+    '''A poll wait does not record its old session's results into the
+    session the client switched to meanwhile.'''
+    client = _make_rhapsody_client()
+    client._submitted.add('task.a')
+
+    def _post(url, json=None):
+        assert 'sid-rh' in url
+        client._sid = 'sid-new'                 # another thread switched
+        return _resp([{'uid': 'task.a', 'state': 'DONE'}])
+
+    client._http.post = _post
+    with pytest.raises(RuntimeError, match='session changed'):
+        client.wait_tasks(['task.a'])
+    assert client._completed == {}
+
+
+@pytest.mark.asyncio
+async def test_finished_task_expires_without_further_completions():
+    '''An idle session honours the window too: a lookup expires.'''
+    import radical.orbit.plugin_rhapsody as pr
+
+    session = RhapsodySession('test.idle')
+    session._check_initialized = lambda: None
+    session._finished['task.old'] = (
+        _done_task('task.old', 1),
+        time.monotonic() - pr.FINISHED_RETAIN_S - 1)
+
+    with pytest.raises(HTTPException) as e:
+        await session.get_task('task.old')
+    assert e.value.status_code == 404
+    assert (await session.list_tasks()) == {'tasks': []}
+
+
+def test_late_running_callback_after_release_records_nothing():
+    '''A RUNNING callback for a task already released adds no dedup entry;
+    a resubmitted uid (another task object) still notifies.'''
+    session, _ = _watched_session('test.late')
+    old = _Task('task.l')
+    session._tasks['task.l'] = old
+    session._release('task.l', old)
+
+    session._on_task_state_change(old, 'RUNNING')
+    assert session._notified_states == {}
+
+    new = _Task('task.l', state='RUNNING')
+    session._tasks['task.l'] = new
+    session._on_task_state_change(new, 'RUNNING')
+    assert session._notified_states == {'task.l': 'RUNNING'}
+
+
+def _deliver(client, uid):
+    client._on_task_done(None, None, 'task_status',
+                         {'uid': uid, 'state': 'DONE', 'sid': 'sid-rh'})
+
+
+def _sse_client():
+    client = _make_rhapsody_client()
+    client._bc, client._endpoint_id, client._plugin_name = \
+        MagicMock(), 'ep', 'rhapsody'
+    return client
+
+
+def test_client_completions_expire():
+    '''Completions older than FINISHED_RETAIN_S are dropped, oldest first;
+    a later wait on one fails instead of blocking.'''
+    import radical.orbit.plugin_rhapsody as pr
+
+    client = _sse_client()
+    client._submitted.update(['task.old', 'task.new'])
+    _deliver(client, 'task.old')
+    client._arrived['task.old'] = time.monotonic() - pr.FINISHED_RETAIN_S - 1
+    _deliver(client, 'task.new')
+
+    assert set(client._completed) == {'task.new'}
+    assert set(client._arrived) == {'task.new'}
+    assert client._submitted == set()                  # completed uids leave
+    with pytest.raises(ValueError, match='completed more than'):
+        client.wait_tasks(['task.old'])
+
+
+def test_client_wait_keeps_a_result_that_expires_while_another_is_outstanding():
+    '''A wait on [A, B] keeps A's result although A expires from the
+    accumulator while the wait still waits for B.'''
+    import radical.orbit.plugin_rhapsody as pr
+
+    client = _sse_client()
+    client._submitted.update(['task.a', 'task.b'])
+    _deliver(client, 'task.a')
+
+    entered = threading.Event()
+    real    = client._cond.wait
+
+    def _wait_once(timeout=None):             # signal the first block only
+        client._cond.wait = real
+        entered.set()
+        return real(timeout)
+
+    client._cond.wait = _wait_once
+    out = []
+    waiter = threading.Thread(
+        target=lambda: out.append(client.wait_tasks(['task.a', 'task.b'],
+                                                    timeout=10)))
+    waiter.start()
+    assert entered.wait(5)
+    with client._cond:
+        client._arrived['task.a'] = \
+            time.monotonic() - pr.FINISHED_RETAIN_S - 1
+    _deliver(client, 'task.b')                # expires A, completes B
+    waiter.join(5)
+
+    assert 'task.a' not in client._completed
+    assert [t['uid'] for t in out[0]] == ['task.a', 'task.b']
+    assert all(t['state'] == 'DONE' for t in out[0])
+
+
+def test_client_resubmitted_uid_waits_for_the_new_run():
+    '''Resubmitting a uid forgets its previous result.'''
+    client = _sse_client()
+    client._submitted.add('task.re')
+    _deliver(client, 'task.re')
+    assert 'task.re' in client._completed
+
+    client._http.post.return_value.json.return_value = \
+        [{'uid': 'task.re', 'state': 'NEW'}]
+    client.submit_tasks([{'uid': 'task.re', 'executable': '/bin/true'}])
+    assert 'task.re' not in client._completed
+    assert 'task.re' not in client._arrived
+    assert client.wait_tasks(['task.re'], timeout=0.05) == \
+        [{'uid': 'task.re', 'state': 'UNKNOWN'}]
+
+
+def _resp(body, status_code=200):
+    r = MagicMock(is_error=status_code >= 400, status_code=status_code,
+                  text=json.dumps(body))
+    r.json = MagicMock(return_value=body)
+    return r
+
+
+def test_client_poll_wait_keeps_early_results_and_raises_for_released():
+    '''Without SSE, a result is kept for the wait as soon as a poll returns
+    it and later polls ask only for outstanding uids, so a result the
+    endpoint released meanwhile is not lost; an outstanding uid the
+    endpoint does not know raises instead of a short answer.'''
+    client = _make_rhapsody_client()
+    client._submitted.update(['task.a', 'task.b'])
+    asked = []
+
+    def _post(url, json=None):
+        asked.append(list(json['uids']))
+        if len(asked) == 1:
+            return _resp([{'uid': 'task.a', 'state': 'DONE'},
+                          {'uid': 'task.b', 'state': 'RUNNING'}])
+        return _resp([{'uid': 'task.b', 'state': 'DONE'}])   # A released
+
+    client._http.post = _post
+    with patch('time.sleep'):
+        out = client.wait_tasks(['task.a', 'task.b'])
+    assert asked == [['task.a', 'task.b'], ['task.b']]
+    assert [(t['uid'], t['state']) for t in out] == \
+        [('task.a', 'DONE'), ('task.b', 'DONE')]
+
+    # completed uids leave _submitted, and a later wait is served from the
+    # accumulator without a poll
+    assert client._submitted == set()
+    assert client.wait_tasks(['task.a']) == out[:1] and len(asked) == 2
+
+    client._submitted.update(['task.c', 'task.d', 'task.e'])
+    client._http.post = lambda url, json=None: \
+        _resp([{'uid': 'task.c', 'state': 'DONE'}])
+    with pytest.raises(ValueError, match=r"not found.*task\.d"):
+        client.wait_tasks(['task.c', 'task.d'])
+
+    client._http.post = lambda url, json=None: \
+        _resp({'detail': 'none of the requested tasks found'}, 404)
+    with pytest.raises(ValueError, match='not found'):
+        client.wait_tasks(['task.d'])
+
+    client._http.post = lambda url, json=None: \
+        _resp({'detail': 'session gone'}, 404)    # not a task answer
+    with pytest.raises(RuntimeError, match='HTTP 404'):
+        client.wait_tasks(['task.e'])
+
+
+def test_pickle_cache_keeps_functions_only():
+    '''Per-task arguments differ, so caching them grows with every task.'''
+    import base64
+    import cloudpickle
+
+    def enc(obj):
+        return 'cloudpickle::' + base64.b64encode(
+            cloudpickle.dumps(obj)).decode('ascii')
+
+    session = RhapsodySession('test.pickle')
+    fn = enc(len)
+    for i in range(100):
+        td = session._deserialize_task(
+            {'function': fn, 'args': enc((i,)),
+             '_pickled_fields': ['function', 'args']})
+        assert td['args'] == (i,) and td['function'] is len
+    assert list(session._pickle_cache) == [fn[len('cloudpickle::'):]]
