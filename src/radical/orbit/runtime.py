@@ -94,7 +94,7 @@ _CALLBACK_QUEUE = 1024    # bounded depth of the user-callback dispatcher
 _CALL_TIMEOUT   = 600.0   # default consumer-call timeout (seconds)
 _RETRY_AFTER    = 1.0     # Retry-After on a 503 (seconds)
 _PING_INTERVAL  = 1.0     # websockets client keepalive cadence
-_PING_TIMEOUT   = 3.0     # websockets client keepalive answer deadline
+_PING_TIMEOUT   = utils.PING_TIMEOUT  # keepalive answer deadline (default)
 _BACKOFF_START  = 0.5     # (re)connect backoff floor (seconds)
 _BACKOFF_MAX    = 10.0    # (re)connect backoff ceiling (seconds)
 _BACKOFF_FACTOR = 1.5     # (re)connect backoff growth factor
@@ -140,7 +140,9 @@ class EndpointRuntime(PluginHostBase):
         tunnel:      ``'none'`` / ``'forward'`` / ``'reverse'`` (boolean is not
                      accepted).
         ping_interval: ``websockets`` client keepalive ping cadence (s).
-        ping_timeout: ``websockets`` client keepalive pong deadline (s).
+        ping_timeout: ``websockets`` client keepalive pong deadline (s);
+                      unset defers to ``$RADICAL_ORBIT_PING_TIMEOUT``, then
+                      ``utils.PING_TIMEOUT`` (3 s).
 
     The numeric backpressure/backoff/frame-cap tunables are module-level
     constants (``_REQUEST_CAP``, ``_BACKOFF_*`` …), not per-instance knobs; they
@@ -170,7 +172,7 @@ class EndpointRuntime(PluginHostBase):
                  embedded:    bool           = False,
                  app:         Optional[FastAPI] = None,
                  ping_interval:       float = _PING_INTERVAL,
-                 ping_timeout:        float = _PING_TIMEOUT,
+                 ping_timeout:        Optional[float] = None,
                  **tuning):
 
         if tunnel not in ('none', 'forward', 'reverse'):
@@ -249,7 +251,7 @@ class EndpointRuntime(PluginHostBase):
         self._call_timeout   = tuning.get('call_timeout',   _CALL_TIMEOUT)
         self._retry_after    = tuning.get('retry_after',    _RETRY_AFTER)
         self._ping_interval  = ping_interval
-        self._ping_timeout   = ping_timeout
+        self._ping_timeout   = utils.resolve_ping_timeout(ping_timeout)
         self._frame_cap      = tuning.get('frame_cap',      protocol.FRAME_CAP)
         # permessage-deflate: tuning > $RADICAL_ORBIT_WS_COMPRESSION > auto.
         self._ws_compression = utils.resolve_ws_compression(

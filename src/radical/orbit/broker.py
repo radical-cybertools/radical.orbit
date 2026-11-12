@@ -91,7 +91,9 @@ class BrokerTuning:
     timeouts (or mutate attributes) so no test has to sleep for real.
 
     * ``ping_interval`` / ``ping_timeout`` — uvicorn WS keepalive; a silent
-      socket is closed at ``ping_interval + ping_timeout``.
+      socket is closed at ``ping_interval + ping_timeout``.  ``ping_timeout``
+      ``None`` defers to ``$RADICAL_ORBIT_PING_TIMEOUT``, then 3 s (the same
+      variable sets the runtimes' deadline).
     * ``grace`` — the ``suspect`` → ``lost`` window.
     * ``call_cap`` — a cap on **broker-originated** in-flight calls (the only
       calls the broker itself waits on); overflow raises at the caller.
@@ -102,6 +104,12 @@ class BrokerTuning:
     * ``reap_interval`` — how often the reaper sweeps for expired calls.
     * ``event_queue`` — per-subscriber delivery-queue depth.
     * ``frame_cap`` — uvicorn ``ws_max_size`` / the protocol frame cap.
+    * ``topology_coalesce`` — the topology broadcast's coalescing window (s):
+      a change within this window of the last broadcast is folded into one
+      trailing broadcast of the then-current topology, so a burst of
+      registrations or drops sends one snapshot instead of one per change.
+      The first change after a quiet window is broadcast at once; ``0``
+      broadcasts every change.
     * ``ws_compression`` — accept WS permessage-deflate when a client offers
       it (uvicorn ``ws_per_message_deflate``); ``None`` defers to
       ``$RADICAL_ORBIT_WS_COMPRESSION``, unset means accept.  Only ``off``
@@ -109,7 +117,7 @@ class BrokerTuning:
     """
 
     ping_interval: float = 1.0
-    ping_timeout:  float = 3.0
+    ping_timeout:  Optional[float] = None
     grace:         float = 10.0
     call_cap:      int   = 1024
     forwarded_call_cap: int = 4096
@@ -117,6 +125,7 @@ class BrokerTuning:
     reap_interval: float = 5.0
     event_queue:   int   = 1024
     frame_cap:     int   = protocol.FRAME_CAP
+    topology_coalesce: float = 0.1
     ws_compression: Optional[Union[bool, str]] = None
 
 
@@ -286,13 +295,19 @@ class Broker:
         # ── Tunables (unpacked to attributes; tests may set them) ─────
         tuning = tuning or BrokerTuning()
         self._ping_interval = tuning.ping_interval
-        self._ping_timeout  = tuning.ping_timeout
+        self._ping_timeout  = utils.resolve_ping_timeout(tuning.ping_timeout)
         self._grace         = tuning.grace
         self._call_cap      = tuning.call_cap
         self._forwarded_call_cap = tuning.forwarded_call_cap
         self._call_timeout  = tuning.call_timeout
         self._reap_interval = tuning.reap_interval
         self._event_queue   = tuning.event_queue
+        self._topo_window   = tuning.topology_coalesce
+        # coalesced topology broadcasts: loop time of the last one, a change
+        # not broadcast yet, the task sending them (``None`` when idle)
+        self._topo_last: float = float('-inf')
+        self._topo_dirty = False
+        self._topo_task: Optional[asyncio.Task] = None
         self._frame_cap     = tuning.frame_cap
         self._ws_compression = utils.resolve_ws_compression(
             tuning.ws_compression, default='on') != 'off'
@@ -478,6 +493,9 @@ class Broker:
         self._started = False
         if self._reap_task:
             self._reap_task.cancel()
+        if self._topo_task is not None:
+            self._topo_task.cancel()
+            self._topo_task = None
         for name in list(self.registry):
             self._events.pause_sender(name)
         for name, ws in list(self.registry.items()):
@@ -812,7 +830,7 @@ class Broker:
                 if old is not ws:
                     spawn(self._close_quiet(old), 'broker_close_old')
                 # Broadcast reaches the resumed endpoint too (full topology).
-                await self._broadcast_topology()
+                await self._request_topology()
                 return True, name
 
             log.warning("[Broker] name-in-use (no/invalid resume_key): %s", name)
@@ -832,7 +850,7 @@ class Broker:
 
         await self._send(ws, self._ack(True, key))
         # Broadcast reaches the newcomer too — its full-topology snapshot.
-        await self._broadcast_topology()
+        await self._request_topology()
         return True, name
 
     def _ack(self, ok: bool, resume_key: str,
@@ -1056,7 +1074,7 @@ class Broker:
 
     def _spawn_topology_broadcast(self) -> None:
         """Schedule a full topology rebroadcast on the routing loop."""
-        spawn(self._broadcast_topology(), 'broker_host_topology')
+        spawn(self._request_topology(), 'broker_host_topology')
 
     # ── control ───────────────────────────────────────────────────────
 
@@ -1090,7 +1108,7 @@ class Broker:
         if ws is None:
             return
         self._remove_participant(target)
-        await self._broadcast_topology()
+        await self._request_topology()
         try:
             await self._send(ws, protocol.pack_message(
                 protocol.Control(src=BROKER_NAME, dst=target, op='terminate'),
@@ -1112,14 +1130,14 @@ class Broker:
         if clean:
             # A clean close skips suspect — immediate removal + broadcast.
             self._remove_participant(name)
-            await self._broadcast_topology()
+            await self._request_topology()
             return
 
         self._prof.prof('broker_suspect', uid=name)
         self._liveness[name] = 'suspect'
         # Pause event delivery on the dead socket; buffered events survive.
         self._events.pause_sender(name)
-        await self._broadcast_topology()
+        await self._request_topology()
         self._arm_grace(name, ws)
 
     def _arm_grace(self, name: str, ws) -> None:
@@ -1144,7 +1162,7 @@ class Broker:
         self._prof.prof('broker_lost', uid=name)
         self._remove_participant(name)
         await self._fail_inflight_for(name)
-        await self._broadcast_topology()
+        await self._request_topology()
 
     async def _fail_inflight_for(self, name: str) -> None:
         """Fast-fail every in-flight call touching *name*.
@@ -1234,6 +1252,38 @@ class Broker:
         topo = protocol.Topology(src=BROKER_NAME,
                                  participants=self._participants_for_topology())
         return protocol.pack_message(topo, cap=self._frame_cap)
+
+    async def _request_topology(self) -> None:
+        """Broadcast the topology after a change, coalesced.
+
+        At most one broadcast is pending or in flight at a time, and
+        broadcasts are at least ``topology_coalesce`` apart: a change made
+        while one is pending or being sent is carried by the next one, whose
+        snapshot is built when it is sent.  The first change after a quiet
+        window goes out at once.  Each broadcast costs one frame per
+        participant, and in-process participants decode it on the broker's
+        GIL, so one per change would make a burst of N registrations cost
+        O(N^2) and could stall the loop past the keepalive deadline."""
+        if self._topo_window <= 0:
+            await self._broadcast_topology()
+            return
+        self._topo_dirty = True
+        if self._topo_task is None:
+            self._topo_task = spawn(self._topology_sender(), 'broker_topology')
+            await asyncio.sleep(0)      # a quiet-window change goes out now
+
+    async def _topology_sender(self) -> None:
+        loop = asyncio.get_running_loop()
+        try:
+            while self._topo_dirty:
+                wait = self._topo_last + self._topo_window - loop.time()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                self._topo_dirty = False    # changes from here on: next round
+                self._topo_last = loop.time()
+                await self._broadcast_topology()
+        finally:
+            self._topo_task = None
 
     async def _broadcast_topology(self) -> None:
         packed = self._build_topology_msg()
