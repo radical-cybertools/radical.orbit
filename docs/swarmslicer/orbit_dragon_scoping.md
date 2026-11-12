@@ -1,7 +1,8 @@
 # Orbit-Dragon: scoping
 
 Part of the SwarmSlicer project.  RADICAL (Rutgers) with HPE.
-Date: 2026-10-30.  Audience: HPE (Andrew Shao, Maria Kalantzi).
+Date: 2026-10-30, updated 2026-11-12 (section 5).  Audience: HPE (Andrew
+Shao, Maria Kalantzi).
 
 ## 1. Goal
 
@@ -96,9 +97,11 @@ access to the services code, the plugin drives DDict directly through
 public `dragonhpc` 0.15.0; the API server replaces those calls behind the
 same routes.
 
-Status, 2026-11-03: works on a laptop in both runtime modes (attach to a
-running runtime, or start one); container image and compose setup for
-both deployment modes written.  Client API, close to native DDict:
+Status, 2026-11-12: works on a laptop and on Perlmutter (4 CPU nodes,
+dragonhpc 0.15.0), in all three runtime modes: inside a runtime started
+by the `dragon` launcher, attached to a running runtime, or starting one.
+Container image and compose setup for both deployment modes are written,
+not yet run.  Client API, close to native DDict:
 
 ```python
 dragon = rt.get_plugin('site', 'dragon')
@@ -109,8 +112,41 @@ dd.descriptor        # DDict.attach(descriptor) inside the runtime
 dd.destroy()
 ```
 
-Next for the POC: run it on a Kubernetes cluster, then propose the next
-meeting.
+First numbers on Perlmutter (2026-11-04/05; one run per point, so first
+estimates).  The client reaches the DDict through the broker and an
+endpoint inside the Dragon runtime, compared with native DDict access from
+inside the runtime:
+
+| | through ORBIT | native |
+|---|---|---|
+| put / get latency, 1 KiB, p50 | 1.5 / 1.4 ms | 0.34 / 0.25 ms |
+| put / get latency, 1 MiB, p50 | 16 / 18 ms | 0.45 / 0.41 ms |
+| gets/s, one endpoint, 1–4 node DDict | 3.0–3.5k | 5.9k–15.7k |
+| gets/s, one endpoint per node, 4 nodes | 15.6k | 15.7k |
+
+What we learned:
+
+- The ORBIT round trip costs about 1 ms; a small DDict op adds 0.5 ms.
+- WebSocket compression made large values 5–6× slower (base64 payloads
+  compress poorly).  It is now configurable per hop; the default `auto`
+  turns it on only for slow links (connect time above 10 ms), so it stays
+  off inside an allocation.
+- One endpoint is limited by its single Dragon thread (concurrent DDict
+  calls from several threads hang in dragonhpc 0.15.0), so its throughput
+  does not grow with DDict nodes.  One endpoint per node scales to native
+  throughput.
+- Broker on a login node or a compute node: same numbers within about 5%.
+  Perlmutter compute nodes reach the internet over HTTPS, so an external
+  broker works without a tunnel.
+- DDict puts can drop to about a third of their speed in a
+  history-dependent slow mode inside Dragon's DDict put path (time spent
+  in the manager's heap allocator), independent of ORBIT and of
+  concurrency.  We would like the Dragon team's view on it.
+- A clean stop needs SIGTERM to the endpoint only; signalling the `dragon`
+  launcher as well leaves DDict processes and `/dev/shm` pools behind.
+
+Next for the POC: run it on a Kubernetes cluster once one is chosen, then
+propose the next meeting.
 
 ## 6. Work split
 
@@ -159,3 +195,4 @@ first.
 3. Driving use cases: which services must work end to end first.
 4. A contact for the auth hook and the Slurm launch.
 5. Which HPE machines to target, with accounts.
+6. A look at the DDict put slow mode (section 5).
