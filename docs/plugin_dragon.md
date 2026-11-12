@@ -38,6 +38,8 @@ DDict calls from several threads hang in dragonhpc 0.15.0. A put of several
 keys is sent as one Dragon batch put (`start_batch_put` / `end_batch_put`),
 so the managers do not confirm each key; an error then shows only at the
 end, and an unknown subset of the batch may be stored.
+`RADICAL_ORBIT_DRAGON_BATCH_PUTS=0` turns that off (key by key, each
+confirmed), for comparisons with unbatched native writers.
 
 **Worker processes.** One thread caps an endpoint at about one DDict call
 per 0.4 ms. With `RADICAL_ORBIT_DRAGON_WORKERS=N` the endpoint instead

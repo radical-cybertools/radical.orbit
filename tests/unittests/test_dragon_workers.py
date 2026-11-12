@@ -296,3 +296,27 @@ def test_backend_worker_start_failure_is_503(monkeypatch):
                                                      'items': {'a': 1}})
     assert r.status_code == 503
     assert backend._workers is None
+
+
+def test_batch_puts_switch(monkeypatch):
+    monkeypatch.setenv(dw.ENV_BATCH_PUTS, '0')
+    assert not dw.batch_puts()
+    dd = _DDict()
+    assert dw.batch_put(dd, {'a': 1, 'b': 2}) == 2
+    assert dd == {'a': 1, 'b': 2} and dd.batches == 0
+    monkeypatch.setenv(dw.ENV_BATCH_PUTS, 'on')
+    assert dw.batch_puts()
+    monkeypatch.delenv(dw.ENV_BATCH_PUTS)
+    assert dw.batch_puts()
+
+
+def test_unbatched_put_reports_progress(monkeypatch):
+    monkeypatch.setenv(dw.ENV_BATCH_PUTS, '0')
+
+    class _Full(_DDict):
+        def __setitem__(self, k, v):
+            if len(self) >= 1:
+                raise RuntimeError('full')
+            super().__setitem__(k, v)
+    with pytest.raises(RuntimeError, match='after 1 of 2 items'):
+        dw.batch_put(_Full(), {'a': 1, 'b': 2})

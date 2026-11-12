@@ -46,6 +46,7 @@ log = logging.getLogger("radical.orbit")
 ENV_WORKERS      = 'RADICAL_ORBIT_DRAGON_WORKERS'
 ENV_WORKER_HOST  = 'RADICAL_ORBIT_DRAGON_WORKER_HOST'
 ENV_SECRET       = 'RADICAL_ORBIT_DRAGON_WORKER_SECRET'
+ENV_BATCH_PUTS   = 'RADICAL_ORBIT_DRAGON_BATCH_PUTS'
 MAX_WORKERS      = 256
 HELLO_TIMEOUT    = 120                  # s, all workers connected
 STOP_TIMEOUT     = 10                   # s, workers acknowledge exit
@@ -107,14 +108,28 @@ def _recv(sock: socket.socket) -> Optional[Any]:
     return None if body is None else _unpack(body)
 
 
+def batch_puts() -> bool:
+    """Whether multi-key puts go to Dragon as one batch put
+    (``$RADICAL_ORBIT_DRAGON_BATCH_PUTS``, default on; ``0`` puts key by
+    key, each confirmed: slower, for comparisons)."""
+    return os.environ.get(ENV_BATCH_PUTS, '1').strip().lower() \
+        not in ('0', 'false', 'no', 'off')
+
+
 def batch_put(dd: Any, items: Dict[str, Any]) -> int:
     """Store *items*; several at once as one Dragon batch put (no per-put
     confirmation: errors show only at the end, so on failure an unknown
-    subset may be stored)."""
-    if len(items) == 1:
-        (k, v), = items.items()
-        dd[k] = v
-        return 1
+    subset may be stored), or key by key when batch puts are off."""
+    if len(items) == 1 or not batch_puts():
+        for n, (k, v) in enumerate(items.items()):
+            try:
+                dd[k] = v
+            except Exception as e:
+                if len(items) == 1:
+                    raise
+                raise RuntimeError(f"put stopped at key {k!r} after {n} of "
+                                   f"{len(items)} items: {e}") from e
+        return len(items)
     n = 0
     dd.start_batch_put()
     try:
