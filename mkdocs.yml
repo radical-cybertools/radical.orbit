@@ -108,6 +108,7 @@ nav:
       - Plugin Writer's Tutorial: tutorial_plugin.md
       - Plugin Development: plugin_development.md
       - Plugin API Reference: plugin_api.md
+      - Dragon Plugin: plugin_dragon.md
       - Federation Plugin: plugin_federation.md
       - Globus Plugin: plugin_globus.md
       - Queue Info Plugin: plugin_queue_info.md
@@ -116,6 +117,7 @@ nav:
       - REST API: rest_api.md
       - Machine Guide: machine_guide.md
       - Task Dispatcher Strategy: task_dispatcher_strategy.md
+      - "Orbit-Dragon: Scoping": swarmslicer/orbit_dragon_scoping.md
   - API Reference:
       - Modules: api/
 

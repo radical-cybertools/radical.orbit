@@ -1,0 +1,63 @@
+# Orbit-Dragon POC: a containerized endpoint serving Dragon DDicts.
+#
+# Run ./mkcreds.sh first.  Two modes:
+#
+#   docker compose up                      # broker + endpoint (in-cluster)
+#   docker compose --profile external up endpoint-external
+#                                          # endpoint only, dialing a broker
+#                                          # outside ($RADICAL_ORBIT_BROKER_URL)
+#
+# The client runs on the host; see README.md.
+
+x-image: &image
+  image: radical-orbit-dragon:latest
+  build:
+    context: ../..
+    dockerfile: examples/dragon/Dockerfile
+
+x-endpoint: &endpoint
+  <<: *image
+  # Dragon keeps its channels and DDict memory in /dev/shm
+  shm_size: "4gb"
+  environment:
+    RADICAL_ORBIT_DRAGON_RUNTIME: start
+    RADICAL_ORBIT_BROKER_CERT:    /creds/broker_cert.pem
+  volumes:
+    - ./creds/broker_cert.pem:/creds/broker_cert.pem:ro
+    - ./creds/broker.token:/root/.radical/orbit/broker.token:ro
+
+services:
+
+  broker:
+    <<: *image
+    hostname: broker
+    environment:
+      RADICAL_ORBIT_BROKER_CERT: /creds/broker_cert.pem
+      RADICAL_ORBIT_BROKER_KEY:  /creds/broker_key.pem
+    volumes:
+      - ./creds:/creds:ro
+      - ./creds/broker.token:/root/.radical/orbit/broker.token:ro
+    command: ["radical-orbit-broker.py", "--port", "8000"]
+    ports:
+      - "${BROKER_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import socket; socket.create_connection((\"localhost\", 8000), 1)'"]
+      interval: 5s
+      retries: 12
+
+  endpoint:
+    <<: *endpoint
+    depends_on:
+      broker:
+        condition: service_healthy
+    command: ["radical-orbit-endpoint.py", "--name", "dragon-pod",
+              "--url", "https://broker:8000", "--plugins", "sysinfo,dragon"]
+
+  endpoint-external:
+    <<: *endpoint
+    profiles: ["external"]
+    command: ["sh", "-c", "exec radical-orbit-endpoint.py --name dragon-pod --url \"$${RADICAL_ORBIT_BROKER_URL:?set RADICAL_ORBIT_BROKER_URL}\" --plugins sysinfo,dragon"]
+    environment:
+      RADICAL_ORBIT_DRAGON_RUNTIME: start
+      RADICAL_ORBIT_BROKER_CERT:    /creds/broker_cert.pem
+      RADICAL_ORBIT_BROKER_URL:     ${RADICAL_ORBIT_BROKER_URL:-}

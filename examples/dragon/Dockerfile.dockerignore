@@ -1,0 +1,14 @@
+# Build context for examples/dragon/Dockerfile: only what the image installs.
+*
+!VERSION
+!setup.py
+!setup.cfg
+!pyproject.toml
+!requirements.txt
+!MANIFEST.in
+!README.md
+!LICENSE.md
+!bin
+!src
+**/__pycache__
+src/radical/orbit/_version.py
