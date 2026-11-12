@@ -144,6 +144,34 @@ def resolve_ws_compression_rtt_ms(value: Optional[float] = None) -> float:
                          f"number of milliseconds") from None
 
 
+# The WebSocket keepalive deadline (s): a socket whose pong is this late is
+# closed, on the broker (uvicorn ``ws_ping_timeout``) and in every runtime
+# (``websockets`` ``ping_timeout``).  One variable for both ends: a broker
+# whose loop stalls longer than this under load drops every connection at
+# once (a broker hosting hundreds of in-process participants, e.g. one per
+# DT service session), so a deployment raises it on both sides together.
+ENV_PING_TIMEOUT = 'RADICAL_ORBIT_PING_TIMEOUT'
+PING_TIMEOUT     = 3.0
+
+
+def resolve_ping_timeout(value: Optional[float] = None) -> float:
+    """Keepalive deadline (s): explicit > ``$RADICAL_ORBIT_PING_TIMEOUT`` >
+    ``PING_TIMEOUT``.  A value that is not a positive number raises
+    ``ValueError``."""
+    src, raw = ('setting', value) if value is not None \
+        else (f'${ENV_PING_TIMEOUT}', _env(ENV_PING_TIMEOUT))
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return PING_TIMEOUT
+    try:
+        timeout = float(raw)
+    except (TypeError, ValueError):
+        timeout = -1.0
+    if not timeout > 0:
+        raise ValueError(f"ping_timeout {src}={raw!r}: expected a positive "
+                         f"number of seconds")
+    return timeout
+
+
 # Cookie the browser/SSE path carries (set by the broker's POST /auth).  The
 # token never lives in a query string, only this HttpOnly cookie or a
 # request header.
