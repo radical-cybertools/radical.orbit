@@ -1,3 +1,0 @@
-sent TERM to 2100317 at 1793805499.203179997
-endpoint 2100317 gone after 1s
-dev_shm_files: 4

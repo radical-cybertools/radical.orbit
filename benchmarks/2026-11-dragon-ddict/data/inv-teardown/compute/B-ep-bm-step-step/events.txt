@@ -1,4 +1,0 @@
-probe start 1793806679.204551190, sent none to 882741
-endpoint 882741 still alive after 60s
-dev_shm_files: 7
-step gone 0s after the probe ended

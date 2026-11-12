@@ -1,2 +1,0 @@
-2026-11-05 10:36:19 INFO     [Runtime] ws_compression=auto: connect 1.1 ms (threshold 10.0 ms) -> deflate off
-2026-11-05 10:36:23,374 INFO [Runtime] ws_compression=auto: connect 1.0 ms (threshold 10.0 ms) -> deflate off

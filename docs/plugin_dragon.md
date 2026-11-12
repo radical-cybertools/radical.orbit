@@ -41,14 +41,26 @@ from the batch script or an interactive `salloc` shell, not from inside an
 `srun` step. Inside a step, Slurm narrows `SLURM_JOB_NODELIST` to the step's
 nodes, so the launcher's own `srun` only sees those nodes. If you must
 launch from a step, first re-export the job's node list and drop the step
-variables (see `benchmarks/2026-11-dragon-ddict/step_env.sh`).
+variables:
+
+```sh
+export SLURM_JOB_NODELIST=$SLURM_NODELIST
+export SLURM_JOB_NUM_NODES=$(scontrol show hostnames $SLURM_NODELIST | wc -l)
+unset SLURM_NNODES SLURM_NTASKS SLURM_NPROCS SLURM_TASKS_PER_NODE \
+      SLURM_DISTRIBUTION SLURM_STEP_ID SLURM_STEPID SLURM_STEP_NODELIST \
+      SLURM_STEP_NUM_NODES SLURM_STEP_NUM_TASKS SLURM_STEP_TASKS_PER_NODE \
+      SLURM_STEP_LAUNCHER_PORT SLURM_STEP_RESV_PORTS SLURM_NODEID \
+      SLURM_PROCID SLURM_LOCALID SLURM_GTIDS
+export SLURM_OVERLAP=1
+```
 
 **Stopping.** Send SIGTERM to the endpoint process only. The endpoint then
 destroys its DDicts and exits, and the launcher tears the runtime down. A
 signal to the `dragon` launcher itself (e.g. `pkill -f` on the endpoint
 script name, which also matches the launcher's command line) kills the
 runtime under the endpoint. That leaves DDict processes and `/dev/shm`
-pools behind (see the benchmark README, "Teardown").
+pools behind (found in the endpoint teardown benchmarks on Perlmutter,
+which are kept outside this repository).
 
 ## DDicts
 
