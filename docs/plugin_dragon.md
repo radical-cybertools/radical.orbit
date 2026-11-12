@@ -33,8 +33,24 @@ plugin reaches a runtime:
 Default: `attach` when `$DRAGON_ATTACH_TOKEN` is set, else `start`.  The
 `dragon` launcher must be on `PATH` or next to the endpoint's interpreter.
 
-All Dragon calls run on one dedicated thread: concurrent DDict calls from
-several threads hang in dragonhpc 0.15.0.
+All Dragon calls of the endpoint run on one dedicated thread: concurrent
+DDict calls from several threads hang in dragonhpc 0.15.0. A put of several
+keys is sent as one Dragon batch put (`start_batch_put` / `end_batch_put`),
+so the managers do not confirm each key; an error then shows only at the
+end, and an unknown subset of the batch may be stored.
+
+**Worker processes.** One thread caps an endpoint at about one DDict call
+per 0.4 ms. With `RADICAL_ORBIT_DRAGON_WORKERS=N` the endpoint instead
+starts N Dragon processes in the runtime, round-robin over its nodes, and
+runs put, get, presence checks and pop there. Each worker attaches the
+DDicts by descriptor and serves one request at a time; a multi-key request
+is split across the workers by key hash and the parts run in parallel.
+Create, destroy, `keys`, `len` and `clear` stay on the endpoint's thread.
+Workers connect back to the endpoint over TCP (to `$(hostname)`, or
+`$RADICAL_ORBIT_DRAGON_WORKER_HOST`), authenticated with a per-endpoint
+secret, and exit when the endpoint stops. Natively, more than about two
+writers per DDict manager slow puts down, so raise `managers_per_node` with
+the worker count.
 
 **Multi-node runtimes under Slurm.** Start the endpoint under `dragon -m`
 from the batch script or an interactive `salloc` shell, not from inside an

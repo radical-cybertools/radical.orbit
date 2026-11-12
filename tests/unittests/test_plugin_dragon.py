@@ -21,6 +21,8 @@ class _FakeDDict(dict):
         super().__init__()
         self.args      = args
         self.destroyed = False
+        self.batches   = 0              # batch puts started
+        self.in_batch  = False
 
     def serialize(self):
         return f'desc:{id(self)}'
@@ -28,11 +30,19 @@ class _FakeDDict(dict):
     def destroy(self):
         self.destroyed = True
 
+    def start_batch_put(self, persist=False):
+        assert not self.in_batch
+        self.in_batch  = True
+        self.batches  += 1
+
+    def end_batch_put(self):
+        self.in_batch = False
+
 
 class _FakeBackend(DDictBackend):
 
-    def __init__(self, mode='start'):
-        super().__init__(mode)
+    def __init__(self, mode='start', workers=0):
+        super().__init__(mode, workers=workers)
         self.up     = 0
         self.down   = 0
         self.fail   = None
@@ -576,7 +586,8 @@ def test_partial_put_reports_progress():
     async def _run():
         await backend.create('d', 1, 1, 1024)
         await backend.put('d', {'a': 1, 'b': 2, 'c': 3})
-    with pytest.raises(RuntimeError, match="after 2 of 3 items"):
+    with pytest.raises(RuntimeError,
+                       match="batch put of 3 items failed after 2 were sent"):
         asyncio.run(_run())
 
 

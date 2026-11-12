@@ -23,6 +23,11 @@ in.  Otherwise, runtime selection (``$RADICAL_ORBIT_DRAGON_RUNTIME``):
               plugin shutdown.
 
 Default: ``attach`` when ``$DRAGON_ATTACH_TOKEN`` is set, else ``start``.
+
+Data operations (put, get, contains, pop) run on the endpoint's own Dragon
+thread, or, with ``$RADICAL_ORBIT_DRAGON_WORKERS=N``, on N Dragon worker
+processes inside the runtime (:mod:`.dragon_workers`), which is how Dragon
+itself scales writers.
 """
 
 __author__    = 'Radical Development Team'
@@ -57,6 +62,9 @@ from fastapi import FastAPI, HTTPException
 from starlette.requests import Request
 
 from .client import PluginClient
+from .dragon_workers import (WorkerError, WorkerPool, batch_put,
+                             dragon_reap, dragon_spawn, handle,
+                             worker_count)
 from .errors import http_exception
 from .plugin_base import Plugin, resolve_frame_cap
 from .plugin_session_base import PluginSession
@@ -249,13 +257,17 @@ class DDictBackend:
     :meth:`_new_ddict`.
     """
 
-    def __init__(self, mode: str):
+    def __init__(self, mode: str, workers: Optional[int] = None):
         self._mode    = mode
         self._pool    = DragonThread()
         self._rt      = None
         self._nodes   = None                # runtime node count, cached
         self._closed  = False
         self._ddicts: Dict[str, Any] = {}
+        self._descs:  Dict[str, str] = {}   # did -> descriptor, for workers
+        self._nworkers = worker_count() if workers is None else workers
+        self._workers: Optional[WorkerPool] = None
+        self._wlock   = None                # created on the loop that uses it
 
     @property
     def closed(self) -> bool:
@@ -362,6 +374,57 @@ class DDictBackend:
         return DDict(managers_per_node, n_nodes, total_mem,
                      timeout=RUNTIME_TIMEOUT)
 
+    def _spawn_workers(self, host: str, port: int, n: int,
+                       secret: str) -> Any:
+        """Start the worker processes (Dragon thread)."""
+        return dragon_spawn(host, port, n, secret)
+
+    def _reap_workers(self, procs: Any) -> None:
+        """Join or kill the worker processes (Dragon thread)."""
+        dragon_reap(procs)
+
+    async def _pool_of_workers(self) -> Optional[WorkerPool]:
+        """The worker pool, started on first use; None without workers."""
+        if not self._nworkers:
+            return None
+        if self._workers is not None:
+            return self._workers
+        if self._wlock is None:
+            self._wlock = asyncio.Lock()
+        async with self._wlock:
+            if self._workers is None:
+                pool = WorkerPool(self._nworkers, self._spawn_workers)
+                try:
+                    await pool.start(self._call)
+                except BaseException as e:
+                    await pool.stop()
+                    if pool.procs:
+                        await self._call(self._reap_workers, pool.procs)
+                    if isinstance(e, HTTPException):
+                        raise
+                    raise HTTPException(status_code=503,
+                                        detail=f"dragon workers: {e}") from e
+                self._workers = pool
+        return self._workers
+
+    def _desc(self, did: str) -> str:
+        try:
+            return self._descs[did]
+        except KeyError:
+            raise http_exception(FileNotFoundError(
+                f"unknown ddict: {did}")) from None
+
+    async def _on_workers(self, op: str, did: str, arg: Any) -> Any:
+        """Run *op* on the workers; None when there are none."""
+        pool = await self._pool_of_workers()
+        if pool is None:
+            return None
+        desc = self._desc(did)
+        try:
+            return await getattr(pool, op)(did, desc, arg)
+        except WorkerError as e:
+            raise RuntimeError(str(e)) from e
+
     # -- DDict operations ----------------------------------------------------
 
     def _ddict(self, did: str) -> Any:
@@ -385,53 +448,46 @@ class DDictBackend:
             self._check_nodes(n_nodes)
             dd = self._new_ddict(managers_per_node, n_nodes, total_mem)
             self._ddicts[did] = dd
-            return dd.serialize()
+            self._descs[did]  = dd.serialize()
+            return self._descs[did]
         return await self._call(_create)
 
     async def destroy(self, did: str) -> None:
+        if self._workers is not None:
+            await self._workers.detach(did)
+
         def _destroy():
             self._ddict(did).destroy()
             del self._ddicts[did]
+            self._descs.pop(did, None)
         await self._call(_destroy)
 
     async def put(self, did: str, items: Dict[str, Any]) -> int:
-        def _put():
-            dd = self._ddict(did)
-            for n, (k, v) in enumerate(items.items()):
-                try:
-                    dd[k] = v
-                except Exception as e:
-                    raise RuntimeError(f"put stopped at key {k!r} after "
-                                       f"{n} of {len(items)} items: "
-                                       f"{e}") from e
-            return len(items)
-        return await self._call(_put)
+        """Store *items*; several at once as one Dragon batch put."""
+        if self._nworkers:
+            return await self._on_workers('put', did, items)
+        return await self._call(lambda: batch_put(self._ddict(did), items))
 
     async def get(self, did: str, keys: List[str]) -> tuple:
         """Returns ``({key: value}, [missing keys])``."""
-        def _get():
-            dd = self._ddict(did)
-            found, missing = {}, []
-            for k in keys:
-                try:
-                    found[k] = dd[k]
-                except KeyError:
-                    missing.append(k)
-            return found, missing
-        return await self._call(_get)
+        if self._nworkers:
+            return await self._on_workers('get', did, keys)
+        return tuple(await self._call(
+            lambda: handle('get', self._ddict(did), {'keys': keys})))
 
     async def contains(self, did: str, keys: List[str]) -> List[str]:
         """Returns the keys of *keys* that are missing (values not read)."""
-        def _contains():
-            dd = self._ddict(did)
-            return [k for k in keys if k not in dd]
-        return await self._call(_contains)
+        if self._nworkers:
+            return await self._on_workers('contains', did, keys)
+        return await self._call(
+            lambda: handle('contains', self._ddict(did), {'keys': keys}))
 
     def discard(self, did: str) -> None:
         """Queue the destroy of *did*, if it exists by then: for a create
         whose caller went away while the create still runs (the single
         Dragon thread runs this after it)."""
         def _discard():
+            self._descs.pop(did, None)
             dd = self._ddicts.pop(did, None)
             if dd is not None:
                 try:
@@ -445,16 +501,10 @@ class DDictBackend:
 
     async def pop(self, did: str, keys: List[str]) -> List[str]:
         """Remove *keys*; returns the ones that were missing."""
-        def _pop():
-            dd = self._ddict(did)
-            missing = []
-            for k in keys:
-                try:
-                    del dd[k]
-                except KeyError:
-                    missing.append(k)
-            return missing
-        return await self._call(_pop)
+        if self._nworkers:
+            return await self._on_workers('pop', did, keys)
+        return await self._call(
+            lambda: handle('pop', self._ddict(did), {'keys': keys}))
 
     async def keys(self, did: str) -> List[Any]:
         return await self._call(lambda: list(self._ddict(did).keys()))
@@ -475,6 +525,7 @@ class DDictBackend:
                 except Exception as e:
                     log.warning("[dragon] destroy %s failed: %s", did, e)
             self._ddicts.clear()
+            self._descs.clear()
             self._runtime_down()
         except Exception as e:
             log.warning("[dragon] runtime release failed, it may be left "
@@ -490,6 +541,11 @@ class DDictBackend:
         completes it at exit if it did not get to run."""
         if self._closed or self._pool.down:
             return                      # a cancelled close: close_sync
+        workers, self._workers, self._nworkers = self._workers, None, 0
+        if workers is not None:
+            # workers first: they hold handles on the DDicts destroyed below
+            await workers.stop()
+            self._pool.submit(self._reap_workers, workers.procs)
         # the close is the last job: no create can queue behind it
         fut = self._pool.submit(self._close)
         self._pool.shutdown(wait=False)
