@@ -27,6 +27,7 @@ __license__   = 'MIT'
 
 
 import asyncio
+import collections
 import hmac
 import logging
 import os
@@ -244,25 +245,59 @@ class WorkerError(RuntimeError):
 
 
 class _Conn:
+    """
+    The endpoint's connection to one worker.
+
+    Requests are sent as they come, without waiting for earlier replies,
+    so the next request is already in the worker's socket when it finishes
+    one: a worker idles about 1 ms per request otherwise.  The worker
+    serves them in order, so replies are matched to requests by order.
+    """
 
     def __init__(self, wid: int, reader, writer, info: dict):
-        self.wid    = wid
-        self.reader = reader
-        self.writer = writer
-        self.info   = info
-        self.lock   = asyncio.Lock()        # one request at a time
+        self.wid      = wid
+        self.reader   = reader
+        self.writer   = writer
+        self.info     = info
+        self._send    = asyncio.Lock()      # one frame at a time on the wire
+        self._pending: collections.deque = collections.deque()
+        self._dead: Optional[WorkerError] = None
+        self._reader  = asyncio.ensure_future(self._read_replies())
 
-    async def call(self, msg: dict) -> Any:
-        async with self.lock:
-            try:
-                self.writer.write(_pack(msg))
-                await self.writer.drain()
+    async def _read_replies(self) -> None:
+        try:
+            while True:
                 head = await self.reader.readexactly(_LEN.size)
                 n,   = _LEN.unpack(head)
                 body = await self.reader.readexactly(n)
-            except (OSError, asyncio.IncompleteReadError) as e:
-                raise WorkerError(f"worker {self.wid} went away: "
-                                  f"{e}") from e
+                fut  = self._pending.popleft()
+                if not fut.done():          # its caller may have given up
+                    fut.set_result(body)
+        except (OSError, asyncio.IncompleteReadError, IndexError) as e:
+            self._fail(WorkerError(f"worker {self.wid} went away: {e}"))
+        except asyncio.CancelledError:
+            self._fail(WorkerError(f"worker {self.wid}: connection closed"))
+            raise
+
+    def _fail(self, err: WorkerError) -> None:
+        self._dead = err
+        while self._pending:
+            fut = self._pending.popleft()
+            if not fut.done():
+                fut.set_exception(err)
+
+    async def call(self, msg: dict) -> Any:
+        if self._dead is not None:
+            raise self._dead
+        fut = asyncio.get_running_loop().create_future()
+        async with self._send:
+            self._pending.append(fut)
+            try:
+                self.writer.write(_pack(msg))
+                await self.writer.drain()
+            except OSError as e:
+                self._fail(WorkerError(f"worker {self.wid} went away: {e}"))
+        body  = await fut
         reply = _unpack(body)
         if not reply.get('ok'):
             if reply.get('type') == 'KeyError':
@@ -397,6 +432,7 @@ class WorkerPool:
             except Exception:
                 pass
             c.writer.close()
+            c._reader.cancel()
         await asyncio.gather(*[_bye(c) for c in self._conns.values()])
         self._conns.clear()
         if self._server is not None:

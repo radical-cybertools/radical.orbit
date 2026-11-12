@@ -320,3 +320,52 @@ def test_unbatched_put_reports_progress(monkeypatch):
             super().__setitem__(k, v)
     with pytest.raises(RuntimeError, match='after 1 of 2 items'):
         dw.batch_put(_Full(), {'a': 1, 'b': 2})
+
+
+def test_pool_overlaps_requests_to_one_worker():
+    """A second request reaches the worker while it still runs the first."""
+    gate, seen = threading.Event(), []
+
+    class _Slow(_DDict):
+        def __getitem__(self, k):
+            seen.append(k)
+            if k == 'first':
+                gate.wait(5)
+            return super().__getitem__(k)
+    dds = {'D': _Slow()}
+    dds['D'].update({'first': 1, 'second': 2})
+
+    async def _run():
+        pool = dw.WorkerPool(1, _thread_spawn(dds))
+        await pool.start(_run_spawn)
+        conn = pool._conns[0]
+        t1 = asyncio.ensure_future(pool.get('x', 'D', ['first']))
+        t2 = asyncio.ensure_future(pool.get('x', 'D', ['second']))
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if len(conn._pending) == 2:
+                break
+        in_flight = len(conn._pending)            # both sent, none answered
+        gate.set()
+        r1, r2 = await t1, await t2
+        await pool.stop()
+        return in_flight, r1, r2
+    in_flight, r1, r2 = asyncio.run(_run())
+    assert in_flight == 2
+    assert r1 == ({'first': 1}, []) and r2 == ({'second': 2}, [])
+    assert seen == ['first', 'second']            # served in order
+
+
+def test_pool_many_concurrent_calls_match_replies():
+    dds = {'D': _DDict()}
+    dds['D'].update({f'k{i}': i for i in range(200)})
+
+    async def _run():
+        pool = dw.WorkerPool(2, _thread_spawn(dds))
+        await pool.start(_run_spawn)
+        rs = await asyncio.gather(*[pool.get('x', 'D', [f'k{i}'])
+                                    for i in range(200)])
+        await pool.stop()
+        return rs
+    rs = asyncio.run(_run())
+    assert all(r == ({f'k{i}': i}, []) for i, r in enumerate(rs))
