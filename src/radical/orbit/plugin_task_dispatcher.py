@@ -2916,6 +2916,10 @@ class PluginTaskDispatcher(Plugin):
         cert   = os.environ.get('RADICAL_ORBIT_BROKER_CERT')
         if cert and shared:
             env['RADICAL_ORBIT_BROKER_CERT'] = cert
+        # a raised keepalive deadline only helps if both ends use it
+        ping_timeout = os.environ.get('RADICAL_ORBIT_PING_TIMEOUT')
+        if ping_timeout:
+            env['RADICAL_ORBIT_PING_TIMEOUT'] = ping_timeout
         return env
 
     def _build_job_spec(self, pool_state: PoolState,

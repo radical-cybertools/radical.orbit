@@ -1678,7 +1678,32 @@ async def test_shutdown_leaves_no_pending_topology_broadcast(make_broker):
     assert broker._topo_task is None
 
 
-@pytest.mark.parametrize('bad', [None, -1, 'soon'])
+@pytest.mark.asyncio
+async def test_a_loss_is_not_coalesced_away_by_a_fresh_reregistration(
+        make_broker):
+    """A removal and a fresh registration under the same name in one window:
+    consumers that infer a loss from absence (runtimes, the dispatcher's
+    pilot liveness via the host delivery) must still see it gone."""
+    broker = make_broker()
+    broker._topo_window = 0.5
+    await broker.startup()
+    try:
+        watcher, x1, x2 = FakeWS(), FakeWS(), FakeWS()
+        await _register(broker, 'w', watcher)
+        await _register(broker, 'x', x1)        # in w's window: trailing
+        await _until(lambda: broker._topo_task is None)
+        await broker._on_socket_drop('x', x1, clean=True)   # pending again
+        await _register(broker, 'x', x2)        # a new process, same name
+        await _until(lambda: broker._topo_task is None)
+        seen = [('x' in t.participants) for t in _topologies(watcher)]
+        first = seen.index(True)                # x present ...
+        gone = seen.index(False, first)         # ... then gone ...
+        assert True in seen[gone:]              # ... then present again
+    finally:
+        await broker.shutdown()
+
+
+@pytest.mark.parametrize('bad', [None, -1, 'soon', True, float('nan')])
 def test_topology_coalesce_is_validated(self_signed, tmp_path, monkeypatch,
                                         bad):
     from radical.orbit import utils
@@ -1729,7 +1754,7 @@ def test_ping_timeout_env_reaches_broker_and_runtime(make_broker, self_signed,
     assert make_broker(ping_timeout=None)._ping_timeout is None
 
 
-@pytest.mark.parametrize('raw', ['-1', 'soon'])
+@pytest.mark.parametrize('raw', ['-1', 'soon', 'nan', 'inf'])
 def test_ping_timeout_env_rejects_bad_values(make_broker, monkeypatch, raw):
     from radical.orbit import utils
     monkeypatch.setenv(utils.ENV_PING_TIMEOUT, raw)
