@@ -152,16 +152,22 @@ def resolve_ws_compression_rtt_ms(value: Optional[float] = None) -> float:
 # DT service session), so a deployment raises it on both sides together.
 ENV_PING_TIMEOUT = 'RADICAL_ORBIT_PING_TIMEOUT'
 PING_TIMEOUT     = 3.0
+PING_TIMEOUT_UNSET = object()   # "not set": the variable, then the default
 
 
-def resolve_ping_timeout(value: Optional[float] = None) -> float:
+def resolve_ping_timeout(value: Any = PING_TIMEOUT_UNSET) -> Optional[float]:
     """Keepalive deadline (s): explicit > ``$RADICAL_ORBIT_PING_TIMEOUT`` >
-    ``PING_TIMEOUT``.  A value that is not a positive number raises
+    ``PING_TIMEOUT``.  An explicit ``None`` disables the deadline, as uvicorn
+    and ``websockets`` take it.  A value that is not a positive number raises
     ``ValueError``."""
-    src, raw = ('setting', value) if value is not None \
-        else (f'${ENV_PING_TIMEOUT}', _env(ENV_PING_TIMEOUT))
-    if raw is None or (isinstance(raw, str) and not raw.strip()):
-        return PING_TIMEOUT
+    if value is None:
+        return None
+    if value is PING_TIMEOUT_UNSET:
+        src, raw = f'${ENV_PING_TIMEOUT}', _env(ENV_PING_TIMEOUT)
+        if not raw:
+            return PING_TIMEOUT
+    else:
+        src, raw = 'setting', value
     try:
         timeout = float(raw)
     except (TypeError, ValueError):

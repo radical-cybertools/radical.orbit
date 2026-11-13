@@ -92,8 +92,8 @@ class BrokerTuning:
 
     * ``ping_interval`` / ``ping_timeout`` — uvicorn WS keepalive; a silent
       socket is closed at ``ping_interval + ping_timeout``.  ``ping_timeout``
-      ``None`` defers to ``$RADICAL_ORBIT_PING_TIMEOUT``, then 3 s (the same
-      variable sets the runtimes' deadline).
+      unset defers to ``$RADICAL_ORBIT_PING_TIMEOUT``, then 3 s (the same
+      variable sets the runtimes' deadline); ``None`` disables it.
     * ``grace`` — the ``suspect`` → ``lost`` window.
     * ``call_cap`` — a cap on **broker-originated** in-flight calls (the only
       calls the broker itself waits on); overflow raises at the caller.
@@ -105,11 +105,11 @@ class BrokerTuning:
     * ``event_queue`` — per-subscriber delivery-queue depth.
     * ``frame_cap`` — uvicorn ``ws_max_size`` / the protocol frame cap.
     * ``topology_coalesce`` — the topology broadcast's coalescing window (s):
-      a change within this window of the last broadcast is folded into one
-      trailing broadcast of the then-current topology, so a burst of
-      registrations or drops sends one snapshot instead of one per change.
-      The first change after a quiet window is broadcast at once; ``0``
-      broadcasts every change.
+      one broadcast is pending or in flight at a time, the next starts no
+      earlier than this long after the previous one ended, and it carries
+      every change made meanwhile, so a burst of registrations or drops
+      sends one snapshot instead of one per change.  The first change after
+      a quiet window is broadcast at once.
     * ``ws_compression`` — accept WS permessage-deflate when a client offers
       it (uvicorn ``ws_per_message_deflate``); ``None`` defers to
       ``$RADICAL_ORBIT_WS_COMPRESSION``, unset means accept.  Only ``off``
@@ -117,7 +117,7 @@ class BrokerTuning:
     """
 
     ping_interval: float = 1.0
-    ping_timeout:  Optional[float] = None
+    ping_timeout:  Any = utils.PING_TIMEOUT_UNSET
     grace:         float = 10.0
     call_cap:      int   = 1024
     forwarded_call_cap: int = 4096
@@ -308,6 +308,10 @@ class Broker:
         self._topo_last: float = float('-inf')
         self._topo_dirty = False
         self._topo_task: Optional[asyncio.Task] = None
+        # names removed since the last snapshot: a fresh registration under
+        # one of them flushes a snapshot first, so its loss is not coalesced
+        # away (a consumer must see it gone before it reappears)
+        self._topo_gone: set = set()
         self._frame_cap     = tuning.frame_cap
         self._ws_compression = utils.resolve_ws_compression(
             tuning.ws_compression, default='on') != 'off'
@@ -838,6 +842,8 @@ class Broker:
             return False, None
 
         # Fresh registration.
+        if name in self._topo_gone:
+            await self._broadcast_topology()
         key = protocol.mint_id()
         self.registry[name]       = ws
         self._resume_keys[name]   = key
@@ -1204,6 +1210,7 @@ class Broker:
         self._resume_keys.pop(name, None)
         self._cancel_grace(name)
         self._events.remove_endpoint(name)
+        self._topo_gone.add(name)
 
     # ── call reaper ───────────────────────────────────────────────────
 
@@ -1256,21 +1263,22 @@ class Broker:
     async def _request_topology(self) -> None:
         """Broadcast the topology after a change, coalesced.
 
-        At most one broadcast is pending or in flight at a time, and
-        broadcasts are at least ``topology_coalesce`` apart: a change made
-        while one is pending or being sent is carried by the next one, whose
-        snapshot is built when it is sent.  The first change after a quiet
-        window goes out at once.  Each broadcast costs one frame per
-        participant, and in-process participants decode it on the broker's
-        GIL, so one per change would make a burst of N registrations cost
-        O(N^2) and could stall the loop past the keepalive deadline."""
-        if self._topo_window <= 0:
-            await self._broadcast_topology()
+        At most one broadcast is pending or in flight at a time; the next
+        starts ``topology_coalesce`` after the previous one ended and
+        carries every change made meanwhile (its snapshot is built when it
+        is sent).  The first change after a quiet window goes out at once.
+        Each broadcast costs one frame per participant, and in-process
+        participants decode it on the broker's GIL, so one per change would
+        make a burst of N registrations cost O(N^2) and could stall the loop
+        past the keepalive deadline."""
+        if not self._started:
             return
         self._topo_dirty = True
         if self._topo_task is None:
             self._topo_task = spawn(self._topology_sender(), 'broker_topology')
-            await asyncio.sleep(0)      # a quiet-window change goes out now
+            # let a quiet-window broadcast start before the caller goes on
+            # (it has built its snapshot and begun sending when we resume)
+            await asyncio.sleep(0)
 
     async def _topology_sender(self) -> None:
         loop = asyncio.get_running_loop()
@@ -1280,12 +1288,14 @@ class Broker:
                 if wait > 0:
                     await asyncio.sleep(wait)
                 self._topo_dirty = False    # changes from here on: next round
-                self._topo_last = loop.time()
                 await self._broadcast_topology()
+                self._topo_last = loop.time()
         finally:
-            self._topo_task = None
+            if self._topo_task is asyncio.current_task():
+                self._topo_task = None
 
     async def _broadcast_topology(self) -> None:
+        self._topo_gone.clear()
         packed = self._build_topology_msg()
         for name, ws in list(self.registry.items()):
             await self._send(ws, packed)

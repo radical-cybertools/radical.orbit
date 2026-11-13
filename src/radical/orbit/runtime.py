@@ -94,7 +94,6 @@ _CALLBACK_QUEUE = 1024    # bounded depth of the user-callback dispatcher
 _CALL_TIMEOUT   = 600.0   # default consumer-call timeout (seconds)
 _RETRY_AFTER    = 1.0     # Retry-After on a 503 (seconds)
 _PING_INTERVAL  = 1.0     # websockets client keepalive cadence
-_PING_TIMEOUT   = utils.PING_TIMEOUT  # keepalive answer deadline (default)
 _BACKOFF_START  = 0.5     # (re)connect backoff floor (seconds)
 _BACKOFF_MAX    = 10.0    # (re)connect backoff ceiling (seconds)
 _BACKOFF_FACTOR = 1.5     # (re)connect backoff growth factor
@@ -142,7 +141,7 @@ class EndpointRuntime(PluginHostBase):
         ping_interval: ``websockets`` client keepalive ping cadence (s).
         ping_timeout: ``websockets`` client keepalive pong deadline (s);
                       unset defers to ``$RADICAL_ORBIT_PING_TIMEOUT``, then
-                      ``utils.PING_TIMEOUT`` (3 s).
+                      ``utils.PING_TIMEOUT`` (3 s); ``None`` disables it.
 
     The numeric backpressure/backoff/frame-cap tunables are module-level
     constants (``_REQUEST_CAP``, ``_BACKOFF_*`` …), not per-instance knobs; they
@@ -172,7 +171,7 @@ class EndpointRuntime(PluginHostBase):
                  embedded:    bool           = False,
                  app:         Optional[FastAPI] = None,
                  ping_interval:       float = _PING_INTERVAL,
-                 ping_timeout:        Optional[float] = None,
+                 ping_timeout:        Any = utils.PING_TIMEOUT_UNSET,
                  **tuning):
 
         if tunnel not in ('none', 'forward', 'reverse'):
