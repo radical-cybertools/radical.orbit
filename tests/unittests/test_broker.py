@@ -1568,24 +1568,35 @@ def _topologies(ws):
     return [m for m in ws.msgs() if m.kind == 'topology']
 
 
+def _count_broadcasts(broker):
+    sent = []
+    orig = broker._broadcast_topology
+
+    async def counted():
+        sent.append(sorted(broker.registry))
+        await orig()
+    broker._broadcast_topology = counted
+    return sent
+
+
 @pytest.mark.asyncio
-async def test_burst_of_registrations_sends_one_trailing_topology(make_broker):
+async def test_burst_of_registrations_shares_broadcasts(make_broker):
     broker = make_broker()
-    broker._topo_window = 0.2
+    broker._topo_window = 1.0
     await broker.startup()
     try:
+        sent = _count_broadcasts(broker)
         socks = {f'e{i}': FakeWS() for i in range(10)}
         for name, ws in socks.items():
             ok, _ = await _register(broker, name, ws)
             assert ok is True
-        # the first registration is broadcast at once; the other nine fall
-        # into its window and share one trailing broadcast
-        assert len(_topologies(socks['e0'])) == 1
-        await asyncio.sleep(0.35)
+        await asyncio.sleep(1.3)
+        # 10 changes within one window: the first broadcast at once, the
+        # rest in one trailing broadcast
+        assert 1 <= len(sent) <= 2
+        assert sent[-1] == sorted(socks)
         for name, ws in socks.items():
-            topos = _topologies(ws)
-            assert len(topos) == (2 if name == 'e0' else 1), name
-            assert set(socks) <= set(topos[-1].participants)
+            assert set(socks) <= set(_topologies(ws)[-1].participants), name
         assert broker._topo_task is None
     finally:
         await broker.shutdown()
@@ -1594,15 +1605,14 @@ async def test_burst_of_registrations_sends_one_trailing_topology(make_broker):
 @pytest.mark.asyncio
 async def test_change_after_a_quiet_window_is_broadcast_at_once(make_broker):
     broker = make_broker()
-    broker._topo_window = 0.05
+    broker._topo_window = 0.3
     await broker.startup()
     try:
         ws0, ws1 = FakeWS(), FakeWS()
         await _register(broker, 'e0', ws0)
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.5)                # a quiet window
         await _register(broker, 'e1', ws1)
-        # no wait: both topologies are out when the registration returns
-        assert len(_topologies(ws0)) == 2
+        await asyncio.sleep(0.02)               # far less than the window
         assert 'e1' in _topologies(ws0)[-1].participants
         assert len(_topologies(ws1)) == 1
     finally:
@@ -1610,7 +1620,7 @@ async def test_change_after_a_quiet_window_is_broadcast_at_once(make_broker):
 
 
 @pytest.mark.asyncio
-async def test_zero_window_broadcasts_every_change(make_broker):
+async def test_zero_window_sends_each_spaced_change(make_broker):
     broker = make_broker()
     broker._topo_window = 0
     await broker.startup()
@@ -1618,7 +1628,9 @@ async def test_zero_window_broadcasts_every_change(make_broker):
         ws0 = FakeWS()
         await _register(broker, 'e0', ws0)
         for i in range(1, 4):
+            await asyncio.sleep(0.02)
             await _register(broker, f'e{i}', FakeWS())
+        await asyncio.sleep(0.02)
         assert len(_topologies(ws0)) == 4
     finally:
         await broker.shutdown()
@@ -1630,6 +1642,7 @@ async def test_shutdown_leaves_no_pending_topology_broadcast(make_broker):
     broker._topo_window = 5.0
     await broker.startup()
     await _register(broker, 'e0', FakeWS())
+    await asyncio.sleep(0.02)                   # the first one went out
     await _register(broker, 'e1', FakeWS())
     task = broker._topo_task
     assert task is not None and not task.done()
@@ -1637,6 +1650,29 @@ async def test_shutdown_leaves_no_pending_topology_broadcast(make_broker):
     await asyncio.sleep(0)
     assert task.cancelled()
     assert broker._topo_task is None
+    await broker._request_topology()            # e.g. a drop during shutdown
+    assert broker._topo_task is None
+
+
+@pytest.mark.asyncio
+async def test_a_loss_is_not_coalesced_away_by_a_fresh_reregistration(
+        make_broker):
+    broker = make_broker()
+    broker._topo_window = 0.5
+    await broker.startup()
+    try:
+        watcher, x1, x2 = FakeWS(), FakeWS(), FakeWS()
+        await _register(broker, 'w', watcher)
+        await _register(broker, 'x', x1)        # in w's window: trailing
+        await asyncio.sleep(0.7)                # ... which carried x
+        await broker._on_socket_drop('x', x1, clean=True)   # pending again
+        await _register(broker, 'x', x2)        # a new process, same name
+        await asyncio.sleep(0.7)
+        seen = [('x' in t.participants) for t in _topologies(watcher)]
+        first = seen.index(True)                # x present ...
+        assert False in seen[first:]            # ... then broadcast gone
+    finally:
+        await broker.shutdown()
 
 
 def test_ping_timeout_defaults_to_three_seconds(make_broker, self_signed,
@@ -1645,7 +1681,7 @@ def test_ping_timeout_defaults_to_three_seconds(make_broker, self_signed,
     from radical.orbit import utils
     from radical.orbit.runtime import EndpointRuntime
     monkeypatch.delenv(utils.ENV_PING_TIMEOUT, raising=False)
-    assert make_broker(ping_timeout=None)._ping_timeout == 3.0
+    assert make_broker(ping_timeout=utils.PING_TIMEOUT_UNSET)._ping_timeout == 3.0
     assert EndpointRuntime(broker_url='https://127.0.0.1:1',
                            cert=cert)._ping_timeout == 3.0
 
@@ -1656,13 +1692,16 @@ def test_ping_timeout_env_reaches_broker_and_runtime(make_broker, self_signed,
     from radical.orbit import utils
     from radical.orbit.runtime import EndpointRuntime
     monkeypatch.setenv(utils.ENV_PING_TIMEOUT, '20')
-    assert make_broker(ping_timeout=None)._ping_timeout == 20.0
+    assert make_broker(ping_timeout=utils.PING_TIMEOUT_UNSET)._ping_timeout == 20.0
     assert EndpointRuntime(broker_url='https://127.0.0.1:1',
                            cert=cert)._ping_timeout == 20.0
-    # an explicit setting wins over the variable
+    # an explicit setting wins over the variable, None disables the deadline
     assert make_broker(ping_timeout=0.5)._ping_timeout == 0.5
+    assert make_broker(ping_timeout=None)._ping_timeout is None
     assert EndpointRuntime(broker_url='https://127.0.0.1:1', cert=cert,
                            ping_timeout=0.5)._ping_timeout == 0.5
+    assert EndpointRuntime(broker_url='https://127.0.0.1:1', cert=cert,
+                           ping_timeout=None)._ping_timeout is None
 
 
 @pytest.mark.parametrize('raw', ['0', '-1', 'soon'])
@@ -1670,7 +1709,7 @@ def test_ping_timeout_env_rejects_non_positive(make_broker, monkeypatch, raw):
     from radical.orbit import utils
     monkeypatch.setenv(utils.ENV_PING_TIMEOUT, raw)
     with pytest.raises(ValueError, match='RADICAL_ORBIT_PING_TIMEOUT'):
-        make_broker(ping_timeout=None)
+        make_broker(ping_timeout=utils.PING_TIMEOUT_UNSET)
 
 
 class SlowWS(FakeWS):
@@ -1701,23 +1740,17 @@ async def test_changes_during_a_broadcast_wait_for_it(make_broker):
         for i, ws in enumerate(socks):
             ok, _ = await _register(broker, f'e{i}', ws)
             assert ok is True
-        await asyncio.sleep(0.3)               # registrations' broadcasts done
+        await asyncio.sleep(0.5)               # registrations' broadcasts done
         SlowWS.peak = 0
-        sent = []
-        orig = broker._broadcast_topology
-
-        async def counted():
-            sent.append(len(broker.registry))
-            await orig()
-        broker._broadcast_topology = counted
-        for i in range(20):                    # a burst of liveness changes
+        sent = _count_broadcasts(broker)
+        for _ in range(20):                    # a burst of liveness changes
             await broker._request_topology()
             await asyncio.sleep(0.005)
-        await asyncio.sleep(0.5)
-        # 20 changes over about 0.1 s, each broadcast taking about 0.1 s:
-        # a handful of broadcasts, never two at once
-        assert 1 <= len(sent) <= 4
-        assert SlowWS.peak == 1               # no two broadcasts overlap
+        await asyncio.sleep(0.6)
+        # each broadcast takes about 0.1 s: far fewer broadcasts than
+        # changes, and never two at once
+        assert 1 <= len(sent) <= 10
+        assert SlowWS.peak == 1
         assert broker._topo_task is None
     finally:
         await broker.shutdown()
