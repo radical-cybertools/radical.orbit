@@ -114,6 +114,26 @@ def encode_value(value: Any) -> Any:
     return value
 
 
+def json_str_len(s: str) -> int:
+    """Length of ``json.dumps(s)`` (``ensure_ascii``), without encoding
+    the common case: printable ASCII with no quote or backslash."""
+    if s.isascii() and s.isprintable() and '"' not in s and '\\' not in s:
+        return len(s) + 2
+    return len(json.dumps(s))
+
+
+def json_value_len(value: Any) -> int:
+    """Length of ``json.dumps(value, allow_nan=False)`` for a wire value; a
+    bytes marker from :func:`encode_value` is counted without encoding it
+    (base64 is plain ASCII).  Raises like ``json.dumps`` otherwise."""
+    if type(value) is dict and len(value) == 1:
+        data = value.get(B64_KEY)
+        if type(data) is str:
+            # {"$b64": <data>}
+            return json_str_len(data) + len(B64_KEY) + 6
+    return len(json.dumps(value, allow_nan=False))
+
+
 def decode_value(value: Any) -> Any:
     """Inverse of :func:`encode_value`.  A malformed marker raises
     ``ValueError``."""
@@ -645,19 +665,19 @@ class DragonSession(PluginSession):
                 # written in-runtime: would read back as bytes
                 errors[k] = f"value has the reserved {{{B64_KEY!r}: ...}} " \
                             f"shape"
-                size += len(json.dumps(errors[k])) + len(json.dumps(k)) + 4
+                size += json_str_len(errors[k]) + json_str_len(k) + 4
                 self._p.check_reply(size, hint)
                 continue
             v = encode_value(v)
             try:
                 # strict JSON: the reply renderer rejects NaN / inf
-                size += len(json.dumps(v, allow_nan=False))
+                size += json_value_len(v)
                 items[k] = v
             except (TypeError, ValueError):
                 errors[k] = f"value of type {type(v).__name__} is not " \
                             f"JSON-serializable"
-                size += len(json.dumps(errors[k]))
-            size += len(json.dumps(k)) + 4
+                size += json_str_len(errors[k])
+            size += json_str_len(k) + 4
             self._p.check_reply(size, hint)
         self._p.check_reply(size, hint)     # also when nothing was found
         return {"items": items, "missing": missing, "errors": errors}

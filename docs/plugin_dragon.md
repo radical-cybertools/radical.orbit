@@ -37,7 +37,12 @@ All Dragon calls of the endpoint run on one dedicated thread: concurrent
 DDict calls from several threads hang in dragonhpc 0.15.0. A put of several
 keys is sent as one Dragon batch put (`start_batch_put` / `end_batch_put`),
 so the managers do not confirm each key; an error then shows only at the
-end, and an unknown subset of the batch may be stored.
+end, and an unknown subset of the batch may be stored. Inside a batch,
+dragonhpc 0.15.0 opens manager connections in ascending manager id only, and
+a key for a lower manager than one already open ends the batch and starts a
+new one; so the first key of each manager is put first, in ascending manager
+id, and the rest follow in the given order (`dragon_workers.put_order`, via
+Dragon's private key-to-manager mapping; without it the order is unchanged).
 `RADICAL_ORBIT_DRAGON_BATCH_PUTS=0` turns that off (key by key, each
 confirmed), for comparisons with unbatched native writers.
 

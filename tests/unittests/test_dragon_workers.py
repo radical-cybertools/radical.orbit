@@ -77,6 +77,51 @@ def test_batch_put_end_failure():
         dw.batch_put(_Late(), {'a': 1, 'b': 2})
 
 
+class _Managed(_DDict):
+    """Fake handle with Dragon's key-to-manager mapping; records put order."""
+
+    def __init__(self, mgr):
+        super().__init__()
+        self.mgr, self.order = mgr, []
+
+    def _choose_manager_pickle_key(self, key):
+        return self.mgr[key], b''
+
+    def __setitem__(self, k, v):
+        self.order.append(k)
+        super().__setitem__(k, v)
+
+
+def test_put_order_opens_managers_ascending():
+    mgr = {'a': 2, 'b': 0, 'c': 2, 'd': 1, 'e': 0}
+    # first key of managers 0, 1, 2, then the rest as given
+    assert dw.put_order(_Managed(mgr), list(mgr)) == ['b', 'd', 'a', 'c', 'e']
+    assert dw.put_order(_Managed(mgr), ['a']) == ['a']
+    one = {'x': 3, 'y': 3}
+    assert dw.put_order(_Managed(one), ['y', 'x']) == ['y', 'x']
+
+
+def test_put_order_without_mapping():
+    assert dw.put_order(_DDict(), ['b', 'a']) == ['b', 'a']
+
+    class _Broken(_Managed):
+        def _choose_manager_pickle_key(self, key):
+            raise TypeError('changed API')
+    assert dw.put_order(_Broken({}), ['b', 'a']) == ['b', 'a']
+
+
+def test_batch_put_in_manager_order(monkeypatch):
+    mgr = {'a': 1, 'b': 0, 'c': 1}
+    dd  = _Managed(mgr)
+    assert dw.batch_put(dd, {'a': 1, 'b': 2, 'c': 3}) == 3
+    assert dd.order == ['b', 'a', 'c'] and dd.batches == 1
+    assert dd == {'a': 1, 'b': 2, 'c': 3}
+    monkeypatch.setenv(dw.ENV_BATCH_PUTS, '0')  # unbatched: order as given
+    dd = _Managed(mgr)
+    dw.batch_put(dd, {'a': 1, 'b': 2, 'c': 3})
+    assert dd.order == ['a', 'b', 'c']
+
+
 def test_handle_ops():
     dd = _DDict()
     dw.handle('put', dd, {'items': {'a': 1, 'b': b'\x00'}})

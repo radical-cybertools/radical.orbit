@@ -117,6 +117,32 @@ def batch_puts() -> bool:
         not in ('0', 'false', 'no', 'off')
 
 
+def put_order(dd: Any, keys: List[str]) -> List[str]:
+    """*keys* in an order that keeps a Dragon batch put in one batch.
+
+    Inside a batch, Dragon (0.15) opens manager connections only in
+    ascending manager id; a key whose manager is below the highest one
+    already open ends the batch and starts a new one (a round trip to
+    every open manager).  So the first key of each manager goes first, in
+    ascending manager id, and the rest follow as given, which keeps the
+    managers interleaved.  Uses Dragon's private key-to-manager mapping;
+    without it (or if it fails) the order is unchanged."""
+    choose = getattr(dd, '_choose_manager_pickle_key', None)
+    if choose is None or len(keys) < 2:
+        return keys
+    try:
+        first: Dict[int, str] = {}
+        for k in keys:
+            first.setdefault(choose(k)[0], k)
+    except Exception:
+        return keys
+    if len(first) < 2:
+        return keys
+    heads = [first[m] for m in sorted(first)]
+    taken = set(heads)
+    return heads + [k for k in keys if k not in taken]
+
+
 def batch_put(dd: Any, items: Dict[str, Any]) -> int:
     """Store *items*; several at once as one Dragon batch put (no per-put
     confirmation: errors show only at the end, so on failure an unknown
@@ -132,10 +158,11 @@ def batch_put(dd: Any, items: Dict[str, Any]) -> int:
                                    f"{len(items)} items: {e}") from e
         return len(items)
     n = 0
+    order = put_order(dd, list(items))
     dd.start_batch_put()
     try:
-        for k, v in items.items():
-            dd[k] = v
+        for k in order:
+            dd[k] = items[k]
             n += 1
     except BaseException as e:
         try:

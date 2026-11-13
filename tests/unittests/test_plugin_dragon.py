@@ -1,6 +1,8 @@
 # pylint: disable=protected-access,redefined-outer-name
 
 import asyncio
+import json
+import random
 
 import pytest
 from fastapi import FastAPI
@@ -9,6 +11,7 @@ from starlette.testclient import TestClient
 from radical.orbit.plugin_dragon import (NATIVE, PluginDragon, DDictBackend,
                                          DDictHandle, DragonClient,
                                          encode_value, decode_value,
+                                         json_str_len, json_value_len,
                                          parse_mem, runtime_mode)
 
 
@@ -101,6 +104,20 @@ def test_value_codec_roundtrip():
     for v in (1, 'a', [1, 2], {'x': None}, b'\x00\xff'):
         assert decode_value(encode_value(v)) == v
     assert encode_value(b'ab') == {'$b64': 'YWI='}
+
+
+def test_json_lengths_match_json_dumps():
+    rnd = random.Random(7)
+    for s in ['', 'c3-17', 'a"b', 'x\\y', 'é', '\x00', '\x7f', '\u2028']:
+        assert json_str_len(s) == len(json.dumps(s))
+    for _ in range(500):
+        s = ''.join(rnd.choice('ab"\\é\x00\x1f\x7f ~') for _ in range(8))
+        assert json_str_len(s) == len(json.dumps(s))
+    for v in [encode_value(bytes(range(256)) * 4), encode_value(b''),
+              {'$b64': 5}, {'$b64': 'a"b'}, [1, 'x'], None, 1.5, {'a': 1}]:
+        assert json_value_len(v) == len(json.dumps(v, allow_nan=False))
+    with pytest.raises(ValueError):
+        json_value_len(float('nan'))
 
 
 def test_decode_value_rejects_malformed():
