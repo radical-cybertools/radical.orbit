@@ -6,6 +6,7 @@ belongs in its own module.
 """
 
 import hmac
+import math
 import os
 import socket
 import ssl
@@ -142,6 +143,37 @@ def resolve_ws_compression_rtt_ms(value: Optional[float] = None) -> float:
     except ValueError:
         raise ValueError(f"${ENV_WS_COMPRESSION_RTT_MS}={raw!r}: expected a "
                          f"number of milliseconds") from None
+
+
+# The WebSocket keepalive deadline (s): a socket whose pong is this late is
+# closed, on the broker (uvicorn ``ws_ping_timeout``) and in every runtime
+# (``websockets`` ``ping_timeout``).  One variable for both ends: a broker
+# whose loop stalls longer than this under load drops every connection at
+# once (a broker hosting hundreds of in-process participants, e.g. one per
+# DT service session), so a deployment raises it on both sides together.
+ENV_PING_TIMEOUT = 'RADICAL_ORBIT_PING_TIMEOUT'
+PING_TIMEOUT     = 3.0
+
+
+def resolve_ping_timeout(value: Optional[float] = None) -> Optional[float]:
+    """Keepalive deadline (s): explicit > ``$RADICAL_ORBIT_PING_TIMEOUT`` >
+    ``PING_TIMEOUT``.  ``0`` disables the deadline (``None`` is returned,
+    which uvicorn and ``websockets`` take as "no deadline"); a negative or
+    non-numeric value raises ``ValueError``."""
+    if value is None:
+        src, raw = f'${ENV_PING_TIMEOUT}', _env(ENV_PING_TIMEOUT)
+        if not raw:
+            return PING_TIMEOUT
+    else:
+        src, raw = 'setting', value
+    try:
+        timeout = float(raw)
+    except (TypeError, ValueError):
+        timeout = -1.0
+    if not math.isfinite(timeout) or timeout < 0:
+        raise ValueError(f"ping_timeout {src}={raw!r}: expected a number of "
+                         f"seconds (0 disables)")
+    return timeout or None
 
 
 # Cookie the browser/SSE path carries (set by the broker's POST /auth).  The

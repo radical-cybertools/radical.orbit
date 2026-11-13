@@ -45,6 +45,7 @@ import asyncio
 import concurrent.futures
 import itertools
 import logging
+import math
 import os
 import signal
 import threading
@@ -89,7 +90,9 @@ class BrokerTuning:
     timeouts (or mutate attributes) so no test has to sleep for real.
 
     * ``ping_interval`` / ``ping_timeout`` — uvicorn WS keepalive; a silent
-      socket is closed at ``ping_interval + ping_timeout``.
+      socket is closed at ``ping_interval + ping_timeout``.  ``ping_timeout``
+      ``None`` defers to ``$RADICAL_ORBIT_PING_TIMEOUT``, then 3 s (the same
+      variable sets the runtimes' deadline); ``0`` disables it.
     * ``grace`` — the ``suspect`` → ``lost`` window.
     * ``call_cap`` — a cap on **broker-originated** in-flight calls (the only
       calls the broker itself waits on); overflow raises at the caller.
@@ -100,6 +103,15 @@ class BrokerTuning:
     * ``reap_interval`` — how often the reaper sweeps for expired calls.
     * ``event_queue`` — per-subscriber delivery-queue depth.
     * ``frame_cap`` — uvicorn ``ws_max_size`` / the protocol frame cap.
+    * ``topology_coalesce`` — the topology broadcast's coalescing window (s):
+      one broadcast is pending or in flight at a time, the next starts no
+      earlier than this long after the previous one ended, and it carries
+      every change made meanwhile, so a burst of registrations or drops
+      sends one snapshot instead of one per change.  The first change after
+      a quiet window is broadcast at once.  A participant removed and
+      registered afresh under the same name before its removal went out is
+      first broadcast as gone, then as present, so consumers that infer a
+      loss from absence still see it.
     * ``ws_compression`` — accept WS permessage-deflate when a client offers
       it (uvicorn ``ws_per_message_deflate``); ``None`` defers to
       ``$RADICAL_ORBIT_WS_COMPRESSION``, unset means accept.  Only ``off``
@@ -107,7 +119,7 @@ class BrokerTuning:
     """
 
     ping_interval: float = 1.0
-    ping_timeout:  float = 3.0
+    ping_timeout:  Optional[float] = None
     grace:         float = 10.0
     call_cap:      int   = 1024
     forwarded_call_cap: int = 4096
@@ -115,6 +127,7 @@ class BrokerTuning:
     reap_interval: float = 5.0
     event_queue:   int   = 1024
     frame_cap:     int   = protocol.FRAME_CAP
+    topology_coalesce: float = 0.1
     ws_compression: Optional[Union[bool, str]] = None
 
 
@@ -282,13 +295,29 @@ class Broker:
         # ── Tunables (unpacked to attributes; tests may set them) ─────
         tuning = tuning or BrokerTuning()
         self._ping_interval = tuning.ping_interval
-        self._ping_timeout  = tuning.ping_timeout
+        self._ping_timeout  = utils.resolve_ping_timeout(tuning.ping_timeout)
         self._grace         = tuning.grace
         self._call_cap      = tuning.call_cap
         self._forwarded_call_cap = tuning.forwarded_call_cap
         self._call_timeout  = tuning.call_timeout
         self._reap_interval = tuning.reap_interval
         self._event_queue   = tuning.event_queue
+        coalesce = tuning.topology_coalesce
+        if isinstance(coalesce, bool) or not isinstance(coalesce, (int, float)) \
+                or not math.isfinite(coalesce) or coalesce < 0:
+            raise ValueError(f"topology_coalesce={tuning.topology_coalesce!r}:"
+                             f" expected a number of seconds >= 0")
+        self._topo_window   = tuning.topology_coalesce
+        # coalesced topology broadcasts: loop time of the last one, a change
+        # not broadcast yet, the task sending them (``None`` when idle)
+        self._topo_last: float = float('-inf')
+        self._topo_dirty = False
+        self._topo_task: Optional[asyncio.Task] = None
+        # names in the last broadcast, and names registered afresh since
+        # whose removal did not go out yet: the next round first broadcasts
+        # them as gone, so a loss is not coalesced away
+        self._topo_seen: set = set()
+        self._topo_reborn: set = set()
         self._frame_cap     = tuning.frame_cap
         self._ws_compression = utils.resolve_ws_compression(
             tuning.ws_compression, default='on') != 'off'
@@ -412,7 +441,7 @@ class Broker:
                 pass
         return _remove
 
-    def topology_snapshot(self) -> Dict[str, Dict[str, Any]]:
+    def topology_snapshot(self, exclude=frozenset()) -> Dict[str, Dict[str, Any]]:
         """The current rich topology dict (gateway seam).
 
         ``{name: {role, plugins:{pname:{...}}, liveness}}`` including the
@@ -421,7 +450,7 @@ class Broker:
         """
         return protocol.public_topology(
             {name: info.model_dump()
-             for name, info in self._participants_for_topology().items()})
+             for name, info in self._participants_for_topology(exclude).items()})
 
     async def get_ui_modules(self) -> Dict[str, str]:
         """Gateway seam: ``{plugin_name: js_content}`` for broker-hosted
@@ -474,6 +503,9 @@ class Broker:
         self._started = False
         if self._reap_task:
             self._reap_task.cancel()
+        if self._topo_task is not None:
+            self._topo_task.cancel()
+            self._topo_task = None
         for name in list(self.registry):
             self._events.pause_sender(name)
         for name, ws in list(self.registry.items()):
@@ -817,7 +849,7 @@ class Broker:
                 if old is not ws:
                     spawn(self._close_quiet(old), 'broker_close_old')
                 # Broadcast reaches the resumed endpoint too (full topology).
-                await self._broadcast_topology()
+                await self._request_topology()
                 return True, name
 
             log.warning("[Broker] name-in-use (no/invalid resume_key): %s", name)
@@ -834,10 +866,12 @@ class Broker:
             'plugins': self._plugins_list_to_dict(msg.plugins),
         }
         self._events.add_endpoint(name)
+        if name in self._topo_seen:
+            self._topo_reborn.add(name)     # no await between check and claim
 
         await self._send(ws, self._ack(True, key))
         # Broadcast reaches the newcomer too — its full-topology snapshot.
-        await self._broadcast_topology()
+        await self._request_topology()
         return True, name
 
     def _ack(self, ok: bool, resume_key: str,
@@ -1047,7 +1081,7 @@ class Broker:
 
     def _spawn_topology_broadcast(self) -> None:
         """Schedule a full topology rebroadcast on the routing loop."""
-        spawn(self._broadcast_topology(), 'broker_host_topology')
+        spawn(self._request_topology(), 'broker_host_topology')
 
     # ── control ───────────────────────────────────────────────────────
 
@@ -1081,7 +1115,7 @@ class Broker:
         if ws is None:
             return
         self._remove_participant(target)
-        await self._broadcast_topology()
+        await self._request_topology()
         try:
             await self._send(ws, protocol.pack_message(
                 protocol.Control(src=BROKER_NAME, dst=target, op='terminate'),
@@ -1103,14 +1137,14 @@ class Broker:
         if clean:
             # A clean close skips suspect — immediate removal + broadcast.
             self._remove_participant(name)
-            await self._broadcast_topology()
+            await self._request_topology()
             return
 
         self._prof.prof('broker_suspect', uid=name)
         self._liveness[name] = 'suspect'
         # Pause event delivery on the dead socket; buffered events survive.
         self._events.pause_sender(name)
-        await self._broadcast_topology()
+        await self._request_topology()
         self._arm_grace(name, ws)
 
     def _arm_grace(self, name: str, ws) -> None:
@@ -1135,7 +1169,7 @@ class Broker:
         self._prof.prof('broker_lost', uid=name)
         self._remove_participant(name)
         await self._fail_inflight_for(name)
-        await self._broadcast_topology()
+        await self._request_topology()
 
     async def _fail_inflight_for(self, name: str) -> None:
         """Fast-fail every in-flight call touching *name*.
@@ -1245,9 +1279,12 @@ class Broker:
 
     # ── topology ──────────────────────────────────────────────────────
 
-    def _participants_for_topology(self) -> Dict[str, protocol.ParticipantInfo]:
+    def _participants_for_topology(self, exclude=frozenset()
+                                   ) -> Dict[str, protocol.ParticipantInfo]:
         parts: Dict[str, protocol.ParticipantInfo] = {}
         for name, info in self._participants.items():
+            if name in exclude:
+                continue
             parts[name] = protocol.ParticipantInfo(
                 role=info.get('role', 'endpoint'),
                 plugins=info.get('plugins', {}),
@@ -1265,25 +1302,65 @@ class Broker:
             role='broker', plugins=broker_plugins, liveness='present')
         return parts
 
-    def _build_topology_msg(self) -> bytes:
+    def _build_topology_msg(self, exclude=frozenset()) -> bytes:
         topo = protocol.Topology(src=BROKER_NAME,
-                                 participants=self._participants_for_topology())
+                                 participants=self._participants_for_topology(
+                                     exclude))
         return protocol.pack_message(topo, cap=self._frame_cap)
 
-    async def _broadcast_topology(self) -> None:
-        packed = self._build_topology_msg()
+    async def _request_topology(self) -> None:
+        """Broadcast the topology after a change, coalesced.
+
+        At most one broadcast is pending or in flight at a time; the next
+        starts ``topology_coalesce`` after the previous one ended and
+        carries every change made meanwhile (its snapshot is built when it
+        is sent).  The first change after a quiet window goes out at once.
+        Each broadcast costs one frame per participant, and in-process
+        participants decode it on the broker's GIL, so one per change would
+        make a burst of N registrations cost O(N^2) and could stall the loop
+        past the keepalive deadline."""
+        if not self._started:
+            return
+        self._topo_dirty = True
+        if self._topo_task is None:
+            self._topo_task = spawn(self._topology_sender(), 'broker_topology')
+            # after a quiet window, let the broadcast start before the
+            # caller goes on (inside the window the sender just waits)
+            await asyncio.sleep(0)
+
+    async def _topology_sender(self) -> None:
+        loop = asyncio.get_running_loop()
+        try:
+            while self._topo_dirty:
+                wait = self._topo_last + self._topo_window - loop.time()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                self._topo_dirty = False    # changes from here on: next round
+                if self._topo_reborn:
+                    reborn = frozenset(self._topo_reborn)
+                    self._topo_reborn.clear()
+                    await self._broadcast_topology(exclude=reborn)
+                await self._broadcast_topology()
+                self._topo_last = loop.time()
+        finally:
+            if self._topo_task is asyncio.current_task():
+                self._topo_task = None
+
+    async def _broadcast_topology(self, exclude=frozenset()) -> None:
+        self._topo_seen = set(self._participants) - exclude
+        packed = self._build_topology_msg(exclude)
         for name, ws in list(self.registry.items()):
             await self._send(ws, packed)
         # Deliver the rich topology to the hosted-plugin host (task_dispatcher
         # consumes it for pilot-child liveness).
-        self._deliver_topology_to_host()
+        self._deliver_topology_to_host(exclude)
         # Notify in-process topology listeners (the gateway's SSE fan-out).
         for cb in list(self._topology_listeners):
             try:    cb()
             except Exception as e:
                 log.error("[Broker] topology listener failed: %r", e, exc_info=e)
 
-    def _deliver_topology_to_host(self) -> None:
+    def _deliver_topology_to_host(self, exclude=frozenset()) -> None:
         """Hand the rich topology to hosted plugins on the host loop.
 
         Synthesizes a ``liveness='lost'`` entry for a participant that was
@@ -1294,7 +1371,7 @@ class Broker:
         never ``present`` in this broker's view)."""
         if self._plugin_host is None or self._host_loop is None:
             return
-        curr = self.topology_snapshot()
+        curr = self.topology_snapshot(exclude)
         participants = dict(curr)
         for name, info in self._host_topology_prev.items():
             if name in curr:

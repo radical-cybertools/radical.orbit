@@ -49,6 +49,15 @@ payload:
 Liveness is transport-level only (WebSocket keepalive); there is no app-level
 heartbeat kind. A frame-size cap bounds each frame.
 
+The keepalive deadline (a socket whose pong is this late is closed) is 3 s
+on both ends by default.  `RADICAL_ORBIT_PING_TIMEOUT` sets it for the
+broker (`BrokerTuning.ping_timeout`) and every runtime (`ping_timeout=`)
+together; `0` disables it.  A broker hosting hundreds of in-process
+participants (e.g. one per DT service session) needs more: its loop can
+stall longer than 3 s, and every connection would drop at once.  Topology
+changes are coalesced (`BrokerTuning.topology_coalesce`, 0.1 s): one
+broadcast at a time, carrying every change made meanwhile.
+
 WebSocket permessage-deflate is decided per hop by the side that dials.  It
 dominated large payloads on fast links (1 MiB round trips went from ~100 ms
 to 16–19 ms without it; small frames are unaffected), so:
