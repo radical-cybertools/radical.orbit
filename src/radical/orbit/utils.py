@@ -152,17 +152,14 @@ def resolve_ws_compression_rtt_ms(value: Optional[float] = None) -> float:
 # DT service session), so a deployment raises it on both sides together.
 ENV_PING_TIMEOUT = 'RADICAL_ORBIT_PING_TIMEOUT'
 PING_TIMEOUT     = 3.0
-PING_TIMEOUT_UNSET = object()   # "not set": the variable, then the default
 
 
-def resolve_ping_timeout(value: Any = PING_TIMEOUT_UNSET) -> Optional[float]:
+def resolve_ping_timeout(value: Optional[float] = None) -> Optional[float]:
     """Keepalive deadline (s): explicit > ``$RADICAL_ORBIT_PING_TIMEOUT`` >
-    ``PING_TIMEOUT``.  An explicit ``None`` disables the deadline, as uvicorn
-    and ``websockets`` take it.  A value that is not a positive number raises
-    ``ValueError``."""
+    ``PING_TIMEOUT``.  ``0`` disables the deadline (``None`` is returned,
+    which uvicorn and ``websockets`` take as "no deadline"); a negative or
+    non-numeric value raises ``ValueError``."""
     if value is None:
-        return None
-    if value is PING_TIMEOUT_UNSET:
         src, raw = f'${ENV_PING_TIMEOUT}', _env(ENV_PING_TIMEOUT)
         if not raw:
             return PING_TIMEOUT
@@ -172,10 +169,10 @@ def resolve_ping_timeout(value: Any = PING_TIMEOUT_UNSET) -> Optional[float]:
         timeout = float(raw)
     except (TypeError, ValueError):
         timeout = -1.0
-    if not timeout > 0:
-        raise ValueError(f"ping_timeout {src}={raw!r}: expected a positive "
-                         f"number of seconds")
-    return timeout
+    if timeout < 0:
+        raise ValueError(f"ping_timeout {src}={raw!r}: expected a number of "
+                         f"seconds (0 disables)")
+    return timeout or None
 
 
 # Cookie the browser/SSE path carries (set by the broker's POST /auth).  The

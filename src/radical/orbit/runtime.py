@@ -140,8 +140,8 @@ class EndpointRuntime(PluginHostBase):
                      accepted).
         ping_interval: ``websockets`` client keepalive ping cadence (s).
         ping_timeout: ``websockets`` client keepalive pong deadline (s);
-                      unset defers to ``$RADICAL_ORBIT_PING_TIMEOUT``, then
-                      ``utils.PING_TIMEOUT`` (3 s); ``None`` disables it.
+                      ``None`` defers to ``$RADICAL_ORBIT_PING_TIMEOUT``, then
+                      ``utils.PING_TIMEOUT`` (3 s); ``0`` disables it.
 
     The numeric backpressure/backoff/frame-cap tunables are module-level
     constants (``_REQUEST_CAP``, ``_BACKOFF_*`` …), not per-instance knobs; they
@@ -171,7 +171,7 @@ class EndpointRuntime(PluginHostBase):
                  embedded:    bool           = False,
                  app:         Optional[FastAPI] = None,
                  ping_interval:       float = _PING_INTERVAL,
-                 ping_timeout:        Any = utils.PING_TIMEOUT_UNSET,
+                 ping_timeout:        Optional[float] = None,
                  **tuning):
 
         if tunnel not in ('none', 'forward', 'reverse'):

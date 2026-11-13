@@ -1590,7 +1590,7 @@ async def test_burst_of_registrations_shares_broadcasts(make_broker):
         for name, ws in socks.items():
             ok, _ = await _register(broker, name, ws)
             assert ok is True
-        await asyncio.sleep(1.3)
+        await _until(lambda: broker._topo_task is None)
         # 10 changes within one window: the first broadcast at once, the
         # rest in one trailing broadcast
         assert 1 <= len(sent) <= 2
@@ -1654,25 +1654,24 @@ async def test_shutdown_leaves_no_pending_topology_broadcast(make_broker):
     assert broker._topo_task is None
 
 
-@pytest.mark.asyncio
-async def test_a_loss_is_not_coalesced_away_by_a_fresh_reregistration(
-        make_broker):
-    broker = make_broker()
-    broker._topo_window = 0.5
-    await broker.startup()
-    try:
-        watcher, x1, x2 = FakeWS(), FakeWS(), FakeWS()
-        await _register(broker, 'w', watcher)
-        await _register(broker, 'x', x1)        # in w's window: trailing
-        await asyncio.sleep(0.7)                # ... which carried x
-        await broker._on_socket_drop('x', x1, clean=True)   # pending again
-        await _register(broker, 'x', x2)        # a new process, same name
-        await asyncio.sleep(0.7)
-        seen = [('x' in t.participants) for t in _topologies(watcher)]
-        first = seen.index(True)                # x present ...
-        assert False in seen[first:]            # ... then broadcast gone
-    finally:
-        await broker.shutdown()
+@pytest.mark.parametrize('bad', [None, -1, 'soon'])
+def test_topology_coalesce_is_validated(self_signed, tmp_path, monkeypatch,
+                                        bad):
+    from radical.orbit import utils
+    from radical.orbit.broker import Broker, BrokerTuning
+    monkeypatch.setattr(utils, 'TOKEN_FILE', tmp_path / 'broker.token')
+    cert, key = self_signed
+    with pytest.raises(ValueError, match='topology_coalesce'):
+        Broker(cert=str(cert), key=str(key), auth=False,
+               tuning=BrokerTuning(topology_coalesce=bad))
+
+
+async def _until(cond, timeout=5.0):
+    """Wait until *cond* holds (no fixed budget a slow runner can miss)."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not cond():
+        assert asyncio.get_running_loop().time() < deadline, 'never held'
+        await asyncio.sleep(0.01)
 
 
 def test_ping_timeout_defaults_to_three_seconds(make_broker, self_signed,
@@ -1681,7 +1680,7 @@ def test_ping_timeout_defaults_to_three_seconds(make_broker, self_signed,
     from radical.orbit import utils
     from radical.orbit.runtime import EndpointRuntime
     monkeypatch.delenv(utils.ENV_PING_TIMEOUT, raising=False)
-    assert make_broker(ping_timeout=utils.PING_TIMEOUT_UNSET)._ping_timeout == 3.0
+    assert make_broker(ping_timeout=None)._ping_timeout == 3.0
     assert EndpointRuntime(broker_url='https://127.0.0.1:1',
                            cert=cert)._ping_timeout == 3.0
 
@@ -1692,24 +1691,26 @@ def test_ping_timeout_env_reaches_broker_and_runtime(make_broker, self_signed,
     from radical.orbit import utils
     from radical.orbit.runtime import EndpointRuntime
     monkeypatch.setenv(utils.ENV_PING_TIMEOUT, '20')
-    assert make_broker(ping_timeout=utils.PING_TIMEOUT_UNSET)._ping_timeout == 20.0
+    assert make_broker(ping_timeout=None)._ping_timeout == 20.0
     assert EndpointRuntime(broker_url='https://127.0.0.1:1',
                            cert=cert)._ping_timeout == 20.0
-    # an explicit setting wins over the variable, None disables the deadline
+    # an explicit setting wins over the variable; 0 disables the deadline
     assert make_broker(ping_timeout=0.5)._ping_timeout == 0.5
-    assert make_broker(ping_timeout=None)._ping_timeout is None
+    assert make_broker(ping_timeout=0)._ping_timeout is None
     assert EndpointRuntime(broker_url='https://127.0.0.1:1', cert=cert,
                            ping_timeout=0.5)._ping_timeout == 0.5
     assert EndpointRuntime(broker_url='https://127.0.0.1:1', cert=cert,
-                           ping_timeout=None)._ping_timeout is None
+                           ping_timeout=0)._ping_timeout is None
+    monkeypatch.setenv(utils.ENV_PING_TIMEOUT, '0')
+    assert make_broker(ping_timeout=None)._ping_timeout is None
 
 
-@pytest.mark.parametrize('raw', ['0', '-1', 'soon'])
-def test_ping_timeout_env_rejects_non_positive(make_broker, monkeypatch, raw):
+@pytest.mark.parametrize('raw', ['-1', 'soon'])
+def test_ping_timeout_env_rejects_bad_values(make_broker, monkeypatch, raw):
     from radical.orbit import utils
     monkeypatch.setenv(utils.ENV_PING_TIMEOUT, raw)
     with pytest.raises(ValueError, match='RADICAL_ORBIT_PING_TIMEOUT'):
-        make_broker(ping_timeout=utils.PING_TIMEOUT_UNSET)
+        make_broker(ping_timeout=None)
 
 
 class SlowWS(FakeWS):
@@ -1746,11 +1747,10 @@ async def test_changes_during_a_broadcast_wait_for_it(make_broker):
         for _ in range(20):                    # a burst of liveness changes
             await broker._request_topology()
             await asyncio.sleep(0.005)
-        await asyncio.sleep(0.6)
+        await _until(lambda: broker._topo_task is None)
         # each broadcast takes about 0.1 s: far fewer broadcasts than
         # changes, and never two at once
         assert 1 <= len(sent) <= 10
         assert SlowWS.peak == 1
-        assert broker._topo_task is None
     finally:
         await broker.shutdown()

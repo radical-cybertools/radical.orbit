@@ -90,8 +90,8 @@ class BrokerTuning:
 
     * ``ping_interval`` / ``ping_timeout`` — uvicorn WS keepalive; a silent
       socket is closed at ``ping_interval + ping_timeout``.  ``ping_timeout``
-      unset defers to ``$RADICAL_ORBIT_PING_TIMEOUT``, then 3 s (the same
-      variable sets the runtimes' deadline); ``None`` disables it.
+      ``None`` defers to ``$RADICAL_ORBIT_PING_TIMEOUT``, then 3 s (the same
+      variable sets the runtimes' deadline); ``0`` disables it.
     * ``grace`` — the ``suspect`` → ``lost`` window.
     * ``call_cap`` — a cap on **broker-originated** in-flight calls (the only
       calls the broker itself waits on); overflow raises at the caller.
@@ -107,7 +107,11 @@ class BrokerTuning:
       earlier than this long after the previous one ended, and it carries
       every change made meanwhile, so a burst of registrations or drops
       sends one snapshot instead of one per change.  The first change after
-      a quiet window is broadcast at once.
+      a quiet window is broadcast at once.  A participant removed and
+      registered afresh under the same name within one window appears in
+      no snapshot as gone, so a consumer that infers a loss from absence
+      misses that one (a per-registration incarnation in the topology would
+      make it visible).
     * ``ws_compression`` — accept WS permessage-deflate when a client offers
       it (uvicorn ``ws_per_message_deflate``); ``None`` defers to
       ``$RADICAL_ORBIT_WS_COMPRESSION``, unset means accept.  Only ``off``
@@ -115,7 +119,7 @@ class BrokerTuning:
     """
 
     ping_interval: float = 1.0
-    ping_timeout:  Any = utils.PING_TIMEOUT_UNSET
+    ping_timeout:  Optional[float] = None
     grace:         float = 10.0
     call_cap:      int   = 1024
     forwarded_call_cap: int = 4096
@@ -298,16 +302,16 @@ class Broker:
         self._call_timeout  = tuning.call_timeout
         self._reap_interval = tuning.reap_interval
         self._event_queue   = tuning.event_queue
+        if not isinstance(tuning.topology_coalesce, (int, float)) \
+                or tuning.topology_coalesce < 0:
+            raise ValueError(f"topology_coalesce={tuning.topology_coalesce!r}:"
+                             f" expected a number of seconds >= 0")
         self._topo_window   = tuning.topology_coalesce
         # coalesced topology broadcasts: loop time of the last one, a change
         # not broadcast yet, the task sending them (``None`` when idle)
         self._topo_last: float = float('-inf')
         self._topo_dirty = False
         self._topo_task: Optional[asyncio.Task] = None
-        # names removed since the last snapshot: a fresh registration under
-        # one of them flushes a snapshot first, so its loss is not coalesced
-        # away (a consumer must see it gone before it reappears)
-        self._topo_gone: set = set()
         self._frame_cap     = tuning.frame_cap
         self._ws_compression = utils.resolve_ws_compression(
             tuning.ws_compression, default='on') != 'off'
@@ -847,8 +851,6 @@ class Broker:
             return False, None
 
         # Fresh registration.
-        if name in self._topo_gone:
-            await self._broadcast_topology()
         key = protocol.mint_id()
         self.registry[name]       = ws
         self._resume_keys[name]   = key
@@ -1245,7 +1247,6 @@ class Broker:
         self._resume_keys.pop(name, None)
         self._cancel_grace(name)
         self._events.remove_endpoint(name)
-        self._topo_gone.add(name)
 
     # ── call reaper ───────────────────────────────────────────────────
 
@@ -1330,7 +1331,6 @@ class Broker:
                 self._topo_task = None
 
     async def _broadcast_topology(self) -> None:
-        self._topo_gone.clear()
         packed = self._build_topology_msg()
         for name, ws in list(self.registry.items()):
             await self._send(ws, packed)
