@@ -288,8 +288,10 @@ class EndpointRuntime(PluginHostBase):
         # ``start(wait=True)`` so callers never sit on a dead runtime.
         self._fatal_reason: Optional[str] = None
         self._registered = threading.Event()
-        # Set once the first topology frame lands (the broker sends it right
-        # after register_ack) so start(wait=True) can also wait for it.
+        # Set once the first topology frame lands (the broker sends it after
+        # register_ack, coalesced with other changes: within one
+        # ``topology_coalesce`` window plus any broadcast in flight) so
+        # start(wait=True) can also wait for it.
         self._topology_ready = threading.Event()
         self._transport_future = None
 

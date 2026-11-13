@@ -6,6 +6,7 @@ belongs in its own module.
 """
 
 import hmac
+import math
 import os
 import socket
 import ssl
@@ -169,7 +170,7 @@ def resolve_ping_timeout(value: Optional[float] = None) -> Optional[float]:
         timeout = float(raw)
     except (TypeError, ValueError):
         timeout = -1.0
-    if timeout < 0:
+    if not math.isfinite(timeout) or timeout < 0:
         raise ValueError(f"ping_timeout {src}={raw!r}: expected a number of "
                          f"seconds (0 disables)")
     return timeout or None

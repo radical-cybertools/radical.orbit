@@ -707,6 +707,23 @@ def test_broker_cert_path_travels_only_to_shared_members(
     assert envs['m_remote']['RADICAL_ORBIT_SCRATCH_BASE'] == '/pscratch/u/atomic'
 
 
+def test_pilots_inherit_the_keepalive_deadline(harness, tmp_path, monkeypatch):
+    """A raised keepalive deadline only helps if both ends use it: pilot
+    children inherit the broker's $RADICAL_ORBIT_PING_TIMEOUT."""
+    monkeypatch.setenv('RADICAL_ORBIT_PING_TIMEOUT', '20')
+    monkeypatch.setenv('RADICAL_ORBIT_SCRATCH_BASE', str(tmp_path))
+    fed = _Fed(harness, [_member('m_remote', ['y'], shared_fs=False,
+                                 scratch_base='/pscratch/u/atomic')],
+               tmp_path)
+    _FakePsij.submitted.clear()
+    pid = fed.on_loop(
+        lambda: fed.td._submit_pilot(fed.ps, None, member_id='m_remote'))
+    assert fed.wait(lambda: fed.ps.pilots[pid].child_endpoint_name)
+    assert fed.wait(lambda: len(_FakePsij.submitted) == 1)
+    env = _FakePsij.submitted[0]['job_spec']['environment']
+    assert env['RADICAL_ORBIT_PING_TIMEOUT'] == '20'
+
+
 # ---------------------------------------------------------------------------
 # An endpoint inside an allocation IS the pilot (plan 122)
 #
