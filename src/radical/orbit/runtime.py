@@ -109,6 +109,7 @@ _TUNING_KEYS = {'request_concurrency', 'accept_queue', 'callback_queue',
                 'ws_compression', 'ws_compression_rtt_ms'}
 
 _WS_PROBE_TIMEOUT = 2.0   # ``auto`` deflate: TCP connect probe deadline (s)
+_WS_PROBES        = 3     # ``auto`` deflate: connects timed; the fastest counts
 
 
 # ---------------------------------------------------------------------------
@@ -622,18 +623,38 @@ class EndpointRuntime(PluginHostBase):
                     compression=None,
                     extensions=extensions)
 
-    async def _probe_connect_ms(self, host: str, port: int
+    async def _probe_connect_ms(self, host: str, port: int,
+                                timeout: float = _WS_PROBE_TIMEOUT
                                 ) -> Optional[float]:
         """Time a plain TCP connect to *host*:*port* (ms); ``None`` on error."""
         t0 = time.monotonic()
         try:
             _, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port), _WS_PROBE_TIMEOUT)
+                asyncio.open_connection(host, port), timeout)
         except (OSError, asyncio.TimeoutError):
             return None
         ms = (time.monotonic() - t0) * 1000.0
         writer.close()
         return ms
+
+    async def _probe_rtt_ms(self, host: str, port: int) -> Optional[float]:
+        """The fastest of up to ``_WS_PROBES`` connects within
+        ``_WS_PROBE_TIMEOUT`` (ms): one slow connect, e.g. while many
+        clients start at once, does not decide alone.  Stops at the first
+        connect under the threshold; ``None`` when no connect succeeded."""
+        deadline = time.monotonic() + _WS_PROBE_TIMEOUT
+        best     = None
+        for _ in range(_WS_PROBES):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            ms = await self._probe_connect_ms(host, port, left)
+            if ms is None:
+                break
+            best = ms if best is None else min(best, ms)
+            if best < self._ws_compression_rtt_ms:
+                break
+        return best
 
     @staticmethod
     def _ws_proxy(ws_url: str) -> Optional[str]:
@@ -658,7 +679,7 @@ class EndpointRuntime(PluginHostBase):
             return True
         u    = urlparse(ws_url)
         port = u.port or (443 if u.scheme == 'wss' else 80)
-        ms   = await self._probe_connect_ms(u.hostname, port)
+        ms   = await self._probe_rtt_ms(u.hostname, port)
         # A failed probe means off; the real connect reports the error.
         deflate = ms is not None and ms >= self._ws_compression_rtt_ms
         log.info("[Runtime] ws_compression=auto: connect %s ms (threshold "

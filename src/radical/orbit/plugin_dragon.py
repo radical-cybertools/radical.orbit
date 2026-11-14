@@ -58,8 +58,10 @@ from concurrent.futures import Executor, Future
 from concurrent.futures import TimeoutError as FutureTimeout
 from typing import Any, Dict, List, Optional
 
+import msgpack
 from fastapi import FastAPI, HTTPException
 from starlette.requests import Request
+from starlette.responses import Response
 
 from .client import PluginClient
 from .dragon_workers import (WorkerError, WorkerPool, batch_put,
@@ -93,6 +95,8 @@ NATIVE           = 'native'            # _rt: running inside a runtime
 # A top-level single-key ``{B64_KEY: ...}`` dict is reserved for that: it
 # cannot be stored as a dict through ORBIT (nested ones can).
 B64_KEY          = '$b64'
+MSGPACK          = 'application/msgpack'    # binary bodies (Python client)
+MP_ITEM          = 16       # msgpack bytes per item beyond key and value
 
 # a module-wide guard: one PluginDragon with the default backend (and so one
 # Dragon thread) per process, see PluginDragon.__init__
@@ -638,17 +642,22 @@ class DragonSession(PluginSession):
         self._check_active()
         return await self._p.ddict_destroy(did)
 
-    async def put(self, did: str, items: Dict[str, Any]) -> dict:
+    async def put(self, did: str, items: Dict[str, Any],
+                  raw: bool = False) -> dict:
+        """*raw*: values arrived as msgpack, bytes as bytes: no decoding."""
         self._check_active()
         self._p.entry(did)
-        try:
-            items = {k: decode_value(v) for k, v in items.items()}
-        except ValueError as e:
-            raise http_exception(e) from e
+        if not raw:
+            try:
+                items = {k: decode_value(v) for k, v in items.items()}
+            except ValueError as e:
+                raise http_exception(e) from e
         return {"n": await self._p.backend.put(did, items)}
 
     async def get(self, did: str, keys: List[str],
-                  values: bool = True) -> dict:
+                  values: bool = True, binary: bool = False) -> dict:
+        """``{items, missing, errors}``.  *binary*: for a msgpack reply,
+        values as stored (bytes stay bytes), sizes from byte lengths."""
         self._check_active()
         self._p.entry(did)
         hint = 'get fewer keys per call'
@@ -657,6 +666,8 @@ class DragonSession(PluginSession):
             self._p.check_reply(len(json.dumps(missing)), hint)
             return {"items": {}, "missing": missing, "errors": {}}
         found, missing = await self._p.backend.get(did, keys)
+        if binary:
+            return self._binary_reply(found, missing, hint)
         items, errors = {}, {}
         # sizes as escaped JSON (ensure_ascii): an upper bound of the reply
         size = len(json.dumps(missing))
@@ -668,7 +679,14 @@ class DragonSession(PluginSession):
                 size += json_str_len(errors[k]) + json_str_len(k) + 4
                 self._p.check_reply(size, hint)
                 continue
-            v = encode_value(v)
+            if isinstance(v, (bytes, bytearray)):
+                # {"$b64": "<base64>"}: plain ASCII, length known
+                v = encode_value(v)
+                size += len(v[B64_KEY]) + len(B64_KEY) + 8
+                items[k] = v
+                size += json_str_len(k) + 4
+                self._p.check_reply(size, hint)
+                continue
             try:
                 # strict JSON: the reply renderer rejects NaN / inf
                 size += json_value_len(v)
@@ -680,6 +698,29 @@ class DragonSession(PluginSession):
             size += json_str_len(k) + 4
             self._p.check_reply(size, hint)
         self._p.check_reply(size, hint)     # also when nothing was found
+        return {"items": items, "missing": missing, "errors": errors}
+
+    def _binary_reply(self, found: dict, missing: list, hint: str) -> dict:
+        """The get reply for a msgpack client: values as stored; its size
+        bound from byte lengths (bytes, str) or the packed value."""
+        items, errors = {}, {}
+        size = MP_ITEM + sum(len(k) + MP_ITEM for k in missing)
+        for k, v in found.items():
+            if isinstance(v, (bytes, bytearray, str)):
+                n = len(v) if not isinstance(v, str) else 4 * len(v)
+            else:
+                try:
+                    n = len(msgpack.packb(v, use_bin_type=True))
+                except (TypeError, ValueError, OverflowError):
+                    errors[k] = f"value of type {type(v).__name__} is not " \
+                                f"msgpack-serializable"
+                    size += len(errors[k]) + len(k) + MP_ITEM
+                    self._p.check_reply(size, hint)
+                    continue
+            items[k] = v
+            size += n + len(k) + MP_ITEM
+            self._p.check_reply(size, hint)
+        self._p.check_reply(size, hint)
         return {"items": items, "missing": missing, "errors": errors}
 
     async def keys(self, did: str) -> dict:
@@ -758,9 +799,8 @@ class DDictHandle:
             # the wire form of bytes: it would read back as bytes
             raise ValueError(f"{bad[0]!r}: a dict with the single key "
                              f"{B64_KEY!r} is reserved for bytes")
-        self._client._call('POST', 'ddict/put/{sid}', id=self.id,
-                           items={k: encode_value(v)
-                                  for k, v in items.items()})
+        self._client._call_binary('ddict/put/{sid}', id=self.id,
+                                  items=dict(items))
 
     def __getitem__(self, key: str) -> Any:
         r = self.get_many([key])
@@ -778,11 +818,12 @@ class DDictHandle:
 
     def get_many(self, keys: List[str]) -> dict:
         """``{items, missing, errors}`` for *keys*, values decoded."""
-        r = self._client._call('POST', 'ddict/get/{sid}', id=self.id,
-                               keys=list(keys))
-        # the server reports marker-shaped native values in 'errors': the
-        # items hold only values it encoded
-        r['items'] = {k: decode_value(v) for k, v in r['items'].items()}
+        r, binary = self._client._call_binary('ddict/get/{sid}', id=self.id,
+                                              keys=list(keys))
+        if not binary:
+            # JSON (an older endpoint): the server reports marker-shaped
+            # native values in 'errors', the items hold only values it encoded
+            r['items'] = {k: decode_value(v) for k, v in r['items'].items()}
         return r
 
     def __contains__(self, key: str) -> bool:
@@ -859,6 +900,21 @@ class DragonClient(PluginClient):
                else self._request(method, url)
         self._raise(resp, path.split('/{sid}')[0])
         return resp.json()
+
+    def _call_binary(self, path: str, **body) -> tuple:
+        """A POST with a msgpack body (bytes travel as bytes), asking for a
+        msgpack reply; returns ``(reply, binary)``: *binary* is false when
+        the endpoint answered JSON (an older plugin)."""
+        self._require_session()
+        url  = self._url(path.format(sid=self.sid))
+        resp = self._request('POST', url,
+                             content=msgpack.packb(body, use_bin_type=True),
+                             headers={'content-type': MSGPACK,
+                                      'accept': MSGPACK})
+        self._raise(resp, path.split('/{sid}')[0])
+        if MSGPACK in (resp.headers.get('content-type') or ''):
+            return msgpack.unpackb(resp.content, raw=False), True
+        return resp.json(), False
 
 
 # ------------------------------------------------------------------------
@@ -1024,13 +1080,29 @@ class PluginDragon(Plugin):
     # -- route handlers --------------------------------------------------------
 
     @staticmethod
+    def _is_msgpack(request: Request) -> bool:
+        """Whether the request body is msgpack (raw values)."""
+        ct = Plugin._request_header(request, 'content-type') or ''
+        return MSGPACK in ct
+
+    @staticmethod
+    def _wants_msgpack(request: Request) -> bool:
+        """Whether the caller accepts a msgpack reply."""
+        return MSGPACK in (Plugin._request_header(request, 'accept') or '')
+
+    @staticmethod
     async def _body(request: Request, *required: str) -> dict:
         try:
-            body = await request.json()
+            if PluginDragon._is_msgpack(request):
+                # also for a starlette Request, whose json() is JSON only
+                body = msgpack.unpackb(await request.body(), raw=False)
+            else:
+                body = await request.json()
         except ValueError:
             body = None
         if not isinstance(body, dict):
-            raise http_exception(ValueError("body must be a JSON object"))
+            raise http_exception(ValueError("body must be a JSON or msgpack "
+                                            "object"))
         for field in required:
             if field not in body:
                 raise http_exception(ValueError(f"missing field {field!r}"))
@@ -1108,7 +1180,7 @@ class PluginDragon(Plugin):
             raise http_exception(ValueError("'items' must be an object"))
         return await self._forward(request.path_params['sid'],
                                    DragonSession.put, did=body['id'],
-                                   items=items)
+                                   items=items, raw=self._is_msgpack(request))
 
     async def r_get(self, request: Request) -> dict:
         """``POST ddict/get/{sid}``: ``{id, keys, values?}`` ->
@@ -1118,10 +1190,15 @@ class PluginDragon(Plugin):
         values = body.get('values', True)
         if not isinstance(values, bool):
             raise http_exception(ValueError("'values' must be a boolean"))
-        return await self._forward(request.path_params['sid'],
-                                   DragonSession.get, did=body['id'],
-                                   keys=self._str_list(body, 'keys'),
-                                   values=values)
+        binary = values and self._wants_msgpack(request)
+        reply  = await self._forward(request.path_params['sid'],
+                                     DragonSession.get, did=body['id'],
+                                     keys=self._str_list(body, 'keys'),
+                                     values=values, binary=binary)
+        if binary:
+            return Response(content=msgpack.packb(reply, use_bin_type=True),
+                            media_type=MSGPACK)
+        return reply
 
     async def r_keys(self, request: Request) -> dict:
         """``POST ddict/keys/{sid}``: ``{id}`` -> ``{keys, n_other}``."""

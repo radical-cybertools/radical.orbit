@@ -132,9 +132,11 @@ def _offer(rt, probe_ms=None):
     """Run the per-connect decision with an injected probe; record calls."""
     calls = []
 
-    async def _probe(host, port):
+    seq = list(probe_ms) if isinstance(probe_ms, (list, tuple)) else None
+
+    async def _probe(host, port, timeout=None):
         calls.append((host, port))
-        return probe_ms
+        return seq.pop(0) if seq is not None else probe_ms
 
     rt._probe_connect_ms = _probe
     return asyncio.run(rt._offer_deflate(rt._ws_url())), calls
@@ -187,7 +189,8 @@ def test_runtime_fixed_modes_skip_probe(mode, expected):
 def test_runtime_auto_by_connect_time(probe_ms, expected):
     offer, calls = _offer(_runtime(), probe_ms=probe_ms)
     assert offer is expected
-    assert calls == [('127.0.0.1', 1)]
+    # a slow connect is timed again (the fastest of 3 decides)
+    assert calls == [('127.0.0.1', 1)] * (3 if expected else 1)
 
 
 def test_runtime_auto_threshold_tunable(monkeypatch):
@@ -214,3 +217,17 @@ def test_runtime_connect_kwargs():
     [ext] = on['extensions']
     assert isinstance(ext, ClientPerMessageDeflateFactory)
     assert ext.compress_settings == {'level': 1}
+
+
+def test_runtime_auto_fastest_of_probes_decides():
+    # one slow connect (a start-up burst) does not turn deflate on
+    offer, calls = _offer(_runtime(), probe_ms=[40.0, 0.5, 30.0])
+    assert offer is False and len(calls) == 2       # stops under threshold
+    # slow every time: a remote broker, deflate on after all probes
+    offer, calls = _offer(_runtime(), probe_ms=[40.0, 35.0, 50.0])
+    assert offer is True and len(calls) == 3
+    # a failed probe ends the probing; the best so far decides
+    offer, calls = _offer(_runtime(), probe_ms=[40.0, None])
+    assert offer is True and len(calls) == 2
+    offer, calls = _offer(_runtime(), probe_ms=[None])
+    assert offer is False and len(calls) == 1

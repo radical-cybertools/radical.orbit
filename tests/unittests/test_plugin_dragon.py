@@ -983,9 +983,47 @@ def test_client_malformed_marker_is_per_key_error(client, env):
     dd = client.ddict.create()
     dd.update({'ok': 1})
     backend._ddicts[dd.id]['bad'] = {'$b64': '###'}     # written in-runtime
+    # msgpack (the Python client): unambiguous, the value as stored
     r = dd.get_many(['ok', 'bad'])
+    assert r['items'] == {'ok': 1, 'bad': {'$b64': '###'}}
+    # JSON callers: it would read back as bytes, so a per-key error
+    r = client._call('POST', 'ddict/get/{sid}', id=dd.id, keys=['ok', 'bad'])
     assert r['items'] == {'ok': 1}
     assert 'bad' in r['errors']
+
+
+def test_client_bytes_travel_as_msgpack(client, env):
+    _, backend, _, _ = env
+    dd = client.ddict.create()
+    dd.update({'b': b'\x00\xff' * 600, 's': 'x', 'n': [1, {'a': None}]})
+    stored = backend._ddicts[dd.id]
+    assert stored['b'] == b'\x00\xff' * 600        # no base64 on the way in
+    r = dd.get_many(['b', 's', 'n', 'gone'])
+    assert r['items'] == {'b': b'\x00\xff' * 600, 's': 'x',
+                          'n': [1, {'a': None}]}
+    assert r['missing'] == ['gone'] and r['errors'] == {}
+    # the JSON wire form is unchanged for HTTP callers
+    r = client._call('POST', 'ddict/get/{sid}', id=dd.id, keys=['b'])
+    assert r['items']['b'] == encode_value(b'\x00\xff' * 600)
+
+
+def test_binary_reply_size_bound(client, env):
+    plugin = env[0]
+    dd = client.ddict.create()
+    dd.update({f'k{i}': b'x' * 1000 for i in range(8)})
+    plugin.reply_limit = 4 * (1000 + 2 + 16) + 16    # room for 4 values
+    with pytest.raises(RuntimeError, match='413'):
+        dd.get_many([f'k{i}' for i in range(8)])
+    assert len(dd.get_many(['k0', 'k1', 'k2'])['items']) == 3
+
+
+def test_client_falls_back_to_json_reply(client, env, monkeypatch):
+    # an older endpoint answers JSON even when asked for msgpack
+    monkeypatch.setattr(PluginDragon, '_wants_msgpack',
+                        staticmethod(lambda request: False))
+    dd = client.ddict.create()
+    dd['b'] = b'abc'
+    assert dd['b'] == b'abc'
 
 
 def test_client_rejects_non_str_keys(client):

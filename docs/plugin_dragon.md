@@ -101,7 +101,18 @@ inside the runtime is reported per key in `errors` (nested ones are plain
 dicts).  A value written inside the runtime that
 is neither (e.g. a numpy array) is reported per key in `errors`.  A `get`
 reply above half the transport frame cap fails with 413: get fewer keys per
-call.
+call; the bound is computed from value lengths, without encoding twice.
+
+The Python client (`DDictHandle.update`, `get_many` and the item
+operations built on them) sends msgpack bodies (`content-type:
+application/msgpack`) and asks for a msgpack reply (`accept`): values,
+bytes included, travel as they are, with no base64 and no JSON (the
+endpoint's work loop spent most of its time there, phase 6 on
+Perlmutter).  Values are then what msgpack can carry (ints up to 64 bit;
+a tuple reads back as a list), and a marker-shaped dict reads back as
+stored.  An endpoint without msgpack replies answers JSON, which the
+client decodes as before.  HTTP callers (gateway, Explorer) keep the JSON
+form above.
 
 ## Client API
 
