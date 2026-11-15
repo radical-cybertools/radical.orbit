@@ -51,7 +51,14 @@ per 0.4 ms. With `RADICAL_ORBIT_DRAGON_WORKERS=N` the endpoint instead
 starts N Dragon processes in the runtime, round-robin over its nodes, and
 runs put, get, presence checks and pop there. Each worker attaches the
 DDicts by descriptor and serves one request at a time; a multi-key request
-is split across the workers by key hash and the parts run in parallel.
+is cut into chunks of `RADICAL_ORBIT_DRAGON_KEYS_PER_REQUEST` keys (default
+16), each sent to the least busy worker, and the chunks run in parallel.
+Splitting a call over every worker cost more than it gained from 32
+workers on (phase 8 on Perlmutter: 32 to 46 requests per 64-key call through
+one event loop). A key with a put or pop in flight goes to that worker
+until it is answered, so a later write or read of it cannot overtake the
+write (each worker serves its requests in order). `0` restores the old
+routing: every key to a fixed worker by crc32.
 Create, destroy, `keys`, `len` and `clear` stay on the endpoint's thread.
 Workers connect back to the endpoint over TCP (to `$(hostname)`, or
 `$RADICAL_ORBIT_DRAGON_WORKER_HOST`), authenticated with a per-endpoint

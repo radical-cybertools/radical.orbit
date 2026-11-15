@@ -48,6 +48,9 @@ ENV_WORKERS      = 'RADICAL_ORBIT_DRAGON_WORKERS'
 ENV_WORKER_HOST  = 'RADICAL_ORBIT_DRAGON_WORKER_HOST'
 ENV_SECRET       = 'RADICAL_ORBIT_DRAGON_WORKER_SECRET'
 ENV_BATCH_PUTS   = 'RADICAL_ORBIT_DRAGON_BATCH_PUTS'
+ENV_KEYS_PER_REQ = 'RADICAL_ORBIT_DRAGON_KEYS_PER_REQUEST'
+KEYS_PER_REQ     = 16       # keys per worker request; 0: one fixed worker per key
+WRITE_HIGH       = 1 << 20  # bytes queued to a worker before a send waits
 MAX_WORKERS      = 256
 HELLO_TIMEOUT    = 120                  # s, all workers connected
 STOP_TIMEOUT     = 10                   # s, workers acknowledge exit
@@ -107,6 +110,24 @@ def _recv(sock: socket.socket) -> Optional[Any]:
         raise ValueError(f"frame of {n} bytes")
     body = _recv_exact(sock, n)
     return None if body is None else _unpack(body)
+
+
+def keys_per_request() -> int:
+    """Keys per worker request (``$RADICAL_ORBIT_DRAGON_KEYS_PER_REQUEST``,
+    default 16): a call is cut into chunks of that many keys, each sent to
+    the least busy worker; ``0`` routes every key to a fixed worker (crc32),
+    so a call fans out to up to one request per worker."""
+    raw = os.environ.get(ENV_KEYS_PER_REQ, '').strip()
+    if not raw:
+        return KEYS_PER_REQ
+    try:
+        n = int(raw)
+    except ValueError:
+        n = -1
+    if n < 0:
+        raise ValueError(f"{ENV_KEYS_PER_REQ}={raw!r}: expected an integer "
+                         f">= 0")
+    return n
 
 
 def batch_puts() -> bool:
@@ -279,6 +300,9 @@ class _Conn:
     so the next request is already in the worker's socket when it finishes
     one: a worker idles about 1 ms per request otherwise.  The worker
     serves them in order, so replies are matched to requests by order.
+    Sending is synchronous on the event loop (no lock); it waits only when
+    more than ``WRITE_HIGH`` bytes are queued.  Replies are read in chunks
+    and every complete frame in a chunk is resolved at once.
     """
 
     def __init__(self, wid: int, reader, writer, info: dict):
@@ -286,21 +310,36 @@ class _Conn:
         self.reader   = reader
         self.writer   = writer
         self.info     = info
-        self._send    = asyncio.Lock()      # one frame at a time on the wire
         self._pending: collections.deque = collections.deque()
         self._dead: Optional[WorkerError] = None
         self._reader  = asyncio.ensure_future(self._read_replies())
 
+    @property
+    def load(self) -> int:
+        """Requests sent and not yet answered."""
+        return len(self._pending)
+
     async def _read_replies(self) -> None:
+        buf, head = bytearray(), _LEN.size
         try:
             while True:
-                head = await self.reader.readexactly(_LEN.size)
-                n,   = _LEN.unpack(head)
-                body = await self.reader.readexactly(n)
-                fut  = self._pending.popleft()
-                if not fut.done():          # its caller may have given up
-                    fut.set_result(body)
-        except (OSError, asyncio.IncompleteReadError, IndexError) as e:
+                chunk = await self.reader.read(1 << 18)
+                if not chunk:
+                    raise OSError("connection closed by the worker")
+                buf += chunk
+                pos = 0
+                while len(buf) - pos >= head:
+                    n, = _LEN.unpack_from(buf, pos)
+                    if len(buf) - pos - head < n:
+                        break
+                    body = bytes(buf[pos + head:pos + head + n])
+                    pos += head + n
+                    fut = self._pending.popleft()
+                    if not fut.done():      # its caller may have given up
+                        fut.set_result(body)
+                if pos:
+                    del buf[:pos]
+        except (OSError, IndexError) as e:
             self._fail(WorkerError(f"worker {self.wid} went away: {e}"))
         except asyncio.CancelledError:
             self._fail(WorkerError(f"worker {self.wid}: connection closed"))
@@ -313,18 +352,33 @@ class _Conn:
             if not fut.done():
                 fut.set_exception(err)
 
-    async def call(self, msg: dict) -> Any:
-        if self._dead is not None:
-            raise self._dead
+    def submit(self, msg: dict) -> asyncio.Future:
+        """Send *msg* now; the future resolves to the raw reply body
+        (decode it with :meth:`result`).  Synchronous: requests submitted
+        one after another reach the worker in that order."""
         fut = asyncio.get_running_loop().create_future()
-        async with self._send:
-            self._pending.append(fut)
+        if self._dead is not None:
+            fut.set_exception(self._dead)
+            return fut
+        self._pending.append(fut)
+        try:
+            self.writer.write(_pack(msg))
+        except OSError as e:
+            self._fail(WorkerError(f"worker {self.wid} went away: {e}"))
+        return fut
+
+    async def flush(self) -> None:
+        """Wait while too much is queued to the worker (back pressure)."""
+        transport = self.writer.transport
+        if transport is not None and \
+                transport.get_write_buffer_size() > WRITE_HIGH:
             try:
-                self.writer.write(_pack(msg))
                 await self.writer.drain()
             except OSError as e:
                 self._fail(WorkerError(f"worker {self.wid} went away: {e}"))
-        body  = await fut
+
+    def result(self, body: bytes) -> Any:
+        """The result of a reply body; raises what the worker raised."""
         reply = _unpack(body)
         if not reply.get('ok'):
             if reply.get('type') == 'KeyError':
@@ -332,6 +386,11 @@ class _Conn:
             raise WorkerError(f"worker {self.wid}: {reply.get('type')}: "
                               f"{reply.get('error')}")
         return reply.get('result')
+
+    async def call(self, msg: dict) -> Any:
+        fut = self.submit(msg)
+        await self.flush()
+        return self.result(await fut)
 
 
 class WorkerPool:
@@ -348,6 +407,12 @@ class WorkerPool:
         self._spawn   = spawn
         self._secret  = secrets.token_urlsafe(32)
         self._conns: Dict[int, _Conn] = {}
+        self._kpr     = keys_per_request()
+        # (did, key) -> [worker, writes in flight]: a key being written is
+        # served by that worker until the writes are answered, so a later
+        # write (or read) of it cannot overtake them
+        self._pinned: Dict[tuple, list] = {}
+        self._rr      = 0
         self._server  = None
         self._all_in  = None
         self.procs    = None                # whatever spawn returned
@@ -402,29 +467,102 @@ class WorkerPool:
 
     # -- requests --------------------------------------------------------------
 
+    def _split(self, did: str, keys) -> Dict[int, list]:
+        """Worker -> keys for one call.  Keys pinned by a write in flight go
+        to their worker; the rest in chunks of ``keys_per_request()`` to
+        the least busy workers (or, with ``0``, to a fixed worker each)."""
+        parts: Dict[int, list] = {}
+        if not self._kpr:
+            for k in keys:
+                parts.setdefault(route(k, self.n), []).append(k)
+            return parts
+        free = []
+        pinned = self._pinned
+        for k in keys:
+            p = pinned.get((did, k)) if pinned else None
+            if p is None:
+                free.append(k)
+            else:
+                parts.setdefault(p[0], []).append(k)
+        kpr = self._kpr
+        for i in range(0, len(free), kpr):
+            wid = self._least_busy(parts)
+            parts.setdefault(wid, []).extend(free[i:i + kpr])
+        return parts
+
+    def _least_busy(self, parts: Dict[int, list]) -> int:
+        """The worker with the fewest requests in flight, counting those of
+        this call; ties go round robin."""
+        n, conns, start = self.n, self._conns, self._rr
+        best, best_load = start % n, None
+        for j in range(n):
+            wid  = (start + j) % n
+            load = conns[wid].load + (wid in parts)
+            if best_load is None or load < best_load:
+                best, best_load = wid, load
+                if not load:
+                    break
+        self._rr = best + 1
+        return best
+
+    def _pin(self, did: str, parts: Dict[int, list]) -> None:
+        for wid, ks in parts.items():
+            for k in ks:
+                p = self._pinned.get((did, k))
+                if p is None:
+                    self._pinned[(did, k)] = [wid, 1]
+                else:
+                    p[1] += 1
+
+    def _unpin(self, did: str, parts: Dict[int, list]) -> None:
+        for ks in parts.values():
+            for k in ks:
+                p = self._pinned.get((did, k))
+                if p is not None:
+                    p[1] -= 1
+                    if p[1] <= 0:
+                        del self._pinned[(did, k)]
+
+    async def _fan(self, op: str, did: str, desc: str, keys, args_of,
+                   write: bool) -> list:
+        """Send one request per part, all before any await (so the pins
+        and the send order are set together); return the results."""
+        parts = self._split(did, keys)
+        if write and self._kpr:
+            self._pin(did, parts)
+        conns = [self._conns[w] for w in parts]
+        futs  = [c.submit({'op': op, 'did': did, 'desc': desc,
+                           'args': args_of(ks)})
+                 for c, ks in zip(conns, parts.values())]
+        try:
+            for c in conns:
+                await c.flush()
+            bodies = await asyncio.gather(*futs, return_exceptions=True)
+        finally:
+            if write and self._kpr:
+                self._unpin(did, parts)
+        out = []
+        for c, b in zip(conns, bodies):
+            if isinstance(b, BaseException):
+                raise b
+            out.append(c.result(b))
+        return out
+
     async def _on(self, wid: int, op: str, did: str, desc: str,
                   args: dict) -> Any:
         return await self._conns[wid].call({'op': op, 'did': did,
                                             'desc': desc, 'args': args})
 
-    def _split(self, keys) -> Dict[int, list]:
-        parts: Dict[int, list] = {}
-        for k in keys:
-            parts.setdefault(route(k, self.n), []).append(k)
-        return parts
-
     async def put(self, did: str, desc: str, items: Dict[str, Any]) -> int:
-        parts = self._split(items)
-        done  = await asyncio.gather(*[
-            self._on(w, 'put', did, desc, {'items': {k: items[k] for k in ks}})
-            for w, ks in parts.items()])
+        done = await self._fan('put', did, desc, items,
+                               lambda ks: {'items': {k: items[k] for k in ks}},
+                               write=True)
         return sum(done)
 
     async def get(self, did: str, desc: str, keys: List[str]) -> tuple:
         found, missing = {}, []
-        for f, m in await asyncio.gather(*[
-                self._on(w, 'get', did, desc, {'keys': ks})
-                for w, ks in self._split(keys).items()]):
+        for f, m in await self._fan('get', did, desc, keys,
+                                    lambda ks: {'keys': ks}, write=False):
             found.update(f)
             missing += m
         gone = set(missing)
@@ -433,9 +571,9 @@ class WorkerPool:
     async def _keyed(self, op: str, did: str, desc: str,
                      keys: List[str]) -> List[str]:
         missing = set()
-        for m in await asyncio.gather(*[
-                self._on(w, op, did, desc, {'keys': ks})
-                for w, ks in self._split(keys).items()]):
+        for m in await self._fan(op, did, desc, keys,
+                                 lambda ks: {'keys': ks},
+                                 write=(op == 'pop')):
             missing.update(m)
         return [k for k in keys if k in missing]
 

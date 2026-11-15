@@ -199,7 +199,9 @@ async def _run_spawn(fn, *args):
     return fn(*args)
 
 
-def test_pool_splits_and_merges():
+@pytest.mark.parametrize('kpr, batches', [('16', 2), ('0', 3)])
+def test_pool_splits_and_merges(monkeypatch, kpr, batches):
+    monkeypatch.setenv(dw.ENV_KEYS_PER_REQ, kpr)
     dds = {'D': _DDict()}
 
     async def _run():
@@ -217,7 +219,8 @@ def test_pool_splits_and_merges():
         return pool
     pool = asyncio.run(_run())
     assert dds['D'] == {f'k{i}': i for i in range(30) if i != 1}
-    assert dds['D'].batches == 3                # one batch per worker
+    # 30 keys: 2 chunks of up to 16, or (0) one batch per worker
+    assert dds['D'].batches == batches
     for t in pool.procs:
         t.join(2)
         assert not t.is_alive()
@@ -414,3 +417,100 @@ def test_pool_many_concurrent_calls_match_replies():
         return rs
     rs = asyncio.run(_run())
     assert all(r == ({f'k{i}': i}, []) for i, r in enumerate(rs))
+
+
+def test_keys_per_request(monkeypatch):
+    monkeypatch.delenv(dw.ENV_KEYS_PER_REQ, raising=False)
+    assert dw.keys_per_request() == dw.KEYS_PER_REQ
+    monkeypatch.setenv(dw.ENV_KEYS_PER_REQ, '0')
+    assert dw.keys_per_request() == 0
+    for bad in ('x', '-1'):
+        monkeypatch.setenv(dw.ENV_KEYS_PER_REQ, bad)
+        with pytest.raises(ValueError):
+            dw.keys_per_request()
+
+
+class _Idle:
+    load = 0
+
+
+def test_split_chunks_to_distinct_workers(monkeypatch):
+    monkeypatch.setenv(dw.ENV_KEYS_PER_REQ, '16')
+    pool = dw.WorkerPool(8, None)
+    pool._conns = {w: _Idle() for w in range(8)}
+    keys  = [f'k{i}' for i in range(64)]
+    parts = pool._split('D', keys)
+    assert len(parts) == 4 and all(len(v) == 16 for v in parts.values())
+    assert sorted(k for v in parts.values() for k in v) == sorted(keys)
+    # round robin: the next call starts on other workers
+    assert not set(pool._split('D', keys[:16])) & {min(parts)}
+    monkeypatch.setenv(dw.ENV_KEYS_PER_REQ, '0')
+    pool = dw.WorkerPool(8, None)
+    assert len(pool._split('D', keys)) == 8     # one fixed worker per key
+
+
+def test_split_prefers_idle_workers(monkeypatch):
+    monkeypatch.setenv(dw.ENV_KEYS_PER_REQ, '4')
+
+    class _L:
+        def __init__(self, load):
+            self.load = load
+    pool = dw.WorkerPool(3, None)
+    pool._conns = {0: _L(5), 1: _L(0), 2: _L(2)}
+    assert list(pool._split('D', ['a', 'b'])) == [1]
+
+
+def test_pool_write_in_flight_pins_the_key(monkeypatch):
+    """A second write and a read of a key still being written go to the
+    same worker, so they cannot overtake the first write."""
+    monkeypatch.setenv(dw.ENV_KEYS_PER_REQ, '16')
+    gate = threading.Event()
+
+    class _Slow(_DDict):
+        def __setitem__(self, k, v):
+            if v == 'first':
+                gate.wait(5)
+            super().__setitem__(k, v)
+    dds = {'D': _Slow()}
+
+    async def _run():
+        pool = dw.WorkerPool(4, _thread_spawn(dds))
+        await pool.start(_run_spawn)
+        t1 = asyncio.ensure_future(pool.put('x', 'D', {'a': 'first'}))
+        await asyncio.sleep(0.05)
+        pinned = dict(pool._pinned)
+        t2 = asyncio.ensure_future(pool.put('x', 'D', {'a': 'second',
+                                                       'b': 1}))
+        t3 = asyncio.ensure_future(pool.get('x', 'D', ['a']))
+        await asyncio.sleep(0.05)
+        both = pool._pinned[('x', 'a')][1]
+        gate.set()
+        await t1, await t2
+        found, _ = await t3
+        left = dict(pool._pinned)
+        await pool.stop()
+        return pinned, both, found, left
+    pinned, both, found, left = asyncio.run(_run())
+    assert list(pinned) == [('x', 'a')]
+    assert both == 2                            # both writes on one worker
+    assert found == {'a': 'second'}             # the read waited for them
+    assert dds['D']['a'] == 'second' and left == {}
+
+
+def test_pool_unpins_after_a_failed_write(monkeypatch):
+    monkeypatch.setenv(dw.ENV_KEYS_PER_REQ, '16')
+
+    class _Full(_DDict):
+        def __setitem__(self, k, v):
+            raise RuntimeError('full')
+    dds = {'D': _Full()}
+
+    async def _run():
+        pool = dw.WorkerPool(2, _thread_spawn(dds))
+        await pool.start(_run_spawn)
+        with pytest.raises(dw.WorkerError, match='full'):
+            await pool.put('x', 'D', {'a': 1})
+        left = dict(pool._pinned)
+        await pool.stop()
+        return left
+    assert asyncio.run(_run()) == {}
