@@ -49,7 +49,7 @@ ENV_WORKER_HOST  = 'RADICAL_ORBIT_DRAGON_WORKER_HOST'
 ENV_SECRET       = 'RADICAL_ORBIT_DRAGON_WORKER_SECRET'
 ENV_BATCH_PUTS   = 'RADICAL_ORBIT_DRAGON_BATCH_PUTS'
 ENV_KEYS_PER_REQ = 'RADICAL_ORBIT_DRAGON_KEYS_PER_REQUEST'
-KEYS_PER_REQ     = 16       # keys per worker request; 0: one fixed worker per key
+KEYS_PER_REQ     = 8        # keys per worker request; 0: one fixed worker per key
 WRITE_HIGH       = 1 << 20  # bytes queued to a worker before a send waits
 MAX_WORKERS      = 256
 HELLO_TIMEOUT    = 120                  # s, all workers connected
@@ -114,9 +114,9 @@ def _recv(sock: socket.socket) -> Optional[Any]:
 
 def keys_per_request() -> int:
     """Keys per worker request (``$RADICAL_ORBIT_DRAGON_KEYS_PER_REQUEST``,
-    default 16): a call is cut into chunks of that many keys, each sent to
-    the least busy worker; ``0`` routes every key to a fixed worker (crc32),
-    so a call fans out to up to one request per worker."""
+    default 8): under load a call is cut into chunks of that many keys, each
+    sent to the least busy worker; ``0`` always routes every key to a fixed
+    worker (crc32), so a call fans out to up to one request per worker."""
     raw = os.environ.get(ENV_KEYS_PER_REQ, '').strip()
     if not raw:
         return KEYS_PER_REQ
@@ -408,10 +408,12 @@ class WorkerPool:
         self._secret  = secrets.token_urlsafe(32)
         self._conns: Dict[int, _Conn] = {}
         self._kpr     = keys_per_request()
-        # (did, key) -> [worker, writes in flight]: a key being written is
-        # served by that worker until the writes are answered, so a later
-        # write (or read) of it cannot overtake them
+        # (did, owner, key) -> [worker, writes in flight]: a key one session
+        # is writing is served by that worker for that session until the
+        # writes are answered, so its later write (or read) of the key
+        # cannot overtake them; writes of different sessions race anyway
         self._pinned: Dict[tuple, list] = {}
+        self._inflight = 0                  # requests sent, not answered
         self._rr      = 0
         self._server  = None
         self._all_in  = None
@@ -467,23 +469,31 @@ class WorkerPool:
 
     # -- requests --------------------------------------------------------------
 
-    def _split(self, did: str, keys) -> Dict[int, list]:
-        """Worker -> keys for one call.  Keys pinned by a write in flight go
-        to their worker; the rest in chunks of ``keys_per_request()`` to
-        the least busy workers (or, with ``0``, to a fixed worker each)."""
+    def _split(self, did: str, keys, owner: Optional[str] = None
+               ) -> Dict[int, list]:
+        """Worker -> keys for one call.  Keys this *owner* has a write in
+        flight for go to that worker.  While fewer requests are in flight
+        than there are workers, every other key goes to its fixed worker
+        (crc32: the parallelism and key locality of an idle pool); under
+        load they go in chunks of ``keys_per_request()`` keys to the least
+        busy workers.  With ``0``, always the fixed worker."""
         parts: Dict[int, list] = {}
+        n = self.n
         if not self._kpr:
             for k in keys:
-                parts.setdefault(route(k, self.n), []).append(k)
+                parts.setdefault(route(k, n), []).append(k)
             return parts
-        free = []
-        pinned = self._pinned
+        pinned, free = self._pinned, []
         for k in keys:
-            p = pinned.get((did, k)) if pinned else None
+            p = pinned.get((did, owner, k)) if pinned else None
             if p is None:
                 free.append(k)
             else:
                 parts.setdefault(p[0], []).append(k)
+        if self._inflight < n:
+            for k in free:
+                parts.setdefault(route(k, n), []).append(k)
+            return parts
         kpr = self._kpr
         for i in range(0, len(free), kpr):
             wid = self._least_busy(parts)
@@ -505,42 +515,46 @@ class WorkerPool:
         self._rr = best + 1
         return best
 
-    def _pin(self, did: str, parts: Dict[int, list]) -> None:
+    def _pin(self, did: str, owner: Optional[str],
+             parts: Dict[int, list]) -> None:
         for wid, ks in parts.items():
             for k in ks:
-                p = self._pinned.get((did, k))
+                p = self._pinned.get((did, owner, k))
                 if p is None:
-                    self._pinned[(did, k)] = [wid, 1]
+                    self._pinned[(did, owner, k)] = [wid, 1]
                 else:
                     p[1] += 1
 
-    def _unpin(self, did: str, parts: Dict[int, list]) -> None:
+    def _unpin(self, did: str, owner: Optional[str],
+               parts: Dict[int, list]) -> None:
         for ks in parts.values():
             for k in ks:
-                p = self._pinned.get((did, k))
+                p = self._pinned.get((did, owner, k))
                 if p is not None:
                     p[1] -= 1
                     if p[1] <= 0:
-                        del self._pinned[(did, k)]
+                        del self._pinned[(did, owner, k)]
 
     async def _fan(self, op: str, did: str, desc: str, keys, args_of,
-                   write: bool) -> list:
+                   write: bool, owner: Optional[str] = None) -> list:
         """Send one request per part, all before any await (so the pins
         and the send order are set together); return the results."""
-        parts = self._split(did, keys)
+        parts = self._split(did, keys, owner)
         if write and self._kpr:
-            self._pin(did, parts)
+            self._pin(did, owner, parts)
         conns = [self._conns[w] for w in parts]
         futs  = [c.submit({'op': op, 'did': did, 'desc': desc,
                            'args': args_of(ks)})
                  for c, ks in zip(conns, parts.values())]
+        self._inflight += len(futs)
         try:
             for c in conns:
                 await c.flush()
             bodies = await asyncio.gather(*futs, return_exceptions=True)
         finally:
+            self._inflight -= len(futs)
             if write and self._kpr:
-                self._unpin(did, parts)
+                self._unpin(did, owner, parts)
         out = []
         for c, b in zip(conns, bodies):
             if isinstance(b, BaseException):
@@ -553,35 +567,41 @@ class WorkerPool:
         return await self._conns[wid].call({'op': op, 'did': did,
                                             'desc': desc, 'args': args})
 
-    async def put(self, did: str, desc: str, items: Dict[str, Any]) -> int:
+    async def put(self, did: str, desc: str, items: Dict[str, Any],
+                  owner: Optional[str] = None) -> int:
         done = await self._fan('put', did, desc, items,
                                lambda ks: {'items': {k: items[k] for k in ks}},
-                               write=True)
+                               write=True, owner=owner)
         return sum(done)
 
-    async def get(self, did: str, desc: str, keys: List[str]) -> tuple:
+    async def get(self, did: str, desc: str, keys: List[str],
+                  owner: Optional[str] = None) -> tuple:
         found, missing = {}, []
         for f, m in await self._fan('get', did, desc, keys,
-                                    lambda ks: {'keys': ks}, write=False):
+                                    lambda ks: {'keys': ks}, write=False,
+                                    owner=owner):
             found.update(f)
             missing += m
         gone = set(missing)
         return found, [k for k in keys if k in gone]
 
     async def _keyed(self, op: str, did: str, desc: str,
-                     keys: List[str]) -> List[str]:
+                     keys: List[str], owner: Optional[str] = None
+                     ) -> List[str]:
         missing = set()
         for m in await self._fan(op, did, desc, keys,
                                  lambda ks: {'keys': ks},
-                                 write=(op == 'pop')):
+                                 write=(op == 'pop'), owner=owner):
             missing.update(m)
         return [k for k in keys if k in missing]
 
-    async def contains(self, did: str, desc: str, keys: List[str]) -> list:
-        return await self._keyed('contains', did, desc, keys)
+    async def contains(self, did: str, desc: str, keys: List[str],
+                       owner: Optional[str] = None) -> list:
+        return await self._keyed('contains', did, desc, keys, owner)
 
-    async def pop(self, did: str, desc: str, keys: List[str]) -> list:
-        return await self._keyed('pop', did, desc, keys)
+    async def pop(self, did: str, desc: str, keys: List[str],
+                  owner: Optional[str] = None) -> list:
+        return await self._keyed('pop', did, desc, keys, owner)
 
     async def detach(self, did: str) -> None:
         """Every worker drops its handle on *did* (before a destroy)."""

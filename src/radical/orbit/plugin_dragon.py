@@ -438,14 +438,16 @@ class DDictBackend:
             raise http_exception(FileNotFoundError(
                 f"unknown ddict: {did}")) from None
 
-    async def _on_workers(self, op: str, did: str, arg: Any) -> Any:
-        """Run *op* on the workers; None when there are none."""
+    async def _on_workers(self, op: str, did: str, arg: Any,
+                          owner: Optional[str] = None) -> Any:
+        """Run *op* on the workers; None when there are none.  *owner*
+        (the session) scopes the write order the pool keeps."""
         pool = await self._pool_of_workers()
         if pool is None:
             return None
         desc = self._desc(did)
         try:
-            return await getattr(pool, op)(did, desc, arg)
+            return await getattr(pool, op)(did, desc, arg, owner=owner)
         except WorkerError as e:
             raise RuntimeError(str(e)) from e
 
@@ -486,23 +488,26 @@ class DDictBackend:
             self._descs.pop(did, None)
         await self._call(_destroy)
 
-    async def put(self, did: str, items: Dict[str, Any]) -> int:
+    async def put(self, did: str, items: Dict[str, Any],
+                  owner: Optional[str] = None) -> int:
         """Store *items*; several at once as one Dragon batch put."""
         if self._nworkers:
-            return await self._on_workers('put', did, items)
+            return await self._on_workers('put', did, items, owner)
         return await self._call(lambda: batch_put(self._ddict(did), items))
 
-    async def get(self, did: str, keys: List[str]) -> tuple:
+    async def get(self, did: str, keys: List[str],
+                  owner: Optional[str] = None) -> tuple:
         """Returns ``({key: value}, [missing keys])``."""
         if self._nworkers:
-            return await self._on_workers('get', did, keys)
+            return await self._on_workers('get', did, keys, owner)
         return tuple(await self._call(
             lambda: handle('get', self._ddict(did), {'keys': keys})))
 
-    async def contains(self, did: str, keys: List[str]) -> List[str]:
+    async def contains(self, did: str, keys: List[str],
+                       owner: Optional[str] = None) -> List[str]:
         """Returns the keys of *keys* that are missing (values not read)."""
         if self._nworkers:
-            return await self._on_workers('contains', did, keys)
+            return await self._on_workers('contains', did, keys, owner)
         return await self._call(
             lambda: handle('contains', self._ddict(did), {'keys': keys}))
 
@@ -523,10 +528,11 @@ class DDictBackend:
         except RuntimeError:
             pass                        # closed: close() destroyed it
 
-    async def pop(self, did: str, keys: List[str]) -> List[str]:
+    async def pop(self, did: str, keys: List[str],
+                  owner: Optional[str] = None) -> List[str]:
         """Remove *keys*; returns the ones that were missing."""
         if self._nworkers:
-            return await self._on_workers('pop', did, keys)
+            return await self._on_workers('pop', did, keys, owner)
         return await self._call(
             lambda: handle('pop', self._ddict(did), {'keys': keys}))
 
@@ -652,7 +658,8 @@ class DragonSession(PluginSession):
                 items = {k: decode_value(v) for k, v in items.items()}
             except ValueError as e:
                 raise http_exception(e) from e
-        return {"n": await self._p.backend.put(did, items)}
+        return {"n": await self._p.backend.put(did, items,
+                                                 owner=self.sid)}
 
     async def get(self, did: str, keys: List[str],
                   values: bool = True, binary: bool = False) -> dict:
@@ -662,10 +669,12 @@ class DragonSession(PluginSession):
         self._p.entry(did)
         hint = 'get fewer keys per call'
         if not values:
-            missing = await self._p.backend.contains(did, keys)
+            missing = await self._p.backend.contains(did, keys,
+                                                    owner=self.sid)
             self._p.check_reply(len(json.dumps(missing)), hint)
             return {"items": {}, "missing": missing, "errors": {}}
-        found, missing = await self._p.backend.get(did, keys)
+        found, missing = await self._p.backend.get(did, keys,
+                                                  owner=self.sid)
         if binary:
             return self._binary_reply(found, missing, hint)
         items, errors = {}, {}
@@ -736,7 +745,7 @@ class DragonSession(PluginSession):
     async def pop(self, did: str, keys: List[str]) -> dict:
         self._check_active()
         self._p.entry(did)
-        missing = await self._p.backend.pop(did, keys)
+        missing = await self._p.backend.pop(did, keys, owner=self.sid)
         return {"n": len(keys) - len(missing), "missing": missing}
 
     async def clear(self, did: str) -> dict:

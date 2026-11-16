@@ -199,7 +199,7 @@ async def _run_spawn(fn, *args):
     return fn(*args)
 
 
-@pytest.mark.parametrize('kpr, batches', [('16', 2), ('0', 3)])
+@pytest.mark.parametrize('kpr, batches', [('16', 3), ('0', 3)])
 def test_pool_splits_and_merges(monkeypatch, kpr, batches):
     monkeypatch.setenv(dw.ENV_KEYS_PER_REQ, kpr)
     dds = {'D': _DDict()}
@@ -219,7 +219,7 @@ def test_pool_splits_and_merges(monkeypatch, kpr, batches):
         return pool
     pool = asyncio.run(_run())
     assert dds['D'] == {f'k{i}': i for i in range(30) if i != 1}
-    # 30 keys: 2 chunks of up to 16, or (0) one batch per worker
+    # an idle pool routes by key (crc32): one batch per worker
     assert dds['D'].batches == batches
     for t in pool.procs:
         t.join(2)
@@ -439,6 +439,10 @@ def test_split_chunks_to_distinct_workers(monkeypatch):
     pool = dw.WorkerPool(8, None)
     pool._conns = {w: _Idle() for w in range(8)}
     keys  = [f'k{i}' for i in range(64)]
+    # idle: every key to its fixed worker, the parallelism of the pool
+    assert pool._split('D', keys) == {
+        w: [k for k in keys if dw.route(k, 8) == w] for w in range(8)}
+    pool._inflight = 8                          # busy: chunks
     parts = pool._split('D', keys)
     assert len(parts) == 4 and all(len(v) == 16 for v in parts.values())
     assert sorted(k for v in parts.values() for k in v) == sorted(keys)
@@ -457,7 +461,27 @@ def test_split_prefers_idle_workers(monkeypatch):
             self.load = load
     pool = dw.WorkerPool(3, None)
     pool._conns = {0: _L(5), 1: _L(0), 2: _L(2)}
+    pool._inflight = 7
     assert list(pool._split('D', ['a', 'b'])) == [1]
+
+
+def test_pins_are_per_session(monkeypatch):
+    """A key one session is writing binds only that session's later
+    requests of it: other sessions' writes race anyway, and binding them
+    would pile all writers of a shared key onto one worker."""
+    monkeypatch.setenv(dw.ENV_KEYS_PER_REQ, '4')
+
+    class _L:
+        def __init__(self, load):
+            self.load = load
+    pool = dw.WorkerPool(2, None)
+    pool._conns = {0: _L(5), 1: _L(0)}
+    pool._inflight = 5
+    pool._pin('D', 'A', {0: ['a']})
+    assert pool._split('D', ['a'], 'A') == {0: ['a']}
+    assert pool._split('D', ['a'], 'B') == {1: ['a']}
+    pool._unpin('D', 'A', {0: ['a']})
+    assert pool._pinned == {}
 
 
 def test_pool_write_in_flight_pins_the_key(monkeypatch):
@@ -483,7 +507,7 @@ def test_pool_write_in_flight_pins_the_key(monkeypatch):
                                                        'b': 1}))
         t3 = asyncio.ensure_future(pool.get('x', 'D', ['a']))
         await asyncio.sleep(0.05)
-        both = pool._pinned[('x', 'a')][1]
+        both = pool._pinned[('x', None, 'a')][1]
         gate.set()
         await t1, await t2
         found, _ = await t3
@@ -491,7 +515,7 @@ def test_pool_write_in_flight_pins_the_key(monkeypatch):
         await pool.stop()
         return pinned, both, found, left
     pinned, both, found, left = asyncio.run(_run())
-    assert list(pinned) == [('x', 'a')]
+    assert list(pinned) == [('x', None, 'a')]
     assert both == 2                            # both writes on one worker
     assert found == {'a': 'second'}             # the read waited for them
     assert dds['D']['a'] == 'second' and left == {}
