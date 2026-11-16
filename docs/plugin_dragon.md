@@ -70,6 +70,24 @@ secret, and exit when the endpoint stops. Natively, more than about two
 writers per DDict manager slow puts down, so raise `managers_per_node` with
 the worker count.
 
+**Several endpoints per DDict.** One endpoint's event loop tops out at
+about 70k keys/s at 64 keys per call (phase 11 on Perlmutter, 32 nodes).
+With `RADICAL_ORBIT_DRAGON_ENDPOINTS=E` the endpoint (the head) starts E−1
+sibling endpoints named `<head>.1` … as Dragon processes in its runtime,
+one per node in turn, on its first create; each registers with the broker
+on its own and runs `RADICAL_ORBIT_DRAGON_WORKERS / E` workers, so the
+total stays the same. After a create the head attaches the DDict on every
+sibling (`ddict/attach`, by descriptor) and lists the endpoints that serve
+it in the entry's `endpoints` (a sibling that did not attach is listed in
+`degraded`); before a destroy it detaches them. Siblings serve put, get,
+presence checks, pop, `keys` and `len`; create, destroy and clear answer
+409 there. `DDictHandle` sends its data calls to the listed endpoints in
+turn and retries a failed sibling call once on the head; without the list
+(one endpoint, or an older one) it uses the head. A client sends one call
+at a time, so its writes of a key stay in order across endpoints. The head
+stops its siblings (SIGTERM, they detach) before it destroys its DDicts.
+With `RADICAL_ORBIT_LOG_FILE` set, sibling *i* logs to `<file>.<i>`.
+
 **Multi-node runtimes under Slurm.** Start the endpoint under `dragon -m`
 from the batch script or an interactive `salloc` shell, not from inside an
 `srun` step. Inside a step, Slurm narrows `SLURM_JOB_NODELIST` to the step's

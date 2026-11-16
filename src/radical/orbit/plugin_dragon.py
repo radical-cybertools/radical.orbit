@@ -64,6 +64,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from .client import PluginClient
+from .dragon_workers import dragon_reap_terminate
 from .dragon_workers import (WorkerError, WorkerPool, batch_put,
                              dragon_reap, dragon_spawn, handle,
                              worker_count)
@@ -96,6 +97,12 @@ NATIVE           = 'native'            # _rt: running inside a runtime
 # cannot be stored as a dict through ORBIT (nested ones can).
 B64_KEY          = '$b64'
 MSGPACK          = 'application/msgpack'    # binary bodies (Python client)
+ENV_ENDPOINTS    = 'RADICAL_ORBIT_DRAGON_ENDPOINTS'
+ENV_SIBLING_OF   = 'RADICAL_ORBIT_DRAGON_SIBLING_OF'
+ENV_ENDPOINT_BIN = 'RADICAL_ORBIT_ENDPOINT_BIN'
+MAX_ENDPOINTS    = 64
+SIBLING_TIMEOUT  = 120                    # s, siblings registered / attached
+SIBLING_STOP     = 30                     # s, siblings stopped
 MP_ITEM          = 16       # msgpack bytes per item beyond key and value
 
 # a module-wide guard: one PluginDragon with the default backend (and so one
@@ -177,6 +184,34 @@ def dragon_available() -> bool:
     except (ImportError, ValueError):
         return False
     return spec is not None and spec.origin is not None
+
+
+def _sibling_main(exe: str, argv: List[str], env: Dict[str, str]) -> None:
+    """A sibling endpoint (a Dragon process of the head): the endpoint
+    script *exe* with *argv*, *env* added to the environment."""
+    import runpy
+    os.environ.update(env)
+    sys.argv = [exe] + list(argv)
+    runpy.run_path(exe, run_name='__main__')
+
+
+def endpoint_count() -> int:
+    """Endpoints per DDict (``$RADICAL_ORBIT_DRAGON_ENDPOINTS``, default 1):
+    the head endpoint starts the others as sibling endpoints in its Dragon
+    runtime; a sibling (``$RADICAL_ORBIT_DRAGON_SIBLING_OF`` set) is 1."""
+    if os.environ.get(ENV_SIBLING_OF):
+        return 1
+    raw = os.environ.get(ENV_ENDPOINTS, '').strip()
+    if not raw:
+        return 1
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 0
+    if not 1 <= n <= MAX_ENDPOINTS:
+        raise ValueError(f"${ENV_ENDPOINTS}={raw!r}: expected 1.."
+                         f"{MAX_ENDPOINTS}")
+    return n
 
 
 def runtime_mode() -> str:
@@ -289,6 +324,7 @@ class DDictBackend:
         self._closed  = False
         self._ddicts: Dict[str, Any] = {}
         self._descs:  Dict[str, str] = {}   # did -> descriptor, for workers
+        self._attached: set = set()         # dids served, not owned
         self._nworkers = worker_count() if workers is None else workers
         self._workers: Optional[WorkerPool] = None
         self._wlock   = None                # created on the loop that uses it
@@ -389,6 +425,32 @@ class DDictBackend:
             raise HTTPException(status_code=400,
                                 detail=f"n_nodes={n_nodes} exceeds the "
                                        f"runtime's {limit} node(s)")
+
+    def _attach_ddict(self, desc: str) -> Any:
+        from dragon.data.ddict import DDict
+        return DDict.attach(desc)
+
+    async def attach(self, did: str, desc: str) -> None:
+        """Serve the existing DDict *desc* under *did*, without owning it:
+        :meth:`detach` and :meth:`close` detach instead of destroying."""
+        def _attach():
+            self._runtime_up()
+            self._ddicts[did] = self._attach_ddict(desc)
+            self._descs[did]  = desc
+            self._attached.add(did)
+        await self._call(_attach)
+
+    async def detach(self, did: str) -> None:
+        if self._workers is not None:
+            await self._workers.detach(did)
+
+        def _detach():
+            self._descs.pop(did, None)
+            self._attached.discard(did)
+            dd = self._ddicts.pop(did, None)
+            if dd is not None:
+                dd.detach()
+        await self._call(_detach)
 
     def _new_ddict(self, managers_per_node: int, n_nodes: int,
                    total_mem: int) -> Any:
@@ -551,9 +613,13 @@ class DDictBackend:
         try:
             for did, dd in list(self._ddicts.items()):
                 try:
-                    dd.destroy()
+                    if did in self._attached:
+                        dd.detach()             # not ours: the head's
+                    else:
+                        dd.destroy()
                 except Exception as e:
                     log.warning("[dragon] destroy %s failed: %s", did, e)
+            self._attached.clear()
             self._ddicts.clear()
             self._descs.clear()
             self._runtime_down()
@@ -772,9 +838,45 @@ class DDictHandle:
     Values are JSON-serializable objects or ``bytes``.
     """
 
+    def _data_client(self) -> tuple:
+        """The client for the next data call: the endpoints listed in the
+        entry in turn (the head without that list); ``(client, is_head)``."""
+        eps = self._entry.get('endpoints') or []
+        bc  = getattr(self._client, '_bc', None)
+        if len(eps) < 2 or bc is None:
+            return self._client, True
+        with self._lock:
+            i = self._next % len(eps)
+            self._next += 1
+            if i == 0:
+                return self._client, True
+            c = self._peers.get(eps[i])
+            if c is None:
+                try:
+                    c = bc.get_plugin(eps[i], 'dragon')
+                except Exception as e:      # pylint: disable=broad-except
+                    log.warning("[dragon] %s: using the head: %s", eps[i], e)
+                    c = self._client
+                self._peers[eps[i]] = c
+        return c, c is self._client
+
+    def _binary(self, path: str, **body) -> tuple:
+        """A data call on the next endpoint; once more on the head if a
+        sibling fails."""
+        c, head = self._data_client()
+        try:
+            return c._call_binary(path, **body)
+        except (RuntimeError, ConnectionError, TimeoutError):
+            if head:
+                raise
+            return self._client._call_binary(path, **body)
+
     def __init__(self, client: "DragonClient", entry: dict):
         self._client = client
         self._entry  = entry
+        self._lock   = threading.Lock()
+        self._next   = 0
+        self._peers: Dict[str, Any] = {}
 
     def __repr__(self) -> str:
         return f"DDictHandle({self.id!r}, name={self.name!r})"
@@ -808,8 +910,7 @@ class DDictHandle:
             # the wire form of bytes: it would read back as bytes
             raise ValueError(f"{bad[0]!r}: a dict with the single key "
                              f"{B64_KEY!r} is reserved for bytes")
-        self._client._call_binary('ddict/put/{sid}', id=self.id,
-                                  items=dict(items))
+        self._binary('ddict/put/{sid}', id=self.id, items=dict(items))
 
     def __getitem__(self, key: str) -> Any:
         r = self.get_many([key])
@@ -827,8 +928,8 @@ class DDictHandle:
 
     def get_many(self, keys: List[str]) -> dict:
         """``{items, missing, errors}`` for *keys*, values decoded."""
-        r, binary = self._client._call_binary('ddict/get/{sid}', id=self.id,
-                                              keys=list(keys))
+        r, binary = self._binary('ddict/get/{sid}', id=self.id,
+                                 keys=list(keys))
         if not binary:
             # JSON (an older endpoint): the server reports marker-shaped
             # native values in 'errors', the items hold only values it encoded
@@ -963,7 +1064,12 @@ class PluginDragon(Plugin):
                         not _default_owner.backend.closed:
                     raise RuntimeError("a dragon plugin instance already "
                                        "runs in this process")
-                backend        = DDictBackend(runtime_mode())
+                n_ep           = endpoint_count()
+                kw             = {}
+                if n_ep > 1:
+                    # the workers are split over the endpoints
+                    kw['workers'] = max(1, worker_count() // n_ep)
+                backend        = DDictBackend(runtime_mode(), **kw)
                 self.backend   = backend
                 _default_owner = self
         try:
@@ -976,6 +1082,11 @@ class PluginDragon(Plugin):
 
         self.backend     = backend
         self.entries: Dict[str, dict] = {}
+        self.sibling_of  = os.environ.get(ENV_SIBLING_OF) or None
+        self.n_endpoints = endpoint_count()
+        self._siblings: Optional[List[str]] = None   # names, once started
+        self._sib_procs  = None
+        self._sib_lock: Optional[asyncio.Lock] = None
         self.reply_limit = resolve_frame_cap(app) // 2
 
         # fallback for a host exiting without stop() / shutdown()
@@ -990,6 +1101,8 @@ class PluginDragon(Plugin):
         self.add_route_post('ddict/keys/{sid}',       self.r_keys)
         self.add_route_post('ddict/pop/{sid}',        self.r_pop)
         self.add_route_post('ddict/clear/{sid}',      self.r_clear)
+        self.add_route_post('ddict/attach/{sid}',     self.r_attach)
+        self.add_route_post('ddict/detach/{sid}',     self.r_detach)
 
     def check_reply(self, size: int, hint: str) -> None:
         """413 when a reply of *size* bytes would exceed the reply limit."""
@@ -1016,6 +1129,10 @@ class PluginDragon(Plugin):
     async def ddict_create(self, name: Optional[str], managers_per_node: int,
                            n_nodes: int, total_mem: int,
                            creator: Optional[str]) -> dict:
+        if self.sibling_of:
+            raise HTTPException(status_code=409,
+                                detail=f"create on the head endpoint "
+                                       f"{self.sibling_of!r}")
         did  = f'{ID_PREFIX}{uuid.uuid4().hex[:8]}'
         name = name or did
         if any(e['name'] == name for e in self.entries.values()):
@@ -1046,6 +1163,8 @@ class PluginDragon(Plugin):
             # destroys what it made
             raise HTTPException(status_code=503,
                                 detail="endpoint is stopping")
+        if self.n_endpoints > 1:
+            await self._fan_attach(entry)
         entry['state'] = 'ready'
         log.info("[dragon] created %s (%s)", did, name)
         self._dispatch_notify('ddict_status', {"id": did, "name": name,
@@ -1054,10 +1173,15 @@ class PluginDragon(Plugin):
 
     async def ddict_destroy(self, did: str) -> dict:
         entry = self.entry(did, ready=False)
+        if entry.get('attached'):
+            raise HTTPException(status_code=409,
+                                detail=f"destroy on the head endpoint "
+                                       f"{self.sibling_of!r}")
         if entry['state'] not in ('ready', 'failed'):
             raise http_exception(FileExistsError(
                 f"ddict {did} is {entry['state']}"))
         entry['state'] = 'destroying'
+        await self._fan_detach(entry)
 
         def _gone():
             self.entries.pop(did, None)
@@ -1085,6 +1209,144 @@ class PluginDragon(Plugin):
         log.info("[dragon] destroyed %s (%s)", did, entry['name'])
         _gone()
         return {}
+
+    # -- sibling endpoints (scale-out) -----------------------------------------
+
+    def _host(self):
+        return getattr(getattr(self._app, 'state', None),
+                       'endpoint_service', None)
+
+    def _head_name(self) -> str:
+        svc = self._host()
+        return getattr(svc, 'name', None) or 'endpoint'
+
+    async def _ensure_siblings(self) -> List[str]:
+        """Start the sibling endpoints once (head only), wait until the
+        broker lists them; returns their names."""
+        if self._siblings is not None:
+            return self._siblings
+        if self._sib_lock is None:
+            self._sib_lock = asyncio.Lock()
+        async with self._sib_lock:
+            if self._siblings is None:
+                head  = self._head_name()
+                names = [f'{head}.{i}' for i in range(1, self.n_endpoints)]
+                self._sib_procs = await self.backend._call(
+                    self._spawn_siblings, head, names)
+                await self._wait_registered(names)
+                self._siblings = names
+                log.info("[dragon] %d sibling endpoints: %s", len(names),
+                         ', '.join(names))
+        return self._siblings
+
+    def _spawn_siblings(self, head: str, names: List[str]) -> list:
+        """Start sibling endpoints as Dragon processes (Dragon thread)."""
+        from dragon.native.machine import System
+        from dragon.native.process import Process
+        try:
+            policies = System().hostname_policies()
+        except Exception:               # pylint: disable=broad-except
+            policies = []
+        svc  = self._host()
+        url  = getattr(svc, 'broker_url', None) or \
+            os.environ.get('RADICAL_ORBIT_BROKER_URL', '')
+        exe  = os.path.abspath(os.environ.get(ENV_ENDPOINT_BIN) or sys.argv[0])
+        nw   = self.backend._nworkers
+        logf = os.environ.get('RADICAL_ORBIT_LOG_FILE')
+        procs = []
+        for i, name in enumerate(names, start=1):
+            env = {ENV_SIBLING_OF: head, ENV_ENDPOINTS: '1',
+                   'RADICAL_ORBIT_DRAGON_WORKERS': str(nw),
+                   'RADICAL_ORBIT_DRAGON_WORKER_OFFSET': str(i * nw)}
+            if logf:
+                env['RADICAL_ORBIT_LOG_FILE'] = f'{logf}.{i}'
+            policy = policies[i % len(policies)] if policies else None
+            argv = ['--name', name, '-p', 'dragon']
+            if url:
+                argv += ['--url', url]
+            # a Python-function process: an executable one lacks Dragon's
+            # launch parameters, and the sibling starts processes itself
+            proc = Process(target=_sibling_main, args=(exe, argv, env),
+                           policy=policy)
+            proc.start()
+            procs.append(proc)
+        return procs
+
+    async def _wait_registered(self, names: List[str]) -> None:
+        svc = self._host()
+        t0  = time.time()
+        while svc is not None:
+            have = set(svc.topology())
+            if all(n in have for n in names):
+                return
+            if time.time() - t0 > SIBLING_TIMEOUT:
+                raise HTTPException(status_code=503,
+                                    detail=f"sibling endpoints not "
+                                           f"registered: "
+                                           f"{sorted(set(names) - have)}")
+            await asyncio.sleep(0.5)
+
+    async def _sibling_call(self, name: str, op: str, body: dict) -> int:
+        """POST ``ddict/<op>/default`` on sibling *name*; the status."""
+        svc  = self._host()
+        path = f"/{self.namespace.strip('/')}/ddict/{op}/default"
+        resp = await svc._call(name, 'POST', path, json.dumps(body).encode(),
+                               {'content-type': 'application/json'},
+                               SIBLING_TIMEOUT)
+        return resp.status_code
+
+    async def _fan_attach(self, entry: dict) -> None:
+        """Attach a new DDict on every sibling; ``endpoints`` lists those
+        that serve it, the head first."""
+        names = await self._ensure_siblings()
+        body  = {k: entry[k] for k in ('id', 'name', 'descriptor',
+                                       'managers_per_node', 'n_nodes',
+                                       'total_mem')}
+        codes = await asyncio.gather(*[self._sibling_call(n, 'attach', body)
+                                       for n in names],
+                                     return_exceptions=True)
+        ok = [n for n, c in zip(names, codes) if c == 200]
+        if len(ok) < len(names):
+            entry['degraded'] = sorted(set(names) - set(ok))
+            log.warning("[dragon] %s: siblings did not attach: %s",
+                        entry['id'], entry['degraded'])
+        entry['endpoints'] = [self._head_name()] + ok
+
+    async def _fan_detach(self, entry: dict) -> None:
+        names = (entry.get('endpoints') or [])[1:]
+        if names:
+            await asyncio.gather(*[self._sibling_call(n, 'detach',
+                                                      {'id': entry['id']})
+                                   for n in names], return_exceptions=True)
+
+    async def ddict_attach(self, body: dict) -> dict:
+        """Serve the head's DDict *body* (sibling side)."""
+        did = body['id']
+        if did in self.entries:
+            return dict(self.entries[did])
+        entry = {k: body.get(k) for k in ('id', 'name', 'descriptor',
+                                          'managers_per_node', 'n_nodes',
+                                          'total_mem')}
+        entry.update(created=time.time(), creator=self.sibling_of,
+                     state='ready', attached=True)
+        await self.backend.attach(did, body['descriptor'])
+        self.entries[did] = entry
+        return dict(entry)
+
+    async def ddict_detach(self, did: str) -> dict:
+        entry = self.entries.get(did)
+        if entry is None or not entry.get('attached'):
+            raise http_exception(FileNotFoundError(f"unknown ddict: {did}"))
+        self.entries.pop(did, None)
+        await self.backend.detach(did)
+        return {}
+
+    async def _stop_siblings(self) -> None:
+        procs, self._sib_procs = self._sib_procs, None
+        if procs:
+            # SIGTERM: each sibling stops its runtime part and detaches
+            await self.backend._call(dragon_reap_terminate, procs,
+                                     SIBLING_STOP)
 
     # -- route handlers --------------------------------------------------------
 
@@ -1222,14 +1484,36 @@ class PluginDragon(Plugin):
                                    DragonSession.pop, did=body['id'],
                                    keys=self._str_list(body, 'keys'))
 
+    async def r_attach(self, request: Request) -> dict:
+        """``POST ddict/attach/{sid}``: ``{id, name, descriptor, ...}``
+        from the head endpoint: serve that DDict here (siblings)."""
+        body = await self._body(request, 'id', 'descriptor')
+        if not self.sibling_of:
+            raise HTTPException(status_code=409,
+                                detail="only sibling endpoints attach")
+        return await self.ddict_attach(body)
+
+    async def r_detach(self, request: Request) -> dict:
+        """``POST ddict/detach/{sid}``: ``{id}`` (siblings)."""
+        body = await self._body(request, 'id')
+        return await self.ddict_detach(body['id'])
+
     async def r_clear(self, request: Request) -> dict:
         """``POST ddict/clear/{sid}``: ``{id}``."""
         body = await self._body(request, 'id')
+        if self.entries.get(body['id'], {}).get('attached'):
+            raise HTTPException(status_code=409,
+                                detail=f"clear on the head endpoint "
+                                       f"{self.sibling_of!r}")
         return await self._forward(request.path_params['sid'],
                                    DragonSession.clear, did=body['id'])
 
     async def _release(self) -> None:
         global _default_owner               # pylint: disable=global-statement
+        try:
+            await self._stop_siblings()     # they detach before we destroy
+        except Exception as e:              # pylint: disable=broad-except
+            log.warning("[dragon] stopping sibling endpoints: %s", e)
         self.entries.clear()
         try:
             await self.backend.close()

@@ -538,3 +538,22 @@ def test_pool_unpins_after_a_failed_write(monkeypatch):
         await pool.stop()
         return left
     assert asyncio.run(_run()) == {}
+
+
+
+def test_reap_terminate_signals_then_joins():
+    class _P:
+        def __init__(self):
+            self.seen, self.is_alive = [], False
+
+        def terminate(self):
+            self.seen.append('term')
+
+        def join(self, timeout=None):
+            self.seen.append('join')
+
+        def kill(self):
+            self.seen.append('kill')
+    p = _P()
+    dw.dragon_reap_terminate([p], 1)
+    assert p.seen == ['term', 'join']

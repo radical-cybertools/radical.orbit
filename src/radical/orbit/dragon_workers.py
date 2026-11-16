@@ -49,6 +49,7 @@ ENV_WORKER_HOST  = 'RADICAL_ORBIT_DRAGON_WORKER_HOST'
 ENV_SECRET       = 'RADICAL_ORBIT_DRAGON_WORKER_SECRET'
 ENV_BATCH_PUTS   = 'RADICAL_ORBIT_DRAGON_BATCH_PUTS'
 ENV_KEYS_PER_REQ = 'RADICAL_ORBIT_DRAGON_KEYS_PER_REQUEST'
+ENV_WORKER_OFFSET = 'RADICAL_ORBIT_DRAGON_WORKER_OFFSET'
 KEYS_PER_REQ     = 8        # keys per worker request; 0: one fixed worker per key
 WRITE_HIGH       = 1 << 20  # bytes queued to a worker before a send waits
 MAX_WORKERS      = 256
@@ -652,15 +653,29 @@ def dragon_spawn(host: str, port: int, n: int, secret: str) -> list:
     env[ENV_SECRET] = secret
     env['PYTHONPATH'] = src + (os.pathsep + env['PYTHONPATH']
                                if env.get('PYTHONPATH') else '')
+    # sibling endpoints place their workers from another node on
+    off   = int(os.environ.get(ENV_WORKER_OFFSET, '0') or 0)
     procs = []
     for wid in range(n):
-        policy = policies[wid % len(policies)] if policies else None
+        policy = policies[(off + wid) % len(policies)] if policies else None
         proc = Process(target=sys.executable,
                        args=['-c', _ENTRY, host, str(port), str(wid)],
                        env=env, policy=policy)
         proc.start()
         procs.append(proc)
     return procs
+
+
+def dragon_reap_terminate(procs: list, timeout: float = STOP_TIMEOUT
+                          ) -> None:
+    """Ask Dragon processes to stop (SIGTERM), join them, kill what is
+    left (Dragon thread): sibling endpoints stop gracefully on SIGTERM."""
+    for p in procs or []:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+    dragon_reap(procs, timeout)
 
 
 def dragon_reap(procs: list, timeout: float = STOP_TIMEOUT) -> None:

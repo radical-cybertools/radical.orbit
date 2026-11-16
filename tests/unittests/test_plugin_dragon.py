@@ -77,6 +77,16 @@ class _FakeBackend(DDictBackend):
             raise self.fail
         return _FakeDDict(managers_per_node, n_nodes, total_mem)
 
+    def _attach_ddict(self, desc):
+        dd = _FakeDDict(1, 1, 0)
+        dd.detached = 0
+
+        def _detach():
+            dd.detached += 1
+        dd.detach = _detach
+        self.attached_dd = dd
+        return dd
+
 
 def _mk(mode='start'):
     app     = FastAPI()
@@ -1044,3 +1054,137 @@ def test_client_nested_b64_shape_roundtrips(client):
     dd = client.ddict.create()
     dd['k'] = {'a': {'$b64': 'aGk='}}
     assert dd['k'] == {'a': {'$b64': 'aGk='}}
+
+
+# ── scale-out: sibling endpoints ────────────────────────────────────────────
+
+
+def test_endpoint_count(monkeypatch):
+    from radical.orbit import plugin_dragon as pd
+    monkeypatch.delenv(pd.ENV_ENDPOINTS, raising=False)
+    monkeypatch.delenv(pd.ENV_SIBLING_OF, raising=False)
+    assert pd.endpoint_count() == 1
+    monkeypatch.setenv(pd.ENV_ENDPOINTS, '4')
+    assert pd.endpoint_count() == 4
+    monkeypatch.setenv(pd.ENV_SIBLING_OF, 'head')    # a sibling: never more
+    assert pd.endpoint_count() == 1
+    monkeypatch.delenv(pd.ENV_SIBLING_OF)
+    for bad in ('0', 'x', str(pd.MAX_ENDPOINTS + 1)):
+        monkeypatch.setenv(pd.ENV_ENDPOINTS, bad)
+        with pytest.raises(ValueError):
+            pd.endpoint_count()
+
+
+def _sibling(monkeypatch):
+    from radical.orbit import plugin_dragon as pd
+    monkeypatch.setenv(pd.ENV_SIBLING_OF, 'head')
+    return _mk()
+
+
+def test_sibling_serves_attached_ddict(monkeypatch):
+    plugin, backend, tc, sid = _sibling(monkeypatch)
+    r = tc.post(f'/dragon/ddict/create/{sid}', json={'name': 'a'})
+    assert r.status_code == 409 and 'head' in r.text
+    body = {'id': 'dd-1', 'name': 'a', 'descriptor': 'desc:x',
+            'managers_per_node': 1, 'n_nodes': 1, 'total_mem': 1}
+    r = tc.post(f'/dragon/ddict/attach/{sid}', json=body)
+    assert r.status_code == 200 and r.json()['attached'] is True
+    # idempotent
+    assert tc.post(f'/dragon/ddict/attach/{sid}', json=body).status_code \
+        == 200
+    r = tc.post(f'/dragon/ddict/put/{sid}', json={'id': 'dd-1',
+                                                  'items': {'k': 1}})
+    assert r.status_code == 200
+    r = tc.post(f'/dragon/ddict/get/{sid}', json={'id': 'dd-1',
+                                                  'keys': ['k']})
+    assert r.json()['items'] == {'k': 1}
+    for op in ('destroy', 'clear'):
+        r = tc.post(f'/dragon/ddict/{op}/{sid}', json={'id': 'dd-1'})
+        assert r.status_code == 409, op
+    r = tc.post(f'/dragon/ddict/detach/{sid}', json={'id': 'dd-1'})
+    assert r.status_code == 200
+    assert backend.attached_dd.detached == 1
+    assert tc.get(f'/dragon/ddict/list/{sid}').json()['ddicts'] == []
+    r = tc.post(f'/dragon/ddict/detach/{sid}', json={'id': 'dd-1'})
+    assert r.status_code == 404
+
+
+def test_sibling_close_detaches_not_destroys(monkeypatch):
+    plugin, backend, tc, sid = _sibling(monkeypatch)
+    tc.post(f'/dragon/ddict/attach/{sid}',
+            json={'id': 'dd-2', 'descriptor': 'desc:y'})
+    dd = backend.attached_dd
+    asyncio.run(plugin.on_host_stop())
+    assert dd.detached == 1 and not dd.destroyed
+
+
+def test_head_only_endpoints_refuse_attach(env):
+    plugin, backend, tc, sid = env
+    r = tc.post(f'/dragon/ddict/attach/{sid}',
+                json={'id': 'dd-3', 'descriptor': 'desc:z'})
+    assert r.status_code == 409
+
+
+def test_head_fans_attach_and_detach_out(env):
+    plugin, backend, tc, sid = env
+    plugin.n_endpoints = 3
+    calls = []
+
+    async def _sibs():
+        return ['h.1', 'h.2']
+
+    async def _call(name, op, body):
+        calls.append((name, op, body['id']))
+        if name == 'h.2':
+            raise ConnectionError('gone')
+        return 200
+    plugin._ensure_siblings = _sibs
+    plugin._sibling_call = _call
+    plugin._head_name = lambda: 'h'
+    entry = _create(tc, sid, name='s')
+    assert entry['endpoints'] == ['h', 'h.1'] and entry['degraded'] == ['h.2']
+    assert {(n, op) for n, op, _ in calls} == {('h.1', 'attach'),
+                                               ('h.2', 'attach')}
+    calls.clear()
+    r = tc.post(f'/dragon/ddict/destroy/{sid}', json={'id': entry['id']})
+    assert r.status_code == 200
+    assert calls == [('h.1', 'detach', entry['id'])]
+
+
+class _Peer:
+    def __init__(self, name, fail=False):
+        self.name, self.fail, self.calls = name, fail, []
+        self._bc = None
+
+    def _call_binary(self, path, **body):
+        self.calls.append(path)
+        if self.fail:
+            raise RuntimeError('HTTP 503')
+        return ({'items': {}, 'missing': [], 'errors': {}}, True)
+
+
+def test_client_spreads_data_calls_over_endpoints():
+    head, peer = _Peer('h'), _Peer('h.1')
+
+    class _BC:
+        def get_plugin(self, name, plugin):
+            assert (name, plugin) == ('h.1', 'dragon')
+            return peer
+    head._bc = _BC()
+    dd = DDictHandle(head, {'id': 'dd-1', 'name': 'n', 'descriptor': 'd',
+                            'endpoints': ['h', 'h.1']})
+    for _ in range(4):
+        dd.get_many(['a'])
+    assert len(head.calls) == 2 and len(peer.calls) == 2
+    peer.fail = True
+    dd.update({'a': 1})                        # peer's turn: retried on head
+    dd.update({'a': 1})
+    assert len(head.calls) == 4 and len(peer.calls) == 3
+
+
+def test_client_without_endpoints_uses_the_head():
+    head = _Peer('h')
+    dd = DDictHandle(head, {'id': 'dd-1', 'name': 'n', 'descriptor': 'd'})
+    dd.update({'a': 1})
+    dd.get_many(['a'])
+    assert len(head.calls) == 2
