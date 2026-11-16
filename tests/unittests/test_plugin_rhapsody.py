@@ -849,6 +849,9 @@ async def test_return_value_oversized_reports_error(caplog):
     assert "_return_value_encoding" not in payload
     assert "too large" in payload["error"]
     assert "too large" in caplog.text
+    # a dropped result fails the task: DONE would read as a successful None
+    assert payload["state"] == "FAILED"
+    assert "too large" in payload["exception"]
 
 
 @pytest.mark.asyncio
@@ -867,6 +870,8 @@ async def test_json_safe_return_value_oversized_reports_error(caplog):
     assert "_return_value_encoding" not in payload
     assert "too large" in payload["error"]
     assert "too large" in caplog.text
+    assert payload["state"] == "FAILED"
+    assert "too large" in payload["exception"]
 
 
 def _output_task(uid, stdout, stderr):
