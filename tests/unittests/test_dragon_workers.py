@@ -1,0 +1,559 @@
+# pylint: disable=protected-access,redefined-outer-name
+
+import asyncio
+import socket
+import threading
+
+import pytest
+from fastapi import FastAPI
+from starlette.testclient import TestClient
+
+from radical.orbit import dragon_workers as dw
+from radical.orbit.plugin_dragon import PluginDragon
+
+from test_plugin_dragon import _FakeBackend, _FakeDDict
+
+
+class _DDict(_FakeDDict):
+    """Fake DDict handle as a worker sees it (attach/detach)."""
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.detached = 0
+
+    def detach(self):
+        self.detached += 1
+
+
+# ── config, routing ─────────────────────────────────────────────────────────
+
+def test_worker_count(monkeypatch):
+    monkeypatch.delenv(dw.ENV_WORKERS, raising=False)
+    assert dw.worker_count() == 0
+    monkeypatch.setenv(dw.ENV_WORKERS, '4')
+    assert dw.worker_count() == 4
+    for bad in ('x', '-1', str(dw.MAX_WORKERS + 1)):
+        monkeypatch.setenv(dw.ENV_WORKERS, bad)
+        with pytest.raises(ValueError):
+            dw.worker_count()
+
+
+def test_route_is_stable_and_spreads():
+    keys  = [f'k{i}' for i in range(1000)]
+    first = [dw.route(k, 4) for k in keys]
+    assert first == [dw.route(k, 4) for k in keys]
+    counts = [first.count(w) for w in range(4)]
+    assert min(counts) > 200
+
+
+# ── worker operations ───────────────────────────────────────────────────────
+
+def test_batch_put_uses_one_batch():
+    dd = _DDict()
+    assert dw.batch_put(dd, {'a': 1, 'b': 2}) == 2
+    assert dd == {'a': 1, 'b': 2} and dd.batches == 1 and not dd.in_batch
+    assert dw.batch_put(dd, {'c': 3}) == 1
+    assert dd.batches == 1                     # a single put needs no batch
+
+
+def test_batch_put_failure_ends_batch():
+    class _Full(_DDict):
+        def __setitem__(self, k, v):
+            if len(self) >= 1:
+                raise RuntimeError('full')
+            super().__setitem__(k, v)
+    dd = _Full()
+    with pytest.raises(RuntimeError, match='after 1 were sent'):
+        dw.batch_put(dd, {'a': 1, 'b': 2})
+    assert not dd.in_batch
+
+
+def test_batch_put_end_failure():
+    class _Late(_DDict):
+        def end_batch_put(self):
+            super().end_batch_put()
+            raise RuntimeError('manager full')
+    with pytest.raises(RuntimeError, match='some may be stored'):
+        dw.batch_put(_Late(), {'a': 1, 'b': 2})
+
+
+class _Managed(_DDict):
+    """Fake handle with Dragon's key-to-manager mapping; records put order."""
+
+    def __init__(self, mgr):
+        super().__init__()
+        self.mgr, self.order = mgr, []
+
+    def _choose_manager_pickle_key(self, key):
+        return self.mgr[key], b''
+
+    def __setitem__(self, k, v):
+        self.order.append(k)
+        super().__setitem__(k, v)
+
+
+def test_put_order_opens_managers_ascending():
+    mgr = {'a': 2, 'b': 0, 'c': 2, 'd': 1, 'e': 0}
+    # first key of managers 0, 1, 2, then the rest as given
+    assert dw.put_order(_Managed(mgr), list(mgr)) == ['b', 'd', 'a', 'c', 'e']
+    assert dw.put_order(_Managed(mgr), ['a']) == ['a']
+    one = {'x': 3, 'y': 3}
+    assert dw.put_order(_Managed(one), ['y', 'x']) == ['y', 'x']
+
+
+def test_put_order_without_mapping():
+    assert dw.put_order(_DDict(), ['b', 'a']) == ['b', 'a']
+
+    class _Broken(_Managed):
+        def _choose_manager_pickle_key(self, key):
+            raise TypeError('changed API')
+    assert dw.put_order(_Broken({}), ['b', 'a']) == ['b', 'a']
+
+
+def test_batch_put_in_manager_order(monkeypatch):
+    mgr = {'a': 1, 'b': 0, 'c': 1}
+    dd  = _Managed(mgr)
+    assert dw.batch_put(dd, {'a': 1, 'b': 2, 'c': 3}) == 3
+    assert dd.order == ['b', 'a', 'c'] and dd.batches == 1
+    assert dd == {'a': 1, 'b': 2, 'c': 3}
+    monkeypatch.setenv(dw.ENV_BATCH_PUTS, '0')  # unbatched: order as given
+    dd = _Managed(mgr)
+    dw.batch_put(dd, {'a': 1, 'b': 2, 'c': 3})
+    assert dd.order == ['a', 'b', 'c']
+
+
+def test_handle_ops():
+    dd = _DDict()
+    dw.handle('put', dd, {'items': {'a': 1, 'b': b'\x00'}})
+    assert dw.handle('get', dd, {'keys': ['a', 'zz']}) == [{'a': 1}, ['zz']]
+    assert dw.handle('contains', dd, {'keys': ['b', 'zz']}) == ['zz']
+    assert dw.handle('pop', dd, {'keys': ['a', 'zz']}) == ['zz']
+    assert dd == {'b': b'\x00'}
+    with pytest.raises(ValueError):
+        dw.handle('nope', dd, {})
+
+
+# ── worker loop over a socket ───────────────────────────────────────────────
+
+def _call(sock, msg):
+    sock.sendall(dw._pack(msg))
+    return dw._recv(sock)
+
+
+def test_serve_attaches_once_and_detaches():
+    a, b    = socket.socketpair()
+    dds     = {'D1': _DDict()}
+    attached = []
+
+    def attach(desc):
+        attached.append(desc)
+        return dds[desc]
+    t = threading.Thread(target=dw.serve, args=(b, attach), daemon=True)
+    t.start()
+    m = {'did': 'x', 'desc': 'D1'}
+    assert _call(a, dict(m, op='put', args={'items': {'k': 1}}))['ok']
+    r = _call(a, dict(m, op='get', args={'keys': ['k', 'z']}))
+    assert r == {'ok': True, 'result': [{'k': 1}, ['z']]}
+    assert attached == ['D1']                       # cached handle
+    r = _call(a, dict(m, op='bogus'))
+    assert not r['ok'] and r['type'] == 'ValueError'
+    assert _call(a, {'op': 'detach', 'did': 'x'})['ok']
+    assert dds['D1'].detached == 1
+    assert _call(a, {'op': 'exit'}) == {'ok': True, 'result': None}
+    t.join(2)
+    assert not t.is_alive()
+
+
+def test_serve_exits_on_eof_and_detaches():
+    a, b = socket.socketpair()
+    dd   = _DDict()
+    t = threading.Thread(target=dw.serve, args=(b, lambda d: dd), daemon=True)
+    t.start()
+    _call(a, {'op': 'put', 'did': 'x', 'desc': 'D',
+              'args': {'items': {'k': 1}}})
+    a.close()
+    t.join(2)
+    assert not t.is_alive() and dd.detached == 1
+
+
+# ── pool, workers on threads ────────────────────────────────────────────────
+
+def _thread_spawn(dds, started=None):
+    """A spawn that runs worker_main on threads, attaching from *dds*."""
+    def spawn(host, port, n, secret):
+        threads = []
+        for wid in range(n):
+            t = threading.Thread(target=dw.worker_main,
+                                 args=('127.0.0.1', port, wid, secret),
+                                 kwargs={'attach': dds.__getitem__},
+                                 daemon=True)
+            t.start()
+            threads.append(t)
+        if started is not None:
+            started.extend(threads)
+        return threads
+    return spawn
+
+
+async def _run_spawn(fn, *args):
+    return fn(*args)
+
+
+@pytest.mark.parametrize('kpr, batches', [('16', 3), ('0', 3)])
+def test_pool_splits_and_merges(monkeypatch, kpr, batches):
+    monkeypatch.setenv(dw.ENV_KEYS_PER_REQ, kpr)
+    dds = {'D': _DDict()}
+
+    async def _run():
+        pool = dw.WorkerPool(3, _thread_spawn(dds))
+        await pool.start(_run_spawn)
+        items = {f'k{i}': i for i in range(30)}
+        assert await pool.put('x', 'D', items) == 30
+        keys = ['k0', 'zz', 'k29', 'k7']
+        found, missing = await pool.get('x', 'D', keys)
+        assert found == {'k0': 0, 'k29': 29, 'k7': 7} and missing == ['zz']
+        assert await pool.contains('x', 'D', ['k1', 'no', 'k2']) == ['no']
+        assert await pool.pop('x', 'D', ['k1', 'no']) == ['no']
+        await pool.detach('x')
+        await pool.stop()
+        return pool
+    pool = asyncio.run(_run())
+    assert dds['D'] == {f'k{i}': i for i in range(30) if i != 1}
+    # an idle pool routes by key (crc32): one batch per worker
+    assert dds['D'].batches == batches
+    for t in pool.procs:
+        t.join(2)
+        assert not t.is_alive()
+
+
+def test_pool_rejects_bad_secret(monkeypatch):
+    monkeypatch.setattr(dw, 'HELLO_TIMEOUT', 1)
+
+    def spawn(host, port, n, secret):
+        t = threading.Thread(target=dw.worker_main,
+                             args=('127.0.0.1', port, 0, 'wrong'),
+                             kwargs={'attach': lambda d: _DDict()},
+                             daemon=True)
+        t.start()
+        return [t]
+
+    async def _run():
+        pool = dw.WorkerPool(1, spawn)
+        with pytest.raises(dw.WorkerError, match='0 of 1'):
+            await pool.start(_run_spawn)
+        await pool.stop()
+    asyncio.run(_run())
+
+
+def test_pool_worker_gone_is_worker_error():
+    dds = {'D': _DDict()}
+
+    async def _run():
+        pool = dw.WorkerPool(1, _thread_spawn(dds))
+        await pool.start(_run_spawn)
+        await pool._conns[0].call({'op': 'exit'})     # worker leaves
+        with pytest.raises(dw.WorkerError, match='went away'):
+            await pool.get('x', 'D', ['k'])
+        await pool.stop()
+    asyncio.run(_run())
+
+
+# ── backend and plugin with workers ─────────────────────────────────────────
+
+class _WorkerBackend(_FakeBackend):
+    """Fake Dragon plus thread workers attaching the backend's DDicts."""
+
+    def __init__(self, workers=2):
+        super().__init__(workers=workers)
+        self.spawned = []
+        self.reaped  = None
+
+    def _new_ddict(self, managers_per_node, n_nodes, total_mem):
+        return _DDict(managers_per_node, n_nodes, total_mem)
+
+    def _spawn_workers(self, host, port, n, secret):
+        by_desc = {dd.serialize(): dd for dd in self._ddicts.values()}
+
+        class _Lookup(dict):
+            def __missing__(lookup, desc):      # created after the spawn
+                return {d.serialize(): d
+                        for d in self._ddicts.values()}[desc]
+        return _thread_spawn(_Lookup(by_desc), self.spawned)(
+            host, port, n, secret)
+
+    def _reap_workers(self, procs):
+        self.reaped = procs
+        for t in procs:
+            t.join(2)
+
+
+def _mkw(workers=2):
+    app     = FastAPI()
+    backend = _WorkerBackend(workers)
+    plugin  = PluginDragon(app, backend=backend)
+    tc      = TestClient(app)
+    sid     = tc.post('/dragon/register_session').json()['sid']
+    return plugin, backend, tc, sid
+
+
+def test_plugin_data_ops_through_workers():
+    plugin, backend, tc, sid = _mkw(2)
+    with tc:
+        did = tc.post(f'/dragon/ddict/create/{sid}', json={}).json()['id']
+        u   = f'/dragon/ddict/{{}}/{sid}'
+        items = {f'k{i}': {'i': i} for i in range(20)}
+        r = tc.post(u.format('put'), json={'id': did, 'items': items})
+        assert r.json() == {'n': 20}
+        assert len(backend.spawned) == 2           # started on first use
+        r = tc.post(u.format('get'), json={'id': did,
+                                           'keys': ['k3', 'zz', 'k19']}).json()
+        assert r['items'] == {'k3': {'i': 3}, 'k19': {'i': 19}}
+        assert r['missing'] == ['zz']
+        r = tc.post(u.format('get'), json={'id': did, 'keys': ['k1', 'q'],
+                                           'values': False}).json()
+        assert r['missing'] == ['q']
+        r = tc.post(u.format('pop'), json={'id': did,
+                                           'keys': ['k1', 'q']}).json()
+        assert r == {'n': 1, 'missing': ['q']}
+        dd = backend._ddicts[did]
+        assert len(dd) == 19
+        assert tc.post(f'/dragon/ddict/destroy/{sid}',
+                       json={'id': did}).status_code == 200
+        assert dd.destroyed and dd.detached == 2   # both workers let go
+
+
+def test_backend_close_stops_workers():
+    _, backend, tc, sid = _mkw(2)
+    with tc:
+        did = tc.post(f'/dragon/ddict/create/{sid}', json={}).json()['id']
+        tc.post(f'/dragon/ddict/put/{sid}', json={'id': did,
+                                                 'items': {'a': 1}})
+        tc.portal.call(backend.close)         # on the loop the pool lives on
+    assert backend.reaped == backend.spawned
+    assert all(not t.is_alive() for t in backend.spawned)
+    assert backend.down == 1
+
+
+def test_backend_worker_start_failure_is_503(monkeypatch):
+    monkeypatch.setattr(dw, 'HELLO_TIMEOUT', 0.5)
+    _, backend, tc, sid = _mkw(2)
+    backend._spawn_workers = lambda host, port, n, secret: []   # none come
+    with tc:
+        did = tc.post(f'/dragon/ddict/create/{sid}', json={}).json()['id']
+        r = tc.post(f'/dragon/ddict/put/{sid}', json={'id': did,
+                                                     'items': {'a': 1}})
+    assert r.status_code == 503
+    assert backend._workers is None
+
+
+def test_batch_puts_switch(monkeypatch):
+    monkeypatch.setenv(dw.ENV_BATCH_PUTS, '0')
+    assert not dw.batch_puts()
+    dd = _DDict()
+    assert dw.batch_put(dd, {'a': 1, 'b': 2}) == 2
+    assert dd == {'a': 1, 'b': 2} and dd.batches == 0
+    monkeypatch.setenv(dw.ENV_BATCH_PUTS, 'on')
+    assert dw.batch_puts()
+    monkeypatch.delenv(dw.ENV_BATCH_PUTS)
+    assert dw.batch_puts()
+
+
+def test_unbatched_put_reports_progress(monkeypatch):
+    monkeypatch.setenv(dw.ENV_BATCH_PUTS, '0')
+
+    class _Full(_DDict):
+        def __setitem__(self, k, v):
+            if len(self) >= 1:
+                raise RuntimeError('full')
+            super().__setitem__(k, v)
+    with pytest.raises(RuntimeError, match='after 1 of 2 items'):
+        dw.batch_put(_Full(), {'a': 1, 'b': 2})
+
+
+def test_pool_overlaps_requests_to_one_worker():
+    """A second request reaches the worker while it still runs the first."""
+    gate, seen = threading.Event(), []
+
+    class _Slow(_DDict):
+        def __getitem__(self, k):
+            seen.append(k)
+            if k == 'first':
+                gate.wait(5)
+            return super().__getitem__(k)
+    dds = {'D': _Slow()}
+    dds['D'].update({'first': 1, 'second': 2})
+
+    async def _run():
+        pool = dw.WorkerPool(1, _thread_spawn(dds))
+        await pool.start(_run_spawn)
+        conn = pool._conns[0]
+        t1 = asyncio.ensure_future(pool.get('x', 'D', ['first']))
+        t2 = asyncio.ensure_future(pool.get('x', 'D', ['second']))
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if len(conn._pending) == 2:
+                break
+        in_flight = len(conn._pending)            # both sent, none answered
+        gate.set()
+        r1, r2 = await t1, await t2
+        await pool.stop()
+        return in_flight, r1, r2
+    in_flight, r1, r2 = asyncio.run(_run())
+    assert in_flight == 2
+    assert r1 == ({'first': 1}, []) and r2 == ({'second': 2}, [])
+    assert seen == ['first', 'second']            # served in order
+
+
+def test_pool_many_concurrent_calls_match_replies():
+    dds = {'D': _DDict()}
+    dds['D'].update({f'k{i}': i for i in range(200)})
+
+    async def _run():
+        pool = dw.WorkerPool(2, _thread_spawn(dds))
+        await pool.start(_run_spawn)
+        rs = await asyncio.gather(*[pool.get('x', 'D', [f'k{i}'])
+                                    for i in range(200)])
+        await pool.stop()
+        return rs
+    rs = asyncio.run(_run())
+    assert all(r == ({f'k{i}': i}, []) for i, r in enumerate(rs))
+
+
+def test_keys_per_request(monkeypatch):
+    monkeypatch.delenv(dw.ENV_KEYS_PER_REQ, raising=False)
+    assert dw.keys_per_request() == dw.KEYS_PER_REQ
+    monkeypatch.setenv(dw.ENV_KEYS_PER_REQ, '0')
+    assert dw.keys_per_request() == 0
+    for bad in ('x', '-1'):
+        monkeypatch.setenv(dw.ENV_KEYS_PER_REQ, bad)
+        with pytest.raises(ValueError):
+            dw.keys_per_request()
+
+
+class _Idle:
+    load = 0
+
+
+def test_split_chunks_to_distinct_workers(monkeypatch):
+    monkeypatch.setenv(dw.ENV_KEYS_PER_REQ, '16')
+    pool = dw.WorkerPool(8, None)
+    pool._conns = {w: _Idle() for w in range(8)}
+    keys  = [f'k{i}' for i in range(64)]
+    # idle: every key to its fixed worker, the parallelism of the pool
+    assert pool._split('D', keys) == {
+        w: [k for k in keys if dw.route(k, 8) == w] for w in range(8)}
+    pool._inflight = 8                          # busy: chunks
+    parts = pool._split('D', keys)
+    assert len(parts) == 4 and all(len(v) == 16 for v in parts.values())
+    assert sorted(k for v in parts.values() for k in v) == sorted(keys)
+    # round robin: the next call starts on other workers
+    assert not set(pool._split('D', keys[:16])) & {min(parts)}
+    monkeypatch.setenv(dw.ENV_KEYS_PER_REQ, '0')
+    pool = dw.WorkerPool(8, None)
+    assert len(pool._split('D', keys)) == 8     # one fixed worker per key
+
+
+def test_split_prefers_idle_workers(monkeypatch):
+    monkeypatch.setenv(dw.ENV_KEYS_PER_REQ, '4')
+
+    class _L:
+        def __init__(self, load):
+            self.load = load
+    pool = dw.WorkerPool(3, None)
+    pool._conns = {0: _L(5), 1: _L(0), 2: _L(2)}
+    pool._inflight = 7
+    assert list(pool._split('D', ['a', 'b'])) == [1]
+
+
+def test_pins_are_per_session(monkeypatch):
+    """A key one session is writing binds only that session's later
+    requests of it: other sessions' writes race anyway, and binding them
+    would pile all writers of a shared key onto one worker."""
+    monkeypatch.setenv(dw.ENV_KEYS_PER_REQ, '4')
+
+    class _L:
+        def __init__(self, load):
+            self.load = load
+    pool = dw.WorkerPool(2, None)
+    pool._conns = {0: _L(5), 1: _L(0)}
+    pool._inflight = 5
+    pool._pin('D', 'A', {0: ['a']})
+    assert pool._split('D', ['a'], 'A') == {0: ['a']}
+    assert pool._split('D', ['a'], 'B') == {1: ['a']}
+    pool._unpin('D', 'A', {0: ['a']})
+    assert pool._pinned == {}
+
+
+def test_pool_write_in_flight_pins_the_key(monkeypatch):
+    """A second write and a read of a key still being written go to the
+    same worker, so they cannot overtake the first write."""
+    monkeypatch.setenv(dw.ENV_KEYS_PER_REQ, '16')
+    gate = threading.Event()
+
+    class _Slow(_DDict):
+        def __setitem__(self, k, v):
+            if v == 'first':
+                gate.wait(5)
+            super().__setitem__(k, v)
+    dds = {'D': _Slow()}
+
+    async def _run():
+        pool = dw.WorkerPool(4, _thread_spawn(dds))
+        await pool.start(_run_spawn)
+        t1 = asyncio.ensure_future(pool.put('x', 'D', {'a': 'first'}))
+        await asyncio.sleep(0.05)
+        pinned = dict(pool._pinned)
+        t2 = asyncio.ensure_future(pool.put('x', 'D', {'a': 'second',
+                                                       'b': 1}))
+        t3 = asyncio.ensure_future(pool.get('x', 'D', ['a']))
+        await asyncio.sleep(0.05)
+        both = pool._pinned[('x', None, 'a')][1]
+        gate.set()
+        await t1, await t2
+        found, _ = await t3
+        left = dict(pool._pinned)
+        await pool.stop()
+        return pinned, both, found, left
+    pinned, both, found, left = asyncio.run(_run())
+    assert list(pinned) == [('x', None, 'a')]
+    assert both == 2                            # both writes on one worker
+    assert found == {'a': 'second'}             # the read waited for them
+    assert dds['D']['a'] == 'second' and left == {}
+
+
+def test_pool_unpins_after_a_failed_write(monkeypatch):
+    monkeypatch.setenv(dw.ENV_KEYS_PER_REQ, '16')
+
+    class _Full(_DDict):
+        def __setitem__(self, k, v):
+            raise RuntimeError('full')
+    dds = {'D': _Full()}
+
+    async def _run():
+        pool = dw.WorkerPool(2, _thread_spawn(dds))
+        await pool.start(_run_spawn)
+        with pytest.raises(dw.WorkerError, match='full'):
+            await pool.put('x', 'D', {'a': 1})
+        left = dict(pool._pinned)
+        await pool.stop()
+        return left
+    assert asyncio.run(_run()) == {}
+
+
+
+def test_reap_terminate_signals_then_joins():
+    class _P:
+        def __init__(self):
+            self.seen, self.is_alive = [], False
+
+        def terminate(self):
+            self.seen.append('term')
+
+        def join(self, timeout=None):
+            self.seen.append('join')
+
+        def kill(self):
+            self.seen.append('kill')
+    p = _P()
+    dw.dragon_reap_terminate([p], 1)
+    assert p.seen == ['term', 'join']

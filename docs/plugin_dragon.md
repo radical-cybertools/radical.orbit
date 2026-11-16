@@ -33,8 +33,60 @@ plugin reaches a runtime:
 Default: `attach` when `$DRAGON_ATTACH_TOKEN` is set, else `start`.  The
 `dragon` launcher must be on `PATH` or next to the endpoint's interpreter.
 
-All Dragon calls run on one dedicated thread: concurrent DDict calls from
-several threads hang in dragonhpc 0.15.0.
+All Dragon calls of the endpoint run on one dedicated thread: concurrent
+DDict calls from several threads hang in dragonhpc 0.15.0. A put of several
+keys is sent as one Dragon batch put (`start_batch_put` / `end_batch_put`),
+so the managers do not confirm each key; an error then shows only at the
+end, and an unknown subset of the batch may be stored. Inside a batch,
+dragonhpc 0.15.0 opens manager connections in ascending manager id only, and
+a key for a lower manager than one already open ends the batch and starts a
+new one; so the first key of each manager is put first, in ascending manager
+id, and the rest follow in the given order (`dragon_workers.put_order`, via
+Dragon's private key-to-manager mapping; without it the order is unchanged).
+`RADICAL_ORBIT_DRAGON_BATCH_PUTS=0` turns that off (key by key, each
+confirmed), for comparisons with unbatched native writers.
+
+**Worker processes.** One thread caps an endpoint at about one DDict call
+per 0.4 ms. With `RADICAL_ORBIT_DRAGON_WORKERS=N` the endpoint instead
+starts N Dragon processes in the runtime, round-robin over its nodes, and
+runs put, get, presence checks and pop there. Each worker attaches the
+DDicts by descriptor and serves one request at a time; a multi-key request
+goes, while fewer requests are in flight than there are workers, key by
+key to a fixed worker (crc32), which keeps a single client's calls as
+parallel as the pool allows; under load it is cut into chunks of
+`RADICAL_ORBIT_DRAGON_KEYS_PER_REQUEST` keys (default 8), each sent to the
+least busy worker. Splitting every call over every worker cost more than it
+gained from 32 workers on (phase 8 on Perlmutter: 32 to 46 requests per
+64-key call through one event loop; phase 9: chunks of 8 keys doubled gets
+at 64 workers). A key a session has a put or pop in flight for goes to that
+worker for that session until it is answered, so the session's later write
+or read of it cannot overtake the write (each worker serves its requests in
+order); writes of different sessions are not ordered, as in Dragon. `0`
+always routes by key.
+Create, destroy, `keys`, `len` and `clear` stay on the endpoint's thread.
+Workers connect back to the endpoint over TCP (to `$(hostname)`, or
+`$RADICAL_ORBIT_DRAGON_WORKER_HOST`), authenticated with a per-endpoint
+secret, and exit when the endpoint stops. Natively, more than about two
+writers per DDict manager slow puts down, so raise `managers_per_node` with
+the worker count.
+
+**Several endpoints per DDict.** One endpoint's event loop tops out at
+about 70k keys/s at 64 keys per call (phase 11 on Perlmutter, 32 nodes).
+With `RADICAL_ORBIT_DRAGON_ENDPOINTS=E` the endpoint (the head) starts E−1
+sibling endpoints named `<head>.1` … as Dragon processes in its runtime,
+one per node in turn, on its first create; each registers with the broker
+on its own and runs `RADICAL_ORBIT_DRAGON_WORKERS / E` workers, so the
+total stays the same. After a create the head attaches the DDict on every
+sibling (`ddict/attach`, by descriptor) and lists the endpoints that serve
+it in the entry's `endpoints` (a sibling that did not attach is listed in
+`degraded`); before a destroy it detaches them. Siblings serve put, get,
+presence checks, pop, `keys` and `len`; create, destroy and clear answer
+409 there. `DDictHandle` sends its data calls to the listed endpoints in
+turn and retries a failed sibling call once on the head; without the list
+(one endpoint, or an older one) it uses the head. A client sends one call
+at a time, so its writes of a key stay in order across endpoints. The head
+stops its siblings (SIGTERM, they detach) before it destroys its DDicts.
+With `RADICAL_ORBIT_LOG_FILE` set, sibling *i* logs to `<file>.<i>`.
 
 **Multi-node runtimes under Slurm.** Start the endpoint under `dragon -m`
 from the batch script or an interactive `salloc` shell, not from inside an
@@ -78,7 +130,18 @@ inside the runtime is reported per key in `errors` (nested ones are plain
 dicts).  A value written inside the runtime that
 is neither (e.g. a numpy array) is reported per key in `errors`.  A `get`
 reply above half the transport frame cap fails with 413: get fewer keys per
-call.
+call; the bound is computed from value lengths, without encoding twice.
+
+The Python client (`DDictHandle.update`, `get_many` and the item
+operations built on them) sends msgpack bodies (`content-type:
+application/msgpack`) and asks for a msgpack reply (`accept`): values,
+bytes included, travel as they are, with no base64 and no JSON (the
+endpoint's work loop spent most of its time there, phase 6 on
+Perlmutter).  Values are then what msgpack can carry (ints up to 64 bit;
+a tuple reads back as a list), and a marker-shaped dict reads back as
+stored.  An endpoint without msgpack replies answers JSON, which the
+client decodes as before.  HTTP callers (gateway, Explorer) keep the JSON
+form above.
 
 ## Client API
 

@@ -58,8 +58,8 @@ to 16–19 ms without it; small frames are unaffected), so:
   `RADICAL_ORBIT_WS_COMPRESSION=off` turns acceptance off;
 - an `EndpointRuntime` *offers* it per mode `off`, `on` or `auto`
   (`ws_compression=` keyword > `RADICAL_ORBIT_WS_COMPRESSION` > `auto`).
-  `auto` times a plain TCP connect to the broker before each (re)connect
-  and offers deflate when it takes at least 10 ms
+  `auto` times up to 3 plain TCP connects to the broker before each
+  (re)connect and offers deflate when the fastest takes at least 10 ms
   (`ws_compression_rtt_ms` / `RADICAL_ORBIT_WS_COMPRESSION_RTT_MS`) —
   i.e. on WAN links, not inside a site.  The runtime asks for zlib level 1.
 

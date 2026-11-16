@@ -23,6 +23,11 @@ in.  Otherwise, runtime selection (``$RADICAL_ORBIT_DRAGON_RUNTIME``):
               plugin shutdown.
 
 Default: ``attach`` when ``$DRAGON_ATTACH_TOKEN`` is set, else ``start``.
+
+Data operations (put, get, contains, pop) run on the endpoint's own Dragon
+thread, or, with ``$RADICAL_ORBIT_DRAGON_WORKERS=N``, on N Dragon worker
+processes inside the runtime (:mod:`.dragon_workers`), which is how Dragon
+itself scales writers.
 """
 
 __author__    = 'Radical Development Team'
@@ -53,10 +58,16 @@ from concurrent.futures import Executor, Future
 from concurrent.futures import TimeoutError as FutureTimeout
 from typing import Any, Dict, List, Optional
 
+import msgpack
 from fastapi import FastAPI, HTTPException
 from starlette.requests import Request
+from starlette.responses import Response
 
 from .client import PluginClient
+from .dragon_workers import dragon_reap_terminate
+from .dragon_workers import (WorkerError, WorkerPool, batch_put,
+                             dragon_reap, dragon_spawn, handle,
+                             worker_count)
 from .errors import http_exception
 from .plugin_base import Plugin, resolve_frame_cap
 from .plugin_session_base import PluginSession
@@ -85,6 +96,14 @@ NATIVE           = 'native'            # _rt: running inside a runtime
 # A top-level single-key ``{B64_KEY: ...}`` dict is reserved for that: it
 # cannot be stored as a dict through ORBIT (nested ones can).
 B64_KEY          = '$b64'
+MSGPACK          = 'application/msgpack'    # binary bodies (Python client)
+ENV_ENDPOINTS    = 'RADICAL_ORBIT_DRAGON_ENDPOINTS'
+ENV_SIBLING_OF   = 'RADICAL_ORBIT_DRAGON_SIBLING_OF'
+ENV_ENDPOINT_BIN = 'RADICAL_ORBIT_ENDPOINT_BIN'
+MAX_ENDPOINTS    = 64
+SIBLING_TIMEOUT  = 120                    # s, siblings registered / attached
+SIBLING_STOP     = 30                     # s, siblings stopped
+MP_ITEM          = 16       # msgpack bytes per item beyond key and value
 
 # a module-wide guard: one PluginDragon with the default backend (and so one
 # Dragon thread) per process, see PluginDragon.__init__
@@ -104,6 +123,26 @@ def encode_value(value: Any) -> Any:
     if isinstance(value, (bytes, bytearray)):
         return {B64_KEY: base64.b64encode(value).decode()}
     return value
+
+
+def json_str_len(s: str) -> int:
+    """Length of ``json.dumps(s)`` (``ensure_ascii``), without encoding
+    the common case: printable ASCII with no quote or backslash."""
+    if s.isascii() and s.isprintable() and '"' not in s and '\\' not in s:
+        return len(s) + 2
+    return len(json.dumps(s))
+
+
+def json_value_len(value: Any) -> int:
+    """Length of ``json.dumps(value, allow_nan=False)`` for a wire value; a
+    bytes marker from :func:`encode_value` is counted without encoding it
+    (base64 is plain ASCII).  Raises like ``json.dumps`` otherwise."""
+    if type(value) is dict and len(value) == 1:
+        data = value.get(B64_KEY)
+        if type(data) is str:
+            # {"$b64": <data>}
+            return json_str_len(data) + len(B64_KEY) + 6
+    return len(json.dumps(value, allow_nan=False))
 
 
 def decode_value(value: Any) -> Any:
@@ -145,6 +184,34 @@ def dragon_available() -> bool:
     except (ImportError, ValueError):
         return False
     return spec is not None and spec.origin is not None
+
+
+def _sibling_main(exe: str, argv: List[str], env: Dict[str, str]) -> None:
+    """A sibling endpoint (a Dragon process of the head): the endpoint
+    script *exe* with *argv*, *env* added to the environment."""
+    import runpy
+    os.environ.update(env)
+    sys.argv = [exe] + list(argv)
+    runpy.run_path(exe, run_name='__main__')
+
+
+def endpoint_count() -> int:
+    """Endpoints per DDict (``$RADICAL_ORBIT_DRAGON_ENDPOINTS``, default 1):
+    the head endpoint starts the others as sibling endpoints in its Dragon
+    runtime; a sibling (``$RADICAL_ORBIT_DRAGON_SIBLING_OF`` set) is 1."""
+    if os.environ.get(ENV_SIBLING_OF):
+        return 1
+    raw = os.environ.get(ENV_ENDPOINTS, '').strip()
+    if not raw:
+        return 1
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 0
+    if not 1 <= n <= MAX_ENDPOINTS:
+        raise ValueError(f"${ENV_ENDPOINTS}={raw!r}: expected 1.."
+                         f"{MAX_ENDPOINTS}")
+    return n
 
 
 def runtime_mode() -> str:
@@ -249,13 +316,18 @@ class DDictBackend:
     :meth:`_new_ddict`.
     """
 
-    def __init__(self, mode: str):
+    def __init__(self, mode: str, workers: Optional[int] = None):
         self._mode    = mode
         self._pool    = DragonThread()
         self._rt      = None
         self._nodes   = None                # runtime node count, cached
         self._closed  = False
         self._ddicts: Dict[str, Any] = {}
+        self._descs:  Dict[str, str] = {}   # did -> descriptor, for workers
+        self._attached: set = set()         # dids served, not owned
+        self._nworkers = worker_count() if workers is None else workers
+        self._workers: Optional[WorkerPool] = None
+        self._wlock   = None                # created on the loop that uses it
 
     @property
     def closed(self) -> bool:
@@ -354,6 +426,32 @@ class DDictBackend:
                                 detail=f"n_nodes={n_nodes} exceeds the "
                                        f"runtime's {limit} node(s)")
 
+    def _attach_ddict(self, desc: str) -> Any:
+        from dragon.data.ddict import DDict
+        return DDict.attach(desc)
+
+    async def attach(self, did: str, desc: str) -> None:
+        """Serve the existing DDict *desc* under *did*, without owning it:
+        :meth:`detach` and :meth:`close` detach instead of destroying."""
+        def _attach():
+            self._runtime_up()
+            self._ddicts[did] = self._attach_ddict(desc)
+            self._descs[did]  = desc
+            self._attached.add(did)
+        await self._call(_attach)
+
+    async def detach(self, did: str) -> None:
+        if self._workers is not None:
+            await self._workers.detach(did)
+
+        def _detach():
+            self._descs.pop(did, None)
+            self._attached.discard(did)
+            dd = self._ddicts.pop(did, None)
+            if dd is not None:
+                dd.detach()
+        await self._call(_detach)
+
     def _new_ddict(self, managers_per_node: int, n_nodes: int,
                    total_mem: int) -> Any:
         from dragon.data.ddict import DDict
@@ -361,6 +459,59 @@ class DDictBackend:
         # stuck one fails instead of blocking the Dragon thread for good
         return DDict(managers_per_node, n_nodes, total_mem,
                      timeout=RUNTIME_TIMEOUT)
+
+    def _spawn_workers(self, host: str, port: int, n: int,
+                       secret: str) -> Any:
+        """Start the worker processes (Dragon thread)."""
+        return dragon_spawn(host, port, n, secret)
+
+    def _reap_workers(self, procs: Any) -> None:
+        """Join or kill the worker processes (Dragon thread)."""
+        dragon_reap(procs)
+
+    async def _pool_of_workers(self) -> Optional[WorkerPool]:
+        """The worker pool, started on first use; None without workers."""
+        if not self._nworkers:
+            return None
+        if self._workers is not None:
+            return self._workers
+        if self._wlock is None:
+            self._wlock = asyncio.Lock()
+        async with self._wlock:
+            if self._workers is None:
+                pool = WorkerPool(self._nworkers, self._spawn_workers)
+                try:
+                    await pool.start(self._call)
+                except BaseException as e:
+                    await pool.stop()
+                    if pool.procs:
+                        await self._call(self._reap_workers, pool.procs)
+                    if isinstance(e, HTTPException):
+                        raise
+                    raise HTTPException(status_code=503,
+                                        detail=f"dragon workers: {e}") from e
+                self._workers = pool
+        return self._workers
+
+    def _desc(self, did: str) -> str:
+        try:
+            return self._descs[did]
+        except KeyError:
+            raise http_exception(FileNotFoundError(
+                f"unknown ddict: {did}")) from None
+
+    async def _on_workers(self, op: str, did: str, arg: Any,
+                          owner: Optional[str] = None) -> Any:
+        """Run *op* on the workers; None when there are none.  *owner*
+        (the session) scopes the write order the pool keeps."""
+        pool = await self._pool_of_workers()
+        if pool is None:
+            return None
+        desc = self._desc(did)
+        try:
+            return await getattr(pool, op)(did, desc, arg, owner=owner)
+        except WorkerError as e:
+            raise RuntimeError(str(e)) from e
 
     # -- DDict operations ----------------------------------------------------
 
@@ -385,53 +536,49 @@ class DDictBackend:
             self._check_nodes(n_nodes)
             dd = self._new_ddict(managers_per_node, n_nodes, total_mem)
             self._ddicts[did] = dd
-            return dd.serialize()
+            self._descs[did]  = dd.serialize()
+            return self._descs[did]
         return await self._call(_create)
 
     async def destroy(self, did: str) -> None:
+        if self._workers is not None:
+            await self._workers.detach(did)
+
         def _destroy():
             self._ddict(did).destroy()
             del self._ddicts[did]
+            self._descs.pop(did, None)
         await self._call(_destroy)
 
-    async def put(self, did: str, items: Dict[str, Any]) -> int:
-        def _put():
-            dd = self._ddict(did)
-            for n, (k, v) in enumerate(items.items()):
-                try:
-                    dd[k] = v
-                except Exception as e:
-                    raise RuntimeError(f"put stopped at key {k!r} after "
-                                       f"{n} of {len(items)} items: "
-                                       f"{e}") from e
-            return len(items)
-        return await self._call(_put)
+    async def put(self, did: str, items: Dict[str, Any],
+                  owner: Optional[str] = None) -> int:
+        """Store *items*; several at once as one Dragon batch put."""
+        if self._nworkers:
+            return await self._on_workers('put', did, items, owner)
+        return await self._call(lambda: batch_put(self._ddict(did), items))
 
-    async def get(self, did: str, keys: List[str]) -> tuple:
+    async def get(self, did: str, keys: List[str],
+                  owner: Optional[str] = None) -> tuple:
         """Returns ``({key: value}, [missing keys])``."""
-        def _get():
-            dd = self._ddict(did)
-            found, missing = {}, []
-            for k in keys:
-                try:
-                    found[k] = dd[k]
-                except KeyError:
-                    missing.append(k)
-            return found, missing
-        return await self._call(_get)
+        if self._nworkers:
+            return await self._on_workers('get', did, keys, owner)
+        return tuple(await self._call(
+            lambda: handle('get', self._ddict(did), {'keys': keys})))
 
-    async def contains(self, did: str, keys: List[str]) -> List[str]:
+    async def contains(self, did: str, keys: List[str],
+                       owner: Optional[str] = None) -> List[str]:
         """Returns the keys of *keys* that are missing (values not read)."""
-        def _contains():
-            dd = self._ddict(did)
-            return [k for k in keys if k not in dd]
-        return await self._call(_contains)
+        if self._nworkers:
+            return await self._on_workers('contains', did, keys, owner)
+        return await self._call(
+            lambda: handle('contains', self._ddict(did), {'keys': keys}))
 
     def discard(self, did: str) -> None:
         """Queue the destroy of *did*, if it exists by then: for a create
         whose caller went away while the create still runs (the single
         Dragon thread runs this after it)."""
         def _discard():
+            self._descs.pop(did, None)
             dd = self._ddicts.pop(did, None)
             if dd is not None:
                 try:
@@ -443,18 +590,13 @@ class DDictBackend:
         except RuntimeError:
             pass                        # closed: close() destroyed it
 
-    async def pop(self, did: str, keys: List[str]) -> List[str]:
+    async def pop(self, did: str, keys: List[str],
+                  owner: Optional[str] = None) -> List[str]:
         """Remove *keys*; returns the ones that were missing."""
-        def _pop():
-            dd = self._ddict(did)
-            missing = []
-            for k in keys:
-                try:
-                    del dd[k]
-                except KeyError:
-                    missing.append(k)
-            return missing
-        return await self._call(_pop)
+        if self._nworkers:
+            return await self._on_workers('pop', did, keys, owner)
+        return await self._call(
+            lambda: handle('pop', self._ddict(did), {'keys': keys}))
 
     async def keys(self, did: str) -> List[Any]:
         return await self._call(lambda: list(self._ddict(did).keys()))
@@ -471,10 +613,15 @@ class DDictBackend:
         try:
             for did, dd in list(self._ddicts.items()):
                 try:
-                    dd.destroy()
+                    if did in self._attached:
+                        dd.detach()             # not ours: the head's
+                    else:
+                        dd.destroy()
                 except Exception as e:
                     log.warning("[dragon] destroy %s failed: %s", did, e)
+            self._attached.clear()
             self._ddicts.clear()
+            self._descs.clear()
             self._runtime_down()
         except Exception as e:
             log.warning("[dragon] runtime release failed, it may be left "
@@ -490,6 +637,11 @@ class DDictBackend:
         completes it at exit if it did not get to run."""
         if self._closed or self._pool.down:
             return                      # a cancelled close: close_sync
+        workers, self._workers, self._nworkers = self._workers, None, 0
+        if workers is not None:
+            # workers first: they hold handles on the DDicts destroyed below
+            await workers.stop()
+            self._pool.submit(self._reap_workers, workers.procs)
         # the close is the last job: no create can queue behind it
         fut = self._pool.submit(self._close)
         self._pool.shutdown(wait=False)
@@ -562,25 +714,35 @@ class DragonSession(PluginSession):
         self._check_active()
         return await self._p.ddict_destroy(did)
 
-    async def put(self, did: str, items: Dict[str, Any]) -> dict:
+    async def put(self, did: str, items: Dict[str, Any],
+                  raw: bool = False) -> dict:
+        """*raw*: values arrived as msgpack, bytes as bytes: no decoding."""
         self._check_active()
         self._p.entry(did)
-        try:
-            items = {k: decode_value(v) for k, v in items.items()}
-        except ValueError as e:
-            raise http_exception(e) from e
-        return {"n": await self._p.backend.put(did, items)}
+        if not raw:
+            try:
+                items = {k: decode_value(v) for k, v in items.items()}
+            except ValueError as e:
+                raise http_exception(e) from e
+        return {"n": await self._p.backend.put(did, items,
+                                                 owner=self.sid)}
 
     async def get(self, did: str, keys: List[str],
-                  values: bool = True) -> dict:
+                  values: bool = True, binary: bool = False) -> dict:
+        """``{items, missing, errors}``.  *binary*: for a msgpack reply,
+        values as stored (bytes stay bytes), sizes from byte lengths."""
         self._check_active()
         self._p.entry(did)
         hint = 'get fewer keys per call'
         if not values:
-            missing = await self._p.backend.contains(did, keys)
+            missing = await self._p.backend.contains(did, keys,
+                                                    owner=self.sid)
             self._p.check_reply(len(json.dumps(missing)), hint)
             return {"items": {}, "missing": missing, "errors": {}}
-        found, missing = await self._p.backend.get(did, keys)
+        found, missing = await self._p.backend.get(did, keys,
+                                                  owner=self.sid)
+        if binary:
+            return self._binary_reply(found, missing, hint)
         items, errors = {}, {}
         # sizes as escaped JSON (ensure_ascii): an upper bound of the reply
         size = len(json.dumps(missing))
@@ -589,21 +751,51 @@ class DragonSession(PluginSession):
                 # written in-runtime: would read back as bytes
                 errors[k] = f"value has the reserved {{{B64_KEY!r}: ...}} " \
                             f"shape"
-                size += len(json.dumps(errors[k])) + len(json.dumps(k)) + 4
+                size += json_str_len(errors[k]) + json_str_len(k) + 4
                 self._p.check_reply(size, hint)
                 continue
-            v = encode_value(v)
+            if isinstance(v, (bytes, bytearray)):
+                # {"$b64": "<base64>"}: plain ASCII, length known
+                v = encode_value(v)
+                size += len(v[B64_KEY]) + len(B64_KEY) + 8
+                items[k] = v
+                size += json_str_len(k) + 4
+                self._p.check_reply(size, hint)
+                continue
             try:
                 # strict JSON: the reply renderer rejects NaN / inf
-                size += len(json.dumps(v, allow_nan=False))
+                size += json_value_len(v)
                 items[k] = v
             except (TypeError, ValueError):
                 errors[k] = f"value of type {type(v).__name__} is not " \
                             f"JSON-serializable"
-                size += len(json.dumps(errors[k]))
-            size += len(json.dumps(k)) + 4
+                size += json_str_len(errors[k])
+            size += json_str_len(k) + 4
             self._p.check_reply(size, hint)
         self._p.check_reply(size, hint)     # also when nothing was found
+        return {"items": items, "missing": missing, "errors": errors}
+
+    def _binary_reply(self, found: dict, missing: list, hint: str) -> dict:
+        """The get reply for a msgpack client: values as stored; its size
+        bound from byte lengths (bytes, str) or the packed value."""
+        items, errors = {}, {}
+        size = MP_ITEM + sum(len(k) + MP_ITEM for k in missing)
+        for k, v in found.items():
+            if isinstance(v, (bytes, bytearray, str)):
+                n = len(v) if not isinstance(v, str) else 4 * len(v)
+            else:
+                try:
+                    n = len(msgpack.packb(v, use_bin_type=True))
+                except (TypeError, ValueError, OverflowError):
+                    errors[k] = f"value of type {type(v).__name__} is not " \
+                                f"msgpack-serializable"
+                    size += len(errors[k]) + len(k) + MP_ITEM
+                    self._p.check_reply(size, hint)
+                    continue
+            items[k] = v
+            size += n + len(k) + MP_ITEM
+            self._p.check_reply(size, hint)
+        self._p.check_reply(size, hint)
         return {"items": items, "missing": missing, "errors": errors}
 
     async def keys(self, did: str) -> dict:
@@ -619,7 +811,7 @@ class DragonSession(PluginSession):
     async def pop(self, did: str, keys: List[str]) -> dict:
         self._check_active()
         self._p.entry(did)
-        missing = await self._p.backend.pop(did, keys)
+        missing = await self._p.backend.pop(did, keys, owner=self.sid)
         return {"n": len(keys) - len(missing), "missing": missing}
 
     async def clear(self, did: str) -> dict:
@@ -646,9 +838,45 @@ class DDictHandle:
     Values are JSON-serializable objects or ``bytes``.
     """
 
+    def _data_client(self) -> tuple:
+        """The client for the next data call: the endpoints listed in the
+        entry in turn (the head without that list); ``(client, is_head)``."""
+        eps = self._entry.get('endpoints') or []
+        bc  = getattr(self._client, '_bc', None)
+        if len(eps) < 2 or bc is None:
+            return self._client, True
+        with self._lock:
+            i = self._next % len(eps)
+            self._next += 1
+            if i == 0:
+                return self._client, True
+            c = self._peers.get(eps[i])
+            if c is None:
+                try:
+                    c = bc.get_plugin(eps[i], 'dragon')
+                except Exception as e:      # pylint: disable=broad-except
+                    log.warning("[dragon] %s: using the head: %s", eps[i], e)
+                    c = self._client
+                self._peers[eps[i]] = c
+        return c, c is self._client
+
+    def _binary(self, path: str, **body) -> tuple:
+        """A data call on the next endpoint; once more on the head if a
+        sibling fails."""
+        c, head = self._data_client()
+        try:
+            return c._call_binary(path, **body)
+        except (RuntimeError, ConnectionError, TimeoutError):
+            if head:
+                raise
+            return self._client._call_binary(path, **body)
+
     def __init__(self, client: "DragonClient", entry: dict):
         self._client = client
         self._entry  = entry
+        self._lock   = threading.Lock()
+        self._next   = 0
+        self._peers: Dict[str, Any] = {}
 
     def __repr__(self) -> str:
         return f"DDictHandle({self.id!r}, name={self.name!r})"
@@ -682,9 +910,7 @@ class DDictHandle:
             # the wire form of bytes: it would read back as bytes
             raise ValueError(f"{bad[0]!r}: a dict with the single key "
                              f"{B64_KEY!r} is reserved for bytes")
-        self._client._call('POST', 'ddict/put/{sid}', id=self.id,
-                           items={k: encode_value(v)
-                                  for k, v in items.items()})
+        self._binary('ddict/put/{sid}', id=self.id, items=dict(items))
 
     def __getitem__(self, key: str) -> Any:
         r = self.get_many([key])
@@ -702,11 +928,12 @@ class DDictHandle:
 
     def get_many(self, keys: List[str]) -> dict:
         """``{items, missing, errors}`` for *keys*, values decoded."""
-        r = self._client._call('POST', 'ddict/get/{sid}', id=self.id,
-                               keys=list(keys))
-        # the server reports marker-shaped native values in 'errors': the
-        # items hold only values it encoded
-        r['items'] = {k: decode_value(v) for k, v in r['items'].items()}
+        r, binary = self._binary('ddict/get/{sid}', id=self.id,
+                                 keys=list(keys))
+        if not binary:
+            # JSON (an older endpoint): the server reports marker-shaped
+            # native values in 'errors', the items hold only values it encoded
+            r['items'] = {k: decode_value(v) for k, v in r['items'].items()}
         return r
 
     def __contains__(self, key: str) -> bool:
@@ -784,6 +1011,21 @@ class DragonClient(PluginClient):
         self._raise(resp, path.split('/{sid}')[0])
         return resp.json()
 
+    def _call_binary(self, path: str, **body) -> tuple:
+        """A POST with a msgpack body (bytes travel as bytes), asking for a
+        msgpack reply; returns ``(reply, binary)``: *binary* is false when
+        the endpoint answered JSON (an older plugin)."""
+        self._require_session()
+        url  = self._url(path.format(sid=self.sid))
+        resp = self._request('POST', url,
+                             content=msgpack.packb(body, use_bin_type=True),
+                             headers={'content-type': MSGPACK,
+                                      'accept': MSGPACK})
+        self._raise(resp, path.split('/{sid}')[0])
+        if MSGPACK in (resp.headers.get('content-type') or ''):
+            return msgpack.unpackb(resp.content, raw=False), True
+        return resp.json(), False
+
 
 # ------------------------------------------------------------------------
 #
@@ -822,7 +1064,12 @@ class PluginDragon(Plugin):
                         not _default_owner.backend.closed:
                     raise RuntimeError("a dragon plugin instance already "
                                        "runs in this process")
-                backend        = DDictBackend(runtime_mode())
+                n_ep           = endpoint_count()
+                kw             = {}
+                if n_ep > 1:
+                    # the workers are split over the endpoints
+                    kw['workers'] = max(1, worker_count() // n_ep)
+                backend        = DDictBackend(runtime_mode(), **kw)
                 self.backend   = backend
                 _default_owner = self
         try:
@@ -835,6 +1082,11 @@ class PluginDragon(Plugin):
 
         self.backend     = backend
         self.entries: Dict[str, dict] = {}
+        self.sibling_of  = os.environ.get(ENV_SIBLING_OF) or None
+        self.n_endpoints = endpoint_count()
+        self._siblings: Optional[List[str]] = None   # names, once started
+        self._sib_procs  = None
+        self._sib_lock: Optional[asyncio.Lock] = None
         self.reply_limit = resolve_frame_cap(app) // 2
 
         # fallback for a host exiting without stop() / shutdown()
@@ -849,6 +1101,8 @@ class PluginDragon(Plugin):
         self.add_route_post('ddict/keys/{sid}',       self.r_keys)
         self.add_route_post('ddict/pop/{sid}',        self.r_pop)
         self.add_route_post('ddict/clear/{sid}',      self.r_clear)
+        self.add_route_post('ddict/attach/{sid}',     self.r_attach)
+        self.add_route_post('ddict/detach/{sid}',     self.r_detach)
 
     def check_reply(self, size: int, hint: str) -> None:
         """413 when a reply of *size* bytes would exceed the reply limit."""
@@ -875,6 +1129,10 @@ class PluginDragon(Plugin):
     async def ddict_create(self, name: Optional[str], managers_per_node: int,
                            n_nodes: int, total_mem: int,
                            creator: Optional[str]) -> dict:
+        if self.sibling_of:
+            raise HTTPException(status_code=409,
+                                detail=f"create on the head endpoint "
+                                       f"{self.sibling_of!r}")
         did  = f'{ID_PREFIX}{uuid.uuid4().hex[:8]}'
         name = name or did
         if any(e['name'] == name for e in self.entries.values()):
@@ -905,6 +1163,8 @@ class PluginDragon(Plugin):
             # destroys what it made
             raise HTTPException(status_code=503,
                                 detail="endpoint is stopping")
+        if self.n_endpoints > 1:
+            await self._fan_attach(entry)
         entry['state'] = 'ready'
         log.info("[dragon] created %s (%s)", did, name)
         self._dispatch_notify('ddict_status', {"id": did, "name": name,
@@ -913,10 +1173,15 @@ class PluginDragon(Plugin):
 
     async def ddict_destroy(self, did: str) -> dict:
         entry = self.entry(did, ready=False)
+        if entry.get('attached'):
+            raise HTTPException(status_code=409,
+                                detail=f"destroy on the head endpoint "
+                                       f"{self.sibling_of!r}")
         if entry['state'] not in ('ready', 'failed'):
             raise http_exception(FileExistsError(
                 f"ddict {did} is {entry['state']}"))
         entry['state'] = 'destroying'
+        await self._fan_detach(entry)
 
         def _gone():
             self.entries.pop(did, None)
@@ -945,16 +1210,170 @@ class PluginDragon(Plugin):
         _gone()
         return {}
 
+    # -- sibling endpoints (scale-out) -----------------------------------------
+
+    def _host(self):
+        return getattr(getattr(self._app, 'state', None),
+                       'endpoint_service', None)
+
+    def _head_name(self) -> str:
+        svc = self._host()
+        return getattr(svc, 'name', None) or 'endpoint'
+
+    async def _ensure_siblings(self) -> List[str]:
+        """Start the sibling endpoints once (head only), wait until the
+        broker lists them; returns their names."""
+        if self._siblings is not None:
+            return self._siblings
+        if self._sib_lock is None:
+            self._sib_lock = asyncio.Lock()
+        async with self._sib_lock:
+            if self._siblings is None:
+                head  = self._head_name()
+                names = [f'{head}.{i}' for i in range(1, self.n_endpoints)]
+                self._sib_procs = await self.backend._call(
+                    self._spawn_siblings, head, names)
+                await self._wait_registered(names)
+                self._siblings = names
+                log.info("[dragon] %d sibling endpoints: %s", len(names),
+                         ', '.join(names))
+        return self._siblings
+
+    def _spawn_siblings(self, head: str, names: List[str]) -> list:
+        """Start sibling endpoints as Dragon processes (Dragon thread)."""
+        from dragon.native.machine import System
+        from dragon.native.process import Process
+        try:
+            policies = System().hostname_policies()
+        except Exception:               # pylint: disable=broad-except
+            policies = []
+        svc  = self._host()
+        url  = getattr(svc, 'broker_url', None) or \
+            os.environ.get('RADICAL_ORBIT_BROKER_URL', '')
+        exe  = os.path.abspath(os.environ.get(ENV_ENDPOINT_BIN) or sys.argv[0])
+        nw   = self.backend._nworkers
+        logf = os.environ.get('RADICAL_ORBIT_LOG_FILE')
+        procs = []
+        for i, name in enumerate(names, start=1):
+            env = {ENV_SIBLING_OF: head, ENV_ENDPOINTS: '1',
+                   'RADICAL_ORBIT_DRAGON_WORKERS': str(nw),
+                   'RADICAL_ORBIT_DRAGON_WORKER_OFFSET': str(i * nw)}
+            if logf:
+                env['RADICAL_ORBIT_LOG_FILE'] = f'{logf}.{i}'
+            policy = policies[i % len(policies)] if policies else None
+            argv = ['--name', name, '-p', 'dragon']
+            if url:
+                argv += ['--url', url]
+            # a Python-function process: an executable one lacks Dragon's
+            # launch parameters, and the sibling starts processes itself
+            proc = Process(target=_sibling_main, args=(exe, argv, env),
+                           policy=policy)
+            proc.start()
+            procs.append(proc)
+        return procs
+
+    async def _wait_registered(self, names: List[str]) -> None:
+        svc = self._host()
+        t0  = time.time()
+        while svc is not None:
+            have = set(svc.topology())
+            if all(n in have for n in names):
+                return
+            if time.time() - t0 > SIBLING_TIMEOUT:
+                raise HTTPException(status_code=503,
+                                    detail=f"sibling endpoints not "
+                                           f"registered: "
+                                           f"{sorted(set(names) - have)}")
+            await asyncio.sleep(0.5)
+
+    async def _sibling_call(self, name: str, op: str, body: dict) -> int:
+        """POST ``ddict/<op>/default`` on sibling *name*; the status."""
+        svc  = self._host()
+        path = f"/{self.namespace.strip('/')}/ddict/{op}/default"
+        resp = await svc._call(name, 'POST', path, json.dumps(body).encode(),
+                               {'content-type': 'application/json'},
+                               SIBLING_TIMEOUT)
+        return resp.status_code
+
+    async def _fan_attach(self, entry: dict) -> None:
+        """Attach a new DDict on every sibling; ``endpoints`` lists those
+        that serve it, the head first."""
+        names = await self._ensure_siblings()
+        body  = {k: entry[k] for k in ('id', 'name', 'descriptor',
+                                       'managers_per_node', 'n_nodes',
+                                       'total_mem')}
+        codes = await asyncio.gather(*[self._sibling_call(n, 'attach', body)
+                                       for n in names],
+                                     return_exceptions=True)
+        ok = [n for n, c in zip(names, codes) if c == 200]
+        if len(ok) < len(names):
+            entry['degraded'] = sorted(set(names) - set(ok))
+            log.warning("[dragon] %s: siblings did not attach: %s",
+                        entry['id'], entry['degraded'])
+        entry['endpoints'] = [self._head_name()] + ok
+
+    async def _fan_detach(self, entry: dict) -> None:
+        names = (entry.get('endpoints') or [])[1:]
+        if names:
+            await asyncio.gather(*[self._sibling_call(n, 'detach',
+                                                      {'id': entry['id']})
+                                   for n in names], return_exceptions=True)
+
+    async def ddict_attach(self, body: dict) -> dict:
+        """Serve the head's DDict *body* (sibling side)."""
+        did = body['id']
+        if did in self.entries:
+            return dict(self.entries[did])
+        entry = {k: body.get(k) for k in ('id', 'name', 'descriptor',
+                                          'managers_per_node', 'n_nodes',
+                                          'total_mem')}
+        entry.update(created=time.time(), creator=self.sibling_of,
+                     state='ready', attached=True)
+        await self.backend.attach(did, body['descriptor'])
+        self.entries[did] = entry
+        return dict(entry)
+
+    async def ddict_detach(self, did: str) -> dict:
+        entry = self.entries.get(did)
+        if entry is None or not entry.get('attached'):
+            raise http_exception(FileNotFoundError(f"unknown ddict: {did}"))
+        self.entries.pop(did, None)
+        await self.backend.detach(did)
+        return {}
+
+    async def _stop_siblings(self) -> None:
+        procs, self._sib_procs = self._sib_procs, None
+        if procs:
+            # SIGTERM: each sibling stops its runtime part and detaches
+            await self.backend._call(dragon_reap_terminate, procs,
+                                     SIBLING_STOP)
+
     # -- route handlers --------------------------------------------------------
+
+    @staticmethod
+    def _is_msgpack(request: Request) -> bool:
+        """Whether the request body is msgpack (raw values)."""
+        ct = Plugin._request_header(request, 'content-type') or ''
+        return MSGPACK in ct
+
+    @staticmethod
+    def _wants_msgpack(request: Request) -> bool:
+        """Whether the caller accepts a msgpack reply."""
+        return MSGPACK in (Plugin._request_header(request, 'accept') or '')
 
     @staticmethod
     async def _body(request: Request, *required: str) -> dict:
         try:
-            body = await request.json()
+            if PluginDragon._is_msgpack(request):
+                # also for a starlette Request, whose json() is JSON only
+                body = msgpack.unpackb(await request.body(), raw=False)
+            else:
+                body = await request.json()
         except ValueError:
             body = None
         if not isinstance(body, dict):
-            raise http_exception(ValueError("body must be a JSON object"))
+            raise http_exception(ValueError("body must be a JSON or msgpack "
+                                            "object"))
         for field in required:
             if field not in body:
                 raise http_exception(ValueError(f"missing field {field!r}"))
@@ -1032,7 +1451,7 @@ class PluginDragon(Plugin):
             raise http_exception(ValueError("'items' must be an object"))
         return await self._forward(request.path_params['sid'],
                                    DragonSession.put, did=body['id'],
-                                   items=items)
+                                   items=items, raw=self._is_msgpack(request))
 
     async def r_get(self, request: Request) -> dict:
         """``POST ddict/get/{sid}``: ``{id, keys, values?}`` ->
@@ -1042,10 +1461,15 @@ class PluginDragon(Plugin):
         values = body.get('values', True)
         if not isinstance(values, bool):
             raise http_exception(ValueError("'values' must be a boolean"))
-        return await self._forward(request.path_params['sid'],
-                                   DragonSession.get, did=body['id'],
-                                   keys=self._str_list(body, 'keys'),
-                                   values=values)
+        binary = values and self._wants_msgpack(request)
+        reply  = await self._forward(request.path_params['sid'],
+                                     DragonSession.get, did=body['id'],
+                                     keys=self._str_list(body, 'keys'),
+                                     values=values, binary=binary)
+        if binary:
+            return Response(content=msgpack.packb(reply, use_bin_type=True),
+                            media_type=MSGPACK)
+        return reply
 
     async def r_keys(self, request: Request) -> dict:
         """``POST ddict/keys/{sid}``: ``{id}`` -> ``{keys, n_other}``."""
@@ -1060,14 +1484,36 @@ class PluginDragon(Plugin):
                                    DragonSession.pop, did=body['id'],
                                    keys=self._str_list(body, 'keys'))
 
+    async def r_attach(self, request: Request) -> dict:
+        """``POST ddict/attach/{sid}``: ``{id, name, descriptor, ...}``
+        from the head endpoint: serve that DDict here (siblings)."""
+        body = await self._body(request, 'id', 'descriptor')
+        if not self.sibling_of:
+            raise HTTPException(status_code=409,
+                                detail="only sibling endpoints attach")
+        return await self.ddict_attach(body)
+
+    async def r_detach(self, request: Request) -> dict:
+        """``POST ddict/detach/{sid}``: ``{id}`` (siblings)."""
+        body = await self._body(request, 'id')
+        return await self.ddict_detach(body['id'])
+
     async def r_clear(self, request: Request) -> dict:
         """``POST ddict/clear/{sid}``: ``{id}``."""
         body = await self._body(request, 'id')
+        if self.entries.get(body['id'], {}).get('attached'):
+            raise HTTPException(status_code=409,
+                                detail=f"clear on the head endpoint "
+                                       f"{self.sibling_of!r}")
         return await self._forward(request.path_params['sid'],
                                    DragonSession.clear, did=body['id'])
 
     async def _release(self) -> None:
         global _default_owner               # pylint: disable=global-statement
+        try:
+            await self._stop_siblings()     # they detach before we destroy
+        except Exception as e:              # pylint: disable=broad-except
+            log.warning("[dragon] stopping sibling endpoints: %s", e)
         self.entries.clear()
         try:
             await self.backend.close()

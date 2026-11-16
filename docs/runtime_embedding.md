@@ -143,8 +143,8 @@ precedence **constructor argument > environment variable > file under
 WebSocket permessage-deflate (zlib level 1) is offered per mode:
 `ws_compression='off' | 'on' | 'auto'` (or `False` / `True`), else
 `RADICAL_ORBIT_WS_COMPRESSION` (`on/off/auto`, also `1/true/yes`,
-`0/false/no`), else `auto`.  `auto` times a plain TCP connect to the broker
-before each (re)connect and offers deflate if it took at least
+`0/false/no`), else `auto`.  `auto` times up to 3 plain TCP connects to the
+broker before each (re)connect and offers deflate if the fastest took at least
 `ws_compression_rtt_ms` (`RADICAL_ORBIT_WS_COMPRESSION_RTT_MS`, default
 10 ms): compression pays off on WAN links and costs latency on fast ones
 (1 MiB round trips ~100 ms with vs 16–19 ms without on Perlmutter).  The

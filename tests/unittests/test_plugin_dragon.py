@@ -1,6 +1,8 @@
 # pylint: disable=protected-access,redefined-outer-name
 
 import asyncio
+import json
+import random
 
 import pytest
 from fastapi import FastAPI
@@ -9,6 +11,7 @@ from starlette.testclient import TestClient
 from radical.orbit.plugin_dragon import (NATIVE, PluginDragon, DDictBackend,
                                          DDictHandle, DragonClient,
                                          encode_value, decode_value,
+                                         json_str_len, json_value_len,
                                          parse_mem, runtime_mode)
 
 
@@ -21,6 +24,8 @@ class _FakeDDict(dict):
         super().__init__()
         self.args      = args
         self.destroyed = False
+        self.batches   = 0              # batch puts started
+        self.in_batch  = False
 
     def serialize(self):
         return f'desc:{id(self)}'
@@ -28,11 +33,19 @@ class _FakeDDict(dict):
     def destroy(self):
         self.destroyed = True
 
+    def start_batch_put(self, persist=False):
+        assert not self.in_batch
+        self.in_batch  = True
+        self.batches  += 1
+
+    def end_batch_put(self):
+        self.in_batch = False
+
 
 class _FakeBackend(DDictBackend):
 
-    def __init__(self, mode='start'):
-        super().__init__(mode)
+    def __init__(self, mode='start', workers=0):
+        super().__init__(mode, workers=workers)
         self.up     = 0
         self.down   = 0
         self.fail   = None
@@ -64,6 +77,16 @@ class _FakeBackend(DDictBackend):
             raise self.fail
         return _FakeDDict(managers_per_node, n_nodes, total_mem)
 
+    def _attach_ddict(self, desc):
+        dd = _FakeDDict(1, 1, 0)
+        dd.detached = 0
+
+        def _detach():
+            dd.detached += 1
+        dd.detach = _detach
+        self.attached_dd = dd
+        return dd
+
 
 def _mk(mode='start'):
     app     = FastAPI()
@@ -91,6 +114,20 @@ def test_value_codec_roundtrip():
     for v in (1, 'a', [1, 2], {'x': None}, b'\x00\xff'):
         assert decode_value(encode_value(v)) == v
     assert encode_value(b'ab') == {'$b64': 'YWI='}
+
+
+def test_json_lengths_match_json_dumps():
+    rnd = random.Random(7)
+    for s in ['', 'c3-17', 'a"b', 'x\\y', 'é', '\x00', '\x7f', '\u2028']:
+        assert json_str_len(s) == len(json.dumps(s))
+    for _ in range(500):
+        s = ''.join(rnd.choice('ab"\\é\x00\x1f\x7f ~') for _ in range(8))
+        assert json_str_len(s) == len(json.dumps(s))
+    for v in [encode_value(bytes(range(256)) * 4), encode_value(b''),
+              {'$b64': 5}, {'$b64': 'a"b'}, [1, 'x'], None, 1.5, {'a': 1}]:
+        assert json_value_len(v) == len(json.dumps(v, allow_nan=False))
+    with pytest.raises(ValueError):
+        json_value_len(float('nan'))
 
 
 def test_decode_value_rejects_malformed():
@@ -576,7 +613,8 @@ def test_partial_put_reports_progress():
     async def _run():
         await backend.create('d', 1, 1, 1024)
         await backend.put('d', {'a': 1, 'b': 2, 'c': 3})
-    with pytest.raises(RuntimeError, match="after 2 of 3 items"):
+    with pytest.raises(RuntimeError,
+                       match="batch put of 3 items failed after 2 were sent"):
         asyncio.run(_run())
 
 
@@ -955,9 +993,47 @@ def test_client_malformed_marker_is_per_key_error(client, env):
     dd = client.ddict.create()
     dd.update({'ok': 1})
     backend._ddicts[dd.id]['bad'] = {'$b64': '###'}     # written in-runtime
+    # msgpack (the Python client): unambiguous, the value as stored
     r = dd.get_many(['ok', 'bad'])
+    assert r['items'] == {'ok': 1, 'bad': {'$b64': '###'}}
+    # JSON callers: it would read back as bytes, so a per-key error
+    r = client._call('POST', 'ddict/get/{sid}', id=dd.id, keys=['ok', 'bad'])
     assert r['items'] == {'ok': 1}
     assert 'bad' in r['errors']
+
+
+def test_client_bytes_travel_as_msgpack(client, env):
+    _, backend, _, _ = env
+    dd = client.ddict.create()
+    dd.update({'b': b'\x00\xff' * 600, 's': 'x', 'n': [1, {'a': None}]})
+    stored = backend._ddicts[dd.id]
+    assert stored['b'] == b'\x00\xff' * 600        # no base64 on the way in
+    r = dd.get_many(['b', 's', 'n', 'gone'])
+    assert r['items'] == {'b': b'\x00\xff' * 600, 's': 'x',
+                          'n': [1, {'a': None}]}
+    assert r['missing'] == ['gone'] and r['errors'] == {}
+    # the JSON wire form is unchanged for HTTP callers
+    r = client._call('POST', 'ddict/get/{sid}', id=dd.id, keys=['b'])
+    assert r['items']['b'] == encode_value(b'\x00\xff' * 600)
+
+
+def test_binary_reply_size_bound(client, env):
+    plugin = env[0]
+    dd = client.ddict.create()
+    dd.update({f'k{i}': b'x' * 1000 for i in range(8)})
+    plugin.reply_limit = 4 * (1000 + 2 + 16) + 16    # room for 4 values
+    with pytest.raises(RuntimeError, match='413'):
+        dd.get_many([f'k{i}' for i in range(8)])
+    assert len(dd.get_many(['k0', 'k1', 'k2'])['items']) == 3
+
+
+def test_client_falls_back_to_json_reply(client, env, monkeypatch):
+    # an older endpoint answers JSON even when asked for msgpack
+    monkeypatch.setattr(PluginDragon, '_wants_msgpack',
+                        staticmethod(lambda request: False))
+    dd = client.ddict.create()
+    dd['b'] = b'abc'
+    assert dd['b'] == b'abc'
 
 
 def test_client_rejects_non_str_keys(client):
@@ -978,3 +1054,137 @@ def test_client_nested_b64_shape_roundtrips(client):
     dd = client.ddict.create()
     dd['k'] = {'a': {'$b64': 'aGk='}}
     assert dd['k'] == {'a': {'$b64': 'aGk='}}
+
+
+# ── scale-out: sibling endpoints ────────────────────────────────────────────
+
+
+def test_endpoint_count(monkeypatch):
+    from radical.orbit import plugin_dragon as pd
+    monkeypatch.delenv(pd.ENV_ENDPOINTS, raising=False)
+    monkeypatch.delenv(pd.ENV_SIBLING_OF, raising=False)
+    assert pd.endpoint_count() == 1
+    monkeypatch.setenv(pd.ENV_ENDPOINTS, '4')
+    assert pd.endpoint_count() == 4
+    monkeypatch.setenv(pd.ENV_SIBLING_OF, 'head')    # a sibling: never more
+    assert pd.endpoint_count() == 1
+    monkeypatch.delenv(pd.ENV_SIBLING_OF)
+    for bad in ('0', 'x', str(pd.MAX_ENDPOINTS + 1)):
+        monkeypatch.setenv(pd.ENV_ENDPOINTS, bad)
+        with pytest.raises(ValueError):
+            pd.endpoint_count()
+
+
+def _sibling(monkeypatch):
+    from radical.orbit import plugin_dragon as pd
+    monkeypatch.setenv(pd.ENV_SIBLING_OF, 'head')
+    return _mk()
+
+
+def test_sibling_serves_attached_ddict(monkeypatch):
+    plugin, backend, tc, sid = _sibling(monkeypatch)
+    r = tc.post(f'/dragon/ddict/create/{sid}', json={'name': 'a'})
+    assert r.status_code == 409 and 'head' in r.text
+    body = {'id': 'dd-1', 'name': 'a', 'descriptor': 'desc:x',
+            'managers_per_node': 1, 'n_nodes': 1, 'total_mem': 1}
+    r = tc.post(f'/dragon/ddict/attach/{sid}', json=body)
+    assert r.status_code == 200 and r.json()['attached'] is True
+    # idempotent
+    assert tc.post(f'/dragon/ddict/attach/{sid}', json=body).status_code \
+        == 200
+    r = tc.post(f'/dragon/ddict/put/{sid}', json={'id': 'dd-1',
+                                                  'items': {'k': 1}})
+    assert r.status_code == 200
+    r = tc.post(f'/dragon/ddict/get/{sid}', json={'id': 'dd-1',
+                                                  'keys': ['k']})
+    assert r.json()['items'] == {'k': 1}
+    for op in ('destroy', 'clear'):
+        r = tc.post(f'/dragon/ddict/{op}/{sid}', json={'id': 'dd-1'})
+        assert r.status_code == 409, op
+    r = tc.post(f'/dragon/ddict/detach/{sid}', json={'id': 'dd-1'})
+    assert r.status_code == 200
+    assert backend.attached_dd.detached == 1
+    assert tc.get(f'/dragon/ddict/list/{sid}').json()['ddicts'] == []
+    r = tc.post(f'/dragon/ddict/detach/{sid}', json={'id': 'dd-1'})
+    assert r.status_code == 404
+
+
+def test_sibling_close_detaches_not_destroys(monkeypatch):
+    plugin, backend, tc, sid = _sibling(monkeypatch)
+    tc.post(f'/dragon/ddict/attach/{sid}',
+            json={'id': 'dd-2', 'descriptor': 'desc:y'})
+    dd = backend.attached_dd
+    asyncio.run(plugin.on_host_stop())
+    assert dd.detached == 1 and not dd.destroyed
+
+
+def test_head_only_endpoints_refuse_attach(env):
+    plugin, backend, tc, sid = env
+    r = tc.post(f'/dragon/ddict/attach/{sid}',
+                json={'id': 'dd-3', 'descriptor': 'desc:z'})
+    assert r.status_code == 409
+
+
+def test_head_fans_attach_and_detach_out(env):
+    plugin, backend, tc, sid = env
+    plugin.n_endpoints = 3
+    calls = []
+
+    async def _sibs():
+        return ['h.1', 'h.2']
+
+    async def _call(name, op, body):
+        calls.append((name, op, body['id']))
+        if name == 'h.2':
+            raise ConnectionError('gone')
+        return 200
+    plugin._ensure_siblings = _sibs
+    plugin._sibling_call = _call
+    plugin._head_name = lambda: 'h'
+    entry = _create(tc, sid, name='s')
+    assert entry['endpoints'] == ['h', 'h.1'] and entry['degraded'] == ['h.2']
+    assert {(n, op) for n, op, _ in calls} == {('h.1', 'attach'),
+                                               ('h.2', 'attach')}
+    calls.clear()
+    r = tc.post(f'/dragon/ddict/destroy/{sid}', json={'id': entry['id']})
+    assert r.status_code == 200
+    assert calls == [('h.1', 'detach', entry['id'])]
+
+
+class _Peer:
+    def __init__(self, name, fail=False):
+        self.name, self.fail, self.calls = name, fail, []
+        self._bc = None
+
+    def _call_binary(self, path, **body):
+        self.calls.append(path)
+        if self.fail:
+            raise RuntimeError('HTTP 503')
+        return ({'items': {}, 'missing': [], 'errors': {}}, True)
+
+
+def test_client_spreads_data_calls_over_endpoints():
+    head, peer = _Peer('h'), _Peer('h.1')
+
+    class _BC:
+        def get_plugin(self, name, plugin):
+            assert (name, plugin) == ('h.1', 'dragon')
+            return peer
+    head._bc = _BC()
+    dd = DDictHandle(head, {'id': 'dd-1', 'name': 'n', 'descriptor': 'd',
+                            'endpoints': ['h', 'h.1']})
+    for _ in range(4):
+        dd.get_many(['a'])
+    assert len(head.calls) == 2 and len(peer.calls) == 2
+    peer.fail = True
+    dd.update({'a': 1})                        # peer's turn: retried on head
+    dd.update({'a': 1})
+    assert len(head.calls) == 4 and len(peer.calls) == 3
+
+
+def test_client_without_endpoints_uses_the_head():
+    head = _Peer('h')
+    dd = DDictHandle(head, {'id': 'dd-1', 'name': 'n', 'descriptor': 'd'})
+    dd.update({'a': 1})
+    dd.get_many(['a'])
+    assert len(head.calls) == 2
