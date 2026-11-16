@@ -987,7 +987,9 @@ class RhapsodySession(PluginSession):
 
         Applies to both wire forms (encoded and plain JSON): a frame past
         the transport cap is dropped, so the client would wait forever —
-        and truncating would hand back a corrupt result.
+        and truncating would hand back a corrupt result.  The task is
+        reported ``FAILED`` with the error as its exception: left ``DONE``,
+        a client would read the dropped result as a successful ``None``.
         """
         msg = (f"return_value too large: {size} wire bytes exceed the "
                f"{self._return_value_limit} byte limit — stage the result "
@@ -997,6 +999,9 @@ class RhapsodySession(PluginSession):
         d.pop('_return_value_encoding', None)
         if not d.get('error'):
             d['error'] = msg
+        if not d.get('exception'):
+            d['exception'] = msg
+        d['state'] = 'FAILED'
 
     _NOTIFICATION_KEYS = {'uid', 'state', 'exit_code', 'stdout', 'stderr',
                           'return_value', '_return_value_encoding',
