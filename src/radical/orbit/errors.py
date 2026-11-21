@@ -16,6 +16,15 @@ import json
 from typing import Dict, Optional
 
 
+class EndpointUnknown(RuntimeError):
+    """A broker-originated call named a ``dst`` the broker does not know.
+
+    Raised before anything is sent, so the call was not delivered and a retry
+    is safe.  A :class:`RuntimeError`, so existing ``except RuntimeError``
+    handlers (the gateway's 404) keep working.
+    """
+
+
 # ── exception → HTTP status ────────────────────────────────────────────────
 # Boundary handlers translate a raised stdlib exception into an HTTP status via
 # this map (walking the type's MRO); anything unmapped is a 500.  Keep the

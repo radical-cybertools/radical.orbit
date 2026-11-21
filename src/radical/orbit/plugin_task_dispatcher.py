@@ -54,6 +54,7 @@ from fastapi import FastAPI, HTTPException, Request
 
 from .                                  import utils
 from .client                            import PluginClient
+from .errors                            import EndpointUnknown
 from .plugin_base                       import Plugin, resolve_frame_cap
 from .plugin_session_base               import PluginSession
 from .plugin_rhapsody                   import (
@@ -106,6 +107,9 @@ _CHILD_TOUCH_PARALLEL  = 8        # executor threads one touch pass may hold
 # Handshake timeout — a pilot that hasn't handshaken in this long is
 # reconciled against psij job state.
 _HANDSHAKE_TIMEOUT_SEC = 300.0
+# An ACTIVE pilot whose child endpoint is absent from the topology this long
+# (a broker restart the endpoint did not come back from) is treated as lost.
+_ABSENT_GRACE_SEC      = 300.0
 
 # Rhapsody-dialect bulk submit (see ``_route_submit_rh``): task dicts in
 # rhapsody's own wire format, a ``pool`` key per task.  Route template shared
@@ -548,6 +552,19 @@ class _CallerSyncHTTP:
 # ---------------------------------------------------------------------------
 # PoolState — per-pool runtime state
 # ---------------------------------------------------------------------------
+
+def _is_retryable(e: BaseException) -> bool:
+    '''Whether a failed call to a child endpoint was not delivered.
+
+    A 503 (the broker's fast-fail for a suspect endpoint, #166, or the
+    endpoint's admission cap) and :class:`EndpointUnknown` (the broker does
+    not know the endpoint, e.g. it has not reconnected after a broker
+    restart) are both raised before the request reached the plugin, so a
+    retry is safe.
+    '''
+    return isinstance(e, EndpointUnknown) \
+        or getattr(e, 'status_code', None) == 503
+
 
 class PoolState:
     '''Plugin-level runtime state for one pool.
@@ -1137,6 +1154,11 @@ class PluginTaskDispatcher(Plugin):
         # by exactly the rule the topology hook applies.
         self._participants: dict[str, dict] = {}
 
+        # pilot pid -> when its ACTIVE pilot's child endpoint was first seen
+        # absent (or replayed before it reconnected); in memory only.  Such a
+        # pilot is paused, and treated as lost after ``_ABSENT_GRACE_SEC``.
+        self._absent_since: dict[str, float] = {}
+
         # Endpoint-mode task tracking: task_id → target_endpoint_name.
         # Endpoint mode bypasses pool state — the dispatcher is a transparent
         # proxy to the target endpoint's rhapsody.  Backed by one atomic
@@ -1271,11 +1293,22 @@ class PluginTaskDispatcher(Plugin):
         if existing is not None:
             return existing
 
+        replay = state_dir is not None
         if state_dir is None:
             state_dir = self._pool_dir(sid, cfg)
         scratch_base = self._scratch_for(cfg)
         ps = PoolState(cfg, state_dir, scratch_base, self, owning_sid=sid)
         pools[cfg.name] = ps
+
+        # After a restart the broker knows no child endpoint until it
+        # reconnects: a replayed ACTIVE pilot stays paused until topology
+        # reports its endpoint ``present`` (bounded by ``_ABSENT_GRACE_SEC``).
+        if replay:
+            now = time.time()
+            for pilot in ps.pilots.values():
+                if pilot.state == PILOT_ACTIVE and pilot.child_endpoint_name:
+                    pilot.accepting_new_tasks = False
+                    self._absent_since[pilot.pid] = now
 
         # Persist immediately so restart-time replay can rebuild this pool.
         ps.persist()
@@ -1401,10 +1434,14 @@ class PluginTaskDispatcher(Plugin):
             try:
                 await asyncio.sleep(_TICK_INTERVAL_SEC)
                 now = time.time()
+                self._expire_absent_pilots(now)
                 for ps in list(self._all_pools()):
                     if ps.owning_sid not in self._sessions:
                         continue                 # replayed, owner-less pool
-                    ps.policy.on_tick(ps, self._make_submit_pilot(ps))
+                    # a pilot waiting for its endpoint has no free capacity:
+                    # ticking would submit new pilots for its backlog
+                    if not self._has_absent_pilot(ps):
+                        ps.policy.on_tick(ps, self._make_submit_pilot(ps))
                     self._drain_pending(ps)
                 await self._reconcile_overdue_pilots(now)
                 if now - last_touch >= _CHILD_TOUCH_INTERVAL \
@@ -1443,6 +1480,36 @@ class PluginTaskDispatcher(Plugin):
                 pass
             self._untap = None
         await super().shutdown()
+
+    def _has_absent_pilot(self, ps: 'PoolState') -> bool:
+        '''Whether one of *ps*'s ACTIVE pilots waits for its endpoint.
+
+        Housekeeping then skips the whole pool's ``on_tick``, on purpose:
+        it is meant for the restart window, and ``_ABSENT_GRACE_SEC`` bounds
+        it (the pilot is then lost and leaves ``_absent_since``).
+        '''
+        return any(p.pid in self._absent_since and p.state == PILOT_ACTIVE
+                   for p in ps.pilots.values())
+
+    def _expire_absent_pilots(self, now: float) -> None:
+        '''Treat pilots absent longer than the grace as lost.'''
+        for ps in list(self._all_pools()):
+            expired = False
+            for pilot in list(ps.pilots.values()):
+                since = self._absent_since.get(pilot.pid)
+                if since is None:
+                    continue
+                if pilot.state != PILOT_ACTIVE:
+                    self._absent_since.pop(pilot.pid, None)
+                elif now - since >= _ABSENT_GRACE_SEC:
+                    log.warning('[%s] pilot %s: child endpoint %r absent for '
+                                '%.0f s; treating it as lost',
+                                self.instance_name, pilot.pid,
+                                pilot.child_endpoint_name, now - since)
+                    self._pilot_gone(ps, pilot)
+                    expired = True
+            if expired:
+                self._drain_pending(ps)
 
     async def _reconcile_overdue_pilots(self, now: float) -> None:
         '''Reconcile PENDING/STARTING pilots overdue for a handshake.
@@ -1514,14 +1581,17 @@ class PluginTaskDispatcher(Plugin):
         return client_cls(http, f'/{plugin}',
                           endpoint_id=dst, plugin_name=plugin)
 
-    async def _get_child_client(self, dst: str, plugin: str, cls, key,
+    async def _get_child_client(self, dst: str, plugin: str, cls, key, *,
+                                raise_retryable: bool = False,
                                 **register_kwargs):
         '''Return a caller-backed *cls* client for *plugin* on *dst*.
 
         Registers (once) a *plugin* session over the caller, passing
         *register_kwargs* to ``register_session``, and caches the client
         under *key*.  Returns ``None`` when no caller is wired or *dst* /
-        its *plugin* is unreachable.
+        its *plugin* is unreachable; with *raise_retryable*, an undelivered
+        call (:func:`_is_retryable`) is raised instead, so the caller can
+        requeue rather than fail.
 
         The session idle-expires after ``_CHILD_SESSION_TTL``; housekeeping
         touches cached clients (:meth:`_touch_child_sessions`), so a cached
@@ -1561,6 +1631,8 @@ class PluginTaskDispatcher(Plugin):
         except Exception as e:
             log.warning('[%s] %s session unavailable on %s: %s',
                         self.instance_name, plugin, dst, e)
+            if raise_retryable and _is_retryable(e):
+                raise
             return None
         self._child_clients[key] = client
         return client
@@ -1570,12 +1642,15 @@ class PluginTaskDispatcher(Plugin):
         '''Whether *probe*'s endpoint has the ``touch`` route, probed with
         an unknown sid (no session needed): ``404 unknown session`` -> yes,
         ``404 No route`` (older release) -> no, else ``None`` (unknown; the
-        caller then registers persistent, the safe choice).  Blocking.'''
+        caller then registers persistent, the safe choice).  An undelivered
+        probe (:func:`_is_retryable`) is raised: it says nothing.  Blocking.'''
         probe._sid = '_dispatcher_touch_probe'
         try:
             probe.touch()
             return True
         except Exception as e:
+            if _is_retryable(e):
+                raise
             if _session_ended(e):
                 return True
             if _no_route(e):
@@ -1630,7 +1705,8 @@ class PluginTaskDispatcher(Plugin):
             endpoint_name, 'psij', PSIJClient, (endpoint_name, 'psij', None))
 
     async def _get_rhapsody_client(self, child_endpoint: str,
-                                   backend: str | None = None):
+                                   backend: str | None = None, *,
+                                   raise_retryable: bool = False):
         '''Return a caller-backed :class:`RhapsodyClient` for a child.
 
         The session is registered with *backend* when given, and cached per
@@ -1640,9 +1716,11 @@ class PluginTaskDispatcher(Plugin):
         return await self._get_child_client(
             child_endpoint, 'rhapsody', RhapsodyClient,
             (child_endpoint, 'rhapsody', backend),
+            raise_retryable=raise_retryable,
             backends=[backend] if backend else None)
 
-    async def _get_staging_client(self, child_endpoint: str):
+    async def _get_staging_client(self, child_endpoint: str, *,
+                                  raise_retryable: bool = False):
         '''Return a caller-backed :class:`StagingClient` for a child.
 
         It is how a task's inputs (and, for an input-less task, its cwd)
@@ -1651,7 +1729,8 @@ class PluginTaskDispatcher(Plugin):
         from .plugin_staging import StagingClient
         return await self._get_child_client(
             child_endpoint, 'staging', StagingClient,
-            (child_endpoint, 'staging', None))
+            (child_endpoint, 'staging', None),
+            raise_retryable=raise_retryable)
 
     # -- routes --------------------------------------------------------
 
@@ -2661,8 +2740,12 @@ class PluginTaskDispatcher(Plugin):
             liveness = (info or {}).get('liveness') if info else None
 
             if liveness == 'present':
-                # Un-pause a pilot paused on a suspect blip.
-                if pilot.state == PILOT_ACTIVE and not pilot.accepting_new_tasks:
+                self._absent_since.pop(pilot.pid, None)
+                # Un-pause a pilot paused on a suspect blip or an absence --
+                # not one paused because its member is being removed.
+                if pilot.state == PILOT_ACTIVE and not pilot.accepting_new_tasks \
+                        and (not pilot.member_id
+                             or pilot.member_id in ps.config.members):
                     pilot.accepting_new_tasks = True
                     ps.persist()
                     self._drain_pending(ps)
@@ -2676,17 +2759,31 @@ class PluginTaskDispatcher(Plugin):
                     ps.persist()
 
             elif liveness == 'lost':
-                if pilot.adopted:
-                    # An adopted endpoint that goes away has left, or its
-                    # allocation ended -- neither is a pilot failure,
-                    # whatever the deadline says.
-                    self._mark_pilot_done(ps, pilot, 'adopted endpoint gone')
-                elif time.time() >= pilot.walltime_deadline:
-                    self._mark_pilot_done(ps, pilot, 'walltime reached')
-                else:
-                    self._mark_pilot_failed(
-                        ps, pilot, 'child endpoint lost before walltime')
+                self._pilot_gone(ps, pilot)
                 self._drain_pending(ps)
+
+            elif info is None and pilot.state == PILOT_ACTIVE:
+                # Absent (not yet reconnected after a broker restart): pause
+                # like ``suspect``; housekeeping bounds the wait.
+                self._absent_since.setdefault(pilot.pid, time.time())
+                if pilot.accepting_new_tasks:
+                    pilot.accepting_new_tasks = False
+                    ps.persist()
+
+    def _pilot_gone(self, ps: 'PoolState', pilot: PilotRecord) -> None:
+        '''End a pilot whose child endpoint is gone (``lost``, or absent
+        past the grace).'''
+        self._absent_since.pop(pilot.pid, None)
+        if pilot.adopted:
+            # An adopted endpoint that goes away has left, or its
+            # allocation ended -- neither is a pilot failure,
+            # whatever the deadline says.
+            self._mark_pilot_done(ps, pilot, 'adopted endpoint gone')
+        elif time.time() >= pilot.walltime_deadline:
+            self._mark_pilot_done(ps, pilot, 'walltime reached')
+        else:
+            self._mark_pilot_failed(
+                ps, pilot, 'child endpoint lost before walltime')
 
     def _activate_pilot(self, ps: PoolState, pilot: PilotRecord) -> None:
         '''Transition a PENDING/STARTING pilot to ACTIVE on child handshake.'''
@@ -3344,7 +3441,19 @@ class PluginTaskDispatcher(Plugin):
 
         stg = None
         if not shared:
-            stg = await self._get_staging_client(pilot.child_endpoint_name)
+            try:
+                stg = await self._get_staging_client(
+                    pilot.child_endpoint_name, raise_retryable=True)
+            except Exception as e:
+                if _is_retryable(e):
+                    self._requeue_tasks(pool_state, tasks, pilot,
+                                        f'staging client: {e}')
+                    return []
+                log.warning('[%s] staging client failed for %s: %s',
+                            self.instance_name, pilot.child_endpoint_name, e)
+                stg = None
+            # a task cancelled (or handed on) during the await is not ours
+            tasks = [t for t in tasks if self._owned_by(t, pilot)]
             if stg is None:
                 for task in tasks:
                     self._mark_task_failed(
@@ -3377,11 +3486,19 @@ class PluginTaskDispatcher(Plugin):
                         stg.put, str(marker),
                         str(Path(task.cwd) / _CWD_MARKER), True)
             except Exception as e:
+                if not self._owned_by(task, pilot):
+                    continue                     # cancelled during the put
+                if _is_retryable(e):
+                    self._requeue_tasks(pool_state, [task], pilot,
+                                        f'input placement: {e}')
+                    continue
                 log.warning('[%s] input placement failed for task %s: %s',
                             self.instance_name, task.task_id, e)
                 self._mark_task_failed(
                     pool_state, task,
                     f'could not place inputs on the pilot: {e}')
+                continue
+            if not self._owned_by(task, pilot):
                 continue
             ok.append(task)
 
@@ -3397,8 +3514,20 @@ class PluginTaskDispatcher(Plugin):
                                        'child endpoint unavailable')
             return
 
-        rh = await self._get_rhapsody_client(
-            pilot.child_endpoint_name, pilot.rhapsody_backend)
+        try:
+            rh = await self._get_rhapsody_client(
+                pilot.child_endpoint_name, pilot.rhapsody_backend,
+                raise_retryable=True)
+        except Exception as e:
+            if _is_retryable(e):
+                self._requeue_tasks(pool_state, tasks, pilot,
+                                    f'rhapsody client: {e}')
+                return
+            log.warning('[%s] rhapsody client failed for %s: %s',
+                        self.instance_name, pilot.child_endpoint_name, e)
+            rh = None
+        # a task cancelled (or handed on) during the await is not ours
+        tasks = [t for t in tasks if self._owned_by(t, pilot)]
         if rh is None:
             for task in tasks:
                 self._mark_task_failed(pool_state, task,
@@ -3408,6 +3537,7 @@ class PluginTaskDispatcher(Plugin):
         # Place spooled inputs BEFORE the submit: a task that runs without
         # its inputs is worse than a task that fails with a reason.
         tasks = await self._place_inputs(pool_state, tasks, pilot)
+        tasks = [t for t in tasks if self._owned_by(t, pilot)]
         if not tasks:
             return
 
@@ -3469,15 +3599,64 @@ class PluginTaskDispatcher(Plugin):
             await asyncio.to_thread(rh.submit_tasks, [f for _, f in fwds])
             self._mark_dirty(pool_state)
         except Exception as e:
+            # Tasks of batches acked before the failing one were submitted;
+            # they keep their mapping and state.  The rest are requeued when
+            # the call was not delivered, else failed.
+            accepted = set(getattr(e, 'accepted_uids', None) or [])
+            rest     = [t for t, fwd in fwds if fwd['uid'] not in accepted]
+            if _is_retryable(e):
+                self._requeue_tasks(pool_state, rest, pilot,
+                                    f'rhapsody submit: {e}')
+                return
             log.exception('[%s] rhapsody submit failed for %d task(s): %s',
-                          self.instance_name, len(tasks), e)
-            for task, fwd in fwds:
-                self._uid_to_task.pop(fwd['uid'], None)
-                # a task the pilot already finished keeps that outcome
-                if task.state not in TASK_TERMINAL_STATES:
-                    task.rhapsody_uid = None
-                    self._mark_task_failed(pool_state, task,
-                                           f'rhapsody submit error: {e}')
+                          self.instance_name, len(rest), e)
+            for task in rest:
+                # a task the pilot already finished keeps that outcome, and
+                # one a lost pilot handed on (requeued, maybe re-dispatched
+                # under the same uid) is no longer this call's
+                if not self._owned_by(task, pilot):
+                    continue
+                self._uid_to_task.pop(task.rhapsody_uid, None)
+                task.rhapsody_uid = None
+                self._mark_task_failed(pool_state, task,
+                                       f'rhapsody submit error: {e}')
+
+    @staticmethod
+    def _owned_by(task: TaskRecord, pilot: PilotRecord) -> bool:
+        '''Whether *task* is still a live task of this dispatch to *pilot*.'''
+        return task.state == TASK_RUNNING and task.pilot_id == pilot.pid
+
+    def _requeue_tasks(self, pool_state: PoolState, tasks: list[TaskRecord],
+                       pilot: PilotRecord, reason: str) -> None:
+        '''Put tasks whose call to *pilot* was not delivered back in the queue.
+
+        Only tasks still owned by this dispatch (:meth:`_owned_by`).  The
+        record stays in place (same ``task_id``, same pool), the input spool
+        is kept, and ``requeues`` is not bumped: an undelivered call is not a
+        pilot loss.  No drain here -- housekeeping and the ``present``
+        un-pause re-dispatch, so a pilot that keeps answering 503 cannot spin.
+
+        A repeated admission-cap 503 (the endpoint applying backpressure) is
+        therefore retried at drain cadence on purpose, without a cap.
+        '''
+        n = 0
+        for task in tasks:
+            if not self._owned_by(task, pilot):
+                continue
+            if task.rhapsody_uid:
+                self._uid_to_task.pop(task.rhapsody_uid, None)
+                task.rhapsody_uid = None
+            task.pilot_id   = None
+            task.member_id  = None
+            task.started_at = None
+            task.state      = TASK_QUEUED
+            pilot.in_flight = max(0, pilot.in_flight - 1)
+            self._notify_task(pool_state, task)
+            n += 1
+        if n:
+            log.info('[%s] requeued %d task(s) from pilot %s: %s',
+                     self.instance_name, n, pilot.pid, reason)
+            pool_state.persist()
 
     def _on_event(self, event: dict) -> None:
         '''Broker raw-tap callback: a child rhapsody reported a transition.
@@ -3728,10 +3907,11 @@ class PluginTaskDispatcher(Plugin):
             self._notify_task(pool_state, task)
             return self._task_dict(task)
 
-        # RUNNING — best-effort cancel on the pilot
+        # RUNNING — settle it CANCELED before any await, so a submit or
+        # requeue path running meanwhile sees a terminal task (_owned_by)
+        # and nothing picks it again; then best-effort cancel on the pilot
         pilot = pool_state.pilots.get(task.pilot_id or '')
-        if pilot and task.rhapsody_uid:
-            await self._cancel_rhapsody_tasks(pilot, [task.rhapsody_uid])
+        uid   = task.rhapsody_uid
         task.state       = TASK_CANCELED
         task.finished_at = time.time()
         pool_state.drop_spool(task.task_id)
@@ -3739,6 +3919,8 @@ class PluginTaskDispatcher(Plugin):
             pilot.in_flight = max(0, pilot.in_flight - 1)
         self._mark_dirty(pool_state)
         self._notify_task(pool_state, task)
+        if pilot and uid:
+            await self._cancel_rhapsody_tasks(pilot, [uid])
         return self._task_dict(task)
 
     # -- helpers -------------------------------------------------------
