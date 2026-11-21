@@ -1482,7 +1482,12 @@ class PluginTaskDispatcher(Plugin):
         await super().shutdown()
 
     def _has_absent_pilot(self, ps: 'PoolState') -> bool:
-        '''Whether one of *ps*'s ACTIVE pilots waits for its endpoint.'''
+        '''Whether one of *ps*'s ACTIVE pilots waits for its endpoint.
+
+        Housekeeping then skips the whole pool's ``on_tick``, on purpose:
+        it is meant for the restart window, and ``_ABSENT_GRACE_SEC`` bounds
+        it (the pilot is then lost and leaves ``_absent_since``).
+        '''
         return any(p.pid in self._absent_since and p.state == PILOT_ACTIVE
                    for p in ps.pilots.values())
 
@@ -3440,9 +3445,13 @@ class PluginTaskDispatcher(Plugin):
                 stg = await self._get_staging_client(
                     pilot.child_endpoint_name, raise_retryable=True)
             except Exception as e:
-                self._requeue_tasks(pool_state, tasks, pilot,
-                                    f'staging client: {e}')
-                return []
+                if _is_retryable(e):
+                    self._requeue_tasks(pool_state, tasks, pilot,
+                                        f'staging client: {e}')
+                    return []
+                log.warning('[%s] staging client failed for %s: %s',
+                            self.instance_name, pilot.child_endpoint_name, e)
+                stg = None
             if stg is None:
                 for task in tasks:
                     self._mark_task_failed(
@@ -3504,9 +3513,15 @@ class PluginTaskDispatcher(Plugin):
                 pilot.child_endpoint_name, pilot.rhapsody_backend,
                 raise_retryable=True)
         except Exception as e:
-            self._requeue_tasks(pool_state, tasks, pilot,
-                                f'rhapsody client: {e}')
-            return
+            if _is_retryable(e):
+                self._requeue_tasks(pool_state, tasks, pilot,
+                                    f'rhapsody client: {e}')
+                return
+            log.warning('[%s] rhapsody client failed for %s: %s',
+                        self.instance_name, pilot.child_endpoint_name, e)
+            rh = None
+        # a task cancelled (or handed on) during the await is not ours
+        tasks = [t for t in tasks if self._owned_by(t, pilot)]
         if rh is None:
             for task in tasks:
                 self._mark_task_failed(pool_state, task,
@@ -3516,6 +3531,7 @@ class PluginTaskDispatcher(Plugin):
         # Place spooled inputs BEFORE the submit: a task that runs without
         # its inputs is worse than a task that fails with a reason.
         tasks = await self._place_inputs(pool_state, tasks, pilot)
+        tasks = [t for t in tasks if self._owned_by(t, pilot)]
         if not tasks:
             return
 
@@ -3613,6 +3629,9 @@ class PluginTaskDispatcher(Plugin):
         is kept, and ``requeues`` is not bumped: an undelivered call is not a
         pilot loss.  No drain here -- housekeeping and the ``present``
         un-pause re-dispatch, so a pilot that keeps answering 503 cannot spin.
+
+        A repeated admission-cap 503 (the endpoint applying backpressure) is
+        therefore retried at drain cadence on purpose, without a cap.
         '''
         n = 0
         for task in tasks:
@@ -3882,16 +3901,11 @@ class PluginTaskDispatcher(Plugin):
             self._notify_task(pool_state, task)
             return self._task_dict(task)
 
-        # RUNNING — best-effort cancel on the pilot
+        # RUNNING — settle it CANCELED before any await, so a submit or
+        # requeue path running meanwhile sees a terminal task (_owned_by)
+        # and nothing picks it again; then best-effort cancel on the pilot
         pilot = pool_state.pilots.get(task.pilot_id or '')
-        if pilot and task.rhapsody_uid:
-            await self._cancel_rhapsody_tasks(pilot, [task.rhapsody_uid])
-            # settled meanwhile (terminal event), or requeued by an
-            # undelivered submit: only a pilot still holding it frees a slot
-            if task.state in TASK_TERMINAL_STATES:
-                return self._task_dict(task)
-            pilot = pool_state.pilots.get(task.pilot_id or '') \
-                if task.state == TASK_RUNNING else None
+        uid   = task.rhapsody_uid
         task.state       = TASK_CANCELED
         task.finished_at = time.time()
         pool_state.drop_spool(task.task_id)
@@ -3899,6 +3913,8 @@ class PluginTaskDispatcher(Plugin):
             pilot.in_flight = max(0, pilot.in_flight - 1)
         self._mark_dirty(pool_state)
         self._notify_task(pool_state, task)
+        if pilot and uid:
+            await self._cancel_rhapsody_tasks(pilot, [uid])
         return self._task_dict(task)
 
     # -- helpers -------------------------------------------------------

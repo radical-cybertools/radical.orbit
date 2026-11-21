@@ -4081,6 +4081,86 @@ def _present(plugin, ps):
     asyncio.run(drive())
 
 
+class TestCancelAndOwnership:
+
+    _setup = TestUndeliveredRequeue._setup
+
+    def test_cancel_during_requeue_and_drain_stays_canceled(self, tmp_path):
+        plugin, ps, pilot, tasks = self._setup(tmp_path)
+        task, other_task = tasks
+        task.rhapsody_uid = 't.1'
+        plugin._uid_to_task['t.1'] = ('A', 'fed', 't.1')
+        other = PilotRecord(
+            pid='p.2', pool='fed', owning_sid='A', size_key='d',
+            rhapsody_backend='concurrent', state=PILOT_ACTIVE,
+            member_id='m_x', endpoint_name='ep_m_x',
+            attributes={'software': ['x']}, nodes=1, cpus_per_node=4,
+            child_endpoint_name='fed_m_x_p.2', capacity=4)
+        ps.pilots['p.2'] = other
+        rh = MagicMock()
+        rh.submit_tasks = MagicMock(return_value=[])
+
+        async def drive():
+            release = asyncio.Event()
+
+            async def blocking_cancel(*_a):
+                await release.wait()
+            with patch.object(plugin, '_cancel_rhapsody_tasks',
+                              side_effect=blocking_cancel), \
+                 patch.object(plugin, '_get_rhapsody_client',
+                              new=AsyncMock(return_value=rh)):
+                cancel = asyncio.ensure_future(plugin._cancel_task(ps, task))
+                await asyncio.sleep(0.01)            # blocked in the cancel
+                # the in-flight submit's late 503, then a drain
+                plugin._requeue_tasks(ps, [task, other_task], pilot, '503')
+                plugin._drain_pending(ps)
+                await asyncio.sleep(0.05)
+                release.set()
+                await cancel
+        asyncio.run(drive())
+        assert task.state    == TASK_CANCELED
+        assert task.pilot_id != 'p.2'
+        sent = [d['uid'] for c in rh.submit_tasks.call_args_list
+                for d in c.args[0]]
+        assert 't.1' not in sent
+        for p in (pilot, other):                    # one slot per live task
+            assert p.in_flight == sum(
+                1 for t in ps.tasks.values()
+                if t.state == TASK_RUNNING and t.pilot_id == p.pid)
+
+    @pytest.mark.parametrize('where', ['rhapsody', 'staging'])
+    def test_unexpected_client_error_fails(self, tmp_path, where):
+        members = [_member('m_x', shared_fs=False, scratch_base='/remote')] \
+            if where == 'staging' else None
+        plugin, ps, pilot, tasks = self._setup(tmp_path, members=members)
+        boom = AsyncMock(side_effect=ValueError('boom'))
+        ok   = AsyncMock(return_value=MagicMock())
+        with patch.object(plugin, '_get_rhapsody_client',
+                          new=boom if where == 'rhapsody' else ok), \
+             patch.object(plugin, '_get_staging_client',
+                          new=boom if where == 'staging' else ok):
+            asyncio.run(plugin._do_rhapsody_submit(ps, tasks, pilot))
+        assert all(t.state == TASK_FAILED for t in tasks)
+
+    def test_task_cancelled_during_client_await_is_not_submitted(
+            self, tmp_path):
+        plugin, ps, pilot, tasks = self._setup(tmp_path)
+        rh = MagicMock()
+        rh.submit_tasks = MagicMock(return_value=[])
+
+        async def get_client(*_a, **_kw):
+            await plugin._cancel_task(ps, tasks[0])
+            return rh
+        with patch.object(plugin, '_cancel_rhapsody_tasks', new=AsyncMock()), \
+             patch.object(plugin, '_get_rhapsody_client',
+                          side_effect=get_client):
+            asyncio.run(plugin._do_rhapsody_submit(ps, tasks, pilot))
+        sent = [d['uid'] for d in rh.submit_tasks.call_args.args[0]]
+        assert sent == ['t.2']
+        assert tasks[0].state == TASK_CANCELED
+        assert tasks[1].state == TASK_RUNNING
+
+
 class TestAbsentPilots:
 
     def _replayed(self, tmp_path):
