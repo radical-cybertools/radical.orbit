@@ -42,6 +42,7 @@ import os
 import shutil
 import threading
 import time
+import urllib.parse
 import uuid
 
 import msgpack
@@ -2310,7 +2311,9 @@ class PluginTaskDispatcher(Plugin):
         '''Return one task's record (pool mode) or rhapsody info (endpoint mode).'''
         sid = request.path_params['sid']
         self._require_known_session(sid)
-        task_id = request.path_params['task_id']
+        # in-process callers (the federation) percent-quote the id, so an
+        # id containing '/' still matches the one-segment route
+        task_id = urllib.parse.unquote(request.path_params['task_id'])
 
         # Endpoint mode: forward to the target endpoint's rhapsody.
         endpoint_name = self._endpoint_mode_tasks.get(task_id)

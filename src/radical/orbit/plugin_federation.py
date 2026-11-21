@@ -95,6 +95,7 @@ import json
 import logging
 import os
 import time
+import urllib.parse
 
 from pathlib import Path
 from typing import Any
@@ -317,8 +318,9 @@ class _DispatcherAPI:
         return await self._call('POST', f'submit/{sid}', payload)
 
     async def task(self, sid: str, task_id: str) -> dict:
-        '''Return one task record.'''
-        return await self._call('GET', f'task/{sid}/{task_id}')
+        '''Return one task record (the id quoted: it may contain ``/``).'''
+        quoted = urllib.parse.quote(str(task_id), safe='')
+        return await self._call('GET', f'task/{sid}/{quoted}')
 
     async def cancel_task(self, sid: str, task_id: str) -> dict:
         '''Cancel one task.'''
@@ -496,10 +498,16 @@ class PluginFederation(Plugin):
         # a re-attach knows whether it must re-declare the pool first.
         self._pools: set[str] = set()
 
-        # Restart re-attach runs exactly once, whichever comes first: the
-        # first topology delivery or the first route.  See
-        # :meth:`_replay_attachments`.
-        self._replayed = False
+        # Restart re-attach runs once, whichever comes first: the first
+        # topology delivery or the first route; every later caller awaits
+        # the same task, and a failed one is retried by the next caller.
+        # See :meth:`_ensure_replayed`.
+        self._replay: asyncio.Future | None = None
+
+        # task_id -> [lock, holders]: serialises the lookup, pick and submit
+        # of one id, so a retry racing its own original cannot land in a
+        # second pool.  An entry is dropped with its last holder.
+        self._submit_locks: dict[str, list] = {}
 
         # pool_name → (fetched_at, verbose summary).  Shared by usage refresh
         # and the ``child_endpoint`` lookup so a poll loop costs one call.
@@ -545,7 +553,8 @@ class PluginFederation(Plugin):
 
     # -- session helper --------------------------------------------------
 
-    async def _require_session(self, sid: str) -> None:
+    async def _require_session(self, sid: str, *,
+                               best_effort: bool = False) -> None:
         '''Ensure the reserved ``default`` session, then validate *sid*.
 
         Every federation route is addressed with ``default``; a client never
@@ -560,12 +569,74 @@ class PluginFederation(Plugin):
         not re-attached yet.
         '''
         await self._ensure_default_session()
-        if not self._replayed:
-            self._replayed = True
-            await self._replay_attachments()
+        try:
+            await self._ensure_replayed()
+        except HTTPException:
+            # read-only routes answer from the federation's own records
+            if not best_effort:
+                raise
         if sid not in self._sessions:
             raise HTTPException(status_code=404,
                                 detail=f'unknown session id: {sid}')
+
+    async def _ensure_replayed(self) -> None:
+        '''Run the restart re-attach once, and wait for it to finish.
+
+        The flag used to be set *before* the replay was awaited, so a route
+        arriving during that await reached the dispatcher before ``fed``
+        was registered and got a 404 for the session.  Every caller now
+        awaits the one replay task (shielded: a cancelled caller does not
+        cancel it).  A *transient* failure (an ``HTTPException`` of 500 or
+        more -- no dispatcher is a 503 -- or the replay task cancelled) is a
+        **503**, and the next caller starts a new one -- only the caller
+        that still sees the failed task clears it, so a waiter of an old
+        failure cannot drop a newer retry.  Anything else (a 4xx, or a
+        non-HTTP error) is logged and the replay counts as done, as before;
+        :meth:`_sync_attachments` keeps retrying the registration.
+        '''
+        task = self._replay
+        if task is None:
+            task = asyncio.ensure_future(self._replay_attachments())
+            self._replay = task
+        if task.done() and not task.cancelled() \
+                and task.exception() is None:
+            return
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as e:
+            if not task.cancelled():
+                raise                       # the caller was cancelled
+            if self._replay is task:
+                self._replay = None
+            log.warning('[%s] restart re-attach was cancelled (retried on '
+                        'the next call)', self.instance_name)
+            raise HTTPException(status_code=503,
+                                detail='federation replay pending: '
+                                       'cancelled') from e
+        except HTTPException as e:
+            if e.status_code < 500:
+                self._replay_finished(task)
+                log.warning('[%s] restart re-attach failed permanently: %s',
+                            self.instance_name, e)
+                return
+            if self._replay is task:
+                self._replay = None
+            log.warning('[%s] restart re-attach failed (retried on the next '
+                        'call): %s', self.instance_name, e)
+            raise HTTPException(
+                status_code=503,
+                detail=f'federation replay pending: {e.detail}') from e
+        except Exception:
+            # not a dispatcher answer: a bug, not worth a retry per call
+            self._replay_finished(task)
+            log.exception('[%s] restart re-attach failed', self.instance_name)
+
+    def _replay_finished(self, task: asyncio.Future) -> None:
+        '''Mark the replay done after a permanent failure of *task*.'''
+        if self._replay is task:
+            done = asyncio.get_running_loop().create_future()
+            done.set_result(None)
+            self._replay = done
 
     def _participant(self, endpoint: str) -> dict:
         '''Return the topology entry for *endpoint* (empty when unknown).'''
@@ -1417,7 +1488,8 @@ class PluginFederation(Plugin):
 
     async def _route_resources(self, request: Request) -> dict:
         '''List every resource, usage refreshed.'''
-        await self._require_session(request.path_params['sid'])
+        await self._require_session(request.path_params['sid'],
+                                    best_effort=True)
         await self._refresh_all()
         return {'resources': [r.to_wire() for r in
                               sorted(self._state.resources.values(),
@@ -1425,7 +1497,8 @@ class PluginFederation(Plugin):
 
     async def _route_resource(self, request: Request) -> dict:
         '''Return one resource record, usage refreshed.'''
-        await self._require_session(request.path_params['sid'])
+        await self._require_session(request.path_params['sid'],
+                                    best_effort=True)
         rec = self._resource(request.path_params['name'])
         await self._refresh_usage(rec)
         return rec.to_wire()
@@ -1438,7 +1511,8 @@ class PluginFederation(Plugin):
         explicitly **advisory**: the binding placement is made by the
         dispatcher at dispatch and reported by ``task``.
         '''
-        await self._require_session(request.path_params['sid'])
+        await self._require_session(request.path_params['sid'],
+                                    best_effort=True)
         try:
             body = await request.json()
         except Exception:
@@ -1525,16 +1599,8 @@ class PluginFederation(Plugin):
                     detail="'task.inputs_b64' must be an object of "
                            '{filename: base64}')
 
-        await self._refresh_all()
-        chosen = self._pick(requirements)
-        if chosen is None:
-            return self._no_resource(requirements)
-        cls, _score, ranked = chosen
-        pool = self.pool_name_for_class(cls)
-
         payload = {
-            'pool'    : pool,
-            'task_id' : task_id,
+            'task_id' : str(task_id),       # the key every lookup uses
             'cmd'     : list(cmd),
             'priority': int(priority),
             'inputs'  : list(task.get('inputs')  or []),
@@ -1546,6 +1612,40 @@ class PluginFederation(Plugin):
             payload['requirements'] = forward
         if inputs_b64:
             payload['inputs_b64'] = dict(inputs_b64)
+
+        return await self._submit_once(str(task_id), payload, requirements)
+
+    async def _submit_once(self, task_id: str, payload: dict,
+                           requirements: dict):
+        '''Look up, pick and submit *task_id* under its own lock.'''
+        slot = self._submit_locks.setdefault(task_id, [asyncio.Lock(), 0])
+        slot[1] += 1
+        try:
+            async with slot[0]:
+                return await self._submit_unlocked(task_id, payload,
+                                                   requirements)
+        finally:
+            slot[1] -= 1
+            if slot[1] == 0 and self._submit_locks.get(task_id) is slot:
+                del self._submit_locks[task_id]
+
+    async def _submit_unlocked(self, task_id: str, payload: dict,
+                               requirements: dict):
+        '''The body of :meth:`_submit_once`.'''
+        # A retry of a submit whose reply was lost must not become a second
+        # task: the pick below may choose another class pool this time.
+        rec = await self._dispatcher_task(task_id)
+        if rec is not None:
+            return await self._resubmit_known(task_id, rec, payload,
+                                              requirements)
+
+        await self._refresh_all()
+        chosen = self._pick(requirements)
+        if chosen is None:
+            return self._no_resource(requirements)
+        cls, _score, ranked = chosen
+        pool = self.pool_name_for_class(cls)
+        payload['pool'] = pool
 
         # A dispatcher 400 ("no member satisfies the task requirements")
         # propagates verbatim — status and detail — so the caller sees the
@@ -1570,6 +1670,113 @@ class PluginFederation(Plugin):
                 'dispatcher_sid'  : FED_SESSION_SID,
                 'resource'        : advisory,
                 'member'          : None,
+                'members_eligible': [m.member_id for m, _ in ranked]}
+
+    @staticmethod
+    def class_for_pool(pool: str) -> str:
+        '''Return the capability class a ``fed-<class>`` pool backs, or ``''``.'''
+        pool = str(pool or '')
+        return pool[len(_FED_PREFIX):] if pool.startswith(_FED_PREFIX) else ''
+
+    async def _dispatcher_task(self, task_id: str) -> dict | None:
+        '''Return the dispatcher's record of *task_id*, or ``None``.
+
+        Pool-mode records are never released and every pool of ``fed`` is
+        replayed after a restart, so this finds any task the federation ever
+        routed.  Only a 404 for the *task* is a miss: a 404 for the session
+        (or any other error) propagates.  Without a registered ``fed``
+        session (an empty federation) there is nothing to find.
+        '''
+        if not self._pools:
+            return None
+        try:
+            rec = await self._dispatcher.task(FED_SESSION_SID, str(task_id))
+        except HTTPException as e:
+            if e.status_code == 404 and \
+                    str(e.detail or '').startswith('unknown task'):
+                return None
+            raise
+        rec = dict(rec or {})
+        # the dispatcher answers an id of its global endpoint-mode table
+        # first: another client's task, not one of the federation's pools
+        if not self.class_for_pool(rec.get('pool')):
+            return None
+        return rec
+
+    def _adopt_entry(self, task_id: str, rec: dict) -> SubmitLedgerEntry:
+        '''Return the ledger entry of *task_id*, created from *rec* if missing.
+
+        An entry can be missing for a task the dispatcher holds: a crash
+        between the dispatcher's save and the ledger's, or a ``leave`` that
+        dropped the finished entries of its resource.
+        '''
+        entry = self._state.ledger.get(str(task_id))
+        if entry is None:
+            pool      = str(rec.get('pool') or '')
+            member_id = rec.get('member_id') or None
+            entry = SubmitLedgerEntry(
+                task_id        = str(task_id),
+                resource       = (self.split_member_id(member_id)[0] or None
+                                  if member_id else None),
+                pool           = pool,
+                dispatcher_sid = FED_SESSION_SID,
+                state          = str(rec.get('state') or 'QUEUED'),
+                submitted_at   = rec.get('submitted_at') or time.time(),
+                member_id      = member_id,
+                cls            = self.class_for_pool(pool),
+            )
+            self._state.ledger[str(task_id)] = entry
+            self._state.save()
+        return entry
+
+    async def _resubmit_known(self, task_id: str, rec: dict, payload: dict,
+                              requirements: dict) -> dict:
+        '''Answer a submit of a *task_id* the dispatcher already holds.
+
+        A live or DONE task is answered from its record: nothing is
+        submitted.  A FAILED or CANCELED one runs again **in its recorded
+        pool** (the dispatcher re-executes in place); a pool that has no
+        members now is a 409, never a re-pick -- the same id in two pools is
+        exactly the duplicate this avoids.
+        '''
+        pool  = str(rec.get('pool') or '')
+        cls   = self.class_for_pool(pool)
+        entry = self._adopt_entry(task_id, rec)
+        if str(rec.get('state') or '') in ('FAILED', 'CANCELED'):
+            payload['pool'] = pool
+            try:
+                rec = await self._dispatcher.submit(FED_SESSION_SID, payload)
+            except HTTPException as e:
+                if e.status_code == 400 and 'has no members' in str(e.detail):
+                    detail = (f'task {task_id} was routed to class '
+                              f'{cls!r}, which has no live members now; '
+                              'retry later, or use a new task_id to run it '
+                              'elsewhere')
+                    raise HTTPException(status_code=409,
+                                        detail=detail) from e
+                raise
+            rec                = dict(rec or {})
+            entry.state        = str(rec.get('state') or 'QUEUED')
+            entry.submitted_at = time.time()
+            entry.finished_at  = None
+            entry.detail       = ''
+            entry.member_id    = None
+            entry.resource     = None       # not placed yet
+            self._state.save()
+            await self._refresh_all()
+        try:
+            ranked = self._policy.eligible(requirements,
+                                           self._classes().get(cls) or [])
+        except Exception:
+            ranked = []
+        member_id = rec.get('member_id') or None
+        return {'task'            : rec,
+                'pool'            : pool,
+                'class'           : cls,
+                'dispatcher_sid'  : FED_SESSION_SID,
+                'resource'        : entry.resource,
+                'member'          : (self.split_member_id(member_id)[1]
+                                     if member_id else None),
                 'members_eligible': [m.member_id for m, _ in ranked]}
 
     async def _route_task(self, request: Request) -> dict:
@@ -1599,15 +1806,20 @@ class PluginFederation(Plugin):
         await self._require_session(request.path_params['sid'])
         task_id = request.path_params['task_id']
         entry   = self._state.ledger.get(task_id)
+        rec     = None
         if entry is None:
-            raise HTTPException(status_code=404,
-                                detail=f'unknown task: {task_id}')
+            rec = await self._dispatcher_task(task_id)
+            if rec is None:
+                raise HTTPException(status_code=404,
+                                    detail=f'unknown task: {task_id}')
+            entry = self._adopt_entry(task_id, rec)
 
         sid = entry.dispatcher_sid or FED_SESSION_SID
         if sid != FED_SESSION_SID:
             return self._ledger_view(entry)
 
-        task = await self._dispatcher.task(sid, task_id)
+        task = rec if rec is not None \
+            else await self._dispatcher.task(sid, task_id)
         task = dict(task or {})
 
         dirty = False
@@ -1935,9 +2147,10 @@ class PluginFederation(Plugin):
             for name, info in participants.items()
         }
 
-        if not self._replayed:
-            self._replayed = True
-            await self._replay_attachments()
+        try:
+            await self._ensure_replayed()
+        except HTTPException:
+            pass        # logged; liveness is still applied below
 
         await self._sync_attachments()
         await super().on_topology_change(participants)
@@ -2023,12 +2236,14 @@ class PluginFederation(Plugin):
         await self._upgrade_legacy()
 
         try:
-            await self._register_fed()
+            await self._register_fed()      # an empty federation: a no-op
         except Exception as e:
             log.warning('[%s] could not register the %r session: %s',
                         self.instance_name, FED_SESSION_SID, e)
             self._state.save()
-            return
+            if isinstance(e, HTTPException) and e.status_code < 500:
+                return                      # permanent: retrying won't help
+            raise                           # _ensure_replayed retries
 
         for rec in list(self._state.resources.values()):
             for member in rec.member_list():
