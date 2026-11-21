@@ -95,9 +95,9 @@ class _FakeDispatcher:
         self.fail         = None               # verb name that raises
         self.fail_member  = None               # member_id whose add fails
         self.submit_error = None               # HTTPException for submit
-        # opt in: validate members before the resubmit ladder, as the real
+        # validate members before the resubmit ladder, as the real
         # dispatcher does (``check_requirements_against_pool``)
-        self.strict_members = False
+        self.strict_members = True
 
     def _maybe_fail(self, verb):
         if self.fail == verb:
@@ -175,6 +175,9 @@ class _FakeDispatcher:
         self._maybe_fail('submit')
         if self.submit_error is not None:
             raise self.submit_error
+        if sid not in self.sessions:
+            raise HTTPException(status_code=404,
+                                detail=f'unknown session: {sid}')
         if self.strict_members and not self.pools.get(payload['pool']):
             raise HTTPException(
                 status_code=400,
@@ -3442,7 +3445,6 @@ class TestKnownTaskResubmit:
         self._submit(client, plugin)
         fake.tasks['t.1']['state'] = 'DONE'
         client.post(f'{plugin.namespace}/leave/default/alpha', json={})
-        fake.strict_members = True
         r = self._submit(client, plugin)
         assert r.status_code == 200, r.text
         assert r.json()['task']['state'] == 'DONE'
@@ -3496,6 +3498,45 @@ class TestKnownTaskResubmit:
         assert [p['pool'] for _, p in fake.submitted] == ['fed-cpu']
         assert plugin._submit_locks == {}
 
+    def test_a_non_string_id_is_found_on_retry(self, tmp_path, monkeypatch):
+        client, plugin, fake = _joinable(tmp_path)
+        _join(client, plugin, _alloc_body())
+        _join(client, plugin, _members_body())
+        r = self._submit(client, plugin, task_id=7)
+        assert r.status_code == 200, r.text
+        self._pick_gpu(plugin, monkeypatch)
+        r = self._submit(client, plugin, task_id=7)
+        assert r.status_code == 200, r.text
+        assert [p['pool'] for _, p in fake.submitted] == ['fed-cpu']
+        assert fake.submitted[0][1]['task_id'] == '7'
+
+    @staticmethod
+    def _foreign(fake, monkeypatch):
+        """Another client's endpoint-mode task answers every lookup."""
+        async def _endpoint_mode(sid, task_id):
+            return {'task_id': task_id, 'endpoint': 'ep9', 'result': {}}
+        monkeypatch.setattr(fake, 'task', _endpoint_mode)
+
+    def test_a_foreign_endpoint_mode_record_is_a_miss(self, tmp_path,
+                                                      monkeypatch):
+        client, plugin, fake = _joinable(tmp_path)
+        _join(client, plugin, _alloc_body())
+        self._submit(client, plugin, task_id='t.0')     # registers fed
+        self._foreign(fake, monkeypatch)
+        r = self._submit(client, plugin, task_id='e.1')
+        assert r.status_code == 200, r.text
+        assert r.json()['pool'] == 'fed-cpu'
+        assert [p['task_id'] for _, p in fake.submitted] == ['t.0', 'e.1']
+
+    def test_a_poll_adopts_no_foreign_record(self, tmp_path, monkeypatch):
+        client, plugin, fake = _joinable(tmp_path)
+        _join(client, plugin, _alloc_body())
+        self._submit(client, plugin, task_id='t.0')
+        self._foreign(fake, monkeypatch)
+        r = client.get(f'{plugin.namespace}/task/default/e.2')
+        assert r.status_code == 404
+        assert 'e.2' not in plugin._state.ledger
+
     def test_an_unknown_task_on_an_empty_federation_is_unknown(self,
                                                               tmp_path):
         client, plugin, _fake = _joinable(tmp_path)
@@ -3513,10 +3554,9 @@ class TestKnownTaskResubmit:
         client, plugin, fake = self._two(tmp_path)
         fake.tasks['t.1']['state'] = 'FAILED'
         fake.pools['fed-cpu'] = {}
-        fake.strict_members   = True
         r = self._submit(client, plugin)
         assert r.status_code == 409, r.text
-        assert 'new task_id' in r.text
+        assert 'no live members now; retry later' in r.text
         assert len(fake.submitted) == 1
 
     def test_a_failed_task_runs_again_in_its_pool(self, tmp_path,
@@ -3647,6 +3687,23 @@ class TestReplayRace:
         assert r.status_code == 200, r.text
         assert 'alpha' not in plugin2._state.resources
 
+    @pytest.mark.asyncio
+    async def test_a_non_http_error_ends_the_replay(self, tmp_path, caplog):
+        fake2   = _FakeDispatcher()
+        plugin2 = self._restarted(tmp_path, fake2)
+
+        async def _bug(sid, pools):
+            fake2.calls.append(('register_session', sid))
+            raise RuntimeError('a bug')
+        fake2.register_session = _bug
+        with caplog.at_level(logging.ERROR):
+            await plugin2._require_session('default')     # no 503
+            await plugin2._require_session('default')
+        assert [c for c in fake2.calls if c[0] == 'register_session'] == \
+            [('register_session', FED_SESSION_SID)]
+        assert any(r.exc_info for r in caplog.records
+                   if 're-attach failed' in r.getMessage())
+
     def test_read_only_routes_answer_during_a_failed_replay(self, tmp_path):
         fake2      = _FakeDispatcher()
         fake2.fail = 'register_session'               # a 503, transient
@@ -3719,5 +3776,67 @@ class TestCoHostedKnownTask:
         assert r.status_code == 200, r.body
         assert json.loads(r.body)['pool'] == 'fed-cpu'
         pools = td._pool_states[FED_SESSION_SID]
+        assert 't.1' in pools['fed-cpu'].tasks
+        assert 't.1' not in pools['fed-gpu'].tasks
+
+    @pytest.mark.asyncio
+    async def test_an_id_with_a_slash_is_found_on_retry(self, cohosted,
+                                                        monkeypatch):
+        td  = cohosted.plugins['task_dispatcher']
+        fed = cohosted.plugins['federation']
+        await _call(cohosted, 'POST', '/federation/join/default',
+                    _alloc_body(name='local_a'))
+        await _call(cohosted, 'POST', '/federation/join/default',
+                    _members_body(name='local_b'))
+        body = {'task': {'task_id': 'wf/1', 'cmd': ['/bin/true']}}
+        r = await _call(cohosted, 'POST', '/federation/submit/default', body)
+        assert r.status_code == 200, r.body
+        monkeypatch.setattr(fed._policy, 'pick_class',
+                            lambda req, classes: ('gpu', 1.0))
+        r = await _call(cohosted, 'POST', '/federation/submit/default', body)
+        assert r.status_code == 200, r.body
+        assert json.loads(r.body)['pool'] == 'fed-cpu'
+        pools = td._pool_states[FED_SESSION_SID]
+        assert 'wf/1' in pools['fed-cpu'].tasks
+        assert 'wf/1' not in pools['fed-gpu'].tasks
+
+    @pytest.mark.asyncio
+    async def test_a_retry_after_a_restart_stays_in_its_pool(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            'radical.orbit.plugin_task_dispatcher._DEFAULT_STATE_ROOT',
+            tmp_path / 'td_state')
+        monkeypatch.setattr(
+            'radical.orbit.plugin_task_dispatcher._DEFAULT_SCRATCH_ROOT',
+            tmp_path / 'td_scratch')
+        monkeypatch.setenv('RADICAL_ORBIT_FEDERATION_STATE',
+                           str(tmp_path / 'fed'))
+
+        async def _broadcast(*_a, **_kw):
+            return None
+
+        host1 = BrokerPluginHost(['task_dispatcher', 'federation'],
+                                 _broadcast)
+        host1.plugins['federation']._participants = _parts(ep0='present',
+                                                           ep1='present')
+        await _call(host1, 'POST', '/federation/join/default',
+                    _alloc_body(name='local_a'))
+        await _call(host1, 'POST', '/federation/join/default',
+                    _members_body(name='local_b'))
+        body = {'task': {'task_id': 't.1', 'cmd': ['/bin/true']}}
+        r = await _call(host1, 'POST', '/federation/submit/default', body)
+        assert json.loads(r.body)['pool'] == 'fed-cpu'
+
+        host2 = BrokerPluginHost(['task_dispatcher', 'federation'],
+                                 _broadcast)
+        td2   = host2.plugins['task_dispatcher']
+        fed2  = host2.plugins['federation']
+        await fed2.on_topology_change(_topo(ep0='present', ep1='present'))
+        monkeypatch.setattr(fed2._policy, 'pick_class',
+                            lambda req, classes: ('gpu', 1.0))
+        r = await _call(host2, 'POST', '/federation/submit/default', body)
+        assert r.status_code == 200, r.body
+        assert json.loads(r.body)['pool'] == 'fed-cpu'
+        pools = td2._pool_states[FED_SESSION_SID]
         assert 't.1' in pools['fed-cpu'].tasks
         assert 't.1' not in pools['fed-gpu'].tasks

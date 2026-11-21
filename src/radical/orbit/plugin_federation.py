@@ -95,6 +95,7 @@ import json
 import logging
 import os
 import time
+import urllib.parse
 
 from pathlib import Path
 from typing import Any
@@ -317,8 +318,9 @@ class _DispatcherAPI:
         return await self._call('POST', f'submit/{sid}', payload)
 
     async def task(self, sid: str, task_id: str) -> dict:
-        '''Return one task record.'''
-        return await self._call('GET', f'task/{sid}/{task_id}')
+        '''Return one task record (the id quoted: it may contain ``/``).'''
+        quoted = urllib.parse.quote(str(task_id), safe='')
+        return await self._call('GET', f'task/{sid}/{quoted}')
 
     async def cancel_task(self, sid: str, task_id: str) -> dict:
         '''Cancel one task.'''
@@ -584,12 +586,13 @@ class PluginFederation(Plugin):
         arriving during that await reached the dispatcher before ``fed``
         was registered and got a 404 for the session.  Every caller now
         awaits the one replay task (shielded: a cancelled caller does not
-        cancel it).  A *transient* failure (a 5xx, no dispatcher, or the
-        replay task cancelled) is a **503**, and the next caller starts a
-        new one -- only the caller that still sees the failed task clears
-        it, so a waiter of an old failure cannot drop a newer retry.  A
-        permanent one (a 4xx) is logged and the replay counts as done, as
-        before; :meth:`_sync_attachments` keeps retrying the registration.
+        cancel it).  A *transient* failure (an ``HTTPException`` of 500 or
+        more -- no dispatcher is a 503 -- or the replay task cancelled) is a
+        **503**, and the next caller starts a new one -- only the caller
+        that still sees the failed task clears it, so a waiter of an old
+        failure cannot drop a newer retry.  Anything else (a 4xx, or a
+        non-HTTP error) is logged and the replay counts as done, as before;
+        :meth:`_sync_attachments` keeps retrying the registration.
         '''
         task = self._replay
         if task is None:
@@ -610,14 +613,30 @@ class PluginFederation(Plugin):
             raise HTTPException(status_code=503,
                                 detail='federation replay pending: '
                                        'cancelled') from e
-        except Exception as e:
+        except HTTPException as e:
+            if e.status_code < 500:
+                self._replay_finished(task)
+                log.warning('[%s] restart re-attach failed permanently: %s',
+                            self.instance_name, e)
+                return
             if self._replay is task:
                 self._replay = None
             log.warning('[%s] restart re-attach failed (retried on the next '
                         'call): %s', self.instance_name, e)
             raise HTTPException(
                 status_code=503,
-                detail=f'federation replay pending: {e}') from e
+                detail=f'federation replay pending: {e.detail}') from e
+        except Exception:
+            # not a dispatcher answer: a bug, not worth a retry per call
+            self._replay_finished(task)
+            log.exception('[%s] restart re-attach failed', self.instance_name)
+
+    def _replay_finished(self, task: asyncio.Future) -> None:
+        '''Mark the replay done after a permanent failure of *task*.'''
+        if self._replay is task:
+            done = asyncio.get_running_loop().create_future()
+            done.set_result(None)
+            self._replay = done
 
     def _participant(self, endpoint: str) -> dict:
         '''Return the topology entry for *endpoint* (empty when unknown).'''
@@ -1581,7 +1600,7 @@ class PluginFederation(Plugin):
                            '{filename: base64}')
 
         payload = {
-            'task_id' : task_id,
+            'task_id' : str(task_id),       # the key every lookup uses
             'cmd'     : list(cmd),
             'priority': int(priority),
             'inputs'  : list(task.get('inputs')  or []),
@@ -1677,7 +1696,12 @@ class PluginFederation(Plugin):
                     str(e.detail or '').startswith('unknown task'):
                 return None
             raise
-        return dict(rec or {})
+        rec = dict(rec or {})
+        # the dispatcher answers an id of its global endpoint-mode table
+        # first: another client's task, not one of the federation's pools
+        if not self.class_for_pool(rec.get('pool')):
+            return None
+        return rec
 
     def _adopt_entry(self, task_id: str, rec: dict) -> SubmitLedgerEntry:
         '''Return the ledger entry of *task_id*, created from *rec* if missing.
@@ -1724,11 +1748,12 @@ class PluginFederation(Plugin):
                 rec = await self._dispatcher.submit(FED_SESSION_SID, payload)
             except HTTPException as e:
                 if e.status_code == 400 and 'has no members' in str(e.detail):
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f'task {task_id} was routed to class {cls!r}, '
-                               'which has no members now; use a new task_id '
-                               'to run it again') from e
+                    detail = (f'task {task_id} was routed to class '
+                              f'{cls!r}, which has no live members now; '
+                              'retry later, or use a new task_id to run it '
+                              'elsewhere')
+                    raise HTTPException(status_code=409,
+                                        detail=detail) from e
                 raise
             rec                = dict(rec or {})
             entry.state        = str(rec.get('state') or 'QUEUED')
