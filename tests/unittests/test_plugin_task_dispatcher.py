@@ -4161,6 +4161,64 @@ class TestCancelAndOwnership:
         assert tasks[1].state == TASK_RUNNING
 
 
+class TestPlaceInputsOwnership:
+
+    _setup = TestUndeliveredRequeue._setup
+
+    @pytest.mark.parametrize('where', ['client', 'put'])
+    def test_cancel_during_placement_stays_canceled(self, tmp_path, where):
+        plugin, ps, pilot, tasks = self._setup(tmp_path, members=[
+            _member('m_x', shared_fs=False, scratch_base='/remote')])
+        notified = []
+        real_notify = plugin._notify_task
+        loop_box = {}
+
+        def notify(pool_state, task):
+            notified.append((task.task_id, task.state))
+            real_notify(pool_state, task)
+
+        def cancel_first():
+            done = threading.Event()
+            fut  = asyncio.run_coroutine_threadsafe(
+                plugin._cancel_task(ps, tasks[0]), loop_box['loop'])
+            fut.add_done_callback(lambda _f: done.set())
+            assert done.wait(5)
+
+        async def get_staging(*_a, **_kw):
+            if where == 'client':
+                await plugin._cancel_task(ps, tasks[0])
+                return None
+            stg = MagicMock()
+
+            def put(src, dst, _overwrite):
+                if '/t.1/' in dst:
+                    cancel_first()
+                    raise ValueError('put failed')
+                return {}
+            stg.put = MagicMock(side_effect=put)
+            return stg
+
+        async def drive():
+            loop_box['loop'] = asyncio.get_running_loop()
+            with patch.object(plugin, '_notify_task', side_effect=notify), \
+                 patch.object(plugin, '_cancel_rhapsody_tasks',
+                              new=AsyncMock()), \
+                 patch.object(plugin, '_get_staging_client',
+                              side_effect=get_staging), \
+                 patch.object(plugin, '_get_rhapsody_client',
+                              new=AsyncMock(return_value=MagicMock())):
+                await plugin._do_rhapsody_submit(ps, tasks, pilot)
+        asyncio.run(drive())
+        assert tasks[0].state == TASK_CANCELED
+        assert [n for n in notified if n[0] == 't.1'] == \
+            [('t.1', TASK_CANCELED)]
+        if where == 'client':
+            assert tasks[1].state == TASK_FAILED
+        assert pilot.in_flight == sum(
+            1 for t in ps.tasks.values()
+            if t.state == TASK_RUNNING and t.pilot_id == pilot.pid)
+
+
 class TestAbsentPilots:
 
     def _replayed(self, tmp_path):

@@ -3452,6 +3452,8 @@ class PluginTaskDispatcher(Plugin):
                 log.warning('[%s] staging client failed for %s: %s',
                             self.instance_name, pilot.child_endpoint_name, e)
                 stg = None
+            # a task cancelled (or handed on) during the await is not ours
+            tasks = [t for t in tasks if self._owned_by(t, pilot)]
             if stg is None:
                 for task in tasks:
                     self._mark_task_failed(
@@ -3484,6 +3486,8 @@ class PluginTaskDispatcher(Plugin):
                         stg.put, str(marker),
                         str(Path(task.cwd) / _CWD_MARKER), True)
             except Exception as e:
+                if not self._owned_by(task, pilot):
+                    continue                     # cancelled during the put
                 if _is_retryable(e):
                     self._requeue_tasks(pool_state, [task], pilot,
                                         f'input placement: {e}')
@@ -3493,6 +3497,8 @@ class PluginTaskDispatcher(Plugin):
                 self._mark_task_failed(
                     pool_state, task,
                     f'could not place inputs on the pilot: {e}')
+                continue
+            if not self._owned_by(task, pilot):
                 continue
             ok.append(task)
 
