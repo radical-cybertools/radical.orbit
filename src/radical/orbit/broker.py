@@ -69,7 +69,7 @@ from . import utils
 
 from .broker_plugin_host import BrokerPluginHost
 from .broker_events      import EventRouter
-from .errors             import error_body, error_dict
+from .errors             import EndpointUnknown, error_body, error_dict
 
 
 log = logging.getLogger("radical.orbit.broker")
@@ -932,7 +932,7 @@ class Broker:
         corr_id = req.corr_id
         target  = self.registry.get(dst)
         if target is None:
-            raise RuntimeError(f"endpoint {dst!r} unknown")
+            raise EndpointUnknown(f"endpoint {dst!r} unknown")
 
         if self._liveness.get(dst) == 'suspect':
             # as in _route_request: nothing written, retry is safe
@@ -1258,6 +1258,11 @@ class Broker:
         so a not-yet-reconnected child is never synthesized ``lost`` (it was
         never ``present`` in this broker's view)."""
         if self._plugin_host is None or self._host_loop is None:
+            return
+        if not self._started:
+            # shutdown: the sockets it closes are not participants leaving,
+            # and a synthesized ``lost`` would make hosted plugins tear down
+            # state (pilots, resources) the restarted broker still needs
             return
         curr = self.topology_snapshot()
         participants = dict(curr)

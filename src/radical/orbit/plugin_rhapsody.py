@@ -1936,14 +1936,22 @@ class RhapsodyClient(PluginClient):
             batches.append(batch)
 
         # --- submit batches sequentially ---
+        # A failing batch raises with ``accepted_uids``: the uids of the
+        # batches acked before it (sent in sequence, so exactly those).
         results: list[dict] = []
-        for b in batches:
-            resp = self._http.post(
-                url,
-                data=msgpack.packb({"tasks": b}, use_bin_type=True),
-                headers={"Content-Type": "application/msgpack"})
-            self._raise(resp, f"submit {len(b)} task(s)")
-            results.extend(resp.json())
+        accepted: list[str] = []
+        try:
+            for b in batches:
+                resp = self._http.post(
+                    url,
+                    data=msgpack.packb({"tasks": b}, use_bin_type=True),
+                    headers={"Content-Type": "application/msgpack"})
+                self._raise(resp, f"submit {len(b)} task(s)")
+                results.extend(resp.json())
+                accepted.extend(str(td['uid']) for td in b)
+        except Exception as e:
+            e.accepted_uids = list(accepted)
+            raise
         return results
 
     def wait_tasks(self, uids: list[str],
