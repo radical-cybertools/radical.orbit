@@ -189,6 +189,9 @@ class _FakeDispatcher:
     async def task(self, sid, task_id):
         self.calls.append(('task', sid, task_id))
         self._maybe_fail('task')
+        if sid not in self.sessions:
+            raise HTTPException(status_code=404,
+                                detail=f'unknown session: {sid}')
         rec = self.tasks.get(task_id)
         if rec is None:
             raise HTTPException(status_code=404,
@@ -3455,9 +3458,56 @@ class TestKnownTaskResubmit:
         assert plugin._state.ledger['t.1'].pool == 'fed-cpu'
         assert plugin._state.ledger['t.1'].cls  == 'cpu'
         del plugin._state.ledger['t.1']
+        n = len([c for c in fake.calls if c[0] == 'task'])
         r = client.get(f'{plugin.namespace}/task/default/t.1')
         assert r.status_code == 200, r.text
         assert r.json()['class'] == 'cpu'
+        assert len([c for c in fake.calls if c[0] == 'task']) == n + 1
+
+    @pytest.mark.asyncio
+    async def test_concurrent_submits_of_one_id_make_one_task(
+            self, tmp_path, monkeypatch):
+        client, plugin, fake = _joinable(tmp_path)
+        _join(client, plugin, _alloc_body())
+        _join(client, plugin, _members_body())
+        gate, real = asyncio.Event(), fake.submit
+
+        async def _slow_submit(sid, payload):
+            await gate.wait()
+            return await real(sid, payload)
+        monkeypatch.setattr(fake, 'submit', _slow_submit)
+
+        picks = iter([('cpu', 1.0), ('gpu', 1.0)])
+        monkeypatch.setattr(plugin._policy, 'pick_class',
+                            lambda req, classes: next(picks))
+        payload = {'task_id': 't.1', 'cmd': ['/bin/true'], 'priority': 0,
+                   'inputs': [], 'outputs': []}
+        first  = asyncio.ensure_future(
+            plugin._submit_once('t.1', dict(payload), {}))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        second = asyncio.ensure_future(
+            plugin._submit_once('t.1', dict(payload), {}))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        gate.set()
+        r1, r2 = await asyncio.wait_for(asyncio.gather(first, second), 5)
+        assert r1['pool'] == r2['pool'] == 'fed-cpu'
+        assert [p['pool'] for _, p in fake.submitted] == ['fed-cpu']
+        assert plugin._submit_locks == {}
+
+    def test_an_unknown_task_on_an_empty_federation_is_unknown(self,
+                                                              tmp_path):
+        client, plugin, _fake = _joinable(tmp_path)
+        r = client.get(f'{plugin.namespace}/task/default/nope')
+        assert r.status_code == 404
+        assert 'unknown task: nope' in r.text
+
+    def test_a_submit_on_an_empty_federation_is_a_409(self, tmp_path):
+        client, plugin, _fake = _joinable(tmp_path)
+        r = self._submit(client, plugin)
+        assert r.status_code == 409, r.text
+        assert 'reasons' in r.json()
 
     def test_a_failed_task_in_a_memberless_pool_is_a_409(self, tmp_path):
         client, plugin, fake = self._two(tmp_path)
@@ -3476,7 +3526,8 @@ class TestKnownTaskResubmit:
         client.get(f'{plugin.namespace}/task/default/t.1')    # entry: FAILED
         entry = plugin._state.ledger['t.1']
         assert entry.state == 'FAILED' and entry.finished_at
-        entry.detail = 'boom'
+        entry.detail       = 'boom'
+        entry.submitted_at = 1.0
         self._pick_gpu(plugin, monkeypatch)
 
         r = self._submit(client, plugin)
@@ -3488,6 +3539,8 @@ class TestKnownTaskResubmit:
         assert entry.finished_at is None
         assert entry.member_id   is None
         assert entry.detail      == ''
+        assert entry.resource    is None            # not placed yet
+        assert entry.submitted_at > 1.0
 
     def test_an_unknown_session_is_not_a_miss(self, tmp_path, monkeypatch):
         client, plugin, fake = self._two(tmp_path)
@@ -3576,6 +3629,55 @@ class TestReplayRace:
         await plugin2.on_topology_change(_topo(ep0='present'))
         assert plugin2._state.resources['alpha'].liveness == LIVENESS_OK
 
+    @pytest.mark.asyncio
+    async def test_a_permanent_failure_is_not_retried(self, tmp_path):
+        fake2   = _FakeDispatcher()
+        plugin2 = self._restarted(tmp_path, fake2)
+
+        async def _stale(sid, pools):
+            fake2.calls.append(('register_session', sid))
+            raise HTTPException(status_code=400, detail='stale declaration')
+        fake2.register_session = _stale
+        await plugin2._require_session('default')     # no 503
+        await plugin2._require_session('default')
+        assert [c for c in fake2.calls if c[0] == 'register_session'] == \
+            [('register_session', FED_SESSION_SID)]
+        client = TestClient(plugin2._app)
+        r = client.post(f'{plugin2.namespace}/leave/default/alpha', json={})
+        assert r.status_code == 200, r.text
+        assert 'alpha' not in plugin2._state.resources
+
+    def test_read_only_routes_answer_during_a_failed_replay(self, tmp_path):
+        fake2      = _FakeDispatcher()
+        fake2.fail = 'register_session'               # a 503, transient
+        plugin2    = self._restarted(tmp_path, fake2)
+        client     = TestClient(plugin2._app)
+        ns         = plugin2.namespace
+        assert client.get(f'{ns}/resources/default').status_code == 200
+        assert client.get(f'{ns}/resource/default/alpha').status_code == 200
+        assert client.post(f'{ns}/pick/default',
+                           json={}).status_code != 503
+        r = client.post(f'{ns}/submit/default',
+                        json={'task': {'task_id': 't.9',
+                                       'cmd': ['/bin/true']}})
+        assert r.status_code == 503                   # needs the dispatcher
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_replay_is_a_503_and_retried(self, tmp_path):
+        fake2   = _GatedDispatcher()
+        plugin2 = self._restarted(tmp_path, fake2)
+        first   = asyncio.ensure_future(plugin2._require_session('default'))
+        await asyncio.wait_for(fake2.entered.wait(), 5)
+        plugin2._replay.cancel()
+        with pytest.raises(HTTPException) as exc:
+            await asyncio.wait_for(first, 5)
+        assert exc.value.status_code == 503
+        assert plugin2._replay is None
+
+        fake2.gate.set()
+        await asyncio.wait_for(plugin2._require_session('default'), 5)
+        assert FED_SESSION_SID in fake2.sessions
+
     def test_an_empty_federation_joins_after_a_restart(self, tmp_path):
         _make_plugin(tmp_path, dispatcher=_FakeDispatcher())
         fake2 = _FakeDispatcher()
@@ -3583,3 +3685,39 @@ class TestReplayRace:
         plugin2._participants = _parts(ep0='present')
         client = TestClient(plugin2._app)
         assert _join(client, plugin2, _alloc_body()).status_code == 200
+
+
+class TestCoHostedKnownTask:
+
+    @pytest.mark.asyncio
+    async def test_a_submit_on_an_empty_federation_is_a_409(self, cohosted):
+        r = await _call(cohosted, 'POST', '/federation/submit/default',
+                        {'task': {'task_id': 't.1', 'cmd': ['/bin/true']}})
+        assert r.status_code == 409, r.body
+        assert 'reasons' in json.loads(r.body)
+        with pytest.raises(HTTPException) as exc:
+            await _call(cohosted, 'GET', '/federation/task/default/t.1')
+        assert exc.value.status_code == 404
+        assert exc.value.detail == 'unknown task: t.1'
+
+    @pytest.mark.asyncio
+    async def test_a_retry_stays_in_its_pool(self, cohosted, monkeypatch):
+        td  = cohosted.plugins['task_dispatcher']
+        fed = cohosted.plugins['federation']
+        await _call(cohosted, 'POST', '/federation/join/default',
+                    _alloc_body(name='local_a'))
+        await _call(cohosted, 'POST', '/federation/join/default',
+                    _members_body(name='local_b'))
+        body = {'task': {'task_id': 't.1', 'cmd': ['/bin/true']}}
+        r = await _call(cohosted, 'POST', '/federation/submit/default', body)
+        assert r.status_code == 200, r.body
+        assert json.loads(r.body)['pool'] == 'fed-cpu'
+
+        monkeypatch.setattr(fed._policy, 'pick_class',
+                            lambda req, classes: ('gpu', 1.0))
+        r = await _call(cohosted, 'POST', '/federation/submit/default', body)
+        assert r.status_code == 200, r.body
+        assert json.loads(r.body)['pool'] == 'fed-cpu'
+        pools = td._pool_states[FED_SESSION_SID]
+        assert 't.1' in pools['fed-cpu'].tasks
+        assert 't.1' not in pools['fed-gpu'].tasks

@@ -502,6 +502,11 @@ class PluginFederation(Plugin):
         # See :meth:`_ensure_replayed`.
         self._replay: asyncio.Future | None = None
 
+        # task_id -> [lock, holders]: serialises the lookup, pick and submit
+        # of one id, so a retry racing its own original cannot land in a
+        # second pool.  An entry is dropped with its last holder.
+        self._submit_locks: dict[str, list] = {}
+
         # pool_name → (fetched_at, verbose summary).  Shared by usage refresh
         # and the ``child_endpoint`` lookup so a poll loop costs one call.
         self._detail_cache: dict[str, tuple[float, dict]] = {}
@@ -546,7 +551,8 @@ class PluginFederation(Plugin):
 
     # -- session helper --------------------------------------------------
 
-    async def _require_session(self, sid: str) -> None:
+    async def _require_session(self, sid: str, *,
+                               best_effort: bool = False) -> None:
         '''Ensure the reserved ``default`` session, then validate *sid*.
 
         Every federation route is addressed with ``default``; a client never
@@ -561,7 +567,12 @@ class PluginFederation(Plugin):
         not re-attached yet.
         '''
         await self._ensure_default_session()
-        await self._ensure_replayed()
+        try:
+            await self._ensure_replayed()
+        except HTTPException:
+            # read-only routes answer from the federation's own records
+            if not best_effort:
+                raise
         if sid not in self._sessions:
             raise HTTPException(status_code=404,
                                 detail=f'unknown session id: {sid}')
@@ -573,9 +584,12 @@ class PluginFederation(Plugin):
         arriving during that await reached the dispatcher before ``fed``
         was registered and got a 404 for the session.  Every caller now
         awaits the one replay task (shielded: a cancelled caller does not
-        cancel it).  A failed replay is a **503**, and the next caller
-        starts a new one -- only the caller that still sees the failed task
-        clears it, so a waiter of an old failure cannot drop a newer retry.
+        cancel it).  A *transient* failure (a 5xx, no dispatcher, or the
+        replay task cancelled) is a **503**, and the next caller starts a
+        new one -- only the caller that still sees the failed task clears
+        it, so a waiter of an old failure cannot drop a newer retry.  A
+        permanent one (a 4xx) is logged and the replay counts as done, as
+        before; :meth:`_sync_attachments` keeps retrying the registration.
         '''
         task = self._replay
         if task is None:
@@ -586,6 +600,16 @@ class PluginFederation(Plugin):
             return
         try:
             await asyncio.shield(task)
+        except asyncio.CancelledError as e:
+            if not task.cancelled():
+                raise                       # the caller was cancelled
+            if self._replay is task:
+                self._replay = None
+            log.warning('[%s] restart re-attach was cancelled (retried on '
+                        'the next call)', self.instance_name)
+            raise HTTPException(status_code=503,
+                                detail='federation replay pending: '
+                                       'cancelled') from e
         except Exception as e:
             if self._replay is task:
                 self._replay = None
@@ -1445,7 +1469,8 @@ class PluginFederation(Plugin):
 
     async def _route_resources(self, request: Request) -> dict:
         '''List every resource, usage refreshed.'''
-        await self._require_session(request.path_params['sid'])
+        await self._require_session(request.path_params['sid'],
+                                    best_effort=True)
         await self._refresh_all()
         return {'resources': [r.to_wire() for r in
                               sorted(self._state.resources.values(),
@@ -1453,7 +1478,8 @@ class PluginFederation(Plugin):
 
     async def _route_resource(self, request: Request) -> dict:
         '''Return one resource record, usage refreshed.'''
-        await self._require_session(request.path_params['sid'])
+        await self._require_session(request.path_params['sid'],
+                                    best_effort=True)
         rec = self._resource(request.path_params['name'])
         await self._refresh_usage(rec)
         return rec.to_wire()
@@ -1466,7 +1492,8 @@ class PluginFederation(Plugin):
         explicitly **advisory**: the binding placement is made by the
         dispatcher at dispatch and reported by ``task``.
         '''
-        await self._require_session(request.path_params['sid'])
+        await self._require_session(request.path_params['sid'],
+                                    best_effort=True)
         try:
             body = await request.json()
         except Exception:
@@ -1567,6 +1594,25 @@ class PluginFederation(Plugin):
         if inputs_b64:
             payload['inputs_b64'] = dict(inputs_b64)
 
+        return await self._submit_once(str(task_id), payload, requirements)
+
+    async def _submit_once(self, task_id: str, payload: dict,
+                           requirements: dict):
+        '''Look up, pick and submit *task_id* under its own lock.'''
+        slot = self._submit_locks.setdefault(task_id, [asyncio.Lock(), 0])
+        slot[1] += 1
+        try:
+            async with slot[0]:
+                return await self._submit_unlocked(task_id, payload,
+                                                   requirements)
+        finally:
+            slot[1] -= 1
+            if slot[1] == 0 and self._submit_locks.get(task_id) is slot:
+                del self._submit_locks[task_id]
+
+    async def _submit_unlocked(self, task_id: str, payload: dict,
+                               requirements: dict):
+        '''The body of :meth:`_submit_once`.'''
         # A retry of a submit whose reply was lost must not become a second
         # task: the pick below may choose another class pool this time.
         rec = await self._dispatcher_task(task_id)
@@ -1619,8 +1665,11 @@ class PluginFederation(Plugin):
         Pool-mode records are never released and every pool of ``fed`` is
         replayed after a restart, so this finds any task the federation ever
         routed.  Only a 404 for the *task* is a miss: a 404 for the session
-        (or any other error) propagates.
+        (or any other error) propagates.  Without a registered ``fed``
+        session (an empty federation) there is nothing to find.
         '''
+        if not self._pools:
+            return None
         try:
             rec = await self._dispatcher.task(FED_SESSION_SID, str(task_id))
         except HTTPException as e:
@@ -1681,12 +1730,15 @@ class PluginFederation(Plugin):
                                'which has no members now; use a new task_id '
                                'to run it again') from e
                 raise
-            rec               = dict(rec or {})
-            entry.state       = str(rec.get('state') or 'QUEUED')
-            entry.finished_at = None
-            entry.detail      = ''
-            entry.member_id   = None
+            rec                = dict(rec or {})
+            entry.state        = str(rec.get('state') or 'QUEUED')
+            entry.submitted_at = time.time()
+            entry.finished_at  = None
+            entry.detail       = ''
+            entry.member_id    = None
+            entry.resource     = None       # not placed yet
             self._state.save()
+            await self._refresh_all()
         try:
             ranked = self._policy.eligible(requirements,
                                            self._classes().get(cls) or [])
@@ -1729,6 +1781,7 @@ class PluginFederation(Plugin):
         await self._require_session(request.path_params['sid'])
         task_id = request.path_params['task_id']
         entry   = self._state.ledger.get(task_id)
+        rec     = None
         if entry is None:
             rec = await self._dispatcher_task(task_id)
             if rec is None:
@@ -1740,7 +1793,8 @@ class PluginFederation(Plugin):
         if sid != FED_SESSION_SID:
             return self._ledger_view(entry)
 
-        task = await self._dispatcher.task(sid, task_id)
+        task = rec if rec is not None \
+            else await self._dispatcher.task(sid, task_id)
         task = dict(task or {})
 
         dirty = False
@@ -2162,6 +2216,8 @@ class PluginFederation(Plugin):
             log.warning('[%s] could not register the %r session: %s',
                         self.instance_name, FED_SESSION_SID, e)
             self._state.save()
+            if isinstance(e, HTTPException) and e.status_code < 500:
+                return                      # permanent: retrying won't help
             raise                           # _ensure_replayed retries
 
         for rec in list(self._state.resources.values()):
