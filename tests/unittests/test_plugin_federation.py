@@ -205,7 +205,12 @@ class _FakeDispatcher:
         self.calls.append(('cancel_task', sid, task_id))
         self._maybe_fail('cancel_task')
         self.canceled.append((sid, task_id))
-        return {'task_id': task_id, 'state': 'CANCELED'}
+        rec = self.tasks.get(task_id)
+        if rec is None:
+            return {'task_id': task_id, 'state': 'CANCELED'}
+        if rec['state'] not in ('DONE', 'FAILED', 'CANCELED'):
+            rec['state'] = 'CANCELED'
+        return dict(rec)
 
 
 class _FakeCaller:
@@ -1557,6 +1562,10 @@ class TestLeave:
                 task_id=tid, resource='local_b', member_id=mid,
                 pool='fed-cpu', dispatcher_sid=FED_SESSION_SID, state=state,
                 cls='cpu')
+            # the dispatcher holds them too: leave cancels only its records
+            fake.tasks[tid] = {'task_id': tid, 'pool': 'fed-cpu',
+                               'state': state, 'pilot_id': None,
+                               'member_id': mid}
         return client, plugin, fake
 
     def _leave(self, client, plugin, name='local_b', **body):
@@ -1986,8 +1995,8 @@ class TestRestartReattach:
         assert fake.pools == before
 
     @pytest.mark.asyncio
-    async def test_a_resource_whose_endpoint_is_gone_is_released(self,
-                                                                 tmp_path):
+    async def test_a_resource_whose_endpoint_is_missing_stays_attached(
+            self, tmp_path):
         client, plugin, _fake = _joinable(tmp_path)
         _join(client, plugin, _alloc_body())
         _join(client, plugin, _members_body())
@@ -1999,10 +2008,11 @@ class TestRestartReattach:
         # every stored member is re-attached first ...
         assert sorted(c[3] for c in fake2.calls if c[0] == 'add_member') == \
             ['alpha.default', 'local_b.cpu', 'local_b.gpu']
-        # ... then the ones whose endpoint never came back are dropped
-        assert sorted(c['member_id'] for c in fake2.removed) == \
-            ['local_b.cpu', 'local_b.gpu']
-        assert fake2.members_of('fed-cpu') == ['alpha.default']
+        # ... and the ones whose endpoint has not come back yet stay
+        # attached (detaching would requeue tasks still running there);
+        # they read lost, so nothing is routed to them
+        assert fake2.removed == []
+        assert fake2.members_of('fed-cpu') == ['alpha.default', 'local_b.cpu']
         assert plugin2._state.resources['alpha'].liveness   == LIVENESS_OK
         assert plugin2._state.resources['local_b'].liveness == LIVENESS_LOST
 
@@ -2712,6 +2722,12 @@ class _RecordingHTTP:
 
 
 class TestFederationClient:
+
+    def test_cancel_quotes_the_id(self):
+        c, http = self._client()
+        c.cancel('wf/3')
+        assert http.calls == [('POST', '/broker/federation/cancel/default/'
+                                       'wf%2F3', {})]
 
     def _client(self):
         from radical.orbit.plugin_federation import FederationClient
@@ -3905,4 +3921,131 @@ class TestCoHostedKnownTask:
                         {'cancel_tasks': True})
         assert r.status_code == 200, r.body
         rec = td._pool_states[FED_SESSION_SID]['fed-cpu'].tasks['wf/2']
+        assert rec.state == 'CANCELED'
+
+
+# ---------------------------------------------------------------------------
+# Detach only on a reported loss or an ended allocation
+# ---------------------------------------------------------------------------
+
+class TestDetachRule:
+
+    @pytest.mark.asyncio
+    async def test_a_reported_loss_detaches_at_once(self, tmp_path):
+        client, plugin, fake = _joinable(tmp_path)
+        _join(client, plugin, _alloc_body())
+        await plugin.on_topology_change(_topo(ep0='lost'))
+        assert [c['member_id'] for c in fake.removed] == ['alpha.default']
+
+    @pytest.mark.asyncio
+    async def test_an_ended_allocation_detaches_while_missing(self, tmp_path):
+        client, plugin, fake = _joinable(tmp_path)
+        _join(client, plugin, _alloc_body())
+        for m in plugin._state.resources['alpha'].member_list():
+            m.end_time = time.time() - 10
+        await plugin.on_topology_change(_topo())       # ep0 missing
+        assert [c['member_id'] for c in fake.removed] == ['alpha.default']
+
+
+# ---------------------------------------------------------------------------
+# The federation cancel route
+# ---------------------------------------------------------------------------
+
+class TestCancelRoute:
+
+    @staticmethod
+    def _cancel(client, plugin, task_id):
+        return client.post(f'{plugin.namespace}/cancel/default/{task_id}',
+                           json={})
+
+    def _submitted(self, tmp_path):
+        client, plugin, fake = _joinable(tmp_path)
+        _join(client, plugin, _alloc_body())
+        client.post(f'{plugin.namespace}/submit/default',
+                    json={'task': {'task_id': 't.1', 'cmd': ['/bin/true']}})
+        return client, plugin, fake
+
+    def test_cancel_goes_through_the_dispatcher(self, tmp_path):
+        client, plugin, fake = self._submitted(tmp_path)
+        r = self._cancel(client, plugin, 't.1')
+        assert r.status_code == 200, r.text
+        assert r.json()['state'] == 'CANCELED'
+        assert r.json()['class'] == 'cpu'
+        assert fake.canceled == [(FED_SESSION_SID, 't.1')]
+        entry = plugin._state.ledger['t.1']
+        assert entry.state == 'CANCELED' and entry.finished_at
+
+    def test_a_ledger_entry_the_dispatcher_lost_is_marked(self, tmp_path):
+        client, plugin, fake = self._submitted(tmp_path)
+        del fake.tasks['t.1']
+        r = self._cancel(client, plugin, 't.1')
+        assert r.status_code == 200, r.text
+        assert r.json()['state'] == 'CANCELED'
+        assert 'no longer holds' in r.json()['detail']
+        assert fake.canceled == []
+        assert plugin._state.ledger['t.1'].state == 'CANCELED'
+
+    def test_a_finished_task_answers_its_record(self, tmp_path):
+        client, plugin, fake = self._submitted(tmp_path)
+        fake.tasks['t.1']['state'] = 'DONE'
+        r = self._cancel(client, plugin, 't.1')
+        assert r.status_code == 200, r.text
+        assert r.json()['state'] == 'DONE'
+
+    def test_an_unknown_id_is_a_404(self, tmp_path):
+        client, plugin, _fake = self._submitted(tmp_path)
+        r = self._cancel(client, plugin, 'nope')
+        assert r.status_code == 404
+        assert 'unknown task: nope' in r.text
+
+    def test_leave_does_not_cancel_a_foreign_twin(self, tmp_path,
+                                                  monkeypatch):
+        client, plugin, fake = self._submitted(tmp_path)
+        del fake.tasks['t.1']                    # the dispatcher lost it ...
+
+        async def _endpoint_mode(sid, task_id):  # ... a foreign twin answers
+            return {'task_id': task_id, 'endpoint': 'ep9', 'result': {}}
+        monkeypatch.setattr(fake, 'task', _endpoint_mode)
+        r = client.post(f'{plugin.namespace}/leave/default/alpha',
+                        json={'cancel_tasks': True})
+        assert r.status_code == 200, r.text
+        assert fake.canceled == []
+
+    @pytest.mark.asyncio
+    async def test_a_foreign_twin_is_not_cancelled(self, cohosted,
+                                                   monkeypatch):
+        td = cohosted.plugins['task_dispatcher']
+        await _call(cohosted, 'POST', '/federation/join/default',
+                    _alloc_body(name='local_a'))
+        td._endpoint_mode_tasks['x.1'] = 'ep9'   # another client's task
+        cancelled = []
+
+        class _Rh:                               # ep9's rhapsody, reachable
+            def get_task(self, uid):
+                return {'uid': uid, 'state': 'RUNNING'}
+
+            def cancel_task(self, uid):
+                cancelled.append(uid)
+                return {'uid': uid, 'state': 'CANCELED'}
+
+        async def _client(endpoint, backend=None):
+            return _Rh()
+        monkeypatch.setattr(td, '_get_rhapsody_client', _client)
+        with pytest.raises(HTTPException) as exc:
+            await _call(cohosted, 'POST', '/federation/cancel/default/x.1')
+        assert exc.value.status_code == 404
+        assert exc.value.detail == 'unknown task: x.1'
+        assert cancelled == []
+
+    @pytest.mark.asyncio
+    async def test_a_quoted_id_with_a_slash_is_cancelled(self, cohosted):
+        td = cohosted.plugins['task_dispatcher']
+        await _call(cohosted, 'POST', '/federation/join/default',
+                    _alloc_body(name='local_a'))
+        await _call(cohosted, 'POST', '/federation/submit/default',
+                    {'task': {'task_id': 'wf/3', 'cmd': ['/bin/true']}})
+        r = await _call(cohosted, 'POST', '/federation/cancel/default/wf%2F3')
+        assert r.status_code == 200, r.body
+        assert json.loads(r.body)['state'] == 'CANCELED'
+        rec = td._pool_states[FED_SESSION_SID]['fed-cpu'].tasks['wf/3']
         assert rec.state == 'CANCELED'

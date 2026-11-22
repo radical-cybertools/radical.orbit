@@ -413,6 +413,18 @@ class FederationClient(PluginClient):
         self._raise(resp, f'task {task_id!r}')
         return resp.json()
 
+    def cancel(self, task_id: str) -> dict:
+        '''Cancel one task; returns its record (also when already finished).
+
+        The id is quoted, so an id containing ``/`` still names one path
+        segment on an in-process or WebSocket path.
+        '''
+        quoted = urllib.parse.quote(str(task_id), safe='')
+        resp   = self._http.post(
+            self._url(f'cancel/{self.DEFAULT_SID}/{quoted}'), json={})
+        self._raise(resp, f'cancel {task_id!r}')
+        return resp.json()
+
 
 # ---------------------------------------------------------------------------
 # Plugin
@@ -521,6 +533,7 @@ class PluginFederation(Plugin):
         self.add_route_post('pick/{sid}',              self._route_pick)
         self.add_route_post('submit/{sid}',            self._route_submit)
         self.add_route_get ('task/{sid}/{task_id}',    self._route_task)
+        self.add_route_post('cancel/{sid}/{task_id}',  self._route_cancel)
 
         log.info('[%s] loaded %d resource(s) from %s', self.instance_name,
                  len(self._state.resources), self._state.path)
@@ -1477,8 +1490,13 @@ class PluginFederation(Plugin):
             if entry.state in _TERMINAL_TASK_STATES:
                 continue
             try:
-                await self._dispatcher.cancel_task(
-                    entry.dispatcher_sid or FED_SESSION_SID, entry.task_id)
+                # only the federation's own record: a miss could otherwise
+                # cancel another client's endpoint-mode task of that id
+                if (entry.dispatcher_sid or FED_SESSION_SID) \
+                        == FED_SESSION_SID and \
+                        await self._dispatcher_task(entry.task_id) is not None:
+                    await self._dispatcher.cancel_task(FED_SESSION_SID,
+                                                       entry.task_id)
             except Exception as e:
                 log.info('[%s] leave %r: cancelling task %s failed: %s',
                          self.instance_name, name, entry.task_id, e)
@@ -1848,13 +1866,7 @@ class PluginFederation(Plugin):
         if dirty:
             self._state.save()
 
-        member_id = entry.member_id
-        task['member_id'] = member_id
-        task['member']    = (self.split_member_id(member_id)[1]
-                             if member_id else None)
-        task['resource']  = entry.resource
-        if entry.cls:
-            task['class'] = entry.cls
+        self._annotate(task, entry)
 
         pilot_id = task.get('pilot_id')
         if entry.pool and pilot_id:
@@ -1863,6 +1875,70 @@ class PluginFederation(Plugin):
                 if pilot.get('pid') == pilot_id:
                     task['child_endpoint'] = pilot.get('child_endpoint_name')
                     break
+        return task
+
+    def _annotate(self, task: dict, entry: SubmitLedgerEntry) -> None:
+        '''Add the ledger's placement (member, resource, class) to *task*.'''
+        member_id = entry.member_id
+        task['member_id'] = member_id
+        task['member']    = (self.split_member_id(member_id)[1]
+                             if member_id else None)
+        task['resource']  = entry.resource
+        if entry.cls:
+            task['class'] = entry.cls
+
+    async def _route_cancel(self, request: Request) -> dict:
+        '''Cancel one federation task; answer its record.
+
+        Resolved like submit and poll: only a dispatcher record in a
+        ``fed-<class>`` pool is cancelled, so another client's endpoint-mode
+        task with the same id never is.  The id is the raw path segment, or
+        its percent-decoded form on a miss (a quoting client).
+
+        - a dispatcher record: cancelled there (a finished task comes back
+          unchanged), the ledger follows, the annotated record is answered;
+        - only a ledger entry: the dispatcher no longer holds the task, so
+          a live entry is marked ``CANCELED`` with that reason;
+        - neither: 404.
+
+        A RUNNING task whose endpoint is absent is marked CANCELED here and
+        in the dispatcher, but its rhapsody cancel is best effort: the
+        remote process may keep running.
+        '''
+        await self._require_session(request.path_params['sid'])
+        raw     = request.path_params['task_id']
+        task_id = raw
+        rec     = await self._dispatcher_task(raw)
+        entry   = self._state.ledger.get(raw)
+        if rec is None and entry is None:
+            decoded = urllib.parse.unquote(raw)
+            if decoded != raw:
+                task_id = decoded
+                rec     = await self._dispatcher_task(decoded)
+                entry   = self._state.ledger.get(decoded)
+
+        if rec is None:
+            if entry is None:
+                raise HTTPException(status_code=404,
+                                    detail=f'unknown task: {task_id}')
+            if entry.state not in _TERMINAL_TASK_STATES:
+                entry.state       = 'CANCELED'
+                entry.finished_at = time.time()
+                entry.detail      = 'the dispatcher no longer holds this task'
+                self._state.save()
+            return self._ledger_view(entry)
+
+        task  = dict(await self._dispatcher.cancel_task(FED_SESSION_SID,
+                                                        task_id) or {})
+        entry = self._adopt_entry(task_id, {**rec, **task})
+        state = str(task.get('state') or entry.state)
+        if state != entry.state:
+            entry.state = state
+            if state in _TERMINAL_TASK_STATES:
+                entry.finished_at = task.get('finished_at') or time.time()
+            self._state.save()
+        task = {**rec, **task}
+        self._annotate(task, entry)
         return task
 
     def _ledger_view(self, entry: SubmitLedgerEntry) -> dict:
@@ -2312,7 +2388,8 @@ class PluginFederation(Plugin):
         |---|---|
         | ``present``, not attached | ``add_member`` (re-declaring the class pool first when it no longer exists — every member of that class may have left while the endpoint was down) |
         | ``suspect`` | mark ``suspect``, **nothing else**.  The policy already refuses to route to a non-``ok`` member, which is the whole point of ``suspect``; a blip must not touch the dispatcher |
-        | ``lost``, attached | ``del_member`` with ``fail_unsatisfiable=False``.  Its pilots died with the endpoint anyway and its RUNNING tasks re-queue onto a sibling — but a task only *this* member could run stays QUEUED instead of failing, because a lost endpoint is very often back in a minute |
+        | missing from the topology | reads ``lost``, **nothing else**: an endpoint that has not reconnected after a restart may still run tasks, and detaching would requeue them.  The dispatcher pauses its pilots and ends them after its grace |
+        | reported ``lost``, attached | ``del_member`` with ``fail_unsatisfiable=False``.  Its pilots died with the endpoint anyway and its RUNNING tasks re-queue onto a sibling — but a task only *this* member could run stays QUEUED instead of failing, because a lost endpoint is very often back in a minute |
 
         A member whose allocation ``end_time`` has passed is ``lost`` whatever
         its endpoint reports: that endpoint is back in a new allocation, and
@@ -2323,14 +2400,22 @@ class PluginFederation(Plugin):
             target = self._liveness_for(rec.endpoint)
             result = target
 
+            # an endpoint missing from the topology (not reconnected after
+            # a restart) reads lost but is not detached: detaching requeues
+            # tasks still running there.  The dispatcher pauses its pilots
+            # and ends them after its own grace.
+            reported_lost = (self._participant(rec.endpoint).get('liveness')
+                             == LIVENESS_LOST)
             for member in rec.member_list():
                 state = target
-                if self._allocation_ended(member):
+                ended = self._allocation_ended(member)
+                if ended:
                     state  = LIVENESS_LOST
                     result = LIVENESS_LOST
 
                 if state == LIVENESS_LOST:
-                    if member.member_id in self._attached:
+                    if member.member_id in self._attached and \
+                            (ended or reported_lost):
                         await self._detach(member)
 
                 elif state == LIVENESS_SUSPECT:
