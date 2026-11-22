@@ -3840,3 +3840,69 @@ class TestCoHostedKnownTask:
         pools = td2._pool_states[FED_SESSION_SID]
         assert 't.1' in pools['fed-cpu'].tasks
         assert 't.1' not in pools['fed-gpu'].tasks
+
+    @staticmethod
+    async def _two_joined(cohosted):
+        await _call(cohosted, 'POST', '/federation/join/default',
+                    _alloc_body(name='local_a'))
+        await _call(cohosted, 'POST', '/federation/join/default',
+                    _members_body(name='local_b'))
+
+    @pytest.mark.asyncio
+    async def test_an_endpoint_mode_twin_does_not_shadow_a_fed_task(
+            self, cohosted, monkeypatch):
+        td  = cohosted.plugins['task_dispatcher']
+        fed = cohosted.plugins['federation']
+        await self._two_joined(cohosted)
+        body = {'task': {'task_id': 't.1', 'cmd': ['/bin/true']}}
+        await _call(cohosted, 'POST', '/federation/submit/default', body)
+        td._endpoint_mode_tasks['t.1'] = 'ep9'     # another client's task
+
+        monkeypatch.setattr(fed._policy, 'pick_class',
+                            lambda req, classes: ('gpu', 1.0))
+        r = await _call(cohosted, 'POST', '/federation/submit/default', body)
+        assert r.status_code == 200, r.body
+        assert json.loads(r.body)['pool'] == 'fed-cpu'
+        assert 't.1' not in td._pool_states[FED_SESSION_SID]['fed-gpu'].tasks
+
+        r = await _call(cohosted, 'GET', '/federation/task/default/t.1')
+        assert r.status_code == 200, r.body
+        assert json.loads(r.body)['pool'] == 'fed-cpu'
+
+    @pytest.mark.asyncio
+    async def test_an_id_with_a_literal_escape_is_not_decoded_twice(
+            self, cohosted):
+        await self._two_joined(cohosted)
+        body = {'task': {'task_id': 'a%41', 'cmd': ['/bin/true']}}
+        r = await _call(cohosted, 'POST', '/federation/submit/default', body)
+        assert r.status_code == 200, r.body
+
+        # a direct caller passes the raw id, the federation a quoted one
+        r = await _call(cohosted, 'GET',
+                        f'/task_dispatcher/task/{FED_SESSION_SID}/a%41')
+        assert json.loads(r.body)['task_id'] == 'a%41'
+        r = await _call(cohosted, 'GET', '/federation/task/default/a%41')
+        assert json.loads(r.body)['task_id'] == 'a%41'
+        r = await _call(cohosted, 'POST',
+                        f'/task_dispatcher/cancel/{FED_SESSION_SID}/a%41')
+        assert json.loads(r.body)['state'] == 'CANCELED'
+
+    @pytest.mark.asyncio
+    async def test_leave_cancels_a_task_whose_id_has_a_slash(self, cohosted):
+        # two resources share fed-cpu, so the task stays QUEUED (not failed
+        # as unsatisfiable) after one of them leaves; only the ledger
+        # cancel of the leaving resource's attributed tasks cancels it
+        td  = cohosted.plugins['task_dispatcher']
+        fed = cohosted.plugins['federation']
+        await self._two_joined(cohosted)
+        body = {'task': {'task_id': 'wf/2', 'cmd': ['/bin/true']}}
+        r = await _call(cohosted, 'POST', '/federation/submit/default', body)
+        assert r.status_code == 200, r.body
+        leaving = fed._state.ledger['wf/2'].resource
+        assert leaving in ('local_a', 'local_b')
+        r = await _call(cohosted, 'POST',
+                        f'/federation/leave/default/{leaving}',
+                        {'cancel_tasks': True})
+        assert r.status_code == 200, r.body
+        rec = td._pool_states[FED_SESSION_SID]['fed-cpu'].tasks['wf/2']
+        assert rec.state == 'CANCELED'

@@ -323,8 +323,9 @@ class _DispatcherAPI:
         return await self._call('GET', f'task/{sid}/{quoted}')
 
     async def cancel_task(self, sid: str, task_id: str) -> dict:
-        '''Cancel one task.'''
-        return await self._call('POST', f'cancel/{sid}/{task_id}')
+        '''Cancel one task (the id quoted, as in :meth:`task`).'''
+        quoted = urllib.parse.quote(str(task_id), safe='')
+        return await self._call('POST', f'cancel/{sid}/{quoted}')
 
     # There is deliberately no ``cancel_all`` any more: it tears down a
     # session's pools, and the one session now holds *every* class pool, so
