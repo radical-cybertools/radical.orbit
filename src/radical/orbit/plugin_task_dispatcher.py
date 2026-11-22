@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import logging
 import math
 import os
@@ -59,7 +60,7 @@ from .plugin_base                       import Plugin, resolve_frame_cap
 from .plugin_session_base               import PluginSession
 from .plugin_rhapsody                   import (
     RhapsodyClient, RhapsodySession, WS_PAYLOAD_LIMIT, NOTIFY_BATCH_SIZE,
-    _payload_size, _resolve_notify_window, BUDGET_RATIO,
+    _payload_size, _resolve_notify_window, BUDGET_RATIO, OUTPUT_RATIO,
 )
 from .task_dispatcher_config            import (
     PoolConfig, PoolMember, PilotSize, PoolConfigError,
@@ -110,6 +111,9 @@ _HANDSHAKE_TIMEOUT_SEC = 300.0
 # An ACTIVE pilot whose child endpoint is absent from the topology this long
 # (a broker restart the endpoint did not come back from) is treated as lost.
 _ABSENT_GRACE_SEC      = 300.0
+# Reconcile of a pilot's RUNNING tasks after it came back (#149 slice): the
+# waits before each retry of a pass that could not reach the child session.
+_RECONCILE_BACKOFF     = (10.0, 30.0, 60.0)
 
 # Rhapsody-dialect bulk submit (see ``_route_submit_rh``): task dicts in
 # rhapsody's own wire format, a ``pool`` key per task.  Route template shared
@@ -564,6 +568,31 @@ def _is_retryable(e: BaseException) -> bool:
     '''
     return isinstance(e, EndpointUnknown) \
         or getattr(e, 'status_code', None) == 503
+
+
+def _is_transient(e: BaseException) -> bool:
+    '''Whether a reconcile read may succeed when retried: not delivered
+    (:func:`_is_retryable`), timed out (504 or a timeout), or the child
+    session is still initializing (409).'''
+    return _is_retryable(e) \
+        or getattr(e, 'status_code', None) in (409, 504) \
+        or isinstance(e, (TimeoutError, asyncio.TimeoutError,
+                          concurrent.futures.TimeoutError))
+
+
+def _task_not_found(e: BaseException) -> bool:
+    '''Whether a child ``get_task`` failed because the session does not
+    know the uid (404 ``task … not found``, not an unknown session).'''
+    return getattr(e, 'status_code', None) == 404 and 'not found' in str(e) \
+        and 'unknown session' not in str(e)
+
+
+class _OutputLimit:
+    '''Holder for ``RhapsodySession._fit_output``: the reconcile trims a
+    re-read record exactly as the live notification is trimmed.'''
+
+    def __init__(self, limit: int) -> None:
+        self._output_notify_limit = limit
 
 
 class PoolState:
@@ -1167,6 +1196,30 @@ class PluginTaskDispatcher(Plugin):
         self._endpoint_mode_tasks: dict[str, str] = dict(
             read_json(self._endpoint_mode_path, default={}) or {})
 
+        # Child rhapsody session ids, ``"<dst>|<backend>" -> sid``, in one
+        # atomic ``child_sessions.json``: after a broker restart the
+        # dispatcher re-attaches to the session its RUNNING tasks live in
+        # instead of opening a new one (#149 slice).
+        self._child_sids_path = self._state_root / 'child_sessions.json'
+        self._child_sids: dict[str, str] = dict(
+            read_json(self._child_sids_path, default={}) or {})
+        # one lock per child-client key: concurrent cache misses register
+        # one session
+        self._child_locks: dict[tuple, asyncio.Lock] = {}
+
+        # Reconcile of RUNNING tasks of a pilot that came back: pilots with
+        # a pass running, and those that got another trigger meanwhile.
+        self._reconciling:    set[str] = set()
+        self._reconcile_rerun: set[str] = set()
+        # rhapsody uids whose ``submit_tasks`` call is in flight: the
+        # endpoint may not know them yet, so a reconcile skips them
+        self._submitting: set[str] = set()
+        # child endpoint -> [(backend, uids)] a pilot-loss requeue handed
+        # back while their old copies may still run there; cancelled before
+        # anything is dispatched to that endpoint again (in memory only)
+        self._orphaned: dict[str, list[tuple]] = {}
+        self._orphan_cancelling: set[str] = set()
+
         # rhapsody-task-uid → (owning_sid, pool_name, task_id) so the event tap
         # can find the right TaskRecord when a pilot reports completion.
         self._uid_to_task: dict[str, tuple[str, str, str]] = {}
@@ -1620,7 +1673,47 @@ class PluginTaskDispatcher(Plugin):
         client = self._child_clients.get(key)
         if client is not None:
             return client
+        lock = self._child_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            client = self._child_clients.get(key)
+            if client is not None:
+                return client
+            return await self._register_child_client(
+                dst, plugin, cls, key, raise_retryable, register_kwargs)
+
+    @staticmethod
+    def _child_sid_key(key: tuple) -> str | None:
+        '''The session-map key of a child-client key; only rhapsody
+        sessions hold task state worth re-attaching to.'''
+        dst, plugin, backend = key
+        if plugin != 'rhapsody':
+            return None
+        return f'{dst}|{backend or ""}'
+
+    def _save_child_sid(self, key: tuple, sid: str | None) -> None:
+        '''Record (or with ``None``, forget) *key*'s child session id.'''
+        skey = self._child_sid_key(key)
+        if skey is None or self._child_sids.get(skey) == sid:
+            return
+        if sid:
+            self._child_sids[skey] = sid
+        else:
+            self._child_sids.pop(skey, None)
+        try:
+            write_json_atomic(self._child_sids_path, self._child_sids)
+        except OSError as e:
+            log.warning('[%s] could not persist child sessions: %s',
+                        self.instance_name, e)
+
+    async def _register_child_client(self, dst: str, plugin: str, cls,
+                                     key, raise_retryable: bool,
+                                     register_kwargs: dict):
+        '''The cache-miss half of :meth:`_get_child_client` (under the key's
+        lock): register -- re-attaching to the saved session when there is
+        one -- and cache.'''
         client = self._make_child_client(cls, plugin, dst)
+        skey   = self._child_sid_key(key)
+        saved  = self._child_sids.get(skey) if skey else None
         try:
             touchable = self._child_touchable.get(dst)
             probed    = touchable is None
@@ -1628,9 +1721,26 @@ class PluginTaskDispatcher(Plugin):
                 touchable = await asyncio.to_thread(
                     self._probe_touch, self._make_child_client(
                         PluginClient, plugin, dst))
-            await asyncio.to_thread(
-                client.register_session,
-                ttl=_CHILD_SESSION_TTL if touchable else 0, **register_kwargs)
+            ttl = _CHILD_SESSION_TTL if touchable else 0
+            try:
+                if saved:
+                    await asyncio.to_thread(client.register_session, ttl=ttl,
+                                            sid=saved, **register_kwargs)
+                else:
+                    await asyncio.to_thread(client.register_session, ttl=ttl,
+                                            **register_kwargs)
+            except Exception as e:
+                if not (saved and _session_ended(e)):
+                    raise
+                # the saved session ended (idle-expired during a long
+                # outage, or unregistered): its tasks went with it, and the
+                # reconcile finds them unknown
+                log.info('[%s] saved %s session %s on %s ended (%s); '
+                         'registering a new one', self.instance_name,
+                         plugin, saved, dst, e)
+                await asyncio.to_thread(client.register_session, ttl=ttl,
+                                        **register_kwargs)
+            self._save_child_sid(key, client.sid)
             if touchable:
                 self._child_persistent.discard(key)
             else:
@@ -1695,6 +1805,7 @@ class PluginTaskDispatcher(Plugin):
                     if _session_ended(e):
                         if self._child_clients.get(key) is client:
                             self._child_clients.pop(key, None)
+                            self._save_child_sid(key, None)
                         log.info('[%s] child session %s ended: %s',
                                  self.instance_name, key, e)
                     else:
@@ -2735,6 +2846,14 @@ class PluginTaskDispatcher(Plugin):
         self._connected_endpoints = new
         self._participants        = live
 
+        # A child endpoint back after its pilot was ended may still run old
+        # copies of the tasks that pilot handed back; cancel them before any
+        # drain below dispatches there (no live pilot need name it).
+        for name, info in live.items():
+            if name in self._orphaned and \
+                    (info or {}).get('liveness') == 'present':
+                self._start_orphan_cancel(name)
+
         for ps in self._all_pools():
             self._reconcile_pilots_for(ps, participants)
 
@@ -2751,15 +2870,24 @@ class PluginTaskDispatcher(Plugin):
             liveness = (info or {}).get('liveness') if info else None
 
             if liveness == 'present':
+                # Old copies of tasks a pilot loss handed back may still run
+                # there: cancel them before anything is dispatched to it.
+                if ce in self._orphaned:
+                    self._start_orphan_cancel(ce)
+                back = pilot.pid in self._absent_since
                 self._absent_since.pop(pilot.pid, None)
                 # Un-pause a pilot paused on a suspect blip or an absence --
                 # not one paused because its member is being removed.
                 if pilot.state == PILOT_ACTIVE and not pilot.accepting_new_tasks \
                         and (not pilot.member_id
                              or pilot.member_id in ps.config.members):
+                    back = True
                     pilot.accepting_new_tasks = True
                     ps.persist()
                     self._drain_pending(ps)
+                if back and pilot.state == PILOT_ACTIVE:
+                    # events sent while it was away are lost: re-read
+                    self._schedule_reconcile(ps, pilot)
                 if pilot.state in (PILOT_PENDING, PILOT_STARTING):
                     self._activate_pilot(ps, pilot)
 
@@ -2785,6 +2913,13 @@ class PluginTaskDispatcher(Plugin):
         '''End a pilot whose child endpoint is gone (``lost``, or absent
         past the grace).'''
         self._absent_since.pop(pilot.pid, None)
+        uids = [t.rhapsody_uid for t in ps.tasks.values()
+                if t.pilot_id == pilot.pid and t.rhapsody_uid
+                and t.state not in TASK_TERMINAL_STATES]
+        if uids and pilot.child_endpoint_name:
+            # requeued below; their old copies may still run on the endpoint
+            self._orphaned.setdefault(pilot.child_endpoint_name, []).append(
+                (pilot.rhapsody_backend, uids))
         if pilot.adopted:
             # An adopted endpoint that goes away has left, or its
             # allocation ended -- neither is a pilot failure,
@@ -3392,6 +3527,8 @@ class PluginTaskDispatcher(Plugin):
         a non-shared one the broker creates nothing locally — the staging
         ``put`` of the task's inputs creates it on the pilot instead.
         '''
+        if pilot.child_endpoint_name in self._orphan_cancelling:
+            return False              # its stale copies are being cancelled
         if task.cwd_assigned:
             member = pool_state.member(pilot.member_id)
             shared = member is None or member.shared_fs
@@ -3608,6 +3745,8 @@ class PluginTaskDispatcher(Plugin):
                                              pool_state.config.name,
                                              task.task_id)
 
+        uids = [fwd['uid'] for _, fwd in fwds]
+        self._submitting.update(uids)
         try:
             await asyncio.to_thread(rh.submit_tasks, [f for _, f in fwds])
             self._mark_dirty(pool_state)
@@ -3633,6 +3772,8 @@ class PluginTaskDispatcher(Plugin):
                 task.rhapsody_uid = None
                 self._mark_task_failed(pool_state, task,
                                        f'rhapsody submit error: {e}')
+        finally:
+            self._submitting.difference_update(uids)
 
     @staticmethod
     def _owned_by(task: TaskRecord, pilot: PilotRecord) -> bool:
@@ -3670,6 +3811,200 @@ class PluginTaskDispatcher(Plugin):
             log.info('[%s] requeued %d task(s) from pilot %s: %s',
                      self.instance_name, n, pilot.pid, reason)
             pool_state.persist()
+
+    # -- reconcile after a pilot came back (#149 slice) -----------------
+    #
+    # Completions travel only as tap events, and an event sent while the
+    # broker was down (or the frame lost when the endpoint's socket dropped)
+    # is gone.  When a pilot's endpoint is ``present`` again -- after a
+    # replay, an absence or a suspect blip -- its RUNNING tasks are re-read
+    # from their rhapsody session (re-attached by sid, see
+    # :meth:`_register_child_client`).  No periodic pass: events lost while
+    # the endpoint stays present are #149 proper.
+
+    def _schedule_reconcile(self, ps: PoolState, pilot: PilotRecord) -> None:
+        '''Start one reconcile pass for *pilot*, or ask a running one to
+        go again.'''
+        if pilot.pid in self._reconciling:
+            self._reconcile_rerun.add(pilot.pid)
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return                     # no loop (sync unit-test caller)
+        self._reconciling.add(pilot.pid)
+        loop.create_task(self._reconcile_pilot_tasks(ps, pilot)) \
+            .add_done_callback(self._log_reconcile_failure)
+
+    def _log_reconcile_failure(self, task: asyncio.Task) -> None:
+        '''Done-callback of a reconcile: log an exception that escaped it.'''
+        if not task.cancelled() and task.exception() is not None:
+            log.error('[%s] task reconcile failed: %r',
+                      self.instance_name, task.exception())
+
+    async def _reconcile_pilot_tasks(self, ps: PoolState,
+                                     pilot: PilotRecord) -> None:
+        '''Re-read *pilot*'s RUNNING tasks until a pass gets through, with
+        waits of :data:`_RECONCILE_BACKOFF` between passes that could not
+        reach the session; then give up with a warning.  A trigger that
+        arrived meanwhile runs one more pass.'''
+        try:
+            while True:
+                self._reconcile_rerun.discard(pilot.pid)
+                waits = list(_RECONCILE_BACKOFF)
+                while not await self._reconcile_pass(ps, pilot):
+                    if not waits:
+                        log.warning('[%s] pilot %s: could not re-read its '
+                                    'RUNNING tasks; giving up',
+                                    self.instance_name, pilot.pid)
+                        break
+                    await asyncio.sleep(waits.pop(0))
+                if pilot.pid not in self._reconcile_rerun:
+                    break
+        finally:
+            self._reconciling.discard(pilot.pid)
+            self._reconcile_rerun.discard(pilot.pid)
+
+    async def _reconcile_pass(self, ps: PoolState, pilot: PilotRecord) -> bool:
+        '''One re-read of *pilot*'s RUNNING tasks; ``False`` asks for a retry.
+
+        - a terminal record goes through the tap path
+          (:meth:`_on_task_status`), so it is applied exactly once;
+        - a uid the session does not know is requeued (``requeues`` not
+          bumped): the task died with an earlier session, its submit never
+          landed, or it finished longer ago than rhapsody keeps finished
+          tasks (an outage of about an hour -- only then can this re-run
+          finished work);
+        - a result is applied only while ``(pilot_id, rhapsody_uid,
+          started_at)`` still match what was read before the await, and a
+          uid whose submit is in flight is skipped.
+        '''
+        if pilot.state != PILOT_ACTIVE or not pilot.child_endpoint_name:
+            return True
+        snap = [(t, t.rhapsody_uid, t.started_at)
+                for t in ps.tasks.values()
+                if t.pilot_id == pilot.pid and t.state == TASK_RUNNING
+                and t.rhapsody_uid and t.rhapsody_uid not in self._submitting]
+        if not snap:
+            return True
+        try:
+            rh = await self._get_rhapsody_client(
+                pilot.child_endpoint_name, pilot.rhapsody_backend,
+                raise_retryable=True)
+        except Exception as e:
+            return not _is_transient(e)
+        if rh is None:
+            return False
+
+        limit = asyncio.Semaphore(_CHILD_TOUCH_PARALLEL)
+
+        async def _one(uid):
+            async with limit:
+                try:
+                    return await asyncio.to_thread(rh.get_task, uid)
+                except Exception as e:
+                    return e
+
+        results = await asyncio.gather(*(_one(uid) for _, uid, _ in snap))
+
+        retry   = False
+        unknown = []
+        for (task, uid, started), res in zip(snap, results):
+            if task.pilot_id != pilot.pid or task.state != TASK_RUNNING \
+                    or task.rhapsody_uid != uid or task.started_at != started \
+                    or uid in self._submitting:
+                continue                       # moved on meanwhile
+            if isinstance(res, Exception):
+                if _task_not_found(res) or _session_ended(res):
+                    unknown.append(task)
+                elif _is_transient(res):
+                    retry = True
+                else:
+                    log.info('[%s] reconcile of %s on pilot %s: %s',
+                             self.instance_name, uid, pilot.pid, res)
+                continue
+            state = str((res or {}).get('state', '')).upper()
+            if state in ('DONE', 'COMPLETED', 'FAILED', 'CANCELED'):
+                self._on_task_status(self._terminal_payload(res, uid))
+        if unknown:
+            self._requeue_tasks(ps, unknown, pilot,
+                                'unknown to its rhapsody session')
+        n = len(snap)
+        log.info('[%s] pilot %s: re-read %d RUNNING task(s), %d unknown',
+                 self.instance_name, pilot.pid, n, len(unknown))
+        return not retry
+
+    def _terminal_payload(self, record: dict, uid: str) -> dict:
+        '''Cut a ``get_task`` record down to what a live terminal
+        notification carries, with stdout/stderr trimmed to its tails.'''
+        payload = {k: v for k, v in record.items()
+                   if k in RhapsodySession.NOTIFICATION_FORWARD_KEYS}
+        payload['uid'] = uid
+        trim = _OutputLimit(resolve_frame_cap(self._app) // OUTPUT_RATIO)
+        for key in ('stdout', 'stderr'):
+            if isinstance(payload.get(key), str):
+                payload[key], cut = RhapsodySession._fit_output(trim,
+                                                                payload[key])
+                if cut:
+                    payload[f'{key}_truncated'] = True
+        return payload
+
+    def _mapped_on(self, uid: str, child: str) -> bool:
+        '''Whether *uid* maps to a live task on a pilot of endpoint *child*.'''
+        mapping = self._uid_to_task.get(uid)
+        if not mapping:
+            return False
+        ps = self._find_pool(mapping[0], mapping[1])
+        task = ps.tasks.get(mapping[2]) if ps else None
+        pilot = ps.pilots.get(task.pilot_id or '') if task else None
+        return pilot is not None and pilot.child_endpoint_name == child
+
+    def _start_orphan_cancel(self, child: str) -> None:
+        '''Cancel the old copies a pilot loss left on *child*, gating
+        claims to it until done.'''
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return                     # no loop (sync unit-test caller)
+        entries = self._orphaned.pop(child, None)
+        if not entries:
+            return
+        self._orphan_cancelling.add(child)
+        loop.create_task(self._cancel_orphans(child, entries)) \
+            .add_done_callback(self._log_reconcile_failure)
+
+    async def _cancel_orphans(self, child: str, entries: list) -> None:
+        '''Best-effort cancel of *entries* ``[(backend, uids)]`` on *child*;
+        a uid mapped again to a task running on *child* (re-dispatched there
+        under the same uid) is skipped, since a cancel by uid would hit the
+        new copy.  Then lift the claim gate and drain.'''
+        try:
+            for backend, uids in entries:
+                live = [u for u in uids if not self._mapped_on(u, child)]
+                if not live:
+                    continue
+                try:
+                    rh = await self._get_rhapsody_client(child, backend)
+                except Exception as e:
+                    log.info('[%s] orphan cancel on %s: %s',
+                             self.instance_name, child, e)
+                    continue
+                if rh is None:
+                    continue
+                for uid in live:
+                    if self._mapped_on(uid, child):
+                        continue
+                    try:
+                        await asyncio.to_thread(rh.cancel_task, uid)
+                    except Exception as e:
+                        log.info('[%s] orphan cancel of %s on %s: %s',
+                                 self.instance_name, uid, child, e)
+                log.info('[%s] cancelled %d stale task copies on %s',
+                         self.instance_name, len(live), child)
+        finally:
+            self._orphan_cancelling.discard(child)
+            for ps in list(self._all_pools()):
+                self._drain_pending(ps)
 
     def _on_event(self, event: dict) -> None:
         '''Broker raw-tap callback: a child rhapsody reported a transition.

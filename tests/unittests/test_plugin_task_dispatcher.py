@@ -22,6 +22,8 @@ import time
 from pathlib import Path
 from unittest.mock import patch, AsyncMock, MagicMock
 
+import msgpack
+
 import pytest
 from fastapi import FastAPI
 from starlette.testclient import TestClient
@@ -4443,3 +4445,336 @@ class TestRhapsodyAcceptedUids:
             with pytest.raises(ConnectionError) as ei:
                 rh.submit_tasks(tasks)
         assert ei.value.accepted_uids == ['a']
+
+
+# ---------------------------------------------------------------------------
+# #149 slice: child sessions re-attached by sid, RUNNING tasks re-read when a
+# pilot comes back, stale copies cancelled on a returning endpoint
+# ---------------------------------------------------------------------------
+
+def _resp(status, body):
+    import json as _json
+    return {'status' : status,
+            'headers': {'content-type': 'application/json'},
+            'body'   : _json.dumps(body).encode()}
+
+
+class _SessionCaller:
+    '''A broker caller that plays a child endpoint's session routes: the
+    touch probe answers "unknown session" (so the child is touchable), and
+    ``register_session`` answers from *register* (a list of answers, one
+    per call: a sid string, a response dict, or ``None`` for "reconnect to
+    the requested sid, else mint one").  Records each register
+    body.'''
+
+    def __init__(self, register):
+        self.register = list(register)
+        self.bodies   = []
+        self.calls    = []
+
+    def call_threadsafe(self, dst, method, path, body=b'', **_kw):
+        import concurrent.futures
+        import json as _json
+        self.calls.append((dst, method, path))
+        fut = concurrent.futures.Future()
+        if '/touch/' in path:
+            fut.set_result(_resp(404, {'detail': 'unknown session id'}))
+        elif path.endswith('/register_session'):
+            try:
+                self.bodies.append(_json.loads(body or b'{}'))
+            except ValueError:
+                self.bodies.append(msgpack.unpackb(body, raw=False))
+            ans = self.register.pop(0)
+            if ans is None:            # reconnect if asked, else a new sid
+                ans = self.bodies[-1].get('sid') or f'rs.new{len(self.bodies)}'
+            if isinstance(ans, str):
+                ans = _resp(200, {'sid': ans, 'status': 'ready'})
+            fut.set_result(ans)
+        else:
+            fut.set_result(_resp(200, {}))
+        return fut
+
+
+class TestChildSessionMap:
+
+    def test_sid_is_saved_and_reattached_after_restart(self, tmp_path):
+        caller = _SessionCaller(['rs.1', 'rs.1'])
+        _, plugin = _make_plugin(tmp_path, broker_caller=caller)
+        rh = asyncio.run(plugin._get_rhapsody_client('ep_c', 'concurrent'))
+        assert rh is not None and rh.sid == 'rs.1'
+        assert 'sid' not in caller.bodies[0]
+        # a restarted dispatcher: empty cache, the same state root
+        _, plugin2 = _make_plugin(tmp_path, broker_caller=caller)
+        rh2 = asyncio.run(plugin2._get_rhapsody_client('ep_c', 'concurrent'))
+        assert caller.bodies[1].get('sid') == 'rs.1'
+        assert rh2.sid == 'rs.1'
+
+    def test_ended_saved_sid_registers_a_new_session(self, tmp_path):
+        caller = _SessionCaller(['rs.1',
+                                 _resp(410, {'detail': 'session ended'}),
+                                 'rs.2'])
+        _, plugin = _make_plugin(tmp_path, broker_caller=caller)
+        asyncio.run(plugin._get_rhapsody_client('ep_c', 'concurrent'))
+        _, plugin2 = _make_plugin(tmp_path, broker_caller=caller)
+        rh2 = asyncio.run(plugin2._get_rhapsody_client('ep_c', 'concurrent'))
+        assert rh2 is not None and rh2.sid == 'rs.2'
+        assert caller.bodies[1].get('sid') == 'rs.1'
+        assert 'sid' not in caller.bodies[2]
+        _, plugin3 = _make_plugin(tmp_path, broker_caller=caller)
+        assert plugin3._child_sids == {'ep_c|concurrent': 'rs.2'}
+
+    def test_concurrent_misses_register_one_session(self, tmp_path):
+        caller = _SessionCaller(['rs.1', 'rs.2'])
+        _, plugin = _make_plugin(tmp_path, broker_caller=caller)
+
+        async def both():
+            return await asyncio.gather(
+                plugin._get_rhapsody_client('ep_c', 'concurrent'),
+                plugin._get_rhapsody_client('ep_c', 'concurrent'))
+        a, b = asyncio.run(both())
+        assert a is b
+        assert len(caller.bodies) == 1
+
+    def test_cancel_after_restart_reaches_the_saved_session(self, tmp_path):
+        caller = _SessionCaller(['rs.1', None])
+        _, plugin = _make_plugin(tmp_path, broker_caller=caller)
+        asyncio.run(plugin._get_rhapsody_client('ep_c', 'concurrent'))
+        _, plugin2 = _make_plugin(tmp_path, broker_caller=caller)
+        pilot = PilotRecord(pid='p.9', pool='fed', size_key='d',
+                            rhapsody_backend='concurrent',
+                            child_endpoint_name='ep_c')
+        asyncio.run(plugin2._cancel_rhapsody_tasks(pilot, ['t.1']))
+        assert ('ep_c', 'POST', '/rhapsody/cancel/rs.1/t.1') in caller.calls
+
+
+class TestReconcileRunning:
+
+    _replayed = TestAbsentPilots._replayed
+
+    def _running(self, tmp_path):
+        '''A replayed pilot whose task t.1 is RUNNING on it (uid mapped),
+        paused and absent, as after a broker restart.'''
+        plugin, ps, pilot = self._replayed(tmp_path)
+        task = ps.tasks['t.1']
+        pilot.accepting_new_tasks = True
+        assert plugin._claim(ps, task, pilot)
+        pilot.accepting_new_tasks = False
+        task.rhapsody_uid = 't.1'
+        plugin._uid_to_task['t.1'] = ('A', 'fed', 't.1')
+        return plugin, ps, pilot, task
+
+    @staticmethod
+    def _come_back(plugin, ps, rh, settle=0.05):
+        async def drive():
+            with patch.object(plugin, '_get_rhapsody_client',
+                              new=AsyncMock(return_value=rh)):
+                plugin._reconcile_pilots_for(
+                    ps, {'fed_m_x_p.1': {'liveness': 'present'}})
+                await asyncio.sleep(settle)
+        asyncio.run(drive())
+
+    def test_finished_during_outage_goes_done_once(self, tmp_path):
+        plugin, ps, pilot, task = self._running(tmp_path)
+        rh = MagicMock()
+        rh.get_task = MagicMock(return_value={
+            'uid': 't.1', 'state': 'DONE', 'exit_code': 0, 'stdout': 'ok',
+            'task_backend_specific_kwargs': {'cwd': '/x'}})
+        with patch.object(plugin, '_dispatch_notify') as notify:
+            self._come_back(plugin, ps, rh)
+            assert task.state     == TASK_DONE
+            assert task.exit_code == 0
+            assert pilot.in_flight == 0
+            assert 't.1' not in plugin._uid_to_task
+            done = [c for c in notify.call_args_list
+                    if c.args[0] == 'task_status'
+                    and c.args[1].get('state') == TASK_DONE]
+            assert len(done) == 1
+            plugin._on_task_status({'uid': 't.1', 'state': 'DONE'})
+            done = [c for c in notify.call_args_list
+                    if c.args[0] == 'task_status'
+                    and c.args[1].get('state') == TASK_DONE]
+            assert len(done) == 1
+
+    def test_unknown_task_is_requeued(self, tmp_path):
+        plugin, ps, pilot, task = self._running(tmp_path)
+        e = RuntimeError('HTTP 404 — task t.1 not found (finished tasks are '
+                         'kept for 3600 s)')
+        e.status_code = 404
+        rh = MagicMock()
+        rh.get_task = MagicMock(side_effect=e)
+        self._come_back(plugin, ps, rh)
+        assert task.state    == TASK_QUEUED
+        assert task.pilot_id is None
+        assert task.requeues == 0
+        assert pilot.in_flight == 0
+        assert 't.1' not in plugin._uid_to_task
+
+    @pytest.mark.parametrize('status', [503, 409])
+    def test_transient_error_is_retried(self, tmp_path, status):
+        from radical.orbit import plugin_task_dispatcher as ptd
+        plugin, ps, pilot, task = self._running(tmp_path)
+        e = RuntimeError(f'HTTP {status}')
+        e.status_code = status
+        rh = MagicMock()
+        rh.get_task = MagicMock(side_effect=[
+            e, {'uid': 't.1', 'state': 'DONE', 'exit_code': 0}])
+        with patch.object(ptd, '_RECONCILE_BACKOFF', (0.01, 0.01, 0.01)):
+            self._come_back(plugin, ps, rh, settle=0.2)
+        assert task.state == TASK_DONE
+        assert rh.get_task.call_count == 2
+
+    def test_gives_up_after_the_backoff(self, tmp_path, caplog):
+        from radical.orbit import plugin_task_dispatcher as ptd
+        plugin, ps, pilot, task = self._running(tmp_path)
+        e = RuntimeError('HTTP 503')
+        e.status_code = 503
+        rh = MagicMock()
+        rh.get_task = MagicMock(side_effect=e)
+        with patch.object(ptd, '_RECONCILE_BACKOFF', (0.01, 0.01, 0.01)), \
+                caplog.at_level('WARNING'):
+            self._come_back(plugin, ps, rh, settle=0.3)
+        assert task.state == TASK_RUNNING
+        assert rh.get_task.call_count == 4
+        assert 'giving up' in caplog.text
+        assert 'p.1' not in plugin._reconciling
+
+    def test_redispatch_during_the_read_is_left_alone(self, tmp_path):
+        plugin, ps, pilot, task = self._running(tmp_path)
+
+        def moved(uid):
+            # the task was requeued and dispatched again meanwhile
+            task.started_at = (task.started_at or 0) + 1.0
+            return {'uid': uid, 'state': 'DONE', 'exit_code': 0}
+        rh = MagicMock()
+        rh.get_task = MagicMock(side_effect=moved)
+        self._come_back(plugin, ps, rh)
+        assert task.state == TASK_RUNNING
+        assert 't.1' in plugin._uid_to_task
+
+    def test_submit_in_flight_is_skipped(self, tmp_path):
+        plugin, ps, pilot, task = self._running(tmp_path)
+        plugin._submitting.add('t.1')
+        rh = MagicMock()
+        self._come_back(plugin, ps, rh)
+        rh.get_task.assert_not_called()
+        assert task.state == TASK_RUNNING
+
+    def test_large_output_is_trimmed(self, tmp_path):
+        from radical.orbit.plugin_base import resolve_frame_cap
+        from radical.orbit.plugin_rhapsody import OUTPUT_RATIO
+        plugin, ps, pilot, task = self._running(tmp_path)
+        limit = resolve_frame_cap(plugin._app) // OUTPUT_RATIO
+        rh = MagicMock()
+        rh.get_task = MagicMock(return_value={
+            'uid': 't.1', 'state': 'FAILED', 'exit_code': 1,
+            'stdout': 'a' * (limit * 2), 'stderr': 'short',
+            'task_backend_specific_kwargs': {'cwd': '/x'}})
+        seen = []
+        orig = plugin._on_task_status
+        with patch.object(plugin, '_on_task_status',
+                          side_effect=lambda d: (seen.append(d), orig(d))):
+            self._come_back(plugin, ps, rh)
+        assert len(seen) == 1
+        payload = seen[0]
+        assert payload['stdout_truncated'] is True
+        assert len(payload['stdout'].encode()) <= limit
+        assert payload['stderr'] == 'short'
+        assert 'task_backend_specific_kwargs' not in payload
+        assert task.state == TASK_FAILED
+
+    def test_pilot_that_never_left_is_not_reread(self, tmp_path):
+        plugin, ps, pilot, task = self._running(tmp_path)
+        pilot.accepting_new_tasks = True
+        plugin._absent_since.pop('p.1', None)
+        rh = MagicMock()
+        self._come_back(plugin, ps, rh)
+        rh.get_task.assert_not_called()
+
+    def test_trigger_during_a_pass_runs_another(self, tmp_path):
+        plugin, ps, pilot, task = self._running(tmp_path)
+        calls = []
+
+        def read(uid):
+            calls.append(uid)
+            if len(calls) == 1:
+                # another `present` arrives while this pass reads
+                plugin._schedule_reconcile(ps, pilot)
+            return {'uid': uid, 'state': 'RUNNING'}
+        rh = MagicMock()
+        rh.get_task = MagicMock(side_effect=read)
+
+        async def drive():
+            with patch.object(plugin, '_get_rhapsody_client',
+                              new=AsyncMock(return_value=rh)):
+                plugin._schedule_reconcile(ps, pilot)
+                plugin._schedule_reconcile(ps, pilot)   # before it starts
+                await asyncio.sleep(0.1)
+        asyncio.run(drive())
+        assert rh.get_task.call_count == 2
+        assert not plugin._reconciling
+
+
+class TestOrphanCancel:
+
+    _running = TestReconcileRunning._running
+    _replayed = TestAbsentPilots._replayed
+
+    def _expired(self, tmp_path):
+        from radical.orbit import plugin_task_dispatcher as ptd
+        plugin, ps, pilot, task = self._running(tmp_path)
+        since = plugin._absent_since['p.1']
+        plugin._expire_absent_pilots(since + ptd._ABSENT_GRACE_SEC + 1)
+        assert pilot.state == PILOT_FAILED
+        assert task.state  == TASK_QUEUED
+        assert plugin._orphaned == {'fed_m_x_p.1': [('concurrent', ['t.1'])]}
+        return plugin, ps, pilot, task
+
+    def _endpoint_back(self, plugin, rh):
+        async def drive():
+            with patch.object(plugin, '_get_rhapsody_client',
+                              new=AsyncMock(return_value=rh)):
+                await plugin.on_topology_change(
+                    {'fed_m_x_p.1': {'liveness': 'present', 'plugins': {}}})
+                await asyncio.sleep(0.05)
+        asyncio.run(drive())
+
+    def test_returning_endpoint_gets_its_stale_copies_cancelled(self,
+                                                               tmp_path):
+        plugin, ps, pilot, task = self._expired(tmp_path)
+        rh = MagicMock()
+        self._endpoint_back(plugin, rh)
+        rh.cancel_task.assert_called_once_with('t.1')
+        assert not plugin._orphaned
+        assert not plugin._orphan_cancelling
+
+    def test_uid_mapped_again_on_that_endpoint_is_not_cancelled(self,
+                                                               tmp_path):
+        plugin, ps, pilot, task = self._expired(tmp_path)
+        # re-dispatched to another live pilot on the same endpoint, same uid
+        p2 = PilotRecord(
+            pid='p.2', pool='fed', owning_sid='A', size_key='d',
+            rhapsody_backend='concurrent', state=PILOT_ACTIVE,
+            member_id='m_x', endpoint_name='ep_m_x',
+            attributes={'software': ['x']}, nodes=1, cpus_per_node=4,
+            child_endpoint_name='fed_m_x_p.1', capacity=4,
+            walltime_deadline=time.time() + 3600)
+        ps.pilots['p.2'] = p2
+        assert plugin._claim(ps, task, p2)
+        task.rhapsody_uid = 't.1'
+        plugin._uid_to_task['t.1'] = ('A', 'fed', 't.1')
+        rh = MagicMock()
+        rh.get_task = MagicMock(return_value={'uid': 't.1',
+                                              'state': 'RUNNING'})
+        self._endpoint_back(plugin, rh)
+        rh.cancel_task.assert_not_called()
+
+    def test_claims_wait_while_stale_copies_are_cancelled(self, tmp_path):
+        plugin, ps, pilot, task = self._expired(tmp_path)
+        p2 = PilotRecord(
+            pid='p.2', pool='fed', owning_sid='A', size_key='d',
+            rhapsody_backend='concurrent', state=PILOT_ACTIVE,
+            member_id='m_x', child_endpoint_name='fed_m_x_p.1', capacity=4)
+        plugin._orphan_cancelling.add('fed_m_x_p.1')
+        assert not plugin._claim(ps, task, p2)
+        plugin._orphan_cancelling.discard('fed_m_x_p.1')
+        assert plugin._claim(ps, task, p2)
