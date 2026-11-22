@@ -1482,14 +1482,25 @@ class PluginTaskDispatcher(Plugin):
         await super().shutdown()
 
     def _has_absent_pilot(self, ps: 'PoolState') -> bool:
-        '''Whether one of *ps*'s ACTIVE pilots waits for its endpoint.
+        '''Whether one of *ps*'s ACTIVE pilots waits for its endpoint:
+        absent (``_absent_since``) or ``suspect`` in the last topology.
 
-        Housekeeping then skips the whole pool's ``on_tick``, on purpose:
-        it is meant for the restart window, and ``_ABSENT_GRACE_SEC`` bounds
-        it (the pilot is then lost and leaves ``_absent_since``).
+        Both are liveness pauses, read from liveness itself rather than from
+        ``accepting_new_tasks`` (which a member removal clears too), so no
+        state is kept for it.  Housekeeping then skips the whole pool's
+        ``on_tick``, on purpose: it is meant for the restart window and for
+        blips, and both end -- ``_ABSENT_GRACE_SEC`` bounds an absence, and a
+        suspect endpoint turns ``present`` or ``lost``.
         '''
-        return any(p.pid in self._absent_since and p.state == PILOT_ACTIVE
-                   for p in ps.pilots.values())
+        for p in ps.pilots.values():
+            if p.state != PILOT_ACTIVE:
+                continue
+            if p.pid in self._absent_since:
+                return True
+            info = self._participants.get(p.child_endpoint_name or '')
+            if (info or {}).get('liveness') == 'suspect':
+                return True
+        return False
 
     def _expire_absent_pilots(self, now: float) -> None:
         '''Treat pilots absent longer than the grace as lost.'''
@@ -3464,6 +3475,8 @@ class PluginTaskDispatcher(Plugin):
 
         ok: list[TaskRecord] = []
         for task in tasks:
+            if not self._owned_by(task, pilot):
+                continue                 # cancelled during an earlier put
             spool = pool_state.spool_dir(task.task_id)
             try:
                 if shared:

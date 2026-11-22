@@ -4219,6 +4219,73 @@ class TestPlaceInputsOwnership:
             if t.state == TASK_RUNNING and t.pilot_id == pilot.pid)
 
 
+class TestPutLoopAndSuspectTick:
+
+    _setup = TestUndeliveredRequeue._setup
+
+    def test_task_cancelled_during_an_earlier_put_gets_no_put(self, tmp_path):
+        plugin, ps, pilot, tasks = self._setup(tmp_path, members=[
+            _member('m_x', shared_fs=False, scratch_base='/remote')])
+        loop_box = {}
+        puts     = []
+
+        def put(src, dst, _overwrite):
+            puts.append(dst)
+            if '/t.1/' in dst:                   # t.2 is cancelled meanwhile
+                done = threading.Event()
+                fut  = asyncio.run_coroutine_threadsafe(
+                    plugin._cancel_task(ps, tasks[1]), loop_box['loop'])
+                fut.add_done_callback(lambda _f: done.set())
+                assert done.wait(5)
+            return {}
+        stg = MagicMock()
+        stg.put = MagicMock(side_effect=put)
+
+        async def drive():
+            loop_box['loop'] = asyncio.get_running_loop()
+            with patch.object(plugin, '_cancel_rhapsody_tasks',
+                              new=AsyncMock()), \
+                 patch.object(plugin, '_get_staging_client',
+                              new=AsyncMock(return_value=stg)), \
+                 patch.object(plugin, '_get_rhapsody_client',
+                              new=AsyncMock(return_value=MagicMock())):
+                await plugin._do_rhapsody_submit(ps, tasks, pilot)
+        asyncio.run(drive())
+        assert tasks[1].state == TASK_CANCELED
+        assert not any('/t.2/' in d for d in puts), puts
+
+    def test_suspect_pilot_with_backlog_submits_no_pilot(self, tmp_path):
+        from radical.orbit import plugin_task_dispatcher as ptd
+        plugin, ps, pilot, tasks = self._setup(tmp_path)
+        plugin._sessions['A'] = MagicMock()
+        ticks = []
+
+        async def drive():
+            for t in tasks:                      # a backlog, nothing running
+                plugin._requeue_tasks(ps, [t], pilot, 'test')
+            plugin._participants = {
+                pilot.child_endpoint_name: {'liveness': 'suspect'}}
+            plugin._reconcile_pilots_for(ps, plugin._participants)
+            assert not pilot.accepting_new_tasks
+            with patch.object(ptd, '_TICK_INTERVAL_SEC', 0.01), \
+                 patch.object(ps.policy, 'on_tick',
+                              side_effect=lambda *a: ticks.append(1)), \
+                 patch.object(plugin, '_do_pilot_submit',
+                              new=AsyncMock()) as submit:
+                t = asyncio.get_running_loop().create_task(
+                    plugin._housekeeping())
+                await asyncio.sleep(0.1)
+                t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+                return submit
+        submit = asyncio.run(drive())
+        assert not ticks
+        submit.assert_not_called()
+
+
 class TestAbsentPilots:
 
     def _replayed(self, tmp_path):
