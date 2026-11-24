@@ -158,6 +158,10 @@ class TaskRecord:
     state        : str         = TASK_QUEUED
     pilot_id     : str | None  = None           # set on assignment
     rhapsody_uid : str | None  = None           # rhapsody-side task uid
+    # Dispatches so far, counted at claim and kept across a re-execution of
+    # the same ``task_id``: the suffix of ``rhapsody_uid``, so an event of a
+    # stale copy never names the live one.
+    attempt      : int         = 0
     submitted_at : float       = 0.0
     started_at   : float | None = None
     finished_at  : float | None = None
