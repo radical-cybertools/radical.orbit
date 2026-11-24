@@ -4294,30 +4294,44 @@ class PluginTaskDispatcher(Plugin):
                                      uids: list) -> None:
         '''Best-effort rhapsody cancel of *uids* on *pilot*'s endpoint.
 
-        Errors are logged, never raised.
+        Errors are logged, never raised.  Uids that could not be delivered
+        (the endpoint has not reconnected yet, or is suspect) are cancelled
+        when it is ``present`` again, like the stale copies of a lost pilot.
         '''
-        if not pilot.child_endpoint_name or not uids:
+        child = pilot.child_endpoint_name
+        if not child or not uids:
             return
+        missed = list(uids)
         try:
             # the submit's session: its cache key includes the backend
-            rh = await self._get_rhapsody_client(pilot.child_endpoint_name,
+            rh = await self._get_rhapsody_client(child,
                                                  pilot.rhapsody_backend)
         except Exception as e:
             log.warning('[%s] rhapsody client failed for %s: %s',
                         self.instance_name, pilot.pid, e)
+            rh = None
+        if rh is not None:
+            missed = []
+            for uid in uids:
+                try:
+                    await asyncio.to_thread(rh.cancel_task, uid)
+                except Exception as e:
+                    if _session_ended(e):
+                        self._drop_child_client(
+                            (child, 'rhapsody', pilot.rhapsody_backend), rh)
+                    elif _is_transient(e):
+                        missed.append(uid)
+                    log.warning('[%s] rhapsody cancel_task failed: %s',
+                                self.instance_name, e)
+        if not missed:
             return
-        if rh is None:
-            return
-        for uid in uids:
-            try:
-                await asyncio.to_thread(rh.cancel_task, uid)
-            except Exception as e:
-                if _session_ended(e):
-                    self._drop_child_client(
-                        (pilot.child_endpoint_name, 'rhapsody',
-                         pilot.rhapsody_backend), rh)
-                log.warning('[%s] rhapsody cancel_task failed: %s',
-                            self.instance_name, e)
+        self._orphaned.setdefault(child, []).append(
+            (pilot.rhapsody_backend, missed))
+        # it may have come back during the awaits above (one retry: a round
+        # that fails is not queued again)
+        info = self._participants.get(child) or {}
+        if info.get('liveness') == 'present':
+            self._start_orphan_cancel(child)
 
     async def _cancel_task(self, pool_state: PoolState,
                            task: TaskRecord) -> dict:

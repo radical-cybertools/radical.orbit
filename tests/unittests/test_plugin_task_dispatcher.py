@@ -4769,6 +4769,52 @@ class TestOrphanCancel:
         assert not plugin._orphaned
         assert not plugin._orphan_cancelling
 
+    def _cancel_while(self, plugin, ps, task, client):
+        with patch.object(plugin, '_get_rhapsody_client', new=client):
+            asyncio.run(plugin._cancel_task(ps, task))
+        assert task.state == TASK_CANCELED
+
+    def test_a_cancel_before_the_endpoint_reconnects_is_delivered_later(
+            self, tmp_path):
+        plugin, ps, pilot, task = self._running(tmp_path)
+        self._cancel_while(plugin, ps, task, AsyncMock(return_value=None))
+        rh = MagicMock()
+        self._endpoint_back(plugin, rh)
+        rh.cancel_task.assert_called_once_with('t.1')
+        assert not plugin._orphaned
+
+    def test_an_undelivered_cancel_call_is_delivered_later(self, tmp_path):
+        plugin, ps, pilot, task = self._running(tmp_path)
+        bad = MagicMock()
+        bad.cancel_task.side_effect = TimeoutError()
+        self._cancel_while(plugin, ps, task, AsyncMock(return_value=bad))
+        rh = MagicMock()
+        self._endpoint_back(plugin, rh)
+        rh.cancel_task.assert_called_once_with('t.1')
+
+    def test_an_endpoint_back_during_the_cancel_is_retried_once(self,
+                                                                tmp_path):
+        plugin, ps, pilot, task = self._running(tmp_path)
+        rh = MagicMock()
+        rh.cancel_task.side_effect = TimeoutError()
+
+        async def drive():
+            plugin._participants = {'fed_m_x_p.1': {'liveness': 'present'}}
+            with patch.object(plugin, '_get_rhapsody_client',
+                              new=AsyncMock(return_value=rh)):
+                await plugin._cancel_task(ps, task)
+                await asyncio.sleep(0.1)
+        asyncio.run(drive())
+        assert rh.cancel_task.call_count == 2
+        assert not plugin._orphaned
+
+    def test_a_delivered_cancel_is_not_queued(self, tmp_path):
+        plugin, ps, pilot, task = self._running(tmp_path)
+        rh = MagicMock()
+        self._cancel_while(plugin, ps, task, AsyncMock(return_value=rh))
+        rh.cancel_task.assert_called_once_with('t.1')
+        assert not plugin._orphaned
+
     def _second_pilot(self, ps, **kw):
         kw = {'pid': 'p.2', 'state': PILOT_ACTIVE, **kw}
         p2 = PilotRecord(
