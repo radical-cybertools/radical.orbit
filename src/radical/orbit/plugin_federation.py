@@ -91,6 +91,7 @@ Known limitations
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -162,6 +163,11 @@ _DEFAULT_WALLTIME  = 3600
 _SIZE_KEY          = 'default'
 
 # Task states the ledger treats as finished.
+# A joined endpoint missing from the topology this long (it did not come back
+# after a broker restart, or its ``lost`` was never delivered) is detached.
+# Matches the dispatcher's grace for its pilots.
+_ABSENT_GRACE_SEC = 300.0
+
 _TERMINAL_TASK_STATES = frozenset(('DONE', 'FAILED', 'CANCELED'))
 
 # The fields a login-mode ``pool`` block may carry.  Anything else is a
@@ -496,6 +502,15 @@ class PluginFederation(Plugin):
         # endpoint_name → {'liveness': …, 'role': …} from the rich topology.
         self._participants: dict[str, dict] = {}
 
+        # endpoint -> monotonic time from which its grace counts, for every
+        # joined endpoint the topology reported ``lost`` (-inf: no grace) or
+        # does not list.  Latched before any await, because the broker
+        # reports a ``lost`` endpoint in one delivery only.
+        self._absent_since: dict[str, float] = {}
+        # one :meth:`_sync_attachments` at a time: an overlapping one would
+        # write back the liveness it read before its awaits
+        self._sync_lock = asyncio.Lock()
+
         # Member ids currently POSTed into their class pool.  Per *member*,
         # not per resource: a resource's two members live behind one
         # endpoint but attach independently, and one can fail while the
@@ -518,6 +533,7 @@ class PluginFederation(Plugin):
         self._replay: asyncio.Future | None = None
 
         # task_id -> [lock, holders]: serialises the lookup, pick and submit
+        # (and a cancel)
         # of one id, so a retry racing its own original cannot land in a
         # second pool.  An entry is dropped with its last holder.
         self._submit_locks: dict[str, list] = {}
@@ -589,6 +605,9 @@ class PluginFederation(Plugin):
             # read-only routes answer from the federation's own records
             if not best_effort:
                 raise
+        self._note_departures()
+        if self._overdue_members():
+            await self._sync_attachments()
         if sid not in self._sessions:
             raise HTTPException(status_code=404,
                                 detail=f'unknown session id: {sid}')
@@ -1637,12 +1656,18 @@ class PluginFederation(Plugin):
     async def _submit_once(self, task_id: str, payload: dict,
                            requirements: dict):
         '''Look up, pick and submit *task_id* under its own lock.'''
+        async with self._task_lock(task_id):
+            return await self._submit_unlocked(task_id, payload,
+                                               requirements)
+
+    @contextlib.asynccontextmanager
+    async def _task_lock(self, task_id: str):
+        '''Hold *task_id*'s lock; it is dropped with its last holder.'''
         slot = self._submit_locks.setdefault(task_id, [asyncio.Lock(), 0])
         slot[1] += 1
         try:
             async with slot[0]:
-                return await self._submit_unlocked(task_id, payload,
-                                                   requirements)
+                yield
         finally:
             slot[1] -= 1
             if slot[1] == 0 and self._submit_locks.get(task_id) is slot:
@@ -1837,6 +1862,11 @@ class PluginFederation(Plugin):
         if sid != FED_SESSION_SID:
             return self._ledger_view(entry)
 
+        if rec is None and entry.state in _TERMINAL_TASK_STATES:
+            rec = await self._dispatcher_task(task_id)
+            if rec is None:         # e.g. cancelled in the ledger alone
+                return self._ledger_view(entry)
+
         task = rec if rec is not None \
             else await self._dispatcher.task(sid, task_id)
         task = dict(task or {})
@@ -1898,7 +1928,8 @@ class PluginFederation(Plugin):
         - a dispatcher record: cancelled there (a finished task comes back
           unchanged), the ledger follows, the annotated record is answered;
         - only a ledger entry: the dispatcher no longer holds the task, so
-          a live entry is marked ``CANCELED`` with that reason;
+          a live entry is marked ``CANCELED`` with that reason (503 while no
+          class pool is registered, since the dispatcher was not asked);
         - neither: 404.
 
         A RUNNING task whose endpoint is absent is marked CANCELED here and
@@ -1906,22 +1937,29 @@ class PluginFederation(Plugin):
         remote process may keep running.
         '''
         await self._require_session(request.path_params['sid'])
-        raw     = request.path_params['task_id']
-        task_id = raw
-        rec     = await self._dispatcher_task(raw)
-        entry   = self._state.ledger.get(raw)
-        if rec is None and entry is None:
-            decoded = urllib.parse.unquote(raw)
-            if decoded != raw:
-                task_id = decoded
-                rec     = await self._dispatcher_task(decoded)
-                entry   = self._state.ledger.get(decoded)
+        raw = request.path_params['task_id']
+        for task_id in dict.fromkeys((raw, urllib.parse.unquote(raw))):
+            async with self._task_lock(task_id):
+                task = await self._cancel_unlocked(task_id)
+            if task is not None:
+                return task
+        raise HTTPException(status_code=404, detail=f'unknown task: {task_id}')
 
+    async def _cancel_unlocked(self, task_id: str) -> dict | None:
+        '''The body of :meth:`_route_cancel` for one id (under its lock, so a
+        submit in flight settles first); ``None`` when the id is unknown.'''
+        rec   = await self._dispatcher_task(task_id)
+        entry = self._state.ledger.get(task_id)
         if rec is None:
             if entry is None:
-                raise HTTPException(status_code=404,
-                                    detail=f'unknown task: {task_id}')
+                return None
             if entry.state not in _TERMINAL_TASK_STATES:
+                if not self._pools:
+                    # the dispatcher was not asked: it may still run it
+                    raise HTTPException(
+                        status_code=503,
+                        detail='no federation pool is registered; '
+                               'cannot cancel now')
                 entry.state       = 'CANCELED'
                 entry.finished_at = time.time()
                 entry.detail      = 'the dispatcher no longer holds this task'
@@ -2223,6 +2261,7 @@ class PluginFederation(Plugin):
                    'role'    : str((info or {}).get('role') or '')}
             for name, info in participants.items()
         }
+        self._note_departures()             # before any await
 
         try:
             await self._ensure_replayed()
@@ -2231,6 +2270,34 @@ class PluginFederation(Plugin):
 
         await self._sync_attachments()
         await super().on_topology_change(participants)
+
+    def _note_departures(self) -> None:
+        '''Latch when each joined endpoint went away, or that it is back.'''
+        now   = time.monotonic()
+        names = {rec.endpoint for rec in self._state.resources.values()}
+        for name in names:
+            live = self._participant(name).get('liveness')
+            if live is None:
+                self._absent_since.setdefault(name, now)
+            elif live == LIVENESS_LOST:
+                self._absent_since[name] = float('-inf')
+            else:
+                self._absent_since.pop(name, None)
+        for name in set(self._absent_since) - names:
+            del self._absent_since[name]
+
+    def _is_overdue(self, endpoint: str) -> bool:
+        '''Whether *endpoint* was reported lost, or is absent past the grace.'''
+        since = self._absent_since.get(endpoint)
+        return since is not None and \
+            time.monotonic() - since >= _ABSENT_GRACE_SEC
+
+    def _overdue_members(self) -> bool:
+        '''Whether a member is still attached behind an overdue endpoint.'''
+        return any(member.member_id in self._attached
+                   for rec in self._state.resources.values()
+                   if self._is_overdue(rec.endpoint)
+                   for member in rec.member_list())
 
     async def _upgrade_legacy(self) -> None:
         '''Release the per-resource ``fed-<name>`` sessions of a pre-08 state.
@@ -2370,6 +2437,8 @@ class PluginFederation(Plugin):
         failing.  An error (a 404 from a dispatcher that never had it) is
         logged and ignored: the member is gone either way.
         '''
+        # dropped first, so that a member re-added meanwhile stays attached
+        self._attached.discard(member.member_id)
         try:
             await self._dispatcher.del_member(
                 FED_SESSION_SID, member.pool_name,
@@ -2378,7 +2447,6 @@ class PluginFederation(Plugin):
         except Exception as e:
             log.info('[%s] detach %s: %s',
                      self.instance_name, member.member_id, e)
-        self._attached.discard(member.member_id)
         self._detail_cache.pop(member.pool_name, None)
 
     async def _sync_attachments(self) -> None:
@@ -2388,24 +2456,24 @@ class PluginFederation(Plugin):
         |---|---|
         | ``present``, not attached | ``add_member`` (re-declaring the class pool first when it no longer exists — every member of that class may have left while the endpoint was down) |
         | ``suspect`` | mark ``suspect``, **nothing else**.  The policy already refuses to route to a non-``ok`` member, which is the whole point of ``suspect``; a blip must not touch the dispatcher |
-        | missing from the topology | reads ``lost``, **nothing else**: an endpoint that has not reconnected after a restart may still run tasks, and detaching would requeue them.  The dispatcher pauses its pilots and ends them after its grace |
+        | missing from the topology | reads ``lost``; detached only once absent for ``_ABSENT_GRACE_SEC`` (checked on each topology delivery and each route): an endpoint that has not reconnected after a restart may still run tasks, and detaching would requeue them |
         | reported ``lost``, attached | ``del_member`` with ``fail_unsatisfiable=False``.  Its pilots died with the endpoint anyway and its RUNNING tasks re-queue onto a sibling — but a task only *this* member could run stays QUEUED instead of failing, because a lost endpoint is very often back in a minute |
 
         A member whose allocation ``end_time`` has passed is ``lost`` whatever
         its endpoint reports: that endpoint is back in a new allocation, and
         stays detached until it leaves and joins again.
         '''  # noqa: E501
+        async with self._sync_lock:
+            await self._sync_unlocked()
+
+    async def _sync_unlocked(self) -> None:
+        '''The body of :meth:`_sync_attachments`.'''
         dirty = False
         for rec in list(self._state.resources.values()):
             target = self._liveness_for(rec.endpoint)
             result = target
 
-            # an endpoint missing from the topology (not reconnected after
-            # a restart) reads lost but is not detached: detaching requeues
-            # tasks still running there.  The dispatcher pauses its pilots
-            # and ends them after its own grace.
-            reported_lost = (self._participant(rec.endpoint).get('liveness')
-                             == LIVENESS_LOST)
+            overdue = self._is_overdue(rec.endpoint)
             for member in rec.member_list():
                 state = target
                 ended = self._allocation_ended(member)
@@ -2415,7 +2483,7 @@ class PluginFederation(Plugin):
 
                 if state == LIVENESS_LOST:
                     if member.member_id in self._attached and \
-                            (ended or reported_lost):
+                            (ended or overdue):
                         await self._detach(member)
 
                 elif state == LIVENESS_SUSPECT:

@@ -3946,6 +3946,99 @@ class TestDetachRule:
         await plugin.on_topology_change(_topo())       # ep0 missing
         assert [c['member_id'] for c in fake.removed] == ['alpha.default']
 
+    @staticmethod
+    def _clock(monkeypatch):
+        now = [1000.0]
+        monkeypatch.setattr('radical.orbit.plugin_federation.time.monotonic',
+                            lambda: now[0])
+        return now
+
+    @staticmethod
+    def _removed(fake):
+        return [c['member_id'] for c in fake.removed]
+
+    @pytest.mark.asyncio
+    async def test_present_to_missing_detaches_after_the_grace(
+            self, tmp_path, monkeypatch):
+        client, plugin, fake = _joinable(tmp_path)
+        _join(client, plugin, _alloc_body())
+        now = self._clock(monkeypatch)
+        await plugin.on_topology_change(_topo())
+        now[0] += 299
+        await plugin.on_topology_change(_topo())
+        assert self._removed(fake) == []
+        now[0] += 2
+        await plugin.on_topology_change(_topo())
+        assert self._removed(fake) == ['alpha.default']
+        await plugin.on_topology_change(_topo())
+        assert self._removed(fake) == ['alpha.default']      # only once
+
+    @pytest.mark.asyncio
+    async def test_coming_back_resets_the_grace(self, tmp_path, monkeypatch):
+        client, plugin, fake = _joinable(tmp_path)
+        _join(client, plugin, _alloc_body())
+        now = self._clock(monkeypatch)
+        for _ in range(3):
+            await plugin.on_topology_change(_topo())
+            now[0] += 200
+            await plugin.on_topology_change(_topo(ep0='suspect'))
+        assert self._removed(fake) == []
+
+    def test_a_route_detaches_an_overdue_member(self, tmp_path, monkeypatch):
+        client, plugin, fake = _joinable(tmp_path)
+        _join(client, plugin, _alloc_body())
+        now = self._clock(monkeypatch)
+        plugin._participants = {}
+        url = f'{plugin.namespace}/resources/default'
+        client.get(url)
+        assert self._removed(fake) == []
+        now[0] += 301
+        client.get(url)
+        assert self._removed(fake) == ['alpha.default']
+
+    @pytest.mark.asyncio
+    async def test_an_overwritten_loss_still_detaches(self, tmp_path,
+                                                      monkeypatch):
+        # the one ``lost`` delivery is still awaiting when the next one,
+        # which no longer lists the endpoint, replaces the participants
+        client, plugin, fake = _joinable(tmp_path)
+        _join(client, plugin, _alloc_body())
+        gate = asyncio.Event()
+
+        async def _gated():
+            await gate.wait()
+        monkeypatch.setattr(plugin, '_ensure_replayed', _gated)
+        first  = asyncio.ensure_future(
+            plugin.on_topology_change(_topo(ep0='lost')))
+        await asyncio.sleep(0)
+        second = asyncio.ensure_future(plugin.on_topology_change(_topo()))
+        await asyncio.sleep(0)
+        gate.set()
+        await asyncio.gather(first, second)
+        assert self._removed(fake) == ['alpha.default']
+
+    @pytest.mark.asyncio
+    async def test_overlapping_lost_and_present_end_attached(
+            self, tmp_path, monkeypatch):
+        client, plugin, fake = _joinable(tmp_path)
+        _join(client, plugin, _alloc_body())
+        gate, real = asyncio.Event(), fake.del_member
+
+        async def _slow(*args, **kw):
+            await gate.wait()
+            return await real(*args, **kw)
+        monkeypatch.setattr(fake, 'del_member', _slow)
+        first  = asyncio.ensure_future(
+            plugin.on_topology_change(_topo(ep0='lost')))
+        await asyncio.sleep(0.01)
+        second = asyncio.ensure_future(
+            plugin.on_topology_change(_topo(ep0='present')))
+        await asyncio.sleep(0.01)
+        gate.set()
+        await asyncio.gather(first, second)
+        assert plugin._attached == {'alpha.default'}
+        assert plugin._state.resources['alpha'].liveness == LIVENESS_OK
+
 
 # ---------------------------------------------------------------------------
 # The federation cancel route
@@ -3997,6 +4090,44 @@ class TestCancelRoute:
         r = self._cancel(client, plugin, 'nope')
         assert r.status_code == 404
         assert 'unknown task: nope' in r.text
+
+    def test_a_poll_after_a_ledger_only_cancel_answers_it(self, tmp_path):
+        client, plugin, fake = self._submitted(tmp_path)
+        del fake.tasks['t.1']
+        self._cancel(client, plugin, 't.1')
+        r = client.get(f'{plugin.namespace}/task/default/t.1')
+        assert r.status_code == 200, r.text
+        assert r.json()['state'] == 'CANCELED'
+
+    def test_a_cancel_without_pools_is_a_503(self, tmp_path):
+        client, plugin, fake = self._submitted(tmp_path)
+        plugin._pools = set()
+        r = self._cancel(client, plugin, 't.1')
+        assert r.status_code == 503
+        assert plugin._state.ledger['t.1'].state != 'CANCELED'
+
+    def test_a_cancel_while_the_replay_is_pending_is_a_503(self, tmp_path,
+                                                           monkeypatch):
+        client, plugin, fake = self._submitted(tmp_path)
+
+        async def _pending():
+            raise HTTPException(status_code=503, detail='replay pending')
+        monkeypatch.setattr(plugin, '_ensure_replayed', _pending)
+        assert self._cancel(client, plugin, 't.1').status_code == 503
+        assert fake.canceled == []
+
+    @pytest.mark.asyncio
+    async def test_a_cancel_waits_for_a_submit_in_flight(self, tmp_path):
+        client, plugin, fake = self._submitted(tmp_path)
+        async with plugin._task_lock('t.1'):
+            req = type('R', (), {'path_params': {'sid': 'default',
+                                                 'task_id': 't.1'}})()
+            job = asyncio.ensure_future(plugin._route_cancel(req))
+            await asyncio.sleep(0.01)
+            assert fake.canceled == []
+        await job
+        assert fake.canceled == [(FED_SESSION_SID, 't.1')]
+        assert plugin._submit_locks == {}
 
     def test_leave_does_not_cancel_a_foreign_twin(self, tmp_path,
                                                   monkeypatch):
