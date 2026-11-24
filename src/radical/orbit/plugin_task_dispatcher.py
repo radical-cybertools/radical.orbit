@@ -845,9 +845,18 @@ class TaskDispatcherSession(PluginSession):
         return now - self._stalled_since < QUEUE_WAIT_MAX
 
     async def close(self) -> dict:
-        '''Tear down this session's pools, then run the base close.'''
-        if self._plugin is not None:
-            await self._plugin._teardown_session_pools(self._sid)
+        '''Tear down this session's pools, then run the base close.
+
+        Not for a persistent session (the federation's) when the broker
+        itself stops: the restarted broker replays its pools, and their
+        pilots and running tasks must still be there.
+        '''
+        plugin = self._plugin
+        if plugin is not None:
+            rec = plugin._records.get(self._sid)
+            if not (plugin._shutting_down and rec is not None
+                    and rec.lifetime == 'persistent'):
+                await plugin._teardown_session_pools(self._sid)
         return await super().close()
 
 

@@ -267,6 +267,28 @@ class TestSessionTeardown:
         assert sid not in plugin._pool_states
         assert ps.pilots['p.1'].state == PILOT_FAILED
 
+    @pytest.mark.parametrize('lifetime', ['persistent', 'ephemeral'])
+    def test_a_broker_stop_keeps_only_persistent_pools(self, tmp_path,
+                                                       lifetime):
+        '''The restarted broker replays a persistent session's pools: its
+        pilots (and their tasks) must survive the stop.'''
+        _, plugin = _make_plugin(tmp_path)
+
+        async def scenario():
+            plugin._maybe_start()
+            sid = await plugin._open_session('A', lifetime, None)
+            plugin._materialise_pool(sid, _make_pool_cfg())
+            ps = _pool(plugin, sid, 'cpu')
+            ps.pilots['p.1'] = PilotRecord(
+                pid='p.1', pool='cpu', owning_sid=sid, size_key='s',
+                rhapsody_backend='concurrent', state=PILOT_ACTIVE)
+            await plugin.shutdown()
+            return ps
+
+        ps = asyncio.run(scenario())
+        assert ps.pilots['p.1'].state == (
+            PILOT_ACTIVE if lifetime == 'persistent' else PILOT_FAILED)
+
     def test_ephemeral_pool_survives_owner_loss_until_idle(self, tmp_path):
         '''A client may disconnect and reconnect later: owner loss does not
         reclaim the session; its idle timeout does (pools torn down).'''
