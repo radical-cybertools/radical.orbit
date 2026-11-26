@@ -42,6 +42,7 @@ import os
 import shutil
 import threading
 import time
+import urllib.parse
 import uuid
 
 import msgpack
@@ -2409,7 +2410,14 @@ class PluginTaskDispatcher(Plugin):
         '''Return one task's record (pool mode) or rhapsody info (endpoint mode).'''
         sid = request.path_params['sid']
         self._require_known_session(sid)
-        task_id = request.path_params['task_id']
+        task_id = self._task_id_param(sid, request.path_params['task_id'])
+
+        # The session's own pool records first: another client's
+        # endpoint-mode task with the same id must not shadow them.
+        for ps in self._pool_states.get(sid, {}).values():
+            rec = ps.tasks.get(task_id)
+            if rec is not None:
+                return self._task_dict(rec)
 
         # Endpoint mode: forward to the target endpoint's rhapsody.
         endpoint_name = self._endpoint_mode_tasks.get(task_id)
@@ -2434,18 +2442,35 @@ class PluginTaskDispatcher(Plugin):
             return {'task_id': task_id, 'endpoint': endpoint_name,
                     'result': info}
 
-        for ps in self._pool_states.get(sid, {}).values():
-            rec = ps.tasks.get(task_id)
-            if rec is not None:
-                return self._task_dict(rec)
         raise HTTPException(status_code=404,
                             detail=f'unknown task: {task_id}')
+
+    def _task_id_param(self, sid: str, raw: str) -> str:
+        '''Return the task id a ``task``/``cancel`` path segment names.
+
+        In-process callers (the federation) percent-quote the id so an id
+        containing ``/`` still matches the one-segment route.  The raw
+        segment is tried first, so an id that literally contains ``%XX``
+        (a direct caller's) is not decoded a second time; only a miss is
+        decoded.
+        '''
+        if raw in self._endpoint_mode_tasks or any(
+                raw in ps.tasks
+                for ps in self._pool_states.get(sid, {}).values()):
+            return raw
+        return urllib.parse.unquote(raw)
 
     async def _route_cancel_task(self, request: Request) -> dict:
         '''Cancel one task (pool mode) or forward the cancel (endpoint mode).'''
         sid = request.path_params['sid']
         self._require_known_session(sid)
-        task_id = request.path_params['task_id']
+        task_id = self._task_id_param(sid, request.path_params['task_id'])
+
+        # pool records first, as in _route_get_task
+        for ps in self._pool_states.get(sid, {}).values():
+            rec = ps.tasks.get(task_id)
+            if rec is not None:
+                return await self._cancel_task(ps, rec)
 
         # Endpoint mode: forward cancel to the target endpoint's rhapsody.
         endpoint_name = self._endpoint_mode_tasks.get(task_id)
@@ -2470,10 +2495,6 @@ class PluginTaskDispatcher(Plugin):
             return {'task_id': task_id, 'endpoint': endpoint_name,
                     'result': info}
 
-        for ps in self._pool_states.get(sid, {}).values():
-            rec = ps.tasks.get(task_id)
-            if rec is not None:
-                return await self._cancel_task(ps, rec)
         raise HTTPException(status_code=404,
                             detail=f'unknown task: {task_id}')
 

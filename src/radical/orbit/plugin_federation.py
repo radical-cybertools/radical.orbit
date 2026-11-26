@@ -91,10 +91,12 @@ Known limitations
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import time
+import urllib.parse
 
 from pathlib import Path
 from typing import Any
@@ -161,6 +163,11 @@ _DEFAULT_WALLTIME  = 3600
 _SIZE_KEY          = 'default'
 
 # Task states the ledger treats as finished.
+# A joined endpoint missing from the topology this long (it did not come back
+# after a broker restart, or its ``lost`` was never delivered) is detached.
+# Matches the dispatcher's grace for its pilots.
+_ABSENT_GRACE_SEC = 300.0
+
 _TERMINAL_TASK_STATES = frozenset(('DONE', 'FAILED', 'CANCELED'))
 
 # The fields a login-mode ``pool`` block may carry.  Anything else is a
@@ -317,12 +324,14 @@ class _DispatcherAPI:
         return await self._call('POST', f'submit/{sid}', payload)
 
     async def task(self, sid: str, task_id: str) -> dict:
-        '''Return one task record.'''
-        return await self._call('GET', f'task/{sid}/{task_id}')
+        '''Return one task record (the id quoted: it may contain ``/``).'''
+        quoted = urllib.parse.quote(str(task_id), safe='')
+        return await self._call('GET', f'task/{sid}/{quoted}')
 
     async def cancel_task(self, sid: str, task_id: str) -> dict:
-        '''Cancel one task.'''
-        return await self._call('POST', f'cancel/{sid}/{task_id}')
+        '''Cancel one task (the id quoted, as in :meth:`task`).'''
+        quoted = urllib.parse.quote(str(task_id), safe='')
+        return await self._call('POST', f'cancel/{sid}/{quoted}')
 
     # There is deliberately no ``cancel_all`` any more: it tears down a
     # session's pools, and the one session now holds *every* class pool, so
@@ -410,6 +419,18 @@ class FederationClient(PluginClient):
         self._raise(resp, f'task {task_id!r}')
         return resp.json()
 
+    def cancel(self, task_id: str) -> dict:
+        '''Cancel one task; returns its record (also when already finished).
+
+        The id is quoted, so an id containing ``/`` still names one path
+        segment on an in-process or WebSocket path.
+        '''
+        quoted = urllib.parse.quote(str(task_id), safe='')
+        resp   = self._http.post(
+            self._url(f'cancel/{self.DEFAULT_SID}/{quoted}'), json={})
+        self._raise(resp, f'cancel {task_id!r}')
+        return resp.json()
+
 
 # ---------------------------------------------------------------------------
 # Plugin
@@ -481,6 +502,15 @@ class PluginFederation(Plugin):
         # endpoint_name → {'liveness': …, 'role': …} from the rich topology.
         self._participants: dict[str, dict] = {}
 
+        # endpoint -> monotonic time from which its grace counts, for every
+        # joined endpoint the topology reported ``lost`` (-inf: no grace) or
+        # does not list.  Latched before any await, because the broker
+        # reports a ``lost`` endpoint in one delivery only.
+        self._absent_since: dict[str, float] = {}
+        # one :meth:`_sync_attachments` at a time: an overlapping one would
+        # write back the liveness it read before its awaits
+        self._sync_lock = asyncio.Lock()
+
         # Member ids currently POSTed into their class pool.  Per *member*,
         # not per resource: a resource's two members live behind one
         # endpoint but attach independently, and one can fail while the
@@ -496,10 +526,17 @@ class PluginFederation(Plugin):
         # a re-attach knows whether it must re-declare the pool first.
         self._pools: set[str] = set()
 
-        # Restart re-attach runs exactly once, whichever comes first: the
-        # first topology delivery or the first route.  See
-        # :meth:`_replay_attachments`.
-        self._replayed = False
+        # Restart re-attach runs once, whichever comes first: the first
+        # topology delivery or the first route; every later caller awaits
+        # the same task, and a failed one is retried by the next caller.
+        # See :meth:`_ensure_replayed`.
+        self._replay: asyncio.Future | None = None
+
+        # task_id -> [lock, holders]: serialises the lookup, pick and submit
+        # (and a cancel)
+        # of one id, so a retry racing its own original cannot land in a
+        # second pool.  An entry is dropped with its last holder.
+        self._submit_locks: dict[str, list] = {}
 
         # pool_name → (fetched_at, verbose summary).  Shared by usage refresh
         # and the ``child_endpoint`` lookup so a poll loop costs one call.
@@ -512,6 +549,7 @@ class PluginFederation(Plugin):
         self.add_route_post('pick/{sid}',              self._route_pick)
         self.add_route_post('submit/{sid}',            self._route_submit)
         self.add_route_get ('task/{sid}/{task_id}',    self._route_task)
+        self.add_route_post('cancel/{sid}/{task_id}',  self._route_cancel)
 
         log.info('[%s] loaded %d resource(s) from %s', self.instance_name,
                  len(self._state.resources), self._state.path)
@@ -545,7 +583,8 @@ class PluginFederation(Plugin):
 
     # -- session helper --------------------------------------------------
 
-    async def _require_session(self, sid: str) -> None:
+    async def _require_session(self, sid: str, *,
+                               best_effort: bool = False) -> None:
         '''Ensure the reserved ``default`` session, then validate *sid*.
 
         Every federation route is addressed with ``default``; a client never
@@ -560,12 +599,77 @@ class PluginFederation(Plugin):
         not re-attached yet.
         '''
         await self._ensure_default_session()
-        if not self._replayed:
-            self._replayed = True
-            await self._replay_attachments()
+        try:
+            await self._ensure_replayed()
+        except HTTPException:
+            # read-only routes answer from the federation's own records
+            if not best_effort:
+                raise
+        self._note_departures()
+        if self._overdue_members():
+            await self._sync_attachments()
         if sid not in self._sessions:
             raise HTTPException(status_code=404,
                                 detail=f'unknown session id: {sid}')
+
+    async def _ensure_replayed(self) -> None:
+        '''Run the restart re-attach once, and wait for it to finish.
+
+        The flag used to be set *before* the replay was awaited, so a route
+        arriving during that await reached the dispatcher before ``fed``
+        was registered and got a 404 for the session.  Every caller now
+        awaits the one replay task (shielded: a cancelled caller does not
+        cancel it).  A *transient* failure (an ``HTTPException`` of 500 or
+        more -- no dispatcher is a 503 -- or the replay task cancelled) is a
+        **503**, and the next caller starts a new one -- only the caller
+        that still sees the failed task clears it, so a waiter of an old
+        failure cannot drop a newer retry.  Anything else (a 4xx, or a
+        non-HTTP error) is logged and the replay counts as done, as before;
+        :meth:`_sync_attachments` keeps retrying the registration.
+        '''
+        task = self._replay
+        if task is None:
+            task = asyncio.ensure_future(self._replay_attachments())
+            self._replay = task
+        if task.done() and not task.cancelled() \
+                and task.exception() is None:
+            return
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as e:
+            if not task.cancelled():
+                raise                       # the caller was cancelled
+            if self._replay is task:
+                self._replay = None
+            log.warning('[%s] restart re-attach was cancelled (retried on '
+                        'the next call)', self.instance_name)
+            raise HTTPException(status_code=503,
+                                detail='federation replay pending: '
+                                       'cancelled') from e
+        except HTTPException as e:
+            if e.status_code < 500:
+                self._replay_finished(task)
+                log.warning('[%s] restart re-attach failed permanently: %s',
+                            self.instance_name, e)
+                return
+            if self._replay is task:
+                self._replay = None
+            log.warning('[%s] restart re-attach failed (retried on the next '
+                        'call): %s', self.instance_name, e)
+            raise HTTPException(
+                status_code=503,
+                detail=f'federation replay pending: {e.detail}') from e
+        except Exception:
+            # not a dispatcher answer: a bug, not worth a retry per call
+            self._replay_finished(task)
+            log.exception('[%s] restart re-attach failed', self.instance_name)
+
+    def _replay_finished(self, task: asyncio.Future) -> None:
+        '''Mark the replay done after a permanent failure of *task*.'''
+        if self._replay is task:
+            done = asyncio.get_running_loop().create_future()
+            done.set_result(None)
+            self._replay = done
 
     def _participant(self, endpoint: str) -> dict:
         '''Return the topology entry for *endpoint* (empty when unknown).'''
@@ -1405,8 +1509,13 @@ class PluginFederation(Plugin):
             if entry.state in _TERMINAL_TASK_STATES:
                 continue
             try:
-                await self._dispatcher.cancel_task(
-                    entry.dispatcher_sid or FED_SESSION_SID, entry.task_id)
+                # only the federation's own record: a miss could otherwise
+                # cancel another client's endpoint-mode task of that id
+                if (entry.dispatcher_sid or FED_SESSION_SID) \
+                        == FED_SESSION_SID and \
+                        await self._dispatcher_task(entry.task_id) is not None:
+                    await self._dispatcher.cancel_task(FED_SESSION_SID,
+                                                       entry.task_id)
             except Exception as e:
                 log.info('[%s] leave %r: cancelling task %s failed: %s',
                          self.instance_name, name, entry.task_id, e)
@@ -1417,7 +1526,8 @@ class PluginFederation(Plugin):
 
     async def _route_resources(self, request: Request) -> dict:
         '''List every resource, usage refreshed.'''
-        await self._require_session(request.path_params['sid'])
+        await self._require_session(request.path_params['sid'],
+                                    best_effort=True)
         await self._refresh_all()
         return {'resources': [r.to_wire() for r in
                               sorted(self._state.resources.values(),
@@ -1425,7 +1535,8 @@ class PluginFederation(Plugin):
 
     async def _route_resource(self, request: Request) -> dict:
         '''Return one resource record, usage refreshed.'''
-        await self._require_session(request.path_params['sid'])
+        await self._require_session(request.path_params['sid'],
+                                    best_effort=True)
         rec = self._resource(request.path_params['name'])
         await self._refresh_usage(rec)
         return rec.to_wire()
@@ -1438,7 +1549,8 @@ class PluginFederation(Plugin):
         explicitly **advisory**: the binding placement is made by the
         dispatcher at dispatch and reported by ``task``.
         '''
-        await self._require_session(request.path_params['sid'])
+        await self._require_session(request.path_params['sid'],
+                                    best_effort=True)
         try:
             body = await request.json()
         except Exception:
@@ -1525,16 +1637,8 @@ class PluginFederation(Plugin):
                     detail="'task.inputs_b64' must be an object of "
                            '{filename: base64}')
 
-        await self._refresh_all()
-        chosen = self._pick(requirements)
-        if chosen is None:
-            return self._no_resource(requirements)
-        cls, _score, ranked = chosen
-        pool = self.pool_name_for_class(cls)
-
         payload = {
-            'pool'    : pool,
-            'task_id' : task_id,
+            'task_id' : str(task_id),       # the key every lookup uses
             'cmd'     : list(cmd),
             'priority': int(priority),
             'inputs'  : list(task.get('inputs')  or []),
@@ -1546,6 +1650,46 @@ class PluginFederation(Plugin):
             payload['requirements'] = forward
         if inputs_b64:
             payload['inputs_b64'] = dict(inputs_b64)
+
+        return await self._submit_once(str(task_id), payload, requirements)
+
+    async def _submit_once(self, task_id: str, payload: dict,
+                           requirements: dict):
+        '''Look up, pick and submit *task_id* under its own lock.'''
+        async with self._task_lock(task_id):
+            return await self._submit_unlocked(task_id, payload,
+                                               requirements)
+
+    @contextlib.asynccontextmanager
+    async def _task_lock(self, task_id: str):
+        '''Hold *task_id*'s lock; it is dropped with its last holder.'''
+        slot = self._submit_locks.setdefault(task_id, [asyncio.Lock(), 0])
+        slot[1] += 1
+        try:
+            async with slot[0]:
+                yield
+        finally:
+            slot[1] -= 1
+            if slot[1] == 0 and self._submit_locks.get(task_id) is slot:
+                del self._submit_locks[task_id]
+
+    async def _submit_unlocked(self, task_id: str, payload: dict,
+                               requirements: dict):
+        '''The body of :meth:`_submit_once`.'''
+        # A retry of a submit whose reply was lost must not become a second
+        # task: the pick below may choose another class pool this time.
+        rec = await self._dispatcher_task(task_id)
+        if rec is not None:
+            return await self._resubmit_known(task_id, rec, payload,
+                                              requirements)
+
+        await self._refresh_all()
+        chosen = self._pick(requirements)
+        if chosen is None:
+            return self._no_resource(requirements)
+        cls, _score, ranked = chosen
+        pool = self.pool_name_for_class(cls)
+        payload['pool'] = pool
 
         # A dispatcher 400 ("no member satisfies the task requirements")
         # propagates verbatim — status and detail — so the caller sees the
@@ -1570,6 +1714,113 @@ class PluginFederation(Plugin):
                 'dispatcher_sid'  : FED_SESSION_SID,
                 'resource'        : advisory,
                 'member'          : None,
+                'members_eligible': [m.member_id for m, _ in ranked]}
+
+    @staticmethod
+    def class_for_pool(pool: str) -> str:
+        '''Return the capability class a ``fed-<class>`` pool backs, or ``''``.'''
+        pool = str(pool or '')
+        return pool[len(_FED_PREFIX):] if pool.startswith(_FED_PREFIX) else ''
+
+    async def _dispatcher_task(self, task_id: str) -> dict | None:
+        '''Return the dispatcher's record of *task_id*, or ``None``.
+
+        Pool-mode records are never released and every pool of ``fed`` is
+        replayed after a restart, so this finds any task the federation ever
+        routed.  Only a 404 for the *task* is a miss: a 404 for the session
+        (or any other error) propagates.  Without a registered ``fed``
+        session (an empty federation) there is nothing to find.
+        '''
+        if not self._pools:
+            return None
+        try:
+            rec = await self._dispatcher.task(FED_SESSION_SID, str(task_id))
+        except HTTPException as e:
+            if e.status_code == 404 and \
+                    str(e.detail or '').startswith('unknown task'):
+                return None
+            raise
+        rec = dict(rec or {})
+        # the dispatcher answers an id of its global endpoint-mode table
+        # first: another client's task, not one of the federation's pools
+        if not self.class_for_pool(rec.get('pool')):
+            return None
+        return rec
+
+    def _adopt_entry(self, task_id: str, rec: dict) -> SubmitLedgerEntry:
+        '''Return the ledger entry of *task_id*, created from *rec* if missing.
+
+        An entry can be missing for a task the dispatcher holds: a crash
+        between the dispatcher's save and the ledger's, or a ``leave`` that
+        dropped the finished entries of its resource.
+        '''
+        entry = self._state.ledger.get(str(task_id))
+        if entry is None:
+            pool      = str(rec.get('pool') or '')
+            member_id = rec.get('member_id') or None
+            entry = SubmitLedgerEntry(
+                task_id        = str(task_id),
+                resource       = (self.split_member_id(member_id)[0] or None
+                                  if member_id else None),
+                pool           = pool,
+                dispatcher_sid = FED_SESSION_SID,
+                state          = str(rec.get('state') or 'QUEUED'),
+                submitted_at   = rec.get('submitted_at') or time.time(),
+                member_id      = member_id,
+                cls            = self.class_for_pool(pool),
+            )
+            self._state.ledger[str(task_id)] = entry
+            self._state.save()
+        return entry
+
+    async def _resubmit_known(self, task_id: str, rec: dict, payload: dict,
+                              requirements: dict) -> dict:
+        '''Answer a submit of a *task_id* the dispatcher already holds.
+
+        A live or DONE task is answered from its record: nothing is
+        submitted.  A FAILED or CANCELED one runs again **in its recorded
+        pool** (the dispatcher re-executes in place); a pool that has no
+        members now is a 409, never a re-pick -- the same id in two pools is
+        exactly the duplicate this avoids.
+        '''
+        pool  = str(rec.get('pool') or '')
+        cls   = self.class_for_pool(pool)
+        entry = self._adopt_entry(task_id, rec)
+        if str(rec.get('state') or '') in ('FAILED', 'CANCELED'):
+            payload['pool'] = pool
+            try:
+                rec = await self._dispatcher.submit(FED_SESSION_SID, payload)
+            except HTTPException as e:
+                if e.status_code == 400 and 'has no members' in str(e.detail):
+                    detail = (f'task {task_id} was routed to class '
+                              f'{cls!r}, which has no live members now; '
+                              'retry later, or use a new task_id to run it '
+                              'elsewhere')
+                    raise HTTPException(status_code=409,
+                                        detail=detail) from e
+                raise
+            rec                = dict(rec or {})
+            entry.state        = str(rec.get('state') or 'QUEUED')
+            entry.submitted_at = time.time()
+            entry.finished_at  = None
+            entry.detail       = ''
+            entry.member_id    = None
+            entry.resource     = None       # not placed yet
+            self._state.save()
+            await self._refresh_all()
+        try:
+            ranked = self._policy.eligible(requirements,
+                                           self._classes().get(cls) or [])
+        except Exception:
+            ranked = []
+        member_id = rec.get('member_id') or None
+        return {'task'            : rec,
+                'pool'            : pool,
+                'class'           : cls,
+                'dispatcher_sid'  : FED_SESSION_SID,
+                'resource'        : entry.resource,
+                'member'          : (self.split_member_id(member_id)[1]
+                                     if member_id else None),
                 'members_eligible': [m.member_id for m, _ in ranked]}
 
     async def _route_task(self, request: Request) -> dict:
@@ -1599,15 +1850,25 @@ class PluginFederation(Plugin):
         await self._require_session(request.path_params['sid'])
         task_id = request.path_params['task_id']
         entry   = self._state.ledger.get(task_id)
+        rec     = None
         if entry is None:
-            raise HTTPException(status_code=404,
-                                detail=f'unknown task: {task_id}')
+            rec = await self._dispatcher_task(task_id)
+            if rec is None:
+                raise HTTPException(status_code=404,
+                                    detail=f'unknown task: {task_id}')
+            entry = self._adopt_entry(task_id, rec)
 
         sid = entry.dispatcher_sid or FED_SESSION_SID
         if sid != FED_SESSION_SID:
             return self._ledger_view(entry)
 
-        task = await self._dispatcher.task(sid, task_id)
+        if rec is None and entry.state in _TERMINAL_TASK_STATES:
+            rec = await self._dispatcher_task(task_id)
+            if rec is None:         # e.g. cancelled in the ledger alone
+                return self._ledger_view(entry)
+
+        task = rec if rec is not None \
+            else await self._dispatcher.task(sid, task_id)
         task = dict(task or {})
 
         dirty = False
@@ -1635,13 +1896,7 @@ class PluginFederation(Plugin):
         if dirty:
             self._state.save()
 
-        member_id = entry.member_id
-        task['member_id'] = member_id
-        task['member']    = (self.split_member_id(member_id)[1]
-                             if member_id else None)
-        task['resource']  = entry.resource
-        if entry.cls:
-            task['class'] = entry.cls
+        self._annotate(task, entry)
 
         pilot_id = task.get('pilot_id')
         if entry.pool and pilot_id:
@@ -1650,6 +1905,78 @@ class PluginFederation(Plugin):
                 if pilot.get('pid') == pilot_id:
                     task['child_endpoint'] = pilot.get('child_endpoint_name')
                     break
+        return task
+
+    def _annotate(self, task: dict, entry: SubmitLedgerEntry) -> None:
+        '''Add the ledger's placement (member, resource, class) to *task*.'''
+        member_id = entry.member_id
+        task['member_id'] = member_id
+        task['member']    = (self.split_member_id(member_id)[1]
+                             if member_id else None)
+        task['resource']  = entry.resource
+        if entry.cls:
+            task['class'] = entry.cls
+
+    async def _route_cancel(self, request: Request) -> dict:
+        '''Cancel one federation task; answer its record.
+
+        Resolved like submit and poll: only a dispatcher record in a
+        ``fed-<class>`` pool is cancelled, so another client's endpoint-mode
+        task with the same id never is.  The id is the raw path segment, or
+        its percent-decoded form on a miss (a quoting client).
+
+        - a dispatcher record: cancelled there (a finished task comes back
+          unchanged), the ledger follows, the annotated record is answered;
+        - only a ledger entry: the dispatcher no longer holds the task, so
+          a live entry is marked ``CANCELED`` with that reason (503 while no
+          class pool is registered, since the dispatcher was not asked);
+        - neither: 404.
+
+        A RUNNING task whose endpoint is absent is marked CANCELED here and
+        in the dispatcher, but its rhapsody cancel is best effort: the
+        remote process may keep running.
+        '''
+        await self._require_session(request.path_params['sid'])
+        raw = request.path_params['task_id']
+        for task_id in dict.fromkeys((raw, urllib.parse.unquote(raw))):
+            async with self._task_lock(task_id):
+                task = await self._cancel_unlocked(task_id)
+            if task is not None:
+                return task
+        raise HTTPException(status_code=404, detail=f'unknown task: {task_id}')
+
+    async def _cancel_unlocked(self, task_id: str) -> dict | None:
+        '''The body of :meth:`_route_cancel` for one id (under its lock, so a
+        submit in flight settles first); ``None`` when the id is unknown.'''
+        rec   = await self._dispatcher_task(task_id)
+        entry = self._state.ledger.get(task_id)
+        if rec is None:
+            if entry is None:
+                return None
+            if entry.state not in _TERMINAL_TASK_STATES:
+                if not self._pools:
+                    # the dispatcher was not asked: it may still run it
+                    raise HTTPException(
+                        status_code=503,
+                        detail='no federation pool is registered; '
+                               'cannot cancel now')
+                entry.state       = 'CANCELED'
+                entry.finished_at = time.time()
+                entry.detail      = 'the dispatcher no longer holds this task'
+                self._state.save()
+            return self._ledger_view(entry)
+
+        task  = dict(await self._dispatcher.cancel_task(FED_SESSION_SID,
+                                                        task_id) or {})
+        entry = self._adopt_entry(task_id, {**rec, **task})
+        state = str(task.get('state') or entry.state)
+        if state != entry.state:
+            entry.state = state
+            if state in _TERMINAL_TASK_STATES:
+                entry.finished_at = task.get('finished_at') or time.time()
+            self._state.save()
+        task = {**rec, **task}
+        self._annotate(task, entry)
         return task
 
     def _ledger_view(self, entry: SubmitLedgerEntry) -> dict:
@@ -1934,13 +2261,43 @@ class PluginFederation(Plugin):
                    'role'    : str((info or {}).get('role') or '')}
             for name, info in participants.items()
         }
+        self._note_departures()             # before any await
 
-        if not self._replayed:
-            self._replayed = True
-            await self._replay_attachments()
+        try:
+            await self._ensure_replayed()
+        except HTTPException:
+            pass        # logged; liveness is still applied below
 
         await self._sync_attachments()
         await super().on_topology_change(participants)
+
+    def _note_departures(self) -> None:
+        '''Latch when each joined endpoint went away, or that it is back.'''
+        now   = time.monotonic()
+        names = {rec.endpoint for rec in self._state.resources.values()}
+        for name in names:
+            live = self._participant(name).get('liveness')
+            if live is None:
+                self._absent_since.setdefault(name, now)
+            elif live == LIVENESS_LOST:
+                self._absent_since[name] = float('-inf')
+            else:
+                self._absent_since.pop(name, None)
+        for name in set(self._absent_since) - names:
+            del self._absent_since[name]
+
+    def _is_overdue(self, endpoint: str) -> bool:
+        '''Whether *endpoint* was reported lost, or is absent past the grace.'''
+        since = self._absent_since.get(endpoint)
+        return since is not None and \
+            time.monotonic() - since >= _ABSENT_GRACE_SEC
+
+    def _overdue_members(self) -> bool:
+        '''Whether a member is still attached behind an overdue endpoint.'''
+        return any(member.member_id in self._attached
+                   for rec in self._state.resources.values()
+                   if self._is_overdue(rec.endpoint)
+                   for member in rec.member_list())
 
     async def _upgrade_legacy(self) -> None:
         '''Release the per-resource ``fed-<name>`` sessions of a pre-08 state.
@@ -2023,12 +2380,14 @@ class PluginFederation(Plugin):
         await self._upgrade_legacy()
 
         try:
-            await self._register_fed()
+            await self._register_fed()      # an empty federation: a no-op
         except Exception as e:
             log.warning('[%s] could not register the %r session: %s',
                         self.instance_name, FED_SESSION_SID, e)
             self._state.save()
-            return
+            if isinstance(e, HTTPException) and e.status_code < 500:
+                return                      # permanent: retrying won't help
+            raise                           # _ensure_replayed retries
 
         for rec in list(self._state.resources.values()):
             for member in rec.member_list():
@@ -2078,6 +2437,8 @@ class PluginFederation(Plugin):
         failing.  An error (a 404 from a dispatcher that never had it) is
         logged and ignored: the member is gone either way.
         '''
+        # dropped first, so that a member re-added meanwhile stays attached
+        self._attached.discard(member.member_id)
         try:
             await self._dispatcher.del_member(
                 FED_SESSION_SID, member.pool_name,
@@ -2086,7 +2447,6 @@ class PluginFederation(Plugin):
         except Exception as e:
             log.info('[%s] detach %s: %s',
                      self.instance_name, member.member_id, e)
-        self._attached.discard(member.member_id)
         self._detail_cache.pop(member.pool_name, None)
 
     async def _sync_attachments(self) -> None:
@@ -2096,25 +2456,34 @@ class PluginFederation(Plugin):
         |---|---|
         | ``present``, not attached | ``add_member`` (re-declaring the class pool first when it no longer exists — every member of that class may have left while the endpoint was down) |
         | ``suspect`` | mark ``suspect``, **nothing else**.  The policy already refuses to route to a non-``ok`` member, which is the whole point of ``suspect``; a blip must not touch the dispatcher |
-        | ``lost``, attached | ``del_member`` with ``fail_unsatisfiable=False``.  Its pilots died with the endpoint anyway and its RUNNING tasks re-queue onto a sibling — but a task only *this* member could run stays QUEUED instead of failing, because a lost endpoint is very often back in a minute |
+        | missing from the topology | reads ``lost``; detached only once absent for ``_ABSENT_GRACE_SEC`` (checked on each topology delivery and each route): an endpoint that has not reconnected after a restart may still run tasks, and detaching would requeue them |
+        | reported ``lost``, attached | ``del_member`` with ``fail_unsatisfiable=False``.  Its pilots died with the endpoint anyway and its RUNNING tasks re-queue onto a sibling — but a task only *this* member could run stays QUEUED instead of failing, because a lost endpoint is very often back in a minute |
 
         A member whose allocation ``end_time`` has passed is ``lost`` whatever
         its endpoint reports: that endpoint is back in a new allocation, and
         stays detached until it leaves and joins again.
         '''  # noqa: E501
+        async with self._sync_lock:
+            await self._sync_unlocked()
+
+    async def _sync_unlocked(self) -> None:
+        '''The body of :meth:`_sync_attachments`.'''
         dirty = False
         for rec in list(self._state.resources.values()):
             target = self._liveness_for(rec.endpoint)
             result = target
 
+            overdue = self._is_overdue(rec.endpoint)
             for member in rec.member_list():
                 state = target
-                if self._allocation_ended(member):
+                ended = self._allocation_ended(member)
+                if ended:
                     state  = LIVENESS_LOST
                     result = LIVENESS_LOST
 
                 if state == LIVENESS_LOST:
-                    if member.member_id in self._attached:
+                    if member.member_id in self._attached and \
+                            (ended or overdue):
                         await self._detach(member)
 
                 elif state == LIVENESS_SUSPECT:
