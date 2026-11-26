@@ -68,7 +68,8 @@ The TLS cert and key each resolve with the precedence
 **CLI flag > environment variable > file under `~/.radical/orbit/`**.
 The broker URL has no file: endpoints and clients take it from the CLI
 flag or the environment variable only, and fail without one
-(`EndpointRuntime(embedded=True)` needs none: it starts its own broker).
+(`EndpointRuntime(embedded=True)` starts its own broker, ignores the
+variable and refuses a `broker_url=` argument).
 
 | Item | Env var                       | Default file                       |
 |------|-------------------------------|------------------------------------|
