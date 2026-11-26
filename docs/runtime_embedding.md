@@ -131,9 +131,11 @@ defaults its name to the hostname rather than an auto-generated one.
 
 ## Configuration
 
-The runtime resolves its broker URL, TLS cert, and ingress token with the
-precedence **constructor argument > environment variable > file under
-`~/.radical/orbit/`**:
+The runtime resolves its TLS cert and ingress token with the precedence
+**constructor argument > environment variable > file under
+`~/.radical/orbit/`**.  The broker URL has no file: it comes from the
+constructor argument or the environment variable only (not needed with
+`embedded=True`, which starts its own broker):
 
 - `RADICAL_ORBIT_BROKER_URL` — the broker URL (`https`/`wss` require a
   cert).
