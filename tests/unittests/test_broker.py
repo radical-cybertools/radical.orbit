@@ -1582,3 +1582,48 @@ async def test_broker_call_oversized_request_is_413(make_broker):
     finally:
         broker.registry.pop('e2', None)
         await broker.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_delivers_no_lost_to_hosted_plugins(make_broker):
+    '''Shutdown closes each socket cleanly (1001), and the clean-close path
+    removes the participant and broadcasts; hosted plugins must not see
+    those children as ``lost`` (the dispatcher would fail its pilots).'''
+    broker = make_broker()
+    await broker.startup()
+    seen = []
+
+    class _Host:
+        # recorded when the delivery is built, not when the host loop runs
+        # it: shutdown stops that loop right after, so a run may never come
+        def on_topology_change(self, participants):
+            seen.append({n: (i or {}).get('liveness')
+                         for n, i in participants.items()})
+            return asyncio.sleep(0)
+
+        def get_topology_info(self):
+            return {'plugins': {}}
+
+        def __getattr__(self, name):            # anything else: a no-op
+            return lambda *a, **kw: None
+
+    class _DroppingWS(FakeWS):
+        async def close(self, code: int = 1000) -> None:
+            self.closed = code
+            await broker._on_socket_drop('e1', self, clean=True)
+
+    real_host = broker._plugin_host
+    broker._plugin_host = _Host()
+    try:
+        ws = _DroppingWS()
+        await _register(broker, 'e1', ws)
+        broker._deliver_topology_to_host()             # e1 now 'present'
+        await asyncio.sleep(0.05)
+        assert seen and seen[-1].get('e1') == 'present'
+        seen.clear()
+        await broker.shutdown()
+        await asyncio.sleep(0.05)
+        assert ws.closed == 1001
+        assert not any(v.get('e1') == 'lost' for v in seen), seen
+    finally:
+        broker._plugin_host = real_host
