@@ -76,7 +76,7 @@ export RADICAL_ORBIT_BROKER_TOKEN="<shared ingress token>"  # see "Ingress authe
 ```
 
 See the **Broker configuration** section below for the full
-precedence rules (CLI > env > file).
+precedence rules (CLI > env > file; the URL has no file).
 
 ### 1b. Ingress authentication (token)
 
@@ -295,7 +295,7 @@ radical-orbit-broker.py [options]
 ```
 radical-orbit-endpoint.py [options]
   --name NAME         Endpoint name (shown in Explorer and /endpoint/list)
-  --url  URL          Broker URL                 (CLI > env > file)
+  --url  URL          Broker URL                 (CLI > env)
   --cert CERT         TLS cert path              (CLI > env > file)
   -p PLUGINS          Comma-separated plugins to load
   --tunnel MODE       Tunnel mode: none | forward | reverse

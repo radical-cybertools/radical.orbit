@@ -79,7 +79,8 @@ def main():
 
     plugins = [t.strip() for t in args.plugins.split(',') if t.strip()]
 
-    # EndpointRuntime resolves URL + cert via radical.orbit.utils (CLI > env > file).
+    # EndpointRuntime resolves URL + cert via radical.orbit.utils (CLI > env,
+    # and > file for the cert).
     runtime = EndpointRuntime(broker_url=args.url,
                               cert       =args.cert,
                               name       =endpoint_name,
