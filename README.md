@@ -267,7 +267,8 @@ Behaviour notes:
   (printing both FQDN and outbound-IPv4 forms on stdout); specific
   binds advertise that literal address.  There is deliberately no
   `broker.url` file: a URL is volatile, so endpoints and clients take it
-  from `--broker-url` or `$RADICAL_ORBIT_BROKER_URL` and raise
+  from their CLI flag (`--url` for `radical-orbit-endpoint.py`) or
+  `$RADICAL_ORBIT_BROKER_URL`, and raise
   `ValueError` if neither is set.
 - **Cert / key**: never auto-written; the operator places them.
   Required for `https://` / `wss://` URLs; ignored entirely for

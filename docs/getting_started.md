@@ -250,7 +250,8 @@ participants' plugins with ``get_plugin(endpoint, plugin)``.
 ```python
 from radical.orbit import EndpointRuntime
 
-# broker URL: CLI-arg > env; cert/token: CLI-arg > env > file
+# broker URL: broker_url= kwarg > $RADICAL_ORBIT_BROKER_URL (required, no file);
+# cert/token: kwarg > env > file
 rt = EndpointRuntime()
 rt.start(wait=True)                      # blocks until registered + first topology
 
