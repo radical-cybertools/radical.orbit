@@ -251,10 +251,11 @@ The broker URL, TLS cert, and TLS key are resolved with this
 precedence:
 
 > **CLI flag > environment variable > file under `~/.radical/orbit/`**
+> (the URL has no file: CLI flag or environment variable only)
 
 | Item | Env var               | Default file                      |
 |------|-----------------------|-----------------------------------|
-| URL  | `RADICAL_ORBIT_BROKER_URL`  | `~/.radical/orbit/broker.url`      |
+| URL  | `RADICAL_ORBIT_BROKER_URL`  | none                               |
 | Cert | `RADICAL_ORBIT_BROKER_CERT` | `~/.radical/orbit/broker_cert.pem` |
 | Key  | `RADICAL_ORBIT_BROKER_KEY`  | `~/.radical/orbit/broker_key.pem`  |
 
@@ -264,10 +265,10 @@ Behaviour notes:
 - **URL** (consumer side only): the broker derives its own advertised
   URL from `(host, port)` — wildcard binds use the local FQDN
   (printing both FQDN and outbound-IPv4 forms on stdout); specific
-  binds advertise that literal address.  The broker writes
-  `broker.url` only when the file does not already exist, so a stale
-  file the operator placed for a different broker is never clobbered.
-  Endpoints / clients raise `ValueError` if no URL resolves.
+  binds advertise that literal address.  There is deliberately no
+  `broker.url` file: a URL is volatile, so endpoints and clients take it
+  from `--broker-url` or `$RADICAL_ORBIT_BROKER_URL` and raise
+  `ValueError` if neither is set.
 - **Cert / key**: never auto-written; the operator places them.
   Required for `https://` / `wss://` URLs; ignored entirely for
   `http://` / `ws://`.
