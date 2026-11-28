@@ -64,12 +64,16 @@ git clone https://github.com/radical-cybertools/radical.orbit.git
 
 ## 2. Configuration
 
-The broker URL, TLS cert, and TLS key each resolve with the precedence
-**CLI flag > environment variable > file under `~/.radical/orbit/`**:
+The TLS cert and key each resolve with the precedence
+**CLI flag > environment variable > file under `~/.radical/orbit/`**.
+The broker URL has no file: endpoints and clients take it from the CLI
+flag or the environment variable only, and fail without one
+(`EndpointRuntime(embedded=True)` starts its own broker, ignores the
+variable and refuses a `broker_url=` argument).
 
 | Item | Env var                       | Default file                       |
 |------|-------------------------------|------------------------------------|
-| URL  | `RADICAL_ORBIT_BROKER_URL`  | `~/.radical/orbit/broker.url`      |
+| URL  | `RADICAL_ORBIT_BROKER_URL`  | none                               |
 | Cert | `RADICAL_ORBIT_BROKER_CERT` | `~/.radical/orbit/broker_cert.pem` |
 | Key  | `RADICAL_ORBIT_BROKER_KEY`  | `~/.radical/orbit/broker_key.pem`  |
 
@@ -248,7 +252,8 @@ participants' plugins with ``get_plugin(endpoint, plugin)``.
 ```python
 from radical.orbit import EndpointRuntime
 
-# broker URL/cert/token resolve via CLI-arg > env > file
+# broker URL: broker_url= kwarg > $RADICAL_ORBIT_BROKER_URL (required, no file);
+# cert/token: kwarg > env > file
 rt = EndpointRuntime()
 rt.start(wait=True)                      # blocks until registered + first topology
 

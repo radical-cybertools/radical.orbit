@@ -1569,8 +1569,8 @@ def main():
 
     kind, name = _parse_target_arg(target_arg)
 
-    # EndpointRuntime self-resolves URL + cert via radical.orbit.utils
-    # (CLI > env > file).
+    # EndpointRuntime self-resolves via radical.orbit.utils: the URL from
+    # $RADICAL_ORBIT_BROKER_URL, the cert from env, then file.
     bc         = EndpointRuntime()
     bc.start(wait=True)
     broker_url = bc.broker_url

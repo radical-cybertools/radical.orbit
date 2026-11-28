@@ -81,10 +81,9 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     # URL/cert default to None so EndpointRuntime self-resolves via
-    # radical.orbit.utils (CLI > env > file).
+    # radical.orbit.utils (CLI > env, and > file for the cert).
     parser.add_argument('-u', '--broker-url',  default=None,
-                        help='Broker URL  (CLI > $RADICAL_ORBIT_BROKER_URL > '
-                             '~/.radical/orbit/broker.url).')
+                        help='Broker URL  (CLI > $RADICAL_ORBIT_BROKER_URL).')
     parser.add_argument('-c', '--broker-cert', default=None,
                         help='Broker CA cert path  (CLI > $RADICAL_ORBIT_BROKER_CERT '
                              '> ~/.radical/orbit/broker_cert.pem).')

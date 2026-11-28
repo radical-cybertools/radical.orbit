@@ -229,7 +229,7 @@ The Python SDK is `EndpointRuntime` (a zero-plugin consumer participant, exporte
 ```python
 from radical.orbit import EndpointRuntime
 
-# Join the star as a consumer (broker URL: --arg > env > file)
+# Join the star as a consumer (broker URL: --arg > env)
 rt = EndpointRuntime(broker_url="https://localhost:8000")
 
 # Option 1: Global callback (all notifications)
